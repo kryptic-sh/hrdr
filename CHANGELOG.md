@@ -36,7 +36,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `/find <text>` jumps the transcript to the next message containing `text`
   (case-insensitive) and highlights every match across the transcript; repeat
   `/find` with no argument to cycle through matches. Reports the match position
-  and count; `/find clear` (or `off`/`discard`) drops the search + highlight,
+  and count; `/next` and `/prev` cycle forward/backward through the matches
+  (wrapping); `/find clear` (or `off`/`discard`) drops the search + highlight,
   and `/clear` clears it too.
 - The inference loader shows when the current turn started (`started 2m ago` /
   `started 14:32`), respecting the timestamp style (hidden when set to `none`).

@@ -761,6 +761,8 @@ impl App {
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
             "find" | "search" => self.find_cmd(arg),
+            "next" => self.find_cycle(true),
+            "prev" | "previous" => self.find_cycle(false),
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             _ => return false,
         }
@@ -1335,9 +1337,9 @@ impl App {
         self.system(format!("jumped to message #{target}"));
     }
 
-    /// `/find <text>` — jump to the next message containing `text`
-    /// (case-insensitive). Repeat `/find` with no argument to cycle to the next
-    /// match; `/find clear` (or `off`/`discard`) drops the search + highlight.
+    /// `/find <text>` — search the transcript and jump to the next match
+    /// (case-insensitive). No arg cycles to the next match of the current query;
+    /// `/find clear` (or `off`/`discard`) drops the search + highlight.
     fn find_cmd(&mut self, arg: &str) {
         // Clear the active search + highlight.
         if matches!(
@@ -1353,21 +1355,27 @@ impl App {
             }
             return;
         }
-        let query = if arg.trim().is_empty() {
-            match &self.find_query {
-                Some(q) => q.clone(),
-                None => {
-                    self.system("usage: /find <text>");
-                    return;
-                }
+        let arg = arg.trim();
+        if arg.is_empty() {
+            if self.find_query.is_none() {
+                self.system("usage: /find <text>");
+                return;
             }
         } else {
-            arg.trim().to_string()
-        };
+            // A new query restarts cycling from the top.
+            if self.find_query.as_deref() != Some(arg) {
+                self.find_pos = 0;
+            }
+            self.find_query = Some(arg.to_string());
+        }
+        self.find_cycle(true);
+    }
+
+    /// Message numbers (1-based) whose text contains `query` (case-insensitive).
+    fn find_hits(&self, query: &str) -> Vec<usize> {
         let needle = query.to_ascii_lowercase();
-        // Numbered messages whose text contains the query.
         let mut num = 0;
-        let mut hits: Vec<usize> = Vec::new();
+        let mut hits = Vec::new();
         for e in &self.transcript {
             if let Entry::User(s) | Entry::Assistant(s) = e {
                 num += 1;
@@ -1376,20 +1384,34 @@ impl App {
                 }
             }
         }
+        hits
+    }
+
+    /// Cycle to the next (`forward`) or previous match of the active query,
+    /// wrapping around; used by `/find`, `/next`, and `/prev`.
+    fn find_cycle(&mut self, forward: bool) {
+        let Some(query) = self.find_query.clone() else {
+            self.system("no active search — /find <text>");
+            return;
+        };
+        let hits = self.find_hits(&query);
         if hits.is_empty() {
-            self.find_query = Some(query.clone());
             self.system(format!("no match for {query:?}"));
             return;
         }
-        // Continue from the last landing spot when repeating the same query.
-        let after = if self.find_query.as_deref() == Some(query.as_str()) {
-            self.find_pos
+        let target = if forward {
+            hits.iter()
+                .copied()
+                .find(|&n| n > self.find_pos)
+                .unwrap_or(hits[0])
         } else {
-            0
+            hits.iter()
+                .rev()
+                .copied()
+                .find(|&n| n < self.find_pos)
+                .unwrap_or(*hits.last().unwrap())
         };
-        let target = hits.iter().copied().find(|&n| n > after).unwrap_or(hits[0]);
         let idx = hits.iter().position(|&n| n == target).unwrap_or(0) + 1;
-        self.find_query = Some(query.clone());
         self.find_pos = target;
         self.pending_goto = Some(target);
         self.system(format!(
@@ -2302,6 +2324,8 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/info", "session info"),
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
     ("/find", "jump to text (or 'clear' to drop search)"),
+    ("/next", "jump to next /find match"),
+    ("/prev", "jump to previous /find match"),
     ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
     ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
@@ -2332,6 +2356,8 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/info",
             "/goto",
             "/find",
+            "/next",
+            "/prev",
         ],
     ),
     (
