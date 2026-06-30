@@ -7,7 +7,9 @@
 mod prompt;
 mod session;
 
-pub use session::{Session, SessionMeta, list_sessions, sessions_dir, unique_session_id};
+pub use session::{
+    Session, SessionMeta, list_sessions, resolve_session, sessions_dir, unique_session_id,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

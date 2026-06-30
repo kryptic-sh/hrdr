@@ -52,7 +52,7 @@ pub fn sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
-/// Reduce an arbitrary name to a safe file stem.
+/// Reduce an arbitrary name to a safe, length-capped file stem.
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name
         .trim()
@@ -64,6 +64,7 @@ pub fn sanitize_name(name: &str) -> String {
                 '-'
             }
         })
+        .take(48)
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() {
@@ -111,6 +112,19 @@ impl Session {
             .with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))
     }
+}
+
+/// Resolve a `/resume` argument to `(id, Session)`: match the file id first,
+/// then a session's display `name` (case-insensitive — e.g. after `/rename`).
+pub fn resolve_session(arg: &str) -> Option<(String, Session)> {
+    let id = sanitize_name(arg);
+    if let Ok(s) = Session::load(&id) {
+        return Some((id, s));
+    }
+    list_sessions()
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(arg.trim()) || m.id.eq_ignore_ascii_case(arg.trim()))
+        .and_then(|m| Session::load(&m.id).ok().map(|s| (m.id, s)))
 }
 
 /// A collision-free file id derived from `name`: the slug, then `slug-2`,

@@ -31,9 +31,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `~/.local/share/hrdr/sessions`, via `hjkl-xdg`), with the session `name`
   derived from the first user message and a stable file id assigned on first
   save. Auto-saves after each completed turn and after `/undo`/`/retry`.
-  Commands `/sessions` (list, resume by id), `/resume <id>` (restore history +
-  transcript), `/rename <name>` (rename the session; persisted). `/clear` starts
-  a fresh session. (No `/save` — saving is automatic.)
+  Commands `/sessions` (list), `/resume <id-or-name>` (restore history +
+  transcript; matches the file id or the display name, e.g. after `/rename`),
+  `/rename <name>` (rename the session; persisted). `/clear` starts a fresh
+  session. (No `/save` — saving is automatic.)
 - More slash commands: `/models` (list endpoint models), `/cwd [path]` (show or
   change the tools' working directory), `/tools` (list tools), `/reasoning`
   (toggle showing `<think>` blocks), `/theme [path]` (live theme switch),

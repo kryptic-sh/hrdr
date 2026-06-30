@@ -578,19 +578,17 @@ impl App {
 
     fn resume_session(&mut self, arg: &str) {
         if arg.is_empty() {
-            self.system("usage: /resume <name>  (see /sessions)");
+            self.system("usage: /resume <id-or-name>  (see /sessions)");
             return;
         }
         if self.running {
             self.system("can't resume while a turn is running");
             return;
         }
-        let session = match Session::load(arg) {
-            Ok(s) => s,
-            Err(e) => {
-                self.system(format!("resume failed: {e}"));
-                return;
-            }
+        // Match by file id first, then by display name (e.g. after /rename).
+        let Some((id, session)) = hrdr_agent::resolve_session(arg) else {
+            self.system(format!("no session matching '{arg}' (see /sessions)"));
+            return;
         };
         let count = session.messages.len();
         if let Ok(mut a) = self.agent.try_lock() {
@@ -599,10 +597,10 @@ impl App {
         }
         self.model = session.model.clone();
         self.rebuild_transcript(&session.messages);
-        self.session_id = Some(arg.to_string()); // save()/load() sanitize consistently
+        self.session_id = Some(id.clone());
         self.session_label = Some(session.name.clone());
         self.scroll_offset = 0;
-        self.system(format!("resumed '{arg}' ({count} messages)"));
+        self.system(format!("resumed '{}' ({count} messages)", session.name));
         if session.base_url != self.base_url {
             self.system(format!(
                 "note: session endpoint was {} (current: {})",
