@@ -721,6 +721,7 @@ impl App {
             }
             "info" => self.show_info(),
             "copy" => self.copy_cmd(arg),
+            "export" => self.export_cmd(arg),
             "paste" => self.paste_cmd(),
             "retry" => self.retry_last(arg),
             "edit" => self.edit_file_cmd(arg),
@@ -1248,15 +1249,28 @@ impl App {
                     self.copy_to_clipboard(&t, "transcript");
                 }
             }
-            ["msg", n] | ["message", n] | ["m", n] => match n.parse::<usize>() {
-                Ok(num) => match self.nth_message_text(num) {
-                    Some(t) => self.copy_to_clipboard(&t, &format!("message #{num}")),
-                    None => self.system(format!("no message #{num} (see the #N tags)")),
-                },
-                Err(_) => self.system("usage: /copy msg <number>"),
-            },
-            _ => self.system("usage: /copy [code | all | msg N]"),
+            ["msg", spec] | ["message", spec] | ["m", spec] => self.copy_message_spec(spec),
+            _ => self.system("usage: /copy [code | all | msg N | msg N-M]"),
         }
+    }
+
+    /// Copy a single message (`N`) or an inclusive range (`N-M`) by number.
+    fn copy_message_spec(&mut self, spec: &str) {
+        let Some((a, b)) = parse_msg_range(spec) else {
+            self.system("usage: /copy msg <N> or <N-M>");
+            return;
+        };
+        let parts: Vec<String> = (a..=b).filter_map(|n| self.nth_message_text(n)).collect();
+        if parts.is_empty() {
+            self.system(format!("no messages in {a}..{b} (see the #N tags)"));
+            return;
+        }
+        let label = if a == b {
+            format!("message #{a}")
+        } else {
+            format!("messages #{a}-{b}")
+        };
+        self.copy_to_clipboard(&parts.join("\n\n"), &label);
     }
 
     /// The text of the Nth (1-based) user/assistant message in the transcript.
@@ -1387,6 +1401,33 @@ impl App {
             }
         }
         self.editor.paste(&text);
+    }
+
+    /// `/export <file>` — write the transcript (as text) to a file.
+    fn export_cmd(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.system("usage: /export <file>");
+            return;
+        }
+        let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let p = std::path::Path::new(arg);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        let text = self.transcript_text();
+        match std::fs::write(&path, &text) {
+            Ok(()) => self.system(format!(
+                "exported transcript to {} ({} lines)",
+                path.display(),
+                text.lines().count()
+            )),
+            Err(e) => self.system(format!("export failed: {e}")),
+        }
     }
 
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
@@ -2070,7 +2111,8 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
-    ("/copy", "copy reply (or 'code' / 'all' / 'msg N')"),
+    ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
+    ("/export", "write the transcript to a file"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
     ("/retry", "re-run last turn (optional model)"),
@@ -2116,7 +2158,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/paste",
         ],
     ),
-    ("Reply", &["/copy", "/retry", "/undo"]),
+    ("Reply", &["/copy", "/export", "/retry", "/undo"]),
     ("Appearance", &["/theme", "/timestamps"]),
     ("Other", &["/reload", "/help", "/exit"]),
 ];
@@ -2230,6 +2272,19 @@ fn last_fenced_block(md: &str) -> Option<String> {
         .next_back()
         .map(|b| b.trim_end().to_string())
         .filter(|b| !b.is_empty())
+}
+
+/// Parse a message spec: `N` → `(N, N)`, or `N-M` → `(N, M)` (1-based,
+/// inclusive). Returns `None` for invalid or zero/reversed ranges.
+fn parse_msg_range(spec: &str) -> Option<(usize, usize)> {
+    if let Some((a, b)) = spec.split_once('-') {
+        let a: usize = a.trim().parse().ok()?;
+        let b: usize = b.trim().parse().ok()?;
+        (a >= 1 && b >= a).then_some((a, b))
+    } else {
+        let n: usize = spec.trim().parse().ok()?;
+        (n >= 1).then_some((n, n))
+    }
 }
 
 /// Max input-history entries kept (in memory and on disk).
@@ -2481,8 +2536,19 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use super::{
-        active_file_token, is_quit_command, last_fenced_block, resolve_alias, slash_completions,
+        active_file_token, is_quit_command, last_fenced_block, parse_msg_range, resolve_alias,
+        slash_completions,
     };
+
+    #[test]
+    fn parse_msg_range_specs() {
+        assert_eq!(parse_msg_range("3"), Some((3, 3)));
+        assert_eq!(parse_msg_range("2-5"), Some((2, 5)));
+        assert_eq!(parse_msg_range(" 2 - 5 "), Some((2, 5)));
+        assert_eq!(parse_msg_range("0"), None); // 1-based
+        assert_eq!(parse_msg_range("5-2"), None); // reversed
+        assert_eq!(parse_msg_range("x"), None);
+    }
 
     #[test]
     fn last_fenced_block_extraction() {

@@ -34,7 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `on`/`off`); default-on, also via `timestamps` in config, `--no-timestamps`,
   `$HRDR_TIMESTAMPS`.
 - `/copy msg N` copies a specific numbered message (the `#N` shown by the
-  timestamp headers), alongside the existing `/copy`, `/copy code`, `/copy all`.
+  timestamp headers), and `/copy msg N-M` copies an inclusive range, alongside
+  the existing `/copy`, `/copy code`, `/copy all`.
+- `/export <file>` writes the transcript (as text) to a file.
 - `/reload` re-reads `AGENTS.md` and the config file, applying the bits that can
   change live (theme, icons, effort, toggles, temperature) without a restart.
 - `/paste` inserts the system clipboard into the input — and if the clipboard
