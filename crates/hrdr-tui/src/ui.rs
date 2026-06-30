@@ -317,17 +317,23 @@ fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Re
 /// context size, model, and effort.
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let sep = || Span::styled("  │  ", Style::default().fg(t.dim));
+    let sep = || Span::styled(" │ ", Style::default().fg(t.dim));
     let mut spans: Vec<Span> = Vec::new();
 
+    // Show just the cwd's basename, not the full path, with a folder icon.
+    let dir_label = app
+        .dir
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(&app.dir);
     spans.push(Span::styled(
-        format!(" {}", app.dir),
+        format!(" \u{f07b} {dir_label}"),
         Style::default().fg(t.assistant),
     ));
     if let Some(branch) = &app.branch {
         spans.push(sep());
         spans.push(Span::styled(
-            format!(" {branch}"),
+            format!("\u{e0a0} {branch}"),
             Style::default().fg(t.success),
         ));
     }
