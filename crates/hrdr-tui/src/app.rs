@@ -1337,8 +1337,22 @@ impl App {
 
     /// `/find <text>` — jump to the next message containing `text`
     /// (case-insensitive). Repeat `/find` with no argument to cycle to the next
-    /// match of the same query.
+    /// match; `/find clear` (or `off`/`discard`) drops the search + highlight.
     fn find_cmd(&mut self, arg: &str) {
+        // Clear the active search + highlight.
+        if matches!(
+            arg.trim().to_ascii_lowercase().as_str(),
+            "clear" | "off" | "discard"
+        ) {
+            if self.find_query.is_some() {
+                self.find_query = None;
+                self.find_pos = 0;
+                self.system("search cleared");
+            } else {
+                self.system("no active search");
+            }
+            return;
+        }
         let query = if arg.trim().is_empty() {
             match &self.find_query {
                 Some(q) => q.clone(),
@@ -2287,7 +2301,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
-    ("/find", "jump to next message containing text"),
+    ("/find", "jump to text (or 'clear' to drop search)"),
     ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
     ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
