@@ -293,6 +293,33 @@ impl AgentConfig {
     }
 }
 
+/// System prompt for the one-off compaction (summarization) call.
+const COMPACT_SYSTEM: &str = "\
+You are summarizing a software-engineering conversation between a user and an AI \
+coding agent so it can continue in a fresh context with nothing important lost. \
+Be precise, technical, and exhaustive about concrete details — vague summaries are \
+useless here.";
+
+/// User-turn instruction that triggers the structured summary.
+const COMPACT_TRIGGER: &str = "\
+Summarize the conversation so far. The summary REPLACES the full history, so it must \
+let the agent continue seamlessly. Use these sections:
+
+1. **Intent & requirements** — what the user asked for, in their own terms, including \
+   explicit constraints and preferences.
+2. **Technical context** — languages, frameworks, key APIs, architecture decisions.
+3. **Files & code** — every file created or modified (with paths) and the gist of the \
+   changes; include important snippets, signatures, and config values verbatim.
+4. **Commands & results** — notable commands run and their outcomes (builds, tests, \
+   commits, pushes).
+5. **Errors & fixes** — problems hit and how they were resolved.
+6. **Current state** — what is done and verified vs. in progress.
+7. **Pending tasks & next step** — what remains, and the single most immediate next \
+   action.
+
+Be specific: prefer exact names, paths, and values over paraphrase. Output only the \
+summary.";
+
 /// A running agent: model client + tools + conversation state.
 pub struct Agent {
     client: Client,
@@ -399,6 +426,59 @@ impl Agent {
     /// Shared TODO list, mutated by the `todo_write` tool.
     pub fn todos(&self) -> Arc<Mutex<Vec<TodoItem>>> {
         self.ctx.todos.clone()
+    }
+
+    /// Number of messages currently in history (including the system prompt).
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Compact the conversation: ask the model for a structured summary and
+    /// replace the history with `[system prompt, summary]`, so the context
+    /// shrinks while continuity is preserved (Claude Code / opencode style).
+    ///
+    /// `instructions` optionally steers the summary's focus. Returns
+    /// `(messages_before, messages_after)`; a no-op when there's nothing beyond
+    /// the system prompt and one message.
+    pub async fn compact(&mut self, instructions: Option<&str>) -> Result<(usize, usize)> {
+        let before = self.messages.len();
+        if before <= 2 {
+            return Ok((before, before));
+        }
+
+        // Build a one-off summarization request: a dedicated summarizer system
+        // prompt + the conversation so far (minus its own system prompt) + the
+        // trigger instruction. No tools — we only want prose back.
+        let mut trigger = COMPACT_TRIGGER.to_string();
+        if let Some(extra) = instructions.map(str::trim).filter(|s| !s.is_empty()) {
+            trigger.push_str("\n\nAdditional instructions for the summary, follow them closely:\n");
+            trigger.push_str(extra);
+        }
+        let mut req = Vec::with_capacity(before + 1);
+        req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
+        req.extend(self.messages.iter().skip(1).cloned());
+        req.push(ChatMessage::user(trigger));
+
+        let mut stream = self.client.chat_stream(req, vec![]).await?;
+        let mut acc = Accumulator::new();
+        while let Some(chunk) = stream.next().await {
+            acc.push(&chunk?);
+        }
+        let summary = acc.into_message().content.unwrap_or_default();
+        if summary.trim().is_empty() {
+            bail!("compaction produced an empty summary");
+        }
+
+        // Replace history: keep the original (coding) system prompt, then a
+        // single user message carrying the summary as the continuation seed.
+        let system = self.messages[0].clone();
+        let continuation = format!(
+            "This session is being continued from an earlier conversation that ran out of \
+             context. The summary below captures everything that happened; continue from where \
+             it left off without losing any detail.\n\n{summary}"
+        );
+        self.messages = vec![system, ChatMessage::user(continuation)];
+        Ok((before, self.messages.len()))
     }
 
     /// Run one user turn to completion, emitting events as it goes.

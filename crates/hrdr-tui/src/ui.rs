@@ -229,16 +229,23 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
         None => "ctx —".to_string(),
     };
 
-    let phase = if app.first_token_at.is_some() {
-        "generating"
+    let text = if app.compacting {
+        format!(
+            " {frame} compacting context — summarizing the conversation…  ·  {:.1}s",
+            elapsed.as_secs_f64(),
+        )
     } else {
-        "inferring"
+        let phase = if app.first_token_at.is_some() {
+            "generating"
+        } else {
+            "inferring"
+        };
+        format!(
+            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s",
+            app.out_tokens,
+            elapsed.as_secs_f64(),
+        )
     };
-    let text = format!(
-        " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s",
-        app.out_tokens,
-        elapsed.as_secs_f64(),
-    );
     f.render_widget(
         Paragraph::new(text).style(
             Style::default()

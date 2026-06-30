@@ -59,7 +59,13 @@ enum TurnMsg {
     System(String),
     /// Out-of-band diff block (e.g. async `/diff` result).
     Diff(String),
+    /// Compaction finished: `Ok((before, after))` message counts, or an error.
+    Compacted(Result<(usize, usize), String>),
 }
+
+/// Auto-compact once the prompt size reaches this fraction of the context
+/// window — with headroom so the next turn doesn't overflow (Claude Code style).
+const AUTO_COMPACT_RATIO: f64 = 0.85;
 
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
@@ -90,6 +96,8 @@ pub(crate) struct App {
     pub(crate) completion_idx: usize,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
+    /// True while a compaction (summarization) pass is running.
+    pub(crate) compacting: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
     /// Active session's file id (stem). Assigned on first auto-save; stable.
@@ -176,6 +184,7 @@ impl App {
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
             show_reasoning: true,
+            compacting: false,
             base_url,
             session_id: None,
             session_label: None,
@@ -526,6 +535,7 @@ impl App {
             "resume" | "load" => self.resume_session(arg),
             "rename" => self.rename_session(arg),
             "sessions" => self.list_sessions_cmd(arg),
+            "compact" => self.compact_cmd(arg),
             _ => return false,
         }
         true
@@ -1051,6 +1061,58 @@ impl App {
         self.turn_handle = Some(handle);
     }
 
+    /// `/compact [instructions]` — summarize the conversation to reclaim context.
+    fn compact_cmd(&mut self, arg: &str) {
+        if self.running {
+            self.system("can't compact while a turn is running");
+            return;
+        }
+        let count = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| a.message_count())
+            .unwrap_or(0);
+        if count <= 2 {
+            self.system("nothing to compact yet");
+            return;
+        }
+        let instructions = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+        self.system("compacting conversation…");
+        self.spawn_compaction(instructions);
+    }
+
+    /// Whether the context has grown enough to auto-compact (with headroom).
+    fn should_auto_compact(&self) -> bool {
+        if self.compacting {
+            return false;
+        }
+        let (Some((prompt, _)), Some(window)) = (self.last_usage, self.context_window) else {
+            return false;
+        };
+        window > 0 && f64::from(prompt) >= f64::from(window) * AUTO_COMPACT_RATIO
+    }
+
+    /// Run a compaction pass on the background task, reporting via `TurnMsg`.
+    fn spawn_compaction(&mut self, instructions: Option<String>) {
+        self.running = true;
+        self.compacting = true;
+        self.status = "compacting…".to_string();
+        self.turn_started = Some(Instant::now());
+        self.first_token_at = None;
+        self.out_tokens = 0;
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let res = {
+                let mut a = agent.lock().await;
+                a.compact(instructions.as_deref()).await
+            };
+            let _ = tx.send(TurnMsg::Compacted(res.map_err(|e| e.to_string())));
+        });
+        self.turn_handle = Some(handle);
+    }
+
     fn on_turn_msg(&mut self, msg: TurnMsg) {
         match msg {
             TurnMsg::Event(ev) => {
@@ -1088,7 +1150,44 @@ impl App {
                 }
                 // Persist the completed turn into the active session, if any.
                 self.autosave();
+                // Auto-compact near the context limit before doing more work;
+                // its Compacted handler resumes the queue afterward.
+                if self.should_auto_compact() {
+                    self.transcript.push(Entry::System(
+                        "context near the limit — auto-compacting…".to_string(),
+                    ));
+                    self.spawn_compaction(None);
+                    return;
+                }
                 // Start the next queued message, if any (FIFO).
+                if let Some(next) = self.queue.pop_front() {
+                    self.spawn_turn(next);
+                }
+            }
+            TurnMsg::Compacted(res) => {
+                self.turn_handle = None;
+                self.running = false;
+                self.compacting = false;
+                // Context shrank; drop stale usage so the status bar refreshes
+                // on the next turn (and we don't immediately re-trigger).
+                self.last_usage = None;
+                match res {
+                    Ok((before, after)) => {
+                        self.status = "ready".to_string();
+                        self.transcript.push(Entry::System(format!(
+                            "compacted: {before} → {after} messages (summary kept; scrollback \
+                             above is preserved for you)"
+                        )));
+                        self.autosave();
+                    }
+                    Err(e) => {
+                        self.status = format!("compact failed: {e}");
+                        self.transcript
+                            .push(Entry::System(format!("[compact failed] {e}")));
+                    }
+                }
+                self.scroll_offset = 0;
+                // Resume any queued work now that the context is compact.
                 if let Some(next) = self.queue.pop_front() {
                     self.spawn_turn(next);
                 }
@@ -1270,6 +1369,7 @@ fn session_name_from(msgs: &[Message]) -> String {
 /// Slash commands offered by the completion popup.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
+    ("/compact", "summarize the conversation to reclaim context"),
     (
         "/sessions",
         "list this dir's saved sessions (--all for every dir)",

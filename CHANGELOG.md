@@ -26,6 +26,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Context compaction (Claude Code / opencode style): `/compact [instructions]`
+  asks the model for a structured summary of the conversation (intent, technical
+  context, files & code, commands, errors & fixes, current state, pending tasks)
+  and replaces the message history with the system prompt + that summary, so the
+  context shrinks while continuity is preserved. Optional trailing text steers
+  the summary's focus. Compaction also runs automatically once the prompt size
+  reaches 85% of the model's context window (with headroom, before the next turn
+  can overflow). The on-screen scrollback is left intact for the user; only what
+  the model sees is compacted.
 - Session persistence with continuous auto-save: every non-empty conversation is
   saved as JSON under `$XDG_DATA_HOME/hrdr/sessions` (default
   `~/.local/share/hrdr/sessions`, via `hjkl-xdg`), partitioned by working
