@@ -11,7 +11,7 @@
 mod host;
 mod plain;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hjkl_buffer_tui::{BufferView, Gutter};
 use hjkl_engine::{CoarseMode, Editor, Host, Options};
 use ratatui::Frame;
@@ -48,6 +48,22 @@ pub trait EditorEngine {
     fn desired_rows(&self, _width: u16, max: u16) -> u16 {
         let lines = self.content().split('\n').count().max(1);
         (lines as u16).clamp(1, max)
+    }
+    /// Insert pasted (bracketed-paste) text at the cursor. Default feeds each
+    /// character as a key event (works for any insert-mode engine); engines may
+    /// override for a faster/correct direct insertion.
+    fn paste(&mut self, text: &str) {
+        for c in text.chars() {
+            if c == '\r' {
+                continue;
+            }
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                '\t' => KeyCode::Tab,
+                other => KeyCode::Char(other),
+            };
+            self.feed_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
     }
     /// Draw the editable pane into `area` and place the cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect);

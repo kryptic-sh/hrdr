@@ -42,6 +42,8 @@ pub(crate) enum Entry {
         done: bool,
     },
     System(String),
+    /// Final per-turn stats line, appended below the last output.
+    Stats(String),
 }
 
 /// Messages from the background agent task back to the UI loop.
@@ -154,6 +156,10 @@ impl App {
                         }
                     }
                     Some(Ok(Event::Mouse(m))) => self.on_mouse(m),
+                    Some(Ok(Event::Paste(text))) => {
+                        self.quit_armed = false;
+                        self.editor.paste(&text);
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
                 },
@@ -386,12 +392,53 @@ impl App {
                     }
                     None => self.status = "ready".to_string(),
                 }
+                // Append the final stats for the turn (before stats are reset by
+                // any queued turn that spawns next).
+                if let Some(stats) = self.turn_stats() {
+                    self.transcript.push(Entry::Stats(stats));
+                }
                 // Start the next queued message, if any (FIFO).
                 if let Some(next) = self.queue.pop_front() {
                     self.spawn_turn(next);
                 }
             }
         }
+    }
+
+    /// Format the final stats line for the just-finished turn, if it produced
+    /// any output.
+    fn turn_stats(&self) -> Option<String> {
+        let started = self.turn_started?;
+        if self.out_tokens == 0 && self.last_usage.is_none() {
+            return None;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let speed = match self.first_token_at {
+            Some(t0) if self.out_tokens > 0 => {
+                let secs = t0.elapsed().as_secs_f64();
+                if secs > 0.0 {
+                    self.out_tokens as f64 / secs
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        let mut s = format!(
+            "✓ {} tok · {speed:.1} tok/s · {elapsed:.1}s",
+            self.out_tokens
+        );
+        if let Some((prompt, completion)) = self.last_usage {
+            let ratio = if completion > 0 {
+                prompt as f64 / completion as f64
+            } else {
+                0.0
+            };
+            s.push_str(&format!(
+                " · ctx {prompt} (in/out {prompt}/{completion}, {ratio:.1}:1)"
+            ));
+        }
+        Some(s)
     }
 
     /// Count a streamed delta toward the live tok/s stats.

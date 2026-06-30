@@ -16,6 +16,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Transcript scrollbar on the right edge showing total session length and the
+  current scroll position within it.
+- The input box has one column of left/right padding for breathing room.
+- Paste support: bracketed-paste text is inserted into the input at the cursor
+  (newlines kept literal, so a multi-line paste no longer submits early).
+- A final per-turn stats line (`✓ N tok · X tok/s · Ys · ctx … (in/out …)`) is
+  appended below the model's last output when a turn completes.
 - Quit commands: submitting a common quit word exits the session instead of
   being sent to the model — bare `exit`/`quit`/`q`/`bye`, the `/exit` `/quit`
   `/bye` slash family, and vim's `:q`/`:qa`/`:wq`/`:x` family

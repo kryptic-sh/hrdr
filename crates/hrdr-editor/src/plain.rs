@@ -207,6 +207,14 @@ impl EditorEngine for PlainEngine {
         (wrapped_row_count(&self.content(), width) as u16).clamp(1, max)
     }
 
+    fn paste(&mut self, text: &str) {
+        for c in text.chars() {
+            if c != '\r' {
+                self.insert(c);
+            }
+        }
+    }
+
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Hard-wrap at the inner width, tracking the cursor's wrapped position,
         // so render and `desired_rows` agree and the cursor stays correct.

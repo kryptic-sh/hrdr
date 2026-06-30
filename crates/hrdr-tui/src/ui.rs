@@ -4,7 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::app::{App, Entry};
 
@@ -28,8 +30,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // The inference loader sits just above the input while a turn runs.
     let loader_height: u16 = if app.running { 1 } else { 0 };
 
-    // Input box auto-grows 1..=INPUT_MAX_ROWS text rows with the content (+2 border).
-    let input_inner_w = area.width.saturating_sub(2);
+    // Input box auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
+    // Inner width = full width minus 2 border + 2 horizontal padding columns.
+    let input_inner_w = area.width.saturating_sub(4);
     let input_height = app.editor.desired_rows(input_inner_w, INPUT_MAX_ROWS) + 2;
 
     // Build the row stack dynamically, remembering each section's index.
@@ -64,10 +67,16 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the height so key handlers can compute half-page offsets.
     app.transcript_height = area.height;
 
+    // Reserve the rightmost column for the scrollbar.
+    let text_area = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+
     let para = Paragraph::new(transcript_lines(app)).wrap(Wrap { trim: false });
     // Count the *wrapped* rows at this width — not the logical line count — so
     // long messages that wrap don't push the newest content below the fold.
-    let total = para.line_count(area.width) as u16;
+    let total = para.line_count(text_area.width) as u16;
     let max_scroll = total.saturating_sub(area.height);
     // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
     // Clamp and write back so "scrolled up" state (and the follow button) is
@@ -76,7 +85,19 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.scroll_offset = offset as usize;
     let scroll = max_scroll.saturating_sub(offset);
 
-    f.render_widget(para.scroll((scroll, 0)), area);
+    f.render_widget(para.scroll((scroll, 0)), text_area);
+
+    // Scrollbar shows total session length + where we are within it.
+    let mut sb_state = ScrollbarState::new(total as usize)
+        .viewport_content_length(area.height as usize)
+        .position(scroll as usize);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_stateful_widget(scrollbar, area, &mut sb_state);
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
@@ -171,7 +192,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" input [{mode}] "))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.editor.render(f, inner);
@@ -282,6 +304,12 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
+            ),
+            Entry::Stats(text) => push_text(
+                &mut out,
+                Span::styled("└ ", Style::default().fg(Color::DarkGray)),
+                text,
+                Style::default().fg(Color::DarkGray),
             ),
         }
         out.push(Line::raw(""));
