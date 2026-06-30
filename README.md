@@ -82,10 +82,14 @@ Configuration (CLI flags override env):
 - [x] Agent loop with tool execution
 - [x] hjkl vim input pane (FSM-agnostic seam)
 - [x] Interactive TUI + headless `run`
-- [ ] In-flight turn cancellation
-- [ ] TODO panel + wrap-aware transcript scrolling
-- [ ] Config file (`~/.config/hrdr/config.toml`), `hrdr models`
-- [ ] Broader tool + client unit tests
+- [x] In-flight turn cancellation
+- [x] TODO panel + transcript scrolling _(wrap-aware scroll still TODO)_
+- [x] Config file (`~/.config/hrdr/config.toml`), `hrdr models`
+- [x] Tool + client unit tests
+- [x] Temporary managed `llama-server` backend
+- [ ] infr serve path with tool calling (replaces the temporary backend)
+- [ ] Wrap-aware transcript scrolling
+- [ ] Switch hjkl path-deps to registry pins for standalone CI
 
 ## License
 
