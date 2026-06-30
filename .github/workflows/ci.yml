@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      # hrdr depends on the sibling hjkl crates via `../hjkl/...` path deps, so
+      # both repos are checked out side by side under the workspace.
+      - uses: actions/checkout@v4
+        with:
+          path: hrdr
+      - uses: actions/checkout@v4
+        with:
+          repository: kryptic-sh/hjkl
+          path: hjkl
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          cache: false
+      - run: cargo fmt --all --check
+        working-directory: hrdr
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hrdr
+      - uses: actions/checkout@v4
+        with:
+          repository: kryptic-sh/hjkl
+          path: hjkl
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hrdr
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        working-directory: hrdr
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hrdr
+      - uses: actions/checkout@v4
+        with:
+          repository: kryptic-sh/hjkl
+          path: hjkl
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hrdr
+      - run: cargo test --workspace --all-features
+        working-directory: hrdr

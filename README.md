@@ -1,5 +1,7 @@
 # hrdr
 
+[![CI](https://github.com/kryptic-sh/hrdr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/hrdr/actions/workflows/ci.yml)
+
 **Herder** — a fast, agentic coding harness for OpenAI-compatible models.
 
 hrdr drives a model through native tool calls to complete software-engineering
