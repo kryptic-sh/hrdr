@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
+  (any other key/mouse action disarms it) and shows a "Press Ctrl+C again to
+  quit" banner on the input box's top border (taking priority over the follow
+  button); a second consecutive Ctrl+C quits. While a turn is running the first
+  Ctrl+C still interrupts it. Ctrl+Q remains an immediate quit.
+
 ### Added
 
 - Chat scrolling: mouse wheel scrolls the transcript, `PageUp`/`PageDown` page

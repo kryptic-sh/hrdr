@@ -214,7 +214,7 @@ impl EditorEngine for PlainEngine {
     }
 
     fn keybind_hint(&self) -> &'static str {
-        "Enter=send · Alt/Shift+Enter or \\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C=quit"
+        "Enter=send · Alt/Shift+Enter or \\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {

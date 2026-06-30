@@ -72,6 +72,9 @@ pub(crate) struct App {
     /// Screen rect of the "follow output" button, set during draw while scrolled
     /// up so mouse clicks can hit-test against it. `None` when following.
     pub(crate) follow_button: Option<Rect>,
+    /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
+    /// key (or a mouse action) disarms it.
+    pub(crate) quit_armed: bool,
     tx: mpsc::UnboundedSender<TurnMsg>,
     rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     should_quit: bool,
@@ -91,10 +94,10 @@ impl App {
         };
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
-             Ctrl+G opens $EDITOR, Ctrl+C quits."
+             Ctrl+G opens $EDITOR, Ctrl+C twice quits."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
-             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C quits. \
+             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C twice quits. \
              Submit while a reply is running to queue follow-ups."
         };
         Ok(Self {
@@ -110,6 +113,7 @@ impl App {
             todos,
             queue: VecDeque::new(),
             follow_button: None,
+            quit_armed: false,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -148,14 +152,33 @@ impl App {
             return Action::None;
         }
 
+        // Any key other than a Ctrl+C disarms the quit confirmation.
+        let is_ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if !is_ctrl_c {
+            self.quit_armed = false;
+        }
+
         // Ctrl+C / Ctrl+Q / Ctrl+G, plus vim-mode scroll.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                // Ctrl+C interrupts a running turn (doesn't arm quit).
                 KeyCode::Char('c') if self.running => {
                     self.cancel_turn();
+                    self.quit_armed = false;
                     return Action::None;
                 }
-                KeyCode::Char('c') | KeyCode::Char('q') => {
+                // First idle Ctrl+C arms; a second consecutive one quits.
+                KeyCode::Char('c') => {
+                    if self.quit_armed {
+                        self.should_quit = true;
+                    } else {
+                        self.quit_armed = true;
+                    }
+                    return Action::None;
+                }
+                // Ctrl+Q is an immediate, deliberate quit.
+                KeyCode::Char('q') => {
                     self.should_quit = true;
                     return Action::None;
                 }
@@ -236,6 +259,7 @@ impl App {
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
     /// resumes following the newest output.
     fn on_mouse(&mut self, m: MouseEvent) {
+        self.quit_armed = false;
         match m.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(MOUSE_SCROLL_LINES);

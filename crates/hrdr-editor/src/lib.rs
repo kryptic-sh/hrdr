@@ -126,7 +126,7 @@ impl EditorEngine for VimEngine {
     }
 
     fn keybind_hint(&self) -> &'static str {
-        "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C=quit"
+        "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {

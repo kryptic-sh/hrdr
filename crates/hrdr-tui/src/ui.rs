@@ -115,29 +115,49 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
     app.editor.render(f, inner);
 
-    // While scrolled up, overlay a "follow output" button on the top border.
-    if app.scroll_offset > 0 {
-        let label = " Press END to follow output ↓ ";
-        let w = (label.chars().count() as u16).min(area.width);
-        let x = area.x + area.width.saturating_sub(w) / 2;
-        let rect = Rect {
-            x,
-            y: area.y,
-            width: w,
-            height: 1,
-        };
-        let button = Paragraph::new(Line::from(Span::styled(
-            label,
+    // Overlay on the top border. The quit-confirm hint takes priority over the
+    // "follow output" button when both would apply.
+    if app.quit_armed {
+        top_border_button(
+            f,
+            area,
+            " Press Ctrl+C again to quit ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        );
+        // Not clickable; and it sits over the follow button's spot.
+        app.follow_button = None;
+    } else if app.scroll_offset > 0 {
+        let rect = top_border_button(
+            f,
+            area,
+            " Press END to follow output ↓ ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )));
-        f.render_widget(button, rect);
+        );
         app.follow_button = Some(rect);
     } else {
         app.follow_button = None;
     }
+}
+
+/// Render a centered, single-row label over the top border of `area` and
+/// return its screen rect (for click hit-testing).
+fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Rect {
+    let w = (label.chars().count() as u16).min(area.width);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let rect = Rect {
+        x,
+        y: area.y,
+        width: w,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+    rect
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
