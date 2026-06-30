@@ -61,6 +61,8 @@ pub struct AgentConfig {
     /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
+    /// Path to an hjkl theme TOML for the TUI; `None` uses the bundled default.
+    pub theme: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -74,6 +76,7 @@ impl Default for AgentConfig {
             max_steps: 50,
             vim_mode: false,
             provider: None,
+            theme: None,
         }
     }
 }
@@ -124,6 +127,7 @@ struct FileConfig {
     temperature: Option<f32>,
     vim: Option<bool>,
     provider: Option<String>,
+    theme: Option<String>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -184,11 +188,17 @@ impl AgentConfig {
             if let Some(v) = fc.provider {
                 cfg.provider = Some(v);
             }
+            if let Some(v) = fc.theme {
+                cfg.theme = Some(v);
+            }
         }
 
         // Layer 2: env vars override file.
         if let Ok(v) = std::env::var("HRDR_PROVIDER") {
             cfg.provider = Some(v);
+        }
+        if let Ok(v) = std::env::var("HRDR_THEME") {
+            cfg.theme = Some(v);
         }
         if let Ok(v) = std::env::var("HRDR_BASE_URL") {
             cfg.base_url = v;

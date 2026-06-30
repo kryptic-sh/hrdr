@@ -22,6 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Theming via the hjkl theme system: `--theme <path>` (or `theme` in config /
+  `$HRDR_THEME`) loads an hjkl theme TOML and maps its palette/`[ui]` styles
+  onto hrdr's chat roles (user, assistant, dim chrome, tool/loader accent,
+  success/error); hjkl's bundled dark theme is the default. Uses `hjkl-theme` +
+  `hjkl-theme-tui`'s `ToRatatui`.
 - Transcript scrollbar on the right edge showing total session length and the
   current scroll position within it.
 - `Home` jumps the transcript to the top of the session (and `End` back to

@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 const MOUSE_SCROLL_LINES: usize = 3;
 
 use crate::Tui;
+use crate::theme::Theme;
 use crate::ui;
 
 /// What a key press asks the run loop to do (for actions needing the terminal).
@@ -56,6 +57,8 @@ enum TurnMsg {
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
     pub(crate) editor: Box<dyn EditorEngine>,
+    /// Resolved chat-UI colors (from an hjkl theme).
+    pub(crate) theme: Theme,
     pub(crate) transcript: Vec<Entry>,
     pub(crate) running: bool,
     pub(crate) status: String,
@@ -99,6 +102,7 @@ impl App {
     pub(crate) fn new(config: AgentConfig) -> Result<Self> {
         let model = config.model.clone();
         let vim_mode = config.vim_mode;
+        let theme = Theme::load(config.theme.as_deref());
         let agent = Agent::new(config)?;
         let todos = agent.todos();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -118,6 +122,7 @@ impl App {
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             editor,
+            theme,
             transcript: vec![Entry::System(welcome.to_string())],
             running: false,
             status: "ready".to_string(),

@@ -856,6 +856,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-theme-tui"
+version = "0.33.2"
+dependencies = [
+ "hjkl-theme",
+ "ratatui",
+]
+
+[[package]]
 name = "hjkl-vim"
 version = "0.33.2"
 dependencies = [
@@ -954,6 +962,8 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures-util",
+ "hjkl-theme",
+ "hjkl-theme-tui",
  "hrdr-agent",
  "hrdr-editor",
  "ratatui",

@@ -32,6 +32,8 @@ hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer" }
 hjkl-buffer-tui = { path = "../hjkl/crates/hjkl-buffer-tui" }
 hjkl-engine-tui = { path = "../hjkl/crates/hjkl-engine-tui" }
 hjkl-clipboard = { path = "../hjkl/crates/hjkl-clipboard" }
+hjkl-theme = { path = "../hjkl/crates/hjkl-theme" }
+hjkl-theme-tui = { path = "../hjkl/crates/hjkl-theme-tui" }
 
 # third-party
 tokio = { version = "1", features = ["full"] }

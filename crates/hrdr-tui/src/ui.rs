@@ -9,6 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{App, Entry};
+use crate::theme::Theme;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Max lines shown in the TODO panel (plus 2 for borders).
@@ -100,7 +101,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         .end_symbol(Some("↓"))
         .track_symbol(Some("│"))
         .thumb_symbol("█")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(app.theme.dim));
     f.render_stateful_widget(scrollbar, area, &mut sb_state);
 }
 
@@ -116,7 +117,7 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" todos ")
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.dim));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -124,9 +125,9 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|t| {
             let (mark, color) = match t.status.as_str() {
-                "completed" => ("x", Color::Green),
-                "in_progress" => ("~", Color::Yellow),
-                _ => (" ", Color::DarkGray),
+                "completed" => ("x", app.theme.success),
+                "in_progress" => ("~", app.theme.warn),
+                _ => (" ", app.theme.dim),
             };
             Line::from(Span::styled(
                 format!("[{mark}] {}", t.content),
@@ -184,7 +185,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(text).style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.warn)
                 .add_modifier(Modifier::BOLD),
         ),
         area,
@@ -196,7 +197,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" input [{mode}] "))
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(app.theme.dim))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -211,7 +212,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
             " Press Ctrl+C again to quit ",
             Style::default()
                 .fg(Color::White)
-                .bg(Color::Red)
+                .bg(app.theme.error)
                 .add_modifier(Modifier::BOLD),
         );
         // Not clickable; and it sits over the follow button's spot.
@@ -223,7 +224,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
             " Press END to follow output ↓ ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(app.theme.warn)
                 .add_modifier(Modifier::BOLD),
         );
         app.follow_button = Some(rect);
@@ -265,32 +266,33 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         app.model,
         app.editor.keybind_hint(),
     );
-    let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+    let para = Paragraph::new(text).style(Style::default().fg(app.theme.dim));
     f.render_widget(para, area);
 }
 
 fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
     let mut out: Vec<Line> = Vec::new();
     for entry in &app.transcript {
         match entry {
             Entry::User(text) => push_text(
                 &mut out,
-                Span::styled("❯ ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("❯ ", Style::default().fg(theme.user).bold()),
                 text,
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.user),
             ),
             Entry::Assistant(text) => push_text(
                 &mut out,
                 Span::raw(""),
                 text,
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.assistant),
             ),
             Entry::Reasoning(text) => push_text(
                 &mut out,
-                Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                Span::styled("· ", Style::default().fg(theme.dim)),
                 text,
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme.dim)
                     .add_modifier(Modifier::ITALIC),
             ),
             Entry::Tool {
@@ -300,20 +302,20 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                 ok,
                 done,
                 ..
-            } => push_tool(&mut out, name, args, result, *ok, *done),
+            } => push_tool(&mut out, theme, name, args, result, *ok, *done),
             Entry::System(text) => push_text(
                 &mut out,
                 Span::raw(""),
                 text,
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme.dim)
                     .add_modifier(Modifier::ITALIC),
             ),
             Entry::Stats(text) => push_text(
                 &mut out,
-                Span::styled("└ ", Style::default().fg(Color::DarkGray)),
+                Span::styled("└ ", Style::default().fg(theme.dim)),
                 text,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             ),
         }
         out.push(Line::raw(""));
@@ -324,15 +326,15 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
     if !app.queue.is_empty() {
         out.push(Line::from(Span::styled(
             "— queued —",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )));
         for msg in &app.queue {
             push_text(
                 &mut out,
-                Span::styled("❯ ", Style::default().fg(Color::DarkGray).bold()),
+                Span::styled("❯ ", Style::default().fg(theme.dim).bold()),
                 msg,
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme.dim)
                     .add_modifier(Modifier::ITALIC),
             );
         }
@@ -356,6 +358,7 @@ fn push_text(out: &mut Vec<Line<'static>>, prefix: Span<'static>, text: &str, st
 
 fn push_tool(
     out: &mut Vec<Line<'static>>,
+    theme: &Theme,
     name: &str,
     args: &str,
     result: &str,
@@ -363,26 +366,23 @@ fn push_tool(
     done: bool,
 ) {
     let mark = if !done {
-        ("…", Color::Yellow)
+        ("…", theme.warn)
     } else if ok {
-        ("✓", Color::Green)
+        ("✓", theme.success)
     } else {
-        ("✗", Color::Red)
+        ("✗", theme.error)
     };
     let args_preview = truncate_inline(args, 80);
     out.push(Line::from(vec![
         Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1)),
-        Span::styled(name.to_string(), Style::default().fg(Color::Yellow).bold()),
-        Span::styled(
-            format!(" {args_preview}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(name.to_string(), Style::default().fg(theme.warn).bold()),
+        Span::styled(format!(" {args_preview}"), Style::default().fg(theme.dim)),
     ]));
     if done && !result.is_empty() {
         for line in result.lines().take(TOOL_RESULT_PREVIEW_LINES) {
             out.push(Line::from(Span::styled(
                 format!("  {line}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
         }
         let extra = result
@@ -392,7 +392,7 @@ fn push_tool(
         if extra > 0 {
             out.push(Line::from(Span::styled(
                 format!("  … (+{extra} more lines)"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
         }
     }

@@ -8,6 +8,7 @@
 //! Workflow: type in the input (Insert mode), `Esc` to Normal, `Enter` to send.
 
 mod app;
+mod theme;
 mod ui;
 
 use std::io::{Stdout, stdout};

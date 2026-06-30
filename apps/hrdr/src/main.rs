@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long, global = true)]
     vim: bool,
 
+    /// Path to an hjkl theme TOML for the TUI (default: bundled dark theme).
+    #[arg(long, global = true)]
+    theme: Option<String>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -124,6 +128,9 @@ async fn main() -> Result<()> {
     }
     if cli.vim {
         config.vim_mode = true;
+    }
+    if let Some(t) = cli.theme {
+        config.theme = Some(t);
     }
 
     if remote_provider && config.model == "default" {

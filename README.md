@@ -93,6 +93,15 @@ hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
 
 `--base-url` / `$HRDR_BASE_URL` still override a provider's endpoint.
 
+### Theme
+
+The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.
+`--theme <path>` (or `theme = "..."` in config / `$HRDR_THEME`) points at an
+hjkl theme TOML (palette + `[ui]` styles); without one, hjkl's bundled dark
+theme is used. hrdr maps the theme's palette onto its chat roles (user,
+assistant, dim chrome, tool/loader accent, success/error), so any hjkl theme
+works.
+
 Configuration (CLI flags override env):
 
 | Env             | Default                            | Meaning                     |
