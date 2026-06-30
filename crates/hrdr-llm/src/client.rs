@@ -1,9 +1,10 @@
-//! HTTP client over `/v1/chat/completions`.
+//! HTTP client over `/v1/chat/completions` and `/v1/models`.
 
 use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
 
 use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, ToolDef};
 
@@ -135,4 +136,36 @@ impl Client {
         };
         Ok(Box::pin(stream))
     }
+
+    /// List available models from `GET {base_url}/models`.
+    /// Returns model ids sorted alphabetically.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let mut req = self.http.get(format!("{}/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.context("models request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.context("reading models response")?;
+        if !status.is_success() {
+            bail!("models endpoint returned {status}: {text}");
+        }
+        let parsed: ModelsResponse = serde_json::from_str(&text)
+            .with_context(|| format!("decoding models response: {text}"))?;
+        let mut ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
+        ids.sort();
+        Ok(ids)
+    }
+}
+
+// --- /v1/models response types (local to this module) ---
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
 }

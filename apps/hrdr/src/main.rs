@@ -2,18 +2,21 @@
 //!
 //! No subcommand launches the interactive TUI. `hrdr run <task>` runs a single
 //! turn headlessly, streaming to stdout (scriptable, pipeable).
+//! `hrdr models` lists available models from the configured endpoint.
 
 use std::io::Write;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
+use hrdr_llm::Client;
 
 #[derive(Parser)]
 #[command(
     name = "hrdr",
     version,
-    about = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models."
+    about = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models.",
+    before_help = include_str!("../art.txt"),
 )]
 struct Cli {
     /// OpenAI-compatible base URL (default: $HRDR_BASE_URL or http://localhost:8080/v1).
@@ -36,6 +39,8 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
     },
+    /// List available models from the configured endpoint.
+    Models,
 }
 
 #[tokio::main]
@@ -48,7 +53,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut config = AgentConfig::from_env();
+    // Precedence: CLI flag > env var > config file > built-in default.
+    let mut config = AgentConfig::load();
     if let Some(u) = cli.base_url {
         config.base_url = u;
     }
@@ -58,6 +64,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Run { prompt }) => run_headless(config, prompt.join(" ")).await,
+        Some(Command::Models) => list_models(config).await,
         None => hrdr_tui::run(config).await,
     }
 }
@@ -86,6 +93,16 @@ async fn run_headless(config: AgentConfig, prompt: String) -> Result<()> {
             AgentEvent::TurnDone => println!(),
         })
         .await?;
+    Ok(())
+}
+
+/// Print available model ids, one per line.
+async fn list_models(config: AgentConfig) -> Result<()> {
+    let client = Client::new(config.base_url, config.api_key, config.model);
+    let models = client.list_models().await?;
+    for m in models {
+        println!("{m}");
+    }
     Ok(())
 }
 
