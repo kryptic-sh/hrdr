@@ -552,8 +552,13 @@ impl App {
             .session_label
             .clone()
             .unwrap_or_else(|| session_name_from(&msgs));
+        // Notify once, when the session is first created.
         if self.session_id.is_none() {
-            self.session_id = Some(hrdr_agent::unique_session_id(&name));
+            let id = hrdr_agent::unique_session_id(&name);
+            self.transcript.push(Entry::System(format!(
+                "session saved as '{id}' — /resume {id}"
+            )));
+            self.session_id = Some(id);
         }
         let id = self.session_id.clone().unwrap_or_else(|| name.clone());
         let s = Session::new(
@@ -819,8 +824,13 @@ impl App {
             (Some((p, _)), None) => p.to_string(),
             _ => "—".into(),
         };
+        let session = match (&self.session_id, &self.session_label) {
+            (Some(id), Some(name)) => format!("{id}  (name: {name})"),
+            (Some(id), None) => id.clone(),
+            (None, _) => "(unsaved — send a message to start one)".to_string(),
+        };
         let info = format!(
-            "model: {}\nendpoint: {}\ncwd: {} ({branch})\ncontext: {ctx}\ntokens: ↑{} ↓{}\ntemperature: {}\neffort: {}",
+            "session: {session}\nmodel: {}\nendpoint: {}\ncwd: {} ({branch})\ncontext: {ctx}\ntokens: ↑{} ↓{}\ntemperature: {}\neffort: {}",
             self.model,
             self.base_url,
             self.dir,
