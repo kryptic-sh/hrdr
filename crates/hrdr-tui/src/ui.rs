@@ -328,7 +328,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(&app.dir);
     spans.push(Span::styled(
         format!(" \u{f07b} {dir_label}"),
-        Style::default().fg(t.assistant),
+        Style::default().fg(t.user),
     ));
     if let Some(branch) = &app.branch {
         spans.push(sep());
@@ -344,39 +344,60 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
             fmt_count(app.session_in),
             fmt_count(app.session_out)
         ),
-        Style::default().fg(t.dim),
+        Style::default().fg(t.accent),
     ));
     spans.push(sep());
     let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
-    let (ctx_str, ctx_color) = match app.context_window {
+    match app.context_window {
         Some(w) if w > 0 => {
-            let frac = ctx as f64 / w as f64;
+            // Render the section as a used/free bar: the label gets a filled
+            // background on its left portion (used) and a track background on
+            // the right (free), split proportionally to context usage.
+            let frac = (ctx as f64 / w as f64).clamp(0.0, 1.0);
             let pct = (frac * 100.0).round() as u32;
-            // Escalate color as the context fills: dim → amber → red at the
+            // Fill color escalates with usage: green → amber → red at the
             // auto-compact threshold (where compaction kicks in next turn).
-            let color = if app.auto_compact_ratio > 0.0 && frac >= app.auto_compact_ratio {
+            let fill_color = if app.auto_compact_ratio > 0.0 && frac >= app.auto_compact_ratio {
                 t.error
             } else if frac >= 0.70 {
                 t.warn
             } else {
-                t.dim
+                t.success
             };
-            (
-                format!(
-                    "{} of {} ctx ({pct}%)",
-                    fmt_count(ctx),
-                    fmt_count(w as usize)
-                ),
-                color,
-            )
+            let label = format!(
+                " {} of {} ctx ({pct}%) ",
+                fmt_count(ctx),
+                fmt_count(w as usize)
+            );
+            let chars: Vec<char> = label.chars().collect();
+            let fill = ((frac * chars.len() as f64).round() as usize).min(chars.len());
+            let used: String = chars[..fill].iter().collect();
+            let free: String = chars[fill..].iter().collect();
+            if !used.is_empty() {
+                spans.push(Span::styled(
+                    used,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(fill_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !free.is_empty() {
+                spans.push(Span::styled(
+                    free,
+                    Style::default().fg(t.assistant).bg(t.dim),
+                ));
+            }
         }
-        _ => (format!("{} ctx", fmt_count(ctx)), t.warn),
-    };
-    spans.push(Span::styled(ctx_str, Style::default().fg(ctx_color)));
+        _ => spans.push(Span::styled(
+            format!(" {} ctx ", fmt_count(ctx)),
+            Style::default().fg(t.warn),
+        )),
+    }
     spans.push(sep());
     spans.push(Span::styled(
         app.model.clone(),
-        Style::default().fg(t.assistant),
+        Style::default().fg(t.accent2),
     ));
     if let Some(effort) = &app.effort {
         spans.push(sep());

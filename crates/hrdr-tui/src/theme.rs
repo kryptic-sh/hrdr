@@ -28,6 +28,10 @@ pub struct Theme {
     pub success: Color,
     /// Error marks (tool ✗) and the quit-confirm banner.
     pub error: Color,
+    /// Secondary accent (blue) — extra variety for status-bar sections.
+    pub accent: Color,
+    /// Tertiary accent (magenta/purple) — extra variety for status-bar sections.
+    pub accent2: Color,
 }
 
 impl Theme {
@@ -63,6 +67,11 @@ impl Theme {
                 .map(|c| c.to_ratatui())
                 .or_else(|| pal("red"))
                 .unwrap_or(Color::Red),
+            accent: pal("blue").or_else(|| pal("teal")).unwrap_or(Color::Blue),
+            accent2: pal("magenta")
+                .or_else(|| pal("purple"))
+                .or_else(|| pal("blue"))
+                .unwrap_or(Color::Magenta),
         }
     }
 
