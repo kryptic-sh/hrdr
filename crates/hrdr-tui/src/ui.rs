@@ -339,12 +339,13 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(sep());
     spans.push(Span::styled(
-        format!(
-            "↑{} ↓{}",
-            fmt_count(app.session_in),
-            fmt_count(app.session_out)
-        ),
+        format!("↑{}", fmt_count(app.session_in)),
         Style::default().fg(t.accent),
+    ));
+    spans.push(sep());
+    spans.push(Span::styled(
+        format!("↓{}", fmt_count(app.session_out)),
+        Style::default().fg(t.accent2),
     ));
     spans.push(sep());
     let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
@@ -397,7 +398,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     spans.push(sep());
     spans.push(Span::styled(
         app.model.clone(),
-        Style::default().fg(t.accent2),
+        Style::default().fg(t.assistant),
     ));
     if let Some(effort) = &app.effort {
         spans.push(sep());
