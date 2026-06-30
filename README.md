@@ -79,11 +79,17 @@ spawning. Spawn logs go to `~/.cache/hrdr/llama-server.log`.
 selects a preset endpoint + API-key env, and remote providers skip the local
 backend:
 
-| Provider           | Endpoint                     | API key env        | Backend |
-| ------------------ | ---------------------------- | ------------------ | ------- |
-| `zen` / `opencode` | `https://opencode.ai/zen/v1` | `OPENCODE_API_KEY` | remote  |
-| `openai`           | `https://api.openai.com/v1`  | `OPENAI_API_KEY`   | remote  |
-| `local` / `infr`   | `http://localhost:8080/v1`   | `HRDR_API_KEY`     | spawned |
+Built-in presets:
+
+| Provider               | Endpoint                       | API key env          | Backend |
+| ---------------------- | ------------------------------ | -------------------- | ------- |
+| `zen` / `opencode`     | `https://opencode.ai/zen/v1`   | `OPENCODE_API_KEY`   | remote  |
+| `openai`               | `https://api.openai.com/v1`    | `OPENAI_API_KEY`     | remote  |
+| `openrouter`           | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | remote  |
+| `claude` / `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`  | remote  |
+| `local` / `infr`       | `http://localhost:8080/v1`     | `HRDR_API_KEY`       | spawned |
+
+(`claude` uses Anthropic's OpenAI-compatible endpoint.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
@@ -92,6 +98,33 @@ hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
 ```
 
 `--base-url` / `$HRDR_BASE_URL` still override a provider's endpoint.
+
+#### Custom providers
+
+Define your own in `~/.config/hrdr/config.toml` under `[providers.<name>]` — a
+custom entry shadows a built-in of the same name. Each can carry its own model
+and context window, so switching is a single `--provider <name>`:
+
+```toml
+provider = "mylocal"            # default provider for this config
+
+[providers.mylocal]
+base_url = "http://localhost:8080/v1"
+model = "Qwen3-30B-A3B"
+remote = false                  # hrdr may spawn/own a local backend
+context_window = 16384
+
+[providers.zen]
+base_url = "https://opencode.ai/zen/v1"
+key_env = "OPENCODE_API_KEY"    # or inline `api_key = "..."`
+model = "grok-build-0.1"
+context_window = 256000
+
+[providers.chatgpt]
+base_url = "https://api.openai.com/v1"
+key_env = "OPENAI_API_KEY"
+model = "gpt-5.5"
+```
 
 ### Theme
 

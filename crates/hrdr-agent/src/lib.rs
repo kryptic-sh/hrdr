@@ -6,6 +6,7 @@
 
 mod prompt;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +69,8 @@ pub struct AgentConfig {
     pub context_window: Option<u32>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
+    /// User-defined providers from `[providers.<name>]` in config, keyed by name.
+    pub providers: HashMap<String, ProviderConfig>,
 }
 
 impl Default for AgentConfig {
@@ -84,45 +87,92 @@ impl Default for AgentConfig {
             theme: None,
             context_window: None,
             effort: None,
+            providers: HashMap::new(),
         }
     }
 }
 
-/// A named, OpenAI-compatible model provider preset.
-#[derive(Debug, Clone)]
-pub struct Provider {
-    /// OpenAI-compatible base URL (including the `/v1` suffix).
-    pub base_url: &'static str,
-    /// Environment variable holding the API key.
-    pub key_env: &'static str,
-    /// Remote provider — hrdr must NOT spawn a local backend for it.
-    pub remote: bool,
+impl AgentConfig {
+    /// Resolve a provider name to a preset: a `[providers.<name>]` entry from
+    /// config takes precedence over the built-ins (`zen`/`openai`/`local`).
+    pub fn resolve_provider(&self, name: &str) -> Option<ResolvedProvider> {
+        let lname = name.trim().to_ascii_lowercase();
+        if let Some((_, c)) = self
+            .providers
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == lname)
+        {
+            return Some(ResolvedProvider {
+                base_url: c.base_url.clone(),
+                key_env: c.key_env.clone(),
+                api_key: c.api_key.clone(),
+                model: c.model.clone(),
+                remote: c.remote.unwrap_or(true),
+                context_window: c.context_window,
+            });
+        }
+        builtin_provider(name)
+    }
 }
 
-/// Resolve a provider name (case-insensitive) to its preset.
+/// A user-defined provider from `[providers.<name>]` in config.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProviderConfig {
+    /// OpenAI-compatible base URL (including the `/v1` suffix).
+    pub base_url: String,
+    /// Environment variable holding the API key (preferred over an inline key).
+    #[serde(default)]
+    pub key_env: Option<String>,
+    /// Inline API key (avoid in shared config; prefer `key_env`).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Default model for this provider.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether hrdr should skip spawning a local backend (default: true).
+    #[serde(default)]
+    pub remote: Option<bool>,
+    /// Model context window (for the status bar's "X of Y").
+    #[serde(default)]
+    pub context_window: Option<u32>,
+}
+
+/// A fully-resolved provider preset.
+#[derive(Debug, Clone)]
+pub struct ResolvedProvider {
+    pub base_url: String,
+    pub key_env: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub remote: bool,
+    pub context_window: Option<u32>,
+}
+
+/// Resolve a built-in provider name (case-insensitive).
 ///
 /// - `zen` / `opencode` — OpenCode Zen gateway (`OPENCODE_API_KEY`).
 /// - `openai` — OpenAI (`OPENAI_API_KEY`).
 /// - `local` / `infr` — a local OpenAI-compatible server (spawned backend).
-pub fn resolve_provider(name: &str) -> Option<Provider> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "zen" | "opencode" | "opencode-zen" => Some(Provider {
-            base_url: "https://opencode.ai/zen/v1",
-            key_env: "OPENCODE_API_KEY",
-            remote: true,
-        }),
-        "openai" => Some(Provider {
-            base_url: "https://api.openai.com/v1",
-            key_env: "OPENAI_API_KEY",
-            remote: true,
-        }),
-        "local" | "infr" => Some(Provider {
-            base_url: "http://localhost:8080/v1",
-            key_env: "HRDR_API_KEY",
-            remote: false,
-        }),
-        _ => None,
-    }
+pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
+    let (base_url, key_env, remote) = match name.trim().to_ascii_lowercase().as_str() {
+        "zen" | "opencode" | "opencode-zen" => {
+            ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", true)
+        }
+        "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", true),
+        "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", true),
+        // Anthropic's OpenAI-compatible endpoint (Bearer auth via the compat layer).
+        "claude" | "anthropic" => ("https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", true),
+        "local" | "infr" => ("http://localhost:8080/v1", "HRDR_API_KEY", false),
+        _ => return None,
+    };
+    Some(ResolvedProvider {
+        base_url: base_url.to_string(),
+        key_env: Some(key_env.to_string()),
+        api_key: None,
+        model: None,
+        remote,
+        context_window: None,
+    })
 }
 
 /// Subset of config.toml we parse; all fields are optional.
@@ -137,6 +187,8 @@ struct FileConfig {
     theme: Option<String>,
     context_window: Option<u32>,
     effort: Option<String>,
+    #[serde(default)]
+    providers: HashMap<String, ProviderConfig>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -205,6 +257,9 @@ impl AgentConfig {
             }
             if let Some(v) = fc.effort {
                 cfg.effort = Some(v);
+            }
+            if !fc.providers.is_empty() {
+                cfg.providers = fc.providers;
             }
         }
 
@@ -367,20 +422,44 @@ pub fn is_assistant(m: &ChatMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_provider;
+    use super::{AgentConfig, ProviderConfig, builtin_provider};
 
     #[test]
-    fn zen_provider_is_remote_with_opencode_key() {
-        let p = resolve_provider("ZEN").expect("zen resolves (case-insensitive)");
+    fn zen_builtin_is_remote_with_opencode_key() {
+        let p = builtin_provider("ZEN").expect("zen resolves (case-insensitive)");
         assert_eq!(p.base_url, "https://opencode.ai/zen/v1");
-        assert_eq!(p.key_env, "OPENCODE_API_KEY");
+        assert_eq!(p.key_env.as_deref(), Some("OPENCODE_API_KEY"));
         assert!(p.remote);
-        assert!(resolve_provider("opencode").is_some());
+        assert!(builtin_provider("opencode").is_some());
     }
 
     #[test]
-    fn local_provider_is_not_remote_and_unknown_is_none() {
-        assert!(!resolve_provider("local").unwrap().remote);
-        assert!(resolve_provider("nope").is_none());
+    fn local_builtin_is_not_remote_and_unknown_is_none() {
+        assert!(!builtin_provider("local").unwrap().remote);
+        assert!(builtin_provider("nope").is_none());
+    }
+
+    #[test]
+    fn config_provider_overrides_builtin() {
+        let mut cfg = AgentConfig::default();
+        cfg.providers.insert(
+            "zen".to_string(),
+            ProviderConfig {
+                base_url: "https://my.zen/v1".to_string(),
+                key_env: Some("MY_KEY".to_string()),
+                api_key: None,
+                model: Some("my-model".to_string()),
+                remote: Some(true),
+                context_window: Some(123),
+            },
+        );
+        // Custom "zen" shadows the built-in; an unknown custom name resolves too.
+        let p = cfg.resolve_provider("zen").unwrap();
+        assert_eq!(p.base_url, "https://my.zen/v1");
+        assert_eq!(p.model.as_deref(), Some("my-model"));
+        assert_eq!(p.context_window, Some(123));
+        // Built-ins still resolve when not shadowed.
+        assert!(cfg.resolve_provider("openai").is_some());
+        assert!(cfg.resolve_provider("nope").is_none());
     }
 }

@@ -14,7 +14,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, resolve_provider};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use hrdr_llm::Client;
 
 use backend::{Backend, BackendConfig};
@@ -102,24 +102,38 @@ async fn main() -> Result<()> {
     let mut config = AgentConfig::load();
 
     // Apply a provider preset (CLI > config/env) before explicit CLI overrides.
+    // Custom `[providers.<name>]` from config shadow the built-ins.
     let mut remote_provider = false;
     let provider_name = cli.provider.clone().or_else(|| config.provider.clone());
     if let Some(name) = &provider_name {
-        let p = resolve_provider(name).ok_or_else(|| {
-            anyhow::anyhow!("unknown provider '{name}' (known: zen, openai, local)")
+        let p = config.resolve_provider(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown provider '{name}' (built-ins: zen, openai, openrouter, claude, local; \
+                 or define [providers.{name}] in config)"
+            )
         })?;
         // Provider sets the endpoint unless an explicit --base-url / $HRDR_BASE_URL wins.
         let base_overridden = cli.base_url.is_some() || std::env::var_os("HRDR_BASE_URL").is_some();
         if !base_overridden {
-            config.base_url = p.base_url.to_string();
+            config.base_url = p.base_url.clone();
         }
-        if let Ok(key) = std::env::var(p.key_env) {
+        // Key: an inline key wins, else the provider's key_env.
+        if let Some(key) = p.api_key.clone() {
             config.api_key = Some(key);
-        } else if p.remote && config.api_key.is_none() {
-            eprintln!(
-                "hrdr: provider '{name}' needs an API key — set ${}",
-                p.key_env
-            );
+        } else if let Some(env) = &p.key_env {
+            if let Ok(key) = std::env::var(env) {
+                config.api_key = Some(key);
+            } else if p.remote && config.api_key.is_none() {
+                eprintln!("hrdr: provider '{name}' needs an API key — set ${env}");
+            }
+        }
+        // Provider's default model, unless the user set one explicitly.
+        let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
+        if !model_overridden && let Some(m) = p.model.clone() {
+            config.model = m;
+        }
+        if config.context_window.is_none() {
+            config.context_window = p.context_window;
         }
         remote_provider = p.remote;
     }

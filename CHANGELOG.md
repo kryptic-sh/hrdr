@@ -26,6 +26,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Custom providers in config: define `[providers.<name>]` (with `base_url`,
+  `key_env`/`api_key`, optional `model`, `remote`, `context_window`) and select
+  with `--provider <name>` (config entries shadow built-ins of the same name).
+- Built-in `openrouter` and `claude`/`anthropic` provider presets (the latter
+  via Anthropic's OpenAI-compatible endpoint).
 - Status bar above the help line showing working directory, git branch, session
   input/output token totals, context size (current / window), model, and a
   reasoning-effort label. Context window comes from the spawned backend (or
