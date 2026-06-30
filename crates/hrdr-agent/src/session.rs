@@ -52,7 +52,7 @@ pub fn sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
-/// Reduce an arbitrary name to a safe, length-capped file stem.
+/// Reduce an arbitrary name to a safe, length-capped, lowercase file stem.
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name
         .trim()
@@ -66,7 +66,7 @@ pub fn sanitize_name(name: &str) -> String {
         })
         .take(48)
         .collect();
-    let s = s.trim_matches('-').to_string();
+    let s = s.trim_matches('-').to_lowercase();
     if s.is_empty() {
         "session".to_string()
     } else {
