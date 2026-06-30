@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The status bar now degrades gracefully on narrow terminals: instead of being
+  clipped mid-section, it drops the least-important sections (effort, then
+  in/out tokens, then git branch, then model) until it fits, keeping the cwd and
+  context bar, and shows a trailing `…` when anything was dropped.
 - Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
   (any other key/mouse action disarms it) and shows a "Press Ctrl+C again to
   quit" banner on the input box's top border (taking priority over the follow

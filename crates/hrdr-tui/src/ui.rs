@@ -350,11 +350,12 @@ fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Re
 /// context size, model, and effort.
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let sep = || Span::styled(" │ ", Style::default().fg(t.dim));
-    let mut spans: Vec<Span> = Vec::new();
 
-    // Show just the cwd's basename, not the full path, with a folder icon
-    // (Nerd-font glyphs only when the icon mode allows them).
+    // Each section is `(priority, spans)`; lower priority is kept, higher is the
+    // first to be dropped when the bar is too narrow. Built in display order.
+    let mut sections: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+
+    // cwd basename + folder icon (Nerd glyphs only when the icon mode allows).
     let nerd = app.icon_mode == hjkl_icons::IconMode::Nerd;
     let folder = if nerd { "\u{f07b} " } else { "" };
     let branch_icon = if nerd { "\u{e0a0} " } else { "" };
@@ -363,34 +364,40 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         .rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or(&app.dir);
-    spans.push(Span::styled(
-        format!(" {folder}{dir_label}"),
-        Style::default().fg(t.user),
+    sections.push((
+        0,
+        vec![Span::styled(
+            format!(" {folder}{dir_label}"),
+            Style::default().fg(t.user),
+        )],
     ));
     if let Some(branch) = &app.branch {
-        spans.push(sep());
-        spans.push(Span::styled(
-            format!("{branch_icon}{branch}"),
-            Style::default().fg(t.success),
+        sections.push((
+            3,
+            vec![Span::styled(
+                format!("{branch_icon}{branch}"),
+                Style::default().fg(t.success),
+            )],
         ));
     }
-    spans.push(sep());
-    spans.push(Span::styled(
-        format!("↑{}", fmt_count(app.session_in)),
-        Style::default().fg(t.accent),
+    sections.push((
+        4,
+        vec![Span::styled(
+            format!("↑{}", fmt_count(app.session_in)),
+            Style::default().fg(t.accent),
+        )],
     ));
-    spans.push(sep());
-    spans.push(Span::styled(
-        format!("↓{}", fmt_count(app.session_out)),
-        Style::default().fg(t.accent2),
+    sections.push((
+        4,
+        vec![Span::styled(
+            format!("↓{}", fmt_count(app.session_out)),
+            Style::default().fg(t.accent2),
+        )],
     ));
-    spans.push(sep());
+    // Context: a used/free bar when the window is known, else a plain count.
     let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
-    match app.context_window {
+    let ctx_spans = match app.context_window {
         Some(w) if w > 0 => {
-            // Render the section as a used/free bar: the label gets a filled
-            // background on its left portion (used) and a track background on
-            // the right (free), split proportionally to context usage.
             let frac = (ctx as f64 / w as f64).clamp(0.0, 1.0);
             let pct = (frac * 100.0).round() as u32;
             // Fill color escalates with usage: green → amber → red at the
@@ -411,8 +418,9 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
             let fill = ((frac * chars.len() as f64).round() as usize).min(chars.len());
             let used: String = chars[..fill].iter().collect();
             let free: String = chars[fill..].iter().collect();
+            let mut s = Vec::new();
             if !used.is_empty() {
-                spans.push(Span::styled(
+                s.push(Span::styled(
                     used,
                     Style::default()
                         .fg(Color::Black)
@@ -421,25 +429,75 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             if !free.is_empty() {
-                spans.push(Span::styled(
+                s.push(Span::styled(
                     free,
                     Style::default().fg(t.assistant).bg(t.dim),
                 ));
             }
+            s
         }
-        _ => spans.push(Span::styled(
+        _ => vec![Span::styled(
             format!(" {} ctx ", fmt_count(ctx)),
             Style::default().fg(t.warn),
-        )),
-    }
-    spans.push(sep());
-    spans.push(Span::styled(
-        app.model.clone(),
-        Style::default().fg(t.assistant),
+        )],
+    };
+    sections.push((1, ctx_spans));
+    sections.push((
+        2,
+        vec![Span::styled(
+            app.model.clone(),
+            Style::default().fg(t.assistant),
+        )],
     ));
     if let Some(effort) = &app.effort {
-        spans.push(sep());
-        spans.push(Span::styled(effort.clone(), Style::default().fg(t.warn)));
+        sections.push((
+            5,
+            vec![Span::styled(effort.clone(), Style::default().fg(t.warn))],
+        ));
+    }
+
+    // Drop the highest-priority (least important) sections until the bar fits.
+    const SEP_W: usize = 3; // " │ "
+    let avail = area.width as usize;
+    let widths: Vec<usize> = sections
+        .iter()
+        .map(|(_, ss)| ss.iter().map(Span::width).sum())
+        .collect();
+    let mut keep = vec![true; sections.len()];
+    loop {
+        let kept: Vec<usize> = (0..sections.len()).filter(|&i| keep[i]).collect();
+        let total: usize =
+            kept.iter().map(|&i| widths[i]).sum::<usize>() + SEP_W * kept.len().saturating_sub(1);
+        if total <= avail || kept.len() <= 1 {
+            break;
+        }
+        // Drop the kept section with the largest (priority, index): least
+        // important first, and later-in-order to break ties (e.g. out before in).
+        if let Some(&drop) = kept.iter().max_by_key(|&&i| (sections[i].0, i)) {
+            keep[drop] = false;
+        }
+    }
+
+    let truncated = keep.iter().any(|k| !k);
+    let sep = || Span::styled(" │ ", Style::default().fg(t.dim));
+    let mut spans: Vec<Span> = Vec::new();
+    let mut first = true;
+    for (i, (_, ss)) in sections.into_iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if !first {
+            spans.push(sep());
+        }
+        spans.extend(ss);
+        first = false;
+    }
+    // A trailing ellipsis signals dropped sections, when there's room for it.
+    if truncated {
+        let used: usize = spans.iter().map(Span::width).sum();
+        if used + 2 <= avail {
+            spans.push(Span::styled(" …", Style::default().fg(t.dim)));
+        }
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
