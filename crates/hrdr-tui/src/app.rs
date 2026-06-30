@@ -607,6 +607,20 @@ impl App {
         self.session_label = Some(session.name.clone());
         self.scroll_offset = 0;
         self.system(format!("resumed '{}' ({count} messages)", session.name));
+        // Switch hrdr's tools to the session's working directory (in-process
+        // only — the parent shell is untouched).
+        if !session.cwd.is_empty() && session.cwd != cwd {
+            let target = std::path::PathBuf::from(&session.cwd);
+            if target.is_dir() {
+                self.apply_cwd(target.clone());
+                self.system(format!("cwd → {}", target.display()));
+            } else {
+                self.system(format!(
+                    "note: session cwd {} no longer exists; staying in {cwd}",
+                    session.cwd
+                ));
+            }
+        }
         if session.base_url != self.base_url {
             self.system(format!(
                 "note: session endpoint was {} (current: {})",
@@ -741,12 +755,17 @@ impl App {
             return;
         }
         let new = new.canonicalize().unwrap_or(new);
+        self.apply_cwd(new.clone());
+        self.system(format!("cwd → {}", new.display()));
+    }
+
+    /// Switch the tools' working directory: update the agent and the status bar.
+    fn apply_cwd(&mut self, new: std::path::PathBuf) {
         if let Ok(mut a) = self.agent.try_lock() {
             a.set_cwd(new.clone());
         }
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
-        self.system(format!("cwd → {}", new.display()));
     }
 
     fn show_tools(&mut self) {

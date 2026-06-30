@@ -39,6 +39,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/rename`), `/rename <name>` (rename the session; persisted). `/clear` starts
   a fresh session. (No `/save` — saving is automatic.) `/info` shows the current
   session id + name, and a notice prints the id when a session is first saved.
+  Resuming a session recorded in a different directory switches hrdr's tools to
+  that directory (in-process only — the parent shell is untouched); if it no
+  longer exists, hrdr stays put and says so.
 - More slash commands: `/models` (list endpoint models), `/cwd [path]` (show or
   change the tools' working directory), `/tools` (list tools), `/reasoning`
   (toggle showing `<think>` blocks), `/theme [path]` (live theme switch),
