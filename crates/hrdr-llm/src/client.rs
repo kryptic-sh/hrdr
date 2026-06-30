@@ -44,6 +44,16 @@ impl Client {
         self
     }
 
+    /// Repoint the client at a different endpoint (for mid-session provider switch).
+    pub fn set_base_url(&mut self, base_url: impl Into<String>) {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+    }
+
+    /// Replace the API key (or clear it with `None`).
+    pub fn set_api_key(&mut self, api_key: Option<String>) {
+        self.api_key = api_key;
+    }
+
     fn request(
         &self,
         messages: Vec<ChatMessage>,

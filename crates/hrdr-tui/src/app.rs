@@ -10,6 +10,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use futures_util::StreamExt;
+use hjkl_clipboard::{Clipboard, MimeType, Selection};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
 use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
 use ratatui::layout::Rect;
@@ -75,6 +76,10 @@ pub(crate) struct App {
     /// Cumulative input/output tokens across the session.
     pub(crate) session_in: usize,
     pub(crate) session_out: usize,
+    /// Config kept for mid-session provider resolution (`/provider`).
+    cfg: AgentConfig,
+    /// OS clipboard for `/copy` (None if unavailable).
+    clipboard: Option<Clipboard>,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -119,6 +124,7 @@ impl App {
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
         let effort = config.effort.clone();
+        let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -129,11 +135,11 @@ impl App {
         };
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
-             Ctrl+G opens $EDITOR. Send /exit (or Ctrl+C twice) to quit."
+             Ctrl+G opens $EDITOR. /help for commands; /exit (or Ctrl+C twice) to quit."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
-             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Send /exit (or \
-             Ctrl+C twice) to quit. Submit while a reply is running to queue follow-ups."
+             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. /help for commands; \
+             /exit (or Ctrl+C twice) to quit. Submit while a reply runs to queue follow-ups."
         };
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
@@ -149,6 +155,8 @@ impl App {
             effort,
             session_in: 0,
             session_out: 0,
+            cfg,
+            clipboard: Clipboard::new().ok(),
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -303,6 +311,12 @@ impl App {
                 self.should_quit = true;
                 return Action::None;
             }
+            // Slash commands are handled locally, not sent to the model.
+            if self.handle_slash(input.trim()) {
+                self.editor.set_content("");
+                self.scroll_offset = 0;
+                return Action::None;
+            }
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
             if self.running {
@@ -361,6 +375,148 @@ impl App {
         }
         let _ = std::fs::remove_file(&path);
         Ok(())
+    }
+
+    fn system(&mut self, msg: impl Into<String>) {
+        self.transcript.push(Entry::System(msg.into()));
+    }
+
+    /// Dispatch a known slash command. Returns `true` if it was a recognized
+    /// command (and thus shouldn't be sent to the model); unknown `/…` input
+    /// returns `false` so it goes to the model (e.g. a literal path).
+    fn handle_slash(&mut self, input: &str) -> bool {
+        let Some(rest) = input.strip_prefix('/') else {
+            return false;
+        };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        match cmd {
+            "help" => self.system(
+                "commands: /clear  /model [id]  /provider <name>  /copy  /retry  /help  /exit",
+            ),
+            "clear" => {
+                if let Ok(mut a) = self.agent.try_lock() {
+                    a.clear();
+                }
+                self.transcript.clear();
+                self.queue.clear();
+                self.scroll_offset = 0;
+                self.session_in = 0;
+                self.session_out = 0;
+                self.last_usage = None;
+                self.system("conversation cleared");
+            }
+            "model" => {
+                if arg.is_empty() {
+                    self.system(format!("model: {}", self.model));
+                } else {
+                    let ok = match self.agent.try_lock() {
+                        Ok(mut a) => {
+                            a.set_model(arg);
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    if ok {
+                        self.model = arg.to_string();
+                        self.system(format!("model → {arg}"));
+                    } else {
+                        self.system("busy — try again after the current turn");
+                    }
+                }
+            }
+            "provider" => self.switch_provider(arg),
+            "copy" => self.copy_last_reply(),
+            "retry" => self.retry_last(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn switch_provider(&mut self, name: &str) {
+        if name.is_empty() {
+            self.system("usage: /provider <name>");
+            return;
+        }
+        let Some(p) = self.cfg.resolve_provider(name) else {
+            self.system(format!("unknown provider '{name}'"));
+            return;
+        };
+        let key = p
+            .api_key
+            .clone()
+            .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()));
+        let switched = match self.agent.try_lock() {
+            Ok(mut a) => {
+                a.set_endpoint(p.base_url.clone(), key);
+                if let Some(m) = &p.model {
+                    a.set_model(m.clone());
+                }
+                true
+            }
+            Err(_) => false,
+        };
+        if !switched {
+            self.system("busy — try again after the current turn");
+            return;
+        }
+        if let Some(m) = &p.model {
+            self.model = m.clone();
+        }
+        if let Some(w) = p.context_window {
+            self.context_window = Some(w);
+        }
+        self.system(format!("provider → {name} ({})", p.base_url));
+        if !p.remote {
+            self.system(
+                "note: a running backend isn't restarted; relaunch hrdr for a local backend",
+            );
+        }
+    }
+
+    fn copy_last_reply(&mut self) {
+        let last = self.transcript.iter().rev().find_map(|e| match e {
+            Entry::Assistant(s) => Some(s.clone()),
+            _ => None,
+        });
+        match (last, self.clipboard.as_mut()) {
+            (Some(text), Some(cb)) => {
+                match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
+                    Ok(()) => self.system("copied last reply to clipboard"),
+                    Err(_) => self.system("clipboard write failed"),
+                }
+            }
+            (Some(_), None) => self.system("clipboard unavailable"),
+            (None, _) => self.system("no assistant reply to copy"),
+        }
+    }
+
+    fn retry_last(&mut self) {
+        if self.running {
+            self.system("can't retry while a turn is running");
+            return;
+        }
+        let text = self
+            .agent
+            .try_lock()
+            .ok()
+            .and_then(|mut a| a.rewind_last_user());
+        match text {
+            Some(t) => {
+                // Drop the old turn's transcript entries back to the last user message.
+                if let Some(idx) = self
+                    .transcript
+                    .iter()
+                    .rposition(|e| matches!(e, Entry::User(_)))
+                {
+                    self.transcript.truncate(idx);
+                }
+                self.scroll_offset = 0;
+                self.spawn_turn(t);
+            }
+            None => self.system("nothing to retry"),
+        }
     }
 
     /// Abort the in-flight agent task and discard any queued messages.

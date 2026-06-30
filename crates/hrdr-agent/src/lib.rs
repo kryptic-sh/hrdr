@@ -321,6 +321,31 @@ impl Agent {
         &self.messages
     }
 
+    /// Reset the conversation, keeping only the system prompt.
+    pub fn clear(&mut self) {
+        self.messages.truncate(1);
+    }
+
+    /// Switch the model for subsequent turns.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.client.model = model.into();
+    }
+
+    /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
+    pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
+        self.client.set_base_url(base_url);
+        self.client.set_api_key(api_key);
+    }
+
+    /// Drop the last user turn (and everything after it) from history, returning
+    /// that user message's text so it can be re-sent (`/retry`).
+    pub fn rewind_last_user(&mut self) -> Option<String> {
+        let idx = self.messages.iter().rposition(|m| m.role == Role::User)?;
+        let text = self.messages[idx].content.clone();
+        self.messages.truncate(idx);
+        text
+    }
+
     /// Shared TODO list, mutated by the `todo_write` tool.
     pub fn todos(&self) -> Arc<Mutex<Vec<TodoItem>>> {
         self.ctx.todos.clone()

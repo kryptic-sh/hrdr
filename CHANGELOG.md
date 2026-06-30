@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slash commands (typed in the input): `/clear` (reset the conversation),
+  `/model [id]` (show or switch model), `/provider <name>` (switch provider
+  preset mid-session), `/copy` (last reply → clipboard), `/retry` (re-run the
+  last turn), `/help`. Unknown `/…` input is still sent to the model.
 - Diff rendering: `edit` and `write_file` now return a unified diff (also fed to
   the model), shown in the TUI with additions green, deletions red, and hunk
   headers in the accent color. New-file writes show a concise create summary.

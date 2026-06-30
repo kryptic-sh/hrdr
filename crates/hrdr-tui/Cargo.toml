@@ -12,6 +12,7 @@ hrdr-agent.workspace = true
 hrdr-editor.workspace = true
 hjkl-theme.workspace = true
 hjkl-theme-tui.workspace = true
+hjkl-clipboard.workspace = true
 hjkl-markdown.workspace = true
 hjkl-markdown-tui.workspace = true
 anyhow.workspace = true
