@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Session persistence: `/save [name]`, `/resume <name>`, `/sessions`. Sessions
+  store the conversation as JSON under `$XDG_DATA_HOME/hrdr/sessions` (default
+  `~/.local/share/hrdr/sessions`, via `hjkl-xdg`). Once a session is active
+  (saved or resumed), it **auto-saves** after each completed turn and after
+  `/undo`/`/retry`; `/clear` detaches from it. Resuming restores the model
+  history and rebuilds the transcript.
 - More slash commands: `/models` (list endpoint models), `/cwd [path]` (show or
   change the tools' working directory), `/tools` (list tools), `/reasoning`
   (toggle showing `<think>` blocks), `/theme [path]` (live theme switch),

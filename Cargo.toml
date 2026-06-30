@@ -36,6 +36,7 @@ hjkl-theme = { path = "../hjkl/crates/hjkl-theme" }
 hjkl-theme-tui = { path = "../hjkl/crates/hjkl-theme-tui" }
 hjkl-markdown = { path = "../hjkl/crates/hjkl-markdown" }
 hjkl-markdown-tui = { path = "../hjkl/crates/hjkl-markdown-tui" }
+hjkl-xdg = { path = "../hjkl/crates/hjkl-xdg" }
 
 # third-party
 tokio = { version = "1", features = ["full"] }

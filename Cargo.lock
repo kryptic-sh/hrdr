@@ -921,6 +921,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "futures-util",
+ "hjkl-xdg",
  "hrdr-llm",
  "hrdr-tools",
  "minijinja",

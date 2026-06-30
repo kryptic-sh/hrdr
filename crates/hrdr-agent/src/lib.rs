@@ -5,6 +5,9 @@
 //! repeat. Emits [`AgentEvent`]s for a UI (or stdout) to render live.
 
 mod prompt;
+mod session;
+
+pub use session::{Session, SessionMeta, list_sessions, sessions_dir};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -324,6 +327,16 @@ impl Agent {
     /// Reset the conversation, keeping only the system prompt.
     pub fn clear(&mut self) {
         self.messages.truncate(1);
+    }
+
+    /// A clone of the full message history (for saving a session).
+    pub fn messages_owned(&self) -> Vec<ChatMessage> {
+        self.messages.clone()
+    }
+
+    /// Replace the message history (for resuming a session).
+    pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
     }
 
     /// Switch the model for subsequent turns.

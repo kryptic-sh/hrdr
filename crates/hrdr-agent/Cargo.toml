@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 hrdr-llm.workspace = true
 hrdr-tools.workspace = true
+hjkl-xdg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

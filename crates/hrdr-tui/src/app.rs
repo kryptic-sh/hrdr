@@ -1,6 +1,6 @@
 //! App state, the async event loop, and agent orchestration.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use futures_util::StreamExt;
 use hjkl_clipboard::{Clipboard, MimeType, Selection};
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole, Session, Todo};
 use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
@@ -92,6 +92,8 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
+    /// Active session file name; while `Some`, changes auto-save to it.
+    session_name: Option<String>,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -173,6 +175,7 @@ impl App {
             completion_idx: 0,
             show_reasoning: true,
             base_url,
+            session_name: None,
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -452,6 +455,7 @@ impl App {
                 self.session_in = 0;
                 self.session_out = 0;
                 self.last_usage = None;
+                self.session_name = None; // detach from any active session file
                 self.system("conversation cleared");
             }
             "model" => {
@@ -511,9 +515,167 @@ impl App {
             "copy" => self.copy_last_reply(),
             "retry" => self.retry_last(),
             "undo" => self.undo_last(),
+            "save" => self.save_session(arg),
+            "resume" | "load" => self.resume_session(arg),
+            "sessions" => self.list_sessions_cmd(),
             _ => return false,
         }
         true
+    }
+
+    /// Re-save the active session (if any) — called after history changes.
+    fn autosave(&mut self) {
+        let Some(name) = self.session_name.clone() else {
+            return;
+        };
+        let snap = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| (a.messages_owned(), a.cwd()));
+        let Some((msgs, cwd)) = snap else {
+            return;
+        };
+        let s = Session::new(
+            session_title(&msgs),
+            self.model.clone(),
+            self.base_url.clone(),
+            cwd.display().to_string(),
+            msgs,
+        );
+        let _ = s.save(&name); // best-effort; silent
+    }
+
+    fn save_session(&mut self, arg: &str) {
+        let snap = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| (a.messages_owned(), a.cwd()));
+        let Some((msgs, cwd)) = snap else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let title = session_title(&msgs);
+        // Auto-name from the title when no name is given (save() sanitizes it).
+        let name = if arg.is_empty() {
+            title.clone()
+        } else {
+            arg.to_string()
+        };
+        let s = Session::new(
+            title,
+            self.model.clone(),
+            self.base_url.clone(),
+            cwd.display().to_string(),
+            msgs,
+        );
+        match s.save(&name) {
+            Ok(path) => {
+                // Adopt the (sanitized) on-disk stem as the active session.
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                self.session_name = Some(stem.clone());
+                self.system(format!("saved session '{stem}' → {}", path.display()));
+            }
+            Err(e) => self.system(format!("save failed: {e}")),
+        }
+    }
+
+    fn resume_session(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.system("usage: /resume <name>  (see /sessions)");
+            return;
+        }
+        if self.running {
+            self.system("can't resume while a turn is running");
+            return;
+        }
+        let session = match Session::load(arg) {
+            Ok(s) => s,
+            Err(e) => {
+                self.system(format!("resume failed: {e}"));
+                return;
+            }
+        };
+        let count = session.messages.len();
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.set_messages(session.messages.clone());
+            a.set_model(session.model.clone());
+        }
+        self.model = session.model.clone();
+        self.rebuild_transcript(&session.messages);
+        self.session_name = Some(arg.to_string()); // save()/load() sanitize consistently
+        self.scroll_offset = 0;
+        self.system(format!("resumed '{arg}' ({count} messages)"));
+        if session.base_url != self.base_url {
+            self.system(format!(
+                "note: session endpoint was {} (current: {})",
+                session.base_url, self.base_url
+            ));
+        }
+    }
+
+    fn list_sessions_cmd(&mut self) {
+        let sessions = hrdr_agent::list_sessions();
+        if sessions.is_empty() {
+            self.system(format!(
+                "no saved sessions in {}",
+                hrdr_agent::sessions_dir().display()
+            ));
+            return;
+        }
+        let mut s = String::from("sessions:");
+        for m in sessions {
+            s.push_str(&format!("\n  {} — {}", m.name, m.title));
+        }
+        self.system(s);
+    }
+
+    /// Rebuild the display transcript from a restored message history.
+    fn rebuild_transcript(&mut self, msgs: &[Message]) {
+        self.transcript.clear();
+        // Map tool_call_id → (result, ok) from the tool-result messages.
+        let mut results: HashMap<String, (String, bool)> = HashMap::new();
+        for m in msgs {
+            if m.role == MessageRole::Tool
+                && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
+            {
+                let ok = !content.starts_with("Error:");
+                results.insert(id.clone(), (content.clone(), ok));
+            }
+        }
+        for m in msgs {
+            match m.role {
+                MessageRole::User => {
+                    if let Some(c) = &m.content {
+                        self.transcript.push(Entry::User(c.clone()));
+                    }
+                }
+                MessageRole::Assistant => {
+                    if let Some(c) = &m.content
+                        && !c.is_empty()
+                    {
+                        self.transcript.push(Entry::Assistant(c.clone()));
+                    }
+                    for call in m.tool_calls.iter().flatten() {
+                        let (result, ok) = results.get(&call.id).cloned().unwrap_or_default();
+                        self.transcript.push(Entry::Tool {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            args: call.function.arguments.clone(),
+                            result,
+                            ok,
+                            done: true,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn list_models_cmd(&mut self) {
@@ -702,6 +864,7 @@ impl App {
                 }
                 self.editor.set_content(&t); // restore for editing
                 self.scroll_offset = 0;
+                self.autosave();
                 self.system("undid last turn — edit and resend");
             }
             None => self.system("nothing to undo"),
@@ -826,12 +989,15 @@ impl App {
         let tx = self.tx.clone();
         let tx_events = tx.clone();
         let handle = tokio::spawn(async move {
-            let mut a = agent.lock().await;
-            let result = a
-                .run(input, |ev| {
+            // Release the agent lock before signalling Done, so the UI's
+            // auto-save (try_lock) can run immediately afterward.
+            let result = {
+                let mut a = agent.lock().await;
+                a.run(input, |ev| {
                     let _ = tx_events.send(TurnMsg::Event(ev));
                 })
-                .await;
+                .await
+            };
             let _ = tx.send(TurnMsg::Done(result.err().map(|e| e.to_string())));
         });
         self.turn_handle = Some(handle);
@@ -872,6 +1038,8 @@ impl App {
                 if let Some(stats) = self.turn_stats() {
                     self.transcript.push(Entry::Stats(stats));
                 }
+                // Persist the completed turn into the active session, if any.
+                self.autosave();
                 // Start the next queued message, if any (FIFO).
                 if let Some(next) = self.queue.pop_front() {
                     self.spawn_turn(next);
@@ -1033,9 +1201,30 @@ fn parse_head(head: &str) -> Option<String> {
     }
 }
 
+/// A short title for a session, from the first user message.
+fn session_title(msgs: &[Message]) -> String {
+    msgs.iter()
+        .find(|m| m.role == MessageRole::User)
+        .and_then(|m| m.content.as_deref())
+        .map(|c| {
+            c.lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "untitled".to_string())
+}
+
 /// Slash commands offered by the completion popup.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
+    ("/save", "save the session"),
+    ("/resume", "resume a saved session"),
+    ("/sessions", "list saved sessions"),
     ("/model", "show or switch model"),
     ("/models", "list models from the endpoint"),
     ("/provider", "switch provider preset"),
