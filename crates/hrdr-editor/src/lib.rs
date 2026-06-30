@@ -9,8 +9,9 @@
 //! `VimMode`.
 
 mod host;
+mod plain;
 
-use crossterm::event::{KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use hjkl_buffer_tui::{BufferView, Gutter};
 use hjkl_engine::{CoarseMode, Editor, Host, Options};
 use ratatui::Frame;
@@ -18,6 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
 pub use host::HrdrHost;
+pub use plain::PlainEngine;
 
 /// A pluggable editing discipline embedded in the TUI.
 ///
@@ -34,6 +36,12 @@ pub trait EditorEngine {
     fn mode_label(&self) -> &'static str;
     /// Whether the engine is in a text-insertion mode (cursor-shape hint).
     fn is_insert(&self) -> bool;
+    /// Whether `key`, in the engine's current state, should submit the buffer
+    /// as a message rather than be fed to the editor. (e.g. vim: Enter in
+    /// Normal mode; plain: Enter without Shift / trailing backslash.)
+    fn wants_submit(&self, key: &KeyEvent) -> bool;
+    /// One-line key hint for the status bar, specific to this discipline.
+    fn keybind_hint(&self) -> &'static str;
     /// Draw the editable pane into `area` and place the cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 }
@@ -108,6 +116,17 @@ impl EditorEngine for VimEngine {
 
     fn is_insert(&self) -> bool {
         matches!(self.editor.coarse_mode(), CoarseMode::Insert)
+    }
+
+    fn wants_submit(&self, key: &KeyEvent) -> bool {
+        // Vim convention: Enter in Normal mode sends; in Insert it's a newline.
+        key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && matches!(self.editor.coarse_mode(), CoarseMode::Normal)
+    }
+
+    fn keybind_hint(&self) -> &'static str {
+        "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C=quit"
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {

@@ -123,8 +123,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
     let text = format!(
-        "{dot} {}  │  model: {}  │  Esc=normal  Enter=send  Ctrl+C=quit{scroll_hint}",
-        app.status, app.model
+        "{dot} {}  │  {}  │  {}{scroll_hint}",
+        app.status,
+        app.model,
+        app.editor.keybind_hint(),
     );
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(para, area);

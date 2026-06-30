@@ -6,12 +6,18 @@ use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
-use hrdr_editor::{EditorEngine, VimEngine};
+use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::Tui;
 use crate::ui;
+
+/// What a key press asks the run loop to do (for actions needing the terminal).
+enum Action {
+    None,
+    OpenEditor,
+}
 
 /// One rendered item in the transcript.
 pub(crate) enum Entry {
@@ -61,17 +67,26 @@ pub(crate) struct App {
 impl App {
     pub(crate) fn new(config: AgentConfig) -> Result<Self> {
         let model = config.model.clone();
+        let vim_mode = config.vim_mode;
         let agent = Agent::new(config)?;
         let todos = agent.todos();
         let (tx, rx) = mpsc::unbounded_channel();
+        let editor: Box<dyn EditorEngine> = if vim_mode {
+            Box::new(VimEngine::new())
+        } else {
+            Box::new(PlainEngine::new())
+        };
+        let welcome = if vim_mode {
+            "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
+             Ctrl+G opens $EDITOR, Ctrl+C quits."
+        } else {
+            "hrdr ready. Type a message; Enter sends, Shift+Enter or \\+Enter for a newline, \
+             Ctrl+G opens $EDITOR, Ctrl+C quits."
+        };
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
-            editor: Box::new(VimEngine::new()),
-            transcript: vec![Entry::System(
-                "hrdr ready. Type a task — Insert to type, Esc for Normal, Enter to send, \
-                 Ctrl+C to quit (Esc in Normal cancels a running turn)."
-                    .to_string(),
-            )],
+            editor,
+            transcript: vec![Entry::System(welcome.to_string())],
             running: false,
             status: "ready".to_string(),
             model,
@@ -97,7 +112,11 @@ impl App {
 
             tokio::select! {
                 maybe_ev = events.next() => match maybe_ev {
-                    Some(Ok(Event::Key(key))) => self.on_key(key),
+                    Some(Ok(Event::Key(key))) => {
+                        if let Action::OpenEditor = self.on_key(key) {
+                            self.open_in_editor(terminal)?;
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
                 },
@@ -107,45 +126,49 @@ impl App {
         Ok(())
     }
 
-    fn on_key(&mut self, key: KeyEvent) {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
-            return;
+            return Action::None;
         }
 
-        // Ctrl+C / Ctrl+Q: quit when idle, cancel when running.
+        // Ctrl+C / Ctrl+Q / Ctrl+G, plus vim-mode scroll.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') if self.running => {
                     self.cancel_turn();
-                    return;
+                    return Action::None;
                 }
                 KeyCode::Char('c') | KeyCode::Char('q') => {
                     self.should_quit = true;
-                    return;
+                    return Action::None;
                 }
-                // Transcript scroll — Ctrl+U/Ctrl+D in Normal mode (vim convention).
+                // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
+                KeyCode::Char('g') if !self.running => return Action::OpenEditor,
+                // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only
+                // (plain mode uses these for line editing; PageUp/Down scroll).
                 KeyCode::Char('u') if self.editor.mode_label() == "NORMAL" => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_add(half);
-                    return;
+                    return Action::None;
                 }
                 KeyCode::Char('d') if self.editor.mode_label() == "NORMAL" => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(half);
-                    return;
+                    return Action::None;
                 }
                 _ => {}
             }
         }
 
-        // Esc in Normal mode while running → cancel the in-flight turn.
+        // Esc while running cancels the in-flight turn (vim: only in Normal, so
+        // Esc still exits Insert; plain: always, since Esc is otherwise unused).
         if self.running
             && key.code == KeyCode::Esc
             && key.modifiers.is_empty()
-            && self.editor.mode_label() == "NORMAL"
+            && self.editor.mode_label() != "INSERT"
         {
             self.cancel_turn();
-            return;
+            return Action::None;
         }
 
         // PageUp / PageDown scroll the transcript (any mode).
@@ -154,36 +177,54 @@ impl App {
                 KeyCode::PageUp => {
                     let page = self.transcript_height.max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_add(page);
-                    return;
+                    return Action::None;
                 }
                 KeyCode::PageDown => {
                     let page = self.transcript_height.max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(page);
-                    return;
+                    return Action::None;
                 }
                 _ => {}
             }
         }
 
-        // Enter in Normal mode submits the input buffer.
-        if !self.running
-            && key.code == KeyCode::Enter
-            && key.modifiers.is_empty()
-            && self.editor.mode_label() == "NORMAL"
-        {
+        // The engine decides whether this key submits (vim: Enter in Normal;
+        // plain: Enter without Shift / trailing backslash).
+        if !self.running && self.editor.wants_submit(&key) {
             let input = self.editor.content();
             if input.trim().is_empty() {
-                return;
+                return Action::None;
             }
             self.transcript.push(Entry::User(input.clone()));
             self.editor.set_content("");
-            // Reset scroll to auto-follow on new submission.
-            self.scroll_offset = 0;
+            self.scroll_offset = 0; // auto-follow on new submission
             self.spawn_turn(input);
-            return;
+            return Action::None;
         }
 
         self.editor.feed_key(key);
+        Action::None
+    }
+
+    /// Hand the input buffer to `$EDITOR`/`$VISUAL`, then read it back.
+    fn open_in_editor(&mut self, terminal: &mut Tui) -> Result<()> {
+        let path = std::env::temp_dir().join(format!("hrdr-input-{}.md", std::process::id()));
+        std::fs::write(&path, self.editor.content())?;
+
+        crate::suspend_terminal(terminal)?;
+        let status = run_editor(&path);
+        crate::resume_terminal(terminal)?;
+        terminal.clear()?;
+
+        if status.is_ok()
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            // Editors append a trailing newline; drop one so it doesn't submit blank.
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            self.editor.set_content(text);
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     /// Abort the in-flight agent task, update status, push a cancel marker.
@@ -291,4 +332,18 @@ impl App {
             }
         }
     }
+}
+
+/// Run `$VISUAL`/`$EDITOR` (falling back to `vi`) on `path`, inheriting stdio.
+/// The command string may carry args (e.g. `code -w`), split on whitespace.
+fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .status()
 }

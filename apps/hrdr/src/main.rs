@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, global = true)]
     model: Option<String>,
 
+    /// Use vim keybindings in the input pane (default: plain claude-style input).
+    #[arg(long, global = true)]
+    vim: bool,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -88,6 +92,9 @@ async fn main() -> Result<()> {
     }
     if let Some(m) = cli.model {
         config.model = m;
+    }
+    if cli.vim {
+        config.vim_mode = true;
     }
 
     // TEMPORARY: bring up a local llama-server backend unless told not to.

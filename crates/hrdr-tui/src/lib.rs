@@ -59,6 +59,32 @@ impl Drop for TerminalGuard {
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Leave the TUI screen so an external program (e.g. `$EDITOR`) can use the
+/// terminal: drop raw mode, the alt screen, and the keyboard enhancements.
+pub(crate) fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Re-enter the TUI screen after [`suspend_terminal`].
+pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    )?;
+    Ok(())
+}
+
 /// Launch the interactive TUI against the configured agent.
 pub async fn run(config: AgentConfig) -> Result<()> {
     let _guard = TerminalGuard::enter()?;

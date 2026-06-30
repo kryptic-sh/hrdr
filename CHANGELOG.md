@@ -38,4 +38,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--no-backend`. To be removed once infr's serve path supports agentic tool
   use.
 
+- Plain claude-style input discipline (`PlainEngine`), now the **default** input
+  mode: always typing, `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a
+  newline, `Ctrl+G` opens `$EDITOR`/`$VISUAL`, with readline-style `Ctrl+A` /
+  `Ctrl+E` / `Ctrl+W` / `Ctrl+U`. Vim keybindings remain available via `--vim`
+  (or `vim = true` in config). The submit key and status hint are now decided by
+  the `EditorEngine`, keeping the FSM-agnostic seam intact.
+
 [Unreleased]: https://github.com/kryptic-sh/hrdr/commits/main

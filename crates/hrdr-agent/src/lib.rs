@@ -50,6 +50,9 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
     pub max_steps: usize,
+    /// Input discipline for the TUI: `true` = vim (hjkl), `false` = plain
+    /// claude-style input (default).
+    pub vim_mode: bool,
 }
 
 impl Default for AgentConfig {
@@ -61,6 +64,7 @@ impl Default for AgentConfig {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 50,
+            vim_mode: false,
         }
     }
 }
@@ -72,6 +76,7 @@ struct FileConfig {
     api_key: Option<String>,
     model: Option<String>,
     temperature: Option<f32>,
+    vim: Option<bool>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -125,6 +130,9 @@ impl AgentConfig {
             }
             if let Some(v) = fc.temperature {
                 cfg.temperature = Some(v);
+            }
+            if let Some(v) = fc.vim {
+                cfg.vim_mode = v;
             }
         }
 

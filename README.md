@@ -19,11 +19,12 @@ job is done.
 - **Efficient, locked tool set.** Fewer, more powerful tools beat a big menu:
   `read_file`, `write_file`, `edit`, `bash`, `grep`, `glob`, `todo_write`.
   Token-bounded outputs, line-numbered reads for precise edits, ripgrep search.
-- **Vim editing via [hjkl](https://github.com/kryptic-sh/hjkl).** The input pane
-  is a real hjkl editor. The integration is **FSM-agnostic**: hrdr talks only to
-  an `EditorEngine` trait projected from hjkl's `CoarseMode`, so when hjkl's
-  pluggable-FSM work lands a VSCode/Helix discipline, hrdr swaps it in with zero
-  churn.
+- **Pluggable input discipline.** Default is a plain, claude-style input (always
+  typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
+  opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
+  real [hjkl](https://github.com/kryptic-sh/hjkl) vim editor. Both are
+  `EditorEngine` impls behind an **FSM-agnostic** seam, so a future hjkl
+  VSCode/Helix discipline drops in with zero churn.
 - **Jinja prompt templating.** hrdr's own system prompt is assembled with
   minijinja templates — editable without a recompile.
 
@@ -41,8 +42,12 @@ job is done.
 ## Usage
 
 ```bash
-# interactive TUI (Insert to type, Esc for Normal, Enter to send, Ctrl+C quit)
+# interactive TUI — plain input: type, Enter sends, Shift+Enter/\+Enter newline,
+# Ctrl+G opens $EDITOR, Ctrl+C quits
 hrdr
+
+# vim keybindings in the input pane instead
+hrdr --vim
 
 # one-shot headless run, streamed to stdout
 hrdr run "add a --json flag to the status command"
