@@ -92,8 +92,10 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
-    /// Active session file name; while `Some`, changes auto-save to it.
-    session_name: Option<String>,
+    /// Active session's file id (stem). Assigned on first auto-save; stable.
+    session_id: Option<String>,
+    /// Display name override (`/rename`); falls back to the first user message.
+    session_label: Option<String>,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -175,7 +177,8 @@ impl App {
             completion_idx: 0,
             show_reasoning: true,
             base_url,
-            session_name: None,
+            session_id: None,
+            session_label: None,
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -442,9 +445,13 @@ impl App {
         let cmd = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
-            "help" => self.system(
-                "commands: /clear  /model [id]  /provider <name>  /copy  /retry  /help  /exit",
-            ),
+            "help" => {
+                let mut s = String::from("commands:");
+                for (n, d) in SLASH_COMMANDS {
+                    s.push_str(&format!("\n  {n} — {d}"));
+                }
+                self.system(s);
+            }
             "clear" => {
                 if let Ok(mut a) = self.agent.try_lock() {
                     a.clear();
@@ -455,7 +462,8 @@ impl App {
                 self.session_in = 0;
                 self.session_out = 0;
                 self.last_usage = None;
-                self.session_name = None; // detach from any active session file
+                self.session_id = None; // detach; next message starts a new session
+                self.session_label = None;
                 self.system("conversation cleared");
             }
             "model" => {
@@ -515,19 +523,19 @@ impl App {
             "copy" => self.copy_last_reply(),
             "retry" => self.retry_last(),
             "undo" => self.undo_last(),
-            "save" => self.save_session(arg),
             "resume" | "load" => self.resume_session(arg),
+            "rename" => self.rename_session(arg),
             "sessions" => self.list_sessions_cmd(),
             _ => return false,
         }
         true
     }
 
-    /// Re-save the active session (if any) — called after history changes.
+    /// Persist the conversation. Sessions auto-save continuously: any non-empty
+    /// conversation is written to disk, with a stable file id assigned (from the
+    /// name) on first save. Called after every completed turn, `/undo`,
+    /// `/retry`, and `/rename`.
     fn autosave(&mut self) {
-        let Some(name) = self.session_name.clone() else {
-            return;
-        };
         let snap = self
             .agent
             .try_lock()
@@ -536,53 +544,36 @@ impl App {
         let Some((msgs, cwd)) = snap else {
             return;
         };
+        // Non-empty == has at least one user message.
+        if !msgs.iter().any(|m| m.role == MessageRole::User) {
+            return;
+        }
+        let name = self
+            .session_label
+            .clone()
+            .unwrap_or_else(|| session_name_from(&msgs));
+        if self.session_id.is_none() {
+            self.session_id = Some(hrdr_agent::unique_session_id(&name));
+        }
+        let id = self.session_id.clone().unwrap_or_else(|| name.clone());
         let s = Session::new(
-            session_title(&msgs),
+            name,
             self.model.clone(),
             self.base_url.clone(),
             cwd.display().to_string(),
             msgs,
         );
-        let _ = s.save(&name); // best-effort; silent
+        let _ = s.save(&id); // best-effort; silent
     }
 
-    fn save_session(&mut self, arg: &str) {
-        let snap = self
-            .agent
-            .try_lock()
-            .ok()
-            .map(|a| (a.messages_owned(), a.cwd()));
-        let Some((msgs, cwd)) = snap else {
-            self.system("busy — try again after the current turn");
+    fn rename_session(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.system("usage: /rename <name>");
             return;
-        };
-        let title = session_title(&msgs);
-        // Auto-name from the title when no name is given (save() sanitizes it).
-        let name = if arg.is_empty() {
-            title.clone()
-        } else {
-            arg.to_string()
-        };
-        let s = Session::new(
-            title,
-            self.model.clone(),
-            self.base_url.clone(),
-            cwd.display().to_string(),
-            msgs,
-        );
-        match s.save(&name) {
-            Ok(path) => {
-                // Adopt the (sanitized) on-disk stem as the active session.
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&name)
-                    .to_string();
-                self.session_name = Some(stem.clone());
-                self.system(format!("saved session '{stem}' → {}", path.display()));
-            }
-            Err(e) => self.system(format!("save failed: {e}")),
         }
+        self.session_label = Some(arg.to_string());
+        self.autosave(); // persist the new name (no-op while still empty)
+        self.system(format!("session renamed → {arg}"));
     }
 
     fn resume_session(&mut self, arg: &str) {
@@ -608,7 +599,8 @@ impl App {
         }
         self.model = session.model.clone();
         self.rebuild_transcript(&session.messages);
-        self.session_name = Some(arg.to_string()); // save()/load() sanitize consistently
+        self.session_id = Some(arg.to_string()); // save()/load() sanitize consistently
+        self.session_label = Some(session.name.clone());
         self.scroll_offset = 0;
         self.system(format!("resumed '{arg}' ({count} messages)"));
         if session.base_url != self.base_url {
@@ -628,9 +620,9 @@ impl App {
             ));
             return;
         }
-        let mut s = String::from("sessions:");
+        let mut s = String::from("sessions (resume by id):");
         for m in sessions {
-            s.push_str(&format!("\n  {} — {}", m.name, m.title));
+            s.push_str(&format!("\n  {} — {}", m.id, m.name));
         }
         self.system(s);
     }
@@ -1201,8 +1193,8 @@ fn parse_head(head: &str) -> Option<String> {
     }
 }
 
-/// A short title for a session, from the first user message.
-fn session_title(msgs: &[Message]) -> String {
+/// A short session name derived from the first user message.
+fn session_name_from(msgs: &[Message]) -> String {
     msgs.iter()
         .find(|m| m.role == MessageRole::User)
         .and_then(|m| m.content.as_deref())
@@ -1222,9 +1214,9 @@ fn session_title(msgs: &[Message]) -> String {
 /// Slash commands offered by the completion popup.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
-    ("/save", "save the session"),
-    ("/resume", "resume a saved session"),
     ("/sessions", "list saved sessions"),
+    ("/resume", "resume a saved session by id"),
+    ("/rename", "rename the current session"),
     ("/model", "show or switch model"),
     ("/models", "list models from the endpoint"),
     ("/provider", "switch provider preset"),

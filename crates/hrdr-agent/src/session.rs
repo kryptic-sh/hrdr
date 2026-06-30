@@ -17,8 +17,8 @@ const SESSION_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub version: u32,
-    /// Short human title (typically the first user message).
-    pub title: String,
+    /// Human-friendly session name (defaults to the first user message).
+    pub name: String,
     pub model: String,
     pub base_url: String,
     pub cwd: String,
@@ -31,8 +31,10 @@ pub struct Session {
 /// Lightweight directory listing entry.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
+    /// File stem — the id you `/resume` by.
+    pub id: String,
+    /// The session's display name.
     pub name: String,
-    pub title: String,
     pub updated: u64,
 }
 
@@ -73,7 +75,7 @@ pub fn sanitize_name(name: &str) -> String {
 
 impl Session {
     pub fn new(
-        title: impl Into<String>,
+        name: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
         cwd: impl Into<String>,
@@ -82,7 +84,7 @@ impl Session {
         let t = now();
         Self {
             version: SESSION_VERSION,
-            title: title.into(),
+            name: name.into(),
             model: model.into(),
             base_url: base_url.into(),
             cwd: cwd.into(),
@@ -111,6 +113,23 @@ impl Session {
     }
 }
 
+/// A collision-free file id derived from `name`: the slug, then `slug-2`,
+/// `slug-3`, … if files already exist.
+pub fn unique_session_id(name: &str) -> String {
+    let slug = sanitize_name(name);
+    let dir = sessions_dir();
+    if !dir.join(format!("{slug}.json")).exists() {
+        return slug;
+    }
+    for i in 2..10_000 {
+        let cand = format!("{slug}-{i}");
+        if !dir.join(format!("{cand}.json")).exists() {
+            return cand;
+        }
+    }
+    slug
+}
+
 /// List saved sessions, newest first.
 pub fn list_sessions() -> Vec<SessionMeta> {
     let mut out = Vec::new();
@@ -120,7 +139,7 @@ pub fn list_sessions() -> Vec<SessionMeta> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let name = path
+            let id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
@@ -129,8 +148,8 @@ pub fn list_sessions() -> Vec<SessionMeta> {
                 && let Ok(s) = serde_json::from_str::<Session>(&data)
             {
                 out.push(SessionMeta {
-                    name,
-                    title: s.title,
+                    id,
+                    name: s.name,
                     updated: s.updated,
                 });
             }
