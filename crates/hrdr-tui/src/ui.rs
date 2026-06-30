@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::app::{App, Entry};
+use crate::app::{App, Entry, TimestampStyle};
 use crate::theme::Theme;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
@@ -480,14 +480,14 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
     let meta = |out: &mut Vec<Line<'static>>, i: usize, num: usize, role: &str| {
-        if !app.show_timestamps {
+        if app.timestamp_style == TimestampStyle::None {
             return;
         }
         let time = app
             .entry_times
             .get(i)
             .map(|t| {
-                if app.timestamp_relative {
+                if app.timestamp_style == TimestampStyle::Relative {
                     relative_time(*t)
                 } else {
                     t.format("%H:%M").to_string()

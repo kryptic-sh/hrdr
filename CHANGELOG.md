@@ -27,12 +27,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Per-message timestamps + numbers: each user/assistant message gets a dim
-  header (`#3 you · 2m ago`) showing its number and send time. Time is shown
-  relative by default (`now`, `2m ago`, `3h ago`) or absolute (`HH:MM`); switch
-  with `/timestamps relative|absolute` or set `timestamp_style` in config /
-  `$HRDR_TIMESTAMP_STYLE`. Toggle visibility with `/timestamps` (or `ts`,
-  `on`/`off`); default-on, also via `timestamps` in config, `--no-timestamps`,
-  `$HRDR_TIMESTAMPS`.
+  header (`#3 you · 2m ago`) showing its number and send time. A single
+  `timestamps` setting picks the style — `none`, `relative` (default; `now`,
+  `2m ago`, `3h ago`), or `exact` (`HH:MM`) — via config,
+  `--timestamps <style>`, or `$HRDR_TIMESTAMPS`. Change it live with
+  `/timestamps [none|relative|exact]` (no arg toggles off/relative).
 - `/copy msg N` copies a specific numbered message (the `#N` shown by the
   timestamp headers), and `/copy msg N-M` copies an inclusive range, alongside
   the existing `/copy`, `/copy code`, `/copy all`.

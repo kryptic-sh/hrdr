@@ -24,6 +24,29 @@ use crate::Tui;
 use crate::theme::Theme;
 use crate::ui;
 
+/// Per-message timestamp display style.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimestampStyle {
+    /// No timestamps/numbers.
+    None,
+    /// Relative (`now`, `2m ago`, `3h ago`).
+    Relative,
+    /// Exact local time (`HH:MM`).
+    Exact,
+}
+
+impl TimestampStyle {
+    /// Resolve from a config string; anything unrecognized (incl. `None`) is
+    /// `Relative` — the default.
+    fn from_config(s: Option<&str>) -> Self {
+        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+            Some("none" | "off" | "hidden" | "false" | "0") => Self::None,
+            Some("exact" | "absolute" | "abs") => Self::Exact,
+            _ => Self::Relative,
+        }
+    }
+}
+
 /// What a key press asks the run loop to do (for actions needing the terminal).
 enum Action {
     None,
@@ -76,10 +99,8 @@ pub(crate) struct App {
     /// Local timestamp per transcript entry (parallel to `transcript`), rendered
     /// as relative or absolute time at draw.
     pub(crate) entry_times: Vec<chrono::DateTime<chrono::Local>>,
-    /// Show per-message timestamps + numbers in the transcript (`/timestamps`).
-    pub(crate) show_timestamps: bool,
-    /// Render timestamps as relative (`2m ago`) vs absolute (`HH:MM`).
-    pub(crate) timestamp_relative: bool,
+    /// Per-message timestamp style: none / relative / exact (`/timestamps`).
+    pub(crate) timestamp_style: TimestampStyle,
     pub(crate) running: bool,
     pub(crate) status: String,
     pub(crate) model: String,
@@ -177,13 +198,7 @@ impl App {
         let auto_compact = config.auto_compact;
         let auto_resume = config.auto_resume;
         let bell = config.bell;
-        let timestamps = config.timestamps;
-        // Relative unless the style is explicitly "absolute".
-        let timestamp_relative = config
-            .timestamp_style
-            .as_deref()
-            .map(|s| !s.eq_ignore_ascii_case("absolute"))
-            .unwrap_or(true);
+        let timestamp_style = TimestampStyle::from_config(config.timestamps.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
         let icon_mode = config
@@ -226,8 +241,7 @@ impl App {
             theme,
             transcript,
             entry_times,
-            show_timestamps: timestamps,
-            timestamp_relative,
+            timestamp_style,
             running: false,
             status: "ready".to_string(),
             model,
@@ -997,12 +1011,7 @@ impl App {
         self.effort = cfg.effort.clone();
         self.auto_compact_ratio = cfg.auto_compact;
         self.bell = cfg.bell;
-        self.show_timestamps = cfg.timestamps;
-        self.timestamp_relative = cfg
-            .timestamp_style
-            .as_deref()
-            .map(|s| !s.eq_ignore_ascii_case("absolute"))
-            .unwrap_or(true);
+        self.timestamp_style = TimestampStyle::from_config(cfg.timestamps.as_deref());
         self.icon_mode = cfg
             .icons
             .as_deref()
@@ -1287,38 +1296,31 @@ impl App {
             .nth(n - 1)
     }
 
-    /// `/timestamps [on|off|relative|absolute]` — toggle the per-message
-    /// timestamp + number headers, or switch their style.
+    /// `/timestamps [none|relative|exact]` — set the timestamp style (no arg
+    /// toggles between off and relative).
     fn timestamps_cmd(&mut self, arg: &str) {
-        match arg.trim().to_ascii_lowercase().as_str() {
+        let style = match arg.trim().to_ascii_lowercase().as_str() {
             "" => {
-                self.show_timestamps = !self.show_timestamps;
-                self.system(if self.show_timestamps {
-                    "timestamps shown"
+                if self.timestamp_style == TimestampStyle::None {
+                    TimestampStyle::Relative
                 } else {
-                    "timestamps hidden"
-                });
+                    TimestampStyle::None
+                }
             }
-            "on" => {
-                self.show_timestamps = true;
-                self.system("timestamps shown");
+            "none" | "off" | "hidden" => TimestampStyle::None,
+            "relative" | "rel" | "on" => TimestampStyle::Relative,
+            "exact" | "absolute" | "abs" => TimestampStyle::Exact,
+            _ => {
+                self.system("usage: /timestamps [none | relative | exact]");
+                return;
             }
-            "off" => {
-                self.show_timestamps = false;
-                self.system("timestamps hidden");
-            }
-            "relative" | "rel" => {
-                self.timestamp_relative = true;
-                self.show_timestamps = true;
-                self.system("timestamps: relative");
-            }
-            "absolute" | "abs" => {
-                self.timestamp_relative = false;
-                self.show_timestamps = true;
-                self.system("timestamps: absolute (HH:MM)");
-            }
-            _ => self.system("usage: /timestamps [on | off | relative | absolute]"),
-        }
+        };
+        self.timestamp_style = style;
+        self.system(match style {
+            TimestampStyle::None => "timestamps: off",
+            TimestampStyle::Relative => "timestamps: relative",
+            TimestampStyle::Exact => "timestamps: exact (HH:MM)",
+        });
     }
 
     /// Write `text` to the system clipboard, reporting success/failure.
@@ -2106,7 +2108,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
-    ("/timestamps", "toggle/style timestamps (relative|absolute)"),
+    ("/timestamps", "set timestamps (none|relative|exact)"),
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
