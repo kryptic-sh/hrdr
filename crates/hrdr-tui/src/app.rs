@@ -389,7 +389,8 @@ impl App {
         self.turn_started = Some(Instant::now());
         self.first_token_at = None;
         self.out_tokens = 0;
-        self.last_usage = None;
+        // Keep last_usage so the status-bar context size persists between turns;
+        // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
         let tx = self.tx.clone();
         let tx_events = tx.clone();

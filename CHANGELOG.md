@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Status-bar context size no longer drops to 0 between turns: `last_usage` is
+  kept across turns (only the live per-turn counters reset), so the displayed
+  context persists until the next turn's usage refreshes it.
+
 - Scrollbar thumb position: it now reaches the bottom when following the output
   (was stuck midway) — `content_length` is the number of scroll positions, not
   the raw line total, matching ratatui's `position` mapping.
