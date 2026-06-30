@@ -26,6 +26,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `/paste` inserts the system clipboard into the input — and if the clipboard
+  holds a path to an existing file, attaches it as an `@mention` instead.
+- `/help` is now grouped by category (Session, Model & sampling, Files &
+  context, Reply, Appearance, Other) with aligned descriptions and a tips line,
+  instead of one flat list.
 - `Ctrl+L` clears and repaints the screen, to recover from terminal corruption
   (e.g. after a stray external write or a garbled resize).
 - Startup endpoint health check: on launch hrdr probes the endpoint in the

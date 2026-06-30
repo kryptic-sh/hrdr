@@ -614,13 +614,7 @@ impl App {
         let cmd = resolve_alias(parts.next().unwrap_or(""));
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
-            "help" => {
-                let mut s = String::from("commands:");
-                for (n, d) in SLASH_COMMANDS {
-                    s.push_str(&format!("\n  {n} — {d}"));
-                }
-                self.system(s);
-            }
+            "help" => self.system(help_text()),
             "clear" => {
                 if let Ok(mut a) = self.agent.try_lock() {
                     a.clear();
@@ -690,6 +684,7 @@ impl App {
             }
             "info" => self.show_info(),
             "copy" => self.copy_cmd(arg),
+            "paste" => self.paste_cmd(),
             "retry" => self.retry_last(arg),
             "edit" => self.edit_file_cmd(arg),
             "undo" => self.undo_last(),
@@ -1235,6 +1230,43 @@ impl App {
             }
         }
         out.trim_end().to_string()
+    }
+
+    /// `/paste` — insert the system clipboard into the input. If the clipboard
+    /// holds a path to an existing file, attach it as an `@mention` instead.
+    fn paste_cmd(&mut self) {
+        let data = self
+            .clipboard
+            .as_ref()
+            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok());
+        let Some(bytes) = data else {
+            self.system("clipboard unavailable or empty");
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        if text.is_empty() {
+            self.system("clipboard is empty");
+            return;
+        }
+        // A single-line path to an existing file → attach as `@path`.
+        let trimmed = text.trim();
+        if !trimmed.is_empty()
+            && !trimmed.contains('\n')
+            && let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd())
+        {
+            let p = std::path::Path::new(trimmed);
+            let full = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+            if full.is_file() {
+                self.editor.paste(&format!("@{trimmed} "));
+                self.system(format!("attached @{trimmed} from clipboard"));
+                return;
+            }
+        }
+        self.editor.paste(&text);
     }
 
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
@@ -1912,6 +1944,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
     ("/copy", "copy reply (or 'code' / 'all')"),
+    ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
     ("/retry", "re-run last turn (optional model)"),
     ("/undo", "undo last turn (edit & resend)"),
@@ -1925,6 +1958,64 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/continue", "alias of /resume"),
     ("/summarize", "alias of /compact"),
 ];
+
+/// Commands grouped by theme for a readable `/help`.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Session",
+        &[
+            "/clear",
+            "/sessions",
+            "/resume",
+            "/rename",
+            "/compact",
+            "/info",
+        ],
+    ),
+    (
+        "Model & sampling",
+        &[
+            "/model",
+            "/models",
+            "/provider",
+            "/temp",
+            "/effort",
+            "/reasoning",
+        ],
+    ),
+    (
+        "Files & context",
+        &[
+            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/paste",
+        ],
+    ),
+    ("Reply", &["/copy", "/retry", "/undo"]),
+    ("Appearance", &["/theme"]),
+    ("Other", &["/help", "/exit"]),
+];
+
+/// Render the grouped, aligned `/help` text.
+fn help_text() -> String {
+    let desc = |name: &str| {
+        SLASH_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| *d)
+            .unwrap_or("")
+    };
+    let mut s = String::from("Commands");
+    for (group, names) in HELP_GROUPS {
+        s.push_str(&format!("\n\n{group}"));
+        for name in *names {
+            s.push_str(&format!("\n  {name:<11}{}", desc(name)));
+        }
+    }
+    s.push_str(
+        "\n\nTips: @path attaches a file · Up/Down recalls history · Ctrl+L redraws · \
+         Ctrl+C twice quits",
+    );
+    s
+}
 
 /// The active completion popup's contents and kind.
 pub(crate) struct Completions {
