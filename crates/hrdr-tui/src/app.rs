@@ -104,6 +104,8 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// True while a compaction (summarization) pass is running.
     pub(crate) compacting: bool,
+    /// True while an `/init` turn runs, so its result reloads `AGENTS.md`.
+    pending_init: bool,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
@@ -212,6 +214,7 @@ impl App {
             file_index_cwd: None,
             show_reasoning: true,
             compacting: false,
+            pending_init: false,
             auto_compact_ratio: auto_compact,
             bell,
             base_url,
@@ -873,34 +876,36 @@ impl App {
         }
     }
 
-    /// `/init` — write a starter `AGENTS.md` in the cwd (build/test commands
-    /// guessed from project markers), then load it into the system prompt.
-    fn init_agents_cmd(&mut self) {
-        let cwd = self.agent.try_lock().ok().map(|a| a.cwd());
-        let Some(cwd) = cwd else {
-            self.system("busy — try again after the current turn");
-            return;
+    /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
+    /// in place (e.g. after `/init` writes one).
+    fn reload_project_docs(&mut self) {
+        let loaded = match self.agent.try_lock() {
+            Ok(mut a) => {
+                let cwd = a.cwd();
+                a.set_cwd(cwd);
+                a.project_docs().is_some()
+            }
+            Err(_) => return,
         };
-        let path = cwd.join("AGENTS.md");
-        if path.exists() {
-            self.system(
-                "AGENTS.md already exists — edit it directly (or delete it and /init again)",
-            );
+        if loaded {
+            self.system("loaded AGENTS.md into the system prompt");
+        }
+    }
+
+    /// `/init` — have the model explore the project and write an `AGENTS.md`
+    /// (Claude Code / opencode style): we send it an instruction prompt and it
+    /// uses its tools to analyze the repo and create the file.
+    fn init_agents_cmd(&mut self) {
+        if self.running {
+            self.system("can't /init while a turn is running");
             return;
         }
-        let template = agents_template(&cwd);
-        if let Err(e) = std::fs::write(&path, &template) {
-            self.system(format!("can't write {}: {e}", path.display()));
-            return;
-        }
-        // Reload project instructions (re-gathers AGENTS.md, refreshes prompt).
-        if let Ok(mut a) = self.agent.try_lock() {
-            a.set_cwd(cwd.clone());
-        }
-        let lines = template.lines().count();
-        self.system(format!(
-            "wrote AGENTS.md ({lines} lines) and loaded it — fill in the TODOs to guide the agent"
+        self.transcript.push(Entry::System(
+            "/init — exploring the project to write AGENTS.md…".to_string(),
         ));
+        self.scroll_offset = 0;
+        self.pending_init = true;
+        self.launch_turn(INIT_PROMPT.to_string());
     }
 
     fn add_file(&mut self, arg: &str) {
@@ -1133,6 +1138,8 @@ impl App {
             handle.abort();
         }
         self.running = false;
+        self.pending_init = false;
+        self.compacting = false;
         let dropped = self.queue.len();
         self.queue.clear();
         self.status = "cancelled".to_string();
@@ -1150,7 +1157,13 @@ impl App {
         self.transcript.push(Entry::User(input.clone()));
         // Expand `@file` mentions into attached contents for the model only; the
         // transcript still shows the message as the user typed it.
-        let input = self.expand_mentions(&input);
+        let sent = self.expand_mentions(&input);
+        self.launch_turn(sent);
+    }
+
+    /// Run a turn against the model with `input` as the (already-prepared) user
+    /// message. The caller is responsible for any transcript display.
+    fn launch_turn(&mut self, input: String) {
         self.running = true;
         self.status = "thinking…".to_string();
         self.turn_started = Some(Instant::now());
@@ -1480,6 +1493,11 @@ impl App {
                 self.maybe_bell();
                 // Persist the completed turn into the active session, if any.
                 self.autosave();
+                // If this was an /init turn, reload AGENTS.md into the prompt.
+                if self.pending_init {
+                    self.pending_init = false;
+                    self.reload_project_docs();
+                }
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.
                 if self.should_auto_compact() {
@@ -1712,7 +1730,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
-    ("/init", "create a starter AGENTS.md for this project"),
+    ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
@@ -1795,60 +1813,29 @@ const WALK_SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// A starter `AGENTS.md`, with build/test commands guessed from the project's
-/// marker files (Cargo.toml, package.json, …). Sections left as TODO for the
-/// user to fill in.
-fn agents_template(cwd: &std::path::Path) -> String {
-    let has = |f: &str| cwd.join(f).exists();
-    let (stack, build, test) = if has("Cargo.toml") {
-        (
-            "Rust (Cargo)",
-            "cargo build",
-            "cargo test  # also: cargo clippy, cargo fmt",
-        )
-    } else if has("package.json") {
-        (
-            "Node.js",
-            "npm install",
-            "npm test  # or the project's package-manager equivalent",
-        )
-    } else if has("pyproject.toml") || has("setup.py") || has("setup.cfg") {
-        ("Python", "pip install -e .", "pytest")
-    } else if has("go.mod") {
-        ("Go", "go build ./...", "go test ./...")
-    } else if has("composer.json") {
-        ("PHP (Composer)", "composer install", "composer test")
-    } else if has("Gemfile") {
-        ("Ruby (Bundler)", "bundle install", "bundle exec rspec")
-    } else if has("pom.xml") {
-        ("Java (Maven)", "mvn compile", "mvn test")
-    } else if has("build.gradle") || has("build.gradle.kts") {
-        ("Java/Kotlin (Gradle)", "gradle build", "gradle test")
-    } else {
-        (
-            "TODO: describe the stack",
-            "TODO: build command",
-            "TODO: test command",
-        )
-    };
-    format!(
-        "# AGENTS.md\n\n\
-         Guidance for AI coding agents working in this repository \
-         (open standard: https://agents.md).\n\n\
-         ## Project\n\n\
-         TODO: one-paragraph description of what this project is and does.\n\n\
-         Detected stack: {stack}\n\n\
-         ## Setup / Build\n\n\
-         ```sh\n{build}\n```\n\n\
-         ## Test\n\n\
-         ```sh\n{test}\n```\n\n\
-         ## Conventions\n\n\
-         - TODO: formatting, naming, and style rules to follow.\n\
-         - TODO: commit message conventions.\n\n\
-         ## Notes\n\n\
-         - TODO: architecture overview, gotchas, or anything an agent should know.\n"
-    )
-}
+/// Instruction sent to the model by `/init` to author an `AGENTS.md`.
+const INIT_PROMPT: &str = "\
+Analyze this codebase and create an AGENTS.md file at the repository root to guide \
+AI coding agents working here (the open standard at https://agents.md).
+
+Do this:
+1. Explore the project with your tools — read the README(s), the build/manifest \
+   files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), CI \
+   config, and skim the source layout with glob/grep/read_file to understand how \
+   it's organized.
+2. If an AGENTS.md (or CLAUDE.md / .cursorrules / similar) already exists, read it \
+   and improve it instead of discarding useful content.
+3. Write AGENTS.md (use the write_file tool) with concise, repo-specific sections:
+   - Project overview: what it is and does.
+   - Setup / build / run: the actual commands for THIS repo.
+   - Testing: how to run the test suite and a single test.
+   - Code style & conventions: formatting, linting, naming — inferred from config \
+     and existing code.
+   - Architecture / layout: key directories and how they fit together.
+   - Gotchas or rules an agent must follow.
+
+Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
+When finished, give a one-line summary of what you wrote.";
 
 /// Collect relative file paths under `root` for `@file` completion. In a git
 /// repo, honors `.gitignore`/`.ignore` (and parents/global) + `.git/info/exclude`
