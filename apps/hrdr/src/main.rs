@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long, global = true)]
     icons: Option<String>,
 
+    /// Don't show per-message timestamps + numbers in the transcript.
+    #[arg(long = "no-timestamps", global = true)]
+    no_timestamps: bool,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -180,6 +184,9 @@ async fn main() -> Result<()> {
     }
     if let Some(i) = cli.icons {
         config.icons = Some(i);
+    }
+    if cli.no_timestamps {
+        config.timestamps = false;
     }
 
     if remote_provider && config.model == "default" {

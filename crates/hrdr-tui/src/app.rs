@@ -73,6 +73,10 @@ pub(crate) struct App {
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
     pub(crate) transcript: Vec<Entry>,
+    /// Local "HH:MM" timestamp per transcript entry (parallel to `transcript`).
+    pub(crate) entry_times: Vec<String>,
+    /// Show per-message timestamps + numbers in the transcript (`/timestamps`).
+    pub(crate) show_timestamps: bool,
     pub(crate) running: bool,
     pub(crate) status: String,
     pub(crate) model: String,
@@ -170,6 +174,7 @@ impl App {
         let auto_compact = config.auto_compact;
         let auto_resume = config.auto_resume;
         let bell = config.bell;
+        let timestamps = config.timestamps;
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
         let icon_mode = config
@@ -205,11 +210,14 @@ impl App {
                 "loaded project instructions from AGENTS.md".to_string(),
             ));
         }
+        let entry_times = vec![timestamp_now(); transcript.len()];
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             editor,
             theme,
             transcript,
+            entry_times,
+            show_timestamps: timestamps,
             running: false,
             status: "ready".to_string(),
             model,
@@ -322,7 +330,7 @@ impl App {
         self.rebuild_transcript(&session.messages);
         self.session_id = Some(meta.id);
         self.session_label = Some(session.name.clone());
-        self.transcript.push(Entry::System(format!(
+        self.push_entry(Entry::System(format!(
             "resumed most recent session '{}' ({} messages) — /clear to start fresh",
             session.name,
             session.messages.len()
@@ -600,7 +608,26 @@ impl App {
     }
 
     fn system(&mut self, msg: impl Into<String>) {
-        self.transcript.push(Entry::System(msg.into()));
+        self.push_entry(Entry::System(msg.into()));
+    }
+
+    /// Append a transcript entry, stamping it with the current local time so the
+    /// `entry_times` vector stays parallel to `transcript`.
+    fn push_entry(&mut self, e: Entry) {
+        self.transcript.push(e);
+        self.entry_times.push(timestamp_now());
+    }
+
+    /// Clear the transcript (and its parallel timestamps).
+    fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.entry_times.clear();
+    }
+
+    /// Truncate the transcript (and its parallel timestamps) to `len`.
+    fn truncate_transcript(&mut self, len: usize) {
+        self.transcript.truncate(len);
+        self.entry_times.truncate(len);
     }
 
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -619,7 +646,7 @@ impl App {
                 if let Ok(mut a) = self.agent.try_lock() {
                     a.clear();
                 }
-                self.transcript.clear();
+                self.clear_transcript();
                 self.queue.clear();
                 self.scroll_offset = 0;
                 self.session_in = 0;
@@ -693,6 +720,8 @@ impl App {
             "sessions" => self.list_sessions_cmd(arg),
             "compact" => self.compact_cmd(arg),
             "init" => self.init_agents_cmd(),
+            "reload" => self.reload_cmd(),
+            "timestamps" | "ts" => self.toggle_timestamps(),
             _ => return false,
         }
         true
@@ -722,7 +751,7 @@ impl App {
         // Notify once, when the session is first created.
         if self.session_id.is_none() {
             let id = hrdr_agent::unique_session_id(&cwd.display().to_string(), &name);
-            self.transcript.push(Entry::System(format!(
+            self.push_entry(Entry::System(format!(
                 "session saved as '{id}' — /resume {id}"
             )));
             self.session_id = Some(id);
@@ -842,7 +871,7 @@ impl App {
 
     /// Rebuild the display transcript from a restored message history.
     fn rebuild_transcript(&mut self, msgs: &[Message]) {
-        self.transcript.clear();
+        self.clear_transcript();
         // Map tool_call_id → (result, ok) from the tool-result messages.
         let mut results: HashMap<String, (String, bool)> = HashMap::new();
         for m in msgs {
@@ -857,18 +886,18 @@ impl App {
             match m.role {
                 MessageRole::User => {
                     if let Some(c) = &m.content {
-                        self.transcript.push(Entry::User(c.clone()));
+                        self.push_entry(Entry::User(c.clone()));
                     }
                 }
                 MessageRole::Assistant => {
                     if let Some(c) = &m.content
                         && !c.is_empty()
                     {
-                        self.transcript.push(Entry::Assistant(c.clone()));
+                        self.push_entry(Entry::Assistant(c.clone()));
                     }
                     for call in m.tool_calls.iter().flatten() {
                         let (result, ok) = results.get(&call.id).cloned().unwrap_or_default();
-                        self.transcript.push(Entry::Tool {
+                        self.push_entry(Entry::Tool {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
                             args: call.function.arguments.clone(),
@@ -949,6 +978,28 @@ impl App {
         }
     }
 
+    /// `/reload` — re-read `AGENTS.md` and re-load config (applying the runtime
+    /// bits that can change live: theme, icons, effort, toggles, temperature).
+    fn reload_cmd(&mut self) {
+        let cfg = AgentConfig::load();
+        self.theme = Theme::load(cfg.theme.as_deref());
+        self.effort = cfg.effort.clone();
+        self.auto_compact_ratio = cfg.auto_compact;
+        self.bell = cfg.bell;
+        self.show_timestamps = cfg.timestamps;
+        self.icon_mode = cfg
+            .icons
+            .as_deref()
+            .and_then(hjkl_icons::IconMode::from_config)
+            .unwrap_or(hjkl_icons::IconMode::Nerd);
+        if let (Some(t), Ok(mut a)) = (cfg.temperature, self.agent.try_lock()) {
+            a.set_temperature(Some(t));
+        }
+        self.cfg = cfg;
+        self.reload_project_docs();
+        self.system("reloaded config (theme, icons, effort, toggles) + AGENTS.md");
+    }
+
     /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
     /// in place (e.g. after `/init` writes one).
     fn reload_project_docs(&mut self) {
@@ -973,7 +1024,7 @@ impl App {
             self.system("can't /init while a turn is running");
             return;
         }
-        self.transcript.push(Entry::System(
+        self.push_entry(Entry::System(
             "/init — exploring the project to write AGENTS.md…".to_string(),
         ));
         self.scroll_offset = 0;
@@ -1108,7 +1159,7 @@ impl App {
                     .iter()
                     .rposition(|e| matches!(e, Entry::User(_)))
                 {
-                    self.transcript.truncate(idx);
+                    self.truncate_transcript(idx);
                 }
                 self.editor.set_content(&t); // restore for editing
                 self.scroll_offset = 0;
@@ -1161,19 +1212,20 @@ impl App {
         }
     }
 
-    /// `/copy [code|all]` — copy the last reply (default), the last code block,
-    /// or the whole transcript to the clipboard.
+    /// `/copy [code|all|msg N]` — copy the last reply (default), the last code
+    /// block, the whole transcript, or a specific numbered message.
     fn copy_cmd(&mut self, arg: &str) {
-        match arg.trim().to_ascii_lowercase().as_str() {
-            "" | "reply" | "last" => match self.last_assistant_text() {
+        let lower = arg.trim().to_ascii_lowercase();
+        match lower.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] | ["reply"] | ["last"] => match self.last_assistant_text() {
                 Some(t) => self.copy_to_clipboard(&t, "last reply"),
                 None => self.system("no assistant reply to copy"),
             },
-            "code" => match self.last_code_block() {
+            ["code"] => match self.last_code_block() {
                 Some(t) => self.copy_to_clipboard(&t, "last code block"),
                 None => self.system("no code block to copy"),
             },
-            "all" | "transcript" => {
+            ["all"] | ["transcript"] => {
                 let t = self.transcript_text();
                 if t.is_empty() {
                     self.system("nothing to copy");
@@ -1181,10 +1233,39 @@ impl App {
                     self.copy_to_clipboard(&t, "transcript");
                 }
             }
-            other => self.system(format!(
-                "usage: /copy [code|all]  (unknown option: {other})"
-            )),
+            ["msg", n] | ["message", n] | ["m", n] => match n.parse::<usize>() {
+                Ok(num) => match self.nth_message_text(num) {
+                    Some(t) => self.copy_to_clipboard(&t, &format!("message #{num}")),
+                    None => self.system(format!("no message #{num} (see the #N tags)")),
+                },
+                Err(_) => self.system("usage: /copy msg <number>"),
+            },
+            _ => self.system("usage: /copy [code | all | msg N]"),
         }
+    }
+
+    /// The text of the Nth (1-based) user/assistant message in the transcript.
+    fn nth_message_text(&self, n: usize) -> Option<String> {
+        if n == 0 {
+            return None;
+        }
+        self.transcript
+            .iter()
+            .filter_map(|e| match e {
+                Entry::User(s) | Entry::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .nth(n - 1)
+    }
+
+    /// `/timestamps` — toggle the per-message timestamp + number headers.
+    fn toggle_timestamps(&mut self) {
+        self.show_timestamps = !self.show_timestamps;
+        self.system(if self.show_timestamps {
+            "timestamps shown"
+        } else {
+            "timestamps hidden"
+        });
     }
 
     /// Write `text` to the system clipboard, reporting success/failure.
@@ -1328,7 +1409,7 @@ impl App {
                     .iter()
                     .rposition(|e| matches!(e, Entry::User(_)))
                 {
-                    self.transcript.truncate(idx);
+                    self.truncate_transcript(idx);
                 }
                 self.scroll_offset = 0;
                 self.spawn_turn(t);
@@ -1353,13 +1434,13 @@ impl App {
         } else {
             "[cancelled]".to_string()
         };
-        self.transcript.push(Entry::System(msg));
+        self.push_entry(Entry::System(msg));
     }
 
     fn spawn_turn(&mut self, input: String) {
         // Commit the message into history at send time (a queued message lives
         // as a pending bottom item until this point).
-        self.transcript.push(Entry::User(input.clone()));
+        self.push_entry(Entry::User(input.clone()));
         // Expand `@file` mentions into attached contents for the model only; the
         // transcript still shows the message as the user typed it.
         let sent = self.expand_mentions(&input);
@@ -1669,11 +1750,11 @@ impl App {
                 }
             }
             TurnMsg::System(text) => {
-                self.transcript.push(Entry::System(text));
+                self.push_entry(Entry::System(text));
                 self.scroll_offset = 0;
             }
             TurnMsg::Diff(text) => {
-                self.transcript.push(Entry::Diff(text));
+                self.push_entry(Entry::Diff(text));
                 self.scroll_offset = 0;
             }
             TurnMsg::Done(err) => {
@@ -1686,14 +1767,14 @@ impl App {
                 match err {
                     Some(e) => {
                         self.status = format!("error: {e}");
-                        self.transcript.push(Entry::System(format!("[error] {e}")));
+                        self.push_entry(Entry::System(format!("[error] {e}")));
                     }
                     None => self.status = "ready".to_string(),
                 }
                 // Append the final stats for the turn (before stats are reset by
                 // any queued turn that spawns next).
                 if let Some(stats) = self.turn_stats() {
-                    self.transcript.push(Entry::Stats(stats));
+                    self.push_entry(Entry::Stats(stats));
                 }
                 // Notify on completion of a non-trivial turn (if enabled).
                 self.maybe_bell();
@@ -1707,7 +1788,7 @@ impl App {
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.
                 if self.should_auto_compact() {
-                    self.transcript.push(Entry::System(
+                    self.push_entry(Entry::System(
                         "context near the limit — auto-compacting…".to_string(),
                     ));
                     self.spawn_compaction(None);
@@ -1728,7 +1809,7 @@ impl App {
                 match res {
                     Ok((before, after)) => {
                         self.status = "ready".to_string();
-                        self.transcript.push(Entry::System(format!(
+                        self.push_entry(Entry::System(format!(
                             "compacted: {before} → {after} messages (summary kept; scrollback \
                              above is preserved for you)"
                         )));
@@ -1799,14 +1880,14 @@ impl App {
                 self.count_token();
                 match self.transcript.last_mut() {
                     Some(Entry::Assistant(s)) => s.push_str(&t),
-                    _ => self.transcript.push(Entry::Assistant(t)),
+                    _ => self.push_entry(Entry::Assistant(t)),
                 }
             }
             AgentEvent::Reasoning(t) => {
                 self.count_token();
                 match self.transcript.last_mut() {
                     Some(Entry::Reasoning(s)) => s.push_str(&t),
-                    _ => self.transcript.push(Entry::Reasoning(t)),
+                    _ => self.push_entry(Entry::Reasoning(t)),
                 }
             }
             AgentEvent::Usage {
@@ -1819,7 +1900,7 @@ impl App {
             }
             AgentEvent::ToolStart { id, name, args } => {
                 self.status = format!("running {name}…");
-                self.transcript.push(Entry::Tool {
+                self.push_entry(Entry::Tool {
                     id,
                     name,
                     args,
@@ -1857,6 +1938,11 @@ impl App {
             }
         }
     }
+}
+
+/// Current local time as `HH:MM`, for per-message timestamps.
+fn timestamp_now() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
 /// Display form of `cwd`, with the home directory collapsed to `~`.
@@ -1940,10 +2026,12 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
+    ("/timestamps", "toggle message timestamps"),
+    ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
-    ("/copy", "copy reply (or 'code' / 'all')"),
+    ("/copy", "copy reply (or 'code' / 'all' / 'msg N')"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
     ("/retry", "re-run last turn (optional model)"),
@@ -1990,8 +2078,8 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Reply", &["/copy", "/retry", "/undo"]),
-    ("Appearance", &["/theme"]),
-    ("Other", &["/help", "/exit"]),
+    ("Appearance", &["/theme", "/timestamps"]),
+    ("Other", &["/reload", "/help", "/exit"]),
 ];
 
 /// Render the grouped, aligned `/help` text.

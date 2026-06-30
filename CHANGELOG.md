@@ -26,6 +26,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Per-message timestamps + numbers: each user/assistant message gets a dim
+  header (`#3 you · 14:32`) showing its number and local send time. Toggle with
+  `/timestamps` (or `ts`); default-on, configurable via `timestamps` in config,
+  `--no-timestamps`, or `$HRDR_TIMESTAMPS`.
+- `/copy msg N` copies a specific numbered message (the `#N` shown by the
+  timestamp headers), alongside the existing `/copy`, `/copy code`, `/copy all`.
+- `/reload` re-reads `AGENTS.md` and the config file, applying the bits that can
+  change live (theme, icons, effort, toggles, temperature) without a restart.
 - `/paste` inserts the system clipboard into the input — and if the clipboard
   holds a path to an existing file, attaches it as an `@mention` instead.
 - `/help` is now grouped by category (Session, Model & sampling, Files &

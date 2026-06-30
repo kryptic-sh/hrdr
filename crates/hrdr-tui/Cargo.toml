@@ -23,3 +23,4 @@ ratatui.workspace = true
 ignore.workspace = true
 hjkl-icons.workspace = true
 hjkl-xdg.workspace = true
+chrono.workspace = true

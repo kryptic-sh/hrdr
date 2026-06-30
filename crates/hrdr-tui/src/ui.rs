@@ -461,17 +461,35 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
     let mut out: Vec<Line> = Vec::new();
-    for entry in &app.transcript {
+    // Number user/assistant messages so `/copy msg N` lines up with the display.
+    let mut msg_num = 0usize;
+    let meta = |out: &mut Vec<Line<'static>>, i: usize, num: usize, role: &str| {
+        if !app.show_timestamps {
+            return;
+        }
+        let time = app.entry_times.get(i).map(String::as_str).unwrap_or("");
+        out.push(Line::from(Span::styled(
+            format!("#{num} {role} · {time}"),
+            Style::default().fg(theme.dim),
+        )));
+    };
+    for (i, entry) in app.transcript.iter().enumerate() {
         match entry {
-            Entry::User(text) => push_text(
-                &mut out,
-                Span::styled("❯ ", Style::default().fg(theme.user).bold()),
-                text,
-                Style::default().fg(theme.user),
-            ),
+            Entry::User(text) => {
+                msg_num += 1;
+                meta(&mut out, i, msg_num, "you");
+                push_text(
+                    &mut out,
+                    Span::styled("❯ ", Style::default().fg(theme.user).bold()),
+                    text,
+                    Style::default().fg(theme.user),
+                );
+            }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
             // inline/code spans), themed from the active hjkl theme.
             Entry::Assistant(text) => {
+                msg_num += 1;
+                meta(&mut out, i, msg_num, "assistant");
                 let events = hjkl_markdown::parse(text);
                 out.extend(hjkl_markdown_tui::to_lines(
                     &events,
