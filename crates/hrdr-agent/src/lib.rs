@@ -63,6 +63,11 @@ pub struct AgentConfig {
     pub provider: Option<String>,
     /// Path to an hjkl theme TOML for the TUI; `None` uses the bundled default.
     pub theme: Option<String>,
+    /// Model context window in tokens, for the status bar's "X of Y" display.
+    /// Derived from the spawned backend when local; set in config for remotes.
+    pub context_window: Option<u32>,
+    /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
+    pub effort: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -77,6 +82,8 @@ impl Default for AgentConfig {
             vim_mode: false,
             provider: None,
             theme: None,
+            context_window: None,
+            effort: None,
         }
     }
 }
@@ -128,6 +135,8 @@ struct FileConfig {
     vim: Option<bool>,
     provider: Option<String>,
     theme: Option<String>,
+    context_window: Option<u32>,
+    effort: Option<String>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -190,6 +199,12 @@ impl AgentConfig {
             }
             if let Some(v) = fc.theme {
                 cfg.theme = Some(v);
+            }
+            if let Some(v) = fc.context_window {
+                cfg.context_window = Some(v);
+            }
+            if let Some(v) = fc.effort {
+                cfg.effort = Some(v);
             }
         }
 

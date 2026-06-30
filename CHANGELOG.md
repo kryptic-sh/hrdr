@@ -22,6 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Status bar above the help line showing working directory, git branch, session
+  input/output token totals, context size (current / window), model, and a
+  reasoning-effort label. Context window comes from the spawned backend (or
+  `context_window` in config); effort from `--effort`/config.
 - Theming via the hjkl theme system: `--theme <path>` (or `theme` in config /
   `$HRDR_THEME`) loads an hjkl theme TOML and maps its palette/`[ui]` styles
   onto hrdr's chat roles (user, assistant, dim chrome, tool/loader accent,

@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long, global = true)]
     theme: Option<String>,
 
+    /// Reasoning-effort label shown in the status bar (e.g. low/medium/high).
+    #[arg(long, global = true)]
+    effort: Option<String>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -132,6 +136,9 @@ async fn main() -> Result<()> {
     if let Some(t) = cli.theme {
         config.theme = Some(t);
     }
+    if let Some(e) = cli.effort {
+        config.effort = Some(e);
+    }
 
     if remote_provider && config.model == "default" {
         eprintln!(
@@ -155,6 +162,10 @@ async fn main() -> Result<()> {
             bcfg.ctx = c;
         }
         bcfg.extra_args = cli.backend_args;
+        // The spawned backend's context window drives the status bar's "X of Y".
+        if config.context_window.is_none() {
+            config.context_window = Some(bcfg.ctx);
+        }
         Some(Backend::ensure(&bcfg, &config.base_url).await?)
     };
 

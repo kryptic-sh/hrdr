@@ -48,8 +48,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     });
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
-    constraints.push(Constraint::Length(1));
-    let status_idx = constraints.len() - 1;
+    constraints.push(Constraint::Length(1)); // status bar
+    let statusbar_idx = constraints.len() - 1;
+    constraints.push(Constraint::Length(1)); // help / keybind line
+    let help_idx = constraints.len() - 1;
 
     let chunks = Layout::vertical(constraints).split(area);
 
@@ -61,7 +63,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_loader(f, app, chunks[i]);
     }
     draw_input(f, app, chunks[input_idx]);
-    draw_status(f, app, chunks[status_idx]);
+    draw_statusbar(f, app, chunks[statusbar_idx]);
+    draw_help(f, app, chunks[help_idx]);
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
@@ -248,7 +251,55 @@ fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Re
     rect
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+/// Rich status bar (above the help line): cwd, git branch, in/out tokens,
+/// context size, model, and effort.
+fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let sep = || Span::styled("  │  ", Style::default().fg(t.dim));
+    let mut spans: Vec<Span> = Vec::new();
+
+    spans.push(Span::styled(
+        format!(" {}", app.dir),
+        Style::default().fg(t.assistant),
+    ));
+    if let Some(branch) = &app.branch {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!(" {branch}"),
+            Style::default().fg(t.success),
+        ));
+    }
+    spans.push(sep());
+    spans.push(Span::styled(
+        format!(
+            "↑{} ↓{}",
+            fmt_count(app.session_in),
+            fmt_count(app.session_out)
+        ),
+        Style::default().fg(t.dim),
+    ));
+    spans.push(sep());
+    let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
+    let ctx_str = match app.context_window {
+        Some(w) => format!("{} of {} ctx", fmt_count(ctx), fmt_count(w as usize)),
+        None => format!("{} ctx", fmt_count(ctx)),
+    };
+    spans.push(Span::styled(ctx_str, Style::default().fg(t.warn)));
+    spans.push(sep());
+    spans.push(Span::styled(
+        app.model.clone(),
+        Style::default().fg(t.assistant),
+    ));
+    if let Some(effort) = &app.effort {
+        spans.push(sep());
+        spans.push(Span::styled(effort.clone(), Style::default().fg(t.warn)));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Help / keybind line.
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let dot = if app.running { "●" } else { "○" };
     let scroll_hint = if app.scroll_offset > 0 {
         format!("  [scroll: {}↑]", app.scroll_offset)
@@ -261,13 +312,23 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         format!("  [{} queued]", app.queue.len())
     };
     let text = format!(
-        "{dot} {}{queue_hint}  │  {}  │  {}{scroll_hint}",
+        "{dot} {}{queue_hint}  │  {}{scroll_hint}",
         app.status,
-        app.model,
         app.editor.keybind_hint(),
     );
     let para = Paragraph::new(text).style(Style::default().fg(app.theme.dim));
     f.render_widget(para, area);
+}
+
+/// Compact token count: `840`, `12.4k`, `1.8M`.
+fn fmt_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn transcript_lines(app: &App) -> Vec<Line<'static>> {

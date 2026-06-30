@@ -63,6 +63,18 @@ pub(crate) struct App {
     pub(crate) running: bool,
     pub(crate) status: String,
     pub(crate) model: String,
+    // ---- status bar info ----
+    /// Working directory, home-shortened for display.
+    pub(crate) dir: String,
+    /// Current git branch, if the cwd is in a repo.
+    pub(crate) branch: Option<String>,
+    /// Model context window in tokens (for "X of Y"), if known.
+    pub(crate) context_window: Option<u32>,
+    /// Reasoning-effort label to display.
+    pub(crate) effort: Option<String>,
+    /// Cumulative input/output tokens across the session.
+    pub(crate) session_in: usize,
+    pub(crate) session_out: usize,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -103,6 +115,10 @@ impl App {
         let model = config.model.clone();
         let vim_mode = config.vim_mode;
         let theme = Theme::load(config.theme.as_deref());
+        let dir = display_dir(&config.cwd);
+        let branch = git_branch(&config.cwd);
+        let context_window = config.context_window;
+        let effort = config.effort.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -127,6 +143,12 @@ impl App {
             running: false,
             status: "ready".to_string(),
             model,
+            dir,
+            branch,
+            context_window,
+            effort,
+            session_in: 0,
+            session_out: 0,
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -483,6 +505,8 @@ impl App {
                 completion_tokens,
             } => {
                 self.last_usage = Some((prompt_tokens, completion_tokens));
+                self.session_in += prompt_tokens as usize;
+                self.session_out += completion_tokens as usize;
             }
             AgentEvent::ToolStart { id, name, args } => {
                 self.status = format!("running {name}…");
@@ -523,6 +547,49 @@ impl App {
                 self.status = "ready".to_string();
             }
         }
+    }
+}
+
+/// Display form of `cwd`, with the home directory collapsed to `~`.
+fn display_dir(cwd: &std::path::Path) -> String {
+    let s = cwd.to_string_lossy().to_string();
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(rest) = s.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    s
+}
+
+/// Current git branch (or short detached-HEAD sha) by walking up from `cwd` to
+/// the repo root and reading `.git/HEAD`. Cheap, no subprocess.
+fn git_branch(cwd: &std::path::Path) -> Option<String> {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        let git = d.join(".git");
+        if git.is_dir() {
+            return std::fs::read_to_string(git.join("HEAD"))
+                .ok()
+                .and_then(|h| parse_head(&h));
+        }
+        if git.is_file()
+            && let Ok(content) = std::fs::read_to_string(&git)
+            && let Some(p) = content.strip_prefix("gitdir:")
+            && let Ok(head) = std::fs::read_to_string(std::path::Path::new(p.trim()).join("HEAD"))
+        {
+            return parse_head(&head);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+fn parse_head(head: &str) -> Option<String> {
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        None if !head.is_empty() => Some(head.chars().take(7).collect()),
+        None => None,
     }
 }
 
