@@ -12,6 +12,8 @@ use crate::app::{App, Entry};
 use crate::theme::Theme;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
+/// Diff results (edit/write_file) get a larger preview since the diff is the point.
+const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
 /// Input box grows with content up to this many text rows (plus 2 for borders).
@@ -445,22 +447,47 @@ fn push_tool(
         Span::styled(format!(" {args_preview}"), Style::default().fg(theme.dim)),
     ]));
     if done && !result.is_empty() {
-        for line in result.lines().take(TOOL_RESULT_PREVIEW_LINES) {
+        // edit/write_file return a unified diff — color it and show more lines.
+        let is_diff = matches!(name, "edit" | "write_file");
+        let preview = if is_diff {
+            DIFF_PREVIEW_LINES
+        } else {
+            TOOL_RESULT_PREVIEW_LINES
+        };
+        for line in result.lines().take(preview) {
+            let color = if is_diff {
+                diff_line_color(line, theme)
+            } else {
+                theme.dim
+            };
             out.push(Line::from(Span::styled(
                 format!("  {line}"),
-                Style::default().fg(theme.dim),
+                Style::default().fg(color),
             )));
         }
-        let extra = result
-            .lines()
-            .count()
-            .saturating_sub(TOOL_RESULT_PREVIEW_LINES);
+        let extra = result.lines().count().saturating_sub(preview);
         if extra > 0 {
             out.push(Line::from(Span::styled(
                 format!("  … (+{extra} more lines)"),
                 Style::default().fg(theme.dim),
             )));
         }
+    }
+}
+
+/// Color for one unified-diff line: additions green, deletions red, hunk
+/// headers in the accent color, file headers and context dim.
+fn diff_line_color(line: &str, theme: &Theme) -> Color {
+    if line.starts_with("+++") || line.starts_with("---") {
+        theme.dim
+    } else if line.starts_with('@') {
+        theme.user
+    } else if line.starts_with('+') {
+        theme.success
+    } else if line.starts_with('-') {
+        theme.error
+    } else {
+        theme.dim
     }
 }
 

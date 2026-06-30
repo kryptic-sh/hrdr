@@ -26,6 +26,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Diff rendering: `edit` and `write_file` now return a unified diff (also fed to
+  the model), shown in the TUI with additions green, deletions red, and hunk
+  headers in the accent color. New-file writes show a concise create summary.
+- Markdown now renders the full GFM set — tables, task lists, nested lists,
+  blockquotes, strikethrough, images — via the upgraded `hjkl-markdown(-tui)`.
 - Markdown rendering of assistant messages (headings, bold/italic, lists,
   inline/code spans, links, rules) via `hjkl-markdown` + `hjkl-markdown-tui`,
   themed from the active hjkl theme. (Per-language syntax highlighting of code

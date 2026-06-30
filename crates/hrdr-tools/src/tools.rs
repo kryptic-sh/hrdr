@@ -105,17 +105,52 @@ impl Tool for WriteTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: WriteArgs = serde_json::from_value(args).context("invalid write_file args")?;
         let path = ctx.resolve(&a.path);
+        let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        let old = if existed {
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let bytes = a.content.len();
-        tokio::fs::write(&path, a.content)
+        tokio::fs::write(&path, &a.content)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        Ok(format!("Wrote {bytes} bytes to {}", path.display()))
+        if existed {
+            let diff = unified_diff(&path.display().to_string(), &old, &a.content);
+            let body = if diff.is_empty() {
+                "(no changes)".to_string()
+            } else {
+                diff
+            };
+            Ok(truncate(
+                &format!("Wrote {bytes} bytes to {}\n{body}", path.display()),
+                ctx.max_output,
+            ))
+        } else {
+            Ok(format!(
+                "Created {} ({} lines)",
+                path.display(),
+                a.content.lines().count()
+            ))
+        }
     }
+}
+
+/// A unified diff of `old` → `new` for `path`, or empty if unchanged.
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }
 
 // ---- edit ----
@@ -173,12 +208,16 @@ impl Tool for EditTool {
         } else {
             text.replacen(&a.old_string, &a.new_string, 1)
         };
-        tokio::fs::write(&path, updated)
+        tokio::fs::write(&path, &updated)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        Ok(format!(
-            "Replaced {count} occurrence(s) in {}",
-            path.display()
+        let diff = unified_diff(&path.display().to_string(), &text, &updated);
+        Ok(truncate(
+            &format!(
+                "Replaced {count} occurrence(s) in {}\n{diff}",
+                path.display()
+            ),
+            ctx.max_output,
         ))
     }
 }
@@ -517,6 +556,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo qux baz");
+    }
+
+    #[tokio::test]
+    async fn edit_result_includes_unified_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "two", "new_string": "TWO"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("-line two") && out.contains("+line TWO"),
+            "expected diff lines, got: {out}"
+        );
     }
 
     #[tokio::test]
