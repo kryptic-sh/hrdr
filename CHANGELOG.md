@@ -33,6 +33,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Live tool output streaming: long-running tools (notably `bash`) now stream
+  their stdout/stderr into the transcript line-by-line as it's produced, instead
+  of showing nothing until the tool finishes — the running tool entry shows the
+  live tail (with a count of earlier lines). Plumbed via a per-call output sink
+  on `ToolContext` and a new `AgentEvent::ToolOutput`; headless `run` streams it
+  to stderr.
 - Config persistence + hot reload: changing a preference in the client
   (`/timestamps`, `/statusbar`, `/theme`, `/effort`, `/temp`) now writes it to
   `~/.config/hrdr/config.toml` (format/comment-preserving via `toml_edit`). hrdr

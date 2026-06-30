@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{TodoItem, Tool, ToolContext, truncate};
 
@@ -261,30 +262,56 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
-        let output = tokio::time::timeout(timeout, cmd.output())
-            .await
-            .map_err(|_| anyhow!("command timed out after {}ms", timeout.as_millis()))?
-            .context("spawning bash")?;
+
+        let mut child = cmd.spawn().context("spawning bash")?;
+        let stdout = child.stdout.take().context("capturing stdout")?;
+        let stderr = child.stderr.take().context("capturing stderr")?;
+        let mut out_lines = BufReader::new(stdout).lines();
+        let mut err_lines = BufReader::new(stderr).lines();
+
+        // Read stdout + stderr concurrently, accumulating the full output while
+        // streaming each line to the UI sink. Interleaving order between the two
+        // streams isn't guaranteed, which is fine for a live view.
         let mut out = String::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stdout.is_empty() {
-            out.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !out.is_empty() {
-                out.push('\n');
+        let collect = async {
+            let mut out_done = false;
+            let mut err_done = false;
+            loop {
+                tokio::select! {
+                    r = out_lines.next_line(), if !out_done => match r? {
+                        Some(line) => emit_line(&mut out, ctx, line),
+                        None => out_done = true,
+                    },
+                    r = err_lines.next_line(), if !err_done => match r? {
+                        Some(line) => emit_line(&mut out, ctx, line),
+                        None => err_done = true,
+                    },
+                    else => break,
+                }
             }
-            out.push_str(&stderr);
+            let status = child.wait().await.context("waiting on bash")?;
+            anyhow::Ok(status)
+        };
+        let status = tokio::time::timeout(timeout, collect)
+            .await
+            .map_err(|_| anyhow!("command timed out after {}ms", timeout.as_millis()))??;
+
+        if !status.success() {
+            out.push_str(&format!("[exit status: {status}]\n"));
         }
-        if !output.status.success() {
-            out.push_str(&format!("\n[exit status: {}]", output.status));
-        }
+        let out = out.trim_end();
         if out.is_empty() {
-            out.push_str("(no output)");
+            return Ok("(no output)".to_string());
         }
-        Ok(truncate(&out, ctx.max_output))
+        Ok(truncate(out, ctx.max_output))
     }
+}
+
+/// Append a captured line (with newline) to `out` and stream it to the UI sink.
+fn emit_line(out: &mut String, ctx: &ToolContext, line: String) {
+    out.push_str(&line);
+    out.push('\n');
+    ctx.emit(format!("{line}\n"));
 }
 
 // ---- grep ----

@@ -968,15 +968,20 @@ fn push_tool(
         Span::styled(name.to_string(), Style::default().fg(theme.warn).bold()),
         Span::styled(format!(" {args_preview}"), Style::default().fg(theme.dim)),
     ]));
-    if done && !result.is_empty() {
-        // edit/write_file return a unified diff — color it and show more lines.
-        let is_diff = matches!(name, "edit" | "write_file");
-        let preview = if is_diff {
-            DIFF_PREVIEW_LINES
-        } else {
-            TOOL_RESULT_PREVIEW_LINES
-        };
-        for line in result.lines().take(preview) {
+    if result.is_empty() {
+        return;
+    }
+    // edit/write_file return a unified diff — color it and show more lines.
+    let is_diff = matches!(name, "edit" | "write_file");
+    let preview = if is_diff {
+        DIFF_PREVIEW_LINES
+    } else {
+        TOOL_RESULT_PREVIEW_LINES
+    };
+    let lines: Vec<&str> = result.lines().collect();
+    if done {
+        // Finished: show the head of the result.
+        for line in lines.iter().take(preview) {
             let color = if is_diff {
                 diff_line_color(line, theme)
             } else {
@@ -987,10 +992,25 @@ fn push_tool(
                 Style::default().fg(color),
             )));
         }
-        let extra = result.lines().count().saturating_sub(preview);
+        let extra = lines.len().saturating_sub(preview);
         if extra > 0 {
             out.push(Line::from(Span::styled(
                 format!("  … (+{extra} more lines)"),
+                Style::default().fg(theme.dim),
+            )));
+        }
+    } else {
+        // Still running: show the live tail so the newest output is visible.
+        let start = lines.len().saturating_sub(preview);
+        if start > 0 {
+            out.push(Line::from(Span::styled(
+                format!("  ⋮ (live · {start} earlier line(s))"),
+                Style::default().fg(theme.dim),
+            )));
+        }
+        for line in &lines[start..] {
+            out.push(Line::from(Span::styled(
+                format!("  {line}"),
                 Style::default().fg(theme.dim),
             )));
         }

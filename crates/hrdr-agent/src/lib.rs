@@ -36,6 +36,8 @@ pub enum AgentEvent {
         name: String,
         args: String,
     },
+    /// A chunk of live output streamed by a running tool (e.g. `bash`).
+    ToolOutput { id: String, chunk: String },
     /// A tool call finished.
     ToolEnd {
         id: String,
@@ -701,7 +703,12 @@ impl Agent {
                 });
 
                 let result = self
-                    .run_tool(&call.function.name, &call.function.arguments)
+                    .run_tool_streaming(
+                        &call.id,
+                        &call.function.name,
+                        &call.function.arguments,
+                        &mut on_event,
+                    )
                     .await;
                 let (ok, body) = match result {
                     Ok(s) => (true, s),
@@ -721,14 +728,45 @@ impl Agent {
         bail!("agent exceeded max_steps ({})", self.max_steps);
     }
 
-    async fn run_tool(&self, name: &str, raw_args: &str) -> Result<String> {
+    /// Execute a tool, forwarding any live output it streams as `ToolOutput`
+    /// events while it runs.
+    async fn run_tool_streaming<F: FnMut(AgentEvent)>(
+        &self,
+        id: &str,
+        name: &str,
+        raw_args: &str,
+        on_event: &mut F,
+    ) -> Result<String> {
         let args: serde_json::Value = if raw_args.trim().is_empty() {
             serde_json::json!({})
         } else {
             serde_json::from_str(raw_args)
                 .map_err(|e| anyhow::anyhow!("invalid tool arguments JSON: {e}"))?
         };
-        self.tools.execute(name, args, &self.ctx).await
+        // Attach a per-call output sink so the tool can stream progress.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = self.ctx.clone();
+        ctx.stream = Some(tx);
+
+        let fut = self.tools.execute(name, args, &ctx);
+        tokio::pin!(fut);
+        let result = loop {
+            tokio::select! {
+                r = &mut fut => break r,
+                Some(chunk) = rx.recv() => on_event(AgentEvent::ToolOutput {
+                    id: id.to_string(),
+                    chunk,
+                }),
+            }
+        };
+        // Drain any chunks buffered between the last poll and completion.
+        while let Ok(chunk) = rx.try_recv() {
+            on_event(AgentEvent::ToolOutput {
+                id: id.to_string(),
+                chunk,
+            });
+        }
+        result
     }
 }
 

@@ -45,6 +45,10 @@ pub struct ToolContext {
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
+    /// Optional live-output sink: long-running tools (e.g. `bash`) send partial
+    /// output here as it's produced so the UI can show progress. `None` = no
+    /// streaming consumer.
+    pub stream: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl ToolContext {
@@ -53,6 +57,14 @@ impl ToolContext {
             cwd: cwd.into(),
             todos: Arc::new(Mutex::new(Vec::new())),
             max_output: DEFAULT_MAX_OUTPUT,
+            stream: None,
+        }
+    }
+
+    /// Send a chunk of live output to the streaming sink, if one is attached.
+    pub fn emit(&self, chunk: impl Into<String>) {
+        if let Some(tx) = &self.stream {
+            let _ = tx.send(chunk.into());
         }
     }
 

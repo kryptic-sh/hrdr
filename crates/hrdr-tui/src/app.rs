@@ -2336,6 +2336,23 @@ impl App {
                     done: false,
                 });
             }
+            AgentEvent::ToolOutput { id, chunk } => {
+                // Append live output to the running tool's entry.
+                for entry in self.transcript.iter_mut().rev() {
+                    if let Entry::Tool {
+                        id: tid,
+                        result: r,
+                        done,
+                        ..
+                    } = entry
+                        && *tid == id
+                        && !*done
+                    {
+                        r.push_str(&chunk);
+                        break;
+                    }
+                }
+            }
             AgentEvent::ToolEnd {
                 id,
                 result,
