@@ -1607,7 +1607,11 @@ fn active_file_token(input: &str) -> Option<(usize, String)> {
     Some((at, query.to_string()))
 }
 
-/// Directory names skipped when indexing files for `@` completion.
+/// Max files indexed and max directory depth walked for `@file` completion.
+const WALK_MAX_FILES: usize = 20_000;
+const WALK_MAX_DEPTH: usize = 12;
+
+/// Directory names skipped by the fallback walk (non-git projects).
 const WALK_SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -1621,15 +1625,55 @@ const WALK_SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// Collect relative file paths under `root` for `@file` completion. Bounded in
-/// depth and count, skipping VCS/build directories and hidden directories.
+/// Collect relative file paths under `root` for `@file` completion. In a git
+/// repo, honors `.gitignore`/`.ignore` (and parents/global) + `.git/info/exclude`
+/// via the `ignore` crate; outside one, falls back to a manual walk that skips
+/// known VCS/build and hidden directories.
 fn walk_files(root: &std::path::Path) -> Vec<String> {
-    const MAX_FILES: usize = 20_000;
-    const MAX_DEPTH: usize = 12;
+    if in_git_repo(root) {
+        walk_files_gitignore(root)
+    } else {
+        walk_files_fallback(root)
+    }
+}
+
+/// Whether `root` (or an ancestor) is inside a git repo. `.git` may be a
+/// directory (normal) or a file (worktrees/submodules).
+fn in_git_repo(root: &std::path::Path) -> bool {
+    root.ancestors().any(|d| d.join(".git").exists())
+}
+
+/// Gitignore-aware walk (ripgrep's walker).
+fn walk_files_gitignore(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .max_depth(Some(WALK_MAX_DEPTH))
+        .hidden(true) // skip dotfiles/dotdirs
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .build();
+    for entry in walker.flatten() {
+        if out.len() >= WALK_MAX_FILES {
+            break;
+        }
+        if entry.file_type().is_some_and(|t| t.is_file())
+            && let Ok(rel) = entry.path().strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Fallback walk for non-git directories: skip hidden + known build/VCS dirs.
+fn walk_files_fallback(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
-        if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        if depth > WALK_MAX_DEPTH || out.len() >= WALK_MAX_FILES {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1649,7 +1693,7 @@ fn walk_files(root: &std::path::Path) -> Vec<String> {
                 && let Ok(rel) = path.strip_prefix(root)
             {
                 out.push(rel.to_string_lossy().replace('\\', "/"));
-                if out.len() >= MAX_FILES {
+                if out.len() >= WALK_MAX_FILES {
                     break;
                 }
             }

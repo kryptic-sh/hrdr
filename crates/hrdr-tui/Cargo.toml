@@ -20,3 +20,4 @@ tokio.workspace = true
 futures-util.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+ignore.workspace = true
