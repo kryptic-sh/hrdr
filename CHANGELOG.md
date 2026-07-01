@@ -79,6 +79,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Tool output in the TUI now renders on a distinct panel background (the same
+  shade as fenced code blocks) so each tool call reads as a self-contained
+  block, and **clicking a tool block toggles its full output** — a per-entry
+  `/expand` by mouse. The truncation hint reflects it
+  (`… (+N more lines · click or /expand)` /
+  `⌃ (click or /expand off to collapse)`); the click is hit-tested against the
+  tool's on-screen rows (accounting for wrapping + scroll).
+
 - Internal: the TUI `App` is now render- and terminal-I/O-agnostic — a first
   step toward a GUI frontend sharing the same core. The ratatui event loop +
   terminal ownership moved out of `impl App` into a new `tui` driver module;

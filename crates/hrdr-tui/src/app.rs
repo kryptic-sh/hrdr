@@ -184,6 +184,10 @@ pub(crate) struct App {
     /// Screen rect of the "follow output" button, set during draw while scrolled
     /// up so mouse clicks can hit-test against it. `None` when following.
     pub(crate) follow_button: Option<HitRect>,
+    /// Clickable screen rects for each visible tool block → its transcript index,
+    /// set during draw. A left click toggles that tool's `expanded` (like a
+    /// per-entry `/expand`).
+    pub(crate) tool_hits: Vec<(HitRect, usize)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -309,6 +313,7 @@ impl App {
             todo_ttl,
             queue: VecDeque::new(),
             follow_button: None,
+            tool_hits: Vec::new(),
             quit_armed: false,
             turn_started: None,
             turn_started_at: None,
@@ -558,6 +563,18 @@ impl App {
                     && rect.contains(m.column, m.row)
                 {
                     self.scroll_offset = 0;
+                    return;
+                }
+                // Click a tool block to toggle its full output (per-entry /expand).
+                let hit = self
+                    .tool_hits
+                    .iter()
+                    .find(|(r, _)| r.contains(m.column, m.row))
+                    .map(|(_, i)| *i);
+                if let Some(idx) = hit
+                    && let Some(Entry::Tool { expanded, .. }) = self.transcript.get_mut(idx)
+                {
+                    *expanded = !*expanded;
                 }
             }
             _ => {}

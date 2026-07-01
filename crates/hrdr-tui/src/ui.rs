@@ -154,7 +154,26 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
 
-    let (lines, msg_starts) = transcript_lines(app, text_area.width);
+    let (lines, msg_starts, tool_regions) = transcript_lines(app, text_area.width);
+    // Cumulative wrapped-row height at each logical-line boundary, so each tool
+    // block's span can be mapped to on-screen rows for click hit-testing. Built
+    // before `lines` is consumed by the Paragraph below.
+    let cum: Vec<u16> = if tool_regions.is_empty() {
+        Vec::new()
+    } else {
+        let mut cum = Vec::with_capacity(lines.len() + 1);
+        let mut acc = 0u16;
+        cum.push(0);
+        for line in &lines {
+            let h = Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(text_area.width)
+                .max(1) as u16;
+            acc = acc.saturating_add(h);
+            cum.push(acc);
+        }
+        cum
+    };
     // Resolve a pending /goto to a from-top wrapped-row offset before `lines`
     // is consumed by the Paragraph.
     let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
@@ -192,6 +211,31 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.scroll_offset = offset as usize;
     app.max_scroll = max_scroll as usize;
     let scroll = max_scroll.saturating_sub(offset);
+
+    // Map each tool block's wrapped-row span to the visible screen rows (clipped
+    // to the viewport) so a left click can toggle that tool's expansion.
+    app.tool_hits.clear();
+    if !cum.is_empty() {
+        let view_end = scroll.saturating_add(area.height);
+        let last = cum.len() - 1;
+        for (lstart, lend, idx) in tool_regions {
+            let ws = cum[lstart.min(last)];
+            let we = cum[lend.min(last)];
+            let vis_start = ws.max(scroll);
+            let vis_end = we.min(view_end);
+            if vis_end > vis_start {
+                app.tool_hits.push((
+                    crate::app::HitRect {
+                        x: text_area.x,
+                        y: text_area.y + (vis_start - scroll),
+                        w: text_area.width,
+                        h: vis_end - vis_start,
+                    },
+                    idx,
+                ));
+            }
+        }
+    }
 
     f.render_widget(para.scroll((scroll, 0)), text_area);
 
@@ -703,14 +747,20 @@ fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'stat
     lines
 }
 
-fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
-    let ss = syntax_set();
-    let theme = syntect_theme();
-    let bg = theme
+/// The shared panel background for code blocks and tool output (the syntect
+/// theme's background, with a dark fallback), so both render as solid blocks.
+fn panel_bg() -> Color {
+    syntect_theme()
         .settings
         .background
         .map(|c| Color::Rgb(c.r, c.g, c.b))
-        .unwrap_or(Color::Rgb(30, 32, 40));
+        .unwrap_or(Color::Rgb(30, 32, 40))
+}
+
+fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
+    let ss = syntax_set();
+    let theme = syntect_theme();
+    let bg = panel_bg();
     let bg_only = Style::default().bg(bg);
     let syntax = ss
         .find_syntax_by_token(lang)
@@ -767,13 +817,19 @@ fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'sta
     Line::from(spans)
 }
 
-/// Returns the rendered transcript lines plus, for each user/assistant message
-/// (1-based), the logical-line index where it starts (for `/goto`).
-fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
+/// Returns the rendered transcript lines, the logical-line index each 1-based
+/// user/assistant message starts at (for `/goto`), and each tool block's
+/// `(logical_start, logical_end, transcript_index)` span (for click-to-expand).
+#[allow(clippy::type_complexity)]
+fn transcript_lines(
+    app: &App,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<(usize, usize, usize)>) {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
     let mut out: Vec<Line> = Vec::new();
     let mut msg_starts: Vec<usize> = Vec::new();
+    let mut tool_regions: Vec<(usize, usize, usize)> = Vec::new();
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
     let meta = |out: &mut Vec<Line<'static>>, i: usize, num: usize, role: &str| {
@@ -849,16 +905,21 @@ fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
                 done,
                 expanded,
                 ..
-            } => push_tool(
-                &mut out,
-                theme,
-                name,
-                args,
-                result,
-                *ok,
-                *done,
-                *expanded || app.expand_tools,
-            ),
+            } => {
+                let start = out.len();
+                push_tool(
+                    &mut out,
+                    theme,
+                    name,
+                    args,
+                    result,
+                    *ok,
+                    *done,
+                    *expanded || app.expand_tools,
+                    width as usize,
+                );
+                tool_regions.push((start, out.len(), i));
+            }
             Entry::System(text) => push_text(
                 &mut out,
                 Span::raw(""),
@@ -920,7 +981,7 @@ fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         }
     }
 
-    (out, msg_starts)
+    (out, msg_starts, tool_regions)
 }
 
 fn push_text(out: &mut Vec<Line<'static>>, prefix: Span<'static>, text: &str, style: Style) {
@@ -946,7 +1007,12 @@ fn push_tool(
     ok: bool,
     done: bool,
     expanded: bool,
+    width: usize,
 ) {
+    // Tool blocks sit on the shared panel background (like code blocks), so each
+    // line's spans carry `bg` and are padded out to the full width.
+    let bg = panel_bg();
+    let dim_bg = Style::default().fg(theme.dim).bg(bg);
     let mark = if !done {
         ("…", theme.warn)
     } else if ok {
@@ -955,11 +1021,15 @@ fn push_tool(
         ("✗", theme.error)
     };
     let args_preview = hrdr_tools::truncate_inline(args, 80);
-    out.push(Line::from(vec![
-        Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1)),
-        Span::styled(name.to_string(), Style::default().fg(theme.warn).bold()),
-        Span::styled(format!(" {args_preview}"), Style::default().fg(theme.dim)),
-    ]));
+    out.push(pad_line(
+        vec![
+            Span::styled(format!(" {} ", mark.0), Style::default().fg(mark.1).bg(bg)),
+            Span::styled(name.to_string(), Style::default().fg(theme.warn).bg(bg).bold()),
+            Span::styled(format!(" {args_preview}"), dim_bg),
+        ],
+        width,
+        bg,
+    ));
     if result.is_empty() {
         return;
     }
@@ -980,32 +1050,43 @@ fn push_tool(
             } else {
                 theme.dim
             };
-            out.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(color),
-            )));
+            out.push(pad_line(
+                vec![Span::styled(
+                    format!("   {line}"),
+                    Style::default().fg(color).bg(bg),
+                )],
+                width,
+                bg,
+            ));
         }
         let extra = lines.len().saturating_sub(shown);
         if extra > 0 {
-            out.push(Line::from(Span::styled(
-                format!("  … (+{extra} more lines · /expand)"),
-                Style::default().fg(theme.dim),
-            )));
+            let hint = if expanded {
+                "   ⌃ (click or /expand off to collapse)".to_string()
+            } else {
+                format!("   … (+{extra} more lines · click or /expand)")
+            };
+            out.push(pad_line(vec![Span::styled(hint, dim_bg)], width, bg));
         }
     } else {
         // Still running: show the live tail so the newest output is visible.
         let start = lines.len().saturating_sub(preview);
         if start > 0 {
-            out.push(Line::from(Span::styled(
-                format!("  ⋮ (live · {start} earlier line(s))"),
-                Style::default().fg(theme.dim),
-            )));
+            out.push(pad_line(
+                vec![Span::styled(
+                    format!("   ⋮ (live · {start} earlier line(s))"),
+                    dim_bg,
+                )],
+                width,
+                bg,
+            ));
         }
         for line in &lines[start..] {
-            out.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(theme.dim),
-            )));
+            out.push(pad_line(
+                vec![Span::styled(format!("   {line}"), dim_bg)],
+                width,
+                bg,
+            ));
         }
     }
 }
