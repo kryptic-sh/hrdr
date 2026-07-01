@@ -20,6 +20,10 @@ use tokio::task::JoinHandle;
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
 
+/// How many turns a completed TODO item stays visible before it's pruned from
+/// the list. It's shown on the turn it completes and the next four turns.
+const TODO_COMPLETED_TTL: u64 = 5;
+
 use crate::Tui;
 use crate::theme::Theme;
 use crate::ui;
@@ -202,6 +206,12 @@ pub(crate) struct App {
     pub(crate) max_scroll: usize,
     /// Shared TODO list updated live by the `todo_write` tool.
     pub(crate) todos: Arc<Mutex<Vec<Todo>>>,
+    /// Count of completed turns, used to age out finished TODO items.
+    todo_turn: u64,
+    /// Turn (in `todo_turn` units) each completed TODO was first seen finished,
+    /// keyed by content. Completed items are pruned `TODO_COMPLETED_TTL` turns
+    /// after that so the list doesn't accrete stale checkmarks.
+    todo_completed_at: HashMap<String, u64>,
     /// Messages submitted while a turn is running, processed FIFO once it ends.
     pub(crate) queue: VecDeque<String>,
     /// Screen rect of the "follow output" button, set during draw while scrolled
@@ -326,6 +336,8 @@ impl App {
             transcript_height: 24,
             max_scroll: 0,
             todos,
+            todo_turn: 0,
+            todo_completed_at: HashMap::new(),
             queue: VecDeque::new(),
             follow_button: None,
             quit_armed: false,
@@ -731,6 +743,13 @@ impl App {
         self.entry_times.truncate(len);
     }
 
+    /// Age out finished TODO items. Called once per turn (on `TurnDone`).
+    fn prune_completed_todos(&mut self) {
+        if let Ok(mut todos) = self.todos.lock() {
+            age_completed_todos(&mut todos, &mut self.todo_completed_at, self.todo_turn);
+        }
+    }
+
     /// Dispatch a known slash command. Returns `true` if it was a recognized
     /// command (and thus shouldn't be sent to the model); unknown `/…` input
     /// returns `false` so it goes to the model (e.g. a literal path).
@@ -755,6 +774,8 @@ impl App {
                 if let Ok(mut todos) = self.todos.lock() {
                     todos.clear();
                 }
+                self.todo_turn = 0;
+                self.todo_completed_at.clear();
                 self.scroll_offset = 0;
                 self.max_scroll = 0;
                 self.session_in = 0;
@@ -2529,7 +2550,10 @@ impl App {
                 self.push_entry(Entry::System(text));
                 self.scroll_offset = 0;
             }
-            AgentEvent::TurnDone => {}
+            AgentEvent::TurnDone => {
+                self.todo_turn += 1;
+                self.prune_completed_todos();
+            }
         }
     }
 }
@@ -3054,6 +3078,30 @@ pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)
 /// Whether a submitted line is a common "quit the session" command, matched
 /// across popular CLIs/REPLs/editors so users feel at home: bare `exit`/`quit`,
 /// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
+/// Age out finished TODO items in place. Stamps each completed item with the
+/// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
+/// any completed item that has been finished for `TODO_COMPLETED_TTL` turns.
+/// Stamps for items no longer present as completed are forgotten, so a
+/// re-completed item ages from scratch. Pending / in-progress items are kept.
+fn age_completed_todos(todos: &mut Vec<Todo>, stamps: &mut HashMap<String, u64>, turn: u64) {
+    for t in todos.iter() {
+        if t.status == "completed" {
+            stamps.entry(t.content.clone()).or_insert(turn);
+        }
+    }
+    todos.retain(|t| {
+        t.status != "completed"
+            || stamps
+                .get(&t.content)
+                .is_none_or(|&done| turn.saturating_sub(done) < TODO_COMPLETED_TTL)
+    });
+    stamps.retain(|content, _| {
+        todos
+            .iter()
+            .any(|t| t.status == "completed" && &t.content == content)
+    });
+}
+
 /// Resolve a slash-command alias to its canonical name (case-insensitive), so
 /// users coming from other agents can use familiar names. Unknown names pass
 /// through unchanged.
@@ -3117,9 +3165,68 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use super::{
-        active_file_token, is_quit_command, last_fenced_block, parse_duration, parse_msg_range,
-        resolve_alias, slash_completions, walk_files_gitignore,
+        TODO_COMPLETED_TTL, Todo, active_file_token, age_completed_todos, is_quit_command,
+        last_fenced_block, parse_duration, parse_msg_range, resolve_alias, slash_completions,
+        walk_files_gitignore,
     };
+    use std::collections::HashMap;
+
+    fn todo(content: &str, status: &str) -> Todo {
+        Todo {
+            content: content.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn completed_todos_age_out_after_ttl() {
+        let mut stamps = HashMap::new();
+        let mut todos = vec![todo("a", "completed"), todo("b", "in_progress")];
+
+        // Turn it completes and the next TTL-1 turns: still shown.
+        for turn in 0..TODO_COMPLETED_TTL {
+            age_completed_todos(&mut todos, &mut stamps, turn);
+            assert!(
+                todos.iter().any(|t| t.content == "a"),
+                "completed item should survive turn {turn}"
+            );
+        }
+        // TTL turns after completion: pruned. The in-progress item stays.
+        age_completed_todos(&mut todos, &mut stamps, TODO_COMPLETED_TTL);
+        assert!(!todos.iter().any(|t| t.content == "a"));
+        assert!(todos.iter().any(|t| t.content == "b"));
+        assert!(stamps.is_empty(), "stamp forgotten once the item is gone");
+    }
+
+    #[test]
+    fn pending_todos_are_never_pruned() {
+        let mut stamps = HashMap::new();
+        let mut todos = vec![todo("keep", "pending")];
+        for turn in 0..(TODO_COMPLETED_TTL * 3) {
+            age_completed_todos(&mut todos, &mut stamps, turn);
+        }
+        assert_eq!(todos.len(), 1);
+        assert!(stamps.is_empty());
+    }
+
+    #[test]
+    fn recompleted_item_ages_from_scratch() {
+        let mut stamps = HashMap::new();
+        // Completed at turn 0.
+        let mut todos = vec![todo("x", "completed")];
+        age_completed_todos(&mut todos, &mut stamps, 0);
+        // Model flips it back to in_progress at turn 2 → stamp forgotten.
+        todos[0].status = "in_progress".to_string();
+        age_completed_todos(&mut todos, &mut stamps, 2);
+        assert!(stamps.is_empty());
+        // Re-completed at turn 3 → stamped at 3, so it survives through turn 7.
+        todos[0].status = "completed".to_string();
+        age_completed_todos(&mut todos, &mut stamps, 3);
+        age_completed_todos(&mut todos, &mut stamps, 3 + TODO_COMPLETED_TTL - 1);
+        assert!(todos.iter().any(|t| t.content == "x"));
+        age_completed_todos(&mut todos, &mut stamps, 3 + TODO_COMPLETED_TTL);
+        assert!(!todos.iter().any(|t| t.content == "x"));
+    }
 
     #[test]
     fn gitignore_walk_honors_nested_ignore_files() {

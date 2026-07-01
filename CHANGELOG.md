@@ -31,6 +31,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Finished TODO items now age out of the panel. A completed item stays visible
+  for the turn it finishes plus four more (five turns total), then it's pruned —
+  so the list keeps showing recent progress without accreting stale checkmarks.
+  Pending / in-progress items are never pruned, and an item re-completed after
+  being reopened ages from scratch.
 - The status-bar context readout is simpler — just `{used} of {max}` (no
   percentage or `ctx` label). The used/free fill bar and its green→amber→red
   escalation are unchanged (they already convey the fraction visually).
