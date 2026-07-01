@@ -261,12 +261,12 @@ impl App {
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
              Ctrl+G opens $EDITOR. Type @path to attach a file. /help for commands; \
-             /exit (or Ctrl+C twice) to quit."
+             /exit (Ctrl+C twice, or Ctrl+D on an empty line) to quit."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
              (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Type @path to \
-             attach a file. /help for commands; /exit (or Ctrl+C twice) to quit. Submit while a \
-             reply runs to queue follow-ups."
+             attach a file. /help for commands; /exit (Ctrl+C twice, or Ctrl+D on an empty line) \
+             to quit. Submit while a reply runs to queue follow-ups."
         };
         let mut transcript = vec![Entry::System(welcome.to_string())];
         // Warn (but don't fail) if the config file exists but is invalid — the
@@ -554,6 +554,11 @@ impl App {
                 KeyCode::Char('d') if self.editor.mode_label() == "NORMAL" => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(half);
+                    return Action::None;
+                }
+                // Ctrl+D on an empty input quits (shell-style EOF).
+                KeyCode::Char('d') if self.editor.content().is_empty() => {
+                    self.should_quit = true;
                     return Action::None;
                 }
                 _ => {}

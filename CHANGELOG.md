@@ -96,6 +96,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `/help` is now grouped by category (Session, Model & sampling, Files &
   context, Reply, Appearance, Other) with aligned descriptions and a tips line,
   instead of one flat list.
+- `Ctrl+D` on an empty input quits the client (shell-style EOF). In vim Normal
+  mode `Ctrl+D` still half-page scrolls the transcript (it only quits when the
+  input is empty and you're not in Normal mode).
 - `Ctrl+L` clears and repaints the screen, to recover from terminal corruption
   (e.g. after a stray external write or a garbled resize).
 - Startup endpoint health check: on launch hrdr probes the endpoint in the
