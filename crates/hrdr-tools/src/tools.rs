@@ -702,8 +702,9 @@ mod tests {
         assert!(out.contains("[x] done task"), "completed: {out}");
     }
 
-    // ---- bash ----
+    // ---- bash ---- (unix-only: these spawn a real `bash` shell)
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_echo_captures_output() {
         let c = ctx(std::path::PathBuf::from("."));
@@ -714,6 +715,7 @@ mod tests {
         assert!(out.contains("hello_hrdr"), "echo output missing: {out}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_exit_nonzero_includes_status() {
         let c = ctx(std::path::PathBuf::from("."));
