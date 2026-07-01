@@ -170,6 +170,59 @@ impl Client {
         ids.sort();
         Ok(ids)
     }
+
+    /// Best-effort probe of the server's context window in tokens (for the status
+    /// bar's "X of Y" + the auto-compaction threshold). This is **not** part of
+    /// the OpenAI spec, but many OpenAI-compatible servers advertise it:
+    ///
+    /// - on the `/v1/models` entry as a non-standard field — vLLM's
+    ///   `max_model_len`, LM Studio's `max_context_length`, and similar;
+    /// - or, for llama.cpp, via `GET /props`
+    ///   (`default_generation_settings.n_ctx`).
+    ///
+    /// Returns `None` when nothing exposes it (e.g. OpenAI itself, or infr
+    /// today), so the caller can fall back to a configured/default value.
+    pub async fn context_window(&self) -> Option<u32> {
+        if let Some(n) = self.context_from_models().await {
+            return Some(n);
+        }
+        self.context_from_props().await
+    }
+
+    /// Look for a context-length field on this client's model in `/v1/models`
+    /// (falling back to the first entry if the id doesn't match).
+    async fn context_from_models(&self) -> Option<u32> {
+        let v = self.get_json(&format!("{}/models", self.base_url)).await?;
+        let data = v.get("data")?.as_array()?;
+        let entry = data
+            .iter()
+            .find(|e| e.get("id").and_then(|i| i.as_str()) == Some(self.model.as_str()))
+            .or_else(|| data.first())?;
+        context_field(entry)
+    }
+
+    /// llama.cpp exposes the loaded context via `GET /props` (served at the root,
+    /// not under `/v1`), either top-level or under `default_generation_settings`.
+    async fn context_from_props(&self) -> Option<u32> {
+        let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        let v = self.get_json(&format!("{root}/props")).await?;
+        context_field(&v).or_else(|| v.get("default_generation_settings").and_then(context_field))
+    }
+
+    /// GET `url` with the bearer key (if any) and decode JSON; `None` on any error
+    /// (unreachable endpoint, non-2xx, or unparseable body) — detection is
+    /// best-effort and never fails the caller.
+    async fn get_json(&self, url: &str) -> Option<serde_json::Value> {
+        let mut req = self.http.get(url);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    }
 }
 
 // --- /v1/models response types (local to this module) ---
@@ -182,4 +235,56 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+}
+
+/// Pull a context-window value from a JSON object, trying the field names the
+/// various OpenAI-compatible servers use. Accepts a number or a numeric string;
+/// ignores non-positive values.
+fn context_field(v: &serde_json::Value) -> Option<u32> {
+    const KEYS: &[&str] = &[
+        "max_model_len",      // vLLM
+        "max_context_length", // LM Studio et al.
+        "context_length",     // Ollama-style model_info
+        "context_window",     // generic
+        "n_ctx",              // llama.cpp
+        "context_size",
+        "max_context",
+    ];
+    KEYS.iter()
+        .find_map(|k| v.get(k).and_then(json_u32).filter(|n| *n > 0))
+}
+
+/// Read a `u32` from a JSON number or numeric string.
+fn json_u32(v: &serde_json::Value) -> Option<u32> {
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_common_context_fields() {
+        // vLLM
+        assert_eq!(context_field(&json!({"max_model_len": 32768})), Some(32768));
+        // LM Studio
+        assert_eq!(
+            context_field(&json!({"max_context_length": 8192})),
+            Some(8192)
+        );
+        // llama.cpp /props
+        assert_eq!(context_field(&json!({"n_ctx": 4096})), Some(4096));
+        // numeric string
+        assert_eq!(
+            context_field(&json!({"context_window": "16384"})),
+            Some(16384)
+        );
+        // nothing recognizable (e.g. OpenAI/infr)
+        assert_eq!(context_field(&json!({"id": "m", "object": "model"})), None);
+        // non-positive is ignored
+        assert_eq!(context_field(&json!({"n_ctx": 0})), None);
+    }
 }

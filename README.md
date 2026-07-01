@@ -174,6 +174,14 @@ key_env = "OPENAI_API_KEY"
 model = "gpt-5.5"
 ```
 
+`context_window` is optional: if you omit it, hrdr probes the endpoint on
+startup and uses what it advertises (vLLM's `max_model_len`, llama.cpp's
+`/props` `n_ctx`, etc.), falling back to the spawned backend's `--backend-ctx`
+(default 16384). Set it explicitly to override detection — the OpenAI API
+doesn't expose context length, and some servers (including infr today) don't
+advertise it. It drives the status bar's "X of Y" and the auto-compaction
+threshold.
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.

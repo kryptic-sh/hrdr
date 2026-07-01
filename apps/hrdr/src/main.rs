@@ -219,6 +219,7 @@ async fn main() -> Result<()> {
     // Bring up a local backend unless told not to — infr if it's on PATH, else
     // a llama.cpp fallback. Remote providers never spawn one. Held for the
     // command; dropping it kills the server.
+    let mut backend_ctx_fallback: Option<u32> = None;
     let _backend = if cli.no_backend || remote_provider {
         None
     } else {
@@ -233,12 +234,23 @@ async fn main() -> Result<()> {
             bcfg.ctx = c;
         }
         bcfg.extra_args = cli.backend_args;
-        // The spawned backend's context window drives the status bar's "X of Y".
-        if config.context_window.is_none() {
-            config.context_window = Some(bcfg.ctx);
-        }
+        backend_ctx_fallback = Some(bcfg.ctx);
         Some(Backend::ensure(&bcfg, &config.base_url).await?)
     };
+
+    // Resolve the context window (drives the status bar's "X of Y" + the
+    // auto-compaction threshold). Precedence: explicit config/provider wins;
+    // else ask the server (many OpenAI-compatible servers advertise it — vLLM's
+    // `max_model_len`, llama.cpp's `/props` n_ctx, …); else the spawned backend's
+    // configured ctx. Left unknown for a remote that advertises nothing.
+    if config.context_window.is_none() {
+        let probe = hrdr_llm::Client::new(
+            config.base_url.clone(),
+            config.api_key.clone(),
+            config.model.clone(),
+        );
+        config.context_window = probe.context_window().await.or(backend_ctx_fallback);
+    }
 
     match cli.command {
         Some(Command::Run { prompt }) => run_headless(config, prompt.join(" ")).await,

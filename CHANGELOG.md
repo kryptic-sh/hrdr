@@ -82,6 +82,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Auto-detect the server's context window. On startup, when `context_window`
+  isn't set explicitly (config/provider), hrdr probes the endpoint and uses what
+  it advertises — a non-standard field on the `/v1/models` entry (vLLM's
+  `max_model_len`, LM Studio's `max_context_length`, …) or llama.cpp's
+  `GET /props` (`n_ctx`). Precedence: explicit config/provider →
+  server-advertised → the spawned backend's `--backend-ctx` (default 16384) →
+  unknown. The OpenAI spec doesn't expose context length, and infr doesn't
+  advertise it yet, so those fall back; a server that does advertise is now
+  honored for the status bar's "X of Y" and the auto-compaction threshold. New
+  `Client::context_window()`.
 - End-to-end TUI tests + a mock provider. A tiny in-process OpenAI-compatible
   server (`GET /v1/models` + streamed SSE `POST /v1/chat/completions`, with
   scriptable text / tool-call replies) lets tests drive a real `App` through its
