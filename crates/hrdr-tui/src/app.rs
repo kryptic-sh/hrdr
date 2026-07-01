@@ -744,18 +744,29 @@ impl App {
         match cmd {
             "help" => self.system(help_text()),
             "clear" => {
+                // Full reset — as if a fresh session just opened. `Agent::clear`
+                // drops history and re-reads `AGENTS.md` (so an updated/removed
+                // file is reflected); here we reset the view + interaction state.
                 if let Ok(mut a) = self.agent.try_lock() {
                     a.clear();
                 }
                 self.clear_transcript();
                 self.queue.clear();
+                if let Ok(mut todos) = self.todos.lock() {
+                    todos.clear();
+                }
                 self.scroll_offset = 0;
+                self.max_scroll = 0;
                 self.session_in = 0;
                 self.session_out = 0;
                 self.last_usage = None;
                 self.session_id = None; // detach; next message starts a new session
                 self.session_label = None;
                 self.find_query = None;
+                self.find_pos = 0;
+                self.pending_goto = None;
+                self.pending_edit = None;
+                self.expand_tools = false;
                 self.system("conversation cleared");
             }
             "model" => {

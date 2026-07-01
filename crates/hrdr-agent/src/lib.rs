@@ -573,9 +573,29 @@ impl Agent {
         &self.messages
     }
 
-    /// Reset the conversation, keeping only the system prompt.
+    /// Reset the conversation to a fresh state — as if the agent was just
+    /// constructed for the current cwd. Drops all history and **re-reads
+    /// `AGENTS.md`**, so an updated or removed project-instructions file is
+    /// reflected (the old system prompt is not kept around).
     pub fn clear(&mut self) {
-        self.messages.truncate(1);
+        self.messages.clear();
+        self.refresh_system();
+    }
+
+    /// Re-gather `AGENTS.md` for the current cwd and rebuild the system prompt
+    /// in `messages[0]` (seeding it if the history is empty). Shared by
+    /// [`Self::clear`] and [`Self::set_cwd`].
+    fn refresh_system(&mut self) {
+        self.project_docs = gather_agent_docs(&self.ctx.cwd);
+        let Ok(system) = render_system(&self.tools, &self.ctx.cwd, self.project_docs.as_deref())
+        else {
+            return;
+        };
+        if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
+            self.messages[0] = ChatMessage::system(system);
+        } else {
+            self.messages.insert(0, ChatMessage::system(system));
+        }
     }
 
     /// A clone of the full message history (for saving a session).
@@ -607,13 +627,7 @@ impl Agent {
     /// directory and refreshes the system prompt in place.
     pub fn set_cwd(&mut self, cwd: std::path::PathBuf) {
         self.ctx.cwd = cwd;
-        self.project_docs = gather_agent_docs(&self.ctx.cwd);
-        if self.messages.first().map(|m| m.role == Role::System) == Some(true)
-            && let Ok(system) =
-                render_system(&self.tools, &self.ctx.cwd, self.project_docs.as_deref())
-        {
-            self.messages[0] = ChatMessage::system(system);
-        }
+        self.refresh_system();
     }
 
     /// Registered tools as `(name, description)` pairs.
@@ -929,7 +943,41 @@ pub fn is_assistant(m: &ChatMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, ProviderConfig, builtin_provider, is_context_overflow, is_transient};
+    use super::{
+        Agent, AgentConfig, ProviderConfig, builtin_provider, is_context_overflow, is_transient,
+    };
+
+    fn system_prompt(agent: &Agent) -> String {
+        agent.messages()[0].content.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn clear_rereads_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_md = dir.path().join("AGENTS.md");
+        std::fs::write(&agents_md, "ORIGINAL_MARKER").unwrap();
+
+        let cfg = AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            checkpoints: Some("off".to_string()), // keep the test hermetic
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+        assert!(system_prompt(&agent).contains("ORIGINAL_MARKER"));
+
+        // An updated AGENTS.md must be reflected after /clear (the bug: the old
+        // system prompt was kept, so stale instructions lingered forever).
+        std::fs::write(&agents_md, "UPDATED_MARKER").unwrap();
+        agent.clear();
+        let sys = system_prompt(&agent);
+        assert!(sys.contains("UPDATED_MARKER"));
+        assert!(!sys.contains("ORIGINAL_MARKER"));
+
+        // Removing AGENTS.md drops it entirely on the next /clear.
+        std::fs::remove_file(&agents_md).unwrap();
+        agent.clear();
+        assert!(!system_prompt(&agent).contains("UPDATED_MARKER"));
+    }
 
     #[test]
     fn classifies_transient_and_overflow_errors() {

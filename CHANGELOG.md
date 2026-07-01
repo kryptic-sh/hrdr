@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `/clear` (and its `/new` alias) now fully resets to a fresh session. It
+  previously kept the original system prompt, so an `AGENTS.md` that was updated
+  or removed after startup lingered in context forever. `Agent::clear()` now
+  drops all history and **re-reads `AGENTS.md`** for the current cwd, and the
+  TUI handler also clears the TODO list and any pending find/goto/expand state —
+  so `/clear` behaves exactly like reopening the session.
+
 - Scrolling up in the transcript now stays pinned to the content you scrolled to
   while output streams in. `scroll_offset` is measured from the bottom, so as
   new rows were appended the view drifted downward; the draw now bumps the

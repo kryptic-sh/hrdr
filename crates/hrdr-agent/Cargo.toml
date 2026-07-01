@@ -19,3 +19,6 @@ futures-util.workspace = true
 minijinja.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
