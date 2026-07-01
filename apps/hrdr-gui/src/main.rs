@@ -202,6 +202,14 @@ fn app_view(
     });
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
+    // Whether to show the model's `<think>` reasoning (`/reasoning` toggles).
+    let show_reasoning = create_rw_signal(true);
+    // Submitted-input history (shared load/persist), for Up/Down recall.
+    let history: RwSignal<Vec<String>> = create_rw_signal(hrdr_app::load_history());
+    // Position while browsing history (None = editing a fresh draft); the draft
+    // is stashed when browsing begins so Down past the newest restores it.
+    let hist_pos: RwSignal<Option<usize>> = create_rw_signal(None);
+    let hist_draft = create_rw_signal(String::new());
 
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
@@ -225,6 +233,9 @@ fn app_view(
         if text.trim().is_empty() || running.get() {
             return;
         }
+        // Record every submitted line for Up/Down recall, and reset browsing.
+        record_history(history, &text);
+        hist_pos.set(None);
         // Common quit words (shared with the TUI) close the window.
         if hrdr_app::is_quit_command(&text) {
             floem::quit_app();
@@ -233,7 +244,16 @@ fn app_view(
         // Slash commands are handled locally; an unrecognized `/…` falls through
         // to the model (so a literal path still works, matching the TUI).
         if text.starts_with('/')
-            && dispatch_slash(&text, transcript, next_id, usage, model, &agent, &tx)
+            && dispatch_slash(
+                &text,
+                transcript,
+                next_id,
+                usage,
+                model,
+                show_reasoning,
+                &agent,
+                &tx,
+            )
         {
             input.set(String::new());
             return;
@@ -269,7 +289,7 @@ fn app_view(
         dyn_stack(
             move || transcript.get(),
             |item: &Item| item.id,
-            move |item| render_item(item, theme),
+            move |item| render_item(item, theme, show_reasoning),
         )
         .style(|s| s.flex_col().width_full().gap(10.0)),
     )
@@ -281,6 +301,15 @@ fn app_view(
             Key::Named(NamedKey::Enter),
             |m| m.is_empty(),
             move |_| send_enter(),
+        )
+        // Up/Down recall previous submissions (like the TUI's history).
+        .on_key_down(Key::Named(NamedKey::ArrowUp), |m| m.is_empty(), move |_| {
+            history_prev(history, input, hist_pos, hist_draft)
+        })
+        .on_key_down(
+            Key::Named(NamedKey::ArrowDown),
+            |m| m.is_empty(),
+            move |_| history_next(history, input, hist_pos, hist_draft),
         )
         .style(|s| s.flex_grow(1.0).padding(8.0));
 
@@ -395,17 +424,80 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
     push_item(transcript, next_id, Body::System(msg.into()));
 }
 
+/// Append a submitted line to the in-memory history (dropping an immediate
+/// duplicate of the last entry) and persist it (capped at `MAX_HISTORY`).
+fn record_history(history: RwSignal<Vec<String>>, text: &str) {
+    history.update(|h| {
+        if h.last().map(String::as_str) != Some(text) {
+            h.push(text.to_string());
+            if h.len() > hrdr_app::MAX_HISTORY {
+                let drop = h.len() - hrdr_app::MAX_HISTORY;
+                h.drain(0..drop);
+            }
+        }
+    });
+    hrdr_app::persist_history(&history.get_untracked());
+}
+
+/// Up-arrow: step to an older history entry, stashing the live draft on the
+/// first step so Down can restore it.
+fn history_prev(
+    history: RwSignal<Vec<String>>,
+    input: RwSignal<String>,
+    hist_pos: RwSignal<Option<usize>>,
+    hist_draft: RwSignal<String>,
+) {
+    let h = history.get();
+    if h.is_empty() {
+        return;
+    }
+    let pos = match hist_pos.get() {
+        None => {
+            hist_draft.set(input.get_untracked());
+            h.len() - 1
+        }
+        Some(0) => 0,
+        Some(p) => p - 1,
+    };
+    hist_pos.set(Some(pos));
+    input.set(h[pos].clone());
+}
+
+/// Down-arrow: step to a newer history entry, or past the newest back to the
+/// stashed draft.
+fn history_next(
+    history: RwSignal<Vec<String>>,
+    input: RwSignal<String>,
+    hist_pos: RwSignal<Option<usize>>,
+    hist_draft: RwSignal<String>,
+) {
+    let h = history.get();
+    match hist_pos.get() {
+        None => {}
+        Some(p) if p + 1 < h.len() => {
+            hist_pos.set(Some(p + 1));
+            input.set(h[p + 1].clone());
+        }
+        Some(_) => {
+            hist_pos.set(None);
+            input.set(hist_draft.get_untracked());
+        }
+    }
+}
+
 /// Handle a `/…` slash command locally. Returns `true` if it was recognized (and
 /// thus shouldn't be sent to the model). Mirrors the representation-independent
 /// subset of the TUI's `handle_slash`; commands needing the agent lock spawn a
 /// task and report back over the `UiMsg::System` channel. Aliases resolve via the
 /// shared `hrdr_app::resolve_alias`.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_slash(
     input: &str,
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
     model: RwSignal<String>,
+    show_reasoning: RwSignal<bool>,
     agent: &Arc<TokioMutex<Agent>>,
     tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
 ) -> bool {
@@ -415,6 +507,15 @@ fn dispatch_slash(
     let arg = parts.next().unwrap_or("").trim().to_string();
     match cmd {
         "help" => system(transcript, next_id, hrdr_app::help_body()),
+        "reasoning" => {
+            let on = !show_reasoning.get_untracked();
+            show_reasoning.set(on);
+            system(
+                transcript,
+                next_id,
+                if on { "reasoning shown" } else { "reasoning hidden" },
+            );
+        }
         "clear" => {
             transcript.update(|t| t.clear());
             next_id.set(0);
@@ -564,7 +665,7 @@ fn handle_event(
 
 // ---- rendering ----------------------------------------------------------
 
-fn render_item(item: Item, th: GuiTheme) -> AnyView {
+fn render_item(item: Item, th: GuiTheme, show_reasoning: RwSignal<bool>) -> AnyView {
     match item.body {
         Body::User(text) => v_stack((
             label(|| "you").style(move |s| s.color(th.user).font_bold().margin_bottom(2.0)),
@@ -573,8 +674,14 @@ fn render_item(item: Item, th: GuiTheme) -> AnyView {
         .into_any(),
         Body::Assistant(a) => v_stack((
             label(|| "assistant").style(move |s| s.color(th.dim).font_bold().margin_bottom(2.0)),
-            // Reasoning (dim); empty until the model streams any.
-            label(move || a.reasoning.get()).style(move |s| s.color(th.dim).margin_bottom(2.0)),
+            // Reasoning (dim); hidden when `/reasoning` is off or none streamed.
+            label(move || a.reasoning.get()).style(move |s| {
+                if show_reasoning.get() && !a.reasoning.get().is_empty() {
+                    s.color(th.dim).margin_bottom(2.0)
+                } else {
+                    s.hide()
+                }
+            }),
             label(move || a.text.get()).style(move |s| s.color(th.assistant)),
         ))
         .into_any(),

@@ -190,7 +190,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fills the `@path`, and on send the mention is expanded into the file's
   contents for the model via the newly-shared `hrdr_app::expand_mentions`
   (lifted out of the TUI, so both frontends attach files identically) while the
-  transcript keeps the bare `@path`. TUI-shared logic (more commands, sessions,
+  transcript keeps the bare `@path`. **Input-history recall** (Up/Down) browses
+  previously-submitted lines, stashing the live draft, and persists across runs
+  via the shared `hrdr_app::load_history`/`persist_history`; **`/reasoning`**
+  toggles the dim `<think>` blocks. TUI-shared logic (more commands, sessions,
   …) continues to move into the shared `hrdr-app` crate as GUI features land.
   Excluded from CI for now (floem's large X11/Wayland dep tree + Linux system
   libs — wiring it in is a follow-up).
