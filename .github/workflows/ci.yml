@@ -19,22 +19,13 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      # hrdr depends on the sibling hjkl crates via `../hjkl/...` path deps, so
-      # both repos are checked out side by side under the workspace.
       - uses: actions/checkout@v5
-        with:
-          path: hrdr
-      - uses: actions/checkout@v5
-        with:
-          repository: kryptic-sh/hjkl
-          path: hjkl
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           components: rustfmt
           cache: false
       - run: cargo fmt --all --check
-        working-directory: hrdr
 
   clippy:
     name: clippy ${{ matrix.os }}
@@ -45,22 +36,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: hrdr
-      - uses: actions/checkout@v5
-        with:
-          repository: kryptic-sh/hjkl
-          path: hjkl
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           components: clippy
           cache: false
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: hrdr
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-        working-directory: hrdr
 
   test:
     name: test ${{ matrix.os }}
@@ -71,18 +53,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: hrdr
-      - uses: actions/checkout@v5
-        with:
-          repository: kryptic-sh/hjkl
-          path: hjkl
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           cache: false
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: hrdr
       - run: cargo test --workspace --all-features
-        working-directory: hrdr

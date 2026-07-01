@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
+  instead of `../hjkl/...` path deps against the sibling repo. hjkl was
+  published to crates.io at 0.33.3. CI is now standalone — the second checkout
+  of `kryptic-sh/hjkl` alongside hrdr is gone; each job checks out hrdr only.
+
 ### Fixed
 
 - Status-bar context size no longer drops to 0 between turns: `last_usage` is

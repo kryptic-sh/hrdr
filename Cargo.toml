@@ -24,20 +24,19 @@ hrdr-agent = { path = "crates/hrdr-agent", version = "0.0.1" }
 hrdr-editor = { path = "crates/hrdr-editor", version = "0.0.1" }
 hrdr-tui = { path = "crates/hrdr-tui", version = "0.0.1" }
 
-# hjkl — path deps to the sibling repo during pre-release iteration.
-# Switch to crates.io pins once hjkl publishes a matching release.
-hjkl-engine = { path = "../hjkl/crates/hjkl-engine" }
-hjkl-vim = { path = "../hjkl/crates/hjkl-vim" }
-hjkl-buffer = { path = "../hjkl/crates/hjkl-buffer" }
-hjkl-buffer-tui = { path = "../hjkl/crates/hjkl-buffer-tui" }
-hjkl-engine-tui = { path = "../hjkl/crates/hjkl-engine-tui" }
-hjkl-clipboard = { path = "../hjkl/crates/hjkl-clipboard" }
-hjkl-theme = { path = "../hjkl/crates/hjkl-theme" }
-hjkl-theme-tui = { path = "../hjkl/crates/hjkl-theme-tui" }
-hjkl-markdown = { path = "../hjkl/crates/hjkl-markdown" }
-hjkl-markdown-tui = { path = "../hjkl/crates/hjkl-markdown-tui" }
-hjkl-xdg = { path = "../hjkl/crates/hjkl-xdg" }
-hjkl-icons = { path = "../hjkl/crates/hjkl-icons" }
+# hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
+hjkl-engine = "0.33"
+hjkl-vim = "0.33"
+hjkl-buffer = "0.33"
+hjkl-buffer-tui = "0.33"
+hjkl-engine-tui = "0.33"
+hjkl-clipboard = "0.33"
+hjkl-theme = "0.33"
+hjkl-theme-tui = "0.33"
+hjkl-markdown = "0.33"
+hjkl-markdown-tui = "0.33"
+hjkl-xdg = "0.33"
+hjkl-icons = "0.33"
 
 # third-party
 tokio = { version = "1", features = ["full"] }

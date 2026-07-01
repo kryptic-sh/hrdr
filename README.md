@@ -233,8 +233,8 @@ The shell and search tools adapt to the host:
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Temporary managed `llama-server` backend
 - [ ] infr serve path with tool calling (replaces the temporary backend)
+- [x] hjkl deps via crates.io registry pins (standalone CI)
 - [ ] MCP client + LSP diagnostics feedback
-- [ ] Switch hjkl path-deps to registry pins for standalone CI
 
 ## License
 
