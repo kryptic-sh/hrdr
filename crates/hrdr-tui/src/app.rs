@@ -20,10 +20,6 @@ use tokio::task::JoinHandle;
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
 
-/// How many turns a completed TODO item stays visible before it's pruned from
-/// the list. It's shown on the turn it completes and the next four turns.
-const TODO_COMPLETED_TTL: u64 = 5;
-
 use crate::Tui;
 use crate::theme::Theme;
 use crate::ui;
@@ -209,9 +205,11 @@ pub(crate) struct App {
     /// Count of completed turns, used to age out finished TODO items.
     todo_turn: u64,
     /// Turn (in `todo_turn` units) each completed TODO was first seen finished,
-    /// keyed by content. Completed items are pruned `TODO_COMPLETED_TTL` turns
-    /// after that so the list doesn't accrete stale checkmarks.
+    /// keyed by content. Completed items are pruned `todo_ttl` turns after that
+    /// so the list doesn't accrete stale checkmarks.
     todo_completed_at: HashMap<String, u64>,
+    /// Turns a completed TODO stays visible before pruning (config `todo_ttl`).
+    todo_ttl: u64,
     /// Messages submitted while a turn is running, processed FIFO once it ends.
     pub(crate) queue: VecDeque<String>,
     /// Screen rect of the "follow output" button, set during draw while scrolled
@@ -247,6 +245,7 @@ impl App {
         let auto_compact = config.auto_compact;
         let auto_resume = config.auto_resume;
         let bell = config.bell;
+        let todo_ttl = config.todo_ttl;
         let timestamp_style = TimestampStyle::from_config(config.timestamps.as_deref());
         let statusbar_mode = StatusBarMode::from_config(config.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
@@ -338,6 +337,7 @@ impl App {
             todos,
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
+            todo_ttl,
             queue: VecDeque::new(),
             follow_button: None,
             quit_armed: false,
@@ -746,7 +746,12 @@ impl App {
     /// Age out finished TODO items. Called once per turn (on `TurnDone`).
     fn prune_completed_todos(&mut self) {
         if let Ok(mut todos) = self.todos.lock() {
-            age_completed_todos(&mut todos, &mut self.todo_completed_at, self.todo_turn);
+            age_completed_todos(
+                &mut todos,
+                &mut self.todo_completed_at,
+                self.todo_turn,
+                self.todo_ttl,
+            );
         }
     }
 
@@ -1182,6 +1187,7 @@ impl App {
         self.effort = cfg.effort.clone();
         self.auto_compact_ratio = cfg.auto_compact;
         self.bell = cfg.bell;
+        self.todo_ttl = cfg.todo_ttl;
         self.timestamp_style = TimestampStyle::from_config(cfg.timestamps.as_deref());
         self.statusbar_mode = StatusBarMode::from_config(cfg.statusbar.as_deref());
         self.icon_mode = cfg
@@ -3080,10 +3086,15 @@ pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)
 /// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
 /// Age out finished TODO items in place. Stamps each completed item with the
 /// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
-/// any completed item that has been finished for `TODO_COMPLETED_TTL` turns.
-/// Stamps for items no longer present as completed are forgotten, so a
-/// re-completed item ages from scratch. Pending / in-progress items are kept.
-fn age_completed_todos(todos: &mut Vec<Todo>, stamps: &mut HashMap<String, u64>, turn: u64) {
+/// any completed item that has been finished for `ttl` turns. Stamps for items
+/// no longer present as completed are forgotten, so a re-completed item ages
+/// from scratch. Pending / in-progress items are kept.
+fn age_completed_todos(
+    todos: &mut Vec<Todo>,
+    stamps: &mut HashMap<String, u64>,
+    turn: u64,
+    ttl: u64,
+) {
     for t in todos.iter() {
         if t.status == "completed" {
             stamps.entry(t.content.clone()).or_insert(turn);
@@ -3093,7 +3104,7 @@ fn age_completed_todos(todos: &mut Vec<Todo>, stamps: &mut HashMap<String, u64>,
         t.status != "completed"
             || stamps
                 .get(&t.content)
-                .is_none_or(|&done| turn.saturating_sub(done) < TODO_COMPLETED_TTL)
+                .is_none_or(|&done| turn.saturating_sub(done) < ttl)
     });
     stamps.retain(|content, _| {
         todos
@@ -3165,11 +3176,12 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use super::{
-        TODO_COMPLETED_TTL, Todo, active_file_token, age_completed_todos, is_quit_command,
-        last_fenced_block, parse_duration, parse_msg_range, resolve_alias, slash_completions,
-        walk_files_gitignore,
+        Todo, active_file_token, age_completed_todos, is_quit_command, last_fenced_block,
+        parse_duration, parse_msg_range, resolve_alias, slash_completions, walk_files_gitignore,
     };
     use std::collections::HashMap;
+
+    const TTL: u64 = 5;
 
     fn todo(content: &str, status: &str) -> Todo {
         Todo {
@@ -3184,15 +3196,15 @@ mod tests {
         let mut todos = vec![todo("a", "completed"), todo("b", "in_progress")];
 
         // Turn it completes and the next TTL-1 turns: still shown.
-        for turn in 0..TODO_COMPLETED_TTL {
-            age_completed_todos(&mut todos, &mut stamps, turn);
+        for turn in 0..TTL {
+            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
             assert!(
                 todos.iter().any(|t| t.content == "a"),
                 "completed item should survive turn {turn}"
             );
         }
         // TTL turns after completion: pruned. The in-progress item stays.
-        age_completed_todos(&mut todos, &mut stamps, TODO_COMPLETED_TTL);
+        age_completed_todos(&mut todos, &mut stamps, TTL, TTL);
         assert!(!todos.iter().any(|t| t.content == "a"));
         assert!(todos.iter().any(|t| t.content == "b"));
         assert!(stamps.is_empty(), "stamp forgotten once the item is gone");
@@ -3202,8 +3214,8 @@ mod tests {
     fn pending_todos_are_never_pruned() {
         let mut stamps = HashMap::new();
         let mut todos = vec![todo("keep", "pending")];
-        for turn in 0..(TODO_COMPLETED_TTL * 3) {
-            age_completed_todos(&mut todos, &mut stamps, turn);
+        for turn in 0..(TTL * 3) {
+            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
         }
         assert_eq!(todos.len(), 1);
         assert!(stamps.is_empty());
@@ -3214,18 +3226,23 @@ mod tests {
         let mut stamps = HashMap::new();
         // Completed at turn 0.
         let mut todos = vec![todo("x", "completed")];
-        age_completed_todos(&mut todos, &mut stamps, 0);
+        age_completed_todos(&mut todos, &mut stamps, 0, TTL);
         // Model flips it back to in_progress at turn 2 → stamp forgotten.
         todos[0].status = "in_progress".to_string();
-        age_completed_todos(&mut todos, &mut stamps, 2);
+        age_completed_todos(&mut todos, &mut stamps, 2, TTL);
         assert!(stamps.is_empty());
         // Re-completed at turn 3 → stamped at 3, so it survives through turn 7.
         todos[0].status = "completed".to_string();
-        age_completed_todos(&mut todos, &mut stamps, 3);
-        age_completed_todos(&mut todos, &mut stamps, 3 + TODO_COMPLETED_TTL - 1);
+        age_completed_todos(&mut todos, &mut stamps, 3, TTL);
+        age_completed_todos(&mut todos, &mut stamps, 3 + TTL - 1, TTL);
         assert!(todos.iter().any(|t| t.content == "x"));
-        age_completed_todos(&mut todos, &mut stamps, 3 + TODO_COMPLETED_TTL);
+        age_completed_todos(&mut todos, &mut stamps, 3 + TTL, TTL);
         assert!(!todos.iter().any(|t| t.content == "x"));
+    }
+
+    #[test]
+    fn ttl_matches_config_default() {
+        assert_eq!(TTL, hrdr_agent::DEFAULT_TODO_TTL);
     }
 
     #[test]

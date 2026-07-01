@@ -103,6 +103,9 @@ pub struct AgentConfig {
     /// File checkpointing: `on`, `off`, or `auto` (default) — `auto` enables it
     /// only outside a git repo (git already provides revert).
     pub checkpoints: Option<String>,
+    /// How many turns a completed TODO item stays visible before it's pruned
+    /// from the panel. Default [`DEFAULT_TODO_TTL`].
+    pub todo_ttl: u64,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -110,6 +113,10 @@ pub struct AgentConfig {
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
+
+/// Default lifetime (in turns) a completed TODO item stays visible before it's
+/// pruned: the turn it finishes plus four more.
+pub const DEFAULT_TODO_TTL: u64 = 5;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -132,6 +139,7 @@ impl Default for AgentConfig {
             timestamps: None,
             statusbar: None,
             checkpoints: None,
+            todo_ttl: DEFAULT_TODO_TTL,
             providers: HashMap::new(),
         }
     }
@@ -239,6 +247,7 @@ struct FileConfig {
     timestamps: Option<String>,
     statusbar: Option<String>,
     checkpoints: Option<String>,
+    todo_ttl: Option<u64>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -352,55 +361,23 @@ impl AgentConfig {
         if let Some(v) = fc.checkpoints {
             self.checkpoints = Some(v);
         }
+        if let Some(v) = fc.todo_ttl {
+            self.todo_ttl = v;
+        }
         if !fc.providers.is_empty() {
             self.providers = fc.providers;
         }
     }
 
-    /// Layer environment variables over the current config.
+    /// Layer environment variables over the current config. Every knob is one
+    /// row in [`ENV_SETTERS`]; adding a new env var means adding a row there, not
+    /// another `if let` here. `HRDR_API_KEY` is special-cased (it has a fallback
+    /// var) below.
     fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("HRDR_PROVIDER") {
-            self.provider = Some(v);
-        }
-        if let Ok(v) = std::env::var("HRDR_THEME") {
-            self.theme = Some(v);
-        }
-        if let Ok(v) = std::env::var("HRDR_BASE_URL") {
-            self.base_url = v;
-        }
-        if let Ok(v) = std::env::var("HRDR_MODEL") {
-            self.model = v;
-        }
-        if let Ok(v) = std::env::var("HRDR_AUTO_COMPACT")
-            && let Ok(f) = v.parse::<f64>()
-        {
-            self.auto_compact = f;
-        }
-        if let Ok(v) = std::env::var("HRDR_AUTO_RESUME") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" | "off" | "no" => self.auto_resume = false,
-                "1" | "true" | "on" | "yes" => self.auto_resume = true,
-                _ => {}
+        for (name, set) in ENV_SETTERS {
+            if let Ok(v) = std::env::var(name) {
+                set(self, v);
             }
-        }
-        if let Ok(v) = std::env::var("HRDR_BELL") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" | "off" | "no" => self.bell = false,
-                "1" | "true" | "on" | "yes" => self.bell = true,
-                _ => {}
-            }
-        }
-        if let Ok(v) = std::env::var("HRDR_ICONS") {
-            self.icons = Some(v);
-        }
-        if let Ok(v) = std::env::var("HRDR_TIMESTAMPS") {
-            self.timestamps = Some(v);
-        }
-        if let Ok(v) = std::env::var("HRDR_STATUSBAR") {
-            self.statusbar = Some(v);
-        }
-        if let Ok(v) = std::env::var("HRDR_CHECKPOINTS") {
-            self.checkpoints = Some(v);
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
@@ -410,6 +387,53 @@ impl AgentConfig {
         }
     }
 }
+
+/// Parse a boolean-ish env value; `None` (leave the current value) if it's not
+/// one of the recognized on/off spellings.
+fn parse_env_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// Applies an env var's string value to the config.
+type EnvSetter = fn(&mut AgentConfig, String);
+
+/// Env var → setter table used by [`AgentConfig::apply_env`]. Adding a knob is a
+/// single row here (non-capturing closures coerce to `fn` pointers). Values that
+/// need parsing (numbers, bools) silently keep the current value on a bad parse.
+const ENV_SETTERS: &[(&str, EnvSetter)] = &[
+    ("HRDR_PROVIDER", |c, v| c.provider = Some(v)),
+    ("HRDR_THEME", |c, v| c.theme = Some(v)),
+    ("HRDR_BASE_URL", |c, v| c.base_url = v),
+    ("HRDR_MODEL", |c, v| c.model = v),
+    ("HRDR_ICONS", |c, v| c.icons = Some(v)),
+    ("HRDR_TIMESTAMPS", |c, v| c.timestamps = Some(v)),
+    ("HRDR_STATUSBAR", |c, v| c.statusbar = Some(v)),
+    ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
+    ("HRDR_AUTO_COMPACT", |c, v| {
+        if let Ok(f) = v.parse() {
+            c.auto_compact = f;
+        }
+    }),
+    ("HRDR_AUTO_RESUME", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.auto_resume = b;
+        }
+    }),
+    ("HRDR_BELL", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.bell = b;
+        }
+    }),
+    ("HRDR_TODO_TTL", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.todo_ttl = n;
+        }
+    }),
+];
 
 /// A value to persist into the user config file.
 pub enum ConfigValue<'a> {

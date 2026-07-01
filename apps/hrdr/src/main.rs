@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long, global = true)]
     checkpoints: Option<String>,
 
+    /// Turns a completed TODO item stays visible before it's pruned (default 5).
+    #[arg(long, global = true)]
+    todo_ttl: Option<u64>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -201,6 +205,9 @@ async fn main() -> Result<()> {
     }
     if let Some(c) = cli.checkpoints {
         config.checkpoints = Some(c);
+    }
+    if let Some(n) = cli.todo_ttl {
+        config.todo_ttl = n;
     }
 
     if remote_provider && config.model == "default" {
