@@ -137,9 +137,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alias resolution (`resolve_alias`), and quit-command detection
   (`is_quit_command`). The TUI's `/help`, completion, dispatch, and quit-on-type
   use it; the GUI uses `is_quit_command` so typing `exit`/`quit`/`:q` closes the
-  window. More representation-independent logic will move in as the frontends
-  converge (the transcript reducer stays per-frontend for now — the TUI is
-  immediate-mode with plain strings, the GUI retained-mode with per-field
+  window. Also pulled in: the representation-independent helpers `resolve_under`
+  (path resolution), `display_dir`/`git_branch` (status-bar strings),
+  `walk_files`/`walk_files_gitignore` (gitignore-aware `@file` discovery),
+  `parse_duration` (`/goto` time specs), `parse_msg_range` (`/copy msg N-M`),
+  and `last_fenced_block` (`/copy code`) — with their tests — so the TUI now
+  imports them from `hrdr-app` instead of owning private copies (`ignore` moved
+  with them). More representation-independent logic will move in as the
+  frontends converge (the transcript reducer stays per-frontend for now — the
+  TUI is immediate-mode with plain strings, the GUI retained-mode with per-field
   reactive signals).
 - **`hrdr-gui` — a floem desktop frontend (proof-of-concept).** A new
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI

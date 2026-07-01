@@ -26,10 +26,10 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
-use hrdr_app::is_quit_command;
+use hrdr_app::{display_dir, git_branch, is_quit_command};
 use util::{
-    MAX_HISTORY, age_completed_todos, current_config_mtime, display_dir, git_branch, load_history,
-    persist_history, timestamp_now,
+    MAX_HISTORY, age_completed_todos, current_config_mtime, load_history, persist_history,
+    timestamp_now,
 };
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
@@ -1203,10 +1203,7 @@ mod e2e;
 mod tests {
     use super::Todo;
     use super::completion::{active_file_token, slash_completions};
-    use super::util::{
-        age_completed_todos, last_fenced_block, parse_duration, parse_msg_range,
-        walk_files_gitignore,
-    };
+    use super::util::age_completed_todos;
     use std::collections::HashMap;
 
     const TTL: u64 = 5;
@@ -1271,64 +1268,6 @@ mod tests {
     #[test]
     fn ttl_matches_config_default() {
         assert_eq!(TTL, hrdr_agent::DEFAULT_TODO_TTL);
-    }
-
-    #[test]
-    fn gitignore_walk_honors_nested_ignore_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // A `.git` dir so the `ignore` crate applies gitignore rules.
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        // Root-level ignore.
-        std::fs::write(root.join(".gitignore"), "root_ignored.txt\n").unwrap();
-        std::fs::write(root.join("keep_root.txt"), "").unwrap();
-        std::fs::write(root.join("root_ignored.txt"), "").unwrap();
-        // Nested ignore in a subdirectory.
-        let sub = root.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".gitignore"), "ignored.txt\n").unwrap();
-        std::fs::write(sub.join("keep_sub.txt"), "").unwrap();
-        std::fs::write(sub.join("ignored.txt"), "").unwrap();
-
-        let files = walk_files_gitignore(root);
-        assert!(files.iter().any(|f| f == "keep_root.txt"), "{files:?}");
-        assert!(files.iter().any(|f| f == "sub/keep_sub.txt"), "{files:?}");
-        assert!(
-            !files.iter().any(|f| f == "root_ignored.txt"),
-            "root .gitignore not honored: {files:?}"
-        );
-        assert!(
-            !files.iter().any(|f| f == "sub/ignored.txt"),
-            "nested sub/.gitignore not honored: {files:?}"
-        );
-    }
-
-    #[test]
-    fn parse_duration_specs() {
-        assert_eq!(parse_duration("30s"), Some(30));
-        assert_eq!(parse_duration("5m"), Some(300));
-        assert_eq!(parse_duration("1h"), Some(3600));
-        assert_eq!(parse_duration("2d"), Some(172_800));
-        assert_eq!(parse_duration("5"), None); // no unit
-        assert_eq!(parse_duration("xm"), None);
-    }
-
-    #[test]
-    fn parse_msg_range_specs() {
-        assert_eq!(parse_msg_range("3"), Some((3, 3)));
-        assert_eq!(parse_msg_range("2-5"), Some((2, 5)));
-        assert_eq!(parse_msg_range(" 2 - 5 "), Some((2, 5)));
-        assert_eq!(parse_msg_range("0"), None); // 1-based
-        assert_eq!(parse_msg_range("5-2"), None); // reversed
-        assert_eq!(parse_msg_range("x"), None);
-    }
-
-    #[test]
-    fn last_fenced_block_extraction() {
-        let md = "intro\n```rust\nfn a() {}\n```\nmid\n```\nlast block\nline2\n```\nend";
-        assert_eq!(last_fenced_block(md).as_deref(), Some("last block\nline2"));
-        assert_eq!(last_fenced_block("no code here"), None);
-        assert_eq!(last_fenced_block("```\n\n```"), None); // empty block
     }
 
     #[test]

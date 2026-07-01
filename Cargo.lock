@@ -2149,6 +2149,11 @@ dependencies = [
 [[package]]
 name = "hrdr-app"
 version = "0.0.1"
+dependencies = [
+ "hrdr-agent",
+ "ignore",
+ "tempfile",
+]
 
 [[package]]
 name = "hrdr-editor"
@@ -2228,7 +2233,6 @@ dependencies = [
  "hrdr-app",
  "hrdr-editor",
  "hrdr-tools",
- "ignore",
  "notify",
  "ratatui",
  "serde_json",

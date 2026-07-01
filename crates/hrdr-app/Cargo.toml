@@ -8,3 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+hrdr-agent.workspace = true
+ignore.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

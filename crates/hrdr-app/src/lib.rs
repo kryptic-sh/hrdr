@@ -6,6 +6,9 @@
 //! "quit command" detection. More (help metadata is already here) will move in
 //! as the frontends converge.
 
+mod util;
+pub use util::*;
+
 /// The slash commands, as `(name, one-line description)`. Frontends render this
 /// however they like (a completion popup, a `/` menu, a help screen).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[

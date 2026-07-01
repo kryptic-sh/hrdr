@@ -1,22 +1,10 @@
 //! Free helper functions with no `App` receiver.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use hrdr_agent::Todo;
 use tokio::sync::mpsc;
-
-/// Resolve `path` against `base`: absolute paths pass through unchanged,
-/// relative ones are joined onto `base`.
-pub(super) fn resolve_under(base: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        base.join(p)
-    }
-}
 
 /// Set up an OS-level watch on the config file, pinging `()` on the returned
 /// channel whenever it changes. Returns `None` if a watcher can't be created
@@ -55,116 +43,6 @@ pub(super) fn current_config_mtime() -> Option<SystemTime> {
 /// Current local time, for per-message timestamps.
 pub(super) fn timestamp_now() -> chrono::DateTime<chrono::Local> {
     chrono::Local::now()
-}
-/// Display form of `cwd`, with the home directory collapsed to `~`.
-pub(super) fn display_dir(cwd: &std::path::Path) -> String {
-    let s = cwd.to_string_lossy().to_string();
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(rest) = s.strip_prefix(&home)
-    {
-        return format!("~{rest}");
-    }
-    s
-}
-/// Current git branch (or short detached-HEAD sha) by walking up from `cwd` to
-/// the repo root and reading `.git/HEAD`. Cheap, no subprocess.
-pub(super) fn git_branch(cwd: &std::path::Path) -> Option<String> {
-    let mut dir = Some(cwd);
-    while let Some(d) = dir {
-        let git = d.join(".git");
-        if git.is_dir() {
-            return std::fs::read_to_string(git.join("HEAD"))
-                .ok()
-                .and_then(|h| parse_head(&h));
-        }
-        if git.is_file()
-            && let Ok(content) = std::fs::read_to_string(&git)
-            && let Some(p) = content.strip_prefix("gitdir:")
-            && let Ok(head) = std::fs::read_to_string(std::path::Path::new(p.trim()).join("HEAD"))
-        {
-            return parse_head(&head);
-        }
-        dir = d.parent();
-    }
-    None
-}
-fn parse_head(head: &str) -> Option<String> {
-    let head = head.trim();
-    match head.strip_prefix("ref: refs/heads/") {
-        Some(branch) => Some(branch.to_string()),
-        None if !head.is_empty() => Some(head.chars().take(7).collect()),
-        None => None,
-    }
-}
-/// Max files indexed and max directory depth walked for `@file` completion.
-const WALK_MAX_FILES: usize = 20_000;
-const WALK_MAX_DEPTH: usize = 12;
-
-/// Directory names skipped by the fallback walk (non-git projects).
-const WALK_SKIP_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".cache",
-    "dist",
-    "build",
-    ".next",
-    "vendor",
-    ".venv",
-    "__pycache__",
-];
-/// The last fenced (```…```) code block in markdown `md`, without the fences.
-pub(super) fn last_fenced_block(md: &str) -> Option<String> {
-    let mut blocks: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_block = false;
-    for line in md.lines() {
-        if line.trim_start().starts_with("```") {
-            if in_block {
-                blocks.push(std::mem::take(&mut cur));
-                in_block = false;
-            } else {
-                in_block = true;
-                cur.clear();
-            }
-        } else if in_block {
-            cur.push_str(line);
-            cur.push('\n');
-        }
-    }
-    blocks
-        .into_iter()
-        .next_back()
-        .map(|b| b.trim_end().to_string())
-        .filter(|b| !b.is_empty())
-}
-/// Parse a relative duration like `30s`, `5m`, `1h`, `2d` into seconds.
-pub(super) fn parse_duration(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (digits, mult) = if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else if let Some(n) = s.strip_suffix('d') {
-        (n, 86_400)
-    } else {
-        return None;
-    };
-    digits.trim().parse::<i64>().ok().map(|v| v * mult)
-}
-/// Parse a message spec: `N` → `(N, N)`, or `N-M` → `(N, M)` (1-based,
-/// inclusive). Returns `None` for invalid or zero/reversed ranges.
-pub(super) fn parse_msg_range(spec: &str) -> Option<(usize, usize)> {
-    if let Some((a, b)) = spec.split_once('-') {
-        let a: usize = a.trim().parse().ok()?;
-        let b: usize = b.trim().parse().ok()?;
-        (a >= 1 && b >= a).then_some((a, b))
-    } else {
-        let n: usize = spec.trim().parse().ok()?;
-        (n >= 1).then_some((n, n))
-    }
 }
 /// Max input-history entries kept (in memory and on disk).
 pub(super) const MAX_HISTORY: usize = 200;
@@ -208,78 +86,6 @@ pub(super) fn persist_history(history: &[String]) {
         .join("\n");
     let _ = std::fs::write(path, body);
 }
-/// Collect relative file paths under `root` for `@file` completion. In a git
-/// repo, honors `.gitignore`/`.ignore` (and parents/global) + `.git/info/exclude`
-/// via the `ignore` crate; outside one, falls back to a manual walk that skips
-/// known VCS/build and hidden directories.
-pub(super) fn walk_files(root: &std::path::Path) -> Vec<String> {
-    if hrdr_agent::in_git_repo(root) {
-        walk_files_gitignore(root)
-    } else {
-        walk_files_fallback(root)
-    }
-}
-/// Gitignore-aware walk (ripgrep's walker).
-pub(super) fn walk_files_gitignore(root: &std::path::Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let walker = ignore::WalkBuilder::new(root)
-        .max_depth(Some(WALK_MAX_DEPTH))
-        .hidden(true) // skip dotfiles/dotdirs
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .build();
-    for entry in walker.flatten() {
-        if out.len() >= WALK_MAX_FILES {
-            break;
-        }
-        if entry.file_type().is_some_and(|t| t.is_file())
-            && let Ok(rel) = entry.path().strip_prefix(root)
-        {
-            out.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    out.sort();
-    out
-}
-/// Fallback walk for non-git directories: skip hidden + known build/VCS dirs.
-fn walk_files_fallback(root: &std::path::Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > WALK_MAX_DEPTH || out.len() >= WALK_MAX_FILES {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                if name.starts_with('.') || WALK_SKIP_DIRS.contains(&name.as_ref()) {
-                    continue;
-                }
-                stack.push((path, depth + 1));
-            } else if ft.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-                if out.len() >= WALK_MAX_FILES {
-                    break;
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-/// Whether a submitted line is a common "quit the session" command, matched
-/// across popular CLIs/REPLs/editors so users feel at home: bare `exit`/`quit`,
-/// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
 /// Age out finished TODO items in place. Stamps each completed item with the
 /// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
 /// any completed item that has been finished for `ttl` turns. Stamps for items

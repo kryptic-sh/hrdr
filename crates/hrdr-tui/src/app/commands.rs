@@ -1,10 +1,12 @@
 //! Slash-command dispatch and the individual command handlers.
 
-use super::util::{last_fenced_block, parse_duration, parse_msg_range, resolve_under};
 use super::*;
 use crate::theme::Theme;
 use hjkl_clipboard::{MimeType, Selection};
-use hrdr_app::{HELP_GROUPS, SLASH_COMMANDS, resolve_alias};
+use hrdr_app::{
+    HELP_GROUPS, SLASH_COMMANDS, last_fenced_block, parse_duration, parse_msg_range, resolve_alias,
+    resolve_under,
+};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
