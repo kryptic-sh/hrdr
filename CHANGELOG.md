@@ -242,15 +242,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   markdown instead of plain text — headings, bold/italic/inline-code, lists,
   blockquotes, and fenced code blocks syntax-highlighted with syntect on a panel
   background — via a floem `rich_text` renderer over `hjkl_markdown`'s event
-  stream (the same stream the TUI's ratatui backend consumes), re-rendered live
-  as the reply streams. **Session auto-save**: after each completed turn the GUI
-  persists the conversation (via the newly-shared `hrdr_app::save_session`,
-  which the TUI's continuous auto-save now also uses), assigning a stable file
-  id on first save and notifying once (`session saved as '…' — /resume …`);
-  `/resume` adopts the id so later saves update the same file, and `/clear`
-  detaches it. TUI-shared logic continues to move into the shared `hrdr-app`
-  crate as GUI features land. Excluded from CI for now (floem's large
-  X11/Wayland dep tree + Linux system libs — wiring it in is a follow-up).
+  stream (the same stream the TUI's ratatui backend consumes). The blocks render
+  through a `dyn_stack` keyed by per-block content hash, so a streaming reply
+  only re-renders (and re-highlights) the changed tail block instead of the
+  whole reply each token — earlier paragraphs and finished code blocks keep
+  their already-rendered views. **Session auto-save**: after each completed turn
+  the GUI persists the conversation (via the newly-shared
+  `hrdr_app::save_session`, which the TUI's continuous auto-save now also uses),
+  assigning a stable file id on first save and notifying once
+  (`session saved as '…' — /resume …`); `/resume` adopts the id so later saves
+  update the same file, and `/clear` detaches it. TUI-shared logic continues to
+  move into the shared `hrdr-app` crate as GUI features land. Excluded from CI
+  for now (floem's large X11/Wayland dep tree + Linux system libs — wiring it in
+  is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored

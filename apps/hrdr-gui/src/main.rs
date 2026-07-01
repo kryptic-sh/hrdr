@@ -17,7 +17,7 @@ use floem::ext_event::create_signal_from_tokio_channel;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::{Scope, create_effect};
-use floem::views::{Decorators, dyn_container};
+use floem::views::Decorators;
 
 mod md;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole};
@@ -1017,8 +1017,9 @@ fn render_item(item: Item, th: GuiTheme, show_reasoning: RwSignal<bool>) -> AnyV
                 }
             }),
             // Assistant text rendered as markdown (headings, emphasis, lists,
-            // and syntax-highlighted code blocks); re-rendered as it streams.
-            dyn_container(move || a.text.get(), move |t| md::markdown_view(&t, th)),
+            // and syntax-highlighted code blocks). Keyed per block so streaming
+            // only re-renders the changed (tail) block, not the whole reply.
+            md::markdown_stack(a.text, th),
         ))
         .into_any(),
         Body::Tool(t) => {

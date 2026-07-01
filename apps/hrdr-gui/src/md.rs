@@ -4,11 +4,15 @@
 //! panel background. Consumes `hjkl_markdown`'s renderer-agnostic event stream
 //! (the same one the TUI's ratatui backend uses).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 use floem::peniko::Color;
+use floem::prelude::SignalGet;
+use floem::reactive::RwSignal;
 use floem::text::{Attrs, AttrsList, FamilyOwned, Style as FontStyle, TextLayout, Weight, Wrap};
-use floem::views::{Decorators, RichText, container, empty, rich_text, v_stack_from_iter};
+use floem::views::{Decorators, RichText, container, dyn_stack, empty, rich_text};
 use floem::{AnyView, IntoView};
 use hjkl_markdown::{Event, parse};
 use syntect::easy::HighlightLines;
@@ -41,12 +45,63 @@ enum Block {
     Rule,
 }
 
-/// Render markdown `src` into a vertical stack of block views. The returned
-/// view owns its data (`use<>` — it doesn't borrow `src`).
-pub fn markdown_view(src: &str, th: GuiTheme) -> impl IntoView + use<> {
-    let blocks = to_blocks(src, th);
-    v_stack_from_iter(blocks.into_iter().map(move |b| render_block(b, th)))
-        .style(|s| s.flex_col().width_full().gap(3.0))
+/// A block plus a stable identity key, so a `dyn_stack` only re-renders blocks
+/// whose content changed. During streaming, earlier blocks keep their key (and
+/// their already-rendered view — no re-highlight), so only the growing tail
+/// block is rebuilt each token instead of the whole reply.
+struct KeyedBlock {
+    key: String,
+    block: Block,
+}
+
+/// Render an assistant reply (the `text` signal) as markdown, re-parsing on each
+/// change but re-rendering only the blocks that actually changed (keyed by
+/// content hash). This keeps streaming cheap: syntect only re-highlights the
+/// still-growing code block, not every prior one.
+pub fn markdown_stack(text: RwSignal<String>, th: GuiTheme) -> impl IntoView {
+    dyn_stack(
+        move || keyed_blocks(&text.get(), th),
+        |kb: &KeyedBlock| kb.key.clone(),
+        move |kb| render_block(kb.block, th),
+    )
+    .style(|s| s.flex_col().width_full().gap(3.0))
+}
+
+/// Parse `src` into blocks, each tagged with an index + content-hash key.
+fn keyed_blocks(src: &str, th: GuiTheme) -> Vec<KeyedBlock> {
+    to_blocks(src, th)
+        .into_iter()
+        .enumerate()
+        .map(|(i, block)| KeyedBlock {
+            key: block_key(i, &block),
+            block,
+        })
+        .collect()
+}
+
+/// A stable key for a block: its index plus a hash of its rendered content, so an
+/// unchanged block keeps its key across re-parses (colors derive from the fixed
+/// theme, so hashing text + emphasis flags is enough).
+fn block_key(i: usize, b: &Block) -> String {
+    let mut h = DefaultHasher::new();
+    match b {
+        Block::Rich { runs, indent } => {
+            for r in runs {
+                r.text.hash(&mut h);
+                r.bold.hash(&mut h);
+                r.italic.hash(&mut h);
+                r.mono.hash(&mut h);
+                r.size.to_bits().hash(&mut h);
+            }
+            indent.to_bits().hash(&mut h);
+        }
+        Block::Code { lang, content } => {
+            lang.hash(&mut h);
+            content.hash(&mut h);
+        }
+        Block::Rule => 0u8.hash(&mut h),
+    }
+    format!("{i}:{:x}", h.finish())
 }
 
 /// Parse the event stream into blocks, tracking inline emphasis (pre-computed on
