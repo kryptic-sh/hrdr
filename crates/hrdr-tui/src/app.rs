@@ -92,6 +92,8 @@ pub(crate) enum Entry {
         result: String,
         ok: bool,
         done: bool,
+        /// Show the full result instead of a truncated preview (`/expand`).
+        expanded: bool,
     },
     System(String),
     /// Final per-turn stats line, appended below the last output.
@@ -163,6 +165,9 @@ pub(crate) struct App {
     file_index_cwd: Option<std::path::PathBuf>,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
+    /// Show every tool result in full (`/expand all`); per-entry `expanded`
+    /// overrides this for individual results.
+    pub(crate) expand_tools: bool,
     /// True while a compaction (summarization) pass is running.
     pub(crate) compacting: bool,
     /// True while an `/init` turn runs, so its result reloads `AGENTS.md`.
@@ -306,6 +311,7 @@ impl App {
             file_index: Vec::new(),
             file_index_cwd: None,
             show_reasoning: true,
+            expand_tools: false,
             compacting: false,
             pending_init: false,
             pending_edit: None,
@@ -767,6 +773,7 @@ impl App {
             }
             "cwd" => self.change_cwd(arg),
             "tools" => self.show_tools(),
+            "expand" => self.expand_cmd(arg),
             "add" => self.add_file(arg),
             "diff" => self.git_diff_cmd(),
             "reasoning" => {
@@ -991,6 +998,7 @@ impl App {
                             result,
                             ok,
                             done: true,
+                            expanded: false,
                         });
                     }
                 }
@@ -1050,6 +1058,45 @@ impl App {
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
+    }
+
+    /// `/expand [all|off]` — no arg toggles the most recent tool result's full
+    /// view; `all` shows every tool result in full; `off` collapses everything.
+    fn expand_cmd(&mut self, arg: &str) {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "all" | "on" => {
+                self.expand_tools = true;
+                self.system("tool output expanded (all)");
+            }
+            "off" | "none" | "collapse" => {
+                self.expand_tools = false;
+                for e in self.transcript.iter_mut() {
+                    if let Entry::Tool { expanded, .. } = e {
+                        *expanded = false;
+                    }
+                }
+                self.system("tool output collapsed");
+            }
+            "" => {
+                let last = self.transcript.iter_mut().rev().find_map(|e| match e {
+                    Entry::Tool { expanded, .. } => Some(expanded),
+                    _ => None,
+                });
+                match last {
+                    Some(expanded) => {
+                        *expanded = !*expanded;
+                        let now = *expanded;
+                        self.system(if now {
+                            "expanded last tool output"
+                        } else {
+                            "collapsed last tool output"
+                        });
+                    }
+                    None => self.system("no tool output to expand"),
+                }
+            }
+            _ => self.system("usage: /expand [all | off]"),
+        }
     }
 
     fn show_tools(&mut self) {
@@ -2334,6 +2381,7 @@ impl App {
                     result: String::new(),
                     ok: true,
                     done: false,
+                    expanded: false,
                 });
             }
             AgentEvent::ToolOutput { id, chunk } => {
@@ -2477,6 +2525,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
+    ("/expand", "expand tool output (last, or 'all'/'off')"),
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
@@ -2539,7 +2588,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Files & context",
         &[
-            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/paste",
+            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/expand", "/paste",
         ],
     ),
     ("Reply", &["/copy", "/export", "/retry", "/undo"]),

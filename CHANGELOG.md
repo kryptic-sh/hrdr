@@ -33,6 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Expandable tool output: tool results are previewed (head/live tail) with a
+  `… (+N more lines · /expand)` hint; `/expand` toggles the most recent result
+  to full, `/expand all` shows every tool result in full, and `/expand off`
+  collapses everything back to previews.
 - Network resilience: the model connection is now retried with exponential
   backoff (up to 4 attempts) on transient failures — connection errors, 429, and
   5xx — instead of failing the turn. Each retry posts a system notice.

@@ -867,8 +867,18 @@ fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
                 result,
                 ok,
                 done,
+                expanded,
                 ..
-            } => push_tool(&mut out, theme, name, args, result, *ok, *done),
+            } => push_tool(
+                &mut out,
+                theme,
+                name,
+                args,
+                result,
+                *ok,
+                *done,
+                *expanded || app.expand_tools,
+            ),
             Entry::System(text) => push_text(
                 &mut out,
                 Span::raw(""),
@@ -946,6 +956,7 @@ fn push_text(out: &mut Vec<Line<'static>>, prefix: Span<'static>, text: &str, st
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_tool(
     out: &mut Vec<Line<'static>>,
     theme: &Theme,
@@ -954,6 +965,7 @@ fn push_tool(
     result: &str,
     ok: bool,
     done: bool,
+    expanded: bool,
 ) {
     let mark = if !done {
         ("…", theme.warn)
@@ -980,8 +992,9 @@ fn push_tool(
     };
     let lines: Vec<&str> = result.lines().collect();
     if done {
-        // Finished: show the head of the result.
-        for line in lines.iter().take(preview) {
+        // Finished: show the head of the result (or all of it when expanded).
+        let shown = if expanded { lines.len() } else { preview };
+        for line in lines.iter().take(shown) {
             let color = if is_diff {
                 diff_line_color(line, theme)
             } else {
@@ -992,10 +1005,10 @@ fn push_tool(
                 Style::default().fg(color),
             )));
         }
-        let extra = lines.len().saturating_sub(preview);
+        let extra = lines.len().saturating_sub(shown);
         if extra > 0 {
             out.push(Line::from(Span::styled(
-                format!("  … (+{extra} more lines)"),
+                format!("  … (+{extra} more lines · /expand)"),
                 Style::default().fg(theme.dim),
             )));
         }
