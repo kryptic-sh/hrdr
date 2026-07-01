@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Interrupting a turn mid tool-call no longer corrupts the conversation. A turn
+  pushes the assistant `tool_calls` message before running the tools, so
+  cancelling (Esc) during tool execution left the history ending with an
+  assistant message whose `role:"tool"` results were missing — strict servers
+  (OpenAI, infr) then reject the next request. The next turn now backfills a
+  `[interrupted]` stub result for each unanswered call id before sending
+  (`repair_dangling_tool_calls`).
+
 - Tool calls whose server omits the `id` field now get stable synthesized ids
   (`call_0`, `call_1`, …) in `Accumulator::into_message`, so the assistant
   message and its `role:"tool"` results correlate and multiple calls in one turn

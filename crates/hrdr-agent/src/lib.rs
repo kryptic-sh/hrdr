@@ -753,6 +753,10 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
+        // A previous turn interrupted mid tool-call can leave the history ending
+        // with an assistant `tool_calls` message whose results are missing —
+        // strict servers reject that. Backfill stubs before the new user turn.
+        repair_dangling_tool_calls(&mut self.messages);
         self.messages.push(ChatMessage::user(user_input.into()));
         // Start a fresh file checkpoint for this turn's edits.
         if let Some(cp) = &self.checkpoints
@@ -967,14 +971,105 @@ pub fn is_assistant(m: &ChatMessage) -> bool {
     m.role == Role::Assistant
 }
 
+/// Repair a history left dangling by an interrupted turn. An assistant message
+/// with `tool_calls` must be followed by a `role:"tool"` result for every call
+/// id, or strict servers (OpenAI, and infr) reject the next request. If the most
+/// recent such assistant message is missing any results (the turn was cancelled
+/// mid tool-call), append a stub result for each unanswered id. No-op when the
+/// last tool-calling turn is already complete.
+fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
+    let Some(idx) = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+    else {
+        return;
+    };
+    let call_ids: Vec<String> = messages[idx]
+        .tool_calls
+        .as_ref()
+        .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
+        .unwrap_or_default();
+    let answered: std::collections::HashSet<&str> = messages[idx + 1..]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let missing: Vec<String> = call_ids
+        .into_iter()
+        .filter(|id| !answered.contains(id.as_str()))
+        .collect();
+    for id in missing {
+        messages.push(ChatMessage::tool_result(id, "[interrupted]"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Agent, AgentConfig, ProviderConfig, builtin_provider, is_context_overflow, is_transient,
+        repair_dangling_tool_calls,
     };
+    use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
         agent.messages()[0].content.clone().unwrap_or_default()
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: id.to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "t".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn repair_backfills_missing_tool_results_after_interrupt() {
+        // Interrupted after the first of two calls got its result.
+        let mut msgs = vec![
+            ChatMessage::user("go"),
+            assistant_with_calls(&["a", "b"]),
+            ChatMessage::tool_result("a", "done a"),
+        ];
+        repair_dangling_tool_calls(&mut msgs);
+        // A stub was appended for the unanswered "b" — history is now valid.
+        assert_eq!(msgs.len(), 4);
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, Role::Tool);
+        assert_eq!(last.tool_call_id.as_deref(), Some("b"));
+        assert_eq!(last.content.as_deref(), Some("[interrupted]"));
+    }
+
+    #[test]
+    fn repair_is_a_noop_when_all_calls_are_answered() {
+        let mut msgs = vec![
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", "done"),
+        ];
+        let before = msgs.len();
+        repair_dangling_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), before);
+    }
+
+    #[test]
+    fn repair_ignores_history_with_no_tool_calls() {
+        let mut msgs = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
+        repair_dangling_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]
