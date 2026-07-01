@@ -23,8 +23,12 @@ pub struct ChatMessage {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Model "thinking" channel (infr/Qwen3 etc). Received-only; never sent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Model "thinking" channel (infr/Qwen3 etc). Received-only; **never sent**.
+    /// `skip_serializing` (not `skip_serializing_if`) so it's always dropped on
+    /// the wire: reasoning models degrade badly — repetition/gibberish — when a
+    /// prior turn's `<think>` is fed back into the prompt, so history must carry
+    /// only the final answer. Kept in the struct for display + deserialization.
+    #[serde(default, skip_serializing)]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -325,6 +329,34 @@ mod tests {
             }],
             usage: None,
         }
+    }
+
+    #[test]
+    fn reasoning_content_is_never_serialized_but_still_parses() {
+        // The accumulator carries the model's <think> into the history message…
+        let mut acc = Accumulator::new();
+        acc.reasoning = "the user said hi, greet back".to_string();
+        acc.content = "Hello!".to_string();
+        let msg = acc.into_message();
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("the user said hi, greet back")
+        );
+
+        // …but it must NOT go back on the wire — reasoning models degrade when a
+        // prior turn's reasoning is fed back into the prompt.
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("reasoning_content"),
+            "reasoning_content leaked onto the wire: {json}"
+        );
+        assert!(json.contains("Hello!"));
+
+        // Deserialization still accepts it (non-streaming / compact responses).
+        let parsed: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi","reasoning_content":"x"}"#)
+                .unwrap();
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("x"));
     }
 
     #[test]

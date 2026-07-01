@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Multi-turn conversations with reasoning models (Qwen3 via `infr`, etc.) no
+  longer degenerate into repetition/gibberish on the second turn. The assistant
+  history message was serializing its `reasoning_content` (the `<think>` block)
+  back into the request — reasoning models are trained to have prior-turn
+  thinking stripped from the prompt, and feeding it back drove the model
+  off-distribution. `reasoning_content` is now `skip_serializing` (never sent),
+  matching its documented "received-only" intent; it's still kept for display
+  and still parses on the way in.
+
 - `/clear` (and its `/new` alias) now fully resets to a fresh session. It
   previously kept the original system prompt, so an `AGENTS.md` that was updated
   or removed after startup lingered in context forever. `Agent::clear()` now
