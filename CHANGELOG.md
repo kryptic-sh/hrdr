@@ -238,7 +238,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **Turn interruption**: the Send button becomes **Stop** while a turn runs, and
   Esc (or Stop) aborts the in-flight task — dropping its future releases the
   agent lock, late buffered events are discarded, and the next turn repairs any
-  dangling tool calls. **Session auto-save**: after each completed turn the GUI
+  dangling tool calls. **Markdown rendering**: assistant replies now render as
+  markdown instead of plain text — headings, bold/italic/inline-code, lists,
+  blockquotes, and fenced code blocks syntax-highlighted with syntect on a panel
+  background — via a floem `rich_text` renderer over `hjkl_markdown`'s event
+  stream (the same stream the TUI's ratatui backend consumes), re-rendered live
+  as the reply streams. **Session auto-save**: after each completed turn the GUI
   persists the conversation (via the newly-shared `hrdr_app::save_session`,
   which the TUI's continuous auto-save now also uses), assigning a stable file
   id on first save and notifying once (`session saved as '…' — /resume …`);
