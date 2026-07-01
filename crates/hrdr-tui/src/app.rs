@@ -424,6 +424,13 @@ impl App {
         let mut rx = self.rx.take().expect("run called once");
         // Periodic wake so the inference spinner animates between tokens.
         let mut ticker = tokio::time::interval(Duration::from_millis(120));
+        // OS-level config watch (inotify/FSEvents/…); kept alive for the loop.
+        // Falls back to mtime polling on the ticker if a watcher can't be made.
+        let (_config_watcher, mut config_rx) = match setup_config_watcher() {
+            Some((w, rx)) => (Some(w), Some(rx)),
+            None => (None, None),
+        };
+        let watch_active = config_rx.is_some();
 
         loop {
             terminal.draw(|f| ui::draw(f, self))?;
@@ -448,7 +455,19 @@ impl App {
                     Some(Err(_)) | None => break,
                 },
                 Some(msg) = rx.recv() => self.on_turn_msg(msg),
-                _ = ticker.tick() => self.maybe_reload_config(),
+                // OS notified the config file changed → reload (mtime-guarded).
+                _ = async {
+                    match config_rx.as_mut() {
+                        Some(rx) => { rx.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => self.maybe_reload_config(),
+                _ = ticker.tick() => {
+                    // Fallback polling only when no OS watcher is active.
+                    if !watch_active {
+                        self.maybe_reload_config();
+                    }
+                }
             }
         }
         Ok(())
@@ -2436,7 +2455,35 @@ impl App {
     }
 }
 
-/// Modified-time of the user config file, for hot-reload polling.
+/// Set up an OS-level watch on the config file, pinging `()` on the returned
+/// channel whenever it changes. Returns `None` if a watcher can't be created
+/// (the caller falls back to mtime polling). The watcher must be kept alive for
+/// the watch to stay active.
+fn setup_config_watcher() -> Option<(notify::RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
+    use notify::{RecursiveMode, Watcher};
+    let path = hrdr_agent::config_file_path()?;
+    let dir = path.parent()?.to_path_buf();
+    // Watch the parent directory (so atomic saves via rename are caught) and
+    // filter to our file. Create the dir so the watch can be established.
+    let _ = std::fs::create_dir_all(&dir);
+    let file_name = path.file_name()?.to_os_string();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res
+            && event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == Some(file_name.as_os_str()))
+        {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+    Some((watcher, rx))
+}
+
+/// Modified-time of the user config file, for the hot-reload dedup guard.
 fn current_config_mtime() -> Option<SystemTime> {
     hrdr_agent::config_file_path()
         .and_then(|p| std::fs::metadata(p).ok())

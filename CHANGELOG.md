@@ -52,11 +52,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Config persistence + hot reload: changing a preference in the client
   (`/timestamps`, `/statusbar`, `/theme`, `/effort`, `/temp`) now writes it to
   `~/.config/hrdr/config.toml` (format/comment-preserving via `toml_edit`). hrdr
-  watches the config file and hot-reloads live settings when it changes —
-  whether edited by hand or by another running session. Loading is fault
-  tolerant: an invalid config never crashes the client; at startup it warns and
-  falls back to defaults, and on hot-reload it keeps the last known-good
-  settings and warns. New `AgentConfig::load_checked()` + `config_file_path()` +
+  watches the config file with an OS-level notifier (`notify` —
+  inotify/FSEvents/kqueue) and hot-reloads live settings when it changes —
+  whether edited by hand or by another running session (falling back to mtime
+  polling only if a watcher can't be created). Loading is fault tolerant: an
+  invalid config never crashes the client; at startup it warns and falls back to
+  defaults, and on hot-reload it keeps the last known-good settings and warns.
+  New `AgentConfig::load_checked()` + `config_file_path()` +
   `persist_setting`/`remove_setting`.
 - Syntax highlighting for fenced code blocks in assistant messages: code blocks
   are pulled out of the markdown and highlighted with `syntect` (lightweight,
