@@ -740,7 +740,16 @@ impl App {
         self.push_entry(Entry::User(input.clone()));
         // Expand `@file` mentions into attached contents for the model only; the
         // transcript still shows the message as the user typed it.
-        let sent = self.expand_mentions(&input);
+        let cwd = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| a.cwd())
+            .or_else(|| std::env::current_dir().ok());
+        let sent = match cwd {
+            Some(cwd) => hrdr_app::expand_mentions(&input, &cwd),
+            None => input.clone(),
+        };
         self.launch_turn(sent);
     }
 
@@ -874,51 +883,6 @@ impl App {
             let draft = self.history_draft.clone();
             self.editor.set_content(&draft);
         }
-    }
-
-    /// Expand `@file` mentions in `input` by appending the referenced files'
-    /// contents (for the model only). Unreadable or missing references are left
-    /// as-is. Returns `input` unchanged when there are no resolvable mentions.
-    fn expand_mentions(&self, input: &str) -> String {
-        let Some(cwd) = self
-            .agent
-            .try_lock()
-            .ok()
-            .map(|a| a.cwd())
-            .or_else(|| std::env::current_dir().ok())
-        else {
-            return input.to_string();
-        };
-        const MAX_BYTES: usize = 100 * 1024;
-        let mut attached: Vec<(String, String)> = Vec::new();
-        for raw in input.split_whitespace() {
-            let Some(rel) = raw.strip_prefix('@') else {
-                continue;
-            };
-            let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
-            if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
-                continue;
-            }
-            let path = cwd.join(rel);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let text = if text.len() > MAX_BYTES {
-                    let end = hrdr_tools::floor_char_boundary(&text, MAX_BYTES);
-                    format!("{}\n…[truncated]", &text[..end])
-                } else {
-                    text
-                };
-                attached.push((rel.to_string(), text));
-            }
-        }
-        if attached.is_empty() {
-            return input.to_string();
-        }
-        let mut out = String::from(input);
-        out.push_str("\n\n--- Referenced files (via @) ---\n");
-        for (rel, text) in attached {
-            out.push_str(&format!("\n=== {rel} ===\n{text}\n"));
-        }
-        out
     }
 
     pub(crate) fn on_turn_msg(&mut self, msg: TurnMsg) {

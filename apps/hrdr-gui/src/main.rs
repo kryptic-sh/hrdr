@@ -124,6 +124,27 @@ struct Item {
     body: Body,
 }
 
+/// One row in the completion dropdown: a slash command or an `@file` match.
+#[derive(Clone)]
+enum CompRow {
+    Slash {
+        name: &'static str,
+        desc: &'static str,
+    },
+    /// `start` is the byte offset of the `@` in the input; `path` is the match.
+    File { start: usize, path: String },
+}
+
+impl CompRow {
+    /// Stable dyn_stack key.
+    fn key(&self) -> String {
+        match self {
+            CompRow::Slash { name, .. } => format!("/{name}"),
+            CompRow::File { path, .. } => format!("@{path}"),
+        }
+    }
+}
+
 /// UI-thread message from a running turn (mirrors the TUI's `TurnMsg`).
 #[derive(Clone)]
 enum UiMsg {
@@ -167,6 +188,18 @@ fn app_view(
     // Model is a signal so `/model <name>` can switch it and the status bar
     // reflects the change live.
     let model = create_rw_signal(model);
+    // Cached relative file paths under the cwd, for `@file` completion. Built
+    // lazily the first time an `@` mention is typed (see the effect below).
+    let file_index: RwSignal<Vec<String>> = create_rw_signal(Vec::new());
+    // Populate the file index once, when the user starts an `@file` mention.
+    create_effect(move |_| {
+        if input.get().contains('@')
+            && file_index.with_untracked(Vec::is_empty)
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            file_index.set(hrdr_app::walk_files(&cwd));
+        }
+    });
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
 
@@ -209,6 +242,13 @@ fn app_view(
         push_item(transcript, next_id, Body::User(text.clone()));
         running.set(true);
 
+        // Expand `@file` mentions for the model only; the transcript keeps the
+        // bare `@path` the user typed (same split as the TUI).
+        let sent = match std::env::current_dir() {
+            Ok(cwd) => hrdr_app::expand_mentions(&text, &cwd),
+            Err(_) => text,
+        };
+
         let agent = agent.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -216,7 +256,7 @@ fn app_view(
             let result = agent
                 .lock()
                 .await
-                .run(text, move |ev| {
+                .run(sent, move |ev| {
                     let _ = tx_ev.send(UiMsg::Event(ev));
                 })
                 .await;
@@ -247,27 +287,48 @@ fn app_view(
     let input_row = h_stack((input_box, button("Send").on_click_stop(move |_| send())))
         .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
 
-    // Slash-command completion list, shown above the input while a `/…` is being
-    // typed (uses the shared ranker). Clicking a row fills the input.
-    let completions = dyn_stack(
-        move || {
-            let inp = input.get();
-            if inp.starts_with('/') {
-                hrdr_app::slash_completions(&inp)
-            } else {
-                Vec::new()
-            }
-        },
-        |(name, _): &(&'static str, &'static str)| name.to_string(),
-        move |(name, desc)| {
-            h_stack((
-                label(move || name.to_string()).style(move |s| s.color(theme.user).font_bold()),
-                label(move || desc.to_string()).style(move |s| s.color(theme.dim)),
-            ))
-            .style(|s| s.gap(8.0).padding_horiz(10.0).padding_vert(2.0))
-            .on_click_stop(move |_| input.set(format!("{name} ")))
-        },
-    )
+    // Completion list shown above the input: slash commands while a `/…` is being
+    // typed, or ranked `@file` paths while an `@…` mention is active (both use the
+    // shared rankers). Clicking a row fills the input.
+    let comp_rows = move || -> Vec<CompRow> {
+        let inp = input.get();
+        if inp.starts_with('/') {
+            return hrdr_app::slash_completions(&inp)
+                .into_iter()
+                .map(|(name, desc)| CompRow::Slash { name, desc })
+                .collect();
+        }
+        if let Some((start, query)) = hrdr_app::active_file_token(&inp) {
+            return file_index.with(|files| {
+                hrdr_app::rank_file_matches(files, &query)
+                    .into_iter()
+                    .map(|path| CompRow::File { start, path })
+                    .collect()
+            });
+        }
+        Vec::new()
+    };
+    let completions = dyn_stack(comp_rows, CompRow::key, move |row| match row {
+        CompRow::Slash { name, desc } => h_stack((
+            label(move || name.to_string()).style(move |s| s.color(theme.user).font_bold()),
+            label(move || desc.to_string()).style(move |s| s.color(theme.dim)),
+        ))
+        .style(|s| s.gap(8.0).padding_horiz(10.0).padding_vert(2.0))
+        .on_click_stop(move |_| input.set(format!("{name} ")))
+        .into_any(),
+        CompRow::File { start, path } => label({
+            let path = path.clone();
+            move || path.clone()
+        })
+        .style(move |s| s.color(theme.user).padding_horiz(10.0).padding_vert(2.0))
+        .on_click_stop(move |_| {
+            // Replace the partial `@…` token with `@<path> `.
+            let inp = input.get_untracked();
+            let prefix = inp.get(..start).unwrap_or("");
+            input.set(format!("{prefix}@{path} "));
+        })
+        .into_any(),
+    })
     .style(move |s| {
         let s = s
             .flex_col()
@@ -276,7 +337,8 @@ fn app_view(
             .padding_vert(4.0)
             .background(theme.bg);
         // Collapse entirely when there's nothing to show.
-        if input.get().starts_with('/') {
+        let inp = input.get();
+        if inp.starts_with('/') || hrdr_app::active_file_token(&inp).is_some() {
             s
         } else {
             s.hide()

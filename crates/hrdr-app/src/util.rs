@@ -25,6 +25,58 @@ pub fn session_name_from(msgs: &[Message]) -> String {
         .unwrap_or_else(|| "untitled".to_string())
 }
 
+/// Expand `@file` mentions in `input` by appending the referenced files'
+/// contents (resolved under `cwd`), for sending to the model. Each distinct
+/// readable `@path` is attached once under a trailing "Referenced files"
+/// section, truncated at 100 KiB on a char boundary; unreadable/missing/
+/// duplicate references are skipped. Returns `input` unchanged when nothing
+/// resolves. The display copy should keep the bare `@path`; only the sent copy
+/// carries the expansion.
+pub fn expand_mentions(input: &str, cwd: &Path) -> String {
+    const MAX_BYTES: usize = 100 * 1024;
+    let mut attached: Vec<(String, String)> = Vec::new();
+    for raw in input.split_whitespace() {
+        let Some(rel) = raw.strip_prefix('@') else {
+            continue;
+        };
+        let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
+            continue;
+        }
+        let path = cwd.join(rel);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let text = if text.len() > MAX_BYTES {
+                let end = floor_char_boundary(&text, MAX_BYTES);
+                format!("{}\n…[truncated]", &text[..end])
+            } else {
+                text
+            };
+            attached.push((rel.to_string(), text));
+        }
+    }
+    if attached.is_empty() {
+        return input.to_string();
+    }
+    let mut out = String::from(input);
+    out.push_str("\n\n--- Referenced files (via @) ---\n");
+    for (rel, text) in attached {
+        out.push_str(&format!("\n=== {rel} ===\n{text}\n"));
+    }
+    out
+}
+
+/// Largest byte index `<= index` that lands on a UTF-8 char boundary of `s`.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Resolve `path` against `base`: absolute paths pass through unchanged,
 /// relative ones are joined onto `base`.
 pub fn resolve_under(base: &Path, path: &str) -> PathBuf {
@@ -228,6 +280,27 @@ fn walk_files_fallback(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_mentions_attaches_readable_files_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello from a").unwrap();
+
+        // No mentions → unchanged.
+        assert_eq!(expand_mentions("just text", root), "just text");
+
+        // A readable mention is attached (trailing punctuation trimmed), once,
+        // while the original line is preserved.
+        let out = expand_mentions("look at @a.txt, and @a.txt again", root);
+        assert!(out.starts_with("look at @a.txt, and @a.txt again"));
+        assert!(out.contains("--- Referenced files (via @) ---"));
+        assert_eq!(out.matches("=== a.txt ===").count(), 1);
+        assert!(out.contains("hello from a"));
+
+        // A missing mention resolves nothing → unchanged.
+        assert_eq!(expand_mentions("@nope.txt", root), "@nope.txt");
+    }
 
     #[test]
     fn parse_duration_specs() {

@@ -180,10 +180,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/models`, `/tools`, and `/info`, with aliases resolved via the shared
   `resolve_alias`. An unrecognized `/…` still falls through to the model (so a
   literal path works, matching the TUI); the quit-word family closes the window.
-  TUI-shared logic (transcript model, more commands, sessions, …) continues to
-  move into the shared `hrdr-app` crate as GUI features land. Excluded from CI
-  for now (floem's large X11/Wayland dep tree + Linux system libs — wiring it in
-  is a follow-up).
+  **`@file` attachment** works too: the same dropdown shows ranked file matches
+  while an `@…` mention is being typed (shared `active_file_token` +
+  `rank_file_matches` over a lazily-built `walk_files` index), clicking one
+  fills the `@path`, and on send the mention is expanded into the file's
+  contents for the model via the newly-shared `hrdr_app::expand_mentions`
+  (lifted out of the TUI, so both frontends attach files identically) while the
+  transcript keeps the bare `@path`. TUI-shared logic (more commands, sessions,
+  …) continues to move into the shared `hrdr-app` crate as GUI features land.
+  Excluded from CI for now (floem's large X11/Wayland dep tree + Linux system
+  libs — wiring it in is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored
