@@ -41,7 +41,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   content stored once) and deflate-compressed, with a journal recording which
   turn touched which file, kept under `$XDG_DATA_HOME/hrdr/checkpoints/<cwd>/`
   so revert survives restarts. Only files the agent modifies are snapshotted, so
-  it's fast and small.
+  it's fast and small. Checkpointing is **auto-disabled inside a git repo** (git
+  already provides revert); set `checkpoints = on` in config,
+  `--checkpoints on`, or `$HRDR_CHECKPOINTS=on` to force it (or `off` to disable
+  entirely).
 - Expandable tool output: tool results are previewed (head/live tail) with a
   `… (+N more lines · /expand)` hint; `/expand` toggles the most recent result
   to full, `/expand all` shows every tool result in full, and `/expand off`
@@ -165,11 +168,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `@file` mentions with autocompletion: type `@` in the input to get a popup of
   matching project files (Up/Down to select, Tab or Enter to insert the path);
   the file index is built lazily from the cwd. In a git repo it honors
-  `.gitignore`/`.ignore` (and parents/global) plus `.git/info/exclude` via the
-  `ignore` crate; outside a git repo it falls back to skipping known VCS/build
-  and hidden directories. On send, each `@path` is expanded into the referenced
-  file's contents for the model (bounded to 100 KB/file), while the transcript
-  still shows the message exactly as typed. Complements `/add`.
+  `.gitignore`/`.ignore` at every level (nested subdirectory ignore files
+  included, plus parents/global) and `.git/info/exclude` via the `ignore` crate;
+  outside a git repo it falls back to skipping known VCS/build and hidden
+  directories. On send, each `@path` is expanded into the referenced file's
+  contents for the model (bounded to 100 KB/file), while the transcript still
+  shows the message exactly as typed. Complements `/add`.
 - Project instructions via the open `AGENTS.md` standard (https://agents.md): on
   startup (and whenever the working directory changes) hrdr gathers `AGENTS.md`
   files walking from the cwd up to the filesystem root, plus an optional global

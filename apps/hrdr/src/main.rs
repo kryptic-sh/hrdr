@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long, global = true)]
     statusbar: Option<String>,
 
+    /// File checkpointing: on, off, or auto (default; off inside a git repo).
+    #[arg(long, global = true)]
+    checkpoints: Option<String>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -194,6 +198,9 @@ async fn main() -> Result<()> {
     }
     if let Some(s) = cli.statusbar {
         config.statusbar = Some(s);
+    }
+    if let Some(c) = cli.checkpoints {
+        config.checkpoints = Some(c);
     }
 
     if remote_provider && config.model == "default" {

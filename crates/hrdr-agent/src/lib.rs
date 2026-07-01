@@ -100,6 +100,9 @@ pub struct AgentConfig {
     /// Status-bar mode: `none` (hidden), `truncate` (drop sections to fit), or
     /// `wrap` (use multiple rows). `None` resolves to `truncate` (the default).
     pub statusbar: Option<String>,
+    /// File checkpointing: `on`, `off`, or `auto` (default) — `auto` enables it
+    /// only outside a git repo (git already provides revert).
+    pub checkpoints: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -128,6 +131,7 @@ impl Default for AgentConfig {
             icons: None,
             timestamps: None,
             statusbar: None,
+            checkpoints: None,
             providers: HashMap::new(),
         }
     }
@@ -234,6 +238,7 @@ struct FileConfig {
     icons: Option<String>,
     timestamps: Option<String>,
     statusbar: Option<String>,
+    checkpoints: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -344,6 +349,9 @@ impl AgentConfig {
         if let Some(v) = fc.statusbar {
             self.statusbar = Some(v);
         }
+        if let Some(v) = fc.checkpoints {
+            self.checkpoints = Some(v);
+        }
         if !fc.providers.is_empty() {
             self.providers = fc.providers;
         }
@@ -391,6 +399,9 @@ impl AgentConfig {
         if let Ok(v) = std::env::var("HRDR_STATUSBAR") {
             self.statusbar = Some(v);
         }
+        if let Ok(v) = std::env::var("HRDR_CHECKPOINTS") {
+            self.checkpoints = Some(v);
+        }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
@@ -433,6 +444,12 @@ pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
     doc.remove(key);
     write_config_doc(&path, &doc)?;
     Ok(path)
+}
+
+/// Whether `cwd` (or an ancestor) is inside a git repo. `.git` may be a
+/// directory (normal) or a file (worktrees/submodules).
+pub fn in_git_repo(cwd: &std::path::Path) -> bool {
+    cwd.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
@@ -507,7 +524,21 @@ impl Agent {
         let system = render_system(&tools, &config.cwd, project_docs.as_deref())?;
 
         // File checkpoint store, keyed by working directory (like sessions).
-        let checkpoints = checkpoint_dir(&config.cwd)
+        // `auto` (default) enables it only outside a git repo — git already
+        // provides revert, so checkpointing there is redundant.
+        let enable_checkpoints = match config
+            .checkpoints
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("on" | "true" | "yes" | "1" | "always") => true,
+            Some("off" | "false" | "no" | "0" | "never") => false,
+            _ => !in_git_repo(&config.cwd),
+        };
+        let checkpoints = enable_checkpoints
+            .then(|| checkpoint_dir(&config.cwd))
+            .flatten()
             .and_then(|dir| Checkpoints::open(dir).ok())
             .map(|c| Arc::new(Mutex::new(c)));
         ctx.checkpoints = checkpoints.clone();

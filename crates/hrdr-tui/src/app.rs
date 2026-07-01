@@ -1853,7 +1853,7 @@ impl App {
             return;
         }
         let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
-            self.system("checkpoints unavailable");
+            self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
             return;
         };
         let result = match cp.lock() {
@@ -1885,7 +1885,7 @@ impl App {
     /// `/checkpoints` — list the revertible per-turn file checkpoints.
     fn checkpoints_cmd(&mut self) {
         let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
-            self.system("checkpoints unavailable");
+            self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
             return;
         };
         let infos = match cp.lock() {
@@ -2938,17 +2938,11 @@ When finished, give a one-line summary of what you wrote.";
 /// via the `ignore` crate; outside one, falls back to a manual walk that skips
 /// known VCS/build and hidden directories.
 fn walk_files(root: &std::path::Path) -> Vec<String> {
-    if in_git_repo(root) {
+    if hrdr_agent::in_git_repo(root) {
         walk_files_gitignore(root)
     } else {
         walk_files_fallback(root)
     }
-}
-
-/// Whether `root` (or an ancestor) is inside a git repo. `.git` may be a
-/// directory (normal) or a file (worktrees/submodules).
-fn in_git_repo(root: &std::path::Path) -> bool {
-    root.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Gitignore-aware walk (ripgrep's walker).
@@ -3113,8 +3107,38 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 mod tests {
     use super::{
         active_file_token, is_quit_command, last_fenced_block, parse_duration, parse_msg_range,
-        resolve_alias, slash_completions,
+        resolve_alias, slash_completions, walk_files_gitignore,
     };
+
+    #[test]
+    fn gitignore_walk_honors_nested_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A `.git` dir so the `ignore` crate applies gitignore rules.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // Root-level ignore.
+        std::fs::write(root.join(".gitignore"), "root_ignored.txt\n").unwrap();
+        std::fs::write(root.join("keep_root.txt"), "").unwrap();
+        std::fs::write(root.join("root_ignored.txt"), "").unwrap();
+        // Nested ignore in a subdirectory.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(sub.join("keep_sub.txt"), "").unwrap();
+        std::fs::write(sub.join("ignored.txt"), "").unwrap();
+
+        let files = walk_files_gitignore(root);
+        assert!(files.iter().any(|f| f == "keep_root.txt"), "{files:?}");
+        assert!(files.iter().any(|f| f == "sub/keep_sub.txt"), "{files:?}");
+        assert!(
+            !files.iter().any(|f| f == "root_ignored.txt"),
+            "root .gitignore not honored: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f == "sub/ignored.txt"),
+            "nested sub/.gitignore not honored: {files:?}"
+        );
+    }
 
     #[test]
     fn parse_duration_specs() {
