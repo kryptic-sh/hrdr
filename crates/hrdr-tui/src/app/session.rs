@@ -135,36 +135,8 @@ impl super::App {
         }
     }
     pub(super) fn list_sessions_cmd(&mut self, arg: &str) {
-        let all = matches!(arg.trim(), "--all" | "-a" | "all");
-        let cur = hrdr_agent::cwd_slug(&self.current_cwd());
-        let sessions: Vec<_> = hrdr_agent::list_sessions()
-            .into_iter()
-            .filter(|m| all || hrdr_agent::cwd_slug(&m.cwd) == cur)
-            .collect();
-        if sessions.is_empty() {
-            self.system(if all {
-                format!(
-                    "no saved sessions in {}",
-                    hrdr_agent::sessions_dir().display()
-                )
-            } else {
-                "no saved sessions for this directory (try /sessions --all)".to_string()
-            });
-            return;
-        }
-        let mut s = if all {
-            String::from("all sessions (resume by id or name):")
-        } else {
-            String::from("sessions here (resume by id or name; /sessions --all for every dir):")
-        };
-        for m in sessions {
-            if all {
-                s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
-            } else {
-                s.push_str(&format!("\n  {} — {}", m.id, m.name));
-            }
-        }
-        self.system(s);
+        let all = hrdr_app::sessions_all_flag(arg);
+        self.system(hrdr_app::session_list_text(all, &self.current_cwd()));
     }
     /// Rebuild the display transcript from a restored message history.
     fn rebuild_transcript(&mut self, msgs: &[Message]) {

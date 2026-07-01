@@ -201,10 +201,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   toggles the dim `<think>` blocks; **`/copy`** writes the last reply (or
   `/copy code` the last fenced block via the shared `last_fenced_block`, or
   `/copy all` the transcript) to the OS clipboard via `hjkl-clipboard`.
-  TUI-shared logic (more commands, sessions, …) continues to move into the
-  shared `hrdr-app` crate as GUI features land. Excluded from CI for now
-  (floem's large X11/Wayland dep tree + Linux system libs — wiring it in is a
-  follow-up).
+  **Session `/sessions` + `/resume`** land too: `/sessions` (`--all` for every
+  directory) lists saved sessions via the newly-shared
+  `hrdr_app::session_list_text` (the TUI's listing now delegates to it as well),
+  and `/resume <id or name>` restores a saved conversation — rebuilding the GUI
+  transcript from the message history (user/assistant text + each tool call
+  paired with its result) and pushing the messages + model back into the agent.
+  TUI-shared logic continues to move into the shared `hrdr-app` crate as GUI
+  features land. Excluded from CI for now (floem's large X11/Wayland dep tree +
+  Linux system libs — wiring it in is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored

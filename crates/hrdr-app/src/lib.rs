@@ -10,12 +10,14 @@ mod completion;
 mod config;
 mod format;
 mod history;
+mod sessions;
 mod transcript;
 mod util;
 pub use completion::*;
 pub use config::*;
 pub use format::*;
 pub use history::*;
+pub use sessions::*;
 pub use transcript::*;
 pub use util::*;
 

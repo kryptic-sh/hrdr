@@ -18,7 +18,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
-use hrdr_agent::{Agent, AgentConfig, AgentEvent};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole};
 use tokio::sync::Mutex as TokioMutex;
 
 // ---- colors -------------------------------------------------------------
@@ -266,6 +266,7 @@ fn app_view(
         if text.starts_with('/')
             && dispatch_slash(
                 &text,
+                cx,
                 transcript,
                 next_id,
                 usage,
@@ -455,6 +456,78 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
     push_item(transcript, next_id, Body::System(msg.into()));
 }
 
+/// The current working directory as a string (empty if unavailable).
+fn cwd_string() -> String {
+    std::env::current_dir()
+        .map(|c| c.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Rebuild the display transcript from a restored message history (for
+/// `/resume`). Mirrors the TUI's rebuild: user/assistant text plus each
+/// assistant tool call paired with its result message. Non-message roles and
+/// empty assistant turns are skipped.
+fn rebuild_transcript(
+    cx: Scope,
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+    msgs: &[Message],
+) {
+    transcript.update(|t| t.clear());
+    next_id.set(0);
+    // Map tool_call_id → (result, ok) from the tool-result messages.
+    let mut results: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for m in msgs {
+        if m.role == MessageRole::Tool
+            && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
+        {
+            results.insert(id.clone(), (content.clone(), !content.starts_with("Error:")));
+        }
+    }
+    for m in msgs {
+        match m.role {
+            MessageRole::User => {
+                if let Some(c) = &m.content {
+                    push_item(transcript, next_id, Body::User(c.clone()));
+                }
+            }
+            MessageRole::Assistant => {
+                if let Some(c) = &m.content
+                    && !c.is_empty()
+                {
+                    push_item(
+                        transcript,
+                        next_id,
+                        Body::Assistant(Assistant {
+                            reasoning: cx.create_rw_signal(String::new()),
+                            text: cx.create_rw_signal(c.clone()),
+                        }),
+                    );
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    let (result, ok) = results.get(&call.id).cloned().unwrap_or_default();
+                    push_item(
+                        transcript,
+                        next_id,
+                        Body::Tool(Tool {
+                            call_id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            args: call.function.arguments.clone(),
+                            output: cx.create_rw_signal(String::new()),
+                            result: cx.create_rw_signal(result),
+                            ok: cx.create_rw_signal(ok),
+                            done: cx.create_rw_signal(true),
+                            collapsed: cx.create_rw_signal(true),
+                        }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Text of the most recent assistant reply, if any (non-empty).
 fn last_assistant_text(transcript: RwSignal<Vec<Item>>) -> Option<String> {
     transcript
@@ -572,6 +645,7 @@ fn history_next(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_slash(
     input: &str,
+    cx: Scope,
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
@@ -628,6 +702,45 @@ fn dispatch_slash(
             let agent = agent.clone();
             tokio::spawn(async move { agent.lock().await.clear() });
             system(transcript, next_id, "conversation cleared");
+        }
+        "sessions" => {
+            let cwd = cwd_string();
+            let all = hrdr_app::sessions_all_flag(&arg);
+            system(transcript, next_id, hrdr_app::session_list_text(all, &cwd));
+        }
+        "resume" | "load" => {
+            if arg.is_empty() {
+                system(transcript, next_id, "usage: /resume <id or name> (see /sessions)");
+                return true;
+            }
+            let cwd = cwd_string();
+            match hrdr_agent::resolve_session(&cwd, &arg) {
+                Some((_id, session)) => {
+                    let count = session.messages.len();
+                    model.set(session.model.clone());
+                    // Rebuild the display transcript, then push agent state on the
+                    // async side (set_messages/set_model need the lock).
+                    rebuild_transcript(cx, transcript, next_id, &session.messages);
+                    let agent = agent.clone();
+                    let msgs = session.messages.clone();
+                    let m = session.model.clone();
+                    tokio::spawn(async move {
+                        let mut a = agent.lock().await;
+                        a.set_messages(msgs);
+                        a.set_model(m);
+                    });
+                    system(
+                        transcript,
+                        next_id,
+                        format!("resumed '{}' ({count} messages)", session.name),
+                    );
+                }
+                None => system(
+                    transcript,
+                    next_id,
+                    format!("no session matching '{arg}' (see /sessions)"),
+                ),
+            }
         }
         "model" => {
             if arg.is_empty() {
