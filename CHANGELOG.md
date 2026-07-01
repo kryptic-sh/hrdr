@@ -139,11 +139,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   header that collapses/expands the live streamed output, plus a
   pass/fail-colored result), and system/error lines; a status bar shows the
   model / context usage / output tokens and a "thinking" indicator; Enter or a
-  Send button submits. Per-message reactive signals stream tokens in place
-  without rebuilding the list. TUI-shared logic (transcript model, slash
-  commands, sessions, …) will move into a shared crate as GUI features land.
-  Excluded from CI for now (floem's large X11/Wayland dep tree + Linux system
-  libs — wiring it in is a follow-up).
+  Send button submits. Colors come from an **hjkl theme** (the same system the
+  TUI uses — `theme` in config picks it), mapped onto chat roles + the window
+  background. Per-message reactive signals stream tokens in place without
+  rebuilding the list. TUI-shared logic (transcript model, slash commands,
+  sessions, …) will move into a shared crate as GUI features land. Excluded from
+  CI for now (floem's large X11/Wayland dep tree + Linux system libs — wiring it
+  in is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored

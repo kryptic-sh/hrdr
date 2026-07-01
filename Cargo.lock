@@ -2166,6 +2166,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "floem",
+ "hjkl-theme",
  "hrdr-agent",
  "tokio",
 ]

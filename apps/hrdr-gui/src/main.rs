@@ -19,11 +19,71 @@ use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use tokio::sync::Mutex as TokioMutex;
 
 // ---- colors -------------------------------------------------------------
+// Fallbacks when a theme omits a role (or no theme loads).
 const DIM: Color = Color::rgb8(0x8a, 0x8a, 0x8a);
 const USER: Color = Color::rgb8(0x6c, 0xb6, 0xff);
 const OK: Color = Color::rgb8(0x5f, 0xd0, 0x7a);
 const ERR: Color = Color::rgb8(0xe0, 0x6c, 0x6c);
 const TOOL: Color = Color::rgb8(0xc9, 0xa2, 0x66);
+
+/// Chat-role colors resolved from an hjkl theme — the same theme system the TUI
+/// uses (see `hrdr-tui`'s `Theme`), mapped here to floem colors.
+#[derive(Clone, Copy)]
+struct GuiTheme {
+    bg: Color,
+    user: Color,
+    assistant: Color,
+    dim: Color,
+    tool: Color,
+    ok: Color,
+    err: Color,
+}
+
+impl GuiTheme {
+    /// Load an hjkl theme TOML (or hjkl's bundled default), mapping its palette
+    /// + UI styles onto hrdr's chat roles with fallbacks.
+    fn load(path: Option<&str>) -> Self {
+        use hjkl_theme::{Theme as HjklTheme, loader};
+        let t = match path {
+            Some(p) => HjklTheme::from_path(std::path::Path::new(p))
+                .unwrap_or_else(|_| loader::default_theme()),
+            None => loader::default_theme(),
+        };
+        let pal = |name: &str| t.palette.get(name).copied().map(to_floem);
+        Self {
+            bg: t
+                .ui
+                .background
+                .map(to_floem)
+                .unwrap_or(Color::rgb8(0x1e, 0x1e, 0x24)),
+            user: pal("teal").or_else(|| pal("blue")).unwrap_or(USER),
+            assistant: t
+                .ui
+                .foreground
+                .map(to_floem)
+                .or_else(|| pal("fg"))
+                .unwrap_or(Color::rgb8(0xe0, 0xe0, 0xe0)),
+            dim: t
+                .ui
+                .gutter
+                .map(to_floem)
+                .or_else(|| pal("comment"))
+                .unwrap_or(DIM),
+            tool: pal("yellow").unwrap_or(TOOL),
+            ok: pal("green").unwrap_or(OK),
+            err: t
+                .ui
+                .diagnostic_error
+                .map(to_floem)
+                .or_else(|| pal("red"))
+                .unwrap_or(ERR),
+        }
+    }
+}
+
+fn to_floem(c: hjkl_theme::Color) -> Color {
+    Color::rgb8(c.r, c.g, c.b)
+}
 
 // ---- transcript model ---------------------------------------------------
 // Streamed fields are signals so tokens update the view in place; the item
@@ -81,9 +141,10 @@ fn main() -> anyhow::Result<()> {
     let config = AgentConfig::load();
     let model = config.model.clone();
     let ctx_window = config.context_window;
+    let theme_path = config.theme.clone();
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
-    floem::launch(move || app_view(agent, model, ctx_window));
+    floem::launch(move || app_view(agent, model, ctx_window, theme_path));
     Ok(())
 }
 
@@ -91,7 +152,9 @@ fn app_view(
     agent: Arc<TokioMutex<Agent>>,
     model: String,
     ctx_window: Option<u32>,
+    theme_path: Option<String>,
 ) -> impl IntoView {
+    let theme = GuiTheme::load(theme_path.as_deref());
     // Persistent scope for dynamically-created per-message signals, so they
     // outlive the effect that creates them.
     let cx = Scope::current();
@@ -144,8 +207,12 @@ fn app_view(
     let send_enter = send.clone();
 
     let transcript_view = scroll(
-        dyn_stack(move || transcript.get(), |item: &Item| item.id, render_item)
-            .style(|s| s.flex_col().width_full().gap(10.0)),
+        dyn_stack(
+            move || transcript.get(),
+            |item: &Item| item.id,
+            move |item| render_item(item, theme),
+        )
+        .style(|s| s.flex_col().width_full().gap(10.0)),
     )
     .style(|s| s.flex_grow(1.0).width_full().padding(10.0));
 
@@ -173,10 +240,10 @@ fn app_view(
             };
             format!("{model}   ·   ctx {ctx}   ·   ↓{out}")
         })
-        .style(|s| s.color(DIM)),
+        .style(move |s| s.color(theme.dim)),
         label(|| "● thinking…").style(move |s| {
             if running.get() {
-                s.color(TOOL)
+                s.color(theme.tool)
             } else {
                 s.hide()
             }
@@ -190,7 +257,12 @@ fn app_view(
             .items_center()
     });
 
-    v_stack((transcript_view, status_bar, input_row)).style(|s| s.width_full().height_full())
+    v_stack((transcript_view, status_bar, input_row)).style(move |s| {
+        s.width_full()
+            .height_full()
+            .background(theme.bg)
+            .color(theme.assistant)
+    })
 }
 
 // ---- event handling -----------------------------------------------------
@@ -286,18 +358,18 @@ fn handle_event(
 
 // ---- rendering ----------------------------------------------------------
 
-fn render_item(item: Item) -> AnyView {
+fn render_item(item: Item, th: GuiTheme) -> AnyView {
     match item.body {
         Body::User(text) => v_stack((
-            label(|| "you").style(|s| s.color(USER).font_bold().margin_bottom(2.0)),
+            label(|| "you").style(move |s| s.color(th.user).font_bold().margin_bottom(2.0)),
             text_label(text),
         ))
         .into_any(),
         Body::Assistant(a) => v_stack((
-            label(|| "assistant").style(|s| s.color(DIM).font_bold().margin_bottom(2.0)),
+            label(|| "assistant").style(move |s| s.color(th.dim).font_bold().margin_bottom(2.0)),
             // Reasoning (dim); empty until the model streams any.
-            label(move || a.reasoning.get()).style(|s| s.color(DIM).margin_bottom(2.0)),
-            label(move || a.text.get()),
+            label(move || a.reasoning.get()).style(move |s| s.color(th.dim).margin_bottom(2.0)),
+            label(move || a.text.get()).style(move |s| s.color(th.assistant)),
         ))
         .into_any(),
         Body::Tool(t) => {
@@ -310,25 +382,25 @@ fn render_item(item: Item) -> AnyView {
                     let caret = if collapsed.get() { "▸" } else { "▾" };
                     format!("{caret} ⚙ {name} {args}")
                 })
-                .style(|s| s.color(TOOL).font_bold())
+                .style(move |s| s.color(th.tool).font_bold())
                 .on_click_stop(move |_| collapsed.update(|c| *c = !*c)),
                 // Streamed output — hidden while collapsed.
                 label(move || output.get()).style(move |s| {
                     if collapsed.get() {
                         s.hide()
                     } else {
-                        s.color(DIM)
+                        s.color(th.dim)
                     }
                 }),
                 // Result is always shown, colored by pass/fail.
                 label(move || result.get())
-                    .style(move |s| s.color(if ok.get() { OK } else { ERR })),
+                    .style(move |s| s.color(if ok.get() { th.ok } else { th.err })),
             ))
             .style(|s| s.padding(6.0).gap(2.0))
             .into_any()
         }
-        Body::System(s) => text_label(s).style(|st| st.color(DIM)).into_any(),
-        Body::Error(s) => text_label(s).style(|st| st.color(ERR)).into_any(),
+        Body::System(s) => text_label(s).style(move |st| st.color(th.dim)).into_any(),
+        Body::Error(s) => text_label(s).style(move |st| st.color(th.err)).into_any(),
     }
 }
 
