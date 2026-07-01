@@ -436,7 +436,6 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
     let ctx_spans = match app.context_window {
         Some(w) if w > 0 => {
             let frac = (ctx as f64 / w as f64).clamp(0.0, 1.0);
-            let pct = (frac * 100.0).round() as u32;
             // Fill color escalates with usage: green → amber → red at the
             // auto-compact threshold (where compaction kicks in next turn).
             let fill_color = if app.auto_compact_ratio > 0.0 && frac >= app.auto_compact_ratio {
@@ -446,11 +445,7 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
             } else {
                 t.success
             };
-            let label = format!(
-                " {} of {} ctx ({pct}%) ",
-                fmt_count(ctx),
-                fmt_count(w as usize)
-            );
+            let label = format!(" {} of {} ctx ", fmt_count(ctx), fmt_count(w as usize));
             let chars: Vec<char> = label.chars().collect();
             let fill = ((frac * chars.len() as f64).round() as usize).min(chars.len());
             let used: String = chars[..fill].iter().collect();
