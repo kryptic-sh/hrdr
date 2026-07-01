@@ -24,9 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The status-bar context readout is simpler — `{used} of {max} ctx` without the
-  percentage. The used/free fill bar and its green→amber→red escalation are
-  unchanged (they already convey the fraction visually).
+- The status-bar context readout is simpler — just `{used} of {max}` (no
+  percentage or `ctx` label). The used/free fill bar and its green→amber→red
+  escalation are unchanged (they already convey the fraction visually).
 - hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
   instead of `../hjkl/...` path deps against the sibling repo. hjkl was
   published to crates.io at 0.33.3. CI is now standalone — the second checkout

@@ -445,7 +445,7 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
             } else {
                 t.success
             };
-            let label = format!(" {} of {} ctx ", fmt_count(ctx), fmt_count(w as usize));
+            let label = format!(" {} of {} ", fmt_count(ctx), fmt_count(w as usize));
             let chars: Vec<char> = label.chars().collect();
             let fill = ((frac * chars.len() as f64).round() as usize).min(chars.len());
             let used: String = chars[..fill].iter().collect();
