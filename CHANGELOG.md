@@ -33,6 +33,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- File checkpoints + `/revert`: the agent's file edits (`edit`/`write_file`) are
+  now snapshotted per turn, so `/revert` undoes the last turn's file changes
+  (restoring modified files and deleting ones the agent created), and
+  `/checkpoints` lists the revertible turns. Storage is git-like and incremental
+  — each changed file's pre-image is SHA-256 content-addressed (identical
+  content stored once) and deflate-compressed, with a journal recording which
+  turn touched which file, kept under `$XDG_DATA_HOME/hrdr/checkpoints/<cwd>/`
+  so revert survives restarts. Only files the agent modifies are snapshotted, so
+  it's fast and small.
 - Expandable tool output: tool results are previewed (head/live tail) with a
   `… (+N more lines · /expand)` hint; `/expand` toggles the most recent result
   to full, `/expand all` shows every tool result in full, and `/expand off`

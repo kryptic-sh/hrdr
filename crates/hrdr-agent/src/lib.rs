@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
-use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
+use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
+
+pub use hrdr_tools::{CheckpointInfo, Checkpoints as FileCheckpoints};
 
 pub use prompt::{gather_agent_docs, render_system};
 
@@ -433,6 +435,13 @@ pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
+fn checkpoint_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    hjkl_xdg::data_dir("hrdr")
+        .ok()
+        .map(|d| d.join("checkpoints").join(cwd_slug(&cwd.to_string_lossy())))
+}
+
 fn read_config_doc(path: &std::path::Path) -> toml_edit::DocumentMut {
     std::fs::read_to_string(path)
         .ok()
@@ -485,15 +494,23 @@ pub struct Agent {
     max_steps: usize,
     /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
     project_docs: Option<String>,
+    /// File checkpoint store (per-turn pre-images), if a store dir is available.
+    checkpoints: Option<Arc<Mutex<Checkpoints>>>,
 }
 
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
         let tools = ToolRegistry::with_defaults();
-        let ctx = ToolContext::new(config.cwd.clone());
+        let mut ctx = ToolContext::new(config.cwd.clone());
         let project_docs = gather_agent_docs(&config.cwd);
         let system = render_system(&tools, &config.cwd, project_docs.as_deref())?;
+
+        // File checkpoint store, keyed by working directory (like sessions).
+        let checkpoints = checkpoint_dir(&config.cwd)
+            .and_then(|dir| Checkpoints::open(dir).ok())
+            .map(|c| Arc::new(Mutex::new(c)));
+        ctx.checkpoints = checkpoints.clone();
 
         let mut client = Client::new(config.base_url, config.api_key, config.model);
         if let Some(t) = config.temperature {
@@ -507,7 +524,13 @@ impl Agent {
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
             project_docs,
+            checkpoints,
         })
+    }
+
+    /// The file checkpoint store, if available (for `/revert` / `/checkpoints`).
+    pub fn checkpoints(&self) -> Option<Arc<Mutex<Checkpoints>>> {
+        self.checkpoints.clone()
     }
 
     /// The gathered `AGENTS.md` project instructions for the current cwd, if any.
@@ -660,6 +683,12 @@ impl Agent {
         F: FnMut(AgentEvent),
     {
         self.messages.push(ChatMessage::user(user_input.into()));
+        // Start a fresh file checkpoint for this turn's edits.
+        if let Some(cp) = &self.checkpoints
+            && let Ok(mut c) = cp.lock()
+        {
+            c.begin_turn();
+        }
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
         let mut overflow_compacted = false;

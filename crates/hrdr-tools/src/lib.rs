@@ -13,9 +13,11 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
+mod checkpoint;
 mod tools;
 mod web;
 
+pub use checkpoint::{CheckpointInfo, Checkpoints};
 pub use tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, TodoTool, WriteTool};
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -49,6 +51,9 @@ pub struct ToolContext {
     /// output here as it's produced so the UI can show progress. `None` = no
     /// streaming consumer.
     pub stream: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Optional checkpoint store: file-mutating tools record a file's pre-image
+    /// here before writing, so edits can be reverted. `None` = no checkpointing.
+    pub checkpoints: Option<Arc<Mutex<Checkpoints>>>,
 }
 
 impl ToolContext {
@@ -58,6 +63,7 @@ impl ToolContext {
             todos: Arc::new(Mutex::new(Vec::new())),
             max_output: DEFAULT_MAX_OUTPUT,
             stream: None,
+            checkpoints: None,
         }
     }
 
@@ -65,6 +71,16 @@ impl ToolContext {
     pub fn emit(&self, chunk: impl Into<String>) {
         if let Some(tx) = &self.stream {
             let _ = tx.send(chunk.into());
+        }
+    }
+
+    /// Snapshot a file's current content into the checkpoint store (if any)
+    /// before a tool modifies it, so the change can be reverted.
+    pub fn checkpoint(&self, path: &std::path::Path) {
+        if let Some(cp) = &self.checkpoints
+            && let Ok(mut cp) = cp.lock()
+        {
+            cp.record_pre(path);
         }
     }
 

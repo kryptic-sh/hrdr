@@ -796,6 +796,8 @@ impl App {
             "cwd" => self.change_cwd(arg),
             "tools" => self.show_tools(),
             "expand" => self.expand_cmd(arg),
+            "revert" => self.revert_cmd(),
+            "checkpoints" => self.checkpoints_cmd(),
             "add" => self.add_file(arg),
             "diff" => self.git_diff_cmd(),
             "reasoning" => {
@@ -1844,6 +1846,81 @@ impl App {
         serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// `/revert` — undo the most recent turn's file edits (restore pre-images).
+    fn revert_cmd(&mut self) {
+        if self.running {
+            self.system("can't revert while a turn is running");
+            return;
+        }
+        let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
+            self.system("checkpoints unavailable");
+            return;
+        };
+        let result = match cp.lock() {
+            Ok(mut c) => c.revert_last(),
+            Err(_) => {
+                self.system("checkpoint store busy");
+                return;
+            }
+        };
+        match result {
+            Ok(files) if files.is_empty() => self.system("nothing to revert"),
+            Ok(files) => {
+                let names = files
+                    .iter()
+                    .map(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.file_index_cwd = None; // files changed; rebuild @-completion index
+                self.system(format!("reverted {} file(s): {names}", files.len()));
+            }
+            Err(e) => self.system(format!("revert failed: {e}")),
+        }
+    }
+
+    /// `/checkpoints` — list the revertible per-turn file checkpoints.
+    fn checkpoints_cmd(&mut self) {
+        let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
+            self.system("checkpoints unavailable");
+            return;
+        };
+        let infos = match cp.lock() {
+            Ok(c) => c.list(),
+            Err(_) => {
+                self.system("checkpoint store busy");
+                return;
+            }
+        };
+        if infos.is_empty() {
+            self.system("no file checkpoints yet");
+            return;
+        }
+        let mut s = String::from("file checkpoints (newest first; /revert undoes the latest):");
+        for info in infos.iter().take(20) {
+            let names = info
+                .files
+                .iter()
+                .map(|f| {
+                    std::path::Path::new(f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| f.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            s.push_str(&format!(
+                "\n  turn {} · {} file(s): {names}",
+                info.turn,
+                info.files.len()
+            ));
+        }
+        self.system(s);
+    }
+
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
     fn edit_file_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
@@ -2567,6 +2644,8 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
+    ("/revert", "undo the last turn's file edits"),
+    ("/checkpoints", "list revertible file checkpoints"),
     ("/reasoning", "toggle showing model reasoning"),
     ("/timestamps", "set timestamps (none|relative|exact)"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
@@ -2626,7 +2705,16 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Files & context",
         &[
-            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/expand", "/paste",
+            "/init",
+            "/add",
+            "/edit",
+            "/diff",
+            "/revert",
+            "/checkpoints",
+            "/cwd",
+            "/tools",
+            "/expand",
+            "/paste",
         ],
     ),
     ("Reply", &["/copy", "/export", "/retry", "/undo"]),

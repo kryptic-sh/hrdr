@@ -117,6 +117,8 @@ impl Tool for WriteTool {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // Snapshot the pre-write state so the change can be reverted.
+        ctx.checkpoint(&path);
         let bytes = a.content.len();
         tokio::fs::write(&path, &a.content)
             .await
@@ -209,6 +211,8 @@ impl Tool for EditTool {
         } else {
             text.replacen(&a.old_string, &a.new_string, 1)
         };
+        // Snapshot the pre-edit state so the change can be reverted.
+        ctx.checkpoint(&path);
         tokio::fs::write(&path, &updated)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
