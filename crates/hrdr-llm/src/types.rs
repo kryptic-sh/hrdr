@@ -157,8 +157,6 @@ pub struct Usage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
-    #[serde(default)]
-    pub total_tokens: u32,
 }
 
 // ---- streaming ----
@@ -183,8 +181,6 @@ pub struct ChunkChoice {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Delta {
-    #[serde(default)]
-    pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -219,7 +215,6 @@ pub struct FunctionDelta {
 pub struct Accumulator {
     pub content: String,
     pub reasoning: String,
-    pub finish_reason: Option<String>,
     /// Token usage from the final `include_usage` chunk, if the server sent it.
     pub usage: Option<Usage>,
     calls: Vec<ToolCall>,
@@ -239,9 +234,6 @@ impl Accumulator {
             self.usage = chunk.usage.clone();
         }
         let choice = chunk.choices.first()?;
-        if let Some(reason) = &choice.finish_reason {
-            self.finish_reason = Some(reason.clone());
-        }
         if let Some(r) = &choice.delta.reasoning_content {
             self.reasoning.push_str(r);
         }
@@ -308,7 +300,6 @@ mod tests {
         ChatChunk {
             choices: vec![ChunkChoice {
                 delta: Delta {
-                    role: None,
                     content: content.map(|s| s.to_string()),
                     reasoning_content: None,
                     tool_calls,
@@ -489,7 +480,6 @@ mod tests {
             usage: Some(Usage {
                 prompt_tokens,
                 completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
             }),
         }
     }
@@ -498,27 +488,11 @@ mod tests {
         ChatChunk {
             choices: vec![ChunkChoice {
                 delta: Delta {
-                    role: None,
                     content: None,
                     reasoning_content: Some(text.to_string()),
                     tool_calls: None,
                 },
                 finish_reason: None,
-            }],
-            usage: None,
-        }
-    }
-
-    fn chunk_with_finish(content: Option<&str>, reason: &str) -> ChatChunk {
-        ChatChunk {
-            choices: vec![ChunkChoice {
-                delta: Delta {
-                    role: None,
-                    content: content.map(|s| s.to_string()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                },
-                finish_reason: Some(reason.to_string()),
             }],
             usage: None,
         }
@@ -534,7 +508,6 @@ mod tests {
         let u = acc.usage.as_ref().expect("usage should be stored");
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 20);
-        assert_eq!(u.total_tokens, 120);
     }
 
     #[test]
@@ -550,16 +523,6 @@ mod tests {
             msg.content.is_none(),
             "no content expected when only reasoning came in"
         );
-    }
-
-    #[test]
-    fn accumulator_finish_reason_captured() {
-        let mut acc = Accumulator::new();
-        // Verify finish_reason is stored on the accumulator before into_message.
-        acc.push(&chunk_with_finish(Some("answer"), "stop"));
-        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
-        let msg = acc.into_message();
-        assert_eq!(msg.content.as_deref(), Some("answer"));
     }
 
     #[test]
