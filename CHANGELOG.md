@@ -172,10 +172,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Send button submits. Colors come from an **hjkl theme** (the same system the
   TUI uses — `theme` in config picks it), mapped onto chat roles + the window
   background. Per-message reactive signals stream tokens in place without
-  rebuilding the list. TUI-shared logic (transcript model, slash commands,
-  sessions, …) will move into a shared crate as GUI features land. Excluded from
-  CI for now (floem's large X11/Wayland dep tree + Linux system libs — wiring it
-  in is a follow-up).
+  rebuilding the list. **Slash commands** now work in the GUI: typing `/` shows
+  a live completion dropdown (the shared `hrdr_app::slash_completions` ranker)
+  whose rows fill the input on click, and submitting a `/…` runs it locally
+  instead of sending it to the model — `/help` (the shared `help_body` listing),
+  `/clear`, `/model [name]` (switches live; the status bar reflects it),
+  `/models`, `/tools`, and `/info`, with aliases resolved via the shared
+  `resolve_alias`. An unrecognized `/…` still falls through to the model (so a
+  literal path works, matching the TUI); the quit-word family closes the window.
+  TUI-shared logic (transcript model, more commands, sessions, …) continues to
+  move into the shared `hrdr-app` crate as GUI features land. Excluded from CI
+  for now (floem's large X11/Wayland dep tree + Linux system libs — wiring it in
+  is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored

@@ -130,6 +130,8 @@ enum UiMsg {
     Event(AgentEvent),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
+    /// Out-of-band system line (e.g. an async `/models` result).
+    System(String),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -162,6 +164,9 @@ fn app_view(
     let input = create_rw_signal(String::new());
     let running = create_rw_signal(false);
     let next_id = create_rw_signal(0u64);
+    // Model is a signal so `/model <name>` can switch it and the status bar
+    // reflects the change live.
+    let model = create_rw_signal(model);
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
 
@@ -178,6 +183,7 @@ fn app_view(
                     push_item(transcript, next_id, Body::Error(e));
                 }
             }
+            UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
         }
     });
 
@@ -189,6 +195,14 @@ fn app_view(
         // Common quit words (shared with the TUI) close the window.
         if hrdr_app::is_quit_command(&text) {
             floem::quit_app();
+            return;
+        }
+        // Slash commands are handled locally; an unrecognized `/…` falls through
+        // to the model (so a literal path still works, matching the TUI).
+        if text.starts_with('/')
+            && dispatch_slash(&text, transcript, next_id, usage, model, &agent, &tx)
+        {
+            input.set(String::new());
             return;
         }
         input.set(String::new());
@@ -233,6 +247,42 @@ fn app_view(
     let input_row = h_stack((input_box, button("Send").on_click_stop(move |_| send())))
         .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
 
+    // Slash-command completion list, shown above the input while a `/…` is being
+    // typed (uses the shared ranker). Clicking a row fills the input.
+    let completions = dyn_stack(
+        move || {
+            let inp = input.get();
+            if inp.starts_with('/') {
+                hrdr_app::slash_completions(&inp)
+            } else {
+                Vec::new()
+            }
+        },
+        |(name, _): &(&'static str, &'static str)| name.to_string(),
+        move |(name, desc)| {
+            h_stack((
+                label(move || name.to_string()).style(move |s| s.color(theme.user).font_bold()),
+                label(move || desc.to_string()).style(move |s| s.color(theme.dim)),
+            ))
+            .style(|s| s.gap(8.0).padding_horiz(10.0).padding_vert(2.0))
+            .on_click_stop(move |_| input.set(format!("{name} ")))
+        },
+    )
+    .style(move |s| {
+        let s = s
+            .flex_col()
+            .width_full()
+            .max_height(160.0)
+            .padding_vert(4.0)
+            .background(theme.bg);
+        // Collapse entirely when there's nothing to show.
+        if input.get().starts_with('/') {
+            s
+        } else {
+            s.hide()
+        }
+    });
+
     // Status bar: model · context · last-turn output tokens, + a live "thinking"
     // indicator while a turn runs.
     let status_bar = h_stack((
@@ -243,7 +293,7 @@ fn app_view(
                 None if used > 0 => format!("{used} tok"),
                 None => "—".to_string(),
             };
-            format!("{model}   ·   ctx {ctx}   ·   ↓{out}")
+            format!("{}   ·   ctx {ctx}   ·   ↓{out}", model.get())
         })
         .style(move |s| s.color(theme.dim)),
         label(|| "● thinking…").style(move |s| {
@@ -262,7 +312,7 @@ fn app_view(
             .items_center()
     });
 
-    v_stack((transcript_view, status_bar, input_row)).style(move |s| {
+    v_stack((transcript_view, completions, status_bar, input_row)).style(move |s| {
         s.width_full()
             .height_full()
             .background(theme.bg)
@@ -276,6 +326,95 @@ fn push_item(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, body: Body
     let id = next_id.get_untracked();
     next_id.set(id + 1);
     transcript.update(|t| t.push(Item { id, body }));
+}
+
+/// Push a system line into the transcript.
+fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Into<String>) {
+    push_item(transcript, next_id, Body::System(msg.into()));
+}
+
+/// Handle a `/…` slash command locally. Returns `true` if it was recognized (and
+/// thus shouldn't be sent to the model). Mirrors the representation-independent
+/// subset of the TUI's `handle_slash`; commands needing the agent lock spawn a
+/// task and report back over the `UiMsg::System` channel. Aliases resolve via the
+/// shared `hrdr_app::resolve_alias`.
+fn dispatch_slash(
+    input: &str,
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+    usage: RwSignal<Option<(u32, u32)>>,
+    model: RwSignal<String>,
+    agent: &Arc<TokioMutex<Agent>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
+) -> bool {
+    let rest = input.strip_prefix('/').unwrap_or(input);
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let cmd = hrdr_app::resolve_alias(parts.next().unwrap_or(""));
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    match cmd {
+        "help" => system(transcript, next_id, hrdr_app::help_body()),
+        "clear" => {
+            transcript.update(|t| t.clear());
+            next_id.set(0);
+            usage.set(None);
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.lock().await.clear() });
+            system(transcript, next_id, "conversation cleared");
+        }
+        "model" => {
+            if arg.is_empty() {
+                system(transcript, next_id, format!("model: {}", model.get()));
+            } else {
+                model.set(arg.clone());
+                let agent = agent.clone();
+                let name = arg.clone();
+                tokio::spawn(async move { agent.lock().await.set_model(name) });
+                system(transcript, next_id, format!("model → {arg}"));
+            }
+        }
+        "models" => {
+            let agent = agent.clone();
+            let tx = tx.clone();
+            system(transcript, next_id, "fetching models…");
+            tokio::spawn(async move {
+                let client = agent.lock().await.client();
+                let msg = match client.list_models().await {
+                    Ok(m) if !m.is_empty() => format!("models:\n  {}", m.join("\n  ")),
+                    Ok(_) => "endpoint reported no models".to_string(),
+                    Err(e) => format!("models error: {e}"),
+                };
+                let _ = tx.send(UiMsg::System(msg));
+            });
+        }
+        "tools" => {
+            let agent = agent.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let tools = agent.lock().await.tools();
+                let mut msg = format!("{} tools:", tools.len());
+                for (name, desc) in tools {
+                    msg.push_str(&format!("\n  {name:<12}{desc}"));
+                }
+                let _ = tx.send(UiMsg::System(msg));
+            });
+        }
+        "info" => {
+            let agent = agent.clone();
+            let tx = tx.clone();
+            let model = model.get();
+            tokio::spawn(async move {
+                let a = agent.lock().await;
+                let msg = format!(
+                    "model: {model}\nmessages: {}\ncwd: {}",
+                    a.message_count(),
+                    a.cwd().display()
+                );
+                let _ = tx.send(UiMsg::System(msg));
+            });
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// The assistant item currently being streamed into — the last item if it's an
