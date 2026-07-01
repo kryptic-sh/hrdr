@@ -33,6 +33,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Presence-aware shell tools: the `bash` tool is now only offered to the model
+  when `bash` is actually on `PATH`, and a new `powershell` tool is offered when
+  `pwsh`/`powershell` is available (PowerShell 7 runs on Linux/macOS too). So
+  the model always gets a shell it can actually use — bash on unix, PowerShell
+  on Windows (or both), and no phantom shell where neither exists. Both stream
+  output like before.
 - File checkpoints + `/revert`: the agent's file edits (`edit`/`write_file`) are
   now snapshotted per turn, so `/revert` undoes the last turn's file changes
   (restoring modified files and deleting ones the agent created), and

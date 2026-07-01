@@ -19,6 +19,7 @@ reqwest.workspace = true
 async-trait = "0.1"
 sha2 = "0.10"
 miniz_oxide = "0.8"
+which = "7"
 
 [dev-dependencies]
 tempfile.workspace = true

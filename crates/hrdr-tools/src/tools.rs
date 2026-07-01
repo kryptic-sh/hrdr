@@ -260,54 +260,9 @@ impl Tool for BashTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: BashArgs = serde_json::from_value(args).context("invalid bash args")?;
         let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg(&a.command)
-            .current_dir(&ctx.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
-
-        let mut child = cmd.spawn().context("spawning bash")?;
-        let stdout = child.stdout.take().context("capturing stdout")?;
-        let stderr = child.stderr.take().context("capturing stderr")?;
-        let mut out_lines = BufReader::new(stdout).lines();
-        let mut err_lines = BufReader::new(stderr).lines();
-
-        // Read stdout + stderr concurrently, accumulating the full output while
-        // streaming each line to the UI sink. Interleaving order between the two
-        // streams isn't guaranteed, which is fine for a live view.
-        let mut out = String::new();
-        let collect = async {
-            let mut out_done = false;
-            let mut err_done = false;
-            loop {
-                tokio::select! {
-                    r = out_lines.next_line(), if !out_done => match r? {
-                        Some(line) => emit_line(&mut out, ctx, line),
-                        None => out_done = true,
-                    },
-                    r = err_lines.next_line(), if !err_done => match r? {
-                        Some(line) => emit_line(&mut out, ctx, line),
-                        None => err_done = true,
-                    },
-                    else => break,
-                }
-            }
-            let status = child.wait().await.context("waiting on bash")?;
-            anyhow::Ok(status)
-        };
-        let status = tokio::time::timeout(timeout, collect)
-            .await
-            .map_err(|_| anyhow!("command timed out after {}ms", timeout.as_millis()))??;
-
-        if !status.success() {
-            out.push_str(&format!("[exit status: {status}]\n"));
-        }
-        let out = out.trim_end();
-        if out.is_empty() {
-            return Ok("(no output)".to_string());
-        }
-        Ok(truncate(out, ctx.max_output))
+        run_streamed_command(cmd, timeout, ctx).await
     }
 }
 
@@ -316,6 +271,123 @@ fn emit_line(out: &mut String, ctx: &ToolContext, line: String) {
     out.push_str(&line);
     out.push('\n');
     ctx.emit(format!("{line}\n"));
+}
+
+/// Spawn a configured command, streaming its stdout/stderr line-by-line to the
+/// UI sink while accumulating the full (length-bounded) output. Shared by the
+/// `bash` and `powershell` tools.
+async fn run_streamed_command(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+    ctx: &ToolContext,
+) -> Result<String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawning command")?;
+    let stdout = child.stdout.take().context("capturing stdout")?;
+    let stderr = child.stderr.take().context("capturing stderr")?;
+    let mut out_lines = BufReader::new(stdout).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
+
+    // Read stdout + stderr concurrently, accumulating the full output while
+    // streaming each line. Interleaving order isn't guaranteed — fine for a live
+    // view.
+    let mut out = String::new();
+    let collect = async {
+        let mut out_done = false;
+        let mut err_done = false;
+        loop {
+            tokio::select! {
+                r = out_lines.next_line(), if !out_done => match r? {
+                    Some(line) => emit_line(&mut out, ctx, line),
+                    None => out_done = true,
+                },
+                r = err_lines.next_line(), if !err_done => match r? {
+                    Some(line) => emit_line(&mut out, ctx, line),
+                    None => err_done = true,
+                },
+                else => break,
+            }
+        }
+        let status = child.wait().await.context("waiting on command")?;
+        anyhow::Ok(status)
+    };
+    let status = tokio::time::timeout(timeout, collect)
+        .await
+        .map_err(|_| anyhow!("command timed out after {}ms", timeout.as_millis()))??;
+
+    if !status.success() {
+        out.push_str(&format!("[exit status: {status}]\n"));
+    }
+    let out = out.trim_end();
+    if out.is_empty() {
+        return Ok("(no output)".to_string());
+    }
+    Ok(truncate(out, ctx.max_output))
+}
+
+/// The available shell tools for this machine (bash and/or PowerShell), only
+/// including a tool when its interpreter is actually on `PATH`.
+pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
+    let mut tools: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
+    if which::which("bash").is_ok() {
+        tools.push(std::sync::Arc::new(BashTool));
+    }
+    if let Some(program) = detect_powershell() {
+        tools.push(std::sync::Arc::new(PowerShellTool { program }));
+    }
+    tools
+}
+
+/// Locate a PowerShell interpreter: prefer `pwsh` (PowerShell 7+, cross-platform)
+/// then `powershell` (Windows PowerShell). `None` if neither is on `PATH`.
+fn detect_powershell() -> Option<String> {
+    ["pwsh", "powershell"]
+        .into_iter()
+        .find(|p| which::which(p).is_ok())
+        .map(str::to_string)
+}
+
+// ---- powershell ----
+
+pub struct PowerShellTool {
+    program: String,
+}
+
+#[derive(Deserialize)]
+struct PowerShellArgs {
+    command: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for PowerShellTool {
+    fn name(&self) -> &'static str {
+        "powershell"
+    }
+    fn description(&self) -> &'static str {
+        "Run a command via PowerShell (`pwsh`/`powershell`) in the working \
+         directory. Use for build, test, and anything without a dedicated tool, \
+         especially on Windows. Output is captured and length-bounded."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "PowerShell command to run."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in ms (default 120000)."}
+            },
+            "required": ["command"]
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        let a: PowerShellArgs = serde_json::from_value(args).context("invalid powershell args")?;
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &a.command])
+            .current_dir(&ctx.cwd);
+        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
+        run_streamed_command(cmd, timeout, ctx).await
+    }
 }
 
 // ---- grep ----

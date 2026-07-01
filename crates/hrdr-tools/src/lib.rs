@@ -18,7 +18,10 @@ mod tools;
 mod web;
 
 pub use checkpoint::{CheckpointInfo, Checkpoints};
-pub use tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, TodoTool, WriteTool};
+pub use tools::{
+    BashTool, EditTool, GlobTool, GrepTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
+    available_shell_tools,
+};
 pub use web::{WebFetchTool, WebSearchTool};
 
 /// Default cap on a single tool's textual output, in bytes. Larger results are
@@ -120,13 +123,18 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The default set: Core 6 + `todo_write` + web (`web_fetch`, `web_search`).
+    /// The default set: file/search/todo/web tools plus whichever shells are
+    /// actually available on this machine (`bash` and/or `powershell`).
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
-        r.register(Arc::new(BashTool));
+        // Shell tools are presence-gated so the model is only offered a shell it
+        // can actually use (bash on unix; PowerShell where installed, incl. Linux).
+        for shell in available_shell_tools() {
+            r.register(shell);
+        }
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(GlobTool));
         r.register(Arc::new(TodoTool));
