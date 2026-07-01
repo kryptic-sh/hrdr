@@ -219,6 +219,7 @@ impl App {
         let auto_resume = config.auto_resume;
         let bell = config.bell;
         let todo_ttl = config.todo_ttl;
+        let show_thinking = config.show_thinking;
         let timestamp_style = TimestampStyle::from_config(config.timestamps.as_deref());
         let statusbar_mode = StatusBarMode::from_config(config.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
@@ -290,7 +291,7 @@ impl App {
             history_draft: String::new(),
             file_index: Vec::new(),
             file_index_cwd: None,
-            show_reasoning: true,
+            show_reasoning: show_thinking,
             expand_tools: false,
             compacting: false,
             pending_init: false,
@@ -663,6 +664,7 @@ impl App {
         self.todo_ttl = cfg.todo_ttl;
         self.timestamp_style = TimestampStyle::from_config(cfg.timestamps.as_deref());
         self.statusbar_mode = StatusBarMode::from_config(cfg.statusbar.as_deref());
+        self.show_reasoning = cfg.show_thinking;
         self.icon_mode = cfg
             .icons
             .as_deref()

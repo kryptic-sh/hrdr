@@ -79,6 +79,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Showing the model's `<think>` reasoning is now a first-class setting:
+  `show_thinking` in config, `--show-thinking on|off|1|0`, and
+  `$HRDR_SHOW_THINKING` (default on). A new `/thinking [on|off|1|0]` slash
+  command toggles it at runtime and persists to config (no arg flips it);
+  `/reasoning` is now an alias of it. Both frontends honor the config value at
+  startup; the TUI also re-reads it on config hot-reload. The bool parser
+  (`1`/`0`, `on`/`off`, `true`/`false`, `yes`/`no`) is exposed as
+  `hrdr_agent::parse_env_bool`.
+
 - Tool output in the TUI now renders on a distinct panel background (the same
   shade as fenced code blocks) so each tool call reads as a self-contained
   block, and **clicking a tool block toggles its full output** — a per-entry

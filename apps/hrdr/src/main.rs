@@ -84,6 +84,10 @@ struct Cli {
     #[arg(long, global = true)]
     todo_ttl: Option<u64>,
 
+    /// Show the model's `<think>` reasoning: on/off/1/0 (default on).
+    #[arg(long = "show-thinking", global = true, value_name = "on|off")]
+    show_thinking: Option<String>,
+
     /// Don't spawn a local backend; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -208,6 +212,13 @@ async fn main() -> Result<()> {
     }
     if let Some(n) = cli.todo_ttl {
         config.todo_ttl = n;
+    }
+    if let Some(v) = cli
+        .show_thinking
+        .as_deref()
+        .and_then(hrdr_agent::parse_env_bool)
+    {
+        config.show_thinking = v;
     }
 
     if remote_provider && config.model == "default" {

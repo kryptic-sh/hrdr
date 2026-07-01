@@ -175,9 +175,19 @@ fn main() -> anyhow::Result<()> {
     let ctx_window = config.context_window;
     let theme_path = config.theme.clone();
     let base_url = config.base_url.clone();
+    let show_thinking = config.show_thinking;
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
-    floem::launch(move || app_view(agent, model, ctx_window, theme_path, base_url));
+    floem::launch(move || {
+        app_view(
+            agent,
+            model,
+            ctx_window,
+            theme_path,
+            base_url,
+            show_thinking,
+        )
+    });
     Ok(())
 }
 
@@ -187,6 +197,7 @@ fn app_view(
     ctx_window: Option<u32>,
     theme_path: Option<String>,
     base_url: String,
+    show_thinking: bool,
 ) -> impl IntoView {
     let theme = GuiTheme::load(theme_path.as_deref());
     // Persistent scope for dynamically-created per-message signals, so they
@@ -220,8 +231,9 @@ fn app_view(
     // Active session's file id (stem), once assigned by the first auto-save (or
     // adopted on `/resume`). Subsequent saves reuse it; `/clear` resets it.
     let session_id: RwSignal<Option<String>> = create_rw_signal(None);
-    // Whether to show the model's `<think>` reasoning (`/reasoning` toggles).
-    let show_reasoning = create_rw_signal(true);
+    // Whether to show the model's `<think>` reasoning (`/thinking` toggles);
+    // initial value from config (`show_thinking`).
+    let show_reasoning = create_rw_signal(show_thinking);
     // OS clipboard for `/copy`, held for the app's life so the selection stays
     // served (X11 requires the owning process to stay alive). `None` if
     // unavailable. `Rc<RefCell<…>>` since the UI thread is single-threaded.
@@ -749,16 +761,23 @@ fn dispatch_slash(
     let arg = parts.next().unwrap_or("").trim().to_string();
     match cmd {
         "help" => system(transcript, next_id, hrdr_app::help_body()),
-        "reasoning" => {
-            let on = !show_reasoning.get_untracked();
+        "thinking" | "reasoning" | "think" => {
+            let on = if arg.is_empty() {
+                !show_reasoning.get_untracked()
+            } else if let Some(b) = hrdr_agent::parse_env_bool(&arg) {
+                b
+            } else {
+                system(transcript, next_id, "usage: /thinking [on | off]");
+                return true;
+            };
             show_reasoning.set(on);
             system(
                 transcript,
                 next_id,
                 if on {
-                    "reasoning shown"
+                    "thinking shown"
                 } else {
-                    "reasoning hidden"
+                    "thinking hidden"
                 },
             );
         }

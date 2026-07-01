@@ -44,7 +44,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/diff", "show git diff of the working tree"),
     ("/revert", "undo the last turn's file edits"),
     ("/checkpoints", "list revertible file checkpoints"),
-    ("/reasoning", "toggle showing model reasoning"),
+    ("/thinking", "show/hide model reasoning (on|off)"),
+    ("/reasoning", "alias of /thinking"),
     ("/timestamps", "set timestamps (none|relative|exact)"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
     ("/todo-ttl", "turns a finished todo stays shown"),
@@ -98,7 +99,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/provider",
             "/temp",
             "/effort",
-            "/reasoning",
+            "/thinking",
         ],
     ),
     (

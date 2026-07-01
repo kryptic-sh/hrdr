@@ -106,6 +106,10 @@ pub struct AgentConfig {
     /// How many turns a completed TODO item stays visible before it's pruned
     /// from the panel. Default [`DEFAULT_TODO_TTL`].
     pub todo_ttl: u64,
+    /// Show the model's `<think>` reasoning blocks. Default `true`. Toggled at
+    /// runtime by `/thinking` (aka `/reasoning`); set via `show_thinking` in
+    /// config, `--show-thinking`, or `$HRDR_SHOW_THINKING`.
+    pub show_thinking: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -140,6 +144,7 @@ impl Default for AgentConfig {
             statusbar: None,
             checkpoints: None,
             todo_ttl: DEFAULT_TODO_TTL,
+            show_thinking: true,
             providers: HashMap::new(),
         }
     }
@@ -248,6 +253,7 @@ struct FileConfig {
     statusbar: Option<String>,
     checkpoints: Option<String>,
     todo_ttl: Option<u64>,
+    show_thinking: Option<bool>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -348,6 +354,9 @@ impl AgentConfig {
         if let Some(v) = fc.todo_ttl {
             self.todo_ttl = v;
         }
+        if let Some(v) = fc.show_thinking {
+            self.show_thinking = v;
+        }
         if !fc.providers.is_empty() {
             self.providers = fc.providers;
         }
@@ -374,7 +383,11 @@ impl AgentConfig {
 
 /// Parse a boolean-ish env value; `None` (leave the current value) if it's not
 /// one of the recognized on/off spellings.
-fn parse_env_bool(v: &str) -> Option<bool> {
+/// Parse a boolean setting from a config/CLI/env string, accepting the common
+/// spellings (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`,
+/// case-insensitive). Returns `None` for anything unrecognized so callers can
+/// leave the current value unchanged.
+pub fn parse_env_bool(v: &str) -> Option<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "0" | "false" | "off" | "no" => Some(false),
         "1" | "true" | "on" | "yes" => Some(true),
@@ -415,6 +428,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_TODO_TTL", |c, v| {
         if let Ok(n) = v.parse() {
             c.todo_ttl = n;
+        }
+    }),
+    ("HRDR_SHOW_THINKING", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.show_thinking = b;
         }
     }),
 ];
@@ -1301,6 +1319,7 @@ mod tests {
             statusbar: Some("wrap".to_string()),
             checkpoints: Some("on".to_string()),
             todo_ttl: Some(10),
+            show_thinking: Some(false),
             providers: HashMap::new(),
         });
         assert_eq!(cfg.base_url, "http://custom/v1");
@@ -1320,6 +1339,7 @@ mod tests {
         assert_eq!(cfg.statusbar.as_deref(), Some("wrap"));
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
         assert_eq!(cfg.todo_ttl, 10);
+        assert!(!cfg.show_thinking);
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

@@ -79,14 +79,7 @@ impl super::App {
             "checkpoints" => self.checkpoints_cmd(),
             "add" => self.add_file(arg),
             "diff" => self.git_diff_cmd(),
-            "reasoning" => {
-                self.show_reasoning = !self.show_reasoning;
-                self.system(if self.show_reasoning {
-                    "reasoning shown"
-                } else {
-                    "reasoning hidden"
-                });
-            }
+            "thinking" | "reasoning" | "think" => self.thinking_cmd(arg),
             "temp" | "temperature" => self.set_temp_cmd(arg),
             "effort" => {
                 if arg.is_empty() {
@@ -576,6 +569,27 @@ impl super::App {
             StatusBarMode::None => "status bar: hidden",
             StatusBarMode::Truncate => "status bar: truncate",
             StatusBarMode::Wrap => "status bar: wrap",
+        });
+    }
+    /// `/thinking [on|off|1|0]` — show or hide the model's `<think>` reasoning
+    /// blocks (no arg toggles). Persists as `show_thinking` in config. `/reasoning`
+    /// is an alias.
+    fn thinking_cmd(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let on = if arg.is_empty() {
+            !self.show_reasoning
+        } else if let Some(b) = hrdr_agent::parse_env_bool(arg) {
+            b
+        } else {
+            self.system("usage: /thinking [on | off]");
+            return;
+        };
+        self.show_reasoning = on;
+        self.persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
+        self.system(if on {
+            "thinking shown"
+        } else {
+            "thinking hidden"
         });
     }
     /// `/todo-ttl [turns]` — how many turns a completed TODO stays visible
