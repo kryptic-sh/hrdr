@@ -216,8 +216,7 @@ fn app_view(
     // unavailable. `Rc<RefCell<…>>` since the UI thread is single-threaded.
     let clipboard = Rc::new(RefCell::new(hjkl_clipboard::Clipboard::new().ok()));
     // Handle to the in-flight turn task; `abort()` cancels it (Esc / Stop).
-    let turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> =
-        Rc::new(RefCell::new(None));
+    let turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> = Rc::new(RefCell::new(None));
     // Submitted-input history (shared load/persist), for Up/Down recall.
     let history: RwSignal<Vec<String>> = create_rw_signal(hrdr_app::load_history());
     // Position while browsing history (None = editing a fresh draft); the draft
@@ -372,16 +371,14 @@ fn app_view(
         .style(|s| s.flex_grow(1.0).padding(8.0));
 
     // One button: "Stop" (cancel) while a turn runs, "Send" otherwise.
-    let action_button = button(label(move || {
-        if running.get() { "Stop" } else { "Send" }
-    }))
-    .on_click_stop(move |_| {
-        if running.get_untracked() {
-            cancel_btn();
-        } else {
-            send_btn();
-        }
-    });
+    let action_button = button(label(move || if running.get() { "Stop" } else { "Send" }))
+        .on_click_stop(move |_| {
+            if running.get_untracked() {
+                cancel_btn();
+            } else {
+                send_btn();
+            }
+        });
     let input_row = h_stack((input_box, action_button))
         .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
 
@@ -524,7 +521,10 @@ fn rebuild_transcript(
         if m.role == MessageRole::Tool
             && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
         {
-            results.insert(id.clone(), (content.clone(), !content.starts_with("Error:")));
+            results.insert(
+                id.clone(),
+                (content.clone(), !content.starts_with("Error:")),
+            );
         }
     }
     for m in msgs {
@@ -752,7 +752,11 @@ fn dispatch_slash(
         }
         "resume" | "load" => {
             if arg.is_empty() {
-                system(transcript, next_id, "usage: /resume <id or name> (see /sessions)");
+                system(
+                    transcript,
+                    next_id,
+                    "usage: /resume <id or name> (see /sessions)",
+                );
                 return true;
             }
             let cwd = cwd_string();
