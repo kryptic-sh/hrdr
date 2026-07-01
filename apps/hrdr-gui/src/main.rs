@@ -7,6 +7,8 @@
 //! shared with the TUI (transcript model, slash commands, sessions, …) get
 //! lifted out of `hrdr-tui` into a shared crate both frontends consume.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use floem::AnyView;
@@ -204,6 +206,10 @@ fn app_view(
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
     // Whether to show the model's `<think>` reasoning (`/reasoning` toggles).
     let show_reasoning = create_rw_signal(true);
+    // OS clipboard for `/copy`, held for the app's life so the selection stays
+    // served (X11 requires the owning process to stay alive). `None` if
+    // unavailable. `Rc<RefCell<…>>` since the UI thread is single-threaded.
+    let clipboard = Rc::new(RefCell::new(hjkl_clipboard::Clipboard::new().ok()));
     // Submitted-input history (shared load/persist), for Up/Down recall.
     let history: RwSignal<Vec<String>> = create_rw_signal(hrdr_app::load_history());
     // Position while browsing history (None = editing a fresh draft); the draft
@@ -251,6 +257,7 @@ fn app_view(
                 usage,
                 model,
                 show_reasoning,
+                &clipboard,
                 &agent,
                 &tx,
             )
@@ -424,6 +431,54 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
     push_item(transcript, next_id, Body::System(msg.into()));
 }
 
+/// Text of the most recent assistant reply, if any (non-empty).
+fn last_assistant_text(transcript: RwSignal<Vec<Item>>) -> Option<String> {
+    transcript
+        .with_untracked(|t| {
+            t.iter().rev().find_map(|i| match &i.body {
+                Body::Assistant(a) => Some(a.text.get_untracked()),
+                _ => None,
+            })
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// The transcript as plain text (user/assistant/system lines), for `/copy all`.
+fn transcript_text(transcript: RwSignal<Vec<Item>>) -> String {
+    transcript.with_untracked(|t| {
+        let mut out = String::new();
+        for item in t {
+            match &item.body {
+                Body::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
+                Body::Assistant(a) => {
+                    out.push_str(&format!("## Assistant\n{}\n\n", a.text.get_untracked()))
+                }
+                Body::System(s) | Body::Error(s) => out.push_str(&format!("[{s}]\n\n")),
+                Body::Tool(t) => out.push_str(&format!("[tool: {}]\n\n", t.name)),
+            }
+        }
+        out.trim_end().to_string()
+    })
+}
+
+/// Write `text` to the OS clipboard, returning a status line for the transcript.
+fn copy_to_clipboard(
+    clipboard: &Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
+    text: &str,
+    label: &str,
+) -> String {
+    use hjkl_clipboard::{MimeType, Selection};
+    let res = clipboard
+        .borrow_mut()
+        .as_mut()
+        .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()));
+    match res {
+        Some(Ok(())) => format!("copied {label} to clipboard"),
+        Some(Err(_)) => "clipboard write failed".to_string(),
+        None => "clipboard unavailable".to_string(),
+    }
+}
+
 /// Append a submitted line to the in-memory history (dropping an immediate
 /// duplicate of the last entry) and persist it (capped at `MAX_HISTORY`).
 fn record_history(history: RwSignal<Vec<String>>, text: &str) {
@@ -498,6 +553,7 @@ fn dispatch_slash(
     usage: RwSignal<Option<(u32, u32)>>,
     model: RwSignal<String>,
     show_reasoning: RwSignal<bool>,
+    clipboard: &Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: &Arc<TokioMutex<Agent>>,
     tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
 ) -> bool {
@@ -515,6 +571,27 @@ fn dispatch_slash(
                 next_id,
                 if on { "reasoning shown" } else { "reasoning hidden" },
             );
+        }
+        "copy" => {
+            let (text, label) = match arg.to_ascii_lowercase().as_str() {
+                "" | "reply" | "last" => (last_assistant_text(transcript), "last reply"),
+                "code" => (
+                    last_assistant_text(transcript)
+                        .as_deref()
+                        .and_then(hrdr_app::last_fenced_block),
+                    "last code block",
+                ),
+                "all" | "transcript" => (Some(transcript_text(transcript)), "transcript"),
+                _ => {
+                    system(transcript, next_id, "usage: /copy [code | all]");
+                    return true;
+                }
+            };
+            let msg = match text {
+                Some(t) if !t.is_empty() => copy_to_clipboard(clipboard, &t, label),
+                _ => format!("nothing to copy ({label})"),
+            };
+            system(transcript, next_id, msg);
         }
         "clear" => {
             transcript.update(|t| t.clear());

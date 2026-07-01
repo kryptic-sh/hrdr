@@ -2178,6 +2178,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "floem",
+ "hjkl-clipboard",
  "hjkl-theme",
  "hrdr-agent",
  "hrdr-app",

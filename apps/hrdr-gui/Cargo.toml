@@ -15,6 +15,7 @@ path = "src/main.rs"
 hrdr-agent.workspace = true
 hrdr-app.workspace = true
 hjkl-theme.workspace = true
+hjkl-clipboard.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 floem = { version = "0.2.0", features = ["tokio"] }
