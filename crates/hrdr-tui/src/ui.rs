@@ -290,13 +290,23 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
             elapsed.as_secs_f64(),
         )
     } else {
+        // Time to first token: how long the provider took to start streaming.
+        let ttft = match (app.turn_started, app.first_token_at) {
+            (Some(start), Some(first)) => {
+                format!(
+                    "  ·  ttft {:.2}s",
+                    first.duration_since(start).as_secs_f64()
+                )
+            }
+            _ => String::new(),
+        };
         let phase = if app.first_token_at.is_some() {
             "generating"
         } else {
             "inferring"
         };
         format!(
-            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s{started}",
+            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out){ttft}  ·  {:.1}s{started}",
             app.out_tokens,
             elapsed.as_secs_f64(),
         )

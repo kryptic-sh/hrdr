@@ -991,6 +991,13 @@ impl App {
             "✓ {} tok · {speed:.1} tok/s · {elapsed:.1}s",
             self.out_tokens
         );
+        // Time to first token (provider latency before streaming began).
+        if let Some(t0) = self.first_token_at {
+            s.push_str(&format!(
+                " · ttft {:.2}s",
+                t0.duration_since(started).as_secs_f64()
+            ));
+        }
         if let Some((prompt, completion)) = self.last_usage {
             let ratio = if completion > 0 {
                 prompt as f64 / completion as f64

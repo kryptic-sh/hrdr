@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use floem::AnyView;
 use floem::ext_event::create_signal_from_tokio_channel;
@@ -204,6 +205,10 @@ fn app_view(
     });
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
+    // Turn-start instant + measured time-to-first-token (seconds) for the last
+    // turn, shown in the status bar.
+    let turn_start: RwSignal<Option<Instant>> = create_rw_signal(None);
+    let ttft: RwSignal<Option<f64>> = create_rw_signal(None);
     // Whether to show the model's `<think>` reasoning (`/reasoning` toggles).
     let show_reasoning = create_rw_signal(true);
     // OS clipboard for `/copy`, held for the app's life so the selection stays
@@ -223,7 +228,16 @@ fn app_view(
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
-            UiMsg::Event(ev) => handle_event(cx, transcript, next_id, usage, ev),
+            UiMsg::Event(ev) => {
+                // First streamed token → record time-to-first-token.
+                if ttft.get_untracked().is_none()
+                    && matches!(ev, AgentEvent::Text(_) | AgentEvent::Reasoning(_))
+                    && let Some(start) = turn_start.get_untracked()
+                {
+                    ttft.set(Some(start.elapsed().as_secs_f64()));
+                }
+                handle_event(cx, transcript, next_id, usage, ev);
+            }
             UiMsg::Done(err) => {
                 running.set(false);
                 if let Some(e) = err {
@@ -268,6 +282,9 @@ fn app_view(
         input.set(String::new());
         push_item(transcript, next_id, Body::User(text.clone()));
         running.set(true);
+        // Start the TTFT clock; cleared until the first token of this turn.
+        turn_start.set(Some(Instant::now()));
+        ttft.set(None);
 
         // Expand `@file` mentions for the model only; the transcript keeps the
         // bare `@path` the user typed (same split as the TUI).
@@ -310,9 +327,11 @@ fn app_view(
             move |_| send_enter(),
         )
         // Up/Down recall previous submissions (like the TUI's history).
-        .on_key_down(Key::Named(NamedKey::ArrowUp), |m| m.is_empty(), move |_| {
-            history_prev(history, input, hist_pos, hist_draft)
-        })
+        .on_key_down(
+            Key::Named(NamedKey::ArrowUp),
+            |m| m.is_empty(),
+            move |_| history_prev(history, input, hist_pos, hist_draft),
+        )
         .on_key_down(
             Key::Named(NamedKey::ArrowDown),
             |m| m.is_empty(),
@@ -391,7 +410,12 @@ fn app_view(
                 None if used > 0 => format!("{used} tok"),
                 None => "—".to_string(),
             };
-            format!("{}   ·   ctx {ctx}   ·   ↓{out}", model.get())
+            // Time-to-first-token for the last turn, once measured.
+            let ttft = match ttft.get() {
+                Some(secs) => format!("   ·   ttft {secs:.2}s"),
+                None => String::new(),
+            };
+            format!("{}   ·   ctx {ctx}   ·   ↓{out}{ttft}", model.get())
         })
         .style(move |s| s.color(theme.dim)),
         label(|| "● thinking…").style(move |s| {
@@ -569,7 +593,11 @@ fn dispatch_slash(
             system(
                 transcript,
                 next_id,
-                if on { "reasoning shown" } else { "reasoning hidden" },
+                if on {
+                    "reasoning shown"
+                } else {
+                    "reasoning hidden"
+                },
             );
         }
         "copy" => {

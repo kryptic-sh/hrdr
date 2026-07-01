@@ -112,6 +112,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The status-bar context readout is simpler — just `{used} of {max}` (no
   percentage or `ctx` label). The used/free fill bar and its green→amber→red
   escalation are unchanged (they already convey the fraction visually).
+- Time-to-first-token (TTFT) is now reported — how long the provider took to
+  send the first streamed token. The TUI shows `ttft {n.nn}s` on the generating
+  loader (live) and on the persistent per-turn `✓` stats line; the GUI shows it
+  in the status bar (measured from send to the first `Text`/`Reasoning` event,
+  kept until the next turn).
 - hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
   instead of `../hjkl/...` path deps against the sibling repo. hjkl was
   published to crates.io at 0.33.3. CI is now standalone — the second checkout
