@@ -6,6 +6,7 @@
 //! "quit command" detection. More (help metadata is already here) will move in
 //! as the frontends converge.
 
+mod commands;
 mod completion;
 mod config;
 mod format;
@@ -13,6 +14,7 @@ mod history;
 mod sessions;
 mod transcript;
 mod util;
+pub use commands::*;
 pub use completion::*;
 pub use config::*;
 pub use format::*;

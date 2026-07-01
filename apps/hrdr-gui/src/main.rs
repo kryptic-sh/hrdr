@@ -20,7 +20,7 @@ use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
 
 mod md;
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole, Session};
 use tokio::sync::Mutex as TokioMutex;
 
 // ---- colors -------------------------------------------------------------
@@ -233,6 +233,9 @@ fn app_view(
     // Active session's file id (stem), once assigned by the first auto-save (or
     // adopted on `/resume`). Subsequent saves reuse it; `/clear` resets it.
     let session_id: RwSignal<Option<String>> = create_rw_signal(None);
+    // Display-name override for the session (`/rename`); `None` derives it from
+    // the first user message.
+    let session_label: RwSignal<Option<String>> = create_rw_signal(None);
     // Whether to show the model's `<think>` reasoning (`/thinking` toggles);
     // initial value from config (`show_thinking`).
     let show_reasoning = create_rw_signal(show_thinking);
@@ -301,25 +304,28 @@ fn app_view(
             floem::quit_app();
             return;
         }
-        // Slash commands are handled locally; an unrecognized `/…` falls through
-        // to the model (so a literal path still works, matching the TUI).
-        if text.starts_with('/')
-            && dispatch_slash(
-                &text,
+        // Slash commands run through the shared `hrdr_app` dispatcher (so the TUI
+        // and GUI share one implementation). An unrecognized `/…` falls through to
+        // the model (a literal path still works, matching the TUI).
+        if text.starts_with('/') {
+            let mut host = GuiHost {
                 cx,
                 transcript,
                 next_id,
                 usage,
                 model,
                 session_id,
+                session_label,
                 show_reasoning,
-                &clipboard,
-                &agent,
-                &tx,
-            )
-        {
-            input.set(String::new());
-            return;
+                clipboard: clipboard.clone(),
+                agent: agent.clone(),
+                tx: tx.clone(),
+                base_url: base_url.clone(),
+            };
+            if hrdr_app::dispatch(&mut host, &text) {
+                input.set(String::new());
+                return;
+            }
         }
         input.set(String::new());
         push_item(transcript, next_id, Body::User(text.clone()));
@@ -340,6 +346,7 @@ fn app_view(
         // Snapshot session state for the post-turn auto-save (signals can't be
         // read from the spawned task).
         let existing_id = session_id.get_untracked();
+        let session_label = session_label.get_untracked();
         let cur_model = model.get_untracked();
         let base_url = base_url.clone();
         let handle = tokio::spawn(async move {
@@ -359,7 +366,7 @@ fn app_view(
             };
             if let Some(o) = hrdr_app::save_session(
                 existing_id.as_deref(),
-                None,
+                session_label.as_deref(),
                 &cur_model,
                 &base_url,
                 &cwd,
@@ -554,13 +561,6 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
     push_item(transcript, next_id, Body::System(msg.into()));
 }
 
-/// The current working directory as a string (empty if unavailable).
-fn cwd_string() -> String {
-    std::env::current_dir()
-        .map(|c| c.display().to_string())
-        .unwrap_or_default()
-}
-
 /// Rebuild the display transcript from a restored message history (for
 /// `/resume`). Mirrors the TUI's rebuild: user/assistant text plus each
 /// assistant tool call paired with its result message. Non-message roles and
@@ -744,174 +744,129 @@ fn history_next(
 /// task and report back over the `UiMsg::System` channel. Aliases resolve via the
 /// shared `hrdr_app::resolve_alias`.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_slash(
-    input: &str,
+/// The GUI's [`hrdr_app::CommandHost`] — the capability surface the shared
+/// slash-command dispatcher drives. Holds clones of the reactive signals +
+/// agent handle + clipboard so the shared commands can mutate GUI state.
+struct GuiHost {
     cx: Scope,
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
     model: RwSignal<String>,
     session_id: RwSignal<Option<String>>,
+    session_label: RwSignal<Option<String>>,
     show_reasoning: RwSignal<bool>,
-    clipboard: &Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
-    agent: &Arc<TokioMutex<Agent>>,
-    tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
-) -> bool {
-    let rest = input.strip_prefix('/').unwrap_or(input);
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let cmd = hrdr_app::resolve_alias(parts.next().unwrap_or(""));
-    let arg = parts.next().unwrap_or("").trim().to_string();
-    match cmd {
-        "help" => system(transcript, next_id, hrdr_app::help_body()),
-        "thinking" | "reasoning" | "think" => {
-            let on = if arg.is_empty() {
-                !show_reasoning.get_untracked()
-            } else if let Some(b) = hrdr_agent::parse_env_bool(&arg) {
-                b
-            } else {
-                system(transcript, next_id, "usage: /thinking [on | off]");
-                return true;
-            };
-            show_reasoning.set(on);
-            system(
-                transcript,
-                next_id,
-                if on {
-                    "thinking shown"
-                } else {
-                    "thinking hidden"
-                },
-            );
-        }
-        "copy" => {
-            let (text, label) = match arg.to_ascii_lowercase().as_str() {
-                "" | "reply" | "last" => (last_assistant_text(transcript), "last reply"),
-                "code" => (
-                    last_assistant_text(transcript)
-                        .as_deref()
-                        .and_then(hrdr_app::last_fenced_block),
-                    "last code block",
-                ),
-                "all" | "transcript" => (Some(transcript_text(transcript)), "transcript"),
-                _ => {
-                    system(transcript, next_id, "usage: /copy [code | all]");
-                    return true;
-                }
-            };
-            let msg = match text {
-                Some(t) if !t.is_empty() => copy_to_clipboard(clipboard, &t, label),
-                _ => format!("nothing to copy ({label})"),
-            };
-            system(transcript, next_id, msg);
-        }
-        "clear" => {
-            transcript.update(|t| t.clear());
-            next_id.set(0);
-            usage.set(None);
-            session_id.set(None); // detach; the next turn starts a new session
-            let agent = agent.clone();
-            tokio::spawn(async move { agent.lock().await.clear() });
-            system(transcript, next_id, "conversation cleared");
-        }
-        "sessions" => {
-            let cwd = cwd_string();
-            let all = hrdr_app::sessions_all_flag(&arg);
-            system(transcript, next_id, hrdr_app::session_list_text(all, &cwd));
-        }
-        "resume" | "load" => {
-            if arg.is_empty() {
-                system(
-                    transcript,
-                    next_id,
-                    "usage: /resume <id or name> (see /sessions)",
-                );
-                return true;
-            }
-            let cwd = cwd_string();
-            match hrdr_agent::resolve_session(&cwd, &arg) {
-                Some((id, session)) => {
-                    let count = session.messages.len();
-                    model.set(session.model.clone());
-                    // Adopt the id so later auto-saves update this session.
-                    session_id.set(Some(id));
-                    // Rebuild the display transcript, then push agent state on the
-                    // async side (set_messages/set_model need the lock).
-                    rebuild_transcript(cx, transcript, next_id, &session.messages);
-                    let agent = agent.clone();
-                    let msgs = session.messages.clone();
-                    let m = session.model.clone();
-                    tokio::spawn(async move {
-                        let mut a = agent.lock().await;
-                        a.set_messages(msgs);
-                        a.set_model(m);
-                    });
-                    system(
-                        transcript,
-                        next_id,
-                        format!("resumed '{}' ({count} messages)", session.name),
-                    );
-                }
-                None => system(
-                    transcript,
-                    next_id,
-                    format!("no session matching '{arg}' (see /sessions)"),
-                ),
-            }
-        }
-        "model" => {
-            if arg.is_empty() {
-                system(transcript, next_id, format!("model: {}", model.get()));
-            } else {
-                model.set(arg.clone());
-                let agent = agent.clone();
-                let name = arg.clone();
-                tokio::spawn(async move { agent.lock().await.set_model(name) });
-                system(transcript, next_id, format!("model → {arg}"));
-            }
-        }
-        "models" => {
-            let agent = agent.clone();
-            let tx = tx.clone();
-            system(transcript, next_id, "fetching models…");
-            tokio::spawn(async move {
-                let client = agent.lock().await.client();
-                let msg = match client.list_models().await {
-                    Ok(m) if !m.is_empty() => format!("models:\n  {}", m.join("\n  ")),
-                    Ok(_) => "endpoint reported no models".to_string(),
-                    Err(e) => format!("models error: {e}"),
-                };
-                let _ = tx.send(UiMsg::System(msg));
-            });
-        }
-        "tools" => {
-            let agent = agent.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let tools = agent.lock().await.tools();
-                let mut msg = format!("{} tools:", tools.len());
-                for (name, desc) in tools {
-                    msg.push_str(&format!("\n  {name:<12}{desc}"));
-                }
-                let _ = tx.send(UiMsg::System(msg));
-            });
-        }
-        "info" => {
-            let agent = agent.clone();
-            let tx = tx.clone();
-            let model = model.get();
-            tokio::spawn(async move {
-                let a = agent.lock().await;
-                let msg = format!(
-                    "model: {model}\nmessages: {}\ncwd: {}",
-                    a.message_count(),
-                    a.cwd().display()
-                );
-                let _ = tx.send(UiMsg::System(msg));
-            });
-        }
-        _ => return false,
+    clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
+    agent: Arc<TokioMutex<Agent>>,
+    tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
+    base_url: String,
+}
+
+impl hrdr_app::CommandHost for GuiHost {
+    fn info(&mut self, line: String) {
+        system(self.transcript, self.next_id, line);
     }
-    true
+    fn spawn_line(&self, fut: hrdr_app::LineFuture) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if !line.is_empty() {
+                let _ = tx.send(UiMsg::System(line));
+            }
+        });
+    }
+    fn agent(&self) -> Arc<TokioMutex<Agent>> {
+        self.agent.clone()
+    }
+    fn cwd(&self) -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_default()
+    }
+    fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+    fn model(&self) -> String {
+        self.model.get_untracked()
+    }
+    fn set_model(&mut self, model: String) {
+        self.model.set(model);
+    }
+    fn show_thinking(&self) -> bool {
+        self.show_reasoning.get_untracked()
+    }
+    fn set_show_thinking(&mut self, on: bool) {
+        self.show_reasoning.set(on);
+    }
+    fn clear_conversation(&mut self) {
+        self.transcript.update(|t| t.clear());
+        self.next_id.set(0);
+        self.usage.set(None);
+        self.session_id.set(None); // detach; the next turn starts a new session
+        self.session_label.set(None);
+        let agent = self.agent.clone();
+        tokio::spawn(async move { agent.lock().await.clear() });
+    }
+    fn session_id(&self) -> Option<String> {
+        self.session_id.get_untracked()
+    }
+    fn set_session_label(&mut self, name: String) {
+        self.session_label.set(Some(name));
+    }
+    fn autosave(&mut self) {
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        let existing = self.session_id.get_untracked();
+        let label = self.session_label.get_untracked();
+        let model = self.model.get_untracked();
+        let base_url = self.base_url.clone();
+        tokio::spawn(async move {
+            let (msgs, cwd) = {
+                let a = agent.lock().await;
+                (a.messages_owned(), a.cwd().display().to_string())
+            };
+            if let Some(o) = hrdr_app::save_session(
+                existing.as_deref(),
+                label.as_deref(),
+                &model,
+                &base_url,
+                &cwd,
+                msgs,
+            ) {
+                let _ = tx.send(UiMsg::Saved {
+                    id: o.id,
+                    first_save: o.first_save,
+                });
+            }
+        });
+    }
+    fn resume(&mut self, id: String, session: Session) {
+        let count = session.messages.len();
+        self.model.set(session.model.clone());
+        self.session_id.set(Some(id));
+        self.session_label.set(Some(session.name.clone()));
+        rebuild_transcript(self.cx, self.transcript, self.next_id, &session.messages);
+        let agent = self.agent.clone();
+        let msgs = session.messages.clone();
+        let m = session.model.clone();
+        tokio::spawn(async move {
+            let mut a = agent.lock().await;
+            a.set_messages(msgs);
+            a.set_model(m);
+        });
+        system(
+            self.transcript,
+            self.next_id,
+            format!("resumed '{}' ({count} messages)", session.name),
+        );
+    }
+    fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
+        copy_to_clipboard(&self.clipboard, text, label)
+    }
+    fn last_reply(&self) -> Option<String> {
+        last_assistant_text(self.transcript)
+    }
+    fn transcript_text(&self) -> String {
+        transcript_text(self.transcript)
+    }
 }
 
 /// The assistant item currently being streamed into — the last item if it's an

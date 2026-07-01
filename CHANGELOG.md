@@ -79,6 +79,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Slash commands now have a **shared implementation** in `hrdr-app` behind a
+  `CommandHost` trait, so the TUI and GUI drive one dispatcher
+  (`hrdr_app:: dispatch`) instead of each reimplementing commands — a new
+  command benefits both frontends for free. The shared set is `/help`, `/clear`,
+  `/model`, `/models`, `/tools`, `/info`, `/copy`, `/export`, `/rename`,
+  `/diff`, `/thinking`, `/sessions`, `/resume`; async work (network, subprocess,
+  filesystem, agent lock) is expressed as a future the host spawns and reports.
+  As a result the **GUI gains `/export`** (write the conversation as Markdown or
+  `--json`), **`/rename`** (name the session; later auto-saves reuse it), and
+  **`/diff`** (the working-tree `git diff`). Frontend-coupled or richer commands
+  stay local (the TUI keeps its `msg N[-M]` `/copy`, detailed `/info`, and
+  colored `/diff`, plus scrolling/find/goto/expand/theme/editor). New shared
+  cores: `git_working_diff` and `export_conversation`
+  (`conversation_to_markdown`/`_json`).
+
 - Showing the model's `<think>` reasoning is now a first-class setting:
   `show_thinking` in config, `--show-thinking on|off|1|0`, and
   `$HRDR_SHOW_THINKING` (default on). A new `/thinking [on|off|1|0]` slash

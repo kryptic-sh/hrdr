@@ -16,47 +16,10 @@ impl super::App {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let cmd = resolve_alias(parts.next().unwrap_or(""));
         let arg = parts.next().unwrap_or("").trim();
+        // Commands with a richer TUI rendering or that touch terminal-only state
+        // are handled here; everything else falls through to the shared
+        // `hrdr_app` dispatcher (so the TUI and GUI run one implementation).
         match cmd {
-            "help" => self.system(help_text()),
-            "clear" => {
-                // Full reset — as if a fresh session just opened. `Agent::clear`
-                // drops history and re-reads `AGENTS.md` (so an updated/removed
-                // file is reflected); here we reset the view + interaction state.
-                self.with_agent(|a| a.clear());
-                self.clear_transcript();
-                self.queue.clear();
-                if let Ok(mut todos) = self.todos.lock() {
-                    todos.clear();
-                }
-                self.todo_turn = 0;
-                self.todo_completed_at.clear();
-                self.scroll_offset = 0;
-                self.max_scroll = 0;
-                self.session_in = 0;
-                self.session_out = 0;
-                self.last_usage = None;
-                self.session_id = None; // detach; next message starts a new session
-                self.session_label = None;
-                self.find_query = None;
-                self.find_pos = 0;
-                self.pending_goto = None;
-                self.pending_edit = None;
-                self.expand_tools = false;
-                self.system("conversation cleared");
-            }
-            "model" => {
-                if arg.is_empty() {
-                    self.system(format!("model: {}", self.model));
-                } else {
-                    if self.with_agent(|a| a.set_model(arg)).is_some() {
-                        self.model = arg.to_string();
-                        self.system(format!("model → {arg}"));
-                    } else {
-                        self.system("busy — try again after the current turn");
-                    }
-                }
-            }
-            "models" => self.list_models_cmd(),
             "provider" => self.switch_provider(arg),
             "theme" => {
                 let path = (!arg.is_empty()).then_some(arg);
@@ -73,13 +36,11 @@ impl super::App {
                 }
             }
             "cwd" => self.change_cwd(arg),
-            "tools" => self.show_tools(),
             "expand" => self.expand_cmd(arg),
             "revert" => self.revert_cmd(),
             "checkpoints" => self.checkpoints_cmd(),
             "add" => self.add_file(arg),
-            "diff" => self.git_diff_cmd(),
-            "thinking" | "reasoning" | "think" => self.thinking_cmd(arg),
+            "diff" => self.git_diff_cmd(), // colored Entry::Diff rendering
             "temp" | "temperature" => self.set_temp_cmd(arg),
             "effort" => {
                 if arg.is_empty() {
@@ -93,16 +54,12 @@ impl super::App {
                     self.system(format!("effort → {arg}"));
                 }
             }
-            "info" => self.show_info(),
-            "copy" => self.copy_cmd(arg),
-            "export" => self.export_cmd(arg),
+            "info" => self.show_info(),   // richer than the shared /info
+            "copy" => self.copy_cmd(arg), // supports `msg N[-M]`
             "paste" => self.paste_cmd(),
             "retry" => self.retry_last(arg),
             "edit" => self.edit_file_cmd(arg),
             "undo" => self.undo_last(),
-            "resume" | "load" => self.resume_session(arg),
-            "rename" => self.rename_session(arg),
-            "sessions" => self.list_sessions_cmd(arg),
             "compact" => self.compact_cmd(arg),
             "init" => self.init_agents_cmd(),
             "reload" => self.reload_cmd(),
@@ -113,24 +70,39 @@ impl super::App {
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             "statusbar" => self.statusbar_cmd(arg),
             "todo-ttl" | "todottl" | "todos" => self.todo_ttl_cmd(arg),
-            _ => return false,
+            // help, clear, model, models, tools, info?, rename, thinking,
+            // sessions, resume, export → shared dispatcher.
+            _ => {
+                let mut host = TuiHost { app: self };
+                return hrdr_app::dispatch(&mut host, input);
+            }
         }
         true
     }
-    fn list_models_cmd(&mut self) {
-        let Some(client) = self.with_agent_or_busy(|a| a.client()) else {
-            return;
-        };
-        let tx = self.tx.clone();
-        self.system("fetching models…");
-        tokio::spawn(async move {
-            let msg = match client.list_models().await {
-                Ok(m) if !m.is_empty() => format!("models:\n  {}", m.join("\n  ")),
-                Ok(_) => "endpoint reported no models".to_string(),
-                Err(e) => format!("models error: {e}"),
-            };
-            let _ = tx.send(TurnMsg::System(msg));
-        });
+    /// Full reset — as if a fresh session just opened. `Agent::clear` drops
+    /// history and re-reads `AGENTS.md`; this resets the view + interaction
+    /// state. The shared `/clear` command emits the confirmation line.
+    pub(super) fn clear_all(&mut self) {
+        self.with_agent(|a| a.clear());
+        self.clear_transcript();
+        self.queue.clear();
+        if let Ok(mut todos) = self.todos.lock() {
+            todos.clear();
+        }
+        self.todo_turn = 0;
+        self.todo_completed_at.clear();
+        self.scroll_offset = 0;
+        self.max_scroll = 0;
+        self.session_in = 0;
+        self.session_out = 0;
+        self.last_usage = None;
+        self.session_id = None; // detach; next message starts a new session
+        self.session_label = None;
+        self.find_query = None;
+        self.find_pos = 0;
+        self.pending_goto = None;
+        self.pending_edit = None;
+        self.expand_tools = false;
     }
     fn change_cwd(&mut self, arg: &str) {
         let Some(cur) = self.with_agent_or_busy(|a| a.cwd()) else {
@@ -185,18 +157,6 @@ impl super::App {
                 }
             }
             _ => self.system("usage: /expand [all | off]"),
-        }
-    }
-    fn show_tools(&mut self) {
-        match self.with_agent(|a| a.tools()) {
-            Some(tools) => {
-                let mut s = String::from("tools:");
-                for (n, d) in tools {
-                    s.push_str(&format!("\n  {n} — {d}"));
-                }
-                self.system(s);
-            }
-            None => self.system("busy — try again after the current turn"),
         }
     }
     /// `/reload` — re-read config + `AGENTS.md`, applying the runtime bits that
@@ -571,27 +531,6 @@ impl super::App {
             StatusBarMode::Wrap => "status bar: wrap",
         });
     }
-    /// `/thinking [on|off|1|0]` — show or hide the model's `<think>` reasoning
-    /// blocks (no arg toggles). Persists as `show_thinking` in config. `/reasoning`
-    /// is an alias.
-    fn thinking_cmd(&mut self, arg: &str) {
-        let arg = arg.trim();
-        let on = if arg.is_empty() {
-            !self.show_reasoning
-        } else if let Some(b) = hrdr_agent::parse_env_bool(arg) {
-            b
-        } else {
-            self.system("usage: /thinking [on | off]");
-            return;
-        };
-        self.show_reasoning = on;
-        self.persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
-        self.system(if on {
-            "thinking shown"
-        } else {
-            "thinking hidden"
-        });
-    }
     /// `/todo-ttl [turns]` — how many turns a completed TODO stays visible
     /// before it's pruned from the panel. No arg reports the current value.
     fn todo_ttl_cmd(&mut self, arg: &str) {
@@ -646,16 +585,22 @@ impl super::App {
             TimestampStyle::Exact => "timestamps: exact (HH:MM)",
         });
     }
-    /// Write `text` to the system clipboard, reporting success/failure.
+    /// Write `text` to the system clipboard, emitting the status as a system line.
     fn copy_to_clipboard(&mut self, text: &str, label: &str) {
+        let status = self.clipboard_status(text, label);
+        self.system(status);
+    }
+    /// Write `text` to the system clipboard, returning a status line (used by the
+    /// shared `/copy` via [`hrdr_app::CommandHost`]).
+    pub(super) fn clipboard_status(&mut self, text: &str, label: &str) -> String {
         let res = self
             .clipboard
             .as_mut()
             .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()));
         match res {
-            Some(Ok(())) => self.system(format!("copied {label} to clipboard")),
-            Some(Err(_)) => self.system("clipboard write failed"),
-            None => self.system("clipboard unavailable"),
+            Some(Ok(())) => format!("copied {label} to clipboard"),
+            Some(Err(_)) => "clipboard write failed".to_string(),
+            None => "clipboard unavailable".to_string(),
         }
     }
     /// The most recent assistant message text.
@@ -706,49 +651,6 @@ impl super::App {
             }
         }
         self.editor.paste(&text);
-    }
-    /// `/export [--json] [file]` — write the transcript to a file as text
-    /// (default) or JSON. With no file, a timestamped `hrdr-transcript-<date>`
-    /// in the cwd is used (`.md` or `.json`).
-    fn export_cmd(&mut self, arg: &str) {
-        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
-            return;
-        };
-        let mut json = false;
-        let mut file: Option<&str> = None;
-        for tok in arg.split_whitespace() {
-            if tok == "--json" {
-                json = true;
-            } else if file.is_none() {
-                file = Some(tok);
-            }
-        }
-        let path = match file {
-            Some(f) => resolve_under(&cwd, f),
-            None => {
-                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                let ext = if json { "json" } else { "md" };
-                cwd.join(format!("hrdr-transcript-{stamp}.{ext}"))
-            }
-        };
-        let content = if json {
-            self.transcript_json()
-        } else {
-            self.transcript_text()
-        };
-        match std::fs::write(&path, &content) {
-            Ok(()) => self.system(format!(
-                "exported transcript to {} ({} lines)",
-                path.display(),
-                content.lines().count()
-            )),
-            Err(e) => self.system(format!("export failed: {e}")),
-        }
-    }
-    /// The conversation as a JSON array of `{n, role, time, content}` objects
-    /// (user/assistant messages only).
-    fn transcript_json(&self) -> String {
-        hrdr_app::transcript_to_json(&self.transcript, &self.entry_times)
     }
     /// `/revert` — undo the most recent turn's file edits (restore pre-images).
     fn revert_cmd(&mut self) {
@@ -898,16 +800,85 @@ impl super::App {
     }
 }
 
-/// Render the grouped, aligned `/help` text: the shared command body plus the
-/// TUI's own keybinding tips.
-fn help_text() -> String {
-    let mut s = hrdr_app::help_body();
-    s.push_str(
-        "\n\nTips: @path attaches a file · Up/Down recalls history · Ctrl+L redraws · \
-         Ctrl+C twice quits",
-    );
-    s
+/// Keybinding tips appended to the shared `/help` body (TUI-specific).
+const HELP_TIPS: &str =
+    "Tips: @path attaches a file · Up/Down recalls history · Ctrl+L redraws · Ctrl+C twice quits";
+
+/// The TUI's [`hrdr_app::CommandHost`] — a thin adapter over `App` so the shared
+/// slash-command dispatcher can drive it. Commands with a richer TUI rendering
+/// stay in [`App::handle_slash`] and never reach here.
+struct TuiHost<'a> {
+    app: &'a mut super::App,
 }
+
+impl hrdr_app::CommandHost for TuiHost<'_> {
+    fn info(&mut self, line: String) {
+        self.app.system(line);
+    }
+    fn spawn_line(&self, fut: hrdr_app::LineFuture) {
+        let tx = self.app.tx.clone();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if !line.is_empty() {
+                let _ = tx.send(TurnMsg::System(line));
+            }
+        });
+    }
+    fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
+        self.app.agent.clone()
+    }
+    fn cwd(&self) -> std::path::PathBuf {
+        self.app
+            .with_agent(|a| a.cwd())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+    fn base_url(&self) -> String {
+        self.app.base_url.clone()
+    }
+    fn model(&self) -> String {
+        self.app.model.clone()
+    }
+    fn set_model(&mut self, model: String) {
+        self.app.model = model;
+    }
+    fn show_thinking(&self) -> bool {
+        self.app.show_reasoning
+    }
+    fn set_show_thinking(&mut self, on: bool) {
+        self.app.show_reasoning = on;
+        self.app
+            .persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
+    }
+    fn clear_conversation(&mut self) {
+        self.app.clear_all();
+    }
+    fn session_id(&self) -> Option<String> {
+        self.app.session_id.clone()
+    }
+    fn set_session_label(&mut self, name: String) {
+        self.app.session_label = Some(name);
+    }
+    fn autosave(&mut self) {
+        self.app.autosave();
+    }
+    fn resume(&mut self, id: String, session: hrdr_agent::Session) {
+        self.app.apply_session(id, session);
+    }
+    fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
+        self.app.clipboard_status(text, label)
+    }
+    fn last_reply(&self) -> Option<String> {
+        self.app.last_assistant_text()
+    }
+    fn transcript_text(&self) -> String {
+        self.app.transcript_text()
+    }
+    fn help_tips(&self) -> Option<String> {
+        Some(HELP_TIPS.to_string())
+    }
+}
+
 /// Instruction sent to the model by `/init` to author an `AGENTS.md`.
 const INIT_PROMPT: &str = "\
 Analyze this codebase and create an AGENTS.md file at the repository root to guide \

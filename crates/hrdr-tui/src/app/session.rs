@@ -71,30 +71,11 @@ impl super::App {
             self.session_id = Some(o.id);
         }
     }
-    pub(super) fn rename_session(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.system("usage: /rename <name>");
-            return;
-        }
-        self.session_label = Some(arg.to_string());
-        self.autosave(); // persist the new name (no-op while still empty)
-        self.system(format!("session renamed → {arg}"));
-    }
-    pub(super) fn resume_session(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.system("usage: /resume <id-or-name>  (see /sessions)");
-            return;
-        }
-        if self.running {
-            self.system("can't resume while a turn is running");
-            return;
-        }
-        // Match by file id first, then by display name (e.g. after /rename).
+    /// Restore a resolved session (the shared `/resume` command calls this via
+    /// [`hrdr_app::CommandHost::resume`]): swap in its messages/model, rebuild the
+    /// transcript, adopt its id/name, and follow its working directory.
+    pub(super) fn apply_session(&mut self, id: String, session: hrdr_agent::Session) {
         let cwd = self.current_cwd();
-        let Some((id, session)) = hrdr_agent::resolve_session(&cwd, arg) else {
-            self.system(format!("no session matching '{arg}' (see /sessions)"));
-            return;
-        };
         let count = session.messages.len();
         self.with_agent(|a| {
             a.set_messages(session.messages.clone());
@@ -126,10 +107,6 @@ impl super::App {
                 session.base_url, self.base_url
             ));
         }
-    }
-    pub(super) fn list_sessions_cmd(&mut self, arg: &str) {
-        let all = hrdr_app::sessions_all_flag(arg);
-        self.system(hrdr_app::session_list_text(all, &self.current_cwd()));
     }
     /// Rebuild the display transcript from a restored message history.
     fn rebuild_transcript(&mut self, msgs: &[Message]) {
