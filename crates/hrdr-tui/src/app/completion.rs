@@ -1,6 +1,6 @@
 //! Slash-command and @file completion.
 
-use hrdr_app::{SLASH_COMMANDS, walk_files};
+use hrdr_app::{active_file_token, rank_file_matches, slash_completions, walk_files};
 
 impl super::App {
     /// The active completion popup contents: slash commands when the line starts
@@ -58,30 +58,9 @@ impl super::App {
     /// Build (and cache) the list of files under the cwd, then rank by `query`.
     fn file_completion_items(&mut self, query: &str) -> Vec<(String, String)> {
         self.ensure_file_index();
-        let q = query.to_ascii_lowercase();
-        let mut scored: Vec<(u8, usize, &String)> = self
-            .file_index
-            .iter()
-            .filter_map(|p| {
-                if q.is_empty() {
-                    return Some((1u8, p.len(), p));
-                }
-                let lp = p.to_ascii_lowercase();
-                let base = lp.rsplit('/').next().unwrap_or(&lp);
-                if base.starts_with(&q) {
-                    Some((0, p.len(), p))
-                } else if lp.contains(&q) {
-                    Some((1, p.len(), p))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
-        scored
+        rank_file_matches(&self.file_index, query)
             .into_iter()
-            .take(8)
-            .map(|(_, _, p)| (p.clone(), String::new()))
+            .map(|p| (p, String::new()))
             .collect()
     }
     /// Rebuild `file_index` if it's stale for the current cwd.
@@ -124,56 +103,4 @@ impl Completions {
             CompletionKind::File { .. } => " files · Tab ",
         }
     }
-}
-/// If an `@…` file mention is being typed at the end of `input`, return the byte
-/// offset of the `@` and the partial query after it. Requires the `@` to start a
-/// token (preceded by start-of-input or whitespace) with no whitespace after it.
-pub(super) fn active_file_token(input: &str) -> Option<(usize, String)> {
-    let at = input.rfind('@')?;
-    // Must start a token.
-    if at > 0 {
-        let prev = input[..at].chars().next_back()?;
-        if !prev.is_whitespace() {
-            return None;
-        }
-    }
-    let query = &input[at + 1..];
-    if query.chars().any(char::is_whitespace) {
-        return None;
-    }
-    Some((at, query.to_string()))
-}
-/// Commands matching the in-progress `/…` input (empty once a space is typed).
-///
-/// Matches the query (the text after `/`) against both the command name and its
-/// description (case-insensitive substring), so e.g. `/list` surfaces `/help`
-/// ("list commands"). Ranked: name-prefix, then name-substring, then
-/// description-substring.
-pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)> {
-    let Some(query) = input.strip_prefix('/') else {
-        return Vec::new();
-    };
-    if query.chars().any(char::is_whitespace) {
-        return Vec::new();
-    }
-    if query.is_empty() {
-        return SLASH_COMMANDS.to_vec();
-    }
-    let q = query.to_ascii_lowercase();
-    let mut scored: Vec<(u8, (&'static str, &'static str))> = Vec::new();
-    for &(name, desc) in SLASH_COMMANDS {
-        let nl = name.trim_start_matches('/').to_ascii_lowercase();
-        let rank = if nl.starts_with(&q) {
-            0
-        } else if nl.contains(&q) {
-            1
-        } else if desc.to_ascii_lowercase().contains(&q) {
-            2
-        } else {
-            continue;
-        };
-        scored.push((rank, (name, desc)));
-    }
-    scored.sort_by_key(|(r, _)| *r); // stable: preserves list order within a rank
-    scored.into_iter().map(|(_, c)| c).collect()
 }

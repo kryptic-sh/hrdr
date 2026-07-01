@@ -3,7 +3,27 @@
 //! and small argument parsers (`/goto` durations, `/copy` message ranges,
 //! fenced-code extraction). No UI, no rendering — pure logic + filesystem.
 
+use hrdr_agent::{Message, MessageRole};
 use std::path::{Path, PathBuf};
+
+/// A short session name derived from the first user message (first line, trimmed,
+/// capped at 60 chars). Falls back to `"untitled"` when there's no usable text.
+pub fn session_name_from(msgs: &[Message]) -> String {
+    msgs.iter()
+        .find(|m| m.role == MessageRole::User)
+        .and_then(|m| m.content.as_deref())
+        .map(|c| {
+            c.lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "untitled".to_string())
+}
 
 /// Resolve `path` against `base`: absolute paths pass through unchanged,
 /// relative ones are joined onto `base`.

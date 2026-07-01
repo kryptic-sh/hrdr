@@ -59,7 +59,7 @@ impl super::App {
         let name = self
             .session_label
             .clone()
-            .unwrap_or_else(|| session_name_from(&msgs));
+            .unwrap_or_else(|| hrdr_app::session_name_from(&msgs));
         // Notify once, when the session is first created.
         if self.session_id.is_none() {
             let id = hrdr_agent::unique_session_id(&cwd.display().to_string(), &name);
@@ -209,22 +209,4 @@ impl super::App {
             }
         }
     }
-}
-
-/// A short session name derived from the first user message.
-pub(super) fn session_name_from(msgs: &[Message]) -> String {
-    msgs.iter()
-        .find(|m| m.role == MessageRole::User)
-        .and_then(|m| m.content.as_deref())
-        .map(|c| {
-            c.lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .chars()
-                .take(60)
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "untitled".to_string())
 }

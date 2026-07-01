@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 hrdr-agent.workspace = true
 ignore.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

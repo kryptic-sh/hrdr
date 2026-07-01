@@ -6,7 +6,13 @@
 //! "quit command" detection. More (help metadata is already here) will move in
 //! as the frontends converge.
 
+mod completion;
+mod config;
+mod format;
 mod util;
+pub use completion::*;
+pub use config::*;
+pub use format::*;
 pub use util::*;
 
 /// The slash commands, as `(name, one-line description)`. Frontends render this
@@ -131,6 +137,27 @@ pub fn resolve_alias(cmd: &str) -> &str {
         "commands" | "?" => "help",
         _ => cmd,
     }
+}
+
+/// The grouped, aligned `/help` body: a `Commands` header followed by each
+/// `HELP_GROUPS` section with its commands and descriptions. Frontends append
+/// their own keybinding "Tips:" tail (those keys differ per frontend).
+pub fn help_body() -> String {
+    let desc = |name: &str| {
+        SLASH_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| *d)
+            .unwrap_or("")
+    };
+    let mut s = String::from("Commands");
+    for (group, names) in HELP_GROUPS {
+        s.push_str(&format!("\n\n{group}"));
+        for name in *names {
+            s.push_str(&format!("\n  {name:<11}{}", desc(name)));
+        }
+    }
+    s
 }
 
 /// Whether a submitted line is a common "quit the session" command, matched

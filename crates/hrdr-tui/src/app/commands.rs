@@ -3,10 +3,7 @@
 use super::*;
 use crate::theme::Theme;
 use hjkl_clipboard::{MimeType, Selection};
-use hrdr_app::{
-    HELP_GROUPS, SLASH_COMMANDS, last_fenced_block, parse_duration, parse_msg_range, resolve_alias,
-    resolve_under,
-};
+use hrdr_app::{last_fenced_block, parse_duration, parse_msg_range, resolve_alias, resolve_under};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -605,11 +602,7 @@ impl super::App {
         self.statusbar_mode = mode;
         self.persist_setting(
             "statusbar",
-            hrdr_agent::ConfigValue::Str(match mode {
-                StatusBarMode::None => "none",
-                StatusBarMode::Truncate => "truncate",
-                StatusBarMode::Wrap => "wrap",
-            }),
+            hrdr_agent::ConfigValue::Str(mode.as_config_str()),
         );
         self.system(match mode {
             StatusBarMode::None => "status bar: hidden",
@@ -663,11 +656,7 @@ impl super::App {
         self.timestamp_style = style;
         self.persist_setting(
             "timestamps",
-            hrdr_agent::ConfigValue::Str(match style {
-                TimestampStyle::None => "none",
-                TimestampStyle::Relative => "relative",
-                TimestampStyle::Exact => "exact",
-            }),
+            hrdr_agent::ConfigValue::Str(style.as_config_str()),
         );
         self.system(match style {
             TimestampStyle::None => "timestamps: off",
@@ -959,22 +948,10 @@ impl super::App {
     }
 }
 
-/// Render the grouped, aligned `/help` text.
+/// Render the grouped, aligned `/help` text: the shared command body plus the
+/// TUI's own keybinding tips.
 fn help_text() -> String {
-    let desc = |name: &str| {
-        SLASH_COMMANDS
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, d)| *d)
-            .unwrap_or("")
-    };
-    let mut s = String::from("Commands");
-    for (group, names) in HELP_GROUPS {
-        s.push_str(&format!("\n\n{group}"));
-        for name in *names {
-            s.push_str(&format!("\n  {name:<11}{}", desc(name)));
-        }
-    }
+    let mut s = hrdr_app::help_body();
     s.push_str(
         "\n\nTips: @path attaches a file · Up/Down recalls history · Ctrl+L redraws · \
          Ctrl+C twice quits",

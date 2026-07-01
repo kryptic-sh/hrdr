@@ -35,51 +35,9 @@ use util::{
 // can reach these terminal-facing helpers.
 pub(crate) use util::{run_editor, setup_config_watcher};
 
-/// Per-message timestamp display style.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TimestampStyle {
-    /// No timestamps/numbers.
-    None,
-    /// Relative (`now`, `2m ago`, `3h ago`).
-    Relative,
-    /// Exact local time (`HH:MM`).
-    Exact,
-}
-
-impl TimestampStyle {
-    /// Resolve from a config string; anything unrecognized (incl. `None`) is
-    /// `Relative` — the default.
-    fn from_config(s: Option<&str>) -> Self {
-        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
-            Some("none" | "off" | "hidden" | "false" | "0") => Self::None,
-            Some("exact" | "absolute" | "abs") => Self::Exact,
-            _ => Self::Relative,
-        }
-    }
-}
-
-/// How the status bar behaves when it doesn't fit the terminal width.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatusBarMode {
-    /// Hidden entirely.
-    None,
-    /// Drop the least-important sections until it fits one row.
-    Truncate,
-    /// Wrap onto multiple rows so everything is shown.
-    Wrap,
-}
-
-impl StatusBarMode {
-    /// Resolve from a config string; anything unrecognized (incl. `None`) is
-    /// `Truncate` — the default.
-    fn from_config(s: Option<&str>) -> Self {
-        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
-            Some("none" | "off" | "hidden") => Self::None,
-            Some("wrap") => Self::Wrap,
-            _ => Self::Truncate,
-        }
-    }
-}
+// The display-mode enums live in the shared `hrdr-app` core so the TUI and GUI
+// resolve/persist these settings identically.
+pub(crate) use hrdr_app::{StatusBarMode, TimestampStyle};
 
 /// What a key press asks the driver to do (for actions needing the terminal).
 /// Returned by [`App::on_key`] so the render/terminal layer stays outside `App`.
@@ -1202,7 +1160,6 @@ mod e2e;
 #[cfg(test)]
 mod tests {
     use super::Todo;
-    use super::completion::{active_file_token, slash_completions};
     use super::util::age_completed_todos;
     use std::collections::HashMap;
 
@@ -1268,40 +1225,5 @@ mod tests {
     #[test]
     fn ttl_matches_config_default() {
         assert_eq!(TTL, hrdr_agent::DEFAULT_TODO_TTL);
-    }
-
-    #[test]
-    fn active_file_token_detection() {
-        // Bare @ at start, or after whitespace, with a partial query.
-        assert_eq!(active_file_token("@"), Some((0, String::new())));
-        assert_eq!(
-            active_file_token("look at @src/ma"),
-            Some((8, "src/ma".into()))
-        );
-        // Not a token boundary (email-ish) — the @ is preceded by a non-space.
-        assert_eq!(active_file_token("me@host"), None);
-        // Already-completed mention followed by a space is not active.
-        assert_eq!(active_file_token("@src/main.rs and"), None);
-        // No @ at all.
-        assert_eq!(active_file_token("hello world"), None);
-    }
-
-    #[test]
-    fn slash_completions_filter() {
-        let names = |i: &str| {
-            slash_completions(i)
-                .iter()
-                .map(|(n, _)| *n)
-                .collect::<Vec<_>>()
-        };
-        assert!(names("/").len() >= 6); // all commands for a bare slash
-        // Name-prefix matches rank first (/clear, /cwd, /copy all start with c).
-        assert_eq!(names("/c")[0], "/clear");
-        assert!(names("/c").contains(&"/copy") && names("/c").contains(&"/cwd"));
-        // Description match: "/list" surfaces "/help" ("list commands").
-        assert!(names("/list").contains(&"/help"));
-        assert!(!names("/list").contains(&"/clear"));
-        assert!(names("/model gpt").is_empty()); // a space ends completion
-        assert!(names("hello").is_empty()); // not a slash command
     }
 }

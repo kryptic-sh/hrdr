@@ -21,6 +21,7 @@ use syntect::util::LinesWithEndings;
 
 use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
+use hrdr_app::{fmt_count, relative_time};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write_file) get a larger preview since the diff is the point.
@@ -754,44 +755,6 @@ fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'sta
         ));
     }
     Line::from(spans)
-}
-
-/// Human-friendly elapsed time since `then`, with compound units for the larger
-/// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
-fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
-    let secs = (chrono::Local::now() - then).num_seconds().max(0);
-    if secs < 5 {
-        "now".to_string()
-    } else if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        let (h, m) = (secs / 3600, (secs % 3600) / 60);
-        if m > 0 {
-            format!("{h}h{m}m ago")
-        } else {
-            format!("{h}h ago")
-        }
-    } else {
-        let (d, h) = (secs / 86_400, (secs % 86_400) / 3600);
-        if h > 0 {
-            format!("{d}d{h}h ago")
-        } else {
-            format!("{d}d ago")
-        }
-    }
-}
-
-/// Compact token count: `840`, `12.4k`, `1.8M`.
-fn fmt_count(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
 }
 
 /// Returns the rendered transcript lines plus, for each user/assistant message

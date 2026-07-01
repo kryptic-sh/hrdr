@@ -2150,6 +2150,7 @@ dependencies = [
 name = "hrdr-app"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "hrdr-agent",
  "ignore",
  "tempfile",

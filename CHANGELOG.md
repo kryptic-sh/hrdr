@@ -143,10 +143,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `parse_duration` (`/goto` time specs), `parse_msg_range` (`/copy msg N-M`),
   and `last_fenced_block` (`/copy code`) — with their tests — so the TUI now
   imports them from `hrdr-app` instead of owning private copies (`ignore` moved
-  with them). More representation-independent logic will move in as the
-  frontends converge (the transcript reducer stays per-frontend for now — the
-  TUI is immediate-mode with plain strings, the GUI retained-mode with per-field
-  reactive signals).
+  with them). A further batch followed: the completion logic
+  (`slash_completions`, `active_file_token`, `rank_file_matches`), the display
+  formatters (`fmt_count`, `relative_time`), the `help_body` command listing
+  (the TUI appends its own keybinding tips), `session_name_from`
+  (first-user-line session titles), and the config-value enums
+  `TimestampStyle`/`StatusBarMode` (now with an `as_config_str` for round-trip
+  persistence). All the TUI-only copies are gone; `hrdr-app` grew `chrono` for
+  the relative-time formatter. More representation-independent logic will move
+  in as the frontends converge (the transcript reducer stays per-frontend for
+  now — the TUI is immediate-mode with plain strings, the GUI retained-mode with
+  per-field reactive signals).
 - **`hrdr-gui` — a floem desktop frontend (proof-of-concept).** A new
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI
   (`hrdr_agent::Agent`): a chat window that streams a turn's `AgentEvent`s into
