@@ -31,6 +31,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The managed local backend is now **infr-first**. If
+  [`infr`](https://github.com/kryptic-sh/infr) is on `PATH`, hrdr spawns
+  `infr serve <model> --addr <ip:port>` (native `tools`/`tool_calls`, SSE, GGUF
+  Jinja chat template) as the default backend; it falls back to `llama-server`
+  (llama.cpp, `--jinja`) when infr isn't installed, and errors clearly if
+  neither is present. A backend already answering at `--base-url` is still
+  reused. The `--backend-model` ref works for both;
+  `--backend-arg`/`--backend-ctx` apply to the llama.cpp fallback (infr is tuned
+  via `INFR_*` env vars). Spawn logs go to `~/.cache/hrdr/infr-serve.log` or
+  `llama-server.log`. Dropped the "temporary" framing — infr's serve path now
+  has full tool support.
 - Finished TODO items now age out of the panel. A completed item stays visible
   for the turn it finishes plus four more (five turns total), then it's pruned —
   so the list keeps showing recent progress without accreting stale checkmarks.

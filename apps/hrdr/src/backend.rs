@@ -1,17 +1,16 @@
-//! TEMPORARY model-backend bootstrap.
+//! Local model-backend bootstrap.
 //!
-//! For now hrdr spawns a local `llama-server` (llama.cpp) as its
-//! OpenAI-compatible backend, so the harness can be refined against a real
-//! tool-calling model. **This is a stopgap.**
+//! hrdr can bring up a local OpenAI-compatible server so the harness works with
+//! zero setup. It is **presence-aware and infr-first**: if [`infr`] is on
+//! `PATH` it's spawned as the backend (native `tools`/`tool_calls`, SSE, and a
+//! GGUF Jinja chat template); otherwise it falls back to `llama-server`
+//! (llama.cpp, started with `--jinja`). If neither is installed, hrdr errors and
+//! points at `--no-backend` + `--base-url` for a self-managed endpoint.
 //!
-//! REMOVE / REPLACE once `infr`'s serve path supports agentic tool use — today
-//! `infr`'s `Engine::chat` is a `todo!` and its `LlamaGenerator` ignores
-//! `_tools_json` and drops everything but the last user message, so the model
-//! never sees the tools. When infr wires up full-history chat-template
-//! rendering + tool-def injection + `<|tool_call>` parsing, delete this module
-//! and point hrdr straight at `infr serve` (`--no-backend`, or set
-//! `HRDR_BASE_URL`). hrdr itself needs no change — only this bootstrap goes
-//! away.
+//! A backend already answering at `--base-url` is reused as-is (nothing is
+//! spawned or owned). Remote providers never reach this module.
+//!
+//! [`infr`]: https://github.com/kryptic-sh/infr
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -22,24 +21,38 @@ use tokio::process::{Child, Command};
 
 /// How a managed backend was provisioned.
 pub enum Backend {
-    /// We launched `llama-server`; it is killed when this value drops (the
-    /// held `Child` is a kill-on-drop RAII guard, never read directly). Boxed so
-    /// the enum stays small (the `Child` is larger on Windows).
+    /// We launched a local server; it is killed when this value drops (the held
+    /// `Child` is a kill-on-drop RAII guard, never read directly). Boxed so the
+    /// enum stays small (the `Child` is larger on Windows).
     Spawned(#[allow(dead_code)] Box<Child>),
     /// A backend was already reachable; we reuse it and own nothing.
     External,
 }
 
-/// Settings for the spawned `llama-server`.
+/// Which local server to spawn, chosen by what's installed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    /// `infr serve <model> --addr <ip:port>` — preferred (native tool calls).
+    Infr,
+    /// `llama-server -hf <model> --jinja …` — llama.cpp fallback.
+    Llama,
+}
+
+/// Settings for the spawned local backend.
 #[derive(Clone)]
 pub struct BackendConfig {
-    /// Model ref (HF `org/repo:quant`) or path to a `.gguf`.
+    /// Model ref (HF `org/repo[:quant]`) or path to a local `.gguf`. Both infr
+    /// and llama.cpp accept this shape.
     pub model: String,
-    /// `llama-server` binary name or path.
+    /// `llama-server` binary name or path (used only for the llama fallback).
     pub bin: String,
-    /// Context window size.
+    /// Context window size — passed to llama.cpp (`-c`) and used for the status
+    /// bar's "X of Y" display. infr sizes context per request, so it's display
+    /// only there.
     pub ctx: u32,
-    /// Extra args passed through verbatim (e.g. `-ngl 99` for GPU offload).
+    /// Extra args passed verbatim to the **llama.cpp** fallback (e.g. `-ngl 99`
+    /// for GPU offload). Not forwarded to infr, which is tuned via `INFR_*` env
+    /// vars rather than CLI flags.
     pub extra_args: Vec<String>,
 }
 
@@ -55,8 +68,9 @@ impl Default for BackendConfig {
 }
 
 impl Backend {
-    /// Ensure a backend answers at `base_url`. Reuse one if already up,
-    /// otherwise spawn `llama-server --jinja` and block until it is ready.
+    /// Ensure a backend answers at `base_url`. Reuse one if already up; else
+    /// spawn `infr` (preferred) or `llama-server` (fallback) and block until it
+    /// is ready.
     pub async fn ensure(cfg: &BackendConfig, base_url: &str) -> Result<Self> {
         let probe = Client::new(base_url, None, "default");
         if probe.list_models().await.is_ok() {
@@ -65,46 +79,73 @@ impl Backend {
         }
 
         let (host, port) = parse_host_port(base_url)?;
-        let log_path = log_file();
-        eprintln!(
-            "hrdr: starting llama-server ({}) on {host}:{port} — loading model, this can take a minute…\n      logs: {}",
-            cfg.model,
-            log_path.display(),
-        );
 
+        // Presence-aware: prefer infr for its native tool support, fall back to
+        // llama.cpp, error if neither is installed.
+        let kind = if which::which("infr").is_ok() {
+            BackendKind::Infr
+        } else if which::which(&cfg.bin).is_ok() {
+            BackendKind::Llama
+        } else {
+            bail!(
+                "no local backend found on PATH — install `infr` (preferred, native tool \
+                 calling) or `llama-server` (llama.cpp), or run your own OpenAI-compatible \
+                 server and start hrdr with `--no-backend --base-url <url>`"
+            );
+        };
+
+        let log_path = log_file(kind);
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
         let log_err = log.try_clone()?;
 
-        // `--jinja` is REQUIRED: it enables the chat template that injects the
-        // tool definitions and parses the model's tool calls back into the
-        // OpenAI shape. Without it the model never sees the tools.
-        let child = Command::new(&cfg.bin)
-            .arg("-hf")
-            .arg(&cfg.model)
-            .arg("--jinja")
-            .arg("-c")
-            .arg(cfg.ctx.to_string())
-            .arg("--host")
-            .arg(&host)
-            .arg("--port")
-            .arg(port.to_string())
-            .args(&cfg.extra_args)
+        let (label, mut command) = match kind {
+            BackendKind::Infr => {
+                // `infr serve <model> --addr <ip:port>`. The model is a required
+                // positional (HF ref or .gguf); tuning is via `INFR_*` env vars.
+                let mut c = Command::new("infr");
+                c.arg("serve")
+                    .arg(&cfg.model)
+                    .arg("--addr")
+                    .arg(format!("{host}:{port}"));
+                ("infr serve", c)
+            }
+            BackendKind::Llama => {
+                // `--jinja` is REQUIRED: it enables the chat template that injects
+                // the tool definitions and parses the model's tool calls back
+                // into the OpenAI shape. Without it the model never sees tools.
+                let mut c = Command::new(&cfg.bin);
+                c.arg("-hf")
+                    .arg(&cfg.model)
+                    .arg("--jinja")
+                    .arg("-c")
+                    .arg(cfg.ctx.to_string())
+                    .arg("--host")
+                    .arg(&host)
+                    .arg("--port")
+                    .arg(port.to_string())
+                    .args(&cfg.extra_args);
+                ("llama-server", c)
+            }
+        };
+
+        eprintln!(
+            "hrdr: starting {label} ({}) on {host}:{port} — loading model, this can take a \
+             minute…\n      logs: {}",
+            cfg.model,
+            log_path.display(),
+        );
+
+        let child = command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!(
-                    "spawning `{}` — is llama.cpp installed? (use --no-backend to skip and point \
-                     --base-url at your own endpoint)",
-                    cfg.bin
-                )
-            })?;
+            .with_context(|| format!("spawning `{label}` — see {}", log_path.display()))?;
 
         if !wait_ready(&probe, Duration::from_secs(300)).await {
             bail!(
-                "llama-server did not become ready within 5 min — see {}",
+                "{label} did not become ready within 5 min — see {}",
                 log_path.display()
             );
         }
@@ -125,7 +166,8 @@ async fn wait_ready(client: &Client, timeout: Duration) -> bool {
 }
 
 /// Extract `(host, port)` from a base URL like `http://localhost:8080/v1`.
-/// `localhost` is normalised to `127.0.0.1` for the server bind address.
+/// `localhost` is normalised to `127.0.0.1` (infr's `--addr` needs a literal IP,
+/// and it's a valid bind address for llama.cpp too).
 fn parse_host_port(base_url: &str) -> Result<(String, u16)> {
     let after = base_url.split("://").nth(1).unwrap_or(base_url);
     let authority = after.split('/').next().unwrap_or(after);
@@ -141,7 +183,7 @@ fn parse_host_port(base_url: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-fn log_file() -> std::path::PathBuf {
+fn log_file(kind: BackendKind) -> std::path::PathBuf {
     let dir = std::env::var("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -150,5 +192,9 @@ fn log_file() -> std::path::PathBuf {
         })
         .join("hrdr");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("llama-server.log")
+    let name = match kind {
+        BackendKind::Infr => "infr-serve.log",
+        BackendKind::Llama => "llama-server.log",
+    };
+    dir.join(name)
 }

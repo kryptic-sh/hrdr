@@ -1092,6 +1092,7 @@ dependencies = [
  "hrdr-tui",
  "tokio",
  "tracing-subscriber",
+ "which",
 ]
 
 [[package]]

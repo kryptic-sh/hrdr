@@ -84,23 +84,23 @@ struct Cli {
     #[arg(long, global = true)]
     todo_ttl: Option<u64>,
 
-    /// Don't spawn a local llama-server; use the endpoint at --base-url.
+    /// Don't spawn a local backend; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
 
-    /// [temporary] Model ref (HF org/repo:quant or .gguf path) for the spawned backend.
+    /// Model ref (HF org/repo:quant or .gguf path) for the spawned backend.
     #[arg(long, global = true)]
     backend_model: Option<String>,
 
-    /// [temporary] llama-server binary to spawn (default: llama-server).
+    /// llama.cpp fallback binary to spawn when infr isn't on PATH (default: llama-server).
     #[arg(long, global = true)]
     backend_bin: Option<String>,
 
-    /// [temporary] Context window size for the spawned backend.
+    /// Context window size for the spawned backend (llama.cpp; display-only for infr).
     #[arg(long, global = true)]
     backend_ctx: Option<u32>,
 
-    /// [temporary] Extra arg passed verbatim to llama-server (repeatable), e.g. --backend-arg=-ngl --backend-arg=99.
+    /// Extra arg passed verbatim to the llama.cpp fallback (repeatable), e.g. --backend-arg=-ngl --backend-arg=99.
     #[arg(long = "backend-arg", global = true)]
     backend_args: Vec<String>,
 
@@ -216,8 +216,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    // TEMPORARY: bring up a local llama-server backend unless told not to. Remote
-    // providers never spawn one. Held for the command; dropping it kills the server.
+    // Bring up a local backend unless told not to — infr if it's on PATH, else
+    // a llama.cpp fallback. Remote providers never spawn one. Held for the
+    // command; dropping it kills the server.
     let _backend = if cli.no_backend || remote_provider {
         None
     } else {

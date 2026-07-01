@@ -11,8 +11,9 @@ OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
 > Active development. The agent loop, adaptive tool set, sessions, file
-> checkpoints, config hot-reload, and a rich TUI are in place; the main open
-> item is `infr`'s serve path (see the roadmap).
+> checkpoints, config hot-reload, and a rich TUI are in place. The default local
+> backend is now [`infr`](https://github.com/kryptic-sh/infr) (with a
+> `llama-server` fallback); see the roadmap for what's next.
 
 ## Design
 
@@ -98,24 +99,27 @@ Sessions auto-save per working directory and auto-resume on reopen. Project
 instructions are read from `AGENTS.md` (the open [agents.md](https://agents.md)
 standard) walking up from the cwd.
 
-### Backend (temporary)
+### Local backend
 
-By default hrdr **spawns a local `llama-server`** (llama.cpp, started with
-`--jinja` so tool calling works) and shuts it down on exit. This is a
-**stopgap** so the harness can be refined against a real tool-calling model — it
-will be removed once [`infr`](https://github.com/kryptic-sh/infr)'s serve path
-supports agentic tool use (today infr ignores the request's `tools` and only
-forwards the last user message). See `apps/hrdr/src/backend.rs`.
+By default hrdr **spawns a local backend** and shuts it down on exit. It's
+**presence-aware and infr-first**: if
+[`infr`](https://github.com/kryptic-sh/infr) is on `PATH` it's launched as
+`infr serve <model>` (native `tools`/`tool_calls`, SSE, GGUF Jinja chat
+template); otherwise it falls back to **`llama-server`** (llama.cpp, started
+with `--jinja` so tool calling works). If neither is installed, hrdr errors and
+points you at `--no-backend`. See `apps/hrdr/src/backend.rs`.
 
 ```bash
-hrdr                                   # spawns llama-server with the default model
-hrdr --backend-model unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M   # pick a model
-hrdr --backend-arg=-ngl --backend-arg=99                 # GPU offload passthrough
+hrdr                                   # spawns infr (or llama-server) with the default model
+hrdr --backend-model unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M   # pick a model (HF ref or .gguf path)
+hrdr --backend-arg=-ngl --backend-arg=99                 # GPU offload passthrough (llama.cpp fallback)
 hrdr --no-backend                      # use an endpoint you started yourself
 ```
 
 If a backend is already answering at `--base-url`, hrdr reuses it instead of
-spawning. Spawn logs go to `~/.cache/hrdr/llama-server.log`.
+spawning. Spawn logs go to `~/.cache/hrdr/infr-serve.log` (or
+`llama-server.log`). infr tuning (sampling, max tokens) is via `INFR_*` env
+vars; the same `--backend-model` ref works for both backends.
 
 ### Providers
 
@@ -199,7 +203,7 @@ these are on `PATH`. It detects what's available and adapts.
 | **git**                        | Repo awareness (branch in the status bar). In a git repo, file checkpoints auto-disable since git covers it. |
 | **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                           |
 | A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).           |
-| **llama.cpp** (`llama-server`) | Only for the built-in local backend; not needed with a remote provider.                                      |
+| **infr** or **llama.cpp**      | The managed local backend (infr preferred, `llama-server` fallback). Not needed with a remote provider.      |
 
 `SEARXNG_URL` (optional) points `web_search` at a SearXNG instance for more
 reliable results than the zero-config DuckDuckGo default.
@@ -231,8 +235,8 @@ The shell and search tools adapt to the host:
 - [x] File checkpoints + `/revert`; network retry + auto-compact on overflow
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
-- [x] Temporary managed `llama-server` backend
-- [ ] infr serve path with tool calling (replaces the temporary backend)
+- [x] Managed local backend — infr-first (native tool calls), `llama-server`
+      fallback
 - [x] hjkl deps via crates.io registry pins (standalone CI)
 - [ ] MCP client + LSP diagnostics feedback
 
