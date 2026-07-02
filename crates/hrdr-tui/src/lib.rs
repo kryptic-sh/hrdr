@@ -91,13 +91,14 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
-/// Launch the interactive TUI against the configured agent.
-pub async fn run(config: AgentConfig) -> Result<()> {
+/// Launch the interactive TUI against the configured agent, with `ui` holding
+/// the display knobs (theme, icons, vim mode, …) split out of the agent config.
+pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal: Tui = Terminal::new(backend)?;
 
-    let mut app = App::new(config)?;
+    let mut app = App::new(config, ui)?;
     tui::run_loop(&mut app, &mut terminal).await?;
     Ok(())
 }

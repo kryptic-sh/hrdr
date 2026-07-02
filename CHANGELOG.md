@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Display/frontend knobs moved out of the core agent crate into
+  `hrdr_app::UiConfig`: `vim` mode, `theme`, `icons`, `timestamps`, `statusbar`,
+  `bell`, `auto_resume`, `todo_ttl`, and `show_thinking` no longer live on
+  `hrdr_agent::AgentConfig` (which keeps only model/endpoint/loop knobs:
+  base*url, api_key, model, cwd, temperature, max_steps, provider(s),
+  context_window, effort, auto_compact, checkpoints). **No user-facing change**:
+  the config.toml keys,
+  `HRDR*\*`env vars, CLI flags, and precedence (CLI > env > file > default) are all unchanged — both layers read the same file leniently. The TUI entry point is now`hrdr_tui::run(config,
+  ui)`; config hot-reload re-reads both. `DEFAULT_TODO_TTL`moved to`hrdr-app`.
+
 - More frontend plumbing deduplicated into `hrdr-app`:
   - **Highlighting** — the syntect syntax set, theme (base16-ocean.dark), and
     panel background were set up byte-identically in the TUI and GUI; both now

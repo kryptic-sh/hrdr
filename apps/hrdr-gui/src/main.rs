@@ -156,11 +156,12 @@ fn main() -> anyhow::Result<()> {
     let _guard = rt.enter();
 
     let config = AgentConfig::load();
+    let ui = hrdr_app::UiConfig::load();
     let model = config.model.clone();
     let ctx_window = config.context_window;
-    let theme_path = config.theme.clone();
+    let theme_path = ui.theme.clone();
     let base_url = config.base_url.clone();
-    let show_thinking = config.show_thinking;
+    let show_thinking = ui.show_thinking;
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
     floem::launch(move || {

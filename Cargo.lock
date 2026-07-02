@@ -2110,6 +2110,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hrdr-agent",
+ "hrdr-app",
  "hrdr-llm",
  "hrdr-tools",
  "hrdr-tui",
@@ -2145,10 +2146,12 @@ dependencies = [
  "hjkl-xdg",
  "hrdr-agent",
  "ignore",
+ "serde",
  "serde_json",
  "syntect",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

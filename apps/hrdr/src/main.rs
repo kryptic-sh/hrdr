@@ -134,8 +134,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    // Precedence: CLI flag > env var > config file > built-in default.
+    // Precedence: CLI flag > env var > config file > built-in default. Display
+    // knobs live in UiConfig (hrdr-app); model/endpoint/loop knobs in
+    // AgentConfig (hrdr-agent) — both read the same config.toml + HRDR_* vars.
     let mut config = AgentConfig::load();
+    let mut ui = hrdr_app::UiConfig::load();
 
     // Apply a provider preset (CLI > config/env) before explicit CLI overrides.
     // Custom `[providers.<name>]` from config shadow the built-ins.
@@ -181,10 +184,10 @@ async fn main() -> Result<()> {
         config.model = m;
     }
     if cli.vim {
-        config.vim_mode = true;
+        ui.vim_mode = true;
     }
     if let Some(t) = cli.theme {
-        config.theme = Some(t);
+        ui.theme = Some(t);
     }
     if let Some(e) = cli.effort {
         config.effort = Some(e);
@@ -193,32 +196,32 @@ async fn main() -> Result<()> {
         config.auto_compact = r;
     }
     if cli.no_auto_resume {
-        config.auto_resume = false;
+        ui.auto_resume = false;
     }
     if cli.no_bell {
-        config.bell = false;
+        ui.bell = false;
     }
     if let Some(i) = cli.icons {
-        config.icons = Some(i);
+        ui.icons = Some(i);
     }
     if let Some(t) = cli.timestamps {
-        config.timestamps = Some(t);
+        ui.timestamps = Some(t);
     }
     if let Some(s) = cli.statusbar {
-        config.statusbar = Some(s);
+        ui.statusbar = Some(s);
     }
     if let Some(c) = cli.checkpoints {
         config.checkpoints = Some(c);
     }
     if let Some(n) = cli.todo_ttl {
-        config.todo_ttl = n;
+        ui.todo_ttl = n;
     }
     if let Some(v) = cli
         .show_thinking
         .as_deref()
         .and_then(hrdr_agent::parse_env_bool)
     {
-        config.show_thinking = v;
+        ui.show_thinking = v;
     }
 
     if remote_provider && config.model == "default" {
@@ -266,7 +269,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Run { prompt }) => run_headless(config, prompt.join(" ")).await,
         Some(Command::Models) => list_models(config).await,
-        None => hrdr_tui::run(config).await,
+        None => hrdr_tui::run(config, ui).await,
     }
 }
 

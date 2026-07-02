@@ -69,14 +69,9 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
     pub max_steps: usize,
-    /// Input discipline for the TUI: `true` = vim (hjkl), `false` = plain
-    /// claude-style input (default).
-    pub vim_mode: bool,
     /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
-    /// Path to an hjkl theme TOML for the TUI; `None` uses the bundled default.
-    pub theme: Option<String>,
     /// Model context window in tokens, for the status bar's "X of Y" display.
     /// Derived from the spawned backend when local; set in config for remotes.
     pub context_window: Option<u32>,
@@ -86,30 +81,9 @@ pub struct AgentConfig {
     /// `0` (or any value outside that range) disables it. Default
     /// [`DEFAULT_AUTO_COMPACT`].
     pub auto_compact: f64,
-    /// On TUI startup, resume the most recent session for the cwd. Default `true`.
-    pub auto_resume: bool,
-    /// Ring the terminal bell when a turn finishes (after a short minimum
-    /// duration, so quick turns stay quiet). Default `true`.
-    pub bell: bool,
-    /// Icon set for the TUI: `nerd` (default), `unicode`, or `ascii`. `None`
-    /// resolves to nerd (there's no portable way to probe the terminal font).
-    pub icons: Option<String>,
-    /// Per-message timestamp style: `none`, `relative` (e.g. `2m ago`), or
-    /// `exact` (`HH:MM`). `None` resolves to `relative` (the default).
-    pub timestamps: Option<String>,
-    /// Status-bar mode: `none` (hidden), `truncate` (drop sections to fit), or
-    /// `wrap` (use multiple rows). `None` resolves to `truncate` (the default).
-    pub statusbar: Option<String>,
     /// File checkpointing: `on`, `off`, or `auto` (default) — `auto` enables it
     /// only outside a git repo (git already provides revert).
     pub checkpoints: Option<String>,
-    /// How many turns a completed TODO item stays visible before it's pruned
-    /// from the panel. Default [`DEFAULT_TODO_TTL`].
-    pub todo_ttl: u64,
-    /// Show the model's `<think>` reasoning blocks. Default `true`. Toggled at
-    /// runtime by `/thinking` (aka `/reasoning`); set via `show_thinking` in
-    /// config, `--show-thinking`, or `$HRDR_SHOW_THINKING`.
-    pub show_thinking: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -117,10 +91,6 @@ pub struct AgentConfig {
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
-
-/// Default lifetime (in turns) a completed TODO item stays visible before it's
-/// pruned: the turn it finishes plus four more.
-pub const DEFAULT_TODO_TTL: u64 = 5;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -131,20 +101,11 @@ impl Default for AgentConfig {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 50,
-            vim_mode: false,
             provider: None,
-            theme: None,
             context_window: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
-            auto_resume: true,
-            bell: true,
-            icons: None,
-            timestamps: None,
-            statusbar: None,
             checkpoints: None,
-            todo_ttl: DEFAULT_TODO_TTL,
-            show_thinking: true,
             providers: HashMap::new(),
         }
     }
@@ -240,20 +201,11 @@ struct FileConfig {
     api_key: Option<String>,
     model: Option<String>,
     temperature: Option<f32>,
-    vim: Option<bool>,
     provider: Option<String>,
-    theme: Option<String>,
     context_window: Option<u32>,
     effort: Option<String>,
     auto_compact: Option<f64>,
-    auto_resume: Option<bool>,
-    bell: Option<bool>,
-    icons: Option<String>,
-    timestamps: Option<String>,
-    statusbar: Option<String>,
     checkpoints: Option<String>,
-    todo_ttl: Option<u64>,
-    show_thinking: Option<bool>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -315,14 +267,8 @@ impl AgentConfig {
         if let Some(v) = fc.temperature {
             self.temperature = Some(v);
         }
-        if let Some(v) = fc.vim {
-            self.vim_mode = v;
-        }
         if let Some(v) = fc.provider {
             self.provider = Some(v);
-        }
-        if let Some(v) = fc.theme {
-            self.theme = Some(v);
         }
         if let Some(v) = fc.context_window {
             self.context_window = Some(v);
@@ -333,29 +279,8 @@ impl AgentConfig {
         if let Some(v) = fc.auto_compact {
             self.auto_compact = v;
         }
-        if let Some(v) = fc.auto_resume {
-            self.auto_resume = v;
-        }
-        if let Some(v) = fc.bell {
-            self.bell = v;
-        }
-        if let Some(v) = fc.icons {
-            self.icons = Some(v);
-        }
-        if let Some(v) = fc.timestamps {
-            self.timestamps = Some(v);
-        }
-        if let Some(v) = fc.statusbar {
-            self.statusbar = Some(v);
-        }
         if let Some(v) = fc.checkpoints {
             self.checkpoints = Some(v);
-        }
-        if let Some(v) = fc.todo_ttl {
-            self.todo_ttl = v;
-        }
-        if let Some(v) = fc.show_thinking {
-            self.show_thinking = v;
         }
         if !fc.providers.is_empty() {
             self.providers = fc.providers;
@@ -408,36 +333,12 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// need parsing (numbers, bools) silently keep the current value on a bad parse.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_PROVIDER", |c, v| c.provider = Some(v)),
-    ("HRDR_THEME", |c, v| c.theme = Some(v)),
     ("HRDR_BASE_URL", |c, v| c.base_url = v),
     ("HRDR_MODEL", |c, v| c.model = v),
-    ("HRDR_ICONS", |c, v| c.icons = Some(v)),
-    ("HRDR_TIMESTAMPS", |c, v| c.timestamps = Some(v)),
-    ("HRDR_STATUSBAR", |c, v| c.statusbar = Some(v)),
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Ok(f) = v.parse() {
             c.auto_compact = f;
-        }
-    }),
-    ("HRDR_AUTO_RESUME", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.auto_resume = b;
-        }
-    }),
-    ("HRDR_BELL", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.bell = b;
-        }
-    }),
-    ("HRDR_TODO_TTL", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.todo_ttl = n;
-        }
-    }),
-    ("HRDR_SHOW_THINKING", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.show_thinking = b;
         }
     }),
 ];
@@ -1315,12 +1216,8 @@ mod tests {
         // pointer directly, without touching process environment.
         let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[
             ("HRDR_PROVIDER", |c| c.provider.as_deref().unwrap_or("")),
-            ("HRDR_THEME", |c| c.theme.as_deref().unwrap_or("")),
             ("HRDR_BASE_URL", |c| &c.base_url),
             ("HRDR_MODEL", |c| &c.model),
-            ("HRDR_ICONS", |c| c.icons.as_deref().unwrap_or("")),
-            ("HRDR_TIMESTAMPS", |c| c.timestamps.as_deref().unwrap_or("")),
-            ("HRDR_STATUSBAR", |c| c.statusbar.as_deref().unwrap_or("")),
             ("HRDR_CHECKPOINTS", |c| {
                 c.checkpoints.as_deref().unwrap_or("")
             }),
@@ -1334,24 +1231,14 @@ mod tests {
     }
 
     #[test]
-    fn env_setter_bool_ignores_bad_value() {
-        // HRDR_BELL with an unrecognized value must leave `bell` unchanged.
-        let setter = find_setter("HRDR_BELL");
-        let mut cfg = AgentConfig::default();
-        let original = cfg.bell;
-        setter(&mut cfg, "maybe".to_string());
-        assert_eq!(cfg.bell, original, "bad bool value should be ignored");
-    }
-
-    #[test]
     fn env_setter_numeric_ignores_bad_value() {
-        // HRDR_TODO_TTL with a non-numeric string must leave `todo_ttl` unchanged.
-        let setter = find_setter("HRDR_TODO_TTL");
+        // HRDR_AUTO_COMPACT with a non-numeric string must leave the value.
+        let setter = find_setter("HRDR_AUTO_COMPACT");
         let mut cfg = AgentConfig::default();
-        let original = cfg.todo_ttl;
+        let original = cfg.auto_compact;
         setter(&mut cfg, "notanumber".to_string());
-        assert_eq!(
-            cfg.todo_ttl, original,
+        assert!(
+            (cfg.auto_compact - original).abs() < f64::EPSILON,
             "bad numeric value should be ignored"
         );
     }
@@ -1374,40 +1261,22 @@ mod tests {
             api_key: Some("key123".to_string()),
             model: Some("gpt-4".to_string()),
             temperature: Some(0.5),
-            vim: Some(true),
             provider: Some("zen".to_string()),
-            theme: Some("dark".to_string()),
             context_window: Some(8192),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
-            auto_resume: Some(false),
-            bell: Some(false),
-            icons: Some("ascii".to_string()),
-            timestamps: Some("exact".to_string()),
-            statusbar: Some("wrap".to_string()),
             checkpoints: Some("on".to_string()),
-            todo_ttl: Some(10),
-            show_thinking: Some(false),
             providers: HashMap::new(),
         });
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
         assert_eq!(cfg.model, "gpt-4");
         assert_eq!(cfg.temperature, Some(0.5));
-        assert!(cfg.vim_mode);
         assert_eq!(cfg.provider.as_deref(), Some("zen"));
-        assert_eq!(cfg.theme.as_deref(), Some("dark"));
         assert_eq!(cfg.context_window, Some(8192));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
-        assert!(!cfg.auto_resume);
-        assert!(!cfg.bell);
-        assert_eq!(cfg.icons.as_deref(), Some("ascii"));
-        assert_eq!(cfg.timestamps.as_deref(), Some("exact"));
-        assert_eq!(cfg.statusbar.as_deref(), Some("wrap"));
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
-        assert_eq!(cfg.todo_ttl, 10);
-        assert!(!cfg.show_thinking);
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

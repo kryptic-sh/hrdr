@@ -201,23 +201,23 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(config: AgentConfig) -> Result<Self> {
+    pub(crate) fn new(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<Self> {
         let model = config.model.clone();
-        let vim_mode = config.vim_mode;
-        let theme = Theme::load(config.theme.as_deref());
+        let vim_mode = ui.vim_mode;
+        let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
         let auto_compact = config.auto_compact;
-        let auto_resume = config.auto_resume;
-        let bell = config.bell;
-        let todo_ttl = config.todo_ttl;
-        let show_thinking = config.show_thinking;
-        let timestamp_style = TimestampStyle::from_config(config.timestamps.as_deref());
-        let statusbar_mode = StatusBarMode::from_config(config.statusbar.as_deref());
+        let auto_resume = ui.auto_resume;
+        let bell = ui.bell;
+        let todo_ttl = ui.todo_ttl;
+        let show_thinking = ui.show_thinking;
+        let timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
+        let statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
-        let icon_mode = config
+        let icon_mode = ui
             .icons
             .as_deref()
             .and_then(hjkl_icons::IconMode::from_config)
@@ -645,18 +645,18 @@ impl App {
         self.file_index_cwd = None; // force a rebuild for the new directory
     }
 
-    /// Apply the live-changeable settings from a config. Does NOT touch the
-    /// model/provider/endpoint (those are session-scoped).
-    fn apply_runtime_config(&mut self, cfg: &AgentConfig) {
-        self.theme = Theme::load(cfg.theme.as_deref());
+    /// Apply the live-changeable settings from a (config, ui-config) pair. Does
+    /// NOT touch the model/provider/endpoint (those are session-scoped).
+    fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
+        self.theme = Theme::load(ui.theme.as_deref());
         self.effort = cfg.effort.clone();
         self.auto_compact_ratio = cfg.auto_compact;
-        self.bell = cfg.bell;
-        self.todo_ttl = cfg.todo_ttl;
-        self.timestamp_style = TimestampStyle::from_config(cfg.timestamps.as_deref());
-        self.statusbar_mode = StatusBarMode::from_config(cfg.statusbar.as_deref());
-        self.show_reasoning = cfg.show_thinking;
-        self.icon_mode = cfg
+        self.bell = ui.bell;
+        self.todo_ttl = ui.todo_ttl;
+        self.timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
+        self.statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
+        self.show_reasoning = ui.show_thinking;
+        self.icon_mode = ui
             .icons
             .as_deref()
             .and_then(hjkl_icons::IconMode::from_config)
@@ -671,7 +671,7 @@ impl App {
     fn apply_config_reload(&mut self, manual: bool) {
         match AgentConfig::load_checked() {
             Ok(cfg) => {
-                self.apply_runtime_config(&cfg);
+                self.apply_runtime_config(&cfg, &hrdr_app::UiConfig::load());
                 self.cfg = cfg;
                 self.system(if manual {
                     "reloaded config (theme, icons, effort, toggles)"
@@ -1094,10 +1094,10 @@ mod e2e;
 
 #[cfg(test)]
 mod tests {
-    /// The TUI's TODO-panel default lifetime must track the agent's config
+    /// The TUI's TODO-panel default lifetime must track the shared UI-config
     /// default (the aging logic itself is tested in `hrdr-app`).
     #[test]
     fn ttl_matches_config_default() {
-        assert_eq!(5, hrdr_agent::DEFAULT_TODO_TTL);
+        assert_eq!(5, hrdr_app::DEFAULT_TODO_TTL);
     }
 }

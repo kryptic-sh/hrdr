@@ -13,8 +13,10 @@ hjkl-theme.workspace = true
 hjkl-xdg.workspace = true
 ignore.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
+toml.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

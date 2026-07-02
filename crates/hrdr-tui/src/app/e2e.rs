@@ -271,11 +271,14 @@ impl Harness {
             model: "test-model".to_string(),
             cwd: tmp.path().to_path_buf(),
             checkpoints: Some("off".to_string()),
-            auto_resume: false,
             context_window: Some(1000),
             ..Default::default()
         };
-        let mut app = App::new(config).unwrap();
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false, // never pick up the developer's real sessions
+            ..Default::default()
+        };
+        let mut app = App::new(config, ui).unwrap();
         let rx = app.rx.take().expect("fresh app has its receiver");
         Self {
             app,
