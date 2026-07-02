@@ -31,6 +31,87 @@ pub enum StatusRole {
     Ttft,
 }
 
+/// Theme slot a semantic role colors from. Both frontends' themes expose
+/// these eight colors (under their own field names); mapping slot → concrete
+/// color is the only per-frontend piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSlot {
+    User,
+    Assistant,
+    Dim,
+    Warn,
+    Success,
+    Error,
+    Accent,
+    Accent2,
+}
+
+/// Renderer-agnostic style spec: which theme slots to paint with. `fg: None`
+/// means inverted text (black) over `bg` — used by the context-gauge fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleStyle {
+    pub fg: Option<ThemeSlot>,
+    pub bg: Option<ThemeSlot>,
+    pub bold: bool,
+}
+
+impl RoleStyle {
+    const fn fg(slot: ThemeSlot) -> Self {
+        Self {
+            fg: Some(slot),
+            bg: None,
+            bold: false,
+        }
+    }
+}
+
+/// The one place the status-bar color semantics live — frontends resolve the
+/// returned slots against their theme instead of re-deciding role → color.
+pub fn status_role_style(role: StatusRole) -> RoleStyle {
+    match role {
+        StatusRole::Dir => RoleStyle::fg(ThemeSlot::User),
+        StatusRole::Branch => RoleStyle::fg(ThemeSlot::Success),
+        StatusRole::TokensIn => RoleStyle::fg(ThemeSlot::Accent),
+        StatusRole::TokensOut => RoleStyle::fg(ThemeSlot::Accent2),
+        StatusRole::CtxFill(level) => RoleStyle {
+            fg: None,
+            bg: Some(ctx_level_slot(level)),
+            bold: true,
+        },
+        StatusRole::CtxRest => RoleStyle {
+            fg: Some(ThemeSlot::Assistant),
+            bg: Some(ThemeSlot::Dim),
+            bold: false,
+        },
+        StatusRole::CtxPlain => RoleStyle::fg(ThemeSlot::Warn),
+        StatusRole::Model => RoleStyle::fg(ThemeSlot::Assistant),
+        StatusRole::Effort => RoleStyle::fg(ThemeSlot::Warn),
+        StatusRole::Ttft => RoleStyle::fg(ThemeSlot::Dim),
+    }
+}
+
+/// The gauge-fill color slot for a context-usage level (also used by the
+/// GUI's real progress-bar gauge).
+pub fn ctx_level_slot(level: CtxLevel) -> ThemeSlot {
+    match level {
+        CtxLevel::Ok => ThemeSlot::Success,
+        CtxLevel::Warn => ThemeSlot::Warn,
+        CtxLevel::Critical => ThemeSlot::Error,
+    }
+}
+
+/// Diff-line coloring semantics (additions green, deletions red, hunk headers
+/// in the user accent, file headers/context dim) — shared with
+/// [`crate::classify_diff_line`].
+pub fn diff_kind_slot(kind: crate::DiffLineKind) -> ThemeSlot {
+    match kind {
+        crate::DiffLineKind::Hunk => ThemeSlot::User,
+        crate::DiffLineKind::Add => ThemeSlot::Success,
+        crate::DiffLineKind::Remove => ThemeSlot::Error,
+        crate::DiffLineKind::Meta => ThemeSlot::Dim,
+    }
+}
+
 /// How full the context window is, for the gauge's fill color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CtxLevel {

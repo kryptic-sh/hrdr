@@ -352,12 +352,10 @@ pub fn diff_view(diff: &str, th: GuiTheme) -> AnyView {
     let mut s = String::new();
     let mut attrs = AttrsList::new(base);
     for line in diff.lines() {
-        let color = match hrdr_app::classify_diff_line(line) {
-            hrdr_app::DiffLineKind::Hunk => th.user,
-            hrdr_app::DiffLineKind::Add => th.ok,
-            hrdr_app::DiffLineKind::Remove => th.err,
-            hrdr_app::DiffLineKind::Meta => th.dim,
-        };
+        let color = crate::slot_color(
+            hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
+            th,
+        );
         let start = s.len();
         s.push_str(line);
         s.push('\n');

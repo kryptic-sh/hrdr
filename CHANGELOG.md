@@ -44,6 +44,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/goto end` now means the same thing in both: follow the very bottom of the
   transcript (the GUI used to stop at the last user/assistant message).
 
+- **Shared color semantics (`hrdr_app::ThemeSlot`).** The status-bar role →
+  color decisions (`status_role_style`), the diff-line coloring
+  (`diff_kind_slot`), and the context-gauge level color (`ctx_level_slot`) are
+  now single shared tables; each frontend keeps only one eight-line
+  slot-to-theme-color map, so the two UIs can't drift on what a role looks like.
+
 ### Fixed
 
 - **GUI:** a stale `Done` message from a just-cancelled turn no longer clobbers

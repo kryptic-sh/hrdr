@@ -476,31 +476,36 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
         .collect()
 }
 
-/// Terminal style for a shared status color role.
-fn status_role_style(role: hrdr_app::StatusRole, t: &Theme) -> Style {
-    use hrdr_app::{CtxLevel, StatusRole};
-    match role {
-        StatusRole::Dir => Style::default().fg(t.user),
-        StatusRole::Branch => Style::default().fg(t.success),
-        StatusRole::TokensIn => Style::default().fg(t.accent),
-        StatusRole::TokensOut => Style::default().fg(t.accent2),
-        StatusRole::CtxFill(level) => {
-            let bg = match level {
-                CtxLevel::Ok => t.success,
-                CtxLevel::Warn => t.warn,
-                CtxLevel::Critical => t.error,
-            };
-            Style::default()
-                .fg(Color::Black)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD)
-        }
-        StatusRole::CtxRest => Style::default().fg(t.assistant).bg(t.dim),
-        StatusRole::CtxPlain => Style::default().fg(t.warn),
-        StatusRole::Model => Style::default().fg(t.assistant),
-        StatusRole::Effort => Style::default().fg(t.warn),
-        StatusRole::Ttft => Style::default().fg(t.dim),
+/// Resolve a shared theme slot to this theme's concrete color.
+fn slot_color(slot: hrdr_app::ThemeSlot, t: &Theme) -> Color {
+    use hrdr_app::ThemeSlot;
+    match slot {
+        ThemeSlot::User => t.user,
+        ThemeSlot::Assistant => t.assistant,
+        ThemeSlot::Dim => t.dim,
+        ThemeSlot::Warn => t.warn,
+        ThemeSlot::Success => t.success,
+        ThemeSlot::Error => t.error,
+        ThemeSlot::Accent => t.accent,
+        ThemeSlot::Accent2 => t.accent2,
     }
+}
+
+/// Terminal style for a shared status color role (semantics live in
+/// [`hrdr_app::status_role_style`]; only slot → color is local).
+fn status_role_style(role: hrdr_app::StatusRole, t: &Theme) -> Style {
+    let spec = hrdr_app::status_role_style(role);
+    let mut style = Style::default().fg(match spec.fg {
+        Some(slot) => slot_color(slot, t),
+        None => Color::Black, // inverted text over the bg slot
+    });
+    if let Some(bg) = spec.bg {
+        style = style.bg(slot_color(bg, t));
+    }
+    if spec.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
 }
 
 /// Separator width: " │ ".
@@ -1028,11 +1033,9 @@ fn push_tool(
 /// Color for one unified-diff line: additions green, deletions red, hunk
 /// headers in the accent color, file headers and context dim.
 fn diff_line_color(line: &str, theme: &Theme) -> Color {
-    // Shared classification (same mapping in the GUI).
-    match hrdr_app::classify_diff_line(line) {
-        hrdr_app::DiffLineKind::Hunk => theme.user,
-        hrdr_app::DiffLineKind::Add => theme.success,
-        hrdr_app::DiffLineKind::Remove => theme.error,
-        hrdr_app::DiffLineKind::Meta => theme.dim,
-    }
+    // Shared classification + color semantics (same mapping in the GUI).
+    slot_color(
+        hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
+        theme,
+    )
 }

@@ -2130,11 +2130,7 @@ fn apply_ui_config(
 /// layer whose width is the used fraction, and the shared label on top.
 fn ctx_gauge_view(gauge: hrdr_app::CtxGauge, th: GuiTheme) -> AnyView {
     use floem::views::{empty, stack};
-    let fill_color = match gauge.level {
-        hrdr_app::CtxLevel::Ok => th.ok,
-        hrdr_app::CtxLevel::Warn => th.tool,
-        hrdr_app::CtxLevel::Critical => th.err,
-    };
+    let fill_color = slot_color(hrdr_app::ctx_level_slot(gauge.level), th);
     let frac = gauge.frac.clamp(0.0, 1.0) * 100.0;
     let label_text = gauge.label.trim().to_string();
     stack((
@@ -2155,31 +2151,38 @@ fn ctx_gauge_view(gauge: hrdr_app::CtxGauge, th: GuiTheme) -> AnyView {
     .into_any()
 }
 
-/// Map a shared status color role onto the GUI theme (mirrors the TUI's
-/// `status_role_style`).
+/// Resolve a shared theme slot to this theme's concrete color.
+fn slot_color(slot: hrdr_app::ThemeSlot, th: GuiTheme) -> Color {
+    use hrdr_app::ThemeSlot;
+    match slot {
+        ThemeSlot::User => th.user,
+        ThemeSlot::Assistant => th.assistant,
+        ThemeSlot::Dim => th.dim,
+        ThemeSlot::Warn => th.tool,
+        ThemeSlot::Success => th.ok,
+        ThemeSlot::Error => th.err,
+        ThemeSlot::Accent => th.accent,
+        ThemeSlot::Accent2 => th.accent2,
+    }
+}
+
+/// Map a shared status color role onto the GUI theme (semantics live in
+/// [`hrdr_app::status_role_style`]; only slot → color is local).
 fn status_run_style(
     s: floem::style::Style,
     role: hrdr_app::StatusRole,
     th: GuiTheme,
 ) -> floem::style::Style {
-    use hrdr_app::{CtxLevel, StatusRole};
-    match role {
-        StatusRole::Dir => s.color(th.user),
-        StatusRole::Branch => s.color(th.ok),
-        StatusRole::TokensIn => s.color(th.accent),
-        StatusRole::TokensOut => s.color(th.accent2),
-        StatusRole::CtxFill(level) => {
-            let bg = match level {
-                CtxLevel::Ok => th.ok,
-                CtxLevel::Warn => th.tool,
-                CtxLevel::Critical => th.err,
-            };
-            s.color(Color::BLACK).background(bg).font_bold()
-        }
-        StatusRole::CtxRest => s.color(th.assistant).background(th.dim),
-        StatusRole::CtxPlain => s.color(th.tool),
-        StatusRole::Model => s.color(th.assistant),
-        StatusRole::Effort => s.color(th.tool),
-        StatusRole::Ttft => s.color(th.dim),
+    let spec = hrdr_app::status_role_style(role);
+    let mut s = s.color(match spec.fg {
+        Some(slot) => slot_color(slot, th),
+        None => Color::BLACK, // inverted text over the bg slot
+    });
+    if let Some(bg) = spec.bg {
+        s = s.background(slot_color(bg, th));
     }
+    if spec.bold {
+        s = s.font_bold();
+    }
+    s
 }
