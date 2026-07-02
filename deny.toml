@@ -21,6 +21,7 @@ ignore = [
   # theme/syntax dumps; Wayland protocol codegen at build time), not
   # attacker-controlled. Re-check when plist/wayland-scanner bump.
   { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS needs untrusted XML; ours parses trusted bundled data; no upgrade path yet" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader DoS — same crate/preconditions/patch range as RUSTSEC-2026-0194" },
 ]
 
 [licenses]
