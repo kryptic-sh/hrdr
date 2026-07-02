@@ -176,6 +176,17 @@ pub trait CommandHost {
         let _ = turns;
     }
 
+    /// Apply a theme (a path to an hjkl theme TOML; `None` = the bundled
+    /// default). Persistence is dispatch's job.
+    fn set_theme(&mut self, path: Option<String>) {
+        let _ = path;
+    }
+    /// Remove one setting from the user config file (`/theme` reset). Default
+    /// writes directly; the TUI overrides to suppress its hot-reload.
+    fn unpersist_setting(&mut self, key: &str) {
+        let _ = hrdr_agent::remove_setting(key);
+    }
+
     /// Open `path` in an editor (`/edit`). The default launches the OS default
     /// handler (`xdg-open` / `open` / `start`) — right for GUI frontends; the
     /// TUI overrides to suspend the terminal and run `$EDITOR` instead.
@@ -674,6 +685,20 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 }
                 Err(_) => {
                     host.info("usage: /todo-ttl <turns> (a whole number, e.g. 5)".to_string())
+                }
+            }
+        }
+        "theme" => {
+            let path = (!arg.is_empty()).then(|| arg.clone());
+            host.set_theme(path.clone());
+            match path {
+                Some(p) => {
+                    host.persist_setting("theme", hrdr_agent::ConfigValue::Str(&p));
+                    host.info(format!("theme → {p}"));
+                }
+                None => {
+                    host.unpersist_setting("theme");
+                    host.info("theme reset to default".to_string());
                 }
             }
         }

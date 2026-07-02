@@ -193,7 +193,11 @@ fn app_view(
     cfg: Rc<AgentConfig>,
     ui: hrdr_app::UiConfig,
 ) -> impl IntoView {
-    let theme = GuiTheme::load(ui.theme.as_deref());
+    // Theme as a signal so `/theme` can live-swap it; the revision counter is
+    // baked into the dyn_stack keys below so cached children (whose colors are
+    // captured at build time) rebuild on a swap.
+    let theme_sig: RwSignal<GuiTheme> = create_rw_signal(GuiTheme::load(ui.theme.as_deref()));
+    let theme_rev: RwSignal<u64> = create_rw_signal(0);
     let show_thinking = ui.show_thinking;
     // Persistent scope for dynamically-created per-message signals, so they
     // outlive the effect that creates them.
@@ -562,6 +566,8 @@ fn app_view(
                 turn_start,
                 ttft,
                 show_reasoning,
+                theme: theme_sig,
+                theme_rev,
                 timestamp_style,
                 statusbar_mode,
                 dir: dir_sig,
@@ -654,10 +660,22 @@ fn app_view(
     let ids_for_render = msg_view_ids.clone();
     let transcript_view = scroll(
         dyn_stack(
-            move || transcript.get(),
-            |item: &Item| item.id,
-            move |item| {
-                let view = render_item(item.clone(), theme, show_reasoning, timestamp_style);
+            move || {
+                let rev = theme_rev.get();
+                transcript
+                    .get()
+                    .into_iter()
+                    .map(move |i| (rev, i))
+                    .collect::<Vec<_>>()
+            },
+            |(rev, item): &(u64, Item)| (*rev, item.id),
+            move |(_, item)| {
+                let view = render_item(
+                    item.clone(),
+                    theme_sig.get_untracked(),
+                    show_reasoning,
+                    timestamp_style,
+                );
                 // Register user/assistant views so /goto //find can scroll to
                 // them (re-registered whenever the item re-renders).
                 if let Some(n) = item.msg_no {
@@ -675,13 +693,21 @@ fn app_view(
     // TODO panel (mirrors the TUI's): the model's task list, shown while
     // non-empty; completed items age out via todo_ttl.
     let todo_panel = dyn_stack(
-        move || todos_sig.get(),
-        |t: &hrdr_tools::TodoItem| format!("{}:{}", t.status, t.content),
-        move |t| {
+        move || {
+            let rev = theme_rev.get();
+            todos_sig
+                .get()
+                .into_iter()
+                .map(move |t| (rev, t))
+                .collect::<Vec<_>>()
+        },
+        |(rev, t): &(u64, hrdr_tools::TodoItem)| format!("{rev}:{}:{}", t.status, t.content),
+        move |(_, t)| {
+            let th = theme_sig.get_untracked();
             let (glyph, color) = match t.status.as_str() {
-                "completed" => ("✓", theme.ok),
-                "in_progress" => ("▸", theme.tool),
-                _ => ("·", theme.dim),
+                "completed" => ("✓", th.ok),
+                "in_progress" => ("▸", th.tool),
+                _ => ("·", th.dim),
             };
             let content = t.content.clone();
             label(move || format!("{glyph} {content}"))
@@ -776,8 +802,9 @@ fn app_view(
     };
     let completions = dyn_stack(comp_rows, CompRow::key, move |row| match row {
         CompRow::Slash { name, desc } => h_stack((
-            label(move || name.to_string()).style(move |s| s.color(theme.user).font_bold()),
-            label(move || desc.to_string()).style(move |s| s.color(theme.dim)),
+            label(move || name.to_string())
+                .style(move |s| s.color(theme_sig.get().user).font_bold()),
+            label(move || desc.to_string()).style(move |s| s.color(theme_sig.get().dim)),
         ))
         .style(|s| s.gap(8.0).padding_horiz(10.0).padding_vert(2.0))
         .on_click_stop(move |_| input.set(format!("{name} ")))
@@ -786,7 +813,11 @@ fn app_view(
             let path = path.clone();
             move || path.clone()
         })
-        .style(move |s| s.color(theme.user).padding_horiz(10.0).padding_vert(2.0))
+        .style(move |s| {
+            s.color(theme_sig.get().user)
+                .padding_horiz(10.0)
+                .padding_vert(2.0)
+        })
         .on_click_stop(move |_| {
             // Replace the partial `@…` token with `@<path> `.
             let inp = input.get_untracked();
@@ -801,7 +832,7 @@ fn app_view(
             .width_full()
             .max_height(160.0)
             .padding_vert(4.0)
-            .background(theme.bg);
+            .background(theme_sig.get().bg);
         // Collapse entirely when there's nothing to show.
         let inp = input.get();
         if inp.starts_with('/') || hrdr_app::active_file_token(&inp).is_some() {
@@ -839,17 +870,24 @@ fn app_view(
         .collect()
     };
     let status_row = dyn_stack(
-        status_segs,
-        |(i, seg): &(usize, hrdr_app::StatusSeg)| {
-            let text: String = seg.runs.iter().map(|r| r.text.as_str()).collect();
-            format!("{i}:{text}")
+        move || {
+            let rev = theme_rev.get();
+            status_segs()
+                .into_iter()
+                .map(move |(i, s)| (rev, i, s))
+                .collect::<Vec<_>>()
         },
-        move |(i, seg)| {
+        |(rev, i, seg): &(u64, usize, hrdr_app::StatusSeg)| {
+            let text: String = seg.runs.iter().map(|r| r.text.as_str()).collect();
+            format!("{rev}:{i}:{text}")
+        },
+        move |(_, i, seg)| {
+            let th = theme_sig.get_untracked();
             let mut children: Vec<AnyView> = Vec::new();
             if i > 0 {
                 children.push(
                     label(|| "│")
-                        .style(move |s| s.color(theme.dim).margin_horiz(6.0))
+                        .style(move |s| s.color(th.dim).margin_horiz(6.0))
                         .into_any(),
                 );
             }
@@ -857,14 +895,14 @@ fn app_view(
                 // The context gauge as a real progress container: a fill layer
                 // sized by the fraction behind the label (instead of the
                 // character-cell split the TUI's text runs use).
-                children.push(ctx_gauge_view(gauge, theme));
+                children.push(ctx_gauge_view(gauge, th));
             } else {
                 for run in seg.runs {
                     let text = run.text.clone();
                     let role = run.role;
                     children.push(
                         label(move || text.clone())
-                            .style(move |s| status_run_style(s, role, theme))
+                            .style(move |s| status_run_style(s, role, th))
                             .into_any(),
                     );
                 }
@@ -886,7 +924,7 @@ fn app_view(
         status_row,
         label(|| "● thinking…").style(move |s| {
             if running.get() {
-                s.color(theme.tool)
+                s.color(theme_sig.get().tool)
             } else {
                 s.hide()
             }
@@ -916,8 +954,8 @@ fn app_view(
     .style(move |s| {
         s.width_full()
             .height_full()
-            .background(theme.bg)
-            .color(theme.assistant)
+            .background(theme_sig.get().bg)
+            .color(theme_sig.get().assistant)
     })
 }
 
@@ -1257,6 +1295,8 @@ struct GuiHost {
     turn_start: RwSignal<Option<Instant>>,
     ttft: RwSignal<Option<f64>>,
     show_reasoning: RwSignal<bool>,
+    theme: RwSignal<GuiTheme>,
+    theme_rev: RwSignal<u64>,
     timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
     statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
     dir: RwSignal<String>,
@@ -1575,6 +1615,12 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn set_statusbar_mode(&mut self, mode: hrdr_app::StatusBarMode) {
         self.statusbar_mode.set(mode);
+    }
+    fn set_theme(&mut self, path: Option<String>) {
+        self.theme.set(GuiTheme::load(path.as_deref()));
+        // Rebuild cached dyn_stack children (their colors are captured at
+        // build time — the revision is part of their keys).
+        self.theme_rev.update(|r| *r += 1);
     }
     fn set_timestamp_style(&mut self, style: hrdr_app::TimestampStyle) {
         self.timestamp_style.set(style);

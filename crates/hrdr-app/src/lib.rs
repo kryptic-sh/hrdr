@@ -137,7 +137,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
 /// to the GUI). Canonical names; aliases resolve before matching. The GUI
 /// filters these out of completion and `/help`, and answers with a notice
 /// instead of sending the text to the model.
-pub const TUI_ONLY_COMMANDS: &[&str] = &["/theme"];
+pub const TUI_ONLY_COMMANDS: &[&str] = &[];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
 /// TUI-only command per [`TUI_ONLY_COMMANDS`].
@@ -306,7 +306,7 @@ mod tests {
                 "TUI-only references unknown command {name}"
             );
         }
-        assert!(is_tui_only("/theme"));
+        assert!(!is_tui_only("/theme")); // shared since the GUI live-swaps
         assert!(!is_tui_only("cd")); // alias of /cwd — shared now
         assert!(!is_tui_only("/summarize")); // alias of /compact — shared now
         assert!(!is_tui_only("/help"));
@@ -316,10 +316,9 @@ mod tests {
         assert!(is_known_command("/new")); // alias entries count
         assert!(is_known_command("model"));
         assert!(!is_known_command("/frobnicate"));
-        // A filtered help body drops TUI-only commands but keeps shared ones.
+        // With an empty TUI-only list, the filtered help equals the full one.
         let gui_help = help_body_for(|n| !is_tui_only(n));
-        assert!(gui_help.contains("/export"));
-        assert!(!gui_help.contains("/theme"));
+        assert_eq!(gui_help, help_body());
     }
 
     #[test]

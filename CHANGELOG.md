@@ -8,12 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/theme` works in the GUI — full command parity reached.** The GUI theme is
+  now a signal: `/theme <path>` live-swaps to an hjkl theme TOML and `/theme`
+  resets to the bundled default, exactly like the TUI. Top-level chrome recolors
+  reactively; transcript items, the TODO panel, and the status bar (whose colors
+  are captured when their views are built) rebuild via a theme revision baked
+  into their dyn_stack keys. The command moved to the shared dispatcher
+  (`set_theme` + `unpersist_setting` host hooks, persisted to config); the GUI's
+  `/reload` now applies a changed theme live too. **`TUI_ONLY_COMMANDS` is
+  empty** — every registered command works in both frontends.
+
 - **`/edit` works in the GUI**, opening the file in the system's default editor
   (`xdg-open` on Linux/BSD, `open` on macOS, `start` on Windows, detached). The
   command moved to the shared dispatcher with an `open_editor` host hook whose
   default is the OS opener (`hrdr_app::open_system_handler`); the TUI keeps its
-  local terminal-suspending `$EDITOR` flow, unchanged. `TUI_ONLY_COMMANDS` is
-  down to just `/theme`.
+  local terminal-suspending `$EDITOR` flow, unchanged.
 
 - **Agnostic status bar.** The status-bar _content_ — which sections exist (cwd,
   branch, ↑/↓ session tokens, the context gauge with its green/amber/red fill,

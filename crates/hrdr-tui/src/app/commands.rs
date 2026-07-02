@@ -20,20 +20,6 @@ impl super::App {
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so the TUI and GUI run one implementation).
         match cmd {
-            "theme" => {
-                let path = (!arg.is_empty()).then_some(arg);
-                self.theme = Theme::load(path);
-                match path {
-                    Some(p) => {
-                        self.persist_setting("theme", hrdr_agent::ConfigValue::Str(p));
-                        self.system(format!("theme → {p}"));
-                    }
-                    None => {
-                        self.unpersist_setting("theme");
-                        self.system("theme reset to default");
-                    }
-                }
-            }
             "info" => self.show_info(), // richer than the shared /info
             "edit" => self.edit_file_cmd(arg),
             "init" => self.init_agents_cmd(), // reloads AGENTS.md after (pending_init)
@@ -547,6 +533,13 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn set_statusbar_mode(&mut self, mode: hrdr_app::StatusBarMode) {
         self.app.statusbar_mode = mode;
+    }
+    fn set_theme(&mut self, path: Option<String>) {
+        self.app.theme = Theme::load(path.as_deref());
+    }
+    fn unpersist_setting(&mut self, key: &str) {
+        // The TUI version also suppresses the config hot-reload it would cause.
+        self.app.unpersist_setting(key);
     }
     fn set_todo_ttl(&mut self, turns: u64) {
         self.app.todo_ttl = turns;
