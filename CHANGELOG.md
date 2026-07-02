@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/edit` works in the GUI**, opening the file in the system's default editor
+  (`xdg-open` on Linux/BSD, `open` on macOS, `start` on Windows, detached). The
+  command moved to the shared dispatcher with an `open_editor` host hook whose
+  default is the OS opener (`hrdr_app::open_system_handler`); the TUI keeps its
+  local terminal-suspending `$EDITOR` flow, unchanged. `TUI_ONLY_COMMANDS` is
+  down to just `/theme`.
+
 - **Agnostic status bar.** The status-bar _content_ — which sections exist (cwd,
   branch, ↑/↓ session tokens, the context gauge with its green/amber/red fill,
   model, effort, ttft), their text, drop priorities, and color roles — now lives

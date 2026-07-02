@@ -176,6 +176,17 @@ pub trait CommandHost {
         let _ = turns;
     }
 
+    /// Open `path` in an editor (`/edit`). The default launches the OS default
+    /// handler (`xdg-open` / `open` / `start`) — right for GUI frontends; the
+    /// TUI overrides to suspend the terminal and run `$EDITOR` instead.
+    fn open_editor(&mut self, path: PathBuf) {
+        let line = match open_system_handler(&path) {
+            Ok(()) => format!("opened {} in the system editor", path.display()),
+            Err(e) => format!("couldn't open {}: {e}", path.display()),
+        };
+        self.info(line);
+    }
+
     /// Current status-bar mode (frontends with a status bar override the pair).
     fn statusbar_mode(&self) -> crate::StatusBarMode {
         crate::StatusBarMode::Truncate
@@ -666,6 +677,18 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 }
             }
         }
+        "edit" => {
+            if arg.is_empty() {
+                host.info("usage: /edit <file>".to_string());
+                return true;
+            }
+            let path = crate::resolve_under(&host.cwd(), &arg);
+            if !path.exists() {
+                host.info(format!("file not found: {}", path.display()));
+                return true;
+            }
+            host.open_editor(path);
+        }
         "statusbar" => {
             use crate::StatusBarMode;
             let mode = match arg.to_ascii_lowercase().as_str() {
@@ -760,6 +783,33 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Launch the OS default handler for `path` (`xdg-open` on Linux/BSD, `open`
+/// on macOS, `start` on Windows), detached — the child outlives the call.
+pub fn open_system_handler(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]).arg(path);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Instruction sent to the model by `/init` to author an `AGENTS.md`.

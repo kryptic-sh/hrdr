@@ -137,7 +137,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
 /// to the GUI). Canonical names; aliases resolve before matching. The GUI
 /// filters these out of completion and `/help`, and answers with a notice
 /// instead of sending the text to the model.
-pub const TUI_ONLY_COMMANDS: &[&str] = &["/theme", "/edit"];
+pub const TUI_ONLY_COMMANDS: &[&str] = &["/theme"];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
 /// TUI-only command per [`TUI_ONLY_COMMANDS`].
@@ -312,6 +312,7 @@ mod tests {
         assert!(!is_tui_only("/help"));
         assert!(!is_tui_only("/export"));
         assert!(!is_tui_only("/retry"));
+        assert!(!is_tui_only("/edit")); // shared: OS opener in the GUI
         assert!(is_known_command("/new")); // alias entries count
         assert!(is_known_command("model"));
         assert!(!is_known_command("/frobnicate"));
