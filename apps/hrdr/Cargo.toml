@@ -7,6 +7,25 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[package.metadata.deb]
+maintainer = "mxaddict <mxaddict@kryptic.sh>"
+copyright = "2026, mxaddict <mxaddict@kryptic.sh>"
+extended-description = "herder: a fast, agentic coding harness for OpenAI-compatible models — a terminal coding agent with tools (read/write/edit/bash/grep/glob/todo), sessions, and a local-backend spawner."
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/hrdr", "usr/bin/", "755"],
+  ["../../README.md", "usr/share/doc/hrdr/README.md", "644"],
+  ["../../LICENSE", "usr/share/doc/hrdr/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/hrdr", dest = "/usr/bin/hrdr", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/hrdr/README.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/hrdr/LICENSE", mode = "644", doc = true },
+]
+
 [[bin]]
 name = "hrdr"
 path = "src/main.rs"

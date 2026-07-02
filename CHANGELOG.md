@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Release pipeline**, mirroring gpur's: pushing a `v*` tag now builds the
+  `hrdr` binary for 7 targets (Linux gnu/musl × x86_64/aarch64 via
+  cargo-zigbuild, macOS arm/intel, Windows), packages tar.gz/zip (+ `.deb` and
+  `.rpm` for Linux gnu) with sha256s, publishes a GitHub Release, then fans out:
+  crates.io (all workspace crates in dependency order, idempotent), AUR
+  (`hrdr-bin`), the Homebrew tap, the Scoop bucket, and an Alpine `.apk`
+  attached to the release. Every main push dry-runs the build matrix so
+  packaging breakage surfaces before a tag. New CI jobs also run `cargo-deny`
+  and a build+`--version`/`--help` smoke on all three OSes; `deny.toml` gains
+  `BSL-1.0` (clipboard-win/error-code) and the floem-tree unmaintained ignores
+  (`paste` via wgpu/metal, `ttf-parser` via cosmic-text). Packaging templates
+  live under `pkg/` (`aur`/`homebrew`/`scoop`/`alpine`), and `apps/hrdr` carries
+  the `cargo-deb`/`cargo-generate-rpm` metadata.
+
 - **`/theme` works in the GUI — full command parity reached.** The GUI theme is
   now a signal: `/theme <path>` live-swaps to an hjkl theme TOML and `/theme`
   resets to the bundled default, exactly like the TUI. Top-level chrome recolors

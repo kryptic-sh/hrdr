@@ -10,6 +10,11 @@ ignore = [
   # upgrade, pulled transitively by `syntect` (code-block syntax highlighting).
   { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; transitive via syntect" },
   { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained; transitive via syntect" },
+  # Unmaintained advisories pulled transitively by floem (hrdr-gui): `paste`
+  # via wgpu/metal, `ttf-parser` via cosmic-text. No safe upgrade until floem
+  # bumps its stack.
+  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via floem → wgpu → metal" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via floem → cosmic-text" },
 ]
 
 [licenses]
@@ -25,6 +30,8 @@ allow = [
   "Unicode-DFS-2016",
   "Zlib",
   "CC0-1.0",
+  # Boost — permissive, OSI approved; clipboard-win/error-code (floem tree).
+  "BSL-1.0",
 ]
 exceptions = [
   # webpki-roots bundles the Mozilla CA certificate set under the Community
