@@ -847,11 +847,8 @@ impl App {
         let agent = self.agent.clone();
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
-            let res = {
-                let mut a = agent.lock().await;
-                a.compact(instructions.as_deref()).await
-            };
-            let _ = tx.send(TurnMsg::Compacted(res.map_err(|e| e.to_string())));
+            let res = hrdr_app::run_compaction(agent, instructions).await;
+            let _ = tx.send(TurnMsg::Compacted(res));
         });
         self.turn_handle = Some(handle);
     }
@@ -942,19 +939,9 @@ impl App {
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
                 self.last_usage = None;
-                match res {
-                    Ok((before, after)) => {
-                        self.push_entry(Entry::System(format!(
-                            "compacted: {before} → {after} messages (summary kept; scrollback \
-                             above is preserved for you)"
-                        )));
-                        self.autosave();
-                    }
-                    Err(e) => {
-                        // Must go through push_entry: a bare transcript.push
-                        // desyncs the parallel entry_times vec.
-                        self.push_entry(Entry::System(format!("[compact failed] {e}")));
-                    }
+                self.push_entry(Entry::System(hrdr_app::compaction_message(&res)));
+                if res.is_ok() {
+                    self.autosave();
                 }
                 self.scroll_offset = 0;
                 // Resume any queued work now that the context is compact.

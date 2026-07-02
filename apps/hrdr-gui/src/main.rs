@@ -150,6 +150,8 @@ enum UiMsg {
     System(String),
     /// `@file` completion index built off-thread.
     FileIndex(Vec<String>),
+    /// Compaction finished: `Ok((before, after))` message counts, or an error.
+    Compacted(Result<(usize, usize), String>),
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
     /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
@@ -315,6 +317,10 @@ fn app_view(
     // Messages submitted while a turn runs, sent FIFO as turns finish (like
     // the TUI's queue).
     let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
+    // True while a compaction (summarization) pass runs; auto-compaction
+    // triggers at this fraction of the context window (0 disables).
+    let compacting: RwSignal<bool> = create_rw_signal(false);
+    let auto_compact_ratio = cfg.auto_compact;
 
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
@@ -409,8 +415,34 @@ fn app_view(
         }
     });
 
+    // Start a compaction pass (shared by /compact and the auto-compaction
+    // trigger below): runs like a turn — input queues behind it, Esc/Stop
+    // cancels it — and lands as UiMsg::Compacted.
+    let start_compaction: Rc<dyn Fn(Option<String>)> = {
+        let agent = agent.clone();
+        let tx = tx.clone();
+        let th = turn_handle.clone();
+        Rc::new(move |instructions: Option<String>| {
+            running.set(true);
+            compacting.set(true);
+            turn_start.set(Some(Instant::now()));
+            ttft.set(None);
+            let agent = agent.clone();
+            let tx = tx.clone();
+            let handle = tokio::spawn(async move {
+                let res = hrdr_app::run_compaction(agent, instructions).await;
+                let _ = tx.send(UiMsg::Compacted(res));
+            });
+            *th.borrow_mut() = Some(handle);
+        })
+    };
+
     let spawn_for_done = spawn_turn.clone();
     let queue_for_done = queue.clone();
+    let compact_for_done = start_compaction.clone();
+    let agent_for_events = agent.clone();
+    let tx_for_events = tx.clone();
+    let base_url_for_events = base_url;
     let todos_for_events = todos.clone();
     let todo_stamps_for_done = todo_completed_at.clone();
     create_effect(move |_| {
@@ -459,6 +491,23 @@ fn app_view(
                     );
                     todos_sig.set(t.clone());
                 }
+                // Proactively compact near the context limit before more work
+                // (shared threshold; the queue resumes from Compacted).
+                if !compacting.get_untracked()
+                    && hrdr_app::should_auto_compact(
+                        usage.get_untracked().map(|(p, _)| p),
+                        ctx_window.get_untracked(),
+                        auto_compact_ratio,
+                    )
+                {
+                    system(
+                        transcript,
+                        next_id,
+                        "context near the limit — auto-compacting…",
+                    );
+                    (compact_for_done)(None);
+                    return;
+                }
                 // Start the next queued message, if any (FIFO, like the TUI).
                 let next = queue_for_done.borrow_mut().pop_front();
                 if let Some(next) = next {
@@ -469,6 +518,41 @@ fn app_view(
             UiMsg::FileIndex(files) => {
                 file_index.set(files);
                 file_index_state.set(2);
+            }
+            UiMsg::Compacted(res) => {
+                running.set(false);
+                compacting.set(false);
+                // Context shrank; drop stale usage so the gauge refreshes on
+                // the next turn (and we don't immediately re-trigger).
+                usage.set(None);
+                system(transcript, next_id, hrdr_app::compaction_message(&res));
+                if res.is_ok() {
+                    // Persist the compacted conversation (same as turn end).
+                    let agent = agent_for_events.clone();
+                    let tx = tx_for_events.clone();
+                    let existing = session_id.get_untracked();
+                    let label = session_label.get_untracked();
+                    let cur_model = model.get_untracked();
+                    let url = base_url_for_events.get_untracked();
+                    let generation = save_gen.get_untracked();
+                    tokio::spawn(async move {
+                        if let Some(o) =
+                            hrdr_app::save_agent_session(agent, existing, label, cur_model, url)
+                                .await
+                        {
+                            let _ = tx.send(UiMsg::Saved {
+                                id: o.id,
+                                first_save: o.first_save,
+                                generation,
+                            });
+                        }
+                    });
+                }
+                // Resume any queued work now that the context is compact.
+                let next = queue_for_done.borrow_mut().pop_front();
+                if let Some(next) = next {
+                    (spawn_for_done)(next, true);
+                }
             }
             UiMsg::Saved {
                 id,
@@ -496,6 +580,7 @@ fn app_view(
     let history_for_send = history.clone();
     let msg_ids_for_send = msg_view_ids.clone();
     let spawn_for_send = spawn_turn.clone();
+    let compact_for_send = start_compaction.clone();
     let queue_for_send = queue.clone();
     let th_for_host = turn_handle.clone();
     let clipboard_for_send = clipboard.clone();
@@ -600,6 +685,8 @@ fn app_view(
                 queue: queue_for_send.clone(),
                 turn_handle: th_for_host.clone(),
                 spawn_turn: spawn_for_send.clone(),
+                start_compaction: compact_for_send.clone(),
+                compacting,
                 clipboard: clipboard_for_send.clone(),
                 agent: agent_for_send.clone(),
                 tx: tx_for_send.clone(),
@@ -652,6 +739,7 @@ fn app_view(
             h.abort();
         }
         running.set(false);
+        compacting.set(false);
         let dropped = {
             let mut q = queue_for_cancel.borrow_mut();
             let n = q.len();
@@ -911,7 +999,6 @@ fn app_view(
     // indicator while a turn runs.
     // Status bar from the shared content model (same sections/colors as the
     // TUI); /statusbar picks hidden / one row / wrapping rows.
-    let auto_compact_ratio = cfg.auto_compact;
     let status_segs = move || -> Vec<(usize, hrdr_app::StatusSeg)> {
         let dir = dir_sig.get();
         let branch = branch_sig.get();
@@ -1381,6 +1468,8 @@ struct GuiHost {
     queue: Rc<RefCell<VecDeque<String>>>,
     turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>>,
     spawn_turn: Rc<dyn Fn(String, bool)>,
+    start_compaction: Rc<dyn Fn(Option<String>)>,
+    compacting: RwSignal<bool>,
     clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
@@ -1439,6 +1528,7 @@ impl hrdr_app::CommandHost for GuiHost {
             }
             self.running.set(false);
         }
+        self.compacting.set(false);
         self.queue.borrow_mut().clear();
         if let Ok(mut t) = self.todos.lock() {
             t.clear();
@@ -1635,6 +1725,10 @@ impl hrdr_app::CommandHost for GuiHost {
                 None => "no tool output to expand".to_string(),
             },
         }
+    }
+    fn compact(&mut self, instructions: Option<String>) {
+        system(self.transcript, self.next_id, "compacting conversation…");
+        (self.start_compaction)(instructions);
     }
     fn rewind_last_turn(&mut self) -> Option<String> {
         let text = self

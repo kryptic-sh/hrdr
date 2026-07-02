@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unified compaction, and the GUI auto-compacts.** The compaction core is
+  shared (`hrdr_app::run_compaction` + `compaction_message` +
+  `should_auto_compact`): `/compact` now behaves identically in both frontends
+  (runs like a turn — input queues behind it, Esc/Stop cancels it — then shows
+  the same result line, drops stale context usage, autosaves, and resumes queued
+  sends), and the GUI gains the TUI's **proactive auto-compaction**: when a turn
+  ends with the context past the `auto_compact` fraction of the window, a
+  summarization pass runs before the next queued message. The TUI's bespoke
+  threshold check and result formatting were replaced by the shared versions
+  (its local `/compact` arm is deleted; "nothing to compact yet" is now detected
+  from the result instead of a pre-check).
+
 - **Renderer-agnostic `EditorEngine` seam.** The editing-discipline trait no
   longer names a UI toolkit: keys arrive as `hrdr_editor::EditorKey` (hjkl's own
   toolkit-neutral `Input {key, ctrl, alt, shift}` DTO, re-exported), and the

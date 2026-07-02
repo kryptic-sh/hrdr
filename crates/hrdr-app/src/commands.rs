@@ -140,23 +140,11 @@ pub trait CommandHost {
     /// `@file` completion index can be invalidated.
     fn files_changed(&mut self) {}
 
-    /// Run conversation compaction. The default locks the agent, compacts, and
-    /// reports a summary line; the TUI overrides to route through its richer
-    /// progress/queue machinery.
-    fn compact(&mut self, instructions: Option<String>) {
-        let agent = self.agent();
-        self.info("compacting conversation…".to_string());
-        self.spawn_line(Box::pin(async move {
-            let mut a = agent.lock().await;
-            if a.message_count() <= 2 {
-                return "nothing to compact yet".to_string();
-            }
-            match a.compact(instructions.as_deref()).await {
-                Ok((before, after)) => format!("compacted: {before} → {after} messages"),
-                Err(e) => format!("compact failed: {e}"),
-            }
-        }));
-    }
+    /// Start conversation compaction on a background task. Frontends run
+    /// [`run_compaction`] and, when it lands, show [`compaction_message`],
+    /// reset their stale context usage, autosave on success, and resume any
+    /// queued sends — same semantics in both.
+    fn compact(&mut self, instructions: Option<String>);
 
     /// Current per-message timestamp style (frontends with timestamp rendering
     /// override the pair).
@@ -863,6 +851,48 @@ When finished, give a one-line summary of what you wrote.";
 
 // ---- representation-independent command cores ----
 
+/// The shared compaction core (`/compact` and threshold auto-compaction):
+/// lock the agent and summarize. `Ok((before, after))` with `before == after`
+/// means there was nothing to compact.
+pub async fn run_compaction(
+    agent: Arc<Mutex<Agent>>,
+    instructions: Option<String>,
+) -> Result<(usize, usize), String> {
+    let mut a = agent.lock().await;
+    a.compact(instructions.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The system line a finished compaction shows — identical in both frontends.
+pub fn compaction_message(res: &Result<(usize, usize), String>) -> String {
+    match res {
+        Ok((before, after)) if before == after => "nothing to compact yet".to_string(),
+        Ok((before, after)) => format!(
+            "compacted: {before} → {after} messages (summary kept; scrollback above is \
+             preserved for you)"
+        ),
+        Err(e) => format!("[compact failed] {e}"),
+    }
+}
+
+/// Whether the context usage warrants a proactive compaction before more work
+/// — the `auto_compact` threshold check, shared by both frontends.
+/// `last_prompt_tokens` is the latest model call's prompt size.
+pub fn should_auto_compact(
+    last_prompt_tokens: Option<u32>,
+    context_window: Option<u32>,
+    ratio: f64,
+) -> bool {
+    if ratio <= 0.0 || ratio > 1.0 {
+        return false;
+    }
+    let (Some(prompt), Some(window)) = (last_prompt_tokens, context_window) else {
+        return false;
+    };
+    window > 0 && f64::from(prompt) >= f64::from(window) * ratio
+}
+
 /// The working-tree `git diff` for `cwd` (stdout on success, stderr message on
 /// failure). Shared by `/diff`.
 pub async fn git_working_diff(cwd: &Path) -> Result<String, String> {
@@ -958,6 +988,21 @@ pub fn conversation_to_json(msgs: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_compact_threshold_and_messages() {
+        // Below / at threshold, disabled ratio, missing inputs.
+        assert!(should_auto_compact(Some(850), Some(1000), 0.85));
+        assert!(should_auto_compact(Some(900), Some(1000), 0.85));
+        assert!(!should_auto_compact(Some(840), Some(1000), 0.85));
+        assert!(!should_auto_compact(Some(999), Some(1000), 0.0)); // disabled
+        assert!(!should_auto_compact(None, Some(1000), 0.85));
+        assert!(!should_auto_compact(Some(999), None, 0.85));
+        // Message formatting covers the three outcomes.
+        assert_eq!(compaction_message(&Ok((2, 2))), "nothing to compact yet");
+        assert!(compaction_message(&Ok((10, 2))).contains("compacted: 10 → 2"));
+        assert!(compaction_message(&Err("boom".into())).contains("[compact failed] boom"));
+    }
 
     #[test]
     fn conversation_export_covers_only_user_assistant() {

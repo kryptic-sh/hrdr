@@ -23,7 +23,6 @@ impl super::App {
             "info" => self.show_info(), // richer than the shared /info
             "edit" => self.edit_file_cmd(arg),
             "init" => self.init_agents_cmd(), // reloads AGENTS.md after (pending_init)
-            "compact" => self.compact_cmd(arg), // richer: TurnMsg::Compacted + queue resume
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
             "find" | "search" => self.find_cmd(arg),
@@ -343,26 +342,6 @@ impl super::App {
         // Consumed by the run loop (it owns the terminal needed to suspend).
         self.pending_edit = Some(path);
     }
-    /// `/compact [instructions]` — summarize the conversation to reclaim context.
-    fn compact_cmd(&mut self, arg: &str) {
-        if self.running {
-            self.system("can't compact while a turn is running");
-            return;
-        }
-        let count = self
-            .agent
-            .try_lock()
-            .ok()
-            .map(|a| a.message_count())
-            .unwrap_or(0);
-        if count <= 2 {
-            self.system("nothing to compact yet");
-            return;
-        }
-        let instructions = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-        self.system("compacting conversation…");
-        self.spawn_compaction(instructions);
-    }
 }
 
 /// Keybinding tips appended to the shared `/help` body (TUI-specific).
@@ -500,6 +479,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn rewind_last_turn(&mut self) -> Option<String> {
         self.app.rewind_last_turn()
+    }
+    fn compact(&mut self, instructions: Option<String>) {
+        self.app.system("compacting conversation…");
+        self.app.spawn_compaction(instructions);
     }
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
         // The TUI version also suppresses the config hot-reload it would cause.
