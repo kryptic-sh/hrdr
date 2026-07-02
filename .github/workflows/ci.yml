@@ -348,8 +348,13 @@ jobs:
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           # Dependency order; hrdr-gui (floem app) is not published.
+          # NB: crates.io rejects UA-less requests with 403, so the
+          # idempotency probe must send a User-Agent or it never detects an
+          # already-published version.
           for CRATE in hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$CRATE/$VERSION")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -A "hrdr-ci (https://github.com/kryptic-sh/hrdr)" \
+              "https://crates.io/api/v1/crates/$CRATE/$VERSION")
             if [ "$STATUS" = "200" ]; then
               echo "$CRATE $VERSION already on crates.io — skipping"
               continue
