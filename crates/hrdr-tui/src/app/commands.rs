@@ -20,7 +20,6 @@ impl super::App {
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so the TUI and GUI run one implementation).
         match cmd {
-            "info" => self.show_info(), // richer than the shared /info
             "edit" => self.edit_file_cmd(arg),
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
@@ -115,32 +114,6 @@ impl super::App {
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
         self.reload_project_docs();
-    }
-    fn show_info(&mut self) {
-        let temp = self.with_agent(|a| a.temperature()).flatten();
-        let branch = self.branch.clone().unwrap_or_else(|| "—".into());
-        let ctx = match (self.last_usage, self.context_window) {
-            (Some((p, _)), Some(w)) => format!("{p} / {w}"),
-            (Some((p, _)), None) => p.to_string(),
-            _ => "—".into(),
-        };
-        let session = match (&self.session_id, &self.session_label) {
-            (Some(id), Some(name)) => format!("{id}  (name: {name})"),
-            (Some(id), None) => id.clone(),
-            (None, _) => "(unsaved — send a message to start one)".to_string(),
-        };
-        let info = format!(
-            "session: {session}\nmodel: {}\nendpoint: {}\ncwd: {} ({branch})\ncontext: {ctx}\ntokens: ↑{} ↓{}\ntemperature: {}\neffort: {}",
-            self.model,
-            self.base_url,
-            self.dir,
-            self.session_in,
-            self.session_out,
-            temp.map(|t| t.to_string())
-                .unwrap_or_else(|| "default".into()),
-            self.effort.clone().unwrap_or_else(|| "—".into()),
-        );
-        self.system(info);
     }
     /// Rewind the last user turn out of the agent history + transcript,
     /// returning the user's text (shared `/undo` and `/retry` core).
@@ -477,6 +450,18 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn effort(&self) -> Option<String> {
         self.app.effort.clone()
+    }
+    fn session_label(&self) -> Option<String> {
+        self.app.session_label.clone()
+    }
+    fn context_usage(&self) -> Option<(u32, u32)> {
+        self.app.last_usage
+    }
+    fn context_window(&self) -> Option<u32> {
+        self.app.context_window
+    }
+    fn session_tokens(&self) -> (usize, usize) {
+        (self.app.session_in, self.app.session_out)
     }
     fn set_effort(&mut self, label: String) {
         self.app.effort = Some(label);

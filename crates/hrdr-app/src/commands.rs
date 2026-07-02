@@ -126,6 +126,22 @@ pub trait CommandHost {
     fn effort(&self) -> Option<String> {
         None
     }
+    /// The session's display-name override (`/rename`), for `/info`.
+    fn session_label(&self) -> Option<String> {
+        None
+    }
+    /// The latest model call's `(prompt, completion)` token usage.
+    fn context_usage(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// The model's context window in tokens, if known.
+    fn context_window(&self) -> Option<u32> {
+        None
+    }
+    /// Session-cumulative `(input, output)` token counters.
+    fn session_tokens(&self) -> (usize, usize) {
+        (0, 0)
+    }
     /// Update the effort label (persistence is dispatch's job).
     fn set_effort(&mut self, label: String) {
         let _ = label;
@@ -296,13 +312,30 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         "info" => {
             let agent = host.agent();
             let model = host.model();
+            let base_url = host.base_url();
             let cwd = host.cwd();
+            let session = match (host.session_id(), host.session_label()) {
+                (Some(id), Some(name)) => format!("{id}  (name: {name})"),
+                (Some(id), None) => id,
+                (None, _) => "(unsaved — send a message to start one)".to_string(),
+            };
+            let ctx = match (host.context_usage(), host.context_window()) {
+                (Some((p, _)), Some(w)) => format!("{p} / {w}"),
+                (Some((p, _)), None) => p.to_string(),
+                _ => "—".to_string(),
+            };
+            let (tokens_in, tokens_out) = host.session_tokens();
+            let effort = host.effort().unwrap_or_else(|| "—".to_string());
             host.spawn_line(Box::pin(async move {
-                let a = agent.lock().await;
+                let temp = agent.lock().await.temperature();
+                let dir = crate::display_dir(&cwd);
+                let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
                 format!(
-                    "model: {model}\nmessages: {}\ncwd: {}",
-                    a.message_count(),
-                    cwd.display()
+                    "session: {session}\nmodel: {model}\nendpoint: {base_url}\ncwd: {dir} \
+                     ({branch})\ncontext: {ctx}\ntokens: ↑{tokens_in} ↓{tokens_out}\n\
+                     temperature: {}\neffort: {effort}",
+                    temp.map(|t| t.to_string())
+                        .unwrap_or_else(|| "default".to_string())
                 )
             }));
         }

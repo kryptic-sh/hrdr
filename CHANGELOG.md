@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/info` unified at the TUI's richer level.** One shared implementation shows
+  session id/name, model, endpoint, cwd + git branch, context used/window,
+  session ↑/↓ tokens, temperature, and effort in both frontends (new read hooks:
+  `session_label`, `context_usage`, `context_window`, `session_tokens`). The
+  TUI's local `/info` arm is deleted; the GUI's short model/messages/cwd form is
+  replaced by the full report.
+
 - **Four more TUI behaviors unified into shared code paths — the GUI gains all
   of them:**
   - **Per-turn stats line** (`hrdr_app::turn_stats_line`, unit-tested): both

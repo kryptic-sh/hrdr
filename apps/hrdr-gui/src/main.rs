@@ -1852,6 +1852,21 @@ impl hrdr_app::CommandHost for GuiHost {
     fn effort(&self) -> Option<String> {
         self.effort.get_untracked()
     }
+    fn session_label(&self) -> Option<String> {
+        self.session_label.get_untracked()
+    }
+    fn context_usage(&self) -> Option<(u32, u32)> {
+        self.usage.get_untracked()
+    }
+    fn context_window(&self) -> Option<u32> {
+        self.ctx_window.get_untracked()
+    }
+    fn session_tokens(&self) -> (usize, usize) {
+        (
+            self.session_in.get_untracked(),
+            self.session_out.get_untracked(),
+        )
+    }
     fn set_effort(&mut self, label: String) {
         self.effort.set(Some(label));
     }
