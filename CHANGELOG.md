@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Shell guardrails — mechanical enforcement of the git rules.** The `bash` /
+  `powershell` tools now reject the classic foot-guns before they run, each with
+  a corrective error the model learns from at the moment it matters: blanket
+  staging (`git add -A` / `--all` / `.` → "stage the files you actually
+  changed"), force-push (`--force-with-lease` allowed), hook skipping
+  (`--no-verify`, `commit -n`), destructive commands (`reset --hard`,
+  `clean -f`, `checkout`/`restore .`), and interactive commands that need a TTY
+  (`rebase -i`). Quoted arguments are blanked before matching so
+  `rg 'git add -A'` doesn't false-positive. User rules stack on top via
+  `[[guardrails]]` (`pattern` + `message`) in `config.toml`.
+
+- **Read-before-edit gate.** `edit` and `write_file` refuse to mutate an
+  existing file the model hasn't read this session ("call read_file first"),
+  killing blind edits against guessed content — the top source of corrupt
+  patches on small models. A file the model itself wrote counts as read; the
+  gate resets on `/clear`, `/resume`, and compaction, since those drop the file
+  contents from the model's context.
+
+- **System prompt rewritten for small models.** Tool descriptions are no longer
+  duplicated into the prompt (they already ship natively as function defs — the
+  old template paid those tokens twice); only a one-line name list remains. In
+  their place: an editing section (copy `old_string` exactly from `read_file`
+  output, strip line-number prefixes, re-read on failure, don't re-read after
+  success) and a git section stating exactly what the guardrails enforce. Tool
+  descriptions and `edit` failure messages were sharpened to teach the same
+  rules (`old_string not found` now says "re-read the file and copy the exact
+  current text").
+
 - **GUI finish nudge — desktop notification as the bell.** The GUI now honors
   the `bell` config knob: when a turn finishes (or fails) after running at least
   5 seconds, it posts a desktop notification (`notify-rust`: D-Bus/XDG on Linux,

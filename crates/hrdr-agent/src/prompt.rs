@@ -9,18 +9,15 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use hrdr_tools::ToolRegistry;
 use minijinja::{Environment, context};
-use serde::Serialize;
 
 const SYSTEM_TEMPLATE: &str = include_str!("templates/system.j2");
 
-#[derive(Serialize)]
-struct ToolView {
-    name: String,
-    description: String,
-}
-
 /// Render the agent system prompt for the given tool set and working directory.
 /// `instructions` is the gathered AGENTS.md content (see [`gather_agent_docs`]).
+///
+/// Only the tool *names* are inlined — the full name/description/schema defs
+/// go out natively with every request, so repeating descriptions here would
+/// pay their tokens twice.
 pub fn render_system(
     tools: &ToolRegistry,
     cwd: &Path,
@@ -31,19 +28,17 @@ pub fn render_system(
         .context("loading system template")?;
     let tmpl = env.get_template("system")?;
 
-    let views: Vec<ToolView> = tools
+    let tool_names = tools
         .defs()
         .into_iter()
-        .map(|d| ToolView {
-            name: d.function.name,
-            description: d.function.description,
-        })
-        .collect();
+        .map(|d| d.function.name)
+        .collect::<Vec<_>>()
+        .join(", ");
 
     tmpl.render(context! {
         cwd => cwd.display().to_string(),
         os => std::env::consts::OS,
-        tools => views,
+        tool_names => tool_names,
         instructions => instructions,
     })
     .context("rendering system template")
@@ -87,5 +82,35 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
         None
     } else {
         Some(docs.join("\n\n---\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_inlines_names_only_and_rules() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        // Tool names present, one line, but not their long descriptions
+        // (those ship natively as function defs — no double token spend).
+        assert!(p.contains("read_file"));
+        assert!(p.contains("todo_write"));
+        assert!(!p.contains("Replace an exact substring"));
+        // The pitfall rules the guardrails enforce are also stated up front.
+        assert!(p.contains("git add -A"));
+        assert!(p.contains("force-push"));
+        assert!(p.contains("old_string"));
+        assert!(p.contains("/tmp/x"));
+        assert!(!p.contains("Project instructions"));
+    }
+
+    #[test]
+    fn system_prompt_appends_project_instructions() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), Some("Use tabs.")).unwrap();
+        assert!(p.contains("Project instructions"));
+        assert!(p.ends_with("Use tabs."));
     }
 }

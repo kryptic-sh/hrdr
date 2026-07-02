@@ -86,6 +86,9 @@ pub struct AgentConfig {
     pub checkpoints: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
+    /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
+    /// of the built-in rules.
+    pub guardrails: Vec<GuardrailConfig>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -107,6 +110,7 @@ impl Default for AgentConfig {
             auto_compact: DEFAULT_AUTO_COMPACT,
             checkpoints: None,
             providers: HashMap::new(),
+            guardrails: Vec::new(),
         }
     }
 }
@@ -154,6 +158,15 @@ pub struct ProviderConfig {
     /// Model context window (for the status bar's "X of Y").
     #[serde(default)]
     pub context_window: Option<u32>,
+}
+
+/// One user-defined shell guardrail from a `[[guardrails]]` config entry:
+/// commands matching `pattern` (a regex) are rejected with `message`. Applied
+/// on top of the built-in rules (`hrdr_tools::default_guardrails`).
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct GuardrailConfig {
+    pub pattern: String,
+    pub message: String,
 }
 
 /// A fully-resolved provider preset.
@@ -208,6 +221,8 @@ struct FileConfig {
     checkpoints: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
+    #[serde(default)]
+    guardrails: Vec<GuardrailConfig>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -284,6 +299,9 @@ impl AgentConfig {
         }
         if !fc.providers.is_empty() {
             self.providers = fc.providers;
+        }
+        if !fc.guardrails.is_empty() {
+            self.guardrails = fc.guardrails;
         }
     }
 
@@ -454,6 +472,18 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Result<Self> {
         let tools = ToolRegistry::with_defaults();
         let mut ctx = ToolContext::new(config.cwd.clone());
+        // User guardrails layer on top of the built-in set; an invalid regex
+        // is skipped (lenient, like the rest of config parsing).
+        if !config.guardrails.is_empty() {
+            let mut rails = hrdr_tools::default_guardrails();
+            rails.extend(
+                config
+                    .guardrails
+                    .iter()
+                    .filter_map(|g| hrdr_tools::Guardrail::new(&g.pattern, &g.message).ok()),
+            );
+            ctx.guardrails = Arc::new(rails);
+        }
         let project_docs = gather_agent_docs(&config.cwd);
         let system = render_system(&tools, &config.cwd, project_docs.as_deref())?;
 
@@ -516,7 +546,17 @@ impl Agent {
     /// reflected (the old system prompt is not kept around).
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.reset_read_files();
         self.refresh_system();
+    }
+
+    /// Forget which files the model has "seen": once the transcript no longer
+    /// contains their content (clear/resume/compaction), edits must re-read
+    /// first — the read-before-edit gate tracks the model's context, not disk.
+    fn reset_read_files(&mut self) {
+        if let Ok(mut set) = self.ctx.read_files.lock() {
+            set.clear();
+        }
     }
 
     /// Re-gather `AGENTS.md` for the current cwd and rebuild the system prompt
@@ -540,9 +580,11 @@ impl Agent {
         self.messages.clone()
     }
 
-    /// Replace the message history (for resuming a session).
+    /// Replace the message history (for resuming a session). Resets the
+    /// read-before-edit gate: this conversation didn't read those files.
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
+        self.reset_read_files();
     }
 
     /// Switch the model for subsequent turns.
@@ -668,6 +710,9 @@ impl Agent {
              it left off without losing any detail.\n\n{summary}"
         );
         self.messages = vec![system, ChatMessage::user(continuation)];
+        // The file contents the model had read live only in the summary now;
+        // require fresh reads before further edits.
+        self.reset_read_files();
         Ok((before, self.messages.len()))
     }
 
@@ -1267,6 +1312,7 @@ mod tests {
             auto_compact: Some(0.7),
             checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
+            guardrails: vec![],
         });
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
@@ -1277,6 +1323,29 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
+    }
+
+    #[test]
+    fn guardrails_parse_from_config_toml() {
+        let fc: FileConfig = toml::from_str(
+            r#"
+            model = "qwen3"
+
+            [[guardrails]]
+            pattern = "\\brm\\s+-rf\\b"
+            message = "no recursive force-remove"
+
+            [[guardrails]]
+            pattern = "\\bnpm\\s+publish\\b"
+            message = "publishing is manual"
+            "#,
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(cfg.guardrails.len(), 2);
+        assert_eq!(cfg.guardrails[0].message, "no recursive force-remove");
+        assert_eq!(cfg.guardrails[1].pattern, r"\bnpm\s+publish\b");
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

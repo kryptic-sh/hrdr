@@ -14,10 +14,12 @@ use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
 mod checkpoint;
+mod guardrails;
 mod tools;
 mod web;
 
 pub use checkpoint::{CheckpointInfo, Checkpoints};
+pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use tools::{
     BashTool, EditTool, GlobTool, GrepTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
     available_shell_tools,
@@ -57,6 +59,14 @@ pub struct ToolContext {
     /// Optional checkpoint store: file-mutating tools record a file's pre-image
     /// here before writing, so edits can be reverted. `None` = no checkpointing.
     pub checkpoints: Option<Arc<Mutex<Checkpoints>>>,
+    /// Shell-command guardrails ([`default_guardrails`] plus any user rules);
+    /// the shell tools reject a matching command with the rule's message.
+    pub guardrails: Arc<Vec<Guardrail>>,
+    /// Files whose current content the model has seen (read, or written by it
+    /// this session). `edit`/`write_file` refuse to mutate an existing file
+    /// that isn't here — blind edits against guessed content are the top
+    /// source of corrupt patches.
+    pub read_files: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl ToolContext {
@@ -67,6 +77,8 @@ impl ToolContext {
             max_output: DEFAULT_MAX_OUTPUT,
             stream: None,
             checkpoints: None,
+            guardrails: Arc::new(default_guardrails()),
+            read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -91,6 +103,25 @@ impl ToolContext {
     pub fn resolve(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() { p } else { self.cwd.join(p) }
+    }
+
+    /// Record that the model has seen `path`'s current content (a successful
+    /// read, or a write it authored). Canonicalized so relative/absolute
+    /// spellings of the same file agree.
+    pub fn mark_read(&self, path: &std::path::Path) {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(mut set) = self.read_files.lock() {
+            set.insert(canon);
+        }
+    }
+
+    /// Whether the model has seen `path`'s current content this session.
+    pub fn was_read(&self, path: &std::path::Path) -> bool {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.read_files
+            .lock()
+            .map(|set| set.contains(&canon))
+            .unwrap_or(true) // poisoned lock: don't wedge edits
     }
 }
 

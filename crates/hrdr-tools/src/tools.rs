@@ -35,8 +35,9 @@ impl Tool for ReadTool {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a file from disk. Returns 1-based line-numbered content. Use `offset`/`limit` \
-         to page through large files instead of reading the whole thing."
+        "Read a file from disk. Returns 1-based line-numbered content (the `N\\t` prefix is \
+         display-only — never include it in edit strings). Use `offset`/`limit` to page \
+         through large files. You must read a file before editing it."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -55,6 +56,7 @@ impl Tool for ReadTool {
         let text = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
+        ctx.mark_read(&path);
         let start = a.offset.unwrap_or(1).max(1);
         let limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
         let mut out = String::new();
@@ -86,8 +88,9 @@ impl Tool for WriteTool {
         "write_file"
     }
     fn description(&self) -> &'static str {
-        "Create a new file or overwrite an existing one with `content`. Parent directories \
-         are created as needed. Prefer `edit` for changing part of an existing file."
+        "Create a new file or fully rewrite an existing one with `content`. Parent \
+         directories are created as needed. Overwriting an existing file requires reading \
+         it first. Prefer `edit` for changing part of an existing file."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -103,6 +106,13 @@ impl Tool for WriteTool {
         let a: WriteArgs = serde_json::from_value(args).context("invalid write_file args")?;
         let path = ctx.resolve(&a.path);
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        if existed && !ctx.was_read(&path) {
+            bail!(
+                "{} exists but you haven't read it — call read_file first so the rewrite \
+                 starts from its real content (or use edit for a partial change)",
+                path.display()
+            );
+        }
         let old = if existed {
             tokio::fs::read_to_string(&path).await.unwrap_or_default()
         } else {
@@ -119,6 +129,7 @@ impl Tool for WriteTool {
         tokio::fs::write(&path, &a.content)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
+        ctx.mark_read(&path); // the model authored this content
         if existed {
             let diff = unified_diff(&path.display().to_string(), &old, &a.content);
             let body = if diff.is_empty() {
@@ -171,8 +182,10 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &'static str {
-        "Replace an exact substring in a file. `old_string` must match uniquely unless \
-         `replace_all` is set. This is the preferred, token-cheap way to mutate a file."
+        "Replace an exact substring in a file (the preferred, token-cheap way to change \
+         it). Copy `old_string` exactly from read_file output — same whitespace, line-number \
+         prefixes stripped — and include enough surrounding lines to be unique. Requires \
+         having read the file first."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -189,16 +202,29 @@ impl Tool for EditTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: EditArgs = serde_json::from_value(args).context("invalid edit args")?;
         let path = ctx.resolve(&a.path);
+        if !ctx.was_read(&path) {
+            bail!(
+                "you haven't read {} yet — call read_file first, then copy old_string \
+                 exactly from its output",
+                path.display()
+            );
+        }
         let text = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
         let count = text.matches(&a.old_string).count();
         if count == 0 {
-            bail!("old_string not found in {}", path.display());
+            bail!(
+                "old_string not found in {} — the file may have changed since you read it; \
+                 re-read it and copy the exact current text (whitespace included, no \
+                 line-number prefixes)",
+                path.display()
+            );
         }
         if count > 1 && !a.replace_all {
             bail!(
-                "old_string is not unique in {} ({count} matches) — add context or set replace_all",
+                "old_string is not unique in {} ({count} matches) — include more \
+                 surrounding lines to pin one occurrence, or set replace_all",
                 path.display()
             );
         }
@@ -255,13 +281,18 @@ impl Tool for BashTool {
     }
     fn description(&self) -> &'static str {
         "Run a shell command via `bash -c` in the working directory. Use for build, test, \
-         git, and anything without a dedicated tool. Output is captured and length-bounded."
+         git, and anything without a dedicated tool. Output is captured and length-bounded. \
+         Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
+         hook-skipping, and destructive commands are rejected."
     }
     fn parameters(&self) -> serde_json::Value {
         shell_parameters("Shell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ShellArgs = serde_json::from_value(args).context("invalid bash args")?;
+        if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
+            bail!("command blocked: {msg}");
+        }
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
@@ -385,6 +416,9 @@ impl Tool for PowerShellTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ShellArgs = serde_json::from_value(args).context("invalid powershell args")?;
+        if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
+            bail!("command blocked: {msg}");
+        }
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &a.command])
             .current_dir(&ctx.cwd);
@@ -853,6 +887,89 @@ mod tests {
     // ---- write_file ----
 
     #[tokio::test]
+    async fn edit_and_overwrite_require_prior_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "content").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        // Blind edit and blind overwrite both refuse.
+        let err = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "content", "new_string": "x"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read_file first"), "{err}");
+        let err = WriteTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "x"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read_file first"), "{err}");
+        // A read (relative path — canonicalization must unify spellings)
+        // unlocks the edit.
+        ReadTool
+            .execute(serde_json::json!({"path": "f.txt"}), &c)
+            .await
+            .unwrap();
+        EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "content", "new_string": "updated"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+    }
+
+    #[tokio::test]
+    async fn model_authored_writes_are_editable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let c = ctx(dir.path().to_path_buf());
+        // Creating a new file needs no read; the model knows what it wrote,
+        // so an immediate edit (and overwrite) is allowed.
+        WriteTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "alpha beta"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "beta", "new_string": "gamma"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha gamma");
+    }
+
+    #[tokio::test]
+    async fn bash_guardrail_blocks_command() {
+        if which::which("bash").is_err() {
+            return; // no bash on this machine
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let err = BashTool
+            .execute(serde_json::json!({"command": "git add -A"}), &c)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("command blocked"), "{err}");
+        // Harmless commands still run.
+        let out = BashTool
+            .execute(serde_json::json!({"command": "echo ok"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("ok"));
+    }
+
+    #[tokio::test]
     async fn write_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.txt");
@@ -890,6 +1007,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "foo bar baz").unwrap();
         let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path); // edits require a prior read
         EditTool
             .execute(
                 serde_json::json!({"path": path.to_str().unwrap(), "old_string": "bar", "new_string": "qux"}),
@@ -906,6 +1024,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
         let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path);
         let out = EditTool
             .execute(
                 serde_json::json!({"path": path.to_str().unwrap(), "old_string": "two", "new_string": "TWO"}),
@@ -940,6 +1059,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "aa bb aa").unwrap();
         let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path);
         let result = EditTool
             .execute(
                 serde_json::json!({"path": path.to_str().unwrap(), "old_string": "aa", "new_string": "cc"}),
@@ -955,6 +1075,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "aa bb aa").unwrap();
         let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path);
         EditTool
             .execute(
                 serde_json::json!({"path": path.to_str().unwrap(), "old_string": "aa", "new_string": "cc", "replace_all": true}),

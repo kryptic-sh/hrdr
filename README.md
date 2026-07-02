@@ -214,6 +214,32 @@ doesn't expose context length, and some servers (including infr today) don't
 advertise it. It drives the status bar's "X of Y" and the auto-compaction
 threshold.
 
+### Guardrails
+
+The shell tools mechanically reject the classic git foot-guns before they run —
+blanket staging (`git add -A` / `--all` / `.`), force-push (`--force-with-lease`
+is allowed), hook skipping (`--no-verify`), destructive commands
+(`reset --hard`, `clean -f`, `checkout/restore .`), and interactive commands
+that need a TTY. The model gets a corrective error instead ("stage the files you
+actually changed"), which is far more reliable than a prompt rule alone.
+
+Add project- or workflow-specific rules in config; they apply on top of the
+built-ins:
+
+```toml
+[[guardrails]]
+pattern = "\\bnpm\\s+publish\\b"
+message = "publishing is manual — never publish from the agent"
+
+[[guardrails]]
+pattern = "\\bkubectl\\s+delete\\b"
+message = "ask the user before deleting cluster resources"
+```
+
+Relatedly, `edit`/`write_file` refuse to mutate an existing file the model
+hasn't read this session — blind edits against guessed content are the top
+source of corrupt patches.
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.
