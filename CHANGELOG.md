@@ -19,7 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hides the bar, `truncate` keeps one row, `wrap` lets sections flow onto
   multiple rows (terminal width-fitting in the TUI, flex-wrap in the GUI). The
   TUI's bar additionally gains the ttft section the GUI already showed.
-  `TUI_ONLY_COMMANDS` is down to `/theme` and `/edit`.
+  `TUI_ONLY_COMMANDS` is down to `/theme` and `/edit`. The GUI renders the
+  context gauge as a **real progress bar** (a rounded track with a
+  fraction-width fill layer under the label) via the raw `CtxGauge` data the
+  shared section model carries alongside its character-cell runs, so
+  proportional fonts don't skew the fill boundary.
 
 - **GUI feature parity, round two.** The GUI now covers everything but the
   genuinely terminal-bound commands:

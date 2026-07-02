@@ -853,14 +853,21 @@ fn app_view(
                         .into_any(),
                 );
             }
-            for run in seg.runs {
-                let text = run.text.clone();
-                let role = run.role;
-                children.push(
-                    label(move || text.clone())
-                        .style(move |s| status_run_style(s, role, theme))
-                        .into_any(),
-                );
+            if let Some(gauge) = seg.gauge {
+                // The context gauge as a real progress container: a fill layer
+                // sized by the fraction behind the label (instead of the
+                // character-cell split the TUI's text runs use).
+                children.push(ctx_gauge_view(gauge, theme));
+            } else {
+                for run in seg.runs {
+                    let text = run.text.clone();
+                    let role = run.role;
+                    children.push(
+                        label(move || text.clone())
+                            .style(move |s| status_run_style(s, role, theme))
+                            .into_any(),
+                    );
+                }
             }
             h_stack_from_iter(children)
                 .style(|s| s.items_center())
@@ -1777,6 +1784,35 @@ fn render_item(
 /// A plain (non-reactive) text label.
 fn text_label(s: String) -> impl IntoView {
     label(move || s.clone())
+}
+
+/// The context gauge as a real progress bar: a rounded track with a fill
+/// layer whose width is the used fraction, and the shared label on top.
+fn ctx_gauge_view(gauge: hrdr_app::CtxGauge, th: GuiTheme) -> AnyView {
+    use floem::views::{empty, stack};
+    let fill_color = match gauge.level {
+        hrdr_app::CtxLevel::Ok => th.ok,
+        hrdr_app::CtxLevel::Warn => th.tool,
+        hrdr_app::CtxLevel::Critical => th.err,
+    };
+    let frac = gauge.frac.clamp(0.0, 1.0) * 100.0;
+    let label_text = gauge.label.trim().to_string();
+    stack((
+        // Fill layer (drawn first = behind the label).
+        empty().style(move |s| {
+            s.absolute()
+                .inset_left(0.0)
+                .inset_top(0.0)
+                .height_full()
+                .width_pct(frac)
+                .background(fill_color)
+                .border_radius(4.0)
+        }),
+        label(move || label_text.clone())
+            .style(move |s| s.color(th.assistant).padding_horiz(8.0).padding_vert(1.0)),
+    ))
+    .style(move |s| s.background(th.dim).border_radius(4.0).items_center())
+    .into_any()
 }
 
 /// Map a shared status color role onto the GUI theme (mirrors the TUI's

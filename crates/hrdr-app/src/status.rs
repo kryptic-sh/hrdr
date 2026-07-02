@@ -49,12 +49,26 @@ pub struct StatusRun {
     pub role: StatusRole,
 }
 
+/// The context gauge's raw data, for frontends that can draw a real progress
+/// bar (the GUI) instead of the character-cell fill the text runs encode.
+#[derive(Debug, Clone)]
+pub struct CtxGauge {
+    /// Fill fraction, `0.0..=1.0`.
+    pub frac: f64,
+    pub level: CtxLevel,
+    /// The gauge's label (`" 12.3k of 32k "`).
+    pub label: String,
+}
+
 /// One status-bar section: a drop `priority` (higher = dropped first when the
-/// TUI truncates) and its styled runs.
+/// TUI truncates) and its styled runs. `gauge` carries the context gauge's
+/// raw data when this section is it — text frontends use the pre-split
+/// fill/rest runs, pixel frontends draw a real bar from the gauge.
 #[derive(Debug, Clone)]
 pub struct StatusSeg {
     pub priority: u8,
     pub runs: Vec<StatusRun>,
+    pub gauge: Option<CtxGauge>,
 }
 
 impl StatusSeg {
@@ -62,6 +76,7 @@ impl StatusSeg {
         Self {
             priority,
             runs: vec![StatusRun { text, role }],
+            gauge: None,
         }
     }
     /// Display width in characters.
@@ -154,7 +169,11 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
                     role: StatusRole::CtxRest,
                 });
             }
-            sections.push(StatusSeg { priority: 1, runs });
+            sections.push(StatusSeg {
+                priority: 1,
+                runs,
+                gauge: Some(CtxGauge { frac, level, label }),
+            });
         }
         _ => sections.push(StatusSeg::one(
             1,
@@ -205,6 +224,11 @@ mod tests {
         // 90% of a 1000-token window with an 0.85 trigger → critical fill.
         let ctx = &segs[4];
         assert_eq!(ctx.runs[0].role, StatusRole::CtxFill(CtxLevel::Critical));
+        // The raw gauge data rides along for pixel frontends.
+        let gauge = ctx.gauge.as_ref().expect("ctx section carries the gauge");
+        assert!((gauge.frac - 0.9).abs() < 1e-9);
+        assert_eq!(gauge.level, CtxLevel::Critical);
+        assert!(gauge.label.contains("of"));
         // Unknown window → plain count.
         let mut i2 = inputs();
         i2.context_window = None;
