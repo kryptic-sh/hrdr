@@ -961,12 +961,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("command blocked"), "{err}");
-        // Harmless commands still run.
-        let out = BashTool
-            .execute(serde_json::json!({"command": "echo ok"}), &c)
-            .await
-            .unwrap();
-        assert!(out.contains("ok"));
+        // Harmless commands still run. Unix-only: on Windows CI `bash` on
+        // PATH is the WSL stub, which errors without a distro installed.
+        #[cfg(unix)]
+        {
+            let out = BashTool
+                .execute(serde_json::json!({"command": "echo ok"}), &c)
+                .await
+                .unwrap();
+            assert!(out.contains("ok"));
+        }
     }
 
     #[tokio::test]
