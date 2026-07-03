@@ -70,8 +70,7 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
         .unwrap_or_default();
     doc[provider] = toml_edit::value(token);
     let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
     // Write to a temp file in the same directory, then rename atomically.
     // tempfile is a dev-dependency only, so we build the temp name manually.
@@ -90,29 +89,36 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
     };
     #[cfg(not(unix))]
     let create_file = || -> Result<std::fs::File> {
-        std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))
     };
 
+    // `create_new` guarantees we own `tmp`; a failure here means someone else's
+    // temp collided, so we must not clean it up. Everything after gets a
+    // cleanup-on-error guard so a failed save never leaves a stray temp behind
+    // (notably: a rename that fails still removes the temp we wrote).
     let mut f = create_file()?;
-    f.write_all(content.as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    // Flush + fsync so the data is on disk before the rename.
-    f.flush()?;
-    #[cfg(unix)]
-    f.sync_all()?;
+    let result = (|| -> Result<()> {
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Flush + fsync so the data is on disk before the rename.
+        f.flush()?;
+        #[cfg(unix)]
+        f.sync_all()?;
+        Ok(())
+    })();
     drop(f);
-
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-
-    // On non-unix, attempt to restrict permissions after the fact (best-effort).
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_readonly(true));
+    let result = result.and_then(|()| {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-
-    Ok(())
+    // No non-unix permission tightening: the Windows read-only *attribute*
+    // doesn't restrict reads (access is by ACL) and would make the file
+    // un-replaceable by the next atomic rename. Unix already got 0600 above;
+    // proper Windows hardening (per-user ACL) is a follow-up.
+    result
 }
 
 /// A unique temp-file path inside `parent` (same filesystem as `path`, so the
@@ -154,6 +160,23 @@ mod tests {
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_tokens_at(&dir.path().join("nope.toml")).is_empty());
+    }
+
+    #[test]
+    fn save_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        save_token_at(&path, "zen", "sk").unwrap();
+        save_token_at(&path, "openai", "sk2").unwrap();
+        // The only file in the directory is the credential file itself — the
+        // atomic-write temp is renamed away, never orphaned.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "auth.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected files left: {leftovers:?}");
     }
 
     #[cfg(unix)]
