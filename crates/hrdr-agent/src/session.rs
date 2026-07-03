@@ -70,7 +70,7 @@ pub fn cwd_slug(cwd: &str) -> String {
 }
 
 /// The per-cwd directory a session lives in.
-pub fn session_dir(cwd: &str) -> PathBuf {
+fn session_dir(cwd: &str) -> PathBuf {
     sessions_dir().join(cwd_slug(cwd))
 }
 

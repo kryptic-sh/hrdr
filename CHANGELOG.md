@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-07-03
+### Added
+
+- **`/info` now shows a `messages: N` line** — the raw conversation-history
+  length (system prompt + every turn and tool result). Surfaced through the
+  shared command core, so it appears in both the TUI and the GUI.
+
+### Fixed
+
+- **Verbatim-retry breaker messages no longer contain stray whitespace.** The
+  refusal and nudge strings had runs of literal spaces (missing line
+  continuations), so the model saw
+  `…failed 2 times                      in a row…`. Cleaned up to normal prose.
+
+### Changed
+
+- **Internal DRY/YAGNI cleanup of `hrdr-agent` (no behaviour change).** The
+  single-call and concurrent tool paths are now one path (a lone mutating call
+  is a one-element batch); a shared `drain_stream` helper backs the turn loop,
+  the wrap-up round, and the silent compaction call; `config_file_path`,
+  `load()`, and the `is_transient`/`is_context_overflow` error classifiers were
+  deduplicated; and the unused `run_tool_streaming`, `session_dir` export, and
+  `CheckpointInfo`/`FileCheckpoints` re-exports were removed. Net ~160 fewer
+  lines.
 
 ### Fixed
 

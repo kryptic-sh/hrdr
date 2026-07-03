@@ -8,8 +8,7 @@ mod prompt;
 mod session;
 
 pub use session::{
-    Session, SessionMeta, cwd_slug, list_sessions, resolve_session, session_dir, sessions_dir,
-    unique_session_id,
+    Session, SessionMeta, cwd_slug, list_sessions, resolve_session, sessions_dir, unique_session_id,
 };
 
 use std::collections::HashMap;
@@ -20,8 +19,6 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
 use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
-
-pub use hrdr_tools::{CheckpointInfo, Checkpoints as FileCheckpoints};
 
 pub use prompt::{gather_agent_docs, render_system};
 
@@ -134,7 +131,9 @@ impl RepeatGuard {
         (self.key == Some(call_key(name, raw_args)) && self.failures >= REPEAT_REFUSE_AFTER).then(
             || {
                 format!(
-                    "refused without running: this exact {name} call already failed {} times                      in a row — change the arguments or the approach; if you're stuck, stop                      and tell the user what you tried",
+                    "refused without running: this exact {name} call already failed {} \
+                     times in a row — change the arguments or the approach; if you're \
+                     stuck, stop and tell the user what you tried",
                     self.failures
                 )
             },
@@ -157,8 +156,8 @@ impl RepeatGuard {
         }
         self.failures += 1;
         Some(format!(
-            "
-[note: this exact call has failed {} times in a row — change the input or              approach instead of retrying it verbatim]",
+            "\n[note: this exact call has failed {} times in a row — change the input \
+             or approach instead of retrying it verbatim]",
             self.failures
         ))
     }
@@ -331,7 +330,8 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     hjkl_xdg::config_dir("hrdr").ok()
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+/// Path to the user config file (`~/.config/hrdr/config.toml`), if `HOME` is set.
+pub fn config_file_path() -> Option<std::path::PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
@@ -340,22 +340,20 @@ impl AgentConfig {
     /// defaults. Lenient: a malformed config file is ignored (treated as absent).
     /// Does NOT auto-write a config file when one is missing.
     pub fn load() -> Self {
-        let mut cfg = Self::default();
-        if let Some(path) = config_path()
-            && let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(fc) = toml::from_str::<FileConfig>(&text)
-        {
-            cfg.apply_file(fc);
-        }
-        cfg.apply_env();
-        cfg
+        // A malformed file is treated as absent: fall back to defaults, but
+        // still layer env vars on top (same as a missing file).
+        Self::load_checked().unwrap_or_else(|_| {
+            let mut cfg = Self::default();
+            cfg.apply_env();
+            cfg
+        })
     }
 
     /// Like [`load`](Self::load) but returns an error if the config file exists
     /// and fails to parse (for surfacing a warning + falling back to defaults).
     pub fn load_checked() -> Result<Self> {
         let mut cfg = Self::default();
-        if let Some(path) = config_path()
+        if let Some(path) = config_file_path()
             && let Ok(text) = std::fs::read_to_string(&path)
         {
             let fc: FileConfig =
@@ -433,8 +431,6 @@ impl AgentConfig {
     }
 }
 
-/// Parse a boolean-ish env value; `None` (leave the current value) if it's not
-/// one of the recognized on/off spellings.
 /// Parse a boolean setting from a config/CLI/env string, accepting the common
 /// spellings (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`,
 /// case-insensitive). Returns `None` for anything unrecognized so callers can
@@ -478,15 +474,11 @@ pub enum ConfigValue<'a> {
     Int(i64),
 }
 
-/// Path to the user config file (`~/.config/hrdr/config.toml`), if `HOME` is set.
-pub fn config_file_path() -> Option<std::path::PathBuf> {
-    config_path()
-}
-
 /// Set `key = value` in the user config file (creating it if needed), preserving
 /// existing keys, ordering, and comments. Returns the file path.
 pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathBuf> {
-    let path = config_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
+    let path =
+        config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
     let mut doc = read_config_doc(&path);
     match value {
         ConfigValue::Str(s) => doc[key] = toml_edit::value(s),
@@ -500,7 +492,8 @@ pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathB
 
 /// Remove `key` from the user config file (if present). Returns the file path.
 pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
-    let path = config_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
+    let path =
+        config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
     let mut doc = read_config_doc(&path);
     doc.remove(key);
     write_config_doc(&path, &doc)?;
@@ -880,12 +873,10 @@ impl Agent {
     }
 
     /// Run one no-tools request to completion, returning the streamed text.
+    /// Silent: the shared [`drain_stream`] gets a no-op event sink.
     async fn plain_completion(&self, req: Vec<ChatMessage>) -> Result<String> {
         let mut stream = self.client.chat_stream(req, vec![]).await?;
-        let mut acc = Accumulator::new();
-        while let Some(chunk) = stream.next().await {
-            acc.push(&chunk?);
-        }
+        let acc = drain_stream(&mut stream, &mut |_| {}).await?;
         Ok(acc.into_message().content.unwrap_or_default())
     }
 
@@ -918,18 +909,7 @@ impl Agent {
             let mut stream = self
                 .connect_stream(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
-            let mut acc = Accumulator::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                if let Some(choice) = chunk.choices.first()
-                    && let Some(r) = &choice.delta.reasoning_content
-                {
-                    on_event(AgentEvent::Reasoning(r.clone()));
-                }
-                if let Some(text) = acc.push(&chunk) {
-                    on_event(AgentEvent::Text(text));
-                }
-            }
+            let acc = drain_stream(&mut stream, &mut on_event).await?;
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server
@@ -976,33 +956,11 @@ impl Agent {
                 let batch = &tool_calls[idx..end];
                 idx = end;
 
-                if batch.len() == 1 {
-                    let call = &batch[0];
-                    on_event(AgentEvent::ToolStart {
-                        id: call.id.clone(),
-                        name: call.function.name.clone(),
-                        args: call.function.arguments.clone(),
-                    });
-                    // A call that already failed twice verbatim is refused
-                    // without running (the breaker resets on any different
-                    // call, so real retry cycles pass).
-                    let result = match repeat.refusal(&call.function.name, &call.function.arguments)
-                    {
-                        Some(msg) => Err(anyhow::anyhow!(msg)),
-                        None => {
-                            self.run_tool_streaming(
-                                &call.id,
-                                &call.function.name,
-                                &call.function.arguments,
-                                &mut on_event,
-                            )
-                            .await
-                        }
-                    };
-                    self.finish_tool_call(call, result, &mut repeat, &mut on_event);
-                } else {
-                    self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
-                }
+                // One path for both: a read-only run executes concurrently, a
+                // lone mutating call is a one-element batch. The refusal check,
+                // arg parse, streamed output, and in-order results all live in
+                // `run_tool_batch`.
+                self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
             }
 
             // Near the budget: tell the model so it wraps up instead of
@@ -1033,18 +991,7 @@ impl Agent {
         let mut stream = self
             .connect_stream(&[], &mut overflow_compacted, &mut on_event)
             .await?;
-        let mut acc = Accumulator::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if let Some(choice) = chunk.choices.first()
-                && let Some(r) = &choice.delta.reasoning_content
-            {
-                on_event(AgentEvent::Reasoning(r.clone()));
-            }
-            if let Some(text) = acc.push(&chunk) {
-                on_event(AgentEvent::Text(text));
-            }
-        }
+        let acc = drain_stream(&mut stream, &mut on_event).await?;
         self.messages.push(acc.into_message());
         on_event(AgentEvent::TurnDone);
         Ok(())
@@ -1077,9 +1024,10 @@ impl Agent {
             .push(ChatMessage::tool_result(call.id.clone(), body));
     }
 
-    /// Run a batch of read-only tool calls concurrently, forwarding each
-    /// call's streamed output as `ToolOutput` events (attributed by call id)
-    /// while they run. Results are emitted and recorded in call order.
+    /// Run a batch of tool calls, forwarding each call's streamed output as
+    /// `ToolOutput` events (attributed by call id) while they run. A read-only
+    /// run executes concurrently; a lone mutating call is a one-element batch.
+    /// Results are emitted and recorded in call order.
     async fn run_tool_batch<F: FnMut(AgentEvent)>(
         &mut self,
         batch: &[hrdr_llm::ToolCall],
@@ -1199,47 +1147,6 @@ impl Agent {
             }
         }
     }
-
-    /// Execute a tool, forwarding any live output it streams as `ToolOutput`
-    /// events while it runs.
-    async fn run_tool_streaming<F: FnMut(AgentEvent)>(
-        &self,
-        id: &str,
-        name: &str,
-        raw_args: &str,
-        on_event: &mut F,
-    ) -> Result<String> {
-        let args: serde_json::Value = if raw_args.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(raw_args)
-                .map_err(|e| anyhow::anyhow!("invalid tool arguments JSON: {e}"))?
-        };
-        // Attach a per-call output sink so the tool can stream progress.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut ctx = self.ctx.clone();
-        ctx.stream = Some(tx);
-
-        let fut = self.tools.execute(name, args, &ctx);
-        tokio::pin!(fut);
-        let result = loop {
-            tokio::select! {
-                r = &mut fut => break r,
-                Some(chunk) = rx.recv() => on_event(AgentEvent::ToolOutput {
-                    id: id.to_string(),
-                    chunk,
-                }),
-            }
-        };
-        // Drain any chunks buffered between the last poll and completion.
-        while let Ok(chunk) = rx.try_recv() {
-            on_event(AgentEvent::ToolOutput {
-                id: id.to_string(),
-                chunk,
-            });
-        }
-        result
-    }
 }
 
 // Re-exports consumers need without reaching into sub-crates.
@@ -1247,33 +1154,48 @@ pub use hrdr_llm::ChatMessage as Message;
 pub use hrdr_llm::Role as MessageRole;
 pub use hrdr_tools::TodoItem as Todo;
 
-/// Whether an error looks like a transient network/server failure worth
-/// retrying (connection issues, 429, or 5xx).
-fn is_transient(e: &anyhow::Error) -> bool {
+/// Case-insensitive substring scan of an error's display string against a set
+/// of marker phrases — the shared shape of the classifiers below.
+fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
     let msg = e.to_string().to_ascii_lowercase();
-    msg.contains("request failed")           // reqwest send() failure (network)
-        || msg.contains("timed out")
-        || msg.contains("connection")
-        || msg.contains("reset")
-        || msg.contains("broken pipe")
-        || msg.contains("returned 429")       // rate limited
-        || msg.contains("returned 500")
-        || msg.contains("returned 502")
-        || msg.contains("returned 503")
-        || msg.contains("returned 504")
+    needles.iter().any(|n| msg.contains(n))
+}
+
+/// Whether an error looks like a transient network/server failure worth
+/// retrying (connection issues `request failed`/`timed out`/…, 429, or 5xx).
+fn is_transient(e: &anyhow::Error) -> bool {
+    err_mentions(
+        e,
+        &[
+            "request failed", // reqwest send() failure (network)
+            "timed out",
+            "connection",
+            "reset",
+            "broken pipe",
+            "returned 429", // rate limited
+            "returned 500",
+            "returned 502",
+            "returned 503",
+            "returned 504",
+        ],
+    )
 }
 
 /// Whether an error is the server rejecting the request for exceeding the
 /// model's context window.
 fn is_context_overflow(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_ascii_lowercase();
-    msg.contains("context length")
-        || msg.contains("context_length")
-        || msg.contains("maximum context")
-        || msg.contains("context window")
-        || msg.contains("context size")
-        || msg.contains("too many tokens")
-        || msg.contains("reduce the length")
+    err_mentions(
+        e,
+        &[
+            "context length",
+            "context_length",
+            "maximum context",
+            "context window",
+            "context size",
+            "too many tokens",
+            "reduce the length",
+        ],
+    )
 }
 
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
@@ -1333,6 +1255,28 @@ fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
 fn retry_backoff(attempt: usize) -> std::time::Duration {
     let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
     std::time::Duration::from_secs_f64(secs.min(8.0))
+}
+
+/// Drain a chat stream into an [`Accumulator`], emitting `Reasoning` and `Text`
+/// deltas as they arrive. Shared by the turn loop, the budget-exhausted wrap-up
+/// round, and (with a no-op sink) the one-off compaction call.
+async fn drain_stream<F: FnMut(AgentEvent)>(
+    stream: &mut ChatStream,
+    on_event: &mut F,
+) -> Result<Accumulator> {
+    let mut acc = Accumulator::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if let Some(choice) = chunk.choices.first()
+            && let Some(r) = &choice.delta.reasoning_content
+        {
+            on_event(AgentEvent::Reasoning(r.clone()));
+        }
+        if let Some(text) = acc.push(&chunk) {
+            on_event(AgentEvent::Text(text));
+        }
+    }
+    Ok(acc)
 }
 
 /// Repair a history left dangling by an interrupted turn. An assistant message

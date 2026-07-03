@@ -390,13 +390,16 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let (tokens_in, tokens_out) = host.session_tokens();
             let effort = host.effort().unwrap_or_else(|| "—".to_string());
             host.spawn_line(Box::pin(async move {
-                let temp = agent.lock().await.temperature();
+                let (temp, messages) = {
+                    let a = agent.lock().await;
+                    (a.temperature(), a.message_count())
+                };
                 let dir = crate::display_dir(&cwd);
                 let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
                 format!(
                     "session: {session}\nmodel: {model}\nendpoint: {base_url}\ncwd: {dir} \
                      ({branch})\ncontext: {ctx}\ntokens: ↑{tokens_in} ↓{tokens_out}\n\
-                     temperature: {}\neffort: {effort}",
+                     temperature: {}\neffort: {effort}\nmessages: {messages}",
                     temp.map(|t| t.to_string())
                         .unwrap_or_else(|| "default".to_string())
                 )
