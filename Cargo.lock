@@ -2349,6 +2349,7 @@ dependencies = [
  "hrdr-llm",
  "hrdr-tools",
  "hrdr-tui",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
  "which",

@@ -155,6 +155,15 @@ impl CompletionShell {
 enum Command {
     /// Run a single task to completion headlessly, streaming output to stdout.
     Run {
+        /// Emit newline-delimited JSON events on stdout (for scripting/CI).
+        #[arg(long)]
+        json: bool,
+        /// Suppress the tool/usage chrome on stderr; print only the reply text.
+        #[arg(long)]
+        quiet: bool,
+        /// Override the tool-round budget for this run.
+        #[arg(long, value_name = "N")]
+        max_steps: Option<usize>,
         /// The task prompt (all trailing words are joined).
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
@@ -319,51 +328,114 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Run { prompt }) => run_headless(config, prompt.join(" ")).await,
+        Some(Command::Run {
+            json,
+            quiet,
+            max_steps,
+            prompt,
+        }) => {
+            if let Some(n) = max_steps {
+                config.max_steps = n;
+            }
+            run_headless(config, prompt.join(" "), json, quiet).await
+        }
         Some(Command::Models) => list_models(config).await,
         None => hrdr_tui::run(config, ui).await,
     }
 }
 
-/// Headless single-turn run: stream events to stdout.
-async fn run_headless(config: AgentConfig, prompt: String) -> Result<()> {
+/// Headless single-turn run. Default: reply text on stdout, tool/usage chrome
+/// on stderr. `--json`: newline-delimited JSON events on stdout (scripting).
+/// `--quiet`: text only. Exit code 0 on a completed turn, 1 on error.
+async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
-    agent
-        .run(prompt, |ev| match ev {
-            AgentEvent::Text(t) => {
-                print!("{t}");
+    let result = agent
+        .run(prompt, |ev| {
+            if json {
+                println!("{}", event_json(&ev));
                 let _ = std::io::stdout().flush();
+                return;
             }
-            AgentEvent::Reasoning(_) => {}
-            AgentEvent::ToolStart { name, args, .. } => {
-                eprintln!(
-                    "\x1b[33m⚙ {name}\x1b[0m {}",
-                    hrdr_tools::truncate_inline(&args, 120)
-                );
+            match ev {
+                AgentEvent::Text(t) => {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                }
+                AgentEvent::Reasoning(_) => {}
+                AgentEvent::ToolStart { name, args, .. } if !quiet => {
+                    eprintln!(
+                        "\x1b[33m⚙ {name}\x1b[0m {}",
+                        hrdr_tools::truncate_inline(&args, 120)
+                    );
+                }
+                AgentEvent::ToolOutput { chunk, .. } if !quiet => {
+                    eprint!("\x1b[90m{chunk}\x1b[0m");
+                    let _ = std::io::stderr().flush();
+                }
+                AgentEvent::Notice(text) if !quiet => eprintln!("\x1b[90m[{text}]\x1b[0m"),
+                AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
+                    let mark = if ok {
+                        "\x1b[32m✓\x1b[0m"
+                    } else {
+                        "\x1b[31m✗\x1b[0m"
+                    };
+                    eprintln!("{mark} {name}");
+                }
+                AgentEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } if !quiet => {
+                    eprintln!(
+                        "\x1b[90m[usage] ctx {prompt_tokens} · out {completion_tokens}\x1b[0m"
+                    );
+                }
+                AgentEvent::TurnDone => println!(),
+                _ => {}
             }
-            AgentEvent::ToolOutput { chunk, .. } => {
-                eprint!("\x1b[90m{chunk}\x1b[0m");
-                let _ = std::io::stderr().flush();
-            }
-            AgentEvent::Notice(text) => eprintln!("\x1b[90m[{text}]\x1b[0m"),
-            AgentEvent::ToolEnd { name, ok, .. } => {
-                let mark = if ok {
-                    "\x1b[32m✓\x1b[0m"
-                } else {
-                    "\x1b[31m✗\x1b[0m"
-                };
-                eprintln!("{mark} {name}");
-            }
-            AgentEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                eprintln!("\x1b[90m[usage] ctx {prompt_tokens} · out {completion_tokens}\x1b[0m");
-            }
-            AgentEvent::TurnDone => println!(),
         })
-        .await?;
+        .await;
+    if let Err(e) = result {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"type": "error", "message": e.to_string()})
+            );
+        }
+        return Err(e);
+    }
     Ok(())
+}
+
+/// One [`AgentEvent`] as a single-line JSON object (`hrdr run --json`).
+fn event_json(ev: &AgentEvent) -> String {
+    use serde_json::json;
+    let v = match ev {
+        AgentEvent::Text(t) => json!({"type": "text", "text": t}),
+        AgentEvent::Reasoning(t) => json!({"type": "reasoning", "text": t}),
+        AgentEvent::ToolStart { id, name, args } => {
+            json!({"type": "tool_start", "id": id, "name": name, "args": args})
+        }
+        AgentEvent::ToolOutput { id, chunk } => {
+            json!({"type": "tool_output", "id": id, "chunk": chunk})
+        }
+        AgentEvent::ToolEnd {
+            id,
+            name,
+            result,
+            ok,
+        } => {
+            json!({"type": "tool_end", "id": id, "name": name, "ok": ok, "result": result})
+        }
+        AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
+        AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+        } => {
+            json!({"type": "usage", "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})
+        }
+        AgentEvent::TurnDone => json!({"type": "done"}),
+    };
+    v.to_string()
 }
 
 /// Print available model ids, one per line.

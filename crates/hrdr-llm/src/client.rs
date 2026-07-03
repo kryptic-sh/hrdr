@@ -1,12 +1,55 @@
 //! HTTP client over `/v1/chat/completions` and `/v1/models`.
 
+use std::io::Write;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
 use crate::types::{ChatChunk, ChatMessage, ChatRequest, ToolDef};
+
+/// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
+/// request body, every raw SSE data line, and every non-2xx response body is
+/// appended to the file as one JSON object per line. For debugging
+/// harness ⇄ server disagreements (tool-call framing, stream shape) — off
+/// unless the env var is set.
+static REQUEST_LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn request_log() -> Option<&'static Mutex<std::fs::File>> {
+    REQUEST_LOG
+        .get_or_init(|| {
+            let path = std::env::var_os("HRDR_LOG_REQUESTS")?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Append one `{"ts":…,"kind":…,…}` line to the wire log (no-op when off).
+fn log_wire(kind: &str, fields: serde_json::Value) {
+    let Some(file) = request_log() else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut obj = serde_json::json!({"ts": ts, "kind": kind});
+    if let (Some(o), Some(f)) = (obj.as_object_mut(), fields.as_object()) {
+        for (k, v) in f {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{obj}");
+    }
+}
 
 /// Boxed stream of decoded streaming chunks.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
@@ -91,6 +134,13 @@ impl Client {
         tools: Vec<ToolDef>,
     ) -> Result<ChatStream> {
         let body = self.request(messages, tools, true);
+        log_wire(
+            "request",
+            serde_json::json!({
+                "url": format!("{}/chat/completions", self.base_url),
+                "body": serde_json::to_value(&body).unwrap_or_default(),
+            }),
+        );
         let resp = self
             .post(&body)
             .send()
@@ -99,6 +149,10 @@ impl Client {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            log_wire(
+                "error_response",
+                serde_json::json!({"status": status.as_u16(), "body": text}),
+            );
             bail!("chat endpoint returned {status}: {text}");
         }
 
@@ -124,6 +178,7 @@ impl Client {
                     if data.is_empty() {
                         continue;
                     }
+                    log_wire("sse", serde_json::json!({"data": data}));
                     if data == "[DONE]" {
                         return;
                     }

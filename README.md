@@ -90,7 +90,15 @@ hrdr --vim
 
 # one-shot headless run, streamed to stdout
 hrdr run "add a --json flag to the status command"
+
+# scripting/CI: NDJSON events, no chrome, bounded budget
+hrdr run --json --max-steps 20 "bump the patch version" | jq -r 'select(.type=="text").text'
+hrdr run --quiet "summarize the failing tests"
 ```
+
+For debugging harness ⇄ server disagreements, `HRDR_LOG_REQUESTS=<path>` appends
+every chat request body, raw SSE line, and non-2xx response to the file as
+JSON-per-line.
 
 In the TUI, type a message and press `Enter` to send. `@path` attaches a file
 (with completion), and typing `/` opens a slash-command menu.

@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Headless `hrdr run` grows scripting flags.** `--json` streams
+  newline-delimited JSON events on stdout (`text`/`reasoning`/`tool_start`/
+  `tool_output`/`tool_end`/`notice`/`usage`/`done`, plus `error` before a
+  non-zero exit); `--quiet` suppresses the stderr tool/usage chrome;
+  `--max-steps <N>` bounds the tool-round budget per run.
+
+- **Wire-level debug logging (`HRDR_LOG_REQUESTS=<path>`).** Every chat request
+  body, raw SSE data line, and non-2xx response body is appended to the file as
+  one JSON object per line — for debugging harness ⇄ server disagreements
+  (tool-call framing, stream shape). Off unless the env var is set.
+
 - **Compaction keeps the recent tail verbatim.** `/compact` (and
   auto-compaction) now summarizes only the older part of the conversation and
   keeps the last ~6 messages word-for-word after the summary — compaction
