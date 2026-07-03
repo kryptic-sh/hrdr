@@ -521,11 +521,34 @@ struct GrepArgs {
     path: Option<String>,
     #[serde(default)]
     glob: Option<String>,
+    #[serde(default)]
+    context: Option<usize>,
+}
+
+impl GrepArgs {
+    /// Context lines per match side, clamped to something sane.
+    fn context(&self) -> usize {
+        self.context.unwrap_or(0).min(GREP_MAX_CONTEXT)
+    }
+
+    /// Match cap: with context each match is ~2·n+1 lines, so the budget
+    /// shrinks accordingly.
+    fn max_matches(&self) -> usize {
+        if self.context() == 0 {
+            GREP_MAX_MATCHES
+        } else {
+            GREP_MAX_MATCHES_WITH_CONTEXT
+        }
+    }
 }
 
 /// Max matches a single grep call returns; beyond this the result ends with a
 /// "narrow the pattern" nudge instead of flooding the context.
 const GREP_MAX_MATCHES: usize = 200;
+/// Lower cap when `context` is requested (each match is a whole window).
+const GREP_MAX_MATCHES_WITH_CONTEXT: usize = 50;
+/// Upper bound on `context` lines per side.
+const GREP_MAX_CONTEXT: usize = 10;
 
 #[async_trait]
 impl Tool for GrepTool {
@@ -538,7 +561,8 @@ impl Tool for GrepTool {
     fn description(&self) -> &'static str {
         "Search file contents (via ripgrep, grep, or a built-in walker — whichever is available). \
          Returns `path:line:match`. Optionally scope to a `path` and/or filter files with a \
-         `glob` (e.g. '*.rs')."
+         `glob` (e.g. '*.rs'). Set `context` to 2–3 to see the lines around each match \
+         instead of making a follow-up read_file call."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -546,7 +570,8 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {"type": "string", "description": "Regex pattern to search for."},
                 "path": {"type": "string", "description": "File or directory to search (default cwd)."},
-                "glob": {"type": "string", "description": "Glob to filter files, e.g. '*.rs'."}
+                "glob": {"type": "string", "description": "Glob to filter files, e.g. '*.rs'."},
+                "context": {"type": "integer", "description": "Lines of context around each match (0-10, default 0)."}
             },
             "required": ["pattern"]
         })
@@ -567,6 +592,9 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         .arg("--no-heading")
         .arg("--color=never")
         .current_dir(&ctx.cwd);
+    if a.context() > 0 {
+        cmd.arg("-C").arg(a.context().to_string());
+    }
     if let Some(g) = &a.glob {
         cmd.arg("--glob").arg(g);
     }
@@ -574,18 +602,21 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if let Some(p) = &a.path {
         cmd.arg(p);
     }
-    run_search_cmd(cmd, "ripgrep", ctx).await
+    run_search_cmd(cmd, "ripgrep", a.max_matches(), ctx).await
 }
 
 async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let mut cmd = tokio::process::Command::new("grep");
     cmd.arg("-rnE").arg("--color=never").current_dir(&ctx.cwd);
+    if a.context() > 0 {
+        cmd.arg("-C").arg(a.context().to_string());
+    }
     if let Some(g) = &a.glob {
         cmd.arg(format!("--include={g}"));
     }
     cmd.arg("--").arg(&a.pattern);
     cmd.arg(a.path.as_deref().unwrap_or("."));
-    run_search_cmd(cmd, "grep", ctx).await
+    run_search_cmd(cmd, "grep", a.max_matches(), ctx).await
 }
 
 /// Run a configured search command: empty stdout means "(no matches)" (search
@@ -594,6 +625,7 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 async fn run_search_cmd(
     mut cmd: tokio::process::Command,
     tool: &str,
+    max_matches: usize,
     ctx: &ToolContext,
 ) -> Result<String> {
     let output = cmd
@@ -610,10 +642,7 @@ async fn run_search_cmd(
     }
     // Cap by match count first (with a "narrow the pattern" nudge), then by
     // bytes as the backstop.
-    Ok(truncate(
-        &cap_matches(&stdout, GREP_MAX_MATCHES),
-        ctx.max_output,
-    ))
+    Ok(truncate(&cap_matches(&stdout, max_matches), ctx.max_output))
 }
 
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
@@ -656,26 +685,90 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
             continue; // skip binary / non-UTF-8 files
         };
         let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
-        for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                matches += 1;
-                if matches > GREP_MAX_MATCHES {
-                    out.push_str(
-                        "… [match limit reached — narrow the pattern or scope with path/glob]",
-                    );
-                    break 'walk;
-                }
-                out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
-                if out.len() > ctx.max_output {
-                    break 'walk;
+        let n_ctx = a.context();
+        let max_matches = a.max_matches();
+        if n_ctx == 0 {
+            for (i, line) in text.lines().enumerate() {
+                if re.is_match(line) {
+                    matches += 1;
+                    if matches > max_matches {
+                        out.push_str(
+                            "… [match limit reached — narrow the pattern or scope with path/glob]",
+                        );
+                        break 'walk;
+                    }
+                    out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
+                    if out.len() > ctx.max_output {
+                        break 'walk;
+                    }
                 }
             }
+            continue;
+        }
+        // Context mode: collect this file's hits (bounded by the match cap),
+        // then emit merged ±n windows — matches as `path:NN:line`, context as
+        // `path-NN-line`, `--` between disjoint groups (grep/rg -C format).
+        let lines: Vec<&str> = text.lines().collect();
+        let mut hits: Vec<usize> = Vec::new();
+        let mut capped = false;
+        for (i, line) in lines.iter().enumerate() {
+            if re.is_match(line) {
+                if matches >= max_matches {
+                    capped = true;
+                    break;
+                }
+                matches += 1;
+                hits.push(i);
+            }
+        }
+        emit_context_windows(&mut out, &disp.display().to_string(), &lines, &hits, n_ctx);
+        if capped {
+            out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
+            break 'walk;
+        }
+        if out.len() > ctx.max_output {
+            break 'walk;
         }
     }
     if out.is_empty() {
         Ok("(no matches)".to_string())
     } else {
         Ok(truncate(out.trim_end(), ctx.max_output))
+    }
+}
+
+/// Append merged ±`n_ctx` windows around `hits` (0-based line indexes) in
+/// grep `-C` format: `path:NN:line` for matches, `path-NN-line` for context,
+/// `--` between disjoint groups (including the boundary to earlier output).
+fn emit_context_windows(
+    out: &mut String,
+    disp: &str,
+    lines: &[&str],
+    hits: &[usize],
+    n_ctx: usize,
+) {
+    if hits.is_empty() {
+        return;
+    }
+    // Merge overlapping/adjacent windows.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &h in hits {
+        let start = h.saturating_sub(n_ctx);
+        let end = (h + n_ctx).min(lines.len().saturating_sub(1));
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    let hit_set: std::collections::HashSet<usize> = hits.iter().copied().collect();
+    for (start, end) in ranges {
+        if !out.is_empty() {
+            out.push_str("--\n");
+        }
+        for (i, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+            let sep = if hit_set.contains(&i) { ':' } else { '-' };
+            out.push_str(&format!("{disp}{sep}{}{sep}{line}\n", i + 1));
+        }
     }
 }
 
@@ -897,6 +990,7 @@ mod tests {
                 pattern: "foo".into(),
                 path: None,
                 glob: None,
+                context: None,
             },
             &c,
         )
@@ -910,6 +1004,7 @@ mod tests {
                 pattern: "foo".into(),
                 path: None,
                 glob: Some("*.rs".into()),
+                context: None,
             },
             &c,
         )
@@ -923,11 +1018,57 @@ mod tests {
                 pattern: "zzz_nope".into(),
                 path: None,
                 glob: None,
+                context: None,
             },
             &c,
         )
         .unwrap();
         assert_eq!(out, "(no matches)");
+    }
+
+    #[tokio::test]
+    async fn grep_builtin_context_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "l1\nl2\nl3 hit\nl4\nl5\nl6\nl7\nl8 hit\nl9\nl10\nl11\nl12\nl13 hit\nl14\n",
+        )
+        .unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "hit".into(),
+                path: None,
+                glob: None,
+                context: Some(1),
+            },
+            &c,
+        )
+        .unwrap();
+        // Matches use `:`; context lines use `-`; disjoint groups separated
+        // by `--`. Lines 3 and 8 don't overlap at ±1 → two groups; 13 makes
+        // a third.
+        assert!(out.contains("f.txt:3:l3 hit"), "{out}");
+        assert!(out.contains("f.txt-2-l2"), "{out}");
+        assert!(out.contains("f.txt-4-l4"), "{out}");
+        assert!(out.contains("f.txt:8:l8 hit"), "{out}");
+        assert_eq!(out.matches("--\n").count(), 2, "{out}");
+        // Overlapping windows merge: context 3 joins hits 3 and 8 into one
+        // group (and 13 stays separate: 8+3=11 < 13-3=10? no — 11 >= 10-1,
+        // adjacent-merge joins them too, so exactly one separator drops).
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "hit".into(),
+                path: None,
+                glob: None,
+                context: Some(3),
+            },
+            &c,
+        )
+        .unwrap();
+        assert_eq!(out.matches("--\n").count(), 0, "{out}");
+        // No duplicate lines from the merge.
+        assert_eq!(out.matches("l5").count(), 1, "{out}");
     }
 
     // ---- read_file ----

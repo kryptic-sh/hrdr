@@ -318,23 +318,44 @@ pub fn truncate_middle(text: &str, max: usize) -> String {
     )
 }
 
-/// Cap line-per-match output at `max_matches` lines, appending a count of what
-/// was dropped and how to narrow the search. For search tools: a broad pattern
-/// shouldn't flood the context with thousands of hits.
+/// Cap search output at `max_matches` *matches*, appending a count of what
+/// was dropped and how to narrow the search. Only `path:NN:…` lines count as
+/// matches — `path-NN-…` context lines and `--` group separators (grep/rg
+/// `-C` format) ride along with their match, so a context-grep isn't
+/// over-counted.
 pub fn cap_matches(out: &str, max_matches: usize) -> String {
-    let total = out.lines().count();
+    let total = out.lines().filter(|l| is_match_line(l)).count();
     if total <= max_matches {
         return out.trim_end().to_string();
     }
-    let kept: String = out.lines().take(max_matches).collect::<Vec<_>>().join(
-        "
-",
-    );
+    let mut kept: Vec<&str> = Vec::new();
+    let mut count = 0usize;
+    for line in out.lines() {
+        if is_match_line(line) {
+            count += 1;
+            if count > max_matches {
+                break;
+            }
+        }
+        kept.push(line);
+    }
     let more = total - max_matches;
     format!(
-        "{kept}
-… [{more} more matches — narrow the pattern or scope with path/glob]"
+        "{}\n… [{more} more matches — narrow the pattern or scope with path/glob]",
+        kept.join("\n")
     )
+}
+
+/// Whether a search-output line is a match (`path:NN:…`) as opposed to a
+/// `-C` context line (`path-NN-…`) or a `--` group separator.
+fn is_match_line(line: &str) -> bool {
+    let Some((_, rest)) = line.split_once(':') else {
+        return false;
+    };
+    let Some((num, _)) = rest.split_once(':') else {
+        return false;
+    };
+    !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Collapse `s` to a single line (newlines → spaces) and truncate to `max`
@@ -487,6 +508,24 @@ b:2:y
             "a:1:x
 b:2:y"
         );
+    }
+
+    #[test]
+    fn cap_matches_ignores_context_lines_and_separators() {
+        // Context lines (dash format) and `--` separators don't count as
+        // matches; each kept match keeps its surrounding context.
+        let ctx_out =
+            "f.rs-1-a\nf.rs:2:hit\nf.rs-3-b\n--\nf.rs-9-c\nf.rs:10:hit\n--\nf.rs:20:hit\n";
+        let capped = cap_matches(ctx_out, 2);
+        assert!(capped.contains("f.rs:2:hit") && capped.contains("f.rs:10:hit"));
+        assert!(!capped.contains("f.rs:20:hit"));
+        assert!(capped.contains("[1 more matches"));
+        assert!(
+            capped.contains("f.rs-9-c"),
+            "context of kept match survives"
+        );
+        // Untouched when matches (not lines) are under the cap.
+        assert_eq!(cap_matches(ctx_out, 3), ctx_out.trim_end());
     }
 
     #[test]

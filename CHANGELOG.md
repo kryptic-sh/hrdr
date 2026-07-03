@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`grep` gains a `context` param (`-C` style).** `context: 2–3` returns the
+  lines around each match — matches as `path:NN:line`, context as
+  `path-NN-line`, `--` between groups (the standard grep/rg `-C` format, all
+  three backends; the built-in walker merges overlapping windows). Saves the
+  follow-up `read_file` round-trip per investigated hit. With context on, the
+  match cap drops 200 → 50 (each match is a whole window), and the cap now
+  counts only match lines, so context lines never eat the budget.
+
 - **Verbatim-retry breaker.** When the exact same tool call (name + args) fails
   twice in a row, the second failure carries a "change the input or approach"
   nudge and a third attempt is refused without executing — the classic
