@@ -106,6 +106,12 @@ pub struct AgentConfig {
     /// Per-tool output line cap before truncation (`[tool_output] max_lines`),
     /// applied alongside [`tool_max_bytes`](Self::tool_max_bytes).
     pub tool_max_lines: usize,
+    /// Recent turns kept verbatim through compaction (`compaction_tail_turns`).
+    /// Default [`DEFAULT_TAIL_TURNS`].
+    pub compaction_tail_turns: usize,
+    /// Token budget for the verbatim tail kept through compaction
+    /// (`preserve_recent_tokens`). Default [`DEFAULT_PRESERVE_RECENT_TOKENS`].
+    pub preserve_recent_tokens: u32,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -113,12 +119,12 @@ pub struct AgentConfig {
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
 
 /// Tool-output pruning keeps the most recent this-many estimated tokens of tool
-/// output verbatim; older bodies are cleared. Sized for mid-to-large contexts —
-/// on a small-context model it simply never triggers (compaction handles those).
-const PRUNE_PROTECT_TOKENS: u32 = 16_000;
+/// output verbatim; older bodies are cleared. Matches opencode's `PRUNE_PROTECT`.
+const PRUNE_PROTECT_TOKENS: u32 = 40_000;
 /// Only prune when at least this many tokens would actually be reclaimed —
-/// clearing a few small results isn't worth the lost detail.
-const PRUNE_MINIMUM_TOKENS: u32 = 8_000;
+/// clearing a few small results isn't worth the lost detail. Matches opencode's
+/// `PRUNE_MINIMUM`.
+const PRUNE_MINIMUM_TOKENS: u32 = 20_000;
 /// The most recent this-many turns (user messages) are never pruned, so the
 /// model always keeps the tool output it's actively working with.
 const PRUNE_KEEP_TURNS: usize = 2;
@@ -212,6 +218,8 @@ impl Default for AgentConfig {
             hooks: Vec::new(),
             tool_max_bytes: hrdr_tools::DEFAULT_MAX_OUTPUT,
             tool_max_lines: hrdr_tools::DEFAULT_MAX_OUTPUT_LINES,
+            compaction_tail_turns: DEFAULT_TAIL_TURNS,
+            preserve_recent_tokens: DEFAULT_PRESERVE_RECENT_TOKENS,
         }
     }
 }
@@ -382,6 +390,8 @@ struct FileConfig {
     #[serde(default)]
     hooks: Vec<HookConfig>,
     tool_output: Option<ToolOutputConfig>,
+    compaction_tail_turns: Option<usize>,
+    preserve_recent_tokens: Option<u32>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -477,6 +487,12 @@ impl AgentConfig {
             if let Some(v) = to.max_bytes {
                 self.tool_max_bytes = v;
             }
+        }
+        if let Some(v) = fc.compaction_tail_turns {
+            self.compaction_tail_turns = v;
+        }
+        if let Some(v) = fc.preserve_recent_tokens {
+            self.preserve_recent_tokens = v;
         }
     }
 
@@ -644,6 +660,11 @@ pub struct Agent {
     /// Prune old tool output from the history before each request (see
     /// [`AgentConfig::auto_prune`]).
     auto_prune: bool,
+    /// Recent turns kept verbatim through compaction ([`AgentConfig::compaction_tail_turns`]).
+    compaction_tail_turns: usize,
+    /// Token budget for the kept-verbatim compaction tail
+    /// ([`AgentConfig::preserve_recent_tokens`]).
+    preserve_recent_tokens: u32,
     /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
     project_docs: Option<String>,
     /// File checkpoint store (per-turn pre-images), if a store dir is available.
@@ -728,6 +749,8 @@ impl Agent {
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
             auto_prune: config.auto_prune,
+            compaction_tail_turns: config.compaction_tail_turns,
+            preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
             checkpoints,
         })
@@ -893,7 +916,11 @@ impl Agent {
         // Keep the most recent messages verbatim — compaction usually fires
         // mid-task, and the summary alone loses exactly the detail the model
         // is working with. Only the head (everything older) is summarized.
-        let tail_start = compaction_split(&self.messages, KEEP_RECENT_ON_COMPACT);
+        let tail_start = compaction_tail_start(
+            &self.messages,
+            self.compaction_tail_turns,
+            self.preserve_recent_tokens,
+        );
         if tail_start <= 2 {
             // Nothing meaningful before the tail; compacting would only churn.
             return Ok((before, before));
@@ -992,7 +1019,12 @@ impl Agent {
             // (compaction is the expensive fallback). No-op until there's enough
             // old output to matter.
             if self.auto_prune {
-                let reclaimed = prune_tool_messages(&mut self.messages);
+                let reclaimed = prune_tool_messages(
+                    &mut self.messages,
+                    PRUNE_PROTECT_TOKENS,
+                    PRUNE_MINIMUM_TOKENS,
+                    PRUNE_KEEP_TURNS,
+                );
                 if reclaimed > 0 {
                     on_event(AgentEvent::Notice(format!(
                         "pruned ~{reclaimed} tokens of old tool output"
@@ -1297,20 +1329,45 @@ fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
 const ELIDE_TOOL_RESULT_BYTES: usize = 400;
 
-/// How many recent messages survive compaction verbatim (extended backward so
-/// a tool-result group is never split from its assistant `tool_calls`).
-const KEEP_RECENT_ON_COMPACT: usize = 6;
+/// Default recent turns kept verbatim through compaction (`tail_turns`).
+/// Matches opencode's `DEFAULT_TAIL_TURNS`.
+pub const DEFAULT_TAIL_TURNS: usize = 2;
+/// Default token budget for the verbatim tail kept through compaction
+/// (`preserve_recent_tokens`). Matches opencode's `MAX_PRESERVE_RECENT_TOKENS`.
+pub const DEFAULT_PRESERVE_RECENT_TOKENS: u32 = 8_000;
 
-/// Index where the kept-verbatim tail begins for compaction: the last
-/// [`KEEP_RECENT_ON_COMPACT`] messages, moved backward past `role:"tool"`
-/// results so the tail starts on the assistant that owns them (never index 0,
-/// the system prompt). Everything in `1..start` gets summarized.
-fn compaction_split(msgs: &[ChatMessage], keep: usize) -> usize {
-    let mut start = msgs.len().saturating_sub(keep).max(1);
-    while start > 1 && msgs[start].role == Role::Tool {
-        start -= 1;
+/// Index where the kept-verbatim tail begins for compaction. Keeps the last
+/// `tail_turns` turns (a turn begins at a `role:"user"` message), but no more
+/// than `preserve_tokens` estimated tokens — walking newest → oldest, adding
+/// whole turns until the budget is hit, always keeping at least the newest
+/// turn. Never returns 0 (the system prompt stays); the tail always begins on a
+/// user message, so no tool result is orphaned. Everything in `1..start` gets
+/// summarized. Mirrors opencode's compaction tail selection.
+fn compaction_tail_start(msgs: &[ChatMessage], tail_turns: usize, preserve_tokens: u32) -> usize {
+    if tail_turns == 0 {
+        return msgs.len();
     }
-    start
+    // Turn boundaries: user messages after the system prompt.
+    let starts: Vec<usize> = (1..msgs.len())
+        .filter(|&i| msgs[i].role == Role::User)
+        .collect();
+    let Some(&newest) = starts.last() else {
+        return msgs.len().max(1);
+    };
+    let candidates = &starts[starts.len().saturating_sub(tail_turns)..];
+    let mut tail_start = msgs.len();
+    let mut tokens = 0u32;
+    for &start in candidates.iter().rev() {
+        let turn_tokens = estimate_tokens_in_messages(&msgs[start..tail_start]);
+        // Always keep the newest turn; stop before an older turn that busts the
+        // budget.
+        if start != newest && tokens + turn_tokens > preserve_tokens {
+            break;
+        }
+        tokens += turn_tokens;
+        tail_start = start;
+    }
+    tail_start.max(1)
 }
 
 /// Copy of `msgs` with bulky tool-result bodies truncated — tool output is the
@@ -1342,10 +1399,17 @@ fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
 /// stays, so the tool-call ↔ result pairing strict servers require is intact.
 ///
 /// Returns the estimated tokens reclaimed, or `0` when that would be below
-/// [`PRUNE_MINIMUM_TOKENS`] (in which case nothing is changed — small reclaims
-/// aren't worth the lost detail). Cheap and model-only: the UI transcript keeps
-/// the full output; this just bounds what gets re-sent every request.
-fn prune_tool_messages(messages: &mut [ChatMessage]) -> u32 {
+/// `minimum_tokens` (in which case nothing is changed — small reclaims aren't
+/// worth the lost detail). `protect_tokens` is the recent tool-output window
+/// kept verbatim; `keep_turns` the recent turns never touched. Cheap and
+/// model-only: the UI transcript keeps the full output; this just bounds what
+/// gets re-sent every request.
+fn prune_tool_messages(
+    messages: &mut [ChatMessage],
+    protect_tokens: u32,
+    minimum_tokens: u32,
+    keep_turns: usize,
+) -> u32 {
     let mut turns = 0usize;
     // Cumulative tool-output tokens seen scanning newest → oldest.
     let mut seen_tokens = 0u32;
@@ -1358,7 +1422,7 @@ fn prune_tool_messages(messages: &mut [ChatMessage]) -> u32 {
         }
         // The last few turns are always kept whole — the model is still working
         // with that output.
-        if turns < PRUNE_KEEP_TURNS {
+        if turns < keep_turns {
             continue;
         }
         if m.role != Role::Tool {
@@ -1371,13 +1435,13 @@ fn prune_tool_messages(messages: &mut [ChatMessage]) -> u32 {
         let est = estimate_tokens(body);
         seen_tokens += est;
         // Keep the newest window verbatim; everything older is a prune target.
-        if seen_tokens <= PRUNE_PROTECT_TOKENS {
+        if seen_tokens <= protect_tokens {
             continue;
         }
         reclaimable += est;
         victims.push(i);
     }
-    if reclaimable < PRUNE_MINIMUM_TOKENS {
+    if reclaimable < minimum_tokens {
         return 0;
     }
     for i in victims {
@@ -1492,11 +1556,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, PRUNE_MINIMUM_TOKENS,
-        PRUNE_PLACEHOLDER, PRUNE_PROTECT_TOKENS, ProviderConfig, ToolOutputConfig,
-        builtin_provider, compaction_split, elide_tool_results, estimate_tokens,
-        estimate_tokens_in_messages, in_git_repo, is_context_overflow, is_transient,
-        parse_env_bool, prune_tool_messages, repair_dangling_tool_calls, tail_window,
+        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, PRUNE_PLACEHOLDER,
+        ProviderConfig, ToolOutputConfig, builtin_provider, compaction_tail_start,
+        elide_tool_results, estimate_tokens, estimate_tokens_in_messages, in_git_repo,
+        is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
+        repair_dangling_tool_calls, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1756,9 +1820,13 @@ mod tests {
                 max_lines: Some(500),
                 max_bytes: Some(20_000),
             }),
+            compaction_tail_turns: Some(4),
+            preserve_recent_tokens: Some(12_000),
         });
         assert_eq!(cfg.tool_max_lines, 500);
         assert_eq!(cfg.tool_max_bytes, 20_000);
+        assert_eq!(cfg.compaction_tail_turns, 4);
+        assert_eq!(cfg.preserve_recent_tokens, 12_000);
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
         assert_eq!(cfg.model, "gpt-4");
@@ -1930,12 +1998,11 @@ mod tests {
             assistant_with_calls(&["d"]),
             ChatMessage::tool_result("d", big.clone()), // 11 — current turn protected
         ];
-        let reclaimed = prune_tool_messages(&mut msgs);
-
-        // Protect window is 16k tokens: turn-3/4 output is shielded by the
-        // last-2-turns rule, turn-2's 10k fills the window, so only turn-1's
-        // 10k (the oldest) is cleared.
-        assert!(reclaimed >= PRUNE_MINIMUM_TOKENS);
+        // Protect window 16k tokens, minimum 8k, keep 2 turns: turn-3/4 output
+        // is shielded by the last-2-turns rule, turn-2's 10k fills the window,
+        // so only turn-1's 10k (the oldest) is cleared.
+        let reclaimed = prune_tool_messages(&mut msgs, 16_000, 8_000, 2);
+        assert!(reclaimed >= 8_000);
         assert_eq!(reclaimed, estimate_tokens(&big));
         assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
         for kept in [5, 8, 11] {
@@ -1945,7 +2012,7 @@ mod tests {
         assert!(msgs[1].tool_calls.is_some());
 
         // Idempotent: a second pass finds only the placeholder + kept window.
-        assert_eq!(prune_tool_messages(&mut msgs), 0);
+        assert_eq!(prune_tool_messages(&mut msgs, 16_000, 8_000, 2), 0);
     }
 
     #[test]
@@ -1966,34 +2033,38 @@ mod tests {
             ChatMessage::tool_result("c", "recent".to_string()), // 8 — protected
             ChatMessage::user("u4"),
         ];
-        assert!(estimate_tokens(&tiny) < PRUNE_MINIMUM_TOKENS);
-        assert!(estimate_tokens(&within) >= PRUNE_PROTECT_TOKENS - PRUNE_MINIMUM_TOKENS);
-        let reclaimed = prune_tool_messages(&mut msgs);
+        // protect 16k, minimum 8k: `within` fills the window, `tiny` (3k) is the
+        // only prunable — below the minimum, so nothing changes.
+        assert!(estimate_tokens(&tiny) < 8_000);
+        let reclaimed = prune_tool_messages(&mut msgs, 16_000, 8_000, 2);
         assert_eq!(reclaimed, 0);
         assert_eq!(msgs[2].content.as_deref(), Some(tiny.as_str())); // untouched
     }
 
     #[test]
-    fn compaction_split_keeps_recent_and_groups_tool_results() {
-        // 10 messages, keep 4 → tail starts at index 6… but index 6 is a tool
-        // result, so the split walks back to its owning assistant (index 5).
+    fn compaction_tail_start_keeps_turns_within_token_budget() {
+        let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
         let msgs = vec![
             ChatMessage::system("sys"),          // 0
             ChatMessage::user("u1"),             // 1
-            ChatMessage::assistant("a1"),        // 2
+            ChatMessage::assistant(big.clone()), // 2
             ChatMessage::user("u2"),             // 3
-            ChatMessage::assistant("a2"),        // 4
-            assistant_with_calls(&["x", "y"]),   // 5
-            ChatMessage::tool_result("x", "r1"), // 6
-            ChatMessage::tool_result("y", "r2"), // 7
-            ChatMessage::assistant("a3"),        // 8
-            ChatMessage::user("u3"),             // 9
+            ChatMessage::assistant(big.clone()), // 4
+            ChatMessage::user("u3"),             // 5
+            ChatMessage::assistant(big.clone()), // 6
         ];
-        assert_eq!(compaction_split(&msgs, 4), 5);
-        // A clean boundary stays where it lands.
-        assert_eq!(compaction_split(&msgs, 2), 8);
-        // Tiny histories never split past the system prompt.
-        assert_eq!(compaction_split(&msgs[..3], 6), 1);
+        // Generous budget: keep the last 2 whole turns → tail starts at u2 (3).
+        assert_eq!(compaction_tail_start(&msgs, 2, 1_000_000), 3);
+        // One turn only → starts at u3 (5).
+        assert_eq!(compaction_tail_start(&msgs, 1, 1_000_000), 5);
+        // Budget caps it to the newest turn even when tail_turns allows more
+        // (each turn is ~5k tokens; two would bust an 8k budget).
+        assert_eq!(compaction_tail_start(&msgs, 3, 8_000), 5);
+        // tail_turns = 0 keeps nothing verbatim (whole history summarized).
+        assert_eq!(compaction_tail_start(&msgs, 0, 8_000), msgs.len());
+        // The tail always begins on a user message — never orphans a tool result.
+        let start = compaction_tail_start(&msgs, 2, 1_000_000);
+        assert_eq!(msgs[start].role, Role::User);
     }
 
     #[test]

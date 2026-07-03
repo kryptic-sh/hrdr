@@ -232,6 +232,30 @@ API doesn't expose context length, and some servers (including infr today) don't
 advertise it. It drives the status bar's "X of Y" and the auto-compaction
 threshold.
 
+### Context management
+
+hrdr keeps context under control in three layers (modeled on opencode), all
+tunable in `config.toml`:
+
+```toml
+# Per-tool output caps: over either limit, bash/grep output is truncated and the
+# full text saved to a temp file the model can read_file/grep.
+[tool_output]
+max_lines = 2000
+max_bytes = 51200
+
+# Prune: clear old tool-output bodies from the model context before each request
+# (keeps a recent window; the UI transcript keeps everything). Cheap, no model call.
+auto_prune = true
+
+# Compaction: when context fills, summarize the old head and keep the recent tail.
+auto_compact = 0.85            # trigger at 85% of the context window (0 disables)
+compaction_tail_turns = 2      # recent turns kept verbatim through a compaction
+preserve_recent_tokens = 8000  # …bounded by this token budget
+```
+
+`auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —

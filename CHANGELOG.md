@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Context management brought to parity with opencode.** Building on
+  tool-output pruning and the truncate-to-file layer: (1) per-tool truncation
+  now caps on **lines and bytes** (whichever first), both configurable via
+  `[tool_output]` `max_lines` (2000) / `max_bytes` (51200); (2) the prune
+  protect/minimum windows now match opencode's 40k/20k; (3) compaction keeps the
+  recent tail by **turns and a token budget** (`compaction_tail_turns` = 2,
+  `preserve_recent_tokens` = 8000) instead of a fixed message count. All tunable
+  in `config.toml`.
+
 - **Truncated `bash`/`grep` output is saved, not discarded.** When output
   exceeds the per-tool cap, the full result is written to a temp file
   (`<tmp>/hrdr-tool-output/`, read-whitelisted so the cwd-confined tools can
