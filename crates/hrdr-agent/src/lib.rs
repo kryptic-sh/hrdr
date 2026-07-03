@@ -753,6 +753,14 @@ impl Agent {
         if before <= 2 {
             return Ok((before, before));
         }
+        // Keep the most recent messages verbatim — compaction usually fires
+        // mid-task, and the summary alone loses exactly the detail the model
+        // is working with. Only the head (everything older) is summarized.
+        let tail_start = compaction_split(&self.messages, KEEP_RECENT_ON_COMPACT);
+        if tail_start <= 2 {
+            // Nothing meaningful before the tail; compacting would only churn.
+            return Ok((before, before));
+        }
 
         // Build a one-off summarization request: a dedicated summarizer system
         // prompt + the conversation so far (minus its own system prompt) + the
@@ -767,7 +775,7 @@ impl Agent {
         // `tools[]` block). If it overflows too, shrink what the summarizer
         // sees and retry: first elide bulky tool results, then keep only the
         // most recent half/quarter/eighth of the conversation.
-        let full: Vec<ChatMessage> = self.messages.iter().skip(1).cloned().collect();
+        let full: Vec<ChatMessage> = self.messages[1..tail_start].to_vec();
         let mut stage = 0usize;
         let summary = loop {
             let history = match stage {
@@ -789,16 +797,23 @@ impl Agent {
             bail!("compaction produced an empty summary");
         }
 
-        // Replace history: keep the original (coding) system prompt, then a
-        // single user message carrying the summary as the continuation seed.
+        // Replace history: the original (coding) system prompt, a user
+        // message carrying the summary as the continuation seed, then the
+        // recent tail verbatim.
         let system = self.messages[0].clone();
+        let tail: Vec<ChatMessage> = self.messages[tail_start..].to_vec();
         let continuation = format!(
             "This session is being continued from an earlier conversation that ran out of \
-             context. The summary below captures everything that happened; continue from where \
-             it left off without losing any detail.\n\n{summary}"
+             context. The summary below captures the older part of the conversation; the most \
+             recent messages follow it verbatim. Continue from where they leave off without \
+             losing any detail.\n\n{summary}"
         );
-        self.messages = vec![system, ChatMessage::user(continuation)];
-        // The file contents the model had read live only in the summary now;
+        let mut messages = Vec::with_capacity(2 + tail.len());
+        messages.push(system);
+        messages.push(ChatMessage::user(continuation));
+        messages.extend(tail);
+        self.messages = messages;
+        // Most file contents the model had read live only in the summary now;
         // require fresh reads before further edits.
         self.reset_read_files();
         Ok((before, self.messages.len()))
@@ -1177,6 +1192,22 @@ fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
 const ELIDE_TOOL_RESULT_BYTES: usize = 400;
 
+/// How many recent messages survive compaction verbatim (extended backward so
+/// a tool-result group is never split from its assistant `tool_calls`).
+const KEEP_RECENT_ON_COMPACT: usize = 6;
+
+/// Index where the kept-verbatim tail begins for compaction: the last
+/// [`KEEP_RECENT_ON_COMPACT`] messages, moved backward past `role:"tool"`
+/// results so the tail starts on the assistant that owns them (never index 0,
+/// the system prompt). Everything in `1..start` gets summarized.
+fn compaction_split(msgs: &[ChatMessage], keep: usize) -> usize {
+    let mut start = msgs.len().saturating_sub(keep).max(1);
+    while start > 1 && msgs[start].role == Role::Tool {
+        start -= 1;
+    }
+    start
+}
+
 /// Copy of `msgs` with bulky tool-result bodies truncated — tool output is the
 /// usual context hog, and the summarizer mostly needs the surrounding turns.
 fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -1284,9 +1315,9 @@ mod tests {
 
     use super::{
         Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, ProviderConfig,
-        builtin_provider, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
-        in_git_repo, is_context_overflow, is_transient, parse_env_bool, repair_dangling_tool_calls,
-        tail_window,
+        builtin_provider, compaction_split, elide_tool_results, estimate_tokens,
+        estimate_tokens_in_messages, in_git_repo, is_context_overflow, is_transient,
+        parse_env_bool, repair_dangling_tool_calls, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1669,6 +1700,29 @@ mod tests {
         let out = tail_window(&msgs, 2);
         assert!(out[0].role != Role::Tool, "window starts on a tool result");
         assert!(!out.is_empty() && out.len() < msgs.len());
+    }
+
+    #[test]
+    fn compaction_split_keeps_recent_and_groups_tool_results() {
+        // 10 messages, keep 4 → tail starts at index 6… but index 6 is a tool
+        // result, so the split walks back to its owning assistant (index 5).
+        let msgs = vec![
+            ChatMessage::system("sys"),          // 0
+            ChatMessage::user("u1"),             // 1
+            ChatMessage::assistant("a1"),        // 2
+            ChatMessage::user("u2"),             // 3
+            ChatMessage::assistant("a2"),        // 4
+            assistant_with_calls(&["x", "y"]),   // 5
+            ChatMessage::tool_result("x", "r1"), // 6
+            ChatMessage::tool_result("y", "r2"), // 7
+            ChatMessage::assistant("a3"),        // 8
+            ChatMessage::user("u3"),             // 9
+        ];
+        assert_eq!(compaction_split(&msgs, 4), 5);
+        // A clean boundary stays where it lands.
+        assert_eq!(compaction_split(&msgs, 2), 8);
+        // Tiny histories never split past the system prompt.
+        assert_eq!(compaction_split(&msgs[..3], 6), 1);
     }
 
     // ---- repair_dangling_tool_calls (additional cases) ----

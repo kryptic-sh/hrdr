@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Compaction keeps the recent tail verbatim.** `/compact` (and
+  auto-compaction) now summarizes only the older part of the conversation and
+  keeps the last ~6 messages word-for-word after the summary — compaction
+  usually fires mid-task, and a summary alone loses exactly the detail the model
+  is working with. The split never separates a tool result from its assistant
+  `tool_calls` message (strict servers reject orphans), and when everything is
+  already recent the pass is a no-op instead of churn.
+
 - **Post-edit hooks (`[[hooks]]` in config).** Run a shell command after
   `edit`/`write_file` mutates a matching file — formatters, mostly
   (`on`/`glob`/`run` with `{path}` substitution + per-hook `timeout_ms`). The
