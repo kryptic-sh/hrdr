@@ -490,6 +490,43 @@ async fn step_budget_exhaustion_wraps_up_instead_of_failing() {
 }
 
 #[tokio::test]
+async fn verbatim_failing_retry_is_refused_on_third_attempt() {
+    // The model retries the exact same failing call three rounds in a row;
+    // the third must be refused without executing, then the turn ends.
+    let bad = || {
+        MockReply::ToolCalls(vec![(
+            "read_file".to_string(),
+            r#"{"path":"no/such/file.txt"}"#.to_string(),
+        )])
+    };
+    let mut h = Harness::new(vec![
+        bad(),
+        bad(),
+        bad(),
+        MockReply::Text("Giving up differently.".to_string()),
+    ])
+    .await;
+    h.submit("read that file").await;
+    let screen = h.render();
+    assert!(
+        screen.contains("failed 2 times in a row"),
+        "nudge missing:
+{screen}"
+    );
+    assert!(
+        screen.contains("refused without running"),
+        "refusal missing:
+{screen}"
+    );
+    assert!(
+        screen.contains("Giving up differently."),
+        "final text missing:
+{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
 async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
     // The model hallucinates a tool that doesn't exist; the turn must recover.
     let mut h = Harness::new(vec![

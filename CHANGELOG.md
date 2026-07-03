@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Verbatim-retry breaker.** When the exact same tool call (name + args) fails
+  twice in a row, the second failure carries a "change the input or approach"
+  nudge and a third attempt is refused without executing — the classic
+  small-model loop (same wrong `old_string`, forever) now self-terminates. Any
+  intervening different call or a success resets the streak, so legitimate
+  `test → edit → test` retry cycles are never blocked. Applies to both the
+  sequential and the concurrent (read-only batch) paths.
+
 - **Headless `hrdr run` grows scripting flags.** `--json` streams
   newline-delimited JSON events on stdout (`text`/`reasoning`/`tool_start`/
   `tool_output`/`tool_end`/`notice`/`usage`/`done`, plus `error` before a

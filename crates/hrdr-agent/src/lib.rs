@@ -104,6 +104,66 @@ pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
 /// (appended to the last tool result of that round).
 const WRAP_UP_WARNING_ROUNDS: usize = 3;
 
+/// Consecutive identical failures after which the exact same call is refused
+/// without executing (small models loop on verbatim retries).
+const REPEAT_REFUSE_AFTER: u32 = 2;
+
+/// Anti-loop breaker: tracks the last failed call and how many times the
+/// *exact same* call (tool + raw args) has failed in a row. Any intervening
+/// different call — or a success — resets it, so a legitimate
+/// `test → edit → test` retry cycle is never blocked; only verbatim
+/// fail-retry-fail loops are.
+#[derive(Default)]
+struct RepeatGuard {
+    key: Option<u64>,
+    failures: u32,
+}
+
+fn call_key(name: &str, raw_args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    raw_args.hash(&mut h);
+    h.finish()
+}
+
+impl RepeatGuard {
+    /// The refusal message when this call must not run again (it already
+    /// failed [`REPEAT_REFUSE_AFTER`]+ times in a row), else `None`.
+    fn refusal(&self, name: &str, raw_args: &str) -> Option<String> {
+        (self.key == Some(call_key(name, raw_args)) && self.failures >= REPEAT_REFUSE_AFTER).then(
+            || {
+                format!(
+                    "refused without running: this exact {name} call already failed {} times                      in a row — change the arguments or the approach; if you're stuck, stop                      and tell the user what you tried",
+                    self.failures
+                )
+            },
+        )
+    }
+
+    /// Record a call's outcome; on a repeated failure returns the nudge to
+    /// append to the error the model sees.
+    fn record(&mut self, name: &str, raw_args: &str, ok: bool) -> Option<String> {
+        let k = call_key(name, raw_args);
+        if self.key != Some(k) {
+            self.key = Some(k);
+            self.failures = u32::from(!ok);
+            return None;
+        }
+        if ok {
+            self.key = None;
+            self.failures = 0;
+            return None;
+        }
+        self.failures += 1;
+        Some(format!(
+            "
+[note: this exact call has failed {} times in a row — change the input or              approach instead of retrying it verbatim]",
+            self.failures
+        ))
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -848,6 +908,8 @@ impl Agent {
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
         let mut overflow_compacted = false;
+        // Anti-loop breaker for verbatim retries of a failing call.
+        let mut repeat = RepeatGuard::default();
 
         for step in 0..self.max_steps {
             // Stream one assistant turn, accumulating text + tool calls. The
@@ -921,17 +983,25 @@ impl Agent {
                         name: call.function.name.clone(),
                         args: call.function.arguments.clone(),
                     });
-                    let result = self
-                        .run_tool_streaming(
-                            &call.id,
-                            &call.function.name,
-                            &call.function.arguments,
-                            &mut on_event,
-                        )
-                        .await;
-                    self.finish_tool_call(call, result, &mut on_event);
+                    // A call that already failed twice verbatim is refused
+                    // without running (the breaker resets on any different
+                    // call, so real retry cycles pass).
+                    let result = match repeat.refusal(&call.function.name, &call.function.arguments)
+                    {
+                        Some(msg) => Err(anyhow::anyhow!(msg)),
+                        None => {
+                            self.run_tool_streaming(
+                                &call.id,
+                                &call.function.name,
+                                &call.function.arguments,
+                                &mut on_event,
+                            )
+                            .await
+                        }
+                    };
+                    self.finish_tool_call(call, result, &mut repeat, &mut on_event);
                 } else {
-                    self.run_tool_batch(batch, &mut on_event).await;
+                    self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
                 }
             }
 
@@ -981,17 +1051,22 @@ impl Agent {
     }
 
     /// Emit the `ToolEnd` event and push the tool-result message for a
-    /// completed call (shared by the sequential and concurrent paths).
+    /// completed call (shared by the sequential and concurrent paths). Feeds
+    /// the repeat breaker, appending its nudge to a repeated failure.
     fn finish_tool_call<F: FnMut(AgentEvent)>(
         &mut self,
         call: &hrdr_llm::ToolCall,
         result: Result<String>,
+        repeat: &mut RepeatGuard,
         on_event: &mut F,
     ) {
-        let (ok, body) = match result {
+        let (ok, mut body) = match result {
             Ok(s) => (true, s),
             Err(e) => (false, format!("Error: {e}")),
         };
+        if let Some(nudge) = repeat.record(&call.function.name, &call.function.arguments, ok) {
+            body.push_str(&nudge);
+        }
         on_event(AgentEvent::ToolEnd {
             id: call.id.clone(),
             name: call.function.name.clone(),
@@ -1008,6 +1083,7 @@ impl Agent {
     async fn run_tool_batch<F: FnMut(AgentEvent)>(
         &mut self,
         batch: &[hrdr_llm::ToolCall],
+        repeat: &mut RepeatGuard,
         on_event: &mut F,
     ) {
         // One shared (id, chunk) channel; each call gets a private sink whose
@@ -1035,17 +1111,28 @@ impl Agent {
             // Cheap clone (Arc-backed registry) so the futures don't borrow
             // `self` — results are recorded with `&mut self` right after.
             let tools = self.tools.clone();
-            futs.push(async move {
-                let args: serde_json::Value = if raw_args.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    match serde_json::from_str(&raw_args) {
-                        Ok(v) => v,
-                        Err(e) => return Err(anyhow::anyhow!("invalid tool arguments JSON: {e}")),
-                    }
+            // A refused call (repeat breaker) resolves immediately instead of
+            // executing; boxing keeps the join order == call order.
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> =
+                match repeat.refusal(&name, &raw_args) {
+                    Some(msg) => Box::pin(async move { Err(anyhow::anyhow!(msg)) }),
+                    None => Box::pin(async move {
+                        let args: serde_json::Value = if raw_args.trim().is_empty() {
+                            serde_json::json!({})
+                        } else {
+                            match serde_json::from_str(&raw_args) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "invalid tool arguments JSON: {e}"
+                                    ));
+                                }
+                            }
+                        };
+                        tools.execute(&name, args, &ctx).await
+                    }),
                 };
-                tools.execute(&name, args, &ctx).await
-            });
+            futs.push(fut);
         }
         drop(shared_tx); // forwarders hold the remaining senders
 
@@ -1064,7 +1151,7 @@ impl Agent {
             on_event(AgentEvent::ToolOutput { id, chunk });
         }
         for (call, result) in batch.iter().zip(results) {
-            self.finish_tool_call(call, result, on_event);
+            self.finish_tool_call(call, result, repeat, on_event);
         }
     }
 
@@ -1723,6 +1810,32 @@ mod tests {
         assert_eq!(compaction_split(&msgs, 2), 8);
         // Tiny histories never split past the system prompt.
         assert_eq!(compaction_split(&msgs[..3], 6), 1);
+    }
+
+    #[test]
+    fn repeat_guard_blocks_verbatim_loops_only() {
+        let mut g = super::RepeatGuard::default();
+        // First failure: no nudge, no refusal.
+        assert!(g.record("edit", "{a}", false).is_none());
+        assert!(g.refusal("edit", "{a}").is_none());
+        // Second identical failure: nudge; third attempt: refused.
+        assert!(g.record("edit", "{a}", false).is_some());
+        assert!(g.refusal("edit", "{a}").is_some());
+        // A different call resets the streak — the same call may run again…
+        assert!(g.record("bash", "{fix}", true).is_none());
+        assert!(g.refusal("edit", "{a}").is_none());
+        // …so test → edit → test cycles are never blocked.
+        assert!(g.record("bash", "{test}", false).is_none());
+        assert!(g.record("edit", "{fix2}", true).is_none());
+        assert!(g.refusal("bash", "{test}").is_none());
+        // Success of the previously failing call clears it too.
+        assert!(g.record("edit", "{a}", false).is_none());
+        assert!(g.record("edit", "{a}", true).is_none());
+        assert!(g.refusal("edit", "{a}").is_none());
+        // Different args = different call.
+        assert!(g.record("edit", "{x}", false).is_none());
+        assert!(g.record("edit", "{y}", false).is_none());
+        assert!(g.refusal("edit", "{y}").is_none());
     }
 
     // ---- repair_dangling_tool_calls (additional cases) ----
