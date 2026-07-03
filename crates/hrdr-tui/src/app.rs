@@ -150,8 +150,11 @@ pub(crate) struct App {
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
-    /// Auto-compact trigger as a fraction of the context window; 0 disables.
+    /// Auto-compact enable carrier: `0` (or out of range) disables it.
     pub(crate) auto_compact_ratio: f64,
+    /// Tokens reserved below the context window — auto-compaction fires at
+    /// `context_window − compaction_reserved` (opencode's model).
+    pub(crate) compaction_reserved: u32,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
     bell: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
@@ -218,6 +221,7 @@ impl App {
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
         let auto_compact = config.auto_compact;
+        let compaction_reserved = config.compaction_reserved;
         let auto_resume = ui.auto_resume;
         let bell = ui.bell;
         let todo_ttl = ui.todo_ttl;
@@ -297,6 +301,7 @@ impl App {
             pending_goto: None,
             find: hrdr_app::FindState::default(),
             auto_compact_ratio: auto_compact,
+            compaction_reserved,
             bell,
             base_url,
             session_id: None,
@@ -659,6 +664,7 @@ impl App {
         self.theme = Theme::load(ui.theme.as_deref());
         self.effort = cfg.effort.clone();
         self.auto_compact_ratio = cfg.auto_compact;
+        self.compaction_reserved = cfg.compaction_reserved;
         self.bell = ui.bell;
         self.todo_ttl = ui.todo_ttl;
         self.timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
@@ -801,7 +807,8 @@ impl App {
             && hrdr_app::should_auto_compact(
                 self.last_usage.map(|(p, _)| p),
                 self.context_window,
-                self.auto_compact_ratio,
+                self.compaction_reserved,
+                self.auto_compact_ratio > 0.0 && self.auto_compact_ratio <= 1.0,
             )
     }
 

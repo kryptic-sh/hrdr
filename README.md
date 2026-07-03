@@ -249,7 +249,8 @@ max_bytes = 51200
 auto_prune = true
 
 # Compaction: when context fills, summarize the old head and keep the recent tail.
-auto_compact = 0.85            # trigger at 85% of the context window (0 disables)
+auto_compact = 0.85            # on/off toggle (any 0<x≤1 enables; 0 disables)
+compaction_reserved = 20000    # fire at context_window − this many tokens
 compaction_tail_turns = 2      # recent turns kept verbatim through a compaction
 preserve_recent_tokens = 8000  # …bounded by this token budget
 ```

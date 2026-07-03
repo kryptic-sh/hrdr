@@ -1198,21 +1198,33 @@ pub fn compaction_message(res: &Result<(usize, usize), String>) -> String {
     }
 }
 
-/// Whether the context usage warrants a proactive compaction before more work
-/// — the `auto_compact` threshold check, shared by both frontends.
-/// `last_prompt_tokens` is the latest model call's prompt size.
+/// The context-usage token count at which auto-compaction fires:
+/// `context_window − reserved` (opencode's reserved model). The reserve is
+/// clamped to a quarter of the window so a `reserved` larger than a small
+/// model's context still leaves a sane trigger — opencode clamps by the model's
+/// max-output tokens; lacking that figure, a quarter-window proxy keeps the
+/// trigger from collapsing to 0 (which would compact every turn).
+pub fn compaction_trigger(window: u32, reserved: u32) -> u32 {
+    window.saturating_sub(reserved.min(window / 4))
+}
+
+/// Whether the context usage warrants a proactive compaction before more work.
+/// Fires once usage reaches [`compaction_trigger`], shared by both frontends.
+/// `enabled` gates it (the `auto_compact` toggle); `last_prompt_tokens` is the
+/// latest model call's prompt size.
 pub fn should_auto_compact(
     last_prompt_tokens: Option<u32>,
     context_window: Option<u32>,
-    ratio: f64,
+    reserved: u32,
+    enabled: bool,
 ) -> bool {
-    if ratio <= 0.0 || ratio > 1.0 {
+    if !enabled {
         return false;
     }
     let (Some(prompt), Some(window)) = (last_prompt_tokens, context_window) else {
         return false;
     };
-    window > 0 && f64::from(prompt) >= f64::from(window) * ratio
+    window > 0 && prompt >= compaction_trigger(window, reserved)
 }
 
 /// The working-tree `git diff` for `cwd` (stdout on success, stderr message on
@@ -1325,13 +1337,18 @@ mod tests {
 
     #[test]
     fn auto_compact_threshold_and_messages() {
-        // Below / at threshold, disabled ratio, missing inputs.
-        assert!(should_auto_compact(Some(850), Some(1000), 0.85));
-        assert!(should_auto_compact(Some(900), Some(1000), 0.85));
-        assert!(!should_auto_compact(Some(840), Some(1000), 0.85));
-        assert!(!should_auto_compact(Some(999), Some(1000), 0.0)); // disabled
-        assert!(!should_auto_compact(None, Some(1000), 0.85));
-        assert!(!should_auto_compact(Some(999), None, 0.85));
+        // Reserved 200 → fires at window − reserved = 800. Below/at/over,
+        // disabled, and missing inputs.
+        assert!(should_auto_compact(Some(800), Some(1000), 200, true));
+        assert!(should_auto_compact(Some(950), Some(1000), 200, true));
+        assert!(!should_auto_compact(Some(799), Some(1000), 200, true));
+        assert!(!should_auto_compact(Some(999), Some(1000), 200, false)); // disabled
+        assert!(!should_auto_compact(None, Some(1000), 200, true));
+        assert!(!should_auto_compact(Some(999), None, 200, true));
+        // Reserved larger than a quarter-window is clamped, so the trigger
+        // never collapses to 0: with window 1000 it fires at 75% (750), not 0.
+        assert!(should_auto_compact(Some(750), Some(1000), 5000, true));
+        assert!(!should_auto_compact(Some(749), Some(1000), 5000, true));
         // Message formatting covers the three outcomes.
         assert_eq!(compaction_message(&Ok((2, 2))), "nothing to compact yet");
         assert!(compaction_message(&Ok((10, 2))).contains("compacted: 10 → 2"));

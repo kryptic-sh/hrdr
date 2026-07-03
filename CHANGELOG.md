@@ -14,8 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `[tool_output]` `max_lines` (2000) / `max_bytes` (51200); (2) the prune
   protect/minimum windows now match opencode's 40k/20k; (3) compaction keeps the
   recent tail by **turns and a token budget** (`compaction_tail_turns` = 2,
-  `preserve_recent_tokens` = 8000) instead of a fixed message count. All tunable
-  in `config.toml`.
+  `preserve_recent_tokens` = 8000) instead of a fixed message count; (4)
+  auto-compaction now triggers on a **reserved token buffer** —
+  `context_window − compaction_reserved` (default 20000, `--compaction-reserved`
+  / `$HRDR_COMPACTION_RESERVED`) rather than a fixed 85% fraction
+  (`auto_compact` is now the on/off toggle). The reserve is clamped to a quarter
+  of the window so small-context models still get a sane trigger. All tunable in
+  `config.toml`.
 
 - **Truncated `bash`/`grep` output is saved, not discarded.** When output
   exceeds the per-tool cap, the full result is written to a temp file

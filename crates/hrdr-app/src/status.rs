@@ -177,8 +177,12 @@ pub struct StatusInputs<'a> {
     /// Prompt tokens of the latest model call (context in use).
     pub ctx_used: usize,
     pub context_window: Option<u32>,
-    /// Auto-compaction trigger fraction (0 disables the red level).
-    pub auto_compact_ratio: f64,
+    /// Whether auto-compaction is enabled (the `auto_compact` toggle; `false`
+    /// disables the red level).
+    pub auto_compact_enabled: bool,
+    /// Token buffer reserved below the window — the gauge turns red once usage
+    /// reaches `context_window − compaction_reserved` (opencode's model).
+    pub compaction_reserved: u32,
     pub model: &'a str,
     pub effort: Option<&'a str>,
     /// Time-to-first-token of the latest turn, seconds.
@@ -224,8 +228,10 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
         Some(w) if w > 0 => {
             let frac = (i.ctx_used as f64 / w as f64).clamp(0.0, 1.0);
             // Fill color escalates with usage: green → amber → red at the
-            // auto-compact threshold (where compaction kicks in next turn).
-            let level = if i.auto_compact_ratio > 0.0 && frac >= i.auto_compact_ratio {
+            // auto-compact threshold (window − reserved, where compaction kicks
+            // in next turn).
+            let critical_at = crate::compaction_trigger(w, i.compaction_reserved);
+            let level = if i.auto_compact_enabled && i.ctx_used as u32 >= critical_at {
                 CtxLevel::Critical
             } else if frac >= 0.70 {
                 CtxLevel::Warn
@@ -288,7 +294,8 @@ mod tests {
             tokens_out: 90,
             ctx_used: 900,
             context_window: Some(1000),
-            auto_compact_ratio: 0.85,
+            auto_compact_enabled: true,
+            compaction_reserved: 150, // critical at 1000 − 150 = 850 ≤ 900
             model: "qwen3",
             effort: None,
             ttft: Some(1.5),

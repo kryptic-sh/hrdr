@@ -78,8 +78,13 @@ pub struct AgentConfig {
     pub effort: Option<String>,
     /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
     /// `0` (or any value outside that range) disables it. Default
-    /// [`DEFAULT_AUTO_COMPACT`].
+    /// [`DEFAULT_AUTO_COMPACT`]. The value now gates on/off only; the *trigger
+    /// point* is set by [`compaction_reserved`](Self::compaction_reserved).
     pub auto_compact: f64,
+    /// Token buffer reserved below the context window: auto-compaction fires when
+    /// usage reaches `context_window − compaction_reserved` (opencode's reserved
+    /// model). Default [`DEFAULT_COMPACTION_RESERVED`].
+    pub compaction_reserved: u32,
     /// Prune old tool-call *output* from the model history before each request:
     /// bodies older than the recent protected window are replaced with a short
     /// placeholder (the tool call + args stay). Cheap, no model call — the first
@@ -117,6 +122,12 @@ pub struct AgentConfig {
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
+
+/// Default token buffer reserved below the context window before auto-compaction
+/// fires — compaction triggers once usage reaches `context_window − reserved`,
+/// leaving room for the next turn's output. Matches opencode's `COMPACTION_BUFFER`
+/// / `compaction.reserved`.
+pub const DEFAULT_COMPACTION_RESERVED: u32 = 20_000;
 
 /// Tool-output pruning keeps the most recent this-many estimated tokens of tool
 /// output verbatim; older bodies are cleared. Matches opencode's `PRUNE_PROTECT`.
@@ -210,6 +221,7 @@ impl Default for AgentConfig {
             context_window: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
+            compaction_reserved: DEFAULT_COMPACTION_RESERVED,
             auto_prune: true,
             checkpoints: None,
             providers: HashMap::new(),
@@ -380,6 +392,7 @@ struct FileConfig {
     context_window: Option<u32>,
     effort: Option<String>,
     auto_compact: Option<f64>,
+    compaction_reserved: Option<u32>,
     auto_prune: Option<bool>,
     checkpoints: Option<String>,
     #[serde(default)]
@@ -461,6 +474,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.auto_compact {
             self.auto_compact = v;
+        }
+        if let Some(v) = fc.compaction_reserved {
+            self.compaction_reserved = v;
         }
         if let Some(v) = fc.auto_prune {
             self.auto_prune = v;
@@ -551,6 +567,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Ok(f) = v.parse() {
             c.auto_compact = f;
+        }
+    }),
+    ("HRDR_COMPACTION_RESERVED", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.compaction_reserved = n;
         }
     }),
     ("HRDR_AUTO_PRUNE", |c, v| {
@@ -1810,6 +1831,7 @@ mod tests {
             context_window: Some(8192),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
+            compaction_reserved: Some(12_345),
             auto_prune: Some(false),
             checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
@@ -1835,6 +1857,7 @@ mod tests {
         assert_eq!(cfg.context_window, Some(8192));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
+        assert_eq!(cfg.compaction_reserved, 12_345);
         assert!(!cfg.auto_prune);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
         assert!(cfg.allow_outside_cwd);

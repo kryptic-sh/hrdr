@@ -48,9 +48,15 @@ struct Cli {
     #[arg(long, global = true)]
     effort: Option<String>,
 
-    /// Auto-compact trigger as a fraction of the context window (0.0–1.0; 0 disables).
+    /// Auto-compact toggle: any value in 0.0–1.0 enables it, 0 disables (the
+    /// trigger point is set by --compaction-reserved).
     #[arg(long, global = true)]
     auto_compact: Option<f64>,
+
+    /// Tokens reserved below the context window before auto-compaction fires
+    /// (default 20000); compaction triggers at context_window − this.
+    #[arg(long, global = true)]
+    compaction_reserved: Option<u32>,
 
     /// Prune old tool output from the model context before each request (on|off; default on).
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
@@ -232,6 +238,9 @@ async fn main() -> Result<()> {
     }
     if let Some(r) = cli.auto_compact {
         config.auto_compact = r;
+    }
+    if let Some(n) = cli.compaction_reserved {
+        config.compaction_reserved = n;
     }
     if let Some(v) = cli
         .auto_prune

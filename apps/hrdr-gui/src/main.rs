@@ -347,6 +347,7 @@ fn app_view(
     let compacting: RwSignal<bool> = create_rw_signal(false);
     // Signal so `/reload` + hot-reload pick up config edits (the TUI does).
     let auto_compact_ratio = create_rw_signal(cfg.auto_compact);
+    let compaction_reserved = create_rw_signal(cfg.compaction_reserved);
     // Streamed tokens this turn (the per-turn stats line's token count/rate).
     let out_tokens: RwSignal<usize> = create_rw_signal(0);
     // The in-flight turn is an /init run → reload AGENTS.md when it completes.
@@ -586,7 +587,11 @@ fn app_view(
                     && hrdr_app::should_auto_compact(
                         usage.get_untracked().map(|(p, _)| p),
                         ctx_window.get_untracked(),
-                        auto_compact_ratio.get_untracked(),
+                        compaction_reserved.get_untracked(),
+                        {
+                            let r = auto_compact_ratio.get_untracked();
+                            r > 0.0 && r <= 1.0
+                        },
                     )
                 {
                     system(
@@ -629,6 +634,7 @@ fn app_view(
                     bell,
                     effort,
                     auto_compact_ratio,
+                    compaction_reserved,
                 );
                 system(transcript, next_id, line);
             }
@@ -741,6 +747,7 @@ fn app_view(
             expand_all,
             bell,
             auto_compact_ratio,
+            compaction_reserved,
             find_query,
             find_pos,
             ctx_window,
@@ -1144,7 +1151,11 @@ fn app_view(
             tokens_out: session_out.get(),
             ctx_used: usage.get().map(|(p, _)| p as usize).unwrap_or(0),
             context_window: ctx_window.get(),
-            auto_compact_ratio: auto_compact_ratio.get(),
+            auto_compact_enabled: {
+                let r = auto_compact_ratio.get();
+                r > 0.0 && r <= 1.0
+            },
+            compaction_reserved: compaction_reserved.get(),
             model: &model_name,
             effort: effort_label.as_deref(),
             ttft: ttft.get(),
@@ -1575,6 +1586,7 @@ struct GuiHost {
     expand_all: RwSignal<bool>,
     bell: RwSignal<bool>,
     auto_compact_ratio: RwSignal<f64>,
+    compaction_reserved: RwSignal<u32>,
     find_query: RwSignal<Option<String>>,
     find_pos: RwSignal<usize>,
     ctx_window: RwSignal<Option<u32>>,
@@ -1911,6 +1923,7 @@ impl hrdr_app::CommandHost for GuiHost {
             self.bell,
             self.effort,
             self.auto_compact_ratio,
+            self.compaction_reserved,
         );
         self.config_mtime_seen.set(hrdr_app::config_mtime());
         let agent = self.agent.clone();
@@ -2139,6 +2152,7 @@ fn apply_config_reload(
     bell: RwSignal<bool>,
     effort: RwSignal<Option<String>>,
     auto_compact_ratio: RwSignal<f64>,
+    compaction_reserved: RwSignal<u32>,
 ) -> String {
     match AgentConfig::load_checked() {
         Ok(cfg) => {
@@ -2154,6 +2168,7 @@ fn apply_config_reload(
             );
             effort.set(cfg.effort.clone());
             auto_compact_ratio.set(cfg.auto_compact);
+            compaction_reserved.set(cfg.compaction_reserved);
             if let (Some(t), Ok(mut a)) = (cfg.temperature, agent.try_lock()) {
                 a.set_temperature(Some(t));
             }
