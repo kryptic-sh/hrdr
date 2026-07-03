@@ -17,16 +17,22 @@ const USER_AGENT: &str =
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
-/// timeout. Reused for every web tool call so connection pools and DNS results
-/// are shared. Panics on build failure (TLS-backend misconfiguration), which is
-/// unrecoverable anyway.
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+/// timeout. Built once and reused for every web tool call so connection pools
+/// and DNS results are shared. A build failure (TLS-backend misconfiguration)
+/// is stored as an error string and surfaced per call via [`http_client`], so a
+/// broken environment yields a recoverable tool error rather than a panic.
+static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(HTTP_TIMEOUT)
         .build()
-        .expect("building HTTP client: TLS backend missing or misconfigured")
+        .map_err(|e| format!("building HTTP client (TLS backend missing or misconfigured): {e}"))
 });
+
+/// The shared HTTP client, or a tool error if it failed to build.
+fn http_client() -> Result<&'static reqwest::Client> {
+    HTTP_CLIENT.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))
+}
 
 // ---- web_fetch ----
 
@@ -73,7 +79,7 @@ impl Tool for WebFetchTool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             bail!("url must start with http:// or https://");
         }
-        let resp = HTTP_CLIENT.get(url).send().await?;
+        let resp = http_client()?.get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             bail!("HTTP {status} fetching {url}");
@@ -174,7 +180,7 @@ async fn searxng_search(base: &str, query: &str, n: usize) -> Result<Vec<Hit>> {
         base.trim_end_matches('/'),
         percent_encode(query)
     );
-    let resp = HTTP_CLIENT.get(&url).send().await?;
+    let resp = http_client()?.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("SearXNG HTTP {} from {base}", resp.status());
     }
@@ -199,7 +205,7 @@ async fn ddg_search(query: &str, n: usize) -> Result<Vec<Hit>> {
         "https://html.duckduckgo.com/html/?q={}",
         percent_encode(query)
     );
-    let resp = HTTP_CLIENT.get(&url).send().await?;
+    let resp = http_client()?.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("DuckDuckGo HTTP {}", resp.status());
     }
