@@ -2,6 +2,7 @@
 //! results). `web_search` uses a zero-config DuckDuckGo HTML backend by default,
 //! or a SearXNG instance when `SEARXNG_URL` is set (a JSON API — more robust).
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -15,13 +16,17 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0 hrdr";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Shared HTTP client with a browser-ish UA and a sane timeout.
-fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+/// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
+/// timeout. Reused for every web tool call so connection pools and DNS results
+/// are shared. Panics on build failure (TLS-backend misconfiguration), which is
+/// unrecoverable anyway.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(HTTP_TIMEOUT)
-        .build()?)
-}
+        .build()
+        .expect("building HTTP client: TLS backend missing or misconfigured")
+});
 
 // ---- web_fetch ----
 
@@ -68,7 +73,7 @@ impl Tool for WebFetchTool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             bail!("url must start with http:// or https://");
         }
-        let resp = http_client()?.get(url).send().await?;
+        let resp = HTTP_CLIENT.get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             bail!("HTTP {status} fetching {url}");
@@ -169,7 +174,7 @@ async fn searxng_search(base: &str, query: &str, n: usize) -> Result<Vec<Hit>> {
         base.trim_end_matches('/'),
         percent_encode(query)
     );
-    let resp = http_client()?.get(&url).send().await?;
+    let resp = HTTP_CLIENT.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("SearXNG HTTP {} from {base}", resp.status());
     }
@@ -194,7 +199,7 @@ async fn ddg_search(query: &str, n: usize) -> Result<Vec<Hit>> {
         "https://html.duckduckgo.com/html/?q={}",
         percent_encode(query)
     );
-    let resp = http_client()?.get(&url).send().await?;
+    let resp = HTTP_CLIENT.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("DuckDuckGo HTTP {}", resp.status());
     }
