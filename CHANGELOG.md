@@ -23,7 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Mcp-Session-Id`. stdio and HTTP share one client behind a transport
   abstraction; `command` is now optional (exactly one of `command`/`url`).
 - **MCP end-to-end tests across all transports.** A mock server exercises
-  tools + resources + prompts over stdio, Streamable-HTTP, and legacy HTTP+SSE.
+  tools + resources + prompts over stdio, Streamable-HTTP, and legacy HTTP+SSE —
+  including error-tool (`isError`) propagation, non-read-only tools, binary
+  (blob) resources, capability gating (absent `resources`/`prompts` omit their
+  op-tools), and empty-list placeholders.
 
 ### Changed
 

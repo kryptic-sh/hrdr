@@ -917,24 +917,37 @@ data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}
     /// stdout line. `-u` keeps stdout unbuffered so responses aren't withheld.
     #[cfg(unix)]
     const MOCK_SERVER: &str = r#"
-import sys, json
+import sys, json, os
+
+# MOCK_NOCAPS drops the resources/prompts capabilities (so the client shouldn't
+# expose those op-tools). MOCK_EMPTY makes the list methods return nothing.
+CAPS = {"tools":{}} if os.environ.get("MOCK_NOCAPS") else {"tools":{},"resources":{},"prompts":{}}
+EMPTY = bool(os.environ.get("MOCK_EMPTY"))
 
 def handle(m):
     i = m.get("id"); method = m.get("method")
     if method == "initialize":
-        return {"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"mock","version":"0"}}}
+        return {"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18","capabilities":CAPS,"serverInfo":{"name":"mock","version":"0"}}}
     if method == "tools/list":
-        return {"jsonrpc":"2.0","id":i,"result":{"tools":[{"name":"echo","description":"Echo the input back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":True}}]}}
+        return {"jsonrpc":"2.0","id":i,"result":{"tools":[
+            {"name":"echo","description":"Echo the input back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":True}},
+            {"name":"boom","description":"Always fails","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":False}}]}}
     if method == "tools/call":
-        args = m.get("params",{}).get("arguments",{})
+        p = m.get("params",{}); name = p.get("name",""); args = p.get("arguments",{})
+        if name == "boom":
+            return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"kaboom"}],"isError":True}}
         return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"echo: "+str(args.get("text",""))}],"isError":False}}
     if method == "resources/list":
-        return {"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///readme","name":"readme","description":"the readme"}]}}
+        res = [] if EMPTY else [{"uri":"file:///readme","name":"readme","description":"the readme"},{"uri":"blob://logo","name":"logo"}]
+        return {"jsonrpc":"2.0","id":i,"result":{"resources":res}}
     if method == "resources/read":
         uri = m.get("params",{}).get("uri","")
+        if uri.startswith("blob://"):
+            return {"jsonrpc":"2.0","id":i,"result":{"contents":[{"uri":uri,"blob":"aGk="}]}}
         return {"jsonrpc":"2.0","id":i,"result":{"contents":[{"uri":uri,"text":"resource body for "+uri}]}}
     if method == "prompts/list":
-        return {"jsonrpc":"2.0","id":i,"result":{"prompts":[{"name":"greet","description":"greet someone","arguments":[{"name":"who","required":True}]}]}}
+        pr = [] if EMPTY else [{"name":"greet","description":"greet someone","arguments":[{"name":"who","required":True}]}]
+        return {"jsonrpc":"2.0","id":i,"result":{"prompts":pr}}
     if method == "prompts/get":
         args = m.get("params",{}).get("arguments",{})
         return {"jsonrpc":"2.0","id":i,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Hello "+str(args.get("who",""))}}]}}
@@ -1047,6 +1060,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
+        // (env toggles like MOCK_NOCAPS are only exercised over stdio.)
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take()?)
             .read_line(&mut line)
@@ -1079,6 +1093,12 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             "echo: hi there"
         );
 
+        // A non-read-only tool that reports `isError` → `execute` surfaces it.
+        let boom = by("boom");
+        assert!(!boom.read_only());
+        let err = boom.execute(json!({}), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("kaboom"), "err: {err}");
+
         let listed = by("list_resources").execute(json!({}), &ctx).await.unwrap();
         assert!(listed.contains("file:///readme"), "resources: {listed}");
         let read = by("read_resource")
@@ -1086,6 +1106,12 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             .await
             .unwrap();
         assert_eq!(read, "resource body for file:///readme");
+        // A binary (blob) resource is noted, not dumped.
+        let blob = by("read_resource")
+            .execute(json!({ "uri": "blob://logo" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(blob, "[binary resource content omitted]");
 
         let prompts = by("list_prompts").execute(json!({}), &ctx).await.unwrap();
         assert!(prompts.contains("greet(who)"), "prompts: {prompts}");
@@ -1118,8 +1144,8 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_stdio("stdio", py, &args, &[])
             .await
             .expect("connect + handshake + tools/list");
-        // echo + {list,read}_resources + {list,get}_prompt.
-        assert_eq!(tools.len(), 5);
+        // echo + boom + {list,read}_resources + {list,get}_prompt.
+        assert_eq!(tools.len(), 6);
         exercise_all("stdio", tools).await;
     }
 
@@ -1134,7 +1160,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_http("http", &url, &[])
             .await
             .expect("connect over Streamable HTTP");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         exercise_all("http", tools).await;
     }
 
@@ -1149,7 +1175,74 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_sse("sse", &url, &[])
             .await
             .expect("connect over legacy HTTP+SSE");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         exercise_all("sse", tools).await;
+    }
+
+    /// Spawn the stdio mock with extra env, returning its discovered tools.
+    #[cfg(unix)]
+    async fn connect_stdio_mock(
+        server: &str,
+        env: &[(String, String)],
+    ) -> Option<Vec<Arc<dyn Tool>>> {
+        let py = python()?;
+        let args = vec![
+            "-u".to_string(),
+            "-c".to_string(),
+            MOCK_SERVER.to_string(),
+            "stdio".to_string(),
+        ];
+        // Each `McpTool` holds an `Arc<McpClient>`, so the returned `tools` keep
+        // the connection (and its child) alive without threading the client out.
+        let (_client, tools) = McpClient::connect_stdio(server, py, &args, env)
+            .await
+            .expect("connect + handshake + tools/list");
+        Some(tools)
+    }
+
+    // A server that doesn't advertise `resources`/`prompts` gets no op-tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absent_capabilities_omit_resource_and_prompt_tools() {
+        let env = vec![("MOCK_NOCAPS".to_string(), "1".to_string())];
+        let Some(tools) = connect_stdio_mock("nocaps", &env).await else {
+            eprintln!("skipping: no python interpreter");
+            return;
+        };
+        // Only the two real tools — no list/read/get op-tools.
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(tools.len(), 2, "tools: {names:?}");
+        assert!(names.contains(&"nocaps_echo"));
+        assert!(names.contains(&"nocaps_boom"));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("resource") || n.contains("prompt")),
+            "unexpected op-tool: {names:?}"
+        );
+    }
+
+    // Empty resource/prompt lists render as a friendly placeholder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_resource_and_prompt_lists_render_placeholders() {
+        let env = vec![("MOCK_EMPTY".to_string(), "1".to_string())];
+        let Some(tools) = connect_stdio_mock("empty", &env).await else {
+            eprintln!("skipping: no python interpreter");
+            return;
+        };
+        let ctx = ToolContext::new(".");
+        let by = |suffix: &str| {
+            let want = format!("empty_{suffix}");
+            tools.iter().find(|t| t.name() == want).cloned().unwrap()
+        };
+        assert_eq!(
+            by("list_resources").execute(json!({}), &ctx).await.unwrap(),
+            "(no resources)"
+        );
+        assert_eq!(
+            by("list_prompts").execute(json!({}), &ctx).await.unwrap(),
+            "(no prompts)"
+        );
     }
 }
