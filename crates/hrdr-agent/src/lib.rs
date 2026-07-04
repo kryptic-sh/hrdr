@@ -876,6 +876,7 @@ impl Agent {
         if let Some(t) = config.temperature {
             client = client.with_temperature(t);
         }
+        client.set_effort(config.effort.clone());
 
         Ok(Self {
             client,
@@ -1081,6 +1082,12 @@ impl Agent {
     /// Set (or clear) the sampling temperature.
     pub fn set_temperature(&mut self, t: Option<f32>) {
         self.client.temperature = t;
+    }
+
+    /// Set (or clear) the reasoning-effort label. Sent as `reasoning_effort` on
+    /// each request when it names a known level; other labels are display-only.
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.client.set_effort(effort);
     }
 
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
@@ -1528,6 +1535,9 @@ impl Agent {
 // Re-exports consumers need without reaching into sub-crates.
 pub use hrdr_llm::ChatMessage as Message;
 pub use hrdr_llm::Role as MessageRole;
+/// Whether a reasoning-effort label is a level actually sent as `reasoning_effort`
+/// (`minimal`/`low`/`medium`/`high`) rather than a display-only label.
+pub use hrdr_llm::normalize_effort;
 pub use hrdr_tools::TodoItem as Todo;
 
 /// Case-insensitive substring scan of an error's display string against a set

@@ -130,7 +130,8 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 - **Session** — `/clear`, `/sessions`, `/resume <id|name>`, `/rename`,
   `/compact`, `/info`, `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
 - **Model** — `/model`, `/models`, `/provider`, `/login` (guided provider + key
-  setup), `/temp`, `/effort`, `/reasoning`
+  setup), `/temp`, `/effort <minimal|low|medium|high>` (sent as
+  `reasoning_effort` to reasoning models), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,

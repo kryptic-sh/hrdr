@@ -44,7 +44,8 @@ struct Cli {
     #[arg(long, global = true)]
     theme: Option<String>,
 
-    /// Reasoning-effort label shown in the status bar (e.g. low/medium/high).
+    /// Reasoning effort for reasoning models: minimal, low, medium, or high
+    /// (sent as `reasoning_effort`; other values are status-bar labels only).
     #[arg(long, global = true)]
     effort: Option<String>,
 

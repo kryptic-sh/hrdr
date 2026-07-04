@@ -65,6 +65,9 @@ pub struct Client {
     pub temperature: Option<f32>,
     /// Prompt-caching strategy (default [`CacheMode::Off`]).
     cache: CacheMode,
+    /// Reasoning-effort label; sent as `reasoning_effort` when it names a known
+    /// level (see [`crate::normalize_effort`]).
+    effort: Option<String>,
 }
 
 impl Client {
@@ -82,6 +85,7 @@ impl Client {
             model: model.into(),
             temperature: None,
             cache: CacheMode::Off,
+            effort: None,
         }
     }
 
@@ -99,6 +103,12 @@ impl Client {
     /// Set the prompt-caching strategy (e.g. after a mid-session provider switch).
     pub fn set_cache(&mut self, cache: CacheMode) {
         self.cache = cache;
+    }
+
+    /// Set the reasoning-effort label; only recognized levels
+    /// ([`crate::normalize_effort`]) are actually sent.
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.effort = effort;
     }
 
     /// The current endpoint base URL (including the `/v1` suffix).
@@ -127,6 +137,7 @@ impl Client {
             messages,
             tools,
             temperature: self.temperature,
+            reasoning_effort: self.effort.as_deref().and_then(crate::normalize_effort),
             stream,
             // Ask for token usage on streamed turns (for the live loader stats).
             stream_options: stream.then_some(crate::types::StreamOptions {

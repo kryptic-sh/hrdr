@@ -139,9 +139,25 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Reasoning-effort hint for reasoning models (`minimal`/`low`/`medium`/
+    /// `high`). OpenAI-standard field; Anthropic's OpenAI-compat maps it to a
+    /// thinking budget. Unset for non-reasoning models / servers (which ignore
+    /// unknown fields anyway).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+}
+
+/// Normalize a reasoning-effort label to a value worth sending as
+/// `reasoning_effort`, or `None` for anything unrecognized (a display-only label
+/// like `off`, or garbage) so it's never put on the wire.
+pub fn normalize_effort(label: &str) -> Option<String> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        s @ ("minimal" | "low" | "medium" | "high") => Some(s.to_string()),
+        _ => None,
+    }
 }
 
 /// Streaming options. `include_usage` asks the server to emit a final chunk
@@ -668,6 +684,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             temperature: Some(0.5),
+            reasoning_effort: None,
             stream: false,
             stream_options: None,
         };
@@ -685,6 +702,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             temperature: None,
+            reasoning_effort: None,
             stream: false,
             stream_options: None,
         };
@@ -692,6 +710,34 @@ mod tests {
         assert!(
             !json.contains("\"temperature\""),
             "temperature should be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_normalizes_known_levels_only() {
+        assert_eq!(normalize_effort("High").as_deref(), Some("high"));
+        assert_eq!(normalize_effort(" low ").as_deref(), Some("low"));
+        assert_eq!(normalize_effort("minimal").as_deref(), Some("minimal"));
+        assert_eq!(normalize_effort("off"), None);
+        assert_eq!(normalize_effort("turbo"), None);
+        assert_eq!(normalize_effort(""), None);
+    }
+
+    #[test]
+    fn chat_request_reasoning_effort_serialized_when_set() {
+        let req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            reasoning_effort: Some("high".to_string()),
+            stream: false,
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"reasoning_effort\":\"high\""),
+            "reasoning_effort should serialize: {json}"
         );
     }
 }

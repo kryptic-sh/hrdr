@@ -538,7 +538,22 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             } else {
                 host.set_effort(arg.clone());
                 host.persist_setting("effort", hrdr_agent::ConfigValue::Str(&arg));
-                host.info(format!("effort → {arg}"));
+                // Push to the model client so it's actually sent as reasoning_effort.
+                let agent = host.agent();
+                let effort = arg.clone();
+                host.spawn_line(Box::pin(async move {
+                    agent.lock().await.set_effort(Some(effort));
+                    String::new()
+                }));
+                let note = if hrdr_agent::normalize_effort(&arg).is_some() {
+                    format!("effort → {arg} (sent to the model)")
+                } else {
+                    format!(
+                        "effort → {arg} (status-bar label only; a reasoning level \
+                         — minimal/low/medium/high — is sent to the model)"
+                    )
+                };
+                host.info(note);
             }
         }
         "cwd" => {

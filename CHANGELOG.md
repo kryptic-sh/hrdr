@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Reasoning effort is now sent to the model.** `/effort`, `--effort`, and
+  `effort` in config set `reasoning_effort` on each request when the value names
+  a reasoning level (`minimal`/`low`/`medium`/`high`) — previously it was only a
+  status-bar label. Other labels stay display-only; the value follows model and
+  provider switches, and `/effort` reports whether it's actually sent. `/info`
+  unchanged.
 - **Prompt caching.** hrdr now marks `cache_control` breakpoints on each request
   — one on the system prompt, one rolling on the last message — so the stable
   system+tools prefix and the growing conversation prefix are cached across
