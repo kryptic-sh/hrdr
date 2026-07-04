@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Native Anthropic Messages API backend.** hrdr now talks to Claude over
+  Anthropic's native `/v1/messages` API (auto-selected when the endpoint host is
+  `api.anthropic.com`) instead of its OpenAI-compat endpoint. A new backend in
+  `hrdr-llm` translates hrdr's OpenAI-shaped history to the Anthropic wire
+  format (`system` hoisted to top-level blocks, `text`/`tool_use`/`tool_result`
+  content blocks with consecutive same-role turns coalesced, `tools` with
+  `input_schema`, required `max_tokens`, `x-api-key` + `anthropic-version`
+  headers) and normalizes the streaming response back into the same
+  `ChatChunk`/accumulator the agent already uses, so the loop and both frontends
+  are unchanged. This **unlocks native prompt caching on Claude**:
+  `cache_control` breakpoints land on the system prompt, the last tool, and the
+  last message, and `prompt_cache = "auto"` now enables caching for the native
+  Anthropic backend (as well as OpenRouter). Extended thinking is a planned
+  follow-up.
+
 ## [0.2.3] - 2026-07-04
 
 ### Fixed

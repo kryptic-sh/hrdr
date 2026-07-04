@@ -173,13 +173,14 @@ pub enum CacheMode {
     /// No cache breakpoints emitted.
     #[default]
     Off,
-    /// Emit `cache_control: {"type": "ephemeral"}` breakpoints — one on the
-    /// system prompt, one rolling on the last message. Only useful for endpoints
-    /// that consume the marker (OpenRouter, for its Anthropic/Gemini/Qwen
-    /// models). Some direct provider endpoints **reject** an unknown
-    /// `cache_control` field with a `400` (OpenAI, Groq, xAI) and others silently
-    /// ignore it, so which endpoints get this is decided upstream (hrdr's
-    /// `resolve_cache_mode`), not here.
+    /// Emit `cache_control: {"type": "ephemeral"}` breakpoints. Useful for
+    /// endpoints that consume the marker — OpenRouter (for its
+    /// Anthropic/Gemini/Qwen models) and the **native Anthropic Messages API**
+    /// (where breakpoints land on system, the last tool, and the last message).
+    /// Some direct provider endpoints **reject** an unknown `cache_control` field
+    /// with a `400` (OpenAI, Groq, xAI) and others silently ignore it, so which
+    /// endpoints get this is decided upstream (hrdr's `resolve_cache_mode`), not
+    /// here. The exact placement differs by backend (OpenAI-shape vs Anthropic).
     Ephemeral,
 }
 

@@ -412,7 +412,8 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         }
         "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", true),
         "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", true),
-        // Anthropic's OpenAI-compatible endpoint (Bearer auth via the compat layer).
+        // Anthropic's own host → hrdr uses the native Messages API (`x-api-key`),
+        // which unlocks prompt caching (the OpenAI-compat endpoint can't cache).
         "claude" | "anthropic" => ("https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", true),
         "local" | "infr" => ("http://localhost:8080/v1", "HRDR_API_KEY", false),
         _ => return None,
@@ -654,14 +655,16 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
 /// `auto`) against the endpoint into a concrete [`CacheMode`].
 ///
 /// `auto` enables `cache_control` breakpoints **only for endpoints that consume
-/// them safely** — in practice OpenRouter, which normalizes the marker and
-/// strips it for models that don't accept it. It stays **off** for every other
-/// endpoint because sending an unknown `cache_control` field is not universally
-/// safe:
+/// them safely**:
+/// - **OpenRouter**, which normalizes the marker and strips it for models that
+///   don't accept it.
+/// - **Anthropic's own host** (`api.anthropic.com`), which hrdr talks to over the
+///   **native Messages API** — where `cache_control` is the real caching lever.
+///
+/// It stays **off** for every other endpoint because sending an unknown
+/// `cache_control` field is not universally safe:
 /// - **OpenAI, Groq, xAI** reject it with a `400` (strict field validation), so
 ///   a blanket default would break every request.
-/// - **Anthropic's OpenAI-compat endpoint** silently ignores it (caching is only
-///   available on the native Messages API, which hrdr doesn't speak).
 /// - **DeepSeek, Gemini, OpenAI, Groq, xAI** already cache automatically, so the
 ///   marker buys nothing.
 /// - local servers may reject the content-parts form.
@@ -673,9 +676,17 @@ pub fn resolve_cache_mode(setting: Option<&str>, base_url: &str) -> hrdr_llm::Ca
     match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("off") | Some("none") | Some("false") | Some("no") => CacheMode::Off,
         Some("on") | Some("ephemeral") | Some("true") | Some("yes") => CacheMode::Ephemeral,
-        _ if is_openrouter(base_url) => CacheMode::Ephemeral,
+        _ if is_openrouter(base_url) || is_anthropic_native(base_url) => CacheMode::Ephemeral,
         _ => CacheMode::Off,
     }
+}
+
+/// Whether `base_url` is Anthropic's own host — hrdr speaks the native Messages
+/// API there, so `cache_control` breakpoints actually cache (unlike the
+/// OpenAI-compat endpoint, which drops them).
+fn is_anthropic_native(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    host == "api.anthropic.com" || host.ends_with(".anthropic.com")
 }
 
 /// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
@@ -2234,12 +2245,14 @@ mod tests {
             CacheMode::Off
         );
         assert_eq!(
-            resolve_cache_mode(None, "https://api.anthropic.com/v1"),
-            CacheMode::Off
-        );
-        assert_eq!(
             resolve_cache_mode(None, "https://opencode.ai/zen/v1"),
             CacheMode::Off
+        );
+        // Anthropic's own host → on: hrdr speaks the native Messages API there,
+        // where cache_control actually caches.
+        assert_eq!(
+            resolve_cache_mode(None, "https://api.anthropic.com/v1"),
+            CacheMode::Ephemeral
         );
         // Local endpoints stay off; a "not-openrouter.ai.evil.com" host must not
         // match the suffix check.

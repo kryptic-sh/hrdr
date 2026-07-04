@@ -54,6 +54,19 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
 /// Boxed stream of decoded streaming chunks.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
+/// Which wire protocol the endpoint speaks. Auto-detected from `base_url`
+/// (Anthropic's own host → native Messages API), else the OpenAI chat-completions
+/// shape every other server uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    OpenAi,
+    Anthropic,
+}
+
+/// Default `max_tokens` for the native Anthropic backend (required by the API;
+/// well under every current Claude model's output cap).
+const ANTHROPIC_MAX_TOKENS: u32 = 8192;
+
 /// A configured chat-completions client.
 #[derive(Clone)]
 pub struct Client {
@@ -68,6 +81,30 @@ pub struct Client {
     /// Reasoning-effort label; sent as `reasoning_effort` when it names a known
     /// level (see [`crate::normalize_effort`]).
     effort: Option<String>,
+    /// Wire protocol, derived from `base_url`.
+    backend: Backend,
+}
+
+/// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
+/// Anthropic also exposes an OpenAI-compat endpoint, but it can't cache; the
+/// native path is what unlocks prompt caching.
+fn detect_backend(base_url: &str) -> Backend {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    if host == "api.anthropic.com" || host.ends_with(".anthropic.com") {
+        Backend::Anthropic
+    } else {
+        Backend::OpenAi
+    }
 }
 
 impl Client {
@@ -78,6 +115,7 @@ impl Client {
         model: impl Into<String>,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        let backend = detect_backend(&base_url);
         Self {
             http: reqwest::Client::new(),
             base_url,
@@ -86,6 +124,7 @@ impl Client {
             temperature: None,
             cache: CacheMode::Off,
             effort: None,
+            backend,
         }
     }
 
@@ -119,6 +158,7 @@ impl Client {
     /// Repoint the client at a different endpoint (for mid-session provider switch).
     pub fn set_base_url(&mut self, base_url: impl Into<String>) {
         self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self.backend = detect_backend(&self.base_url);
     }
 
     /// Replace the API key (or clear it with `None`).
@@ -166,12 +206,35 @@ impl Client {
         json
     }
 
-    /// Streaming completion. Yields decoded chunks as they arrive.
+    /// Streaming completion. Yields decoded chunks as they arrive. Dispatches to
+    /// the native Anthropic Messages API or the OpenAI chat-completions shape
+    /// based on the detected [`Backend`].
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDef>,
     ) -> Result<ChatStream> {
+        if self.backend == Backend::Anthropic {
+            let (body, stream) = crate::anthropic::chat_stream(
+                &self.http,
+                &self.base_url,
+                self.api_key.as_deref(),
+                &self.model,
+                ANTHROPIC_MAX_TOKENS,
+                self.cache,
+                messages,
+                tools,
+            )
+            .await?;
+            log_wire(
+                "request",
+                serde_json::json!({
+                    "url": format!("{}/messages", self.base_url),
+                    "body": body,
+                }),
+            );
+            return Ok(stream);
+        }
         let body = self.body_json(&self.request(messages, tools, true));
         log_wire(
             "request",

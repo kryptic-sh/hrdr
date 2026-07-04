@@ -4,6 +4,7 @@
 //! `infr`, llama.cpp, OpenRouter, …). Supports native tool calls and SSE
 //! streaming with tool-call reassembly via [`Accumulator`].
 
+mod anthropic;
 mod client;
 mod types;
 

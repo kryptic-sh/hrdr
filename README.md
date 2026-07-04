@@ -49,8 +49,11 @@ builds from source: `cargo run -p hrdr-gui --release`.
 ## Design
 
 - **Provider-agnostic client.** Speaks clean OpenAI chat-completions with native
-  `tools`/`tool_calls` and SSE streaming. The server owns chat-template
-  application; hrdr only ever sends structured `messages[]` + `tools[]`.
+  `tools`/`tool_calls` and SSE streaming, plus a **native Anthropic Messages
+  API** backend (auto-selected for `api.anthropic.com`) that translates the same
+  internal history to Claude's wire format — unlocking native prompt caching.
+  The server owns chat-template application; hrdr only ever sends structured
+  `messages[]` + `tools[]`.
 - **Efficient, adaptive tool set.** `read`, `write`, `edit`, `patch` (multi-file
   unified-diff), `find`, `ls`, `grep`, `todo`, `fetch`, `search`, a shell, and
   any MCP-server tools. Token-bounded outputs and line-numbered reads for
@@ -176,7 +179,11 @@ Built-in presets:
 | `claude` / `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`  |
 | `local` / `infr`       | `http://localhost:8080/v1`     | `HRDR_API_KEY`       |
 
-(`claude` uses Anthropic's OpenAI-compatible endpoint. `local` needs no key.)
+(`claude` / `anthropic` talks to Anthropic's **native Messages API**
+(`/v1/messages`, `x-api-key` auth) rather than its OpenAI-compat endpoint — that
+unlocks native prompt caching on Claude. Backend selection is automatic from the
+endpoint host, so pointing `--base-url` at `api.anthropic.com` works too.
+`local` needs no key.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
@@ -261,23 +268,22 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 
 ### Prompt caching
 
-hrdr can mark `cache_control` breakpoints on each request (one on the system
-prompt, one rolling on the last message) so the stable system+tools prefix and
-the growing conversation prefix are cached across turns — cutting cost and
-latency on providers that consume the marker (e.g. **OpenRouter** for its
-Anthropic/Gemini/Qwen models).
+hrdr can mark `cache_control` breakpoints on each request so the stable
+system+tools prefix and the growing conversation prefix are cached across turns
+— cutting cost and latency on endpoints that consume the marker: **OpenRouter**
+(for its Anthropic/Gemini/Qwen models) and the **native Anthropic Messages API**
+(breakpoints on system, the last tool, and the last message).
 
 ```toml
 prompt_cache = "auto"   # auto (default) | on | off
 ```
 
-`auto` enables it **only for OpenRouter**, because sending an unknown
-`cache_control` field isn't universally safe: OpenAI, Groq, and xAI **reject it
-with a 400**, while others (DeepSeek, Gemini, and OpenAI itself) already cache
-automatically, and Anthropic's OpenAI-compatible endpoint silently ignores it.
-Set `prompt_cache = "on"` to force it on an endpoint you know accepts it (env
-`$HRDR_PROMPT_CACHE`, flag `--prompt-cache off|on|auto`); `/info` shows whether
-it's currently active.
+`auto` enables it **for OpenRouter and the native Anthropic backend** only,
+because sending an unknown `cache_control` field isn't universally safe: OpenAI,
+Groq, and xAI **reject it with a 400**, while others (DeepSeek, Gemini, and
+OpenAI itself) already cache automatically. Set `prompt_cache = "on"` to force
+it on an endpoint you know accepts it (env `$HRDR_PROMPT_CACHE`, flag
+`--prompt-cache off|on|auto`); `/info` shows whether it's currently active.
 
 ### MCP servers
 
