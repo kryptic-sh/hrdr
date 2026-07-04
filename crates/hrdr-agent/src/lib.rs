@@ -93,11 +93,18 @@ pub struct AgentConfig {
     /// Model context window in tokens, for the status bar's "X of Y" display.
     /// Probed from the endpoint when unset; set in config to override.
     pub context_window: Option<u32>,
-    /// Output-token cap for the native Anthropic backend (`max_tokens`, required
-    /// by that API). `None` uses the backend default (8192). Raising it gives
-    /// Claude more room for long replies and extended thinking; the OpenAI path
-    /// ignores it.
+    /// Output-token cap (`max_tokens`). Required by the native Anthropic backend
+    /// (`None` uses its 8192 default); on the OpenAI path it's sent only when set.
     pub max_tokens: Option<u32>,
+    /// Nucleus-sampling `top_p`, sent only when set.
+    pub top_p: Option<f32>,
+    /// Determinism `seed`, sent only when set (provider support varies).
+    pub seed: Option<i64>,
+    /// Stop sequences, sent only when non-empty.
+    pub stop: Vec<String>,
+    /// Ask for streamed token usage (`stream_options.include_usage`); default
+    /// `true`. A few strict/old servers reject it — set `false` to omit.
+    pub stream_usage: bool,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
     /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
@@ -256,6 +263,10 @@ impl Default for AgentConfig {
             provider: None,
             context_window: None,
             max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: Vec::new(),
+            stream_usage: true,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
@@ -486,6 +497,11 @@ struct FileConfig {
     provider: Option<String>,
     context_window: Option<u32>,
     max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    seed: Option<i64>,
+    #[serde(default)]
+    stop: Vec<String>,
+    stream_usage: Option<bool>,
     effort: Option<String>,
     auto_compact: Option<f64>,
     compaction_reserved: Option<u32>,
@@ -570,6 +586,18 @@ impl AgentConfig {
         }
         if let Some(v) = fc.max_tokens {
             self.max_tokens = Some(v);
+        }
+        if let Some(v) = fc.top_p {
+            self.top_p = Some(v);
+        }
+        if let Some(v) = fc.seed {
+            self.seed = Some(v);
+        }
+        if !fc.stop.is_empty() {
+            self.stop = fc.stop;
+        }
+        if let Some(v) = fc.stream_usage {
+            self.stream_usage = v;
         }
         if let Some(v) = fc.effort {
             self.effort = Some(v);
@@ -691,6 +719,21 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_MAX_TOKENS", |c, v| {
         if let Ok(n) = v.parse() {
             c.max_tokens = Some(n);
+        }
+    }),
+    ("HRDR_TOP_P", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.top_p = Some(n);
+        }
+    }),
+    ("HRDR_SEED", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.seed = Some(n);
+        }
+    }),
+    ("HRDR_STREAM_USAGE", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.stream_usage = b;
         }
     }),
 ];
@@ -949,7 +992,13 @@ impl Agent {
             client = client.with_temperature(t);
         }
         client.set_effort(config.effort.clone());
-        client.set_max_tokens(config.max_tokens);
+        client.set_params(hrdr_llm::RequestParams {
+            max_tokens: config.max_tokens,
+            top_p: config.top_p,
+            seed: config.seed,
+            stop: config.stop.clone(),
+            include_usage: config.stream_usage,
+        });
         client.set_headers(config.headers.clone());
         client.set_api_version(config.api_version.clone());
 
@@ -2268,6 +2317,10 @@ mod tests {
             provider: Some("zen".to_string()),
             context_window: Some(8192),
             max_tokens: Some(16_000),
+            top_p: Some(0.9),
+            seed: Some(42),
+            stop: vec!["<END>".to_string()],
+            stream_usage: Some(false),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
             compaction_reserved: Some(12_345),
@@ -2298,6 +2351,10 @@ mod tests {
         assert_eq!(cfg.provider.as_deref(), Some("zen"));
         assert_eq!(cfg.context_window, Some(8192));
         assert_eq!(cfg.max_tokens, Some(16_000));
+        assert_eq!(cfg.top_p, Some(0.9));
+        assert_eq!(cfg.seed, Some(42));
+        assert_eq!(cfg.stop, vec!["<END>".to_string()]);
+        assert!(!cfg.stream_usage);
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.compaction_reserved, 12_345);

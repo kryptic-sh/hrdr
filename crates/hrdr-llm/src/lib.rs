@@ -11,5 +11,6 @@ mod types;
 pub use client::{ChatStream, Client};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
-    FunctionDef, Role, ToolCall, ToolDef, Usage, apply_cache_breakpoints, normalize_effort,
+    FunctionDef, RequestParams, Role, ToolCall, ToolDef, Usage, apply_cache_breakpoints,
+    normalize_effort,
 };

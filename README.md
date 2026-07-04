@@ -312,6 +312,23 @@ OpenAI itself) already cache automatically. Set `prompt_cache = "on"` to force
 it on an endpoint you know accepts it (env `$HRDR_PROMPT_CACHE`, flag
 `--prompt-cache off|on|auto`); `/info` shows whether it's currently active.
 
+### Sampling & limits
+
+Opt-in request parameters, all off (not sent) by default so no strict provider
+rejects an unexpected field:
+
+```toml
+temperature = 0.2
+top_p = 0.9
+seed = 42                # best-effort determinism (provider support varies)
+max_tokens = 8192        # output cap (required by the Anthropic backend)
+stop = ["<END>"]         # stop sequences
+stream_usage = true      # set false only if a server rejects stream_options
+```
+
+Scalars also honor `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED` /
+`$HRDR_STREAM_USAGE`.
+
 ### MCP servers
 
 Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add

@@ -145,9 +145,50 @@ pub struct ChatRequest {
     /// unknown fields anyway).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Output-token cap. Sent only when configured (some models — OpenAI's
+    /// o-series — want `max_completion_tokens` instead, so this stays opt-in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Nucleus-sampling probability mass. Opt-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Best-effort determinism seed (supported by some providers). Opt-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Stop sequences. Opt-in (agentic turns usually stop via tools/end-of-turn).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+}
+
+/// Opt-in request parameters carried by the [`Client`](crate::Client) and applied
+/// to each OpenAI-shape request. All default to "not sent" so no strict provider
+/// 400s on an unexpected field; `include_usage` defaults on (for token stats).
+#[derive(Debug, Clone)]
+pub struct RequestParams {
+    /// Output-token cap. Also the `max_tokens` the native Anthropic backend
+    /// requires (falls back to its default when `None`).
+    pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<i64>,
+    pub stop: Vec<String>,
+    /// Ask the server for a final usage chunk (`stream_options.include_usage`).
+    /// A few strict/old servers reject it — set `false` to omit.
+    pub include_usage: bool,
+}
+
+impl Default for RequestParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: Vec::new(),
+            include_usage: true,
+        }
+    }
 }
 
 /// Normalize a reasoning-effort label to a value worth sending as
@@ -779,6 +820,10 @@ mod tests {
             tools: vec![],
             temperature: Some(0.5),
             reasoning_effort: None,
+            max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
             stream: false,
             stream_options: None,
         };
@@ -797,6 +842,10 @@ mod tests {
             tools: vec![],
             temperature: None,
             reasoning_effort: None,
+            max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
             stream: false,
             stream_options: None,
         };
@@ -818,6 +867,41 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_params_omitted_by_default_and_sent_when_set() {
+        // Defaults: none of the opt-in params appear on the wire.
+        let base = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            reasoning_effort: None,
+            max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
+            stream: false,
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&base).unwrap();
+        for key in ["max_tokens", "top_p", "seed", "stop"] {
+            assert!(!json.contains(key), "{key} should be omitted: {json}");
+        }
+        // Set: they serialize.
+        let set = ChatRequest {
+            max_tokens: Some(4096),
+            top_p: Some(0.9),
+            seed: Some(7),
+            stop: vec!["<STOP>".to_string()],
+            ..base
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains("\"max_tokens\":4096"), "{json}");
+        assert!(json.contains("\"top_p\":0.9"), "{json}");
+        assert!(json.contains("\"seed\":7"), "{json}");
+        assert!(json.contains("\"stop\":[\"<STOP>\"]"), "{json}");
+    }
+
+    #[test]
     fn chat_request_reasoning_effort_serialized_when_set() {
         let req = ChatRequest {
             model: "m".to_string(),
@@ -825,6 +909,10 @@ mod tests {
             tools: vec![],
             temperature: None,
             reasoning_effort: Some("high".to_string()),
+            max_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
             stream: false,
             stream_options: None,
         };

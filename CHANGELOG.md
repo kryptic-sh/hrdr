@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Opt-in request parameters.** `max_tokens` (now also sent on the OpenAI path,
+  not just Anthropic), `top_p`, `seed`, and `stop` are configurable (config /
+  `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED`), and `stream_usage = false`
+  (`$HRDR_STREAM_USAGE`) omits `stream_options` for the few servers that reject
+  it. All default to **not sent**, so no strict provider 400s on an unexpected
+  field. (The `reasoning:{}` object form is intentionally not added — hrdr's
+  providers accept the `reasoning_effort` field it already sends, and emitting
+  both risks a conflict.)
+
 - **Cache-hit and reasoning-token visibility.** Usage now parses the providers'
   `prompt_tokens_details.cached_tokens` and
   `completion_tokens_details.reasoning_tokens` (and Anthropic's

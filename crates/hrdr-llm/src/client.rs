@@ -81,9 +81,9 @@ pub struct Client {
     /// Reasoning-effort label; sent as `reasoning_effort` when it names a known
     /// level (see [`crate::normalize_effort`]).
     effort: Option<String>,
-    /// Output-token cap for the native Anthropic backend (required by that API;
-    /// unused by the OpenAI path).
-    max_tokens: u32,
+    /// Opt-in request parameters (`max_tokens`, `top_p`, `seed`, `stop`,
+    /// `include_usage`) applied to each request.
+    params: crate::RequestParams,
     /// Extra HTTP headers (provider-configured) sent with every request.
     extra_headers: Vec<(String, String)>,
     /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
@@ -145,7 +145,7 @@ impl Client {
             temperature: None,
             cache: CacheMode::Off,
             effort: None,
-            max_tokens: ANTHROPIC_MAX_TOKENS,
+            params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
             api_version: None,
             backend,
@@ -174,10 +174,10 @@ impl Client {
         self.effort = effort;
     }
 
-    /// Set the output-token cap for the native Anthropic backend. `None` keeps
-    /// the default ([`ANTHROPIC_MAX_TOKENS`]).
-    pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
-        self.max_tokens = max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
+    /// Set the opt-in request parameters (`max_tokens`, `top_p`, `seed`, `stop`,
+    /// `include_usage`).
+    pub fn set_params(&mut self, params: crate::RequestParams) {
+        self.params = params;
     }
 
     /// Set the provider-configured extra headers sent with every request.
@@ -228,11 +228,18 @@ impl Client {
             tools,
             temperature: self.temperature,
             reasoning_effort: self.effort.as_deref().and_then(crate::normalize_effort),
+            max_tokens: self.params.max_tokens,
+            top_p: self.params.top_p,
+            seed: self.params.seed,
+            stop: self.params.stop.clone(),
             stream,
-            // Ask for token usage on streamed turns (for the live loader stats).
-            stream_options: stream.then_some(crate::types::StreamOptions {
-                include_usage: true,
-            }),
+            // Ask for token usage on streamed turns (for the live loader stats),
+            // unless a strict server rejects `stream_options`.
+            stream_options: (stream && self.params.include_usage).then_some(
+                crate::types::StreamOptions {
+                    include_usage: true,
+                },
+            ),
         }
     }
 
@@ -283,7 +290,7 @@ impl Client {
                 &self.base_url,
                 self.api_key.as_deref(),
                 &self.model,
-                self.max_tokens,
+                self.params.max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS),
                 self.effort.as_deref(),
                 self.temperature,
                 self.cache,
