@@ -239,6 +239,9 @@ fn app_view(
     let file_index_state: RwSignal<u8> = create_rw_signal(0); // 0 stale, 1 building, 2 ready
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
+    // Prompt-cache hits + reasoning tokens from the latest call (for the stats line).
+    let cached_tokens: RwSignal<Option<u32>> = create_rw_signal(None);
+    let reasoning_tokens: RwSignal<Option<u32>> = create_rw_signal(None);
     // Turn-start instant + measured time-to-first-token (seconds) for the last
     // turn, shown in the status bar.
     let turn_start: RwSignal<Option<Instant>> = create_rw_signal(None);
@@ -535,14 +538,19 @@ fn app_view(
                 if matches!(ev, AgentEvent::Text(_) | AgentEvent::Reasoning(_)) {
                     out_tokens.set(out_tokens.get_untracked() + 1);
                 }
-                // Session-cumulative token counters for the status bar.
+                // Session-cumulative token counters for the status bar, plus the
+                // per-call cache/reasoning detail for the stats line.
                 if let AgentEvent::Usage {
                     prompt_tokens,
                     completion_tokens,
+                    cached_prompt_tokens,
+                    reasoning_tokens: reasoning,
                 } = &ev
                 {
                     session_in.set(session_in.get_untracked() + *prompt_tokens as usize);
                     session_out.set(session_out.get_untracked() + *completion_tokens as usize);
+                    cached_tokens.set(*cached_prompt_tokens);
+                    reasoning_tokens.set(*reasoning);
                 }
                 // Tool completions may have rewritten the shared TODO list.
                 let refresh_todos = matches!(ev, AgentEvent::ToolEnd { .. });
@@ -579,6 +587,8 @@ fn app_view(
                         ttft.get_untracked(),
                         out_tokens.get_untracked(),
                         usage.get_untracked(),
+                        cached_tokens.get_untracked(),
+                        reasoning_tokens.get_untracked(),
                     )
                 {
                     system(transcript, next_id, line);
@@ -2110,6 +2120,7 @@ fn handle_event(
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            ..
         } => usage.set(Some((prompt_tokens, completion_tokens))),
         AgentEvent::TurnDone => {}
     }

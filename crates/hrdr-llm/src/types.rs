@@ -236,6 +236,36 @@ pub struct Usage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// OpenAI-style breakdown of the prompt (`cached_tokens` = prompt-cache hits).
+    #[serde(default)]
+    pub prompt_tokens_details: TokenDetails,
+    /// OpenAI-style breakdown of the completion (`reasoning_tokens`).
+    #[serde(default)]
+    pub completion_tokens_details: TokenDetails,
+}
+
+/// Per-side token breakdown some providers report (`prompt_tokens_details` /
+/// `completion_tokens_details`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TokenDetails {
+    /// Prompt tokens served from the prompt cache (a cache hit).
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+    /// Completion tokens spent on reasoning/thinking.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Prompt tokens that were a cache hit, if the provider reported it.
+    pub fn cached_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details.cached_tokens
+    }
+
+    /// Completion tokens spent on reasoning/thinking, if reported.
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.completion_tokens_details.reasoning_tokens
+    }
 }
 
 // ---- streaming ----
@@ -386,6 +416,24 @@ impl Accumulator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_parses_cached_and_reasoning_details() {
+        let u: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":1200,"completion_tokens":400,
+                "prompt_tokens_details":{"cached_tokens":900},
+                "completion_tokens_details":{"reasoning_tokens":120}}"#,
+        )
+        .unwrap();
+        assert_eq!(u.prompt_tokens, 1200);
+        assert_eq!(u.cached_tokens(), Some(900));
+        assert_eq!(u.reasoning_tokens(), Some(120));
+        // Absent details → None (not zero), so we don't render a bogus "0 cached".
+        let plain: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5}"#).unwrap();
+        assert_eq!(plain.cached_tokens(), None);
+        assert_eq!(plain.reasoning_tokens(), None);
+    }
 
     #[test]
     fn accumulator_captures_finish_reason_and_truncation() {
@@ -655,6 +703,7 @@ mod tests {
             usage: Some(Usage {
                 prompt_tokens,
                 completion_tokens,
+                ..Default::default()
             }),
         }
     }

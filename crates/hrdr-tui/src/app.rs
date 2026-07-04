@@ -212,6 +212,9 @@ pub(crate) struct App {
     pub(crate) out_tokens: usize,
     /// `(prompt_tokens, completion_tokens)` from the latest model call.
     pub(crate) last_usage: Option<(u32, u32)>,
+    /// Prompt-cache hits + reasoning tokens from the latest call, if reported.
+    pub(crate) last_cached_tokens: Option<u32>,
+    pub(crate) last_reasoning_tokens: Option<u32>,
     tx: mpsc::UnboundedSender<TurnMsg>,
     pub(crate) rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     pub(crate) should_quit: bool,
@@ -329,6 +332,8 @@ impl App {
             first_token_at: None,
             out_tokens: 0,
             last_usage: None,
+            last_cached_tokens: None,
+            last_reasoning_tokens: None,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -957,6 +962,8 @@ impl App {
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
                 self.last_usage = None;
+                self.last_cached_tokens = None;
+                self.last_reasoning_tokens = None;
                 self.push_entry(Entry::System(hrdr_app::compaction_message(&res)));
                 if res.is_ok() {
                     self.autosave();
@@ -980,6 +987,8 @@ impl App {
                 .map(|t0| t0.duration_since(started).as_secs_f64()),
             self.out_tokens,
             self.last_usage,
+            self.last_cached_tokens,
+            self.last_reasoning_tokens,
         )
     }
 
@@ -1010,8 +1019,12 @@ impl App {
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cached_prompt_tokens,
+                reasoning_tokens,
             } => {
                 self.last_usage = Some((prompt_tokens, completion_tokens));
+                self.last_cached_tokens = cached_prompt_tokens;
+                self.last_reasoning_tokens = reasoning_tokens;
                 self.session_in += prompt_tokens as usize;
                 self.session_out += completion_tokens as usize;
             }

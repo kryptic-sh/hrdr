@@ -302,7 +302,7 @@ fn map_event(
     match kind {
         "message_start" => {
             let u = ev.get("message").and_then(|m| m.get("usage"));
-            Ok(Some(usage_chunk(prompt_tokens(u), 0)))
+            Ok(Some(message_start_usage(u)))
         }
         "content_block_start" => {
             let block = ev.get("content_block");
@@ -379,8 +379,8 @@ fn map_event(
                     })
                     .unwrap_or_default(),
                 usage: (out > 0).then_some(Usage {
-                    prompt_tokens: 0,
                     completion_tokens: out,
+                    ..Default::default()
                 }),
             };
             Ok((chunk.usage.is_some() || !chunk.choices.is_empty()).then_some(chunk))
@@ -408,26 +408,32 @@ fn map_stop_reason(stop: &str) -> String {
     .to_string()
 }
 
-/// Anthropic `input_tokens` plus the two cache counters (so the status bar's
-/// prompt-token figure reflects what was actually billed/cached).
-fn prompt_tokens(usage: Option<&Value>) -> u32 {
-    let get = |k: &str| {
-        usage
-            .and_then(|u| u.get(k))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
-    (get("input_tokens") + get("cache_read_input_tokens") + get("cache_creation_input_tokens"))
-        as u32
+/// Read a `u64` counter from an Anthropic usage object.
+fn usage_field(usage: Option<&Value>, key: &str) -> u32 {
+    usage
+        .and_then(|u| u.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32
 }
 
-fn usage_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatChunk {
+/// A prompt-usage chunk from Anthropic's `message_start`: total prompt tokens
+/// (`input` + both cache counters) with the cache-read portion surfaced as
+/// `cached_tokens`.
+fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
+    let cache_read = usage_field(usage, "cache_read_input_tokens");
+    let prompt = usage_field(usage, "input_tokens")
+        + cache_read
+        + usage_field(usage, "cache_creation_input_tokens");
+    let mut u = Usage {
+        prompt_tokens: prompt,
+        ..Default::default()
+    };
+    if cache_read > 0 {
+        u.prompt_tokens_details.cached_tokens = Some(cache_read);
+    }
     ChatChunk {
         choices: vec![],
-        usage: Some(Usage {
-            prompt_tokens,
-            completion_tokens,
-        }),
+        usage: Some(u),
     }
 }
 

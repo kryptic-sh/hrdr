@@ -86,6 +86,8 @@ pub fn turn_stats_line(
     ttft_secs: Option<f64>,
     out_tokens: usize,
     usage: Option<(u32, u32)>,
+    cached_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
 ) -> Option<String> {
     if out_tokens == 0 && usage.is_none() {
         return None;
@@ -108,6 +110,13 @@ pub fn turn_stats_line(
         s.push_str(&format!(
             " · ctx {prompt} (in/out {prompt}/{completion}, {ratio:.1}:1)"
         ));
+        // Prompt-cache hits + reasoning tokens, when the provider reports them.
+        if let Some(c) = cached_tokens.filter(|c| *c > 0) {
+            s.push_str(&format!(" · {c} cached"));
+        }
+        if let Some(r) = reasoning_tokens.filter(|r| *r > 0) {
+            s.push_str(&format!(" · {r} reasoning"));
+        }
     }
     Some(s)
 }
@@ -160,15 +169,20 @@ mod stats_tests {
     #[test]
     fn turn_stats_line_shapes() {
         // Nothing measurable → no line.
-        assert_eq!(turn_stats_line(1.0, None, 0, None), None);
-        // Full line: rate measured from the first token.
-        let s = turn_stats_line(3.0, Some(1.0), 100, Some((600, 100))).unwrap();
+        assert_eq!(turn_stats_line(1.0, None, 0, None, None, None), None);
+        // Full line: rate measured from the first token, with cache + reasoning.
+        let s =
+            turn_stats_line(3.0, Some(1.0), 100, Some((600, 100)), Some(450), Some(30)).unwrap();
         assert!(s.contains("✓ 100 tok"), "{s}");
         assert!(s.contains("50.0 tok/s"), "{s}");
         assert!(s.contains("ttft 1.00s"), "{s}");
         assert!(s.contains("ctx 600 (in/out 600/100, 6.0:1)"), "{s}");
-        // Usage-only turn (no streamed tokens) still reports context.
-        let s = turn_stats_line(2.0, None, 0, Some((10, 0))).unwrap();
+        assert!(s.contains("450 cached"), "{s}");
+        assert!(s.contains("30 reasoning"), "{s}");
+        // Usage-only turn (no streamed tokens) still reports context; zero
+        // cache/reasoning are omitted.
+        let s = turn_stats_line(2.0, None, 0, Some((10, 0)), Some(0), None).unwrap();
         assert!(s.contains("0.0 tok/s") && s.contains("ctx 10"), "{s}");
+        assert!(!s.contains("cached"), "{s}");
     }
 }

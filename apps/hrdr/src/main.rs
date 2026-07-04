@@ -373,9 +373,17 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 AgentEvent::Usage {
                     prompt_tokens,
                     completion_tokens,
+                    cached_prompt_tokens,
+                    reasoning_tokens,
                 } if !quiet => {
+                    let cached = cached_prompt_tokens
+                        .map(|c| format!(" ({c} cached)"))
+                        .unwrap_or_default();
+                    let reasoning = reasoning_tokens
+                        .map(|r| format!(" · reasoning {r}"))
+                        .unwrap_or_default();
                     eprintln!(
-                        "\x1b[90m[usage] ctx {prompt_tokens} · out {completion_tokens}\x1b[0m"
+                        "\x1b[90m[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}\x1b[0m"
                     );
                 }
                 AgentEvent::TurnDone => println!(),
@@ -420,8 +428,16 @@ fn event_json(ev: &AgentEvent) -> String {
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
+            reasoning_tokens,
         } => {
-            json!({"type": "usage", "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})
+            json!({
+                "type": "usage",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cached_prompt_tokens": cached_prompt_tokens,
+                "reasoning_tokens": reasoning_tokens,
+            })
         }
         AgentEvent::TurnDone => json!({"type": "done"}),
     };

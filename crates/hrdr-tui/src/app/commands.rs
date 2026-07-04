@@ -72,6 +72,8 @@ impl super::App {
         self.session_in = 0;
         self.session_out = 0;
         self.last_usage = None;
+        self.last_cached_tokens = None;
+        self.last_reasoning_tokens = None;
         self.session_id = None; // detach; next message starts a new session
         self.session_label = None;
         self.find = hrdr_app::FindState::default();

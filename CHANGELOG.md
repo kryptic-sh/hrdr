@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cache-hit and reasoning-token visibility.** Usage now parses the providers'
+  `prompt_tokens_details.cached_tokens` and
+  `completion_tokens_details.reasoning_tokens` (and Anthropic's
+  `cache_read_input_tokens`), and the per-turn stats line shows them — e.g.
+  `… · ctx 1200 (in/out 1200/400, 3.0:1) · 900 cached · 120 reasoning` — so you
+  can see the prompt cache and extended thinking actually working. Also exposed
+  on `hrdr run --json` usage events.
+
 - **Azure OpenAI support.** Set `api_version` on a provider and hrdr appends
   `?api-version=<v>` to requests and authenticates with an `api-key` header
   instead of `Bearer` (Azure is the OpenAI chat-completions wire, just a

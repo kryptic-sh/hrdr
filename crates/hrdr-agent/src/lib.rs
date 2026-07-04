@@ -50,6 +50,10 @@ pub enum AgentEvent {
     Usage {
         prompt_tokens: u32,
         completion_tokens: u32,
+        /// Prompt tokens served from the prompt cache (a cache hit), if reported.
+        cached_prompt_tokens: Option<u32>,
+        /// Completion tokens spent on reasoning/thinking, if reported.
+        reasoning_tokens: Option<u32>,
     },
     /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
     /// surfaced to the user as a system line.
@@ -1395,6 +1399,8 @@ impl Agent {
             on_event(AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cached_prompt_tokens: acc.usage.as_ref().and_then(|u| u.cached_tokens()),
+                reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
             });
 
             // The reply hit the output cap — warn so a silently-truncated answer
