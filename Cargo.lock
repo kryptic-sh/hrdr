@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-agent"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-app"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "hjkl-clipboard",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-editor"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "crossterm",
  "hjkl-buffer",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-gui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-llm"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-tools"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "hrdr-tui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",

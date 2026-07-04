@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-04
+
 ### Added
 
 - **Native Anthropic Messages API backend.** hrdr now talks to Claude over
@@ -1415,7 +1417,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/kryptic-sh/hrdr/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/kryptic-sh/hrdr/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/kryptic-sh/hrdr/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/kryptic-sh/hrdr/compare/v0.2.0...v0.2.1
