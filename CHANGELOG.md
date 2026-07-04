@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-05
+
 ### Added
 
 - **`max_completion_tokens` for OpenAI reasoning models.** `max_tokens` set on
@@ -1484,7 +1486,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/kryptic-sh/hrdr/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/kryptic-sh/hrdr/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/kryptic-sh/hrdr/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/kryptic-sh/hrdr/compare/v0.2.2...v0.2.3
