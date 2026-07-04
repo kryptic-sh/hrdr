@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Prompt caching no longer breaks non-caching providers by default.** In 0.2.2
+  `prompt_cache = "auto"` enabled `cache_control` breakpoints for _every_ remote
+  endpoint, but OpenAI, Groq, and xAI **reject** an unknown `cache_control`
+  field with a `400` (and OpenCode Zen does for GLM/Zhipu models), so the
+  default could break every request on those providers. `auto` now enables the
+  marker **only for OpenRouter** — the one endpoint that consumes it safely (it
+  strips the field for models that don't accept it). Other providers cache
+  automatically or ignore the marker; force it anywhere with
+  `prompt_cache = "on"`. Also corrected the docs: Anthropic caching is only on
+  its native Messages API, not the OpenAI-compatible endpoint hrdr uses.
+
 ## [0.2.2] - 2026-07-04
 
 ### Added

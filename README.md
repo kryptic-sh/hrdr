@@ -261,19 +261,23 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 
 ### Prompt caching
 
-For providers that support it (Anthropic natively, or Anthropic/Gemini models
-via OpenRouter), hrdr marks `cache_control` breakpoints on the request so the
-stable system+tools prefix and the growing conversation prefix are cached across
-turns — cutting cost and latency. Providers that don't support the marker simply
-ignore it.
+hrdr can mark `cache_control` breakpoints on each request (one on the system
+prompt, one rolling on the last message) so the stable system+tools prefix and
+the growing conversation prefix are cached across turns — cutting cost and
+latency on providers that consume the marker (e.g. **OpenRouter** for its
+Anthropic/Gemini/Qwen models).
 
 ```toml
 prompt_cache = "auto"   # auto (default) | on | off
 ```
 
-`auto` enables caching for remote endpoints and disables it for a local server
-(which may reject the content-parts form). Override with `$HRDR_PROMPT_CACHE` or
-`--prompt-cache off|on|auto`; `/info` shows whether it's currently active.
+`auto` enables it **only for OpenRouter**, because sending an unknown
+`cache_control` field isn't universally safe: OpenAI, Groq, and xAI **reject it
+with a 400**, while others (DeepSeek, Gemini, and OpenAI itself) already cache
+automatically, and Anthropic's OpenAI-compatible endpoint silently ignores it.
+Set `prompt_cache = "on"` to force it on an endpoint you know accepts it (env
+`$HRDR_PROMPT_CACHE`, flag `--prompt-cache off|on|auto`); `/info` shows whether
+it's currently active.
 
 ### MCP servers
 

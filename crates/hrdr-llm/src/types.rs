@@ -173,20 +173,26 @@ pub enum CacheMode {
     /// No cache breakpoints emitted.
     #[default]
     Off,
-    /// Emit `cache_control: {"type": "ephemeral"}` breakpoints (Anthropic native
-    /// and OpenRouter passthrough): one on the system prompt, one rolling on the
-    /// last message. Providers that don't support it ignore the marker.
+    /// Emit `cache_control: {"type": "ephemeral"}` breakpoints — one on the
+    /// system prompt, one rolling on the last message. Only useful for endpoints
+    /// that consume the marker (OpenRouter, for its Anthropic/Gemini/Qwen
+    /// models). Some direct provider endpoints **reject** an unknown
+    /// `cache_control` field with a `400` (OpenAI, Groq, xAI) and others silently
+    /// ignore it, so which endpoints get this is decided upstream (hrdr's
+    /// `resolve_cache_mode`), not here.
     Ephemeral,
 }
 
 /// Mark cache breakpoints on a serialized chat-request body (`messages[]`): the
 /// first `system` message and the last message each get a `cache_control`
 /// marker, converting their string `content` into a one-element content-parts
-/// array. Anthropic caches the prefix up to and including each marked block
-/// (≤4 breakpoints allowed; we use ≤2), so the stable system+tools prefix and
-/// the growing conversation prefix are reused turn to turn. No-op when there are
-/// no messages, or a target's `content` isn't a plain string (already parts, or
-/// a tool-call-only assistant turn with no text).
+/// array. A supporting provider (e.g. OpenRouter) caches the prefix up to and
+/// including each marked block (≤4 breakpoints allowed; we use ≤2), so the
+/// stable system+tools prefix and the growing conversation prefix are reused
+/// turn to turn. Only call this for endpoints known to accept the marker — see
+/// [`CacheMode::Ephemeral`]. No-op when there are no messages, or a target's
+/// `content` isn't a plain string (already parts, or a tool-call-only assistant
+/// turn with no text).
 pub fn apply_cache_breakpoints(body: &mut serde_json::Value) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;

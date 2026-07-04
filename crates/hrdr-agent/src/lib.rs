@@ -651,23 +651,35 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
 ];
 
 /// Resolve the prompt-cache `setting` (`off`/`on`/`ephemeral`/`auto`; `None` =
-/// `auto`) against the endpoint into a concrete [`CacheMode`]. `auto` enables
-/// caching for a remote endpoint and disables it for a local one (a local
-/// OpenAI-compatible server may reject the `cache_control` content-parts form,
-/// and cloud providers that don't support the marker simply ignore it).
+/// `auto`) against the endpoint into a concrete [`CacheMode`].
+///
+/// `auto` enables `cache_control` breakpoints **only for endpoints that consume
+/// them safely** — in practice OpenRouter, which normalizes the marker and
+/// strips it for models that don't accept it. It stays **off** for every other
+/// endpoint because sending an unknown `cache_control` field is not universally
+/// safe:
+/// - **OpenAI, Groq, xAI** reject it with a `400` (strict field validation), so
+///   a blanket default would break every request.
+/// - **Anthropic's OpenAI-compat endpoint** silently ignores it (caching is only
+///   available on the native Messages API, which hrdr doesn't speak).
+/// - **DeepSeek, Gemini, OpenAI, Groq, xAI** already cache automatically, so the
+///   marker buys nothing.
+/// - local servers may reject the content-parts form.
+///
+/// Force it anywhere with `prompt_cache = "on"` (the caller's responsibility to
+/// know the endpoint accepts it).
 pub fn resolve_cache_mode(setting: Option<&str>, base_url: &str) -> hrdr_llm::CacheMode {
     use hrdr_llm::CacheMode;
     match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("off") | Some("none") | Some("false") | Some("no") => CacheMode::Off,
         Some("on") | Some("ephemeral") | Some("true") | Some("yes") => CacheMode::Ephemeral,
-        _ if is_local_url(base_url) => CacheMode::Off,
-        _ => CacheMode::Ephemeral,
+        _ if is_openrouter(base_url) => CacheMode::Ephemeral,
+        _ => CacheMode::Off,
     }
 }
 
-/// Whether `base_url` points at a loopback/local endpoint (no prompt caching in
-/// `auto` mode).
-fn is_local_url(base_url: &str) -> bool {
+/// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
+fn url_host(base_url: &str) -> &str {
     let host = base_url
         .split("://")
         .nth(1)
@@ -678,11 +690,16 @@ fn is_local_url(base_url: &str) -> bool {
         .rsplit('@')
         .next()
         .unwrap_or("");
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
-    )
+    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+}
+
+/// Whether `base_url` points at OpenRouter — the one endpoint hrdr enables
+/// `cache_control` for in `auto` mode (it accepts the marker for the models that
+/// benefit and strips it for the rest). Also matches a custom provider pointed
+/// at OpenRouter.
+fn is_openrouter(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    host == "openrouter.ai" || host.ends_with(".openrouter.ai")
 }
 
 /// A value to persist into the user config file.
@@ -2188,29 +2205,50 @@ mod tests {
         use hrdr_llm::CacheMode;
         // Explicit settings win regardless of endpoint.
         assert_eq!(
-            resolve_cache_mode(Some("off"), "https://api.openai.com/v1"),
+            resolve_cache_mode(Some("off"), "https://openrouter.ai/api/v1"),
             CacheMode::Off
         );
         assert_eq!(
-            resolve_cache_mode(Some("on"), "http://localhost:8080/v1"),
+            resolve_cache_mode(Some("on"), "https://api.openai.com/v1"),
             CacheMode::Ephemeral
         );
-        // auto (None or "auto"): on for remote, off for local.
+        // auto (None or "auto"): only OpenRouter (which safely consumes the
+        // marker); a subdomain counts too.
         assert_eq!(
             resolve_cache_mode(None, "https://openrouter.ai/api/v1"),
             CacheMode::Ephemeral
         );
         assert_eq!(
-            resolve_cache_mode(Some("auto"), "http://127.0.0.1:8080/v1"),
+            resolve_cache_mode(Some("auto"), "https://gateway.openrouter.ai/v1"),
+            CacheMode::Ephemeral
+        );
+        // Direct provider endpoints that reject or ignore the marker → off in
+        // auto (they 400 on it or cache automatically). This is the fix for the
+        // blanket-remote default.
+        assert_eq!(
+            resolve_cache_mode(None, "https://api.openai.com/v1"),
             CacheMode::Off
         );
         assert_eq!(
-            resolve_cache_mode(None, "http://localhost:1234/v1"),
+            resolve_cache_mode(None, "https://api.groq.com/openai/v1"),
             CacheMode::Off
         );
-        // A local host with credentials in the URL is still detected as local.
         assert_eq!(
-            resolve_cache_mode(None, "http://user:pass@localhost:8080/v1"),
+            resolve_cache_mode(None, "https://api.anthropic.com/v1"),
+            CacheMode::Off
+        );
+        assert_eq!(
+            resolve_cache_mode(None, "https://opencode.ai/zen/v1"),
+            CacheMode::Off
+        );
+        // Local endpoints stay off; a "not-openrouter.ai.evil.com" host must not
+        // match the suffix check.
+        assert_eq!(
+            resolve_cache_mode(None, "http://127.0.0.1:8080/v1"),
+            CacheMode::Off
+        );
+        assert_eq!(
+            resolve_cache_mode(None, "https://openrouter.ai.evil.com/v1"),
             CacheMode::Off
         );
     }
