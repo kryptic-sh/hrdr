@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Custom per-provider HTTP headers.** `[providers.<name>.headers]` sends
+  arbitrary headers with every request to that provider (e.g. OpenRouter's
+  `HTTP-Referer`/`X-Title`, or a custom auth/routing header). Applied at startup
+  and on a `/provider` switch, on both the OpenAI and native Anthropic backends.
+- **Truncation warning.** When a reply hits the model's output cap
+  (`finish_reason: "length"`, or Anthropic's `max_tokens`), hrdr now surfaces a
+  notice so a silently cut-off answer or edit isn't mistaken for a complete one.
+- **`Retry-After` is honored.** On a `429`/`503`/`529`, hrdr now backs off for
+  the server-requested `Retry-After` seconds (clamped to 60s) instead of its
+  fixed exponential schedule, reducing repeat rate-limit hits.
 - **Extended thinking on the native Anthropic backend.** `/effort`
   (`minimal`/`low`/`medium`/`high`) now turns on a Claude `thinking` budget that
   scales with `max_tokens` (always leaving room for the answer); the

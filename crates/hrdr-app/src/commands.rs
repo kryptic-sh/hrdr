@@ -1131,6 +1131,7 @@ pub fn apply_provider(
     let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p));
     let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
+    let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     // Probe the new endpoint for its advertised context window unless the
     // provider config already declares one (which wins).
     let probe_after = p.context_window.is_none();
@@ -1138,6 +1139,7 @@ pub fn apply_provider(
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
         a.set_endpoint(url, key);
+        a.set_headers(headers);
         if let Some(m) = model {
             a.set_model(m);
         }

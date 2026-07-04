@@ -144,6 +144,9 @@ pub struct AgentConfig {
     /// them for a local server (which may reject the content-parts form). `None`
     /// means `auto`. See [`resolve_cache_mode`].
     pub prompt_cache: Option<String>,
+    /// Extra HTTP headers for the active provider (from its `[providers.<name>]`
+    /// `headers`), sent with every request. Populated when a provider is resolved.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -261,6 +264,7 @@ impl Default for AgentConfig {
             preserve_recent_tokens: DEFAULT_PRESERVE_RECENT_TOKENS,
             mcp: Vec::new(),
             prompt_cache: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -282,6 +286,7 @@ impl AgentConfig {
                 model: c.model.clone(),
                 remote: c.remote.unwrap_or(true),
                 context_window: c.context_window,
+                headers: c.headers.clone(),
             });
         }
         builtin_provider(name)
@@ -346,6 +351,10 @@ pub struct ProviderConfig {
     /// Model context window (for the status bar's "X of Y").
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// Extra HTTP headers sent with every request to this provider (e.g.
+    /// OpenRouter's `HTTP-Referer`/`X-Title`, or a custom auth/routing header).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// One user-defined shell guardrail from a `[[guardrails]]` config entry:
@@ -390,6 +399,8 @@ pub struct ResolvedProvider {
     pub model: Option<String>,
     pub remote: bool,
     pub context_window: Option<u32>,
+    /// Extra HTTP headers to send with every request to this provider.
+    pub headers: HashMap<String, String>,
 }
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
@@ -431,6 +442,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         model: None,
         remote,
         context_window: None,
+        headers: HashMap::new(),
     })
 }
 
@@ -921,6 +933,7 @@ impl Agent {
         }
         client.set_effort(config.effort.clone());
         client.set_max_tokens(config.max_tokens);
+        client.set_headers(config.headers.clone());
 
         Ok(Self {
             client,
@@ -1142,6 +1155,12 @@ impl Agent {
         self.client.set_effort(effort);
     }
 
+    /// Replace the provider-configured extra HTTP headers (used on a `/provider`
+    /// switch so the new provider's headers apply).
+    pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
+        self.client.set_headers(headers);
+    }
+
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
     pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
         let base_url = base_url.into();
@@ -1358,6 +1377,17 @@ impl Agent {
                 completion_tokens,
             });
 
+            // The reply hit the output cap — warn so a silently-truncated answer
+            // or edit isn't mistaken for a complete one (raise `max_tokens` on the
+            // Anthropic backend, or the model's cap otherwise).
+            if acc.truncated() {
+                on_event(AgentEvent::Notice(
+                    "⚠ response truncated at the output limit — it may be incomplete \
+                     (raise max_tokens if this recurs)"
+                        .to_string(),
+                ));
+            }
+
             let assistant = acc.into_message();
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
             self.messages.push(assistant);
@@ -1566,10 +1596,11 @@ impl Agent {
                         *overflow_compacted = true;
                         continue;
                     }
-                    // Transient network/server error → backoff and retry.
+                    // Transient network/server error → backoff and retry. Honor a
+                    // server `Retry-After` when present, else exponential backoff.
                     if is_transient(&e) && attempt < MAX_RETRIES {
                         attempt += 1;
-                        let delay = retry_backoff(attempt);
+                        let delay = retry_after_hint(&e).unwrap_or_else(|| retry_backoff(attempt));
                         on_event(AgentEvent::Notice(format!(
                             "network error — retrying in {:.0}s (attempt {attempt}/{MAX_RETRIES})",
                             delay.as_secs_f64()
@@ -1807,6 +1838,22 @@ fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
 fn retry_backoff(attempt: usize) -> std::time::Duration {
     let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
     std::time::Duration::from_secs_f64(secs.min(8.0))
+}
+
+/// The server-requested wait from a `Retry-After` header, if the client embedded
+/// one in the error as `retry-after: <seconds>s` (see the client's rate-limit
+/// error formatting). Clamped to 60s so a hostile/oversized value can't stall the
+/// turn. Only the integer-seconds form is parsed (the HTTP-date form is ignored).
+fn retry_after_hint(e: &anyhow::Error) -> Option<std::time::Duration> {
+    let msg = e.to_string().to_ascii_lowercase();
+    let after = msg.split("retry-after:").nth(1)?;
+    let secs: u64 = after
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs.min(60)))
 }
 
 /// Drain a chat stream into an [`Accumulator`], emitting `Reasoning` and `Text`
@@ -2097,11 +2144,13 @@ mod tests {
                 model: Some("my-model".to_string()),
                 remote: Some(true),
                 context_window: Some(123),
+                headers: HashMap::from([("X-Title".to_string(), "hrdr".to_string())]),
             },
         );
         // Custom "zen" shadows the built-in; an unknown custom name resolves too.
         let p = cfg.resolve_provider("zen").unwrap();
         assert_eq!(p.base_url, "https://my.zen/v1");
+        assert_eq!(p.headers.get("X-Title").map(String::as_str), Some("hrdr"));
         assert_eq!(p.model.as_deref(), Some("my-model"));
         assert_eq!(p.context_window, Some(123));
         // Built-ins still resolve when not shadowed.
@@ -2412,6 +2461,19 @@ mod tests {
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----
+
+    #[test]
+    fn retry_after_hint_parses_and_clamps() {
+        use super::retry_after_hint;
+        // Parsed from the client's error suffix.
+        let e = anyhow::anyhow!("chat endpoint returned 429 : rate limited (retry-after: 5s)");
+        assert_eq!(retry_after_hint(&e).map(|d| d.as_secs()), Some(5));
+        // Clamped to 60s.
+        let big = anyhow::anyhow!("returned 429 (retry-after: 9999s)");
+        assert_eq!(retry_after_hint(&big).map(|d| d.as_secs()), Some(60));
+        // Absent → None (falls back to exponential backoff).
+        assert_eq!(retry_after_hint(&anyhow::anyhow!("returned 500")), None);
+    }
 
     #[test]
     fn is_transient_more_variants() {

@@ -235,7 +235,18 @@ context_window = 256000
 base_url = "https://api.openai.com/v1"
 key_env = "OPENAI_API_KEY"
 model = "gpt-5.5"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+key_env = "OPENROUTER_API_KEY"
+[providers.openrouter.headers]     # extra headers sent with every request
+HTTP-Referer = "https://your.app"  # OpenRouter attribution / ranking
+X-Title = "your-app"
 ```
+
+Each provider can carry `[providers.<name>.headers]` — arbitrary HTTP headers
+sent on every request (OpenRouter's `HTTP-Referer`/`X-Title`, or a custom
+auth/routing header). They apply at startup and follow a `/provider` switch.
 
 `context_window` is optional: if you omit it, hrdr probes the endpoint and uses
 what it advertises (vLLM's `max_model_len`, llama.cpp's `/props` `n_ctx`, etc.)

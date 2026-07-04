@@ -296,6 +296,9 @@ pub struct Accumulator {
     pub reasoning: String,
     /// Token usage from the final `include_usage` chunk, if the server sent it.
     pub usage: Option<Usage>,
+    /// The last `finish_reason` the server reported (`stop`, `tool_calls`,
+    /// `length`, …). `length` means the reply was cut off at the output cap.
+    pub finish_reason: Option<String>,
     calls: Vec<ToolCall>,
 }
 
@@ -313,6 +316,9 @@ impl Accumulator {
             self.usage = chunk.usage.clone();
         }
         let choice = chunk.choices.first()?;
+        if let Some(fr) = &choice.finish_reason {
+            self.finish_reason = Some(fr.clone());
+        }
         if let Some(r) = &choice.delta.reasoning_content {
             self.reasoning.push_str(r);
         }
@@ -349,6 +355,12 @@ impl Accumulator {
         delta
     }
 
+    /// Whether the reply was cut off at the model's output cap (`finish_reason`
+    /// `length`, or Anthropic's `max_tokens`) rather than finishing naturally.
+    pub fn truncated(&self) -> bool {
+        matches!(self.finish_reason.as_deref(), Some("length" | "max_tokens"))
+    }
+
     /// Assemble the final assistant message.
     pub fn into_message(mut self) -> ChatMessage {
         // Some servers omit tool-call ids. Synthesize a stable one per call so
@@ -374,6 +386,32 @@ impl Accumulator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn accumulator_captures_finish_reason_and_truncation() {
+        let mut acc = Accumulator::new();
+        assert!(!acc.truncated());
+        // A `length` finish_reason flags truncation.
+        acc.push(&ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta::default(),
+                finish_reason: Some("length".into()),
+            }],
+            usage: None,
+        });
+        assert_eq!(acc.finish_reason.as_deref(), Some("length"));
+        assert!(acc.truncated());
+        // A normal `stop` does not.
+        let mut acc2 = Accumulator::new();
+        acc2.push(&ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta::default(),
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        });
+        assert!(!acc2.truncated());
+    }
 
     #[test]
     fn cache_breakpoints_mark_system_and_last_only() {

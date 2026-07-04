@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
         if config.context_window.is_none() {
             config.context_window = p.context_window;
         }
+        config.headers = p.headers.into_iter().collect();
         remote_provider = p.remote;
     }
 

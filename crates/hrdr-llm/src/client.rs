@@ -84,8 +84,22 @@ pub struct Client {
     /// Output-token cap for the native Anthropic backend (required by that API;
     /// unused by the OpenAI path).
     max_tokens: u32,
+    /// Extra HTTP headers (provider-configured) sent with every request.
+    extra_headers: Vec<(String, String)>,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
+}
+
+/// Format a `Retry-After` response header as ` (retry-after: Ns)` so the agent's
+/// retry loop can honor the server's requested wait (integer-seconds form only;
+/// empty string when the header is absent or not a plain number).
+pub(crate) fn retry_after_suffix(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| format!(" (retry-after: {secs}s)"))
+        .unwrap_or_default()
 }
 
 /// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
@@ -128,6 +142,7 @@ impl Client {
             cache: CacheMode::Off,
             effort: None,
             max_tokens: ANTHROPIC_MAX_TOKENS,
+            extra_headers: Vec::new(),
             backend,
         }
     }
@@ -158,6 +173,11 @@ impl Client {
     /// the default ([`ANTHROPIC_MAX_TOKENS`]).
     pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
         self.max_tokens = max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
+    }
+
+    /// Set the provider-configured extra headers sent with every request.
+    pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
+        self.extra_headers = headers;
     }
 
     /// The current endpoint base URL (including the `/v1` suffix).
@@ -204,8 +224,9 @@ impl Client {
         )
     }
 
-    /// Apply the backend's auth to a request builder: `x-api-key` +
-    /// `anthropic-version` for the native Anthropic backend, else `Bearer`.
+    /// Apply the backend's auth + any provider-configured extra headers to a
+    /// request builder: `x-api-key` + `anthropic-version` for the native
+    /// Anthropic backend, else `Bearer`.
     fn auth(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(key) = &self.api_key {
             req = match self.backend {
@@ -214,6 +235,9 @@ impl Client {
                     .header("anthropic-version", crate::anthropic::API_VERSION),
                 Backend::OpenAi => req.bearer_auth(key),
             };
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
         }
         req
     }
@@ -245,6 +269,7 @@ impl Client {
                 self.effort.as_deref(),
                 self.temperature,
                 self.cache,
+                &self.extra_headers,
                 messages,
                 tools,
             )
@@ -273,12 +298,13 @@ impl Client {
             .context("chat stream request failed")?;
         let status = resp.status();
         if !status.is_success() {
+            let retry = retry_after_suffix(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             log_wire(
                 "error_response",
                 serde_json::json!({"status": status.as_u16(), "body": text}),
             );
-            bail!("chat endpoint returned {status}: {text}");
+            bail!("chat endpoint returned {status}: {text}{retry}");
         }
 
         let mut bytes = resp.bytes_stream();

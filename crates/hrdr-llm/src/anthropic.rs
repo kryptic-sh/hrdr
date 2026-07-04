@@ -225,6 +225,7 @@ pub(crate) async fn chat_stream(
     effort: Option<&str>,
     temperature: Option<f32>,
     cache: CacheMode,
+    extra_headers: &[(String, String)],
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDef>,
 ) -> Result<(Value, crate::ChatStream)> {
@@ -244,6 +245,9 @@ pub(crate) async fn chat_stream(
     if let Some(key) = api_key {
         req = req.header("x-api-key", key);
     }
+    for (k, v) in extra_headers {
+        req = req.header(k, v);
+    }
     // Interleaved thinking lets Claude reason between tool calls — valuable in the
     // agent loop, so enable it when thinking is on and tools are offered.
     if body.get("thinking").is_some() && !tools.is_empty() {
@@ -252,8 +256,9 @@ pub(crate) async fn chat_stream(
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
     if !status.is_success() {
+        let retry = crate::client::retry_after_suffix(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        bail!("chat endpoint returned {status}: {text}");
+        bail!("chat endpoint returned {status}: {text}{retry}");
     }
 
     let stream = async_stream::try_stream! {
@@ -357,7 +362,28 @@ fn map_event(
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32;
-            Ok((out > 0).then(|| usage_chunk(0, out)))
+            let finish = ev
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(map_stop_reason);
+            // One chunk carrying end-of-turn usage + the mapped finish_reason
+            // (so truncation — Anthropic's `max_tokens` → `length` — is detected).
+            let chunk = ChatChunk {
+                choices: finish
+                    .map(|fr| {
+                        vec![ChunkChoice {
+                            delta: Delta::default(),
+                            finish_reason: Some(fr),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                usage: (out > 0).then_some(Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: out,
+                }),
+            };
+            Ok((chunk.usage.is_some() || !chunk.choices.is_empty()).then_some(chunk))
         }
         "error" => {
             let msg = ev
@@ -369,6 +395,17 @@ fn map_event(
         }
         _ => Ok(None), // ping, content_block_stop, message_stop
     }
+}
+
+/// Map an Anthropic `stop_reason` to the OpenAI `finish_reason` vocabulary.
+fn map_stop_reason(stop: &str) -> String {
+    match stop {
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        "end_turn" | "stop_sequence" => "stop",
+        other => other,
+    }
+    .to_string()
 }
 
 /// Anthropic `input_tokens` plus the two cache counters (so the status bar's
