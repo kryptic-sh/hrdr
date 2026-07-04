@@ -276,22 +276,30 @@ impl AgentConfig {
     }
 }
 
-/// One MCP server from a `[[mcp]]` config entry. hrdr spawns `command args…`
-/// (with `env` added), connects over the stdio transport, and registers the
-/// server's tools namespaced as `<name>_<tool>`. `disabled = true` keeps the
-/// entry but skips it.
+/// One MCP server from a `[[mcp]]` config entry, registered with its tools
+/// namespaced `<name>_<tool>`. Two transports: **stdio** (set `command`) spawns
+/// `command args…` with `env`; **HTTP** (set `url`) POSTs to a Streamable-HTTP
+/// endpoint with `headers` (e.g. auth). Exactly one of `command`/`url` is
+/// required. `disabled = true` keeps the entry but skips it.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct McpServerConfig {
     /// Short name; namespaces the server's tools and labels its errors.
     pub name: String,
-    /// Executable to spawn (found on `PATH`).
-    pub command: String,
+    /// stdio transport: executable to spawn (found on `PATH`).
+    #[serde(default)]
+    pub command: Option<String>,
     /// Arguments passed to `command`.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Extra environment variables for the server process.
+    /// Extra environment variables for the `command` process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// HTTP transport: the Streamable-HTTP endpoint URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra HTTP headers sent with every request (e.g. `Authorization`).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Keep the entry but don't connect.
     #[serde(default)]
     pub disabled: bool,
@@ -840,12 +848,29 @@ impl Agent {
             if cfg.disabled {
                 continue;
             }
-            let env: Vec<(String, String)> = cfg
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            match hrdr_tools::McpClient::connect(&cfg.name, &cfg.command, &cfg.args, &env).await {
+            let pairs = |m: &HashMap<String, String>| -> Vec<(String, String)> {
+                m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            // Transport: `url` → HTTP, else `command` → stdio.
+            let connected = match (&cfg.url, &cfg.command) {
+                (Some(url), _) => {
+                    hrdr_tools::McpClient::connect_http(&cfg.name, url, &pairs(&cfg.headers)).await
+                }
+                (None, Some(cmd)) => {
+                    hrdr_tools::McpClient::connect_stdio(
+                        &cfg.name,
+                        cmd,
+                        &cfg.args,
+                        &pairs(&cfg.env),
+                    )
+                    .await
+                }
+                (None, None) => {
+                    notices.push(format!("MCP '{}' skipped: no `command` or `url`", cfg.name));
+                    continue;
+                }
+            };
+            match connected {
                 Ok((client, tools)) => {
                     let n = tools.len();
                     for t in tools {
@@ -2148,20 +2173,35 @@ mod tests {
             disabled = true
             [mcp.env]
             GITHUB_TOKEN = "secret"
+
+            [[mcp]]
+            name = "remote"
+            url = "https://example.com/mcp"
+            [mcp.headers]
+            Authorization = "Bearer xyz"
             "#,
         )
         .unwrap();
         let mut cfg = AgentConfig::default();
         cfg.apply_file(fc);
-        assert_eq!(cfg.mcp.len(), 2);
+        assert_eq!(cfg.mcp.len(), 3);
+        // stdio server.
         assert_eq!(cfg.mcp[0].name, "fs");
-        assert_eq!(cfg.mcp[0].command, "npx");
+        assert_eq!(cfg.mcp[0].command.as_deref(), Some("npx"));
         assert_eq!(cfg.mcp[0].args.len(), 3);
+        assert!(cfg.mcp[0].url.is_none());
         assert!(!cfg.mcp[0].disabled);
         assert!(cfg.mcp[1].disabled);
         assert_eq!(
             cfg.mcp[1].env.get("GITHUB_TOKEN").map(String::as_str),
             Some("secret")
+        );
+        // HTTP server.
+        assert_eq!(cfg.mcp[2].url.as_deref(), Some("https://example.com/mcp"));
+        assert!(cfg.mcp[2].command.is_none());
+        assert_eq!(
+            cfg.mcp[2].headers.get("Authorization").map(String::as_str),
+            Some("Bearer xyz")
         );
     }
 

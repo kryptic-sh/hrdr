@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **MCP over HTTP (Streamable-HTTP transport).** `[[mcp]]` servers can now be
+  remote: set `url` (instead of `command`) plus optional `[mcp.headers]` for
+  auth. hrdr POSTs JSON-RPC to the endpoint, handling both `application/json`
+  and SSE (`text/event-stream`) responses and echoing the server's
+  `Mcp-Session-Id`. stdio and HTTP share one client behind a transport
+  abstraction; `command` is now optional (exactly one of `command`/`url`).
+
 ### Changed
 
 - **Tool names shortened (breaking).** `read_file`→`read`, `write_file`→`write`,

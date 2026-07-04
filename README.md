@@ -260,28 +260,38 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 ### MCP servers
 
 Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add
-their tools to the model's tool set. Each `[[mcp]]` entry is spawned over the
-**stdio transport** at startup; its tools are namespaced `<name>_<tool>` and a
-status line is shown per server. A server that fails to start is skipped (the
-rest still load).
+their tools to the model's tool set. Each `[[mcp]]` entry connects at startup;
+its tools are namespaced `<name>_<tool>` and a status line is shown per server.
+A server that fails to connect is skipped (the rest still load). Two transports
+— set `command` for a local **stdio** server, or `url` for a remote
+**Streamable-HTTP** one:
 
 ```toml
+# stdio: a spawned local process
 [[mcp]]
 name = "fs"                                                    # tools appear as fs_*
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+[mcp.env]                   # extra env for the server process
+FOO = "bar"
+
+# HTTP: a remote Streamable-HTTP endpoint
+[[mcp]]
+name = "remote"
+url = "https://mcp.example.com/mcp"
+[mcp.headers]               # sent with every request (auth, etc.)
+Authorization = "Bearer ghp_…"
 
 [[mcp]]
 name = "github"
 command = "github-mcp-server"
-# disabled = true          # keep the entry but skip connecting
-[mcp.env]                   # extra env for the server process
-GITHUB_TOKEN = "ghp_…"
+disabled = true             # keep the entry but skip connecting
 ```
 
 Tools flagged `readOnlyHint` are batched concurrently like the built-in read
-tools; everything else runs sequentially. (v1 is stdio-only — HTTP/SSE
-transports and resources/prompts are follow-ups.)
+tools; everything else runs sequentially. (The HTTP transport handles both
+`application/json` and SSE responses and carries the server's session id;
+resources/prompts and the legacy HTTP+SSE transport are follow-ups.)
 
 ### Guardrails
 
@@ -412,7 +422,8 @@ The shell and search tools adapt to the host:
       search/goto scrolling, live theme swap, multi-line input, queueing)
 - [x] Release pipeline: 7-target binaries, GitHub Releases, crates.io, AUR,
       Homebrew, Scoop, Alpine
-- [x] MCP client (stdio transport) — `[[mcp]]` servers' tools join the set
+- [x] MCP client (stdio + Streamable-HTTP) — `[[mcp]]` servers' tools join the
+      set
 - [ ] LSP diagnostics feedback
 - [ ] Vim input discipline in the GUI (needs a render-agnostic `EditorEngine`
       seam)
