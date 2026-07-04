@@ -801,6 +801,15 @@ impl App {
         self.turn_handle = Some(handle);
     }
 
+    /// Connect the configured MCP servers (once, at startup), showing a status
+    /// line per server. Their tools join the set the model is offered.
+    pub(crate) async fn connect_mcp(&mut self) {
+        let notices = self.agent.lock().await.connect_mcp().await;
+        for n in notices {
+            self.push_entry(Entry::System(n));
+        }
+    }
+
     /// Ring the terminal bell when a turn finishes (shared gate: enabled +
     /// ran at least [`hrdr_app::BELL_MIN_SECS`], so quick replies stay silent).
     fn maybe_bell(&self) {

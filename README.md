@@ -257,6 +257,32 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 
 `auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.
 
+### MCP servers
+
+Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add
+their tools to the model's tool set. Each `[[mcp]]` entry is spawned over the
+**stdio transport** at startup; its tools are namespaced `<name>_<tool>` and a
+status line is shown per server. A server that fails to start is skipped (the
+rest still load).
+
+```toml
+[[mcp]]
+name = "fs"                                                    # tools appear as fs_*
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+
+[[mcp]]
+name = "github"
+command = "github-mcp-server"
+# disabled = true          # keep the entry but skip connecting
+[mcp.env]                   # extra env for the server process
+GITHUB_TOKEN = "ghp_…"
+```
+
+Tools flagged `readOnlyHint` are batched concurrently like the built-in read
+tools; everything else runs sequentially. (v1 is stdio-only — HTTP/SSE
+transports and resources/prompts are follow-ups.)
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —
@@ -386,7 +412,8 @@ The shell and search tools adapt to the host:
       search/goto scrolling, live theme swap, multi-line input, queueing)
 - [x] Release pipeline: 7-target binaries, GitHub Releases, crates.io, AUR,
       Homebrew, Scoop, Alpine
-- [ ] MCP client + LSP diagnostics feedback
+- [x] MCP client (stdio transport) — `[[mcp]]` servers' tools join the set
+- [ ] LSP diagnostics feedback
 - [ ] Vim input discipline in the GUI (needs a render-agnostic `EditorEngine`
       seam)
 

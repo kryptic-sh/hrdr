@@ -320,6 +320,13 @@ async fn main() -> Result<()> {
 /// `--quiet`: text only. Exit code 0 on a completed turn, 1 on error.
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
+    // Connect any configured MCP servers before the turn (their tools join the
+    // set); surface the per-server status on stderr unless quiet.
+    for notice in agent.connect_mcp().await {
+        if !quiet {
+            eprintln!("\x1b[90m[{notice}]\x1b[0m");
+        }
+    }
     // Headless runs have no interactive steering.
     let result = agent
         .run(prompt, hrdr_agent::steering_queue(), |ev| {

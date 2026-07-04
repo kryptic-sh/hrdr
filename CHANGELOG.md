@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MCP client (stdio transport).** Connect
+  [Model Context Protocol](https://modelcontextprotocol.io) servers via
+  `[[mcp]]` config entries (`name`, `command`, `args`, `env`, `disabled`); hrdr
+  spawns each at startup, runs the JSON-RPC handshake, discovers its tools
+  (`tools/list`), and registers them namespaced `<name>_<tool>` so the model can
+  call them (`tools/call`) alongside the built-ins. Tools flagged `readOnlyHint`
+  batch concurrently. A failing server is skipped with a status line; the rest
+  still load. Works in the TUI, GUI, and `hrdr run`. v1 is stdio-only
+  (HTTP/SSE + resources/prompts are follow-ups).
+
 - **Steering — course-correct a running turn (pi-style).** Submit a message
   while a reply is in flight and it's now delivered to the model **after the
   current tool round**, instead of waiting for the whole turn to finish. The

@@ -99,6 +99,7 @@ pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<()> {
     let mut terminal: Tui = Terminal::new(backend)?;
 
     let mut app = App::new(config, ui)?;
+    app.connect_mcp().await;
     tui::run_loop(&mut app, &mut terminal).await?;
     Ok(())
 }

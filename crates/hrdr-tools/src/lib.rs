@@ -16,12 +16,14 @@ use hrdr_llm::ToolDef;
 mod checkpoint;
 mod guardrails;
 mod hooks;
+mod mcp;
 mod tools;
 mod web;
 
 pub use checkpoint::{CheckpointInfo, Checkpoints};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{DEFAULT_HOOK_TIMEOUT_MS, Hook, run_file_hooks};
+pub use mcp::McpClient;
 pub use tools::{
     BashTool, EditTool, GlobTool, GrepTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
     available_shell_tools,

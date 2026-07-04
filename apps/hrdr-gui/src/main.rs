@@ -361,6 +361,18 @@ fn app_view(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
     let events = create_signal_from_tokio_channel(rx);
 
+    // Connect configured MCP servers in the background (non-blocking startup);
+    // their tools join the set and a status line per server appears when ready.
+    {
+        let agent = agent.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for notice in agent.lock().await.connect_mcp().await {
+                let _ = tx.send(UiMsg::System(notice));
+            }
+        });
+    }
+
     // Launch a model turn. Shared by Enter/Send, the queue drain on `Done`,
     // and the CommandHost hooks (`/retry`, `/init`). `show_as_user` displays
     // the prompt as a user message (`false` for /init's internal prompt).

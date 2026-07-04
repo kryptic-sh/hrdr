@@ -132,6 +132,8 @@ pub struct AgentConfig {
     /// Token budget for the verbatim tail kept through compaction
     /// (`preserve_recent_tokens`). Default [`DEFAULT_PRESERVE_RECENT_TOKENS`].
     pub preserve_recent_tokens: u32,
+    /// MCP servers from `[[mcp]]` config; connected by [`Agent::connect_mcp`].
+    pub mcp: Vec<McpServerConfig>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -246,6 +248,7 @@ impl Default for AgentConfig {
             tool_max_lines: hrdr_tools::DEFAULT_MAX_OUTPUT_LINES,
             compaction_tail_turns: DEFAULT_TAIL_TURNS,
             preserve_recent_tokens: DEFAULT_PRESERVE_RECENT_TOKENS,
+            mcp: Vec::new(),
         }
     }
 }
@@ -271,6 +274,27 @@ impl AgentConfig {
         }
         builtin_provider(name)
     }
+}
+
+/// One MCP server from a `[[mcp]]` config entry. hrdr spawns `command args…`
+/// (with `env` added), connects over the stdio transport, and registers the
+/// server's tools namespaced as `<name>_<tool>`. `disabled = true` keeps the
+/// entry but skips it.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    /// Short name; namespaces the server's tools and labels its errors.
+    pub name: String,
+    /// Executable to spawn (found on `PATH`).
+    pub command: String,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the server process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Keep the entry but don't connect.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// A user-defined provider from `[providers.<name>]` in config.
@@ -419,6 +443,8 @@ struct FileConfig {
     tool_output: Option<ToolOutputConfig>,
     compaction_tail_turns: Option<usize>,
     preserve_recent_tokens: Option<u32>,
+    #[serde(default)]
+    mcp: Vec<McpServerConfig>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -523,6 +549,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.preserve_recent_tokens {
             self.preserve_recent_tokens = v;
+        }
+        if !fc.mcp.is_empty() {
+            self.mcp = fc.mcp;
         }
     }
 
@@ -704,6 +733,11 @@ pub struct Agent {
     project_docs: Option<String>,
     /// File checkpoint store (per-turn pre-images), if a store dir is available.
     checkpoints: Option<Arc<Mutex<Checkpoints>>>,
+    /// MCP servers to connect (consumed by [`Self::connect_mcp`]).
+    mcp_configs: Vec<McpServerConfig>,
+    /// Live MCP connections, kept alive for the process (their tools hold clones
+    /// too; dropping these kills the server processes).
+    mcp_clients: Vec<Arc<hrdr_tools::McpClient>>,
 }
 
 impl Agent {
@@ -788,7 +822,50 @@ impl Agent {
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
             checkpoints,
+            mcp_configs: config.mcp,
+            mcp_clients: Vec::new(),
         })
+    }
+
+    /// Connect to the configured `[[mcp]]` servers, registering each server's
+    /// tools (namespaced `<name>_<tool>`) into the tool set and re-rendering the
+    /// system prompt so they're listed. Resilient: a server that fails to start
+    /// or handshake is skipped. Returns one human-readable status line per
+    /// server (for the frontend to surface). Call once, after [`Self::new`],
+    /// before the first turn; a second call is a no-op (configs are consumed).
+    pub async fn connect_mcp(&mut self) -> Vec<String> {
+        let configs = std::mem::take(&mut self.mcp_configs);
+        let mut notices = Vec::new();
+        for cfg in &configs {
+            if cfg.disabled {
+                continue;
+            }
+            let env: Vec<(String, String)> = cfg
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            match hrdr_tools::McpClient::connect(&cfg.name, &cfg.command, &cfg.args, &env).await {
+                Ok((client, tools)) => {
+                    let n = tools.len();
+                    for t in tools {
+                        self.tools.register(t);
+                    }
+                    self.mcp_clients.push(client);
+                    notices.push(format!(
+                        "MCP '{}': connected ({n} tool{})",
+                        cfg.name,
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(e) => notices.push(format!("MCP '{}' failed: {e}", cfg.name)),
+            }
+        }
+        // New tools changed the set the model is told about — rebuild the prompt.
+        if !self.mcp_clients.is_empty() {
+            self.refresh_system();
+        }
+        notices
     }
 
     /// The file checkpoint store, if available (for `/revert` / `/checkpoints`).
@@ -1967,6 +2044,7 @@ mod tests {
             }),
             compaction_tail_turns: Some(4),
             preserve_recent_tokens: Some(12_000),
+            mcp: vec![],
         });
         assert_eq!(cfg.tool_max_lines, 500);
         assert_eq!(cfg.tool_max_bytes, 20_000);
@@ -2053,6 +2131,38 @@ mod tests {
         cfg2.apply_file(partial);
         assert_eq!(cfg2.tool_max_bytes, 100);
         assert_eq!(cfg2.tool_max_lines, hrdr_tools::DEFAULT_MAX_OUTPUT_LINES);
+    }
+
+    #[test]
+    fn mcp_parses_from_config_toml() {
+        let fc: FileConfig = toml::from_str(
+            r#"
+            [[mcp]]
+            name = "fs"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+            [[mcp]]
+            name = "gh"
+            command = "gh-mcp"
+            disabled = true
+            [mcp.env]
+            GITHUB_TOKEN = "secret"
+            "#,
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(cfg.mcp.len(), 2);
+        assert_eq!(cfg.mcp[0].name, "fs");
+        assert_eq!(cfg.mcp[0].command, "npx");
+        assert_eq!(cfg.mcp[0].args.len(), 3);
+        assert!(!cfg.mcp[0].disabled);
+        assert!(cfg.mcp[1].disabled);
+        assert_eq!(
+            cfg.mcp[1].env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("secret")
+        );
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----
