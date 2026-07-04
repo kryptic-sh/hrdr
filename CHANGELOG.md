@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-04
+
 ### Added
 
 - **Reasoning effort is now sent to the model.** `/effort`, `--effort`, and
@@ -43,25 +45,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resources, concurrent id-routing, `Mcp-Session-Id` resend, capability gating
   (absent `resources`/`prompts` omit their op-tools), and empty-list
   placeholders.
-
-### Fixed
-
-- **The endpoint's advertised max context is honored everywhere.** The GUI now
-  probes the model's context window at startup like the TUI/headless paths did
-  (previously it only used a configured value), and both frontends **re-probe**
-  after a `/model`, `/retry <model>`, or `/provider` switch so the
-  auto-compaction threshold and the "X of Y" gauge track the current model's
-  real limit instead of a stale one. An explicit `context_window` (config or
-  provider preset) still wins.
-
-### Changed
-
-- **Tool names shortened (breaking).** `read_file`→`read`, `write_file`→`write`,
-  `web_fetch`→`fetch`, `web_search`→`search`, `todo_write`→`todo`, and `glob` is
-  replaced by `find`. Update any `[[hooks]]` `on = "write_file"` to
-  `on = "write"`, and any custom prompts.
-
-### Added
 
 - **`patch` tool — apply a unified diff across multiple files in one call.**
   Takes git/patch format (`--- a/… / +++ b/… / @@` hunks; `/dev/null` to
@@ -153,6 +136,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tool names shortened (breaking).** `read_file`→`read`, `write_file`→`write`,
+  `web_fetch`→`fetch`, `web_search`→`search`, `todo_write`→`todo`, and `glob` is
+  replaced by `find`. Update any `[[hooks]]` `on = "write_file"` to
+  `on = "write"`, and any custom prompts.
+
 - **Internal DRY/YAGNI cleanup of `hrdr-agent` (no behaviour change).** The
   single-call and concurrent tool paths are now one path (a lone mutating call
   is a one-element batch); a shared `drain_stream` helper backs the turn loop,
@@ -175,6 +163,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   locally-running server needs no flags.
 
 ### Fixed
+
+- **The endpoint's advertised max context is honored everywhere.** The GUI now
+  probes the model's context window at startup like the TUI/headless paths did
+  (previously it only used a configured value), and both frontends **re-probe**
+  after a `/model`, `/retry <model>`, or `/provider` switch so the
+  auto-compaction threshold and the "X of Y" gauge track the current model's
+  real limit instead of a stale one. An explicit `context_window` (config or
+  provider preset) still wins.
 
 - **Verbatim-retry breaker messages no longer contain stray whitespace.** The
   refusal and nudge strings had runs of literal spaces (missing line
@@ -1387,7 +1383,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/kryptic-sh/hrdr/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/kryptic-sh/hrdr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/hrdr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/hrdr/releases/tag/v0.1.0
