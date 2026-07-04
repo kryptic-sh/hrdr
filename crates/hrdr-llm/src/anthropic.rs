@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 /// Anthropic API version pinned in the `anthropic-version` header.
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 
 /// Build the native `/v1/messages` request body from hrdr's OpenAI-shaped
 /// history. When `cache == Ephemeral`, `cache_control` breakpoints are placed on

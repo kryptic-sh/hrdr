@@ -187,12 +187,23 @@ impl Client {
     }
 
     fn post(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(body);
+        self.auth(
+            self.http
+                .post(format!("{}/chat/completions", self.base_url))
+                .json(body),
+        )
+    }
+
+    /// Apply the backend's auth to a request builder: `x-api-key` +
+    /// `anthropic-version` for the native Anthropic backend, else `Bearer`.
+    fn auth(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+            req = match self.backend {
+                Backend::Anthropic => req
+                    .header("x-api-key", key)
+                    .header("anthropic-version", crate::anthropic::API_VERSION),
+                Backend::OpenAi => req.bearer_auth(key),
+            };
         }
         req
     }
@@ -296,10 +307,7 @@ impl Client {
     /// List available models from `GET {base_url}/models`.
     /// Returns model ids sorted alphabetically.
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let mut req = self.http.get(format!("{}/models", self.base_url));
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
+        let req = self.auth(self.http.get(format!("{}/models", self.base_url)));
         let resp = req.send().await.context("models request failed")?;
         let status = resp.status();
         let text = resp.text().await.context("reading models response")?;
@@ -351,15 +359,11 @@ impl Client {
         context_field(&v).or_else(|| v.get("default_generation_settings").and_then(context_field))
     }
 
-    /// GET `url` with the bearer key (if any) and decode JSON; `None` on any error
+    /// GET `url` with the backend's auth and decode JSON; `None` on any error
     /// (unreachable endpoint, non-2xx, or unparseable body) — detection is
     /// best-effort and never fails the caller.
     async fn get_json(&self, url: &str) -> Option<serde_json::Value> {
-        let mut req = self.http.get(url);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = req.send().await.ok()?;
+        let resp = self.auth(self.http.get(url)).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
