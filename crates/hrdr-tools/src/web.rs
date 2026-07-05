@@ -5,8 +5,9 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -15,6 +16,14 @@ use crate::{Tool, ToolContext, truncate};
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0 hrdr";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many times the context's output byte cap the *raw* fetch body may be,
+/// before the download is stopped. HTML is stripped down to a fraction of its
+/// source, so a generous multiple leaves enough markup to reduce to `max_output`
+/// worth of text while still bounding memory against a hostile/huge response.
+const FETCH_BODY_MULTIPLIER: usize = 8;
+/// Absolute floor on the raw-body cap, so a small `max_output` still allows a
+/// normal page through.
+const FETCH_BODY_FLOOR: usize = 256 * 1024;
 
 /// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
 /// timeout. Built once and reused for every web tool call so connection pools
@@ -79,6 +88,12 @@ impl Tool for WebFetchTool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             bail!("url must start with http:// or https://");
         }
+        // Block obviously-internal targets: prompt-injected content can point
+        // `fetch` at the cloud metadata endpoint or a loopback service to read
+        // credentials / pivot (SSRF).
+        if is_blocked_host(url) {
+            bail!("refusing to fetch {url}: internal/loopback host is blocked");
+        }
         let resp = http_client()?.get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -90,14 +105,35 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.to_str().ok())
             .map(|c| c.contains("html"))
             .unwrap_or(false);
-        let body = resp.text().await?;
+        // Stream the body with a hard byte cap instead of buffering an unbounded
+        // `resp.text()` — a hostile server could otherwise stream gigabytes and
+        // OOM the process.
+        let raw_cap = ctx
+            .max_output
+            .saturating_mul(FETCH_BODY_MULTIPLIER)
+            .max(FETCH_BODY_FLOOR);
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut body_truncated = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading response body")?;
+            if push_capped(&mut buf, &chunk, raw_cap) {
+                body_truncated = true;
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&buf).into_owned();
         let text = if is_html || looks_like_html(&body) {
             strip_html(&body)
         } else {
             body
         };
         let cap = args.max_chars.unwrap_or(ctx.max_output);
-        Ok(format!("URL: {url}\n\n{}", truncate(text.trim(), cap)))
+        let mut out = format!("URL: {url}\n\n{}", truncate(text.trim(), cap));
+        if body_truncated {
+            out.push_str("\n\n… [response body truncated at the fetch size cap]");
+        }
+        Ok(out)
     }
 }
 
@@ -276,6 +312,46 @@ fn clean_ddg_url(href: &str) -> String {
         return format!("https://{stripped}");
     }
     href.to_string()
+}
+
+/// Append `chunk` to `buf` without letting it exceed `cap` bytes. Returns `true`
+/// when the cap is reached (the caller stops reading) — the streaming guard that
+/// bounds `fetch`'s response body. Pure, so the cap logic is unit-testable
+/// without a live server.
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    let remaining = cap.saturating_sub(buf.len());
+    if chunk.len() >= remaining {
+        buf.extend_from_slice(&chunk[..remaining]);
+        true
+    } else {
+        buf.extend_from_slice(chunk);
+        false
+    }
+}
+
+/// Whether `url`'s host is an internal/loopback target `fetch` should refuse
+/// (SSRF guard): localhost, loopback IPs, `0.0.0.0`, and the link-local cloud
+/// metadata endpoint. A URL that doesn't parse is not blocked here (the caller
+/// already enforced an `http(s)` scheme).
+fn is_blocked_host(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => u.host_str().is_some_and(is_internal_host),
+        Err(_) => false,
+    }
+}
+
+/// The host-name test behind [`is_blocked_host`], split out for unit tests.
+fn is_internal_host(host: &str) -> bool {
+    let h = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h == "0.0.0.0"
+        || h == "::1"
+        || h == "169.254.169.254" // cloud instance metadata
+        || h.starts_with("127.")
 }
 
 // ---- small HTML helpers (no extra dependencies) ----
@@ -494,6 +570,34 @@ mod tests {
     fn percent_roundtrip() {
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
         assert_eq!(percent_decode("https%3A%2F%2Fx.com"), "https://x.com");
+    }
+
+    #[test]
+    fn push_capped_bounds_body() {
+        let mut buf = Vec::new();
+        assert!(!push_capped(&mut buf, b"hello", 10));
+        // This chunk overflows the cap: only the first 5 bytes are kept.
+        assert!(push_capped(&mut buf, b"world!!!", 10));
+        assert_eq!(buf, b"helloworld");
+    }
+
+    #[test]
+    fn push_capped_exact_fill_signals_stop() {
+        let mut buf = Vec::new();
+        assert!(push_capped(&mut buf, b"0123456789", 10));
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn blocks_internal_hosts() {
+        assert!(is_blocked_host("http://localhost:8080/x"));
+        assert!(is_blocked_host("http://127.0.0.1/x"));
+        assert!(is_blocked_host("http://127.5.5.5/x"));
+        assert!(is_blocked_host("http://[::1]/x"));
+        assert!(is_blocked_host("http://169.254.169.254/latest/meta-data"));
+        assert!(is_blocked_host("http://app.localhost/x"));
+        assert!(!is_blocked_host("https://example.com/x"));
+        assert!(!is_blocked_host("https://8.8.8.8/x"));
     }
 
     #[test]

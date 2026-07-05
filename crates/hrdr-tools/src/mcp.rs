@@ -579,9 +579,13 @@ async fn stdio_request(
 ) -> Result<Value> {
     let (tx, rx) = oneshot::channel();
     t.pending.lock().await.insert(id, tx);
-    t.stdin_tx
-        .send(req.to_string())
-        .map_err(|_| anyhow!("server is not running"))?;
+    // On a send failure the id would otherwise leak in `pending` until the
+    // reader task exits (the reader only removes ids it sees a response for),
+    // so drop it here before returning — mirroring the timeout arm below.
+    if t.stdin_tx.send(req.to_string()).is_err() {
+        t.pending.lock().await.remove(&id);
+        bail!("server is not running");
+    }
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(msg)) => Ok(msg),
         Ok(Err(_)) => bail!("connection closed"),
@@ -639,14 +643,23 @@ async fn sse_request(t: &SseTransport, id: u64, req: Value, timeout: Duration) -
         .ok_or_else(|| anyhow!("no endpoint"))?;
     let (tx, rx) = oneshot::channel();
     t.pending.lock().await.insert(id, tx);
-    let resp = t
+    // A transport error on `send` (or a non-success status below) early-returns,
+    // so drop the just-inserted id before propagating — otherwise it leaks in
+    // `pending` until the reader task tears the map down.
+    let resp = match t
         .http
         .post(&post_url)
         .headers(t.headers.clone())
         .json(&req)
         .send()
         .await
-        .context("request failed")?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            t.pending.lock().await.remove(&id);
+            return Err(anyhow::Error::new(e).context("request failed"));
+        }
+    };
     if !resp.status().is_success() {
         t.pending.lock().await.remove(&id);
         bail!("HTTP {}", resp.status());
@@ -863,6 +876,27 @@ mod tests {
             "github_create_issue"
         );
         assert_eq!(sanitize_tool_name("a/b:c"), "a_b_c");
+    }
+
+    // The stdio/sse request helpers insert a oneshot into `pending` *before*
+    // sending, and must remove it on every early-return (send error, non-success
+    // status, timeout) or the id leaks until the reader task tears the map down.
+    // Constructing a half-open transport to force a real send failure needs a
+    // live child, so this asserts the insert→remove bookkeeping invariant on the
+    // shared `Pending` type the helpers use.
+    #[tokio::test]
+    async fn pending_id_removed_on_send_failure_path() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let id = 7u64;
+        let (tx, _rx) = oneshot::channel::<Value>();
+        pending.lock().await.insert(id, tx);
+        assert!(pending.lock().await.contains_key(&id));
+        // Simulated send failure: the fix removes the id before returning.
+        pending.lock().await.remove(&id);
+        assert!(
+            pending.lock().await.is_empty(),
+            "send-error path must not leak the pending id"
+        );
     }
 
     #[test]

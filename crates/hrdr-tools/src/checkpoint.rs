@@ -9,15 +9,31 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// Keep at most this many of the most-recent turns' checkpoints; older turns are
+/// pruned on `open`. Bounds journal + blob growth across long/many sessions.
+const CHECKPOINT_KEEP_TURNS: u64 = 200;
+/// Also drop any checkpoint whose record is older than this (abandoned
+/// sessions). Kept generous — the turn cap is the primary bound.
+const CHECKPOINT_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
+/// A `journal.lock` older than this is presumed abandoned (crashed holder) and
+/// stolen, so a stale lock can't wedge the store forever.
+const LOCK_STALE_SECS: u64 = 30;
 
 /// A single file change: the file `path` and its content hash *before* the turn
 /// modified it (`pre = None` if the file didn't exist yet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChangeRecord {
     turn: u64,
+    /// Unix seconds when the record was written. `#[serde(default)]` (→ 0) so
+    /// journals from before this field existed still deserialize instead of
+    /// being silently dropped on upgrade; a legacy `ts == 0` is exempt from the
+    /// age cutoff (bounded only by the turn cap — see [`Checkpoints::prune`]).
+    #[serde(default)]
     ts: u64,
     path: String,
     pre: Option<String>,
@@ -33,6 +49,7 @@ pub struct CheckpointInfo {
 
 /// A disk-backed store of per-turn file pre-images.
 pub struct Checkpoints {
+    dir: PathBuf,
     blobs_dir: PathBuf,
     journal_path: PathBuf,
     records: Vec<ChangeRecord>,
@@ -47,22 +64,79 @@ impl Checkpoints {
         std::fs::create_dir_all(&blobs_dir)
             .with_context(|| format!("creating {}", blobs_dir.display()))?;
         let journal_path = dir.join("journal.jsonl");
+        let mut cp = Self {
+            dir,
+            blobs_dir,
+            journal_path,
+            records: Vec::new(),
+            turn: 0,
+            touched: HashSet::new(),
+        };
+        // Prune old checkpoints + GC orphan blobs under the lock, reconciling
+        // with anything another instance in this dir has written.
+        {
+            let _lock = JournalLock::acquire(&cp.dir);
+            cp.reload_records();
+            let _ = cp.prune();
+        }
+        cp.turn = cp.records.iter().map(|r| r.turn).max().unwrap_or(0);
+        Ok(cp)
+    }
+
+    /// Re-read the on-disk journal into `records` (adopting any records another
+    /// `Checkpoints` over the same dir appended since we loaded). Callers hold
+    /// [`JournalLock`] so this reflects a consistent view.
+    fn reload_records(&mut self) {
         let mut records = Vec::new();
-        if let Ok(text) = std::fs::read_to_string(&journal_path) {
+        if let Ok(text) = std::fs::read_to_string(&self.journal_path) {
             for line in text.lines() {
                 if let Ok(r) = serde_json::from_str::<ChangeRecord>(line) {
                     records.push(r);
                 }
             }
         }
-        let turn = records.iter().map(|r| r.turn).max().unwrap_or(0);
-        Ok(Self {
-            blobs_dir,
-            journal_path,
-            records,
-            turn,
-            touched: HashSet::new(),
-        })
+        self.records = records;
+    }
+
+    /// Drop checkpoints older than the turn/age caps and GC blobs no record
+    /// references. Rewrites the journal only when something changed. Caller holds
+    /// [`JournalLock`].
+    fn prune(&mut self) -> Result<()> {
+        let max_turn = self.records.iter().map(|r| r.turn).max().unwrap_or(0);
+        let turn_floor = max_turn.saturating_sub(CHECKPOINT_KEEP_TURNS);
+        let age_cutoff = crate::unix_now().saturating_sub(CHECKPOINT_MAX_AGE_SECS);
+        let before = self.records.len();
+        // Legacy records (ts == 0, pre-timestamp journals) are exempt from the
+        // age cutoff so an upgrade doesn't wipe still-recent checkpoints; the
+        // turn cap alone bounds them.
+        self.records
+            .retain(|r| r.turn > turn_floor && (r.ts == 0 || r.ts >= age_cutoff));
+        let changed = self.records.len() != before;
+        self.gc_blobs();
+        if changed {
+            self.rewrite_journal()?;
+        }
+        Ok(())
+    }
+
+    /// Delete blob files not referenced by any live record (orphans left behind
+    /// by pruned/reverted turns). Caller holds [`JournalLock`].
+    fn gc_blobs(&self) {
+        let live: HashSet<&str> = self
+            .records
+            .iter()
+            .filter_map(|r| r.pre.as_deref())
+            .collect();
+        let Ok(entries) = std::fs::read_dir(&self.blobs_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !live.contains(name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Begin a new turn (its file changes form one checkpoint).
@@ -78,6 +152,10 @@ impl Checkpoints {
         if !self.touched.insert(key.clone()) {
             return; // already snapshotted this file this turn
         }
+        // Hold the lock across blob-store + journal-append so a concurrent
+        // instance's blob GC can't delete a blob between our write and the
+        // record that references it.
+        let _lock = JournalLock::acquire(&self.dir);
         let pre = match std::fs::read(path) {
             Ok(bytes) => match self.store_blob(&bytes) {
                 Ok(hash) => Some(hash),
@@ -133,6 +211,12 @@ impl Checkpoints {
     /// Restore files to their state *before* `turn` — i.e. undo `turn` and every
     /// later turn. Returns the restored paths.
     pub fn revert_to(&mut self, turn: u64) -> Result<Vec<PathBuf>> {
+        // Reconcile under the lock: re-read the journal so a rewrite is applied
+        // to the current on-disk record set (which may include records another
+        // instance in this dir appended) rather than this instance's stale
+        // in-memory view — otherwise the rewrite would silently discard them.
+        let _lock = JournalLock::acquire(&self.dir);
+        self.reload_records();
         // For each file touched in turns >= `turn`, the pre-`turn` state is the
         // pre-image recorded at the SMALLEST such turn.
         let mut earliest: BTreeMap<String, (u64, Option<String>)> = BTreeMap::new();
@@ -162,9 +246,11 @@ impl Checkpoints {
             }
             restored.push(p);
         }
-        // Drop reverted records and rewrite the journal.
+        // Drop reverted records, rewrite the journal, and GC blobs the dropped
+        // records were the only referents of.
         self.records.retain(|r| r.turn < turn);
         self.rewrite_journal()?;
+        self.gc_blobs();
         Ok(restored)
     }
 
@@ -196,6 +282,69 @@ impl Checkpoints {
         std::fs::write(&self.journal_path, out).context("rewriting checkpoint journal")?;
         Ok(())
     }
+}
+
+/// Best-effort advisory lock over a checkpoint directory's journal so two
+/// `Checkpoints` in the same dir (e.g. a main agent + a background sub-agent
+/// sharing a non-git cwd) serialize journal rewrites and blob GC. Implemented as
+/// an `O_EXCL` lock file — no extra dependency — with staleness detection so a
+/// crashed holder's lock (older than [`LOCK_STALE_SECS`]) is stolen rather than
+/// wedging the store. Released on drop. If the lock can't be acquired within the
+/// spin budget it proceeds *unlocked* (best-effort — never wedge the agent);
+/// `held` records whether this instance owns the file so drop doesn't remove a
+/// lock it didn't create.
+struct JournalLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl JournalLock {
+    fn acquire(dir: &Path) -> Self {
+        let path = dir.join("journal.lock");
+        for _ in 0..100 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = write!(f, "{}", std::process::id());
+                    return Self { path, held: true };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue; // steal it
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break, // can't create (perms) — proceed unlocked
+            }
+        }
+        Self { path, held: false }
+    }
+}
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Whether the lock file is missing/unreadable or older than the staleness
+/// window (its holder presumed crashed).
+fn lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            t.elapsed()
+                .map(|e| e > Duration::from_secs(LOCK_STALE_SECS))
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -303,6 +452,103 @@ mod tests {
         cp.record_pre(&f); // second call for the same file in the same turn is a no-op
         // Only one journal record — the first touch.
         assert_eq!(cp.records.len(), 1);
+    }
+
+    #[test]
+    fn prune_drops_old_records_and_orphan_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpdir = dir.path().join("cp");
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "v0").unwrap();
+        {
+            let mut cp = Checkpoints::open(cpdir.clone()).unwrap();
+            cp.begin_turn();
+            cp.record_pre(&f); // stores a blob for "v0"
+            std::fs::write(&f, "v1").unwrap();
+        }
+        let journal = cpdir.join("journal.jsonl");
+        let blobs = cpdir.join("blobs");
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 1);
+
+        // Backdate the record beyond the age cutoff.
+        let text = std::fs::read_to_string(&journal).unwrap();
+        let mut recs: Vec<ChangeRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for r in &mut recs {
+            r.ts = 1; // ancient
+        }
+        let out: String = recs
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&journal, out).unwrap();
+        // An orphan blob no record references.
+        std::fs::write(blobs.join("deadbeefdeadbeef"), b"junk").unwrap();
+
+        // Reopen → prune drops the ancient record and GCs all now-orphan blobs.
+        let cp = Checkpoints::open(cpdir.clone()).unwrap();
+        assert!(cp.list().is_empty(), "stale record pruned");
+        assert!(!blobs.join("deadbeefdeadbeef").exists(), "orphan blob GC'd");
+        assert_eq!(
+            std::fs::read_dir(&blobs).unwrap().count(),
+            0,
+            "blobs GC'd once no record references them"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_recent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpdir = dir.path().join("cp");
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "v0").unwrap();
+        {
+            let mut cp = Checkpoints::open(cpdir.clone()).unwrap();
+            cp.begin_turn();
+            cp.record_pre(&f);
+            std::fs::write(&f, "v1").unwrap();
+        }
+        // Reopen without backdating → the fresh record and its blob survive.
+        let cp = Checkpoints::open(cpdir.clone()).unwrap();
+        assert_eq!(cp.list().len(), 1, "recent checkpoint kept");
+        assert_eq!(std::fs::read_dir(cpdir.join("blobs")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn revert_reconciles_concurrent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpdir = dir.path().join("cp");
+        let fa = dir.path().join("a.txt");
+        std::fs::write(&fa, "a0").unwrap();
+        let fb = dir.path().join("b.txt");
+        std::fs::write(&fb, "b0").unwrap();
+
+        // Instance A: turn 1 touches a.txt (appended to the shared journal).
+        let mut a = Checkpoints::open(cpdir.clone()).unwrap();
+        a.begin_turn();
+        a.record_pre(&fa);
+        std::fs::write(&fa, "a1").unwrap();
+
+        // Instance B over the same dir: its own turn touches b.txt. A's
+        // in-memory view never learns about this record.
+        let mut b = Checkpoints::open(cpdir.clone()).unwrap();
+        b.begin_turn(); // turn = max(disk) + 1 = 2
+        b.record_pre(&fb);
+        std::fs::write(&fb, "b1").unwrap();
+
+        // A rewrites the journal (via a no-op revert of a higher turn). Without
+        // reconcile this discards B's turn-2 record; with it, B survives.
+        a.revert_to(99).unwrap();
+
+        let reopened = Checkpoints::open(cpdir.clone()).unwrap();
+        let turns: Vec<u64> = reopened.list().iter().map(|c| c.turn).collect();
+        assert!(turns.contains(&1), "A's record survives: {turns:?}");
+        assert!(
+            turns.contains(&2),
+            "B's concurrent record survives: {turns:?}"
+        );
     }
 
     #[test]

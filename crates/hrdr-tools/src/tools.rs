@@ -59,6 +59,7 @@ impl Tool for ReadTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ReadArgs = serde_json::from_value(args).context("invalid read args")?;
         let path = ctx.resolve(&a.path);
+        crate::guard_secret_read(&path)?;
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -700,6 +701,11 @@ impl Tool for GrepTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: GrepArgs = serde_json::from_value(args).context("invalid grep args")?;
+        // Refuse to scope a search directly at a credential/secret file — grep
+        // reads file *contents*, so it's an exfiltration vector like `read`.
+        if let Some(p) = &a.path {
+            crate::guard_secret_read(&ctx.resolve(p))?;
+        }
         match self.backend {
             GrepBackend::Rg => grep_ripgrep(&a, ctx).await,
             GrepBackend::Grep => grep_posix(&a, ctx).await,
@@ -754,12 +760,23 @@ async fn run_search_cmd(
         .output()
         .await
         .with_context(|| format!("running {tool}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.is_empty() {
+    let raw = String::from_utf8_lossy(&output.stdout);
+    if raw.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
             bail!("{tool}: {}", stderr.trim());
         }
+        return Ok("(no matches)".to_string());
+    }
+    // Drop any match lines that name a secret file (e.g. a `.env` in the tree),
+    // so a broad `grep KEY .` can't surface credentials the `read` deny-list
+    // would refuse. Best-effort: covers `path:NN:…` match lines.
+    let stdout: String = raw
+        .lines()
+        .filter(|l| !crate::grep_line_is_secret(l, &ctx.cwd))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if stdout.is_empty() {
         return Ok("(no matches)".to_string());
     }
     // Cap by match count first (with a "narrow the pattern" nudge), then by
@@ -801,6 +818,9 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
             continue;
         }
         let path = entry.path();
+        if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
+            continue; // never read credential/secret files (see deny-list)
+        }
         if let Some(gp) = &glob_pat {
             let name = path.file_name().map(|n| n.to_string_lossy());
             let rel = path.strip_prefix(&root).unwrap_or(path);
@@ -1161,6 +1181,93 @@ mod tests {
 
     fn ctx(cwd: PathBuf) -> ToolContext {
         ToolContext::new(cwd)
+    }
+
+    // ---- read deny-list (credential exfiltration guard) ----
+
+    #[tokio::test]
+    async fn read_rejects_credential_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate an auth store at <cwd>/.config/hrdr/auth.toml.
+        let auth = dir.path().join(".config/hrdr/auth.toml");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, "api_key = \"secret\"\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+
+        let err = ReadTool
+            .execute(json!({ "path": ".config/hrdr/auth.toml" }), &c)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to read"), "{err}");
+        assert!(err.contains("credential store"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_allows_normal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello world\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = ReadTool
+            .execute(json!({ "path": "notes.txt" }), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("hello world"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_rejects_dotdot_escape_to_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=abc\n").unwrap();
+        let c = ctx(secrets.clone());
+        // From <cwd>/secrets, `../.env` resolves to the denied dotenv file.
+        let err = ReadTool
+            .execute(json!({ "path": "../.env" }), &c)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to read"), "{err}");
+        assert!(err.contains(".env"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_rejects_private_key_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("id_rsa.pem"), "-----BEGIN-----\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        assert!(
+            ReadTool
+                .execute(json!({ "path": "id_rsa.pem" }), &c)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn grep_builtin_skips_secret_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "let token = 1;\n").unwrap();
+        // A non-hidden private key (the walker already skips dotfiles, so use a
+        // `.pem` to prove the deny-list — not the hidden filter — excludes it).
+        std::fs::write(dir.path().join("server.pem"), "token = SECRET\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "token".into(),
+                path: None,
+                glob: None,
+                context: None,
+            },
+            &c,
+        )
+        .unwrap();
+        assert!(out.contains("code.rs"), "{out}");
+        assert!(
+            !out.contains("server.pem"),
+            "secret file must not be searched: {out}"
+        );
     }
 
     // ---- grep (built-in fallback) ----

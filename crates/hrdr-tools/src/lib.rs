@@ -242,7 +242,7 @@ impl ToolContext {
 /// Canonicalize `path` by resolving its nearest existing ancestor (the path
 /// itself may not exist yet — e.g. a file about to be created) and re-joining
 /// the non-existent remainder.
-fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
+pub(crate) fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
@@ -261,6 +261,97 @@ fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
             _ => return path.to_path_buf(),
         }
     }
+}
+
+/// Credential/secret file patterns the content-reading tools (`read`, `grep`)
+/// refuse to return. Prompt-injected content (a README, a fetched page) can
+/// instruct the agent to read the credential store and smuggle the keys out via
+/// a `fetch` URL; this deny-list is the mechanical guardrail that turns that
+/// class of attack into a corrective tool error rather than an exfiltration.
+///
+/// Matching is **structural** (path components / file suffixes), not
+/// home-relative, and expects an already-resolved path (see
+/// [`guard_secret_read`], which canonicalizes first) so a `..`-escape or an
+/// absolute spelling is caught the same way as a tilde path. Returns
+/// `Some(reason)` naming the matched category, else `None`.
+///
+/// This is the single, well-documented pattern set — extend the arms here to
+/// broaden coverage; every content-reading tool routes through it.
+pub(crate) fn secret_file_reason(path: &std::path::Path) -> Option<&'static str> {
+    use std::path::Component;
+    let comps: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let n = comps.len();
+    let file = comps.last().map(String::as_str).unwrap_or("");
+    let parent = if n >= 2 { comps[n - 2].as_str() } else { "" };
+
+    // hrdr credential store: `<config>/hrdr/auth.toml` (XDG or ~/.config).
+    if parent == "hrdr" && file == "auth.toml" {
+        return Some("hrdr credential store (auth.toml)");
+    }
+    // SSH keys/config — the whole ~/.ssh directory is off-limits.
+    if comps.iter().any(|c| c == ".ssh") {
+        return Some("SSH directory (~/.ssh)");
+    }
+    // AWS static credentials.
+    if parent == ".aws" && file == "credentials" {
+        return Some("AWS credentials file");
+    }
+    // GitHub CLI stored host tokens.
+    if parent == "gh" && (file == "hosts.yml" || file == "hosts.yaml") {
+        return Some("GitHub CLI host tokens (gh/hosts.yml)");
+    }
+    // dotenv files (.env, .env.local, .env.production, …) — but NOT the
+    // non-secret template variants (.env.example/.sample/.template/.dist) that
+    // coding agents legitimately read to learn which vars a project expects.
+    if file == ".env"
+        || (file.starts_with(".env.")
+            && !matches!(
+                file,
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+            ))
+    {
+        return Some("environment/secrets file (.env)");
+    }
+    // Private key material by extension.
+    if file.ends_with(".pem") || file.ends_with(".key") {
+        return Some("private key file (.pem/.key)");
+    }
+    None
+}
+
+/// Guard a content read: canonicalize `path` (resolving symlinks and `..`) then
+/// reject it with a corrective error when it names a credential/secret file per
+/// [`secret_file_reason`]. Used by the `read` and `grep` tools.
+pub(crate) fn guard_secret_read(path: &std::path::Path) -> Result<()> {
+    let resolved = canonicalize_nearest(path);
+    if let Some(reason) = secret_file_reason(&resolved) {
+        return Err(anyhow!(
+            "refusing to read {}: {reason} — secret/credential files are off-limits to \
+             the read/grep tools; if the user genuinely needs this, they must provide it",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a search-output line (`path:NN:…` or `path-NN-…`) names a secret
+/// file, so the grep backends can drop it before returning. `cwd` anchors a
+/// relative path token. Best-effort: only the `:`-delimited leading token is
+/// inspected (covers the common no-context `grep`/`rg` match line).
+pub(crate) fn grep_line_is_secret(line: &str, cwd: &std::path::Path) -> bool {
+    let Some((tok, _)) = line.split_once(':') else {
+        return false; // `--` separators and colon-less context lines ride along
+    };
+    if tok.is_empty() || tok == "--" {
+        return false;
+    }
+    secret_file_reason(&canonicalize_nearest(&cwd.join(tok))).is_some()
 }
 
 /// A model-callable tool.
@@ -680,6 +771,34 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    // ---- secret-file deny-list ----
+
+    #[test]
+    fn secret_file_reason_matches_credential_patterns() {
+        assert!(secret_file_reason(Path::new("/home/u/.config/hrdr/auth.toml")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.ssh/id_ed25519")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.aws/credentials")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.config/gh/hosts.yml")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/server.pem")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/tls.key")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/.env")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/.env.production")).is_some());
+    }
+
+    #[test]
+    fn secret_file_reason_allows_normal_files() {
+        assert!(secret_file_reason(Path::new("/srv/app/src/main.rs")).is_none());
+        assert!(secret_file_reason(Path::new("/srv/app/README.md")).is_none());
+        // A non-auth toml under a non-hrdr dir is fine.
+        assert!(secret_file_reason(Path::new("/srv/app/Cargo.toml")).is_none());
+        // `environment` is not a dotenv file.
+        assert!(secret_file_reason(Path::new("/srv/app/environment")).is_none());
+        // Non-secret dotenv templates stay readable (agents read these often).
+        assert!(secret_file_reason(Path::new("/srv/app/.env.example")).is_none());
+        assert!(secret_file_reason(Path::new("/srv/app/.env.sample")).is_none());
+        assert!(secret_file_reason(Path::new("/srv/app/.env.template")).is_none());
+    }
 
     // ---- concurrency defaults ----
 
