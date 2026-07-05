@@ -30,6 +30,14 @@ pub struct ChatMessage {
     /// only the final answer. Kept in the struct for display + deserialization.
     #[serde(default, skip_serializing)]
     pub reasoning_content: Option<String>,
+    /// Anthropic extended-thinking blocks (type/thinking/signature triples, or
+    /// type/data for redacted). Captured verbatim during streaming for re-emission
+    /// in the native Anthropic assistant message when tool_use is also present —
+    /// Anthropic requires the thinking block with its signature on the follow-up
+    /// turn. **Never serialized** — same invariant as `reasoning_content`: these
+    /// are Anthropic-wire-only and must not go on the OpenAI wire.
+    #[serde(default, skip_serializing)]
+    pub anthropic_thinking_blocks: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Set on `Role::Tool` messages to bind the result to its call.
@@ -57,6 +65,7 @@ impl ChatMessage {
             role,
             content: Some(text.into()),
             reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -69,6 +78,7 @@ impl ChatMessage {
             role: Role::Tool,
             content: Some(content.into()),
             reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
             name: None,
@@ -327,12 +337,18 @@ impl Usage {
 
 /// One `chat.completion.chunk` SSE event. The final chunk (when `include_usage`
 /// is set) carries `usage` with empty `choices`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatChunk {
     #[serde(default)]
     pub choices: Vec<ChunkChoice>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Completed Anthropic thinking blocks accumulated during streaming (emitted
+    /// as a single synthetic chunk after the byte loop). Only populated on the
+    /// native Anthropic path; ignored by the OpenAI path via `#[serde(skip)]`.
+    /// Never serialized.
+    #[serde(skip)]
+    pub anthropic_thinking_blocks: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,6 +401,9 @@ pub struct Accumulator {
     /// `length`, …). `length` means the reply was cut off at the output cap.
     pub finish_reason: Option<String>,
     calls: Vec<ToolCall>,
+    /// Anthropic thinking blocks (with signature) for re-emission in the native
+    /// Messages API request. Never serialized — same invariant as reasoning_content.
+    anthropic_thinking_blocks: Vec<serde_json::Value>,
 }
 
 impl Accumulator {
@@ -397,8 +416,31 @@ impl Accumulator {
     pub fn push(&mut self, chunk: &ChatChunk) -> Option<String> {
         // The usage chunk arrives with empty `choices`, so capture it before
         // the early return below.
-        if chunk.usage.is_some() {
-            self.usage = chunk.usage.clone();
+        if let Some(new) = &chunk.usage {
+            match &mut self.usage {
+                None => self.usage = chunk.usage.clone(),
+                Some(existing) => {
+                    // Anthropic emits usage in two events: message_start (prompt + cache
+                    // counters) then message_delta (completion only). Taking max preserves
+                    // both without knowing the emission order.
+                    existing.prompt_tokens = existing.prompt_tokens.max(new.prompt_tokens);
+                    existing.completion_tokens =
+                        existing.completion_tokens.max(new.completion_tokens);
+                    // Keep existing detail field if new chunk has None (don't clobber).
+                    if new.prompt_tokens_details.cached_tokens.is_some() {
+                        existing.prompt_tokens_details.cached_tokens =
+                            new.prompt_tokens_details.cached_tokens;
+                    }
+                    if new.completion_tokens_details.reasoning_tokens.is_some() {
+                        existing.completion_tokens_details.reasoning_tokens =
+                            new.completion_tokens_details.reasoning_tokens;
+                    }
+                }
+            }
+        }
+        if !chunk.anthropic_thinking_blocks.is_empty() {
+            self.anthropic_thinking_blocks
+                .extend(chunk.anthropic_thinking_blocks.iter().cloned());
         }
         let choice = chunk.choices.first()?;
         if let Some(fr) = &choice.finish_reason {
@@ -460,6 +502,7 @@ impl Accumulator {
             role: Role::Assistant,
             content: (!self.content.is_empty()).then_some(self.content),
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            anthropic_thinking_blocks: self.anthropic_thinking_blocks,
             tool_calls: (!self.calls.is_empty()).then_some(self.calls),
             tool_call_id: None,
             name: None,
@@ -501,6 +544,7 @@ mod tests {
                 finish_reason: Some("length".into()),
             }],
             usage: None,
+            anthropic_thinking_blocks: vec![],
         });
         assert_eq!(acc.finish_reason.as_deref(), Some("length"));
         assert!(acc.truncated());
@@ -512,6 +556,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
             }],
             usage: None,
+            anthropic_thinking_blocks: vec![],
         });
         assert!(!acc2.truncated());
     }
@@ -600,6 +645,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            anthropic_thinking_blocks: vec![],
         }
     }
 
@@ -775,6 +821,7 @@ mod tests {
                 completion_tokens,
                 ..Default::default()
             }),
+            anthropic_thinking_blocks: vec![],
         }
     }
 
@@ -789,6 +836,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            anthropic_thinking_blocks: vec![],
         }
     }
 
@@ -802,6 +850,41 @@ mod tests {
         let u = acc.usage.as_ref().expect("usage should be stored");
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 20);
+    }
+
+    #[test]
+    fn accumulator_usage_merge_preserves_all_fields() {
+        // Simulate Anthropic's two-phase usage: message_start (prompt+cached),
+        // then message_delta (completion only). The merge must keep all three.
+        let mut acc = Accumulator::new();
+        // First chunk: prompt + cached (message_start shape).
+        acc.push(&ChatChunk {
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 0,
+                prompt_tokens_details: TokenDetails {
+                    cached_tokens: Some(80),
+                    ..Default::default()
+                },
+                completion_tokens_details: TokenDetails::default(),
+            }),
+            anthropic_thinking_blocks: vec![],
+        });
+        // Second chunk: completion only (message_delta shape).
+        acc.push(&ChatChunk {
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 50,
+                ..Default::default()
+            }),
+            anthropic_thinking_blocks: vec![],
+        });
+        let u = acc.usage.as_ref().unwrap();
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.cached_tokens(), Some(80));
     }
 
     #[test]

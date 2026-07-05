@@ -117,15 +117,96 @@ pub fn default_guardrails() -> Vec<Guardrail> {
     rails
 }
 
+/// Regex matching nested shell invocations: `sh -c`, `bash -c`, `zsh -c`, etc.
+/// Also matches `env VAR=val sh -c` and similar prefixes. Used by
+/// [`extract_shell_c_args`] to find payloads that need re-scanning.
+fn shell_c_re() -> Regex {
+    Regex::new(r"(?:(?:env\s+\S+=\S+\s+)*)(?:ba|z|da|fi)?sh\s+(?:-\w+\s+)*-c\s*")
+        .expect("shell_c_re")
+}
+
+/// Extract the argument(s) following each `-c` flag in a shell command line
+/// (the nested payload to re-scan). Handles single-quoted, double-quoted, and
+/// bare (unquoted) arguments. Returns at most one extracted arg per `-c` match.
+fn extract_shell_c_args(cmd: &str) -> Vec<String> {
+    let re = shell_c_re();
+    let mut results = Vec::new();
+    for m in re.find_iter(cmd) {
+        let rest = cmd[m.end()..].trim_start();
+        if rest.is_empty() {
+            continue;
+        }
+        let arg = match rest.as_bytes().first().copied() {
+            Some(b'\'') => {
+                // Single-quoted: no backslash escapes; content is everything
+                // up to the matching close quote.
+                let inner = &rest[1..];
+                let end = inner.find('\'').unwrap_or(inner.len());
+                inner[..end].to_string()
+            }
+            Some(b'"') => {
+                // Double-quoted: backslash escapes are honored.
+                let mut out = String::new();
+                let mut chars = rest[1..].chars();
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\\') => {
+                            if let Some(c) = chars.next() {
+                                out.push(c);
+                            }
+                        }
+                        Some('"') => break,
+                        Some(c) => out.push(c),
+                    }
+                }
+                out
+            }
+            _ => {
+                // Unquoted: take up to the next whitespace or end.
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                rest[..end].to_string()
+            }
+        };
+        if !arg.is_empty() {
+            results.push(arg);
+        }
+    }
+    results
+}
+
 /// First matching rule's message, if `command` trips any guardrail. Quoted
 /// spans are blanked before matching so string *arguments* that merely mention
-/// a blocked command (e.g. `rg 'git add -A'`) don't false-positive.
+/// a blocked command (e.g. `rg 'git add -A'`) don't false-positive. Nested
+/// `sh -c '...'` payloads are extracted and re-scanned recursively (depth ≤ 4)
+/// so a model cannot bypass the rules by wrapping them in a subshell.
 pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a str> {
+    check_guardrails_depth(command, rails, 0)
+}
+
+fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) -> Option<&'a str> {
+    // Match against the stripped command (quotes blanked) to avoid false
+    // positives from string arguments that mention blocked patterns.
     let stripped = strip_quoted(command);
-    rails
+    if let Some(msg) = rails
         .iter()
         .find(|r| r.pattern.is_match(&stripped))
         .map(|r| r.message.as_str())
+    {
+        return Some(msg);
+    }
+    // Re-scan nested shell -c payloads so a model cannot bypass the rules by
+    // wrapping them in a subshell (e.g. `bash -c 'git add -A'`). Legitimate
+    // nested shells are rare; re-scanning is preferred over blanket-blocking
+    // (which would reject valid `ssh host 'sh -c ...'`-style uses).
+    if depth < 4 {
+        for payload in extract_shell_c_args(command) {
+            if let Some(msg) = check_guardrails_depth(&payload, rails, depth + 1) {
+                return Some(msg);
+            }
+        }
+    }
+    None
 }
 
 /// Replace the contents of single-/double-quoted spans with spaces (quotes
@@ -306,5 +387,21 @@ mod tests {
         let rails = vec![Guardrail::new(r"\brm\s+-rf\s+/", "no").unwrap()];
         assert_eq!(check_guardrails("rm -rf /tmp/x", &rails), Some("no"));
         assert_eq!(check_guardrails("rm foo", &rails), None);
+    }
+
+    #[test]
+    fn nested_shell_c_bypasses_caught() {
+        // Payloads inside `sh -c '...'` are re-scanned so the model can't bypass
+        // the guardrails by wrapping a blocked command in a subshell.
+        assert!(blocked("bash -c 'git add -A'"));
+        assert!(blocked("sh -c \"git push --force\""));
+        assert!(blocked("bash -c 'git reset --hard HEAD'"));
+        // Deeper nesting (depth 2).
+        assert!(blocked("bash -c \"bash -c 'git add -A'\""));
+        // A grep *of* the pattern (inside quotes stripped by strip_quoted) must
+        // not false-positive even though it mentions the blocked command.
+        assert!(!blocked("rg 'git add -A' docs/"));
+        // Plain form still caught.
+        assert!(blocked("git add -A"));
     }
 }

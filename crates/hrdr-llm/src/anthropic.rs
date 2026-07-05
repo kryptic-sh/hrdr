@@ -183,10 +183,17 @@ fn tool_result_block(m: &ChatMessage) -> Value {
     })
 }
 
-/// Assistant turn → optional leading `text` block + one `tool_use` block per
-/// call (arguments parsed from the JSON string; `{}` if unparseable).
+/// Assistant turn → optional leading `thinking`/`redacted_thinking` blocks
+/// (required when tool_use is also present so the API can verify the signature),
+/// then an optional `text` block, then one `tool_use` block per call.
 fn assistant_blocks(m: &ChatMessage) -> Vec<Value> {
     let mut blocks = Vec::new();
+    // Thinking blocks MUST come first in the Anthropic assistant message when
+    // the turn also contained tool_use — the API rejects the follow-up request
+    // with a 400 if the signature is missing.
+    for blk in &m.anthropic_thinking_blocks {
+        blocks.push(blk.clone());
+    }
     if let Some(t) = &m.content
         && !t.is_empty()
     {
@@ -278,6 +285,16 @@ pub(crate) async fn chat_stream(
         // Anthropic content-block index → our flat tool-call index.
         let mut tool_slot: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         let mut next_tool: usize = 0;
+        // Accumulated Anthropic thinking blocks, keyed by content-block index
+        // (thinking_text, signature). Emitted as one synthetic chunk after the
+        // byte loop so the accumulator can store them for the next request.
+        let mut thinking_slot: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        // Redacted thinking blocks — full `data` arrives in content_block_start,
+        // no deltas. Collected in stream order alongside their block index.
+        let mut redacted_order: Vec<(u64, Value)> = Vec::new();
+        // Whether message_stop was received (for truncation detection).
+        let mut message_stop_seen = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("reading stream chunk")?;
             buf.extend_from_slice(&chunk);
@@ -293,10 +310,45 @@ pub(crate) async fn chat_stream(
                 if data.is_empty() { continue }
                 let ev: Value = serde_json::from_str(data)
                     .with_context(|| format!("decoding stream event: {data}"))?;
-                if let Some(out) = map_event(&ev, &mut tool_slot, &mut next_tool)? {
+                if let Some(out) = map_event(
+                    &ev,
+                    &mut tool_slot,
+                    &mut next_tool,
+                    &mut thinking_slot,
+                    &mut redacted_order,
+                    &mut message_stop_seen,
+                )? {
                     yield out;
                 }
             }
+        }
+        // Emit all accumulated thinking blocks (thinking+signature pairs and
+        // redacted blocks) as one synthetic chunk, ordered by their stream index,
+        // so the Accumulator can store them for the next request.
+        let mut all_thinking: Vec<(u64, Value)> = thinking_slot
+            .into_iter()
+            .filter(|(_, (text, _))| !text.is_empty())
+            .map(|(idx, (text, sig))| {
+                (idx, json!({"type": "thinking", "thinking": text, "signature": sig}))
+            })
+            .collect();
+        all_thinking.extend(redacted_order);
+        all_thinking.sort_by_key(|(idx, _)| *idx);
+        let thinking_blocks: Vec<Value> = all_thinking.into_iter().map(|(_, b)| b).collect();
+        if !thinking_blocks.is_empty() {
+            yield crate::types::ChatChunk {
+                choices: vec![],
+                usage: None,
+                anthropic_thinking_blocks: thinking_blocks,
+            };
+        }
+        // If message_stop never arrived, the stream was cut mid-response.
+        // This classifies as transient so the retry loop can re-request.
+        if !message_stop_seen {
+            Err(anyhow::anyhow!(
+                "incomplete stream: Anthropic stream ended without message_stop \
+                 (partial response, safe to retry)"
+            ))?;
         }
     };
     Ok((body, Box::pin(stream)))
@@ -308,6 +360,9 @@ fn map_event(
     ev: &Value,
     tool_slot: &mut std::collections::HashMap<u64, usize>,
     next_tool: &mut usize,
+    thinking_slot: &mut std::collections::HashMap<u64, (String, String)>,
+    redacted_order: &mut Vec<(u64, Value)>,
+    message_stop_seen: &mut bool,
 ) -> Result<Option<ChatChunk>> {
     let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
@@ -316,9 +371,10 @@ fn map_event(
             Ok(Some(message_start_usage(u)))
         }
         "content_block_start" => {
+            let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0);
             let block = ev.get("content_block");
-            if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
-                let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
+            if block_type == Some("tool_use") {
                 let slot = *next_tool;
                 tool_slot.insert(idx, slot);
                 *next_tool += 1;
@@ -333,6 +389,17 @@ fn map_event(
                     .unwrap_or("")
                     .to_string();
                 Ok(Some(tool_call_chunk(slot, Some(id), Some(name), None)))
+            } else if block_type == Some("thinking") {
+                thinking_slot.insert(idx, (String::new(), String::new()));
+                Ok(None)
+            } else if block_type == Some("redacted_thinking") {
+                let data = block
+                    .and_then(|b| b.get("data"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                redacted_order.push((idx, json!({"type": "redacted_thinking", "data": data})));
+                Ok(None)
             } else {
                 Ok(None)
             }
@@ -348,8 +415,22 @@ fn map_event(
                 Some("thinking_delta") => {
                     let t = delta
                         .and_then(|d| d.get("thinking"))
-                        .and_then(Value::as_str);
-                    Ok(t.map(|t| reasoning_chunk(t.to_string())))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if let Some(entry) = thinking_slot.get_mut(&idx) {
+                        entry.0.push_str(t);
+                    }
+                    Ok((!t.is_empty()).then(|| reasoning_chunk(t.to_string())))
+                }
+                Some("signature_delta") => {
+                    let sig = delta
+                        .and_then(|d| d.get("signature"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if let Some(entry) = thinking_slot.get_mut(&idx) {
+                        entry.1.push_str(sig);
+                    }
+                    Ok(None)
                 }
                 Some("input_json_delta") => {
                     let frag = delta
@@ -366,6 +447,10 @@ fn map_event(
                 }
                 _ => Ok(None),
             }
+        }
+        "message_stop" => {
+            *message_stop_seen = true;
+            Ok(None)
         }
         "message_delta" => {
             let out = ev
@@ -393,6 +478,7 @@ fn map_event(
                     completion_tokens: out,
                     ..Default::default()
                 }),
+                anthropic_thinking_blocks: vec![],
             };
             Ok((chunk.usage.is_some() || !chunk.choices.is_empty()).then_some(chunk))
         }
@@ -404,7 +490,7 @@ fn map_event(
                 .unwrap_or("unknown error");
             bail!("anthropic stream error: {msg}")
         }
-        _ => Ok(None), // ping, content_block_stop, message_stop
+        _ => Ok(None), // ping, content_block_stop, content_block_start(text), …
     }
 }
 
@@ -445,6 +531,7 @@ fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
     ChatChunk {
         choices: vec![],
         usage: Some(u),
+        anthropic_thinking_blocks: vec![],
     }
 }
 
@@ -485,6 +572,7 @@ fn delta_chunk(delta: Delta) -> ChatChunk {
             finish_reason: None,
         }],
         usage: None,
+        anthropic_thinking_blocks: vec![],
     }
 }
 
@@ -530,6 +618,7 @@ mod tests {
             role: Role::Assistant,
             content: Some("let me check".into()),
             reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
                 kind: "function".into(),
@@ -692,27 +781,172 @@ mod tests {
     }
 
     #[test]
+    fn thinking_blocks_captured_and_emitted_first_in_assistant_blocks() {
+        // Simulate a streaming sequence: thinking_delta → signature_delta → tool_use
+        // The accumulated thinking block must appear first in assistant_blocks.
+        use crate::types::{FunctionCall, ToolCall};
+
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        // content_block_start: thinking block at index 0
+        let ev = json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}});
+        assert!(
+            map_event(
+                &ev,
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut stop_seen
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // thinking_delta
+        let ev = json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I should call read"}});
+        let chunk = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("I should call read")
+        );
+
+        // signature_delta
+        let ev = json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG123"}});
+        assert!(
+            map_event(
+                &ev,
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut stop_seen
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // content_block_start: tool_use at index 1
+        let ev = json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_x","name":"read"}});
+        map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap();
+
+        // Verify the thinking block accumulated properly
+        assert_eq!(thinking.get(&0).unwrap().0, "I should call read");
+        assert_eq!(thinking.get(&0).unwrap().1, "SIG123");
+
+        // Simulate assistant_blocks with a ChatMessage that has the thinking blocks stored
+        let msg = crate::types::ChatMessage {
+            role: crate::types::Role::Assistant,
+            content: None,
+            reasoning_content: Some("I should call read".into()),
+            anthropic_thinking_blocks: vec![
+                json!({"type":"thinking","thinking":"I should call read","signature":"SIG123"}),
+            ],
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_x".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let blocks = assistant_blocks(&msg);
+        // Thinking block must be first
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "I should call read");
+        assert_eq!(blocks[0]["signature"], "SIG123");
+        // tool_use comes after
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_x");
+    }
+
+    #[test]
     fn maps_text_and_tool_stream_events() {
         let mut slot = std::collections::HashMap::new();
         let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
         // message_start → prompt usage (incl cache counters).
         let start = json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":5}}});
-        let c = map_event(&start, &mut slot, &mut next).unwrap().unwrap();
+        let c = map_event(
+            &start,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(c.usage.unwrap().prompt_tokens, 15);
         // text delta.
         let td = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}});
-        let c = map_event(&td, &mut slot, &mut next).unwrap().unwrap();
+        let c = map_event(
+            &td,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(c.choices[0].delta.content.as_deref(), Some("hi"));
         // tool_use start at anthropic block index 1 → flat tool index 0.
         let ts = json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"read"}});
-        let c = map_event(&ts, &mut slot, &mut next).unwrap().unwrap();
+        let c = map_event(
+            &ts,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
         let tc = &c.choices[0].delta.tool_calls.as_ref().unwrap()[0];
         assert_eq!(tc.index, 0);
         assert_eq!(tc.id.as_deref(), Some("toolu_9"));
         assert_eq!(tc.function.as_ref().unwrap().name.as_deref(), Some("read"));
         // input_json_delta on block index 1 routes to flat index 0.
         let jd = json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\""}});
-        let c = map_event(&jd, &mut slot, &mut next).unwrap().unwrap();
+        let c = map_event(
+            &jd,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
         let tc = &c.choices[0].delta.tool_calls.as_ref().unwrap()[0];
         assert_eq!(tc.index, 0);
         assert_eq!(
@@ -721,20 +955,39 @@ mod tests {
         );
         // message_delta → completion usage.
         let md = json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}});
-        let c = map_event(&md, &mut slot, &mut next).unwrap().unwrap();
+        let c = map_event(
+            &md,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(c.usage.unwrap().completion_tokens, 42);
         // ping → nothing.
         assert!(
-            map_event(&json!({"type":"ping"}), &mut slot, &mut next)
-                .unwrap()
-                .is_none()
+            map_event(
+                &json!({"type":"ping"}),
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut stop_seen
+            )
+            .unwrap()
+            .is_none()
         );
         // error → Err.
         assert!(
             map_event(
                 &json!({"type":"error","error":{"message":"boom"}}),
                 &mut slot,
-                &mut next
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut stop_seen,
             )
             .is_err()
         );

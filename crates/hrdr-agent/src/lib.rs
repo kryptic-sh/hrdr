@@ -2475,11 +2475,11 @@ impl Agent {
             }
             // Stream one assistant turn, accumulating text + tool calls. The
             // connect is retried on transient errors and auto-compacted once on
-            // a context-length overflow.
-            let mut stream = self
-                .connect_stream(&defs, &mut overflow_compacted, &mut on_event)
+            // a context-length overflow. Mid-stream failures are retried too
+            // (history is unchanged at that point, so re-requesting is safe).
+            let acc = self
+                .connect_and_drain(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
-            let acc = drain_stream(&mut stream, &mut on_event).await?;
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server
@@ -2577,10 +2577,9 @@ impl Agent {
              calls. Summarize what you accomplished and what remains to be done.]"
                 .to_string(),
         ));
-        let mut stream = self
-            .connect_stream(&[], &mut overflow_compacted, &mut on_event)
+        let acc = self
+            .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
             .await?;
-        let acc = drain_stream(&mut stream, &mut on_event).await?;
         self.messages.push(acc.into_message());
         on_event(AgentEvent::TurnDone);
         Ok(())
@@ -2692,6 +2691,39 @@ impl Agent {
         }
     }
 
+    /// Stream one assistant turn, retrying both the connect and any transient
+    /// mid-stream failure with the same backoff the connect path uses. History
+    /// is unchanged when `drain_stream` fails, so a clean re-request is safe.
+    async fn connect_and_drain<F: FnMut(AgentEvent)>(
+        &mut self,
+        defs: &[ToolDef],
+        overflow_compacted: &mut bool,
+        on_event: &mut F,
+    ) -> Result<Accumulator> {
+        const MAX_DRAIN_RETRIES: usize = 3;
+        let mut drain_attempt = 0usize;
+        loop {
+            let mut stream = self
+                .connect_stream(defs, overflow_compacted, on_event)
+                .await?;
+            match drain_stream(&mut stream, on_event).await {
+                Ok(acc) => return Ok(acc),
+                Err(e) if is_transient(&e) && drain_attempt < MAX_DRAIN_RETRIES => {
+                    drain_attempt += 1;
+                    let delay =
+                        retry_after_hint(&e).unwrap_or_else(|| retry_backoff(drain_attempt));
+                    on_event(AgentEvent::Notice(format!(
+                        "stream interrupted — retrying in {:.0}s \
+                         (attempt {drain_attempt}/{MAX_DRAIN_RETRIES})",
+                        delay.as_secs_f64()
+                    )));
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Open a chat stream, retrying transient network/server errors with
     /// exponential backoff and auto-compacting once on a context-length
     /// overflow. Emits `Notice` events for each recovery attempt.
@@ -2770,8 +2802,9 @@ fn is_transient(e: &anyhow::Error) -> bool {
             "returned 502",
             "returned 503",
             "returned 504",
-            "returned 529", // Anthropic "Overloaded"
-            "overloaded",   // Anthropic mid-stream overloaded_error
+            "returned 529",      // Anthropic "Overloaded"
+            "overloaded",        // Anthropic mid-stream overloaded_error
+            "incomplete stream", // stream truncated without terminal marker
         ],
     )
 }
@@ -3086,6 +3119,7 @@ mod tests {
             role: Role::Assistant,
             content: None,
             reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
             tool_calls: Some(
                 ids.iter()
                     .map(|id| ToolCall {
@@ -4271,6 +4305,7 @@ mod tests {
             role: Role::User,
             content: None,
             reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
             tool_calls: None,
             tool_call_id: None,
             name: None,

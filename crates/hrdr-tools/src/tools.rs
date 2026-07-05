@@ -15,6 +15,9 @@ use crate::{TodoItem, Tool, ToolContext, TruncateSide, cap_matches, truncate, tr
 const MAX_LINE: usize = 2_000;
 const DEFAULT_READ_LIMIT: usize = 2_000;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+/// Hard cap on a single output line accumulated from bash/powershell; prevents
+/// a minified-file line from blowing the per-turn context.
+const BASH_LINE_CAP: usize = 8_192;
 
 // ---- read ----
 
@@ -355,87 +358,199 @@ impl Tool for BashTool {
     }
 }
 
-/// Append a captured line (with newline) to `out` and stream it to the UI sink.
-fn emit_line(out: &mut String, ctx: &ToolContext, line: String) {
-    out.push_str(&line);
-    out.push('\n');
-    ctx.emit(format!("{line}\n"));
-}
-
 /// Spawn a configured command, streaming its stdout/stderr line-by-line to the
-/// UI sink while accumulating the full (length-bounded) output. Shared by the
-/// `bash` and `powershell` tools.
+/// UI sink while accumulating a length-bounded view of the output. Full output
+/// is written incrementally to an overflow file so the model can read/grep it
+/// even when the in-memory view is truncated. Shared by `bash` and `powershell`.
 async fn run_streamed_command(
     mut cmd: tokio::process::Command,
     timeout: Duration,
     ctx: &ToolContext,
 ) -> Result<String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // If this future is cancelled (turn interrupt) the process must not linger.
+    // Cancelled future → child must not linger.
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning command")?;
     let stdout = child.stdout.take().context("capturing stdout")?;
     let stderr = child.stderr.take().context("capturing stderr")?;
-    let mut out_lines = BufReader::new(stdout).lines();
-    let mut err_lines = BufReader::new(stderr).lines();
+    let mut out_reader = BufReader::new(stdout);
+    let mut err_reader = BufReader::new(stderr);
 
-    // Read stdout + stderr concurrently, accumulating the full output while
-    // streaming each line. Interleaving order isn't guaranteed — fine for a live
-    // view.
-    let mut out = String::new();
+    // In-memory budget: ~1/5 head + ~4/5 tail ring (both measured in bytes).
+    // 5× max_output keeps enough context for head+tail display while staying
+    // orders of magnitude below a typical huge file.
+    let mem_budget = ctx.max_output.saturating_mul(5).max(ctx.max_output);
+    let head_budget = mem_budget / 5;
+    let tail_budget = mem_budget - head_budget;
+
+    let mut head = String::new();
+    // Tail ring: each entry is one line (with its newline). Evict from front
+    // when tail_bytes would exceed the budget.
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut tail_bytes: usize = 0;
+    let mut total_bytes: usize = 0;
+    let mut total_lines: usize = 0;
+
+    // Overflow file: opened lazily once output starts. Written line-by-line so
+    // the full output is on disk even for huge commands.
+    let overflow_dir = crate::tool_output_dir();
+    let mut overflow_path: Option<std::path::PathBuf> = None;
+    let mut overflow_file: Option<std::fs::File> = None;
+
+    macro_rules! ingest_line {
+        ($line:expr) => {{
+            let line: &str = $line;
+            // Stream to the UI (unchanged from current behaviour).
+            ctx.emit(format!("{line}\n"));
+
+            // Write to overflow file (opened lazily on first line).
+            if overflow_file.is_none() {
+                let _ = std::fs::create_dir_all(&overflow_dir);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let p = overflow_dir.join(format!("bash-{stamp}-{seq}.txt"));
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&p)
+                {
+                    overflow_path = Some(p);
+                    overflow_file = Some(f);
+                }
+            }
+            if let Some(f) = &mut overflow_file {
+                use std::io::Write as _;
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.write_all(b"\n");
+            }
+
+            total_lines += 1;
+            total_bytes += line.len() + 1; // +1 for the newline
+
+            // Accumulate in-memory head + tail.
+            if head.len() < head_budget {
+                head.push_str(line);
+                head.push('\n');
+            } else {
+                let entry = format!("{line}\n");
+                tail_bytes += entry.len();
+                tail.push_back(entry);
+                // Evict oldest tail entries to stay within the tail budget.
+                while tail_bytes > tail_budget {
+                    if let Some(front) = tail.pop_front() {
+                        tail_bytes -= front.len();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }};
+    }
+
+    // Read stdout + stderr concurrently; use read_until(b'\n') so a single
+    // newline-less line (e.g. minified source) can't exhaust memory.
     let collect = async {
         let mut out_done = false;
         let mut err_done = false;
+        let mut out_buf = Vec::<u8>::new();
+        let mut err_buf = Vec::<u8>::new();
         loop {
             tokio::select! {
-                r = out_lines.next_line(), if !out_done => match r? {
-                    Some(line) => emit_line(&mut out, ctx, line),
-                    None => out_done = true,
-                },
-                r = err_lines.next_line(), if !err_done => match r? {
-                    Some(line) => emit_line(&mut out, ctx, line),
-                    None => err_done = true,
-                },
+                n = out_reader.read_until(b'\n', &mut out_buf), if !out_done => {
+                    match n? {
+                        0 => out_done = true,
+                        _ => {
+                            // read_until includes the delimiter; strip trailing
+                            // newline / carriage-return then cap at BASH_LINE_CAP.
+                            if out_buf.last() == Some(&b'\n') { out_buf.pop(); }
+                            if out_buf.last() == Some(&b'\r') { out_buf.pop(); }
+                            let capped_len = out_buf.len().min(BASH_LINE_CAP);
+                            let line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
+                            ingest_line!(&line);
+                            out_buf.clear();
+                        }
+                    }
+                }
+                n = err_reader.read_until(b'\n', &mut err_buf), if !err_done => {
+                    match n? {
+                        0 => err_done = true,
+                        _ => {
+                            if err_buf.last() == Some(&b'\n') { err_buf.pop(); }
+                            if err_buf.last() == Some(&b'\r') { err_buf.pop(); }
+                            let capped_len = err_buf.len().min(BASH_LINE_CAP);
+                            let line = String::from_utf8_lossy(&err_buf[..capped_len]).into_owned();
+                            ingest_line!(&line);
+                            err_buf.clear();
+                        }
+                    }
+                }
                 else => break,
             }
         }
         let status = child.wait().await.context("waiting on command")?;
         anyhow::Ok(status)
     };
+
     let timed = tokio::time::timeout(timeout, collect).await;
     let status = match timed {
-        Ok(status) => Some(status?),
+        Ok(inner) => Some(inner?),
         Err(_) => {
-            // Timed out: kill the process (it would otherwise keep running
-            // orphaned) and hand the model whatever it printed so far.
             let _ = child.kill().await;
-            out.push_str(&format!(
-                "[command timed out after {}ms; process killed — raise timeout_ms or run a \
-                 narrower command]\n",
+            let msg = format!(
+                "[command timed out after {}ms; process killed — raise timeout_ms or \
+                 run a narrower command]",
                 timeout.as_millis()
-            ));
+            );
+            ingest_line!(&msg);
             None
         }
     };
-    if let Some(status) = status
-        && !status.success()
+    if let Some(s) = status
+        && !s.success()
     {
-        out.push_str(&format!("[exit status: {status}]\n"));
+        let msg = format!("[exit status: {s}]");
+        ingest_line!(&msg);
     }
-    let out = out.trim_end();
-    if out.is_empty() {
+
+    // Flush the overflow file (drop closes it).
+    drop(overflow_file);
+
+    // Nothing produced.
+    if total_lines == 0 {
         return Ok("(no output)".to_string());
     }
-    // Head+tail truncation: build/test output puts the failures at the end —
-    // plain head-only truncation would cut exactly what the model needs. The
-    // full output is saved off so the model can retrieve the omitted middle.
-    Ok(truncate_saved(
-        out,
-        ctx.max_output,
-        ctx.max_output_lines,
-        TruncateSide::Middle,
-        "bash",
-    ))
+
+    // Within both display caps: return the full in-memory view (no pointer needed).
+    if total_bytes <= ctx.max_output && total_lines <= ctx.max_output_lines {
+        // head holds all lines in this branch.
+        let out = head.trim_end();
+        return Ok(out.to_string());
+    }
+
+    // Over the display cap: emit head + truncation pointer + tail.
+    // Synthesize the same format truncate_saved produces so any tests
+    // asserting on the marker string still pass.
+    let tail_str: String = tail.iter().map(|s| s.as_str()).collect();
+    let tail_str = tail_str.trim_start();
+    let hint = match &overflow_path {
+        Some(p) => format!(
+            "… [full output ({total_lines} lines, {total_bytes} bytes) saved to {} — \
+             `read` it (with offset/limit) or `grep` it (pattern + path) for the \
+             rest, don't re-run] …",
+            p.display()
+        ),
+        None => format!("… [output truncated — {total_lines} lines, {total_bytes} bytes total] …"),
+    };
+    let head_trimmed = head.trim_end();
+    if tail_str.is_empty() {
+        Ok(format!("{head_trimmed}\n\n{hint}"))
+    } else {
+        Ok(format!("{head_trimmed}\n\n{hint}\n\n{tail_str}"))
+    }
 }
 
 /// The available shell tools for this machine (bash and/or PowerShell), only
@@ -1635,5 +1750,40 @@ mod tests {
             .unwrap();
         assert!(out.contains("early"), "partial output missing: {out}");
         assert!(out.contains("timed out"), "timeout marker missing: {out}");
+    }
+
+    /// Verify that run_streamed_command caps in-memory usage and produces a
+    /// truncation marker when output exceeds max_output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_output_bounded_and_marker_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ToolContext::new(dir.path());
+        // Tiny output cap so even a small command overflows.
+        c.max_output = 200;
+        c.max_output_lines = 10;
+
+        // Generate 50 lines of ~20 chars each (well above both caps).
+        let result = BashTool
+            .execute(
+                serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
+                &c,
+            )
+            .await
+            .unwrap();
+
+        // The result must be within a reasonable bound (not the full 50*~25 = 1250 bytes).
+        assert!(
+            result.len() < 2000,
+            "result should be bounded, got {} bytes",
+            result.len()
+        );
+        // Must contain the truncation pointer so the model knows where to look.
+        assert!(
+            result.contains("full output") || result.contains("truncated"),
+            "marker missing from: {result}"
+        );
+        // Must start with some actual output (head preserved).
+        assert!(result.contains("line 1"), "head not preserved: {result}");
     }
 }

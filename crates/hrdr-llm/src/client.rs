@@ -410,6 +410,13 @@ impl Client {
                     yield parsed;
                 }
             }
+            // Reaching here means the byte stream closed without the [DONE]
+            // sentinel — truncated response or network drop. Classify as
+            // transient so the agent retry loop can re-request.
+            Err(anyhow::anyhow!(
+                "incomplete stream: OpenAI stream ended without [DONE] \
+                 (partial response, safe to retry)"
+            ))?;
         };
         Ok(Box::pin(stream))
     }
