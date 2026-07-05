@@ -437,6 +437,10 @@ pub struct AgentConfig {
     /// to a fresh sub-agent. Default `true`; forced `false` inside a sub-agent so
     /// it can't spawn its own (bounding recursion to one level).
     pub subagents: bool,
+    /// Expose the `memory` tool and auto-load saved notes into the system prompt.
+    /// Default `true`; `$HRDR_MEMORY`. Storage lives under the XDG data dir
+    /// (project-scoped by cwd, plus a shared global scope).
+    pub memory: bool,
     /// Default model for delegated sub-agents (same provider/endpoint as the main
     /// agent). `None` reuses the main agent's model; the `task` tool's `model`
     /// argument overrides per call. This is the "Opus drives, Sonnet implements"
@@ -768,6 +772,7 @@ impl Default for AgentConfig {
             headers: Vec::new(),
             api_version: None,
             subagents: true,
+            memory: true,
             subagent_model: None,
             subagent_profiles: Vec::new(),
             agent_prompt: None,
@@ -995,6 +1000,7 @@ struct FileConfig {
     request_timeout: Option<u64>,
     prompt_cache_ttl: Option<String>,
     subagents: Option<bool>,
+    memory: Option<bool>,
     subagent_model: Option<String>,
     #[serde(default)]
     subagent: Vec<SubagentProfile>,
@@ -1103,6 +1109,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.subagents {
             self.subagents = v;
+        }
+        if let Some(v) = fc.memory {
+            self.memory = v;
         }
         if let Some(v) = fc.subagent_model {
             self.subagent_model = Some(v);
@@ -1257,6 +1266,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_SUBAGENTS", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
             c.subagents = b;
+        }
+    }),
+    ("HRDR_MEMORY", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.memory = b;
         }
     }),
 ];
@@ -1443,6 +1457,9 @@ pub struct Agent {
     /// Persona appended to the system prompt (a sub-agent's role); re-applied
     /// when the prompt is rebuilt on `clear`/`set_cwd`. `None` for the main agent.
     agent_prompt: Option<String>,
+    /// Whether the `memory` tool + auto-loaded memory index are active; drives
+    /// re-resolving the memory roots on `clear`/`set_cwd`.
+    memory_enabled: bool,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -1453,6 +1470,99 @@ fn append_persona(mut system: String, persona: Option<&str>) -> String {
         system.push_str(p);
     }
     system
+}
+
+/// The most of a memory index (`MEMORY.md`) loaded into the prompt each session,
+/// in lines / bytes — the rest is left on disk for on-demand `read`/`grep`
+/// (matching Claude Code's ~200-line / 25 KB budget).
+const MEMORY_INDEX_MAX_LINES: usize = 200;
+const MEMORY_INDEX_MAX_BYTES: usize = 25_600;
+
+/// Storage roots for agent memory: `(project, global)` — project scoped by cwd,
+/// global shared across projects. `None` when no XDG data dir is resolvable.
+fn memory_dirs(cwd: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let base = hjkl_xdg::data_dir("hrdr").ok()?.join("memory");
+    let project = base.join("projects").join(cwd_slug(&cwd.to_string_lossy()));
+    let global = base.join("global");
+    Some((project, global))
+}
+
+/// Read a memory index (`<root>/MEMORY.md`), bounded to the prompt budget.
+/// `None` when it's missing or empty.
+fn read_memory_index(root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("MEMORY.md")).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= MEMORY_INDEX_MAX_BYTES && text.lines().count() <= MEMORY_INDEX_MAX_LINES {
+        return Some(text.to_string());
+    }
+    let mut out = String::new();
+    for line in text.lines().take(MEMORY_INDEX_MAX_LINES) {
+        if out.len() + line.len() + 1 > MEMORY_INDEX_MAX_BYTES {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "… (truncated — read the full index at {}/MEMORY.md)",
+        root.display()
+    ));
+    Some(out)
+}
+
+/// Assemble the memory block for the system prompt from the two scopes' indexes
+/// (global first, then project). `None` when both are empty.
+fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> Option<String> {
+    let g = read_memory_index(global);
+    let p = read_memory_index(project);
+    if g.is_none() && p.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    if let Some(g) = g {
+        out.push_str(&format!(
+            "## Global — {}/MEMORY.md\n\n{}\n\n",
+            global.display(),
+            g
+        ));
+    }
+    if let Some(p) = p {
+        out.push_str(&format!(
+            "## Project — {}/MEMORY.md\n\n{}\n",
+            project.display(),
+            p
+        ));
+    }
+    Some(out)
+}
+
+/// Append the saved-memory block after the base system prompt. A no-op when
+/// there's no memory.
+fn append_memory(mut system: String, memory: Option<&str>) -> String {
+    if let Some(m) = memory.map(str::trim).filter(|m| !m.is_empty()) {
+        system.push_str(
+            "\n\n# Memory\n\nDurable notes you saved in earlier sessions (via the `memory` \
+             tool). Trust them but verify against the code before acting; update or prune \
+             entries as things change. Detail lives in topic files you can `read`/`grep`.\n\n",
+        );
+        system.push_str(m);
+    }
+    system
+}
+
+/// Build the full system prompt: base template + memory + persona.
+fn build_system_prompt(
+    tools: &ToolRegistry,
+    cwd: &std::path::Path,
+    docs: Option<&str>,
+    memory: Option<&str>,
+    persona: Option<&str>,
+) -> Result<String> {
+    let system = render_system(tools, cwd, docs)?;
+    Ok(append_persona(append_memory(system, memory), persona))
 }
 
 impl Agent {
@@ -1468,6 +1578,13 @@ impl Agent {
                 subagent_base_config(&config),
                 resolve_agent_profiles(&config),
             )));
+        }
+        // Memory: expose the `memory` tool (registered before scoping so a
+        // read-only sub-agent drops the writer) and resolve its storage roots
+        // (used for the `ctx` below and the auto-loaded index).
+        let mem_dirs = config.memory.then(|| memory_dirs(&config.cwd)).flatten();
+        if config.memory {
+            tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
         // wins; else `write_ext` grants the read-only tools plus the writers
@@ -1488,6 +1605,10 @@ impl Agent {
         ctx.max_output_lines = config.tool_max_lines;
         // A write-scoped sub-agent (e.g. `plan`) may only touch these extensions.
         ctx.write_allow_ext = config.write_ext.clone();
+        if let Some((proj, glob)) = &mem_dirs {
+            ctx.memory_project = Some(proj.clone());
+            ctx.memory_global = Some(glob.clone());
+        }
         if !config.hooks.is_empty() {
             // Invalid globs are skipped (lenient, like the rest of config).
             let hooks: Vec<hrdr_tools::Hook> = config
@@ -1521,10 +1642,14 @@ impl Agent {
             ctx.guardrails = Arc::new(rails);
         }
         let project_docs = gather_agent_docs(&config.cwd);
-        let system = append_persona(
-            render_system(&tools, &config.cwd, project_docs.as_deref())?,
+        let memory = mem_dirs.as_ref().and_then(|(p, g)| gather_memory(p, g));
+        let system = build_system_prompt(
+            &tools,
+            &config.cwd,
+            project_docs.as_deref(),
+            memory.as_deref(),
             config.agent_prompt.as_deref(),
-        );
+        )?;
 
         // File checkpoint store, keyed by working directory (like sessions).
         // `auto` (default) enables it only outside a git repo — git already
@@ -1583,6 +1708,7 @@ impl Agent {
             mcp_configs: config.mcp,
             mcp_clients: Vec::new(),
             agent_prompt: config.agent_prompt,
+            memory_enabled: config.memory,
         })
     }
 
@@ -1686,11 +1812,29 @@ impl Agent {
     /// [`Self::clear`] and [`Self::set_cwd`].
     fn refresh_system(&mut self) {
         self.project_docs = gather_agent_docs(&self.ctx.cwd);
-        let Ok(system) = render_system(&self.tools, &self.ctx.cwd, self.project_docs.as_deref())
-        else {
+        // Re-resolve memory roots for the (possibly changed) cwd and reload the
+        // index, so `/clear` and `set_cwd` reflect saved notes for this project.
+        let memory = if self.memory_enabled {
+            if let Some((proj, glob)) = memory_dirs(&self.ctx.cwd) {
+                let mem = gather_memory(&proj, &glob);
+                self.ctx.memory_project = Some(proj);
+                self.ctx.memory_global = Some(glob);
+                mem
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Ok(system) = build_system_prompt(
+            &self.tools,
+            &self.ctx.cwd,
+            self.project_docs.as_deref(),
+            memory.as_deref(),
+            self.agent_prompt.as_deref(),
+        ) else {
             return;
         };
-        let system = append_persona(system, self.agent_prompt.as_deref());
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
             self.messages[0] = ChatMessage::system(system);
         } else {
@@ -2780,6 +2924,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_tool_present_only_when_enabled() {
+        let has_memory = |memory: bool| {
+            let cfg = AgentConfig {
+                memory,
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            Agent::new(cfg)
+                .unwrap()
+                .tools()
+                .iter()
+                .any(|(n, _)| n == "memory")
+        };
+        assert!(has_memory(true));
+        assert!(!has_memory(false));
+    }
+
+    #[test]
+    fn gather_memory_reads_bounded_index_per_scope() {
+        use super::{gather_memory, read_memory_index};
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        let glob = dir.path().join("global");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&glob).unwrap();
+        // Both empty → nothing injected.
+        assert!(gather_memory(&proj, &glob).is_none());
+        std::fs::write(proj.join("MEMORY.md"), "- project fact").unwrap();
+        std::fs::write(glob.join("MEMORY.md"), "- global fact").unwrap();
+        let mem = gather_memory(&proj, &glob).unwrap();
+        assert!(mem.contains("global fact") && mem.contains("project fact"));
+        // Global scope precedes project (least-specific first).
+        assert!(mem.find("Global").unwrap() < mem.find("Project").unwrap());
+        // A huge index is bounded, with a pointer to read the rest.
+        std::fs::write(proj.join("MEMORY.md"), "line\n".repeat(10_000)).unwrap();
+        assert!(read_memory_index(&proj).unwrap().contains("truncated"));
+    }
+
+    #[test]
     fn builtin_agents_are_named_and_scoped() {
         use super::builtin_subagent_profiles;
         // The four built-ins ship even with no user config.
@@ -3131,6 +3314,7 @@ mod tests {
             request_timeout: Some(30),
             prompt_cache_ttl: Some("1h".to_string()),
             subagents: Some(false),
+            memory: Some(false),
             subagent_model: Some("claude-sonnet-4-6".to_string()),
             subagent: vec![],
             effort: Some("high".to_string()),
@@ -3170,6 +3354,7 @@ mod tests {
         assert_eq!(cfg.request_timeout, Some(30));
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
         assert!(!cfg.subagents);
+        assert!(!cfg.memory);
         assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);

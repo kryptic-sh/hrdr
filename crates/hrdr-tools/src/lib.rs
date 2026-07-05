@@ -17,6 +17,7 @@ mod checkpoint;
 mod guardrails;
 mod hooks;
 mod mcp;
+mod memory;
 mod patch;
 mod tools;
 mod web;
@@ -25,6 +26,7 @@ pub use checkpoint::{CheckpointInfo, Checkpoints};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{DEFAULT_HOOK_TIMEOUT_MS, Hook, run_file_hooks};
 pub use mcp::McpClient;
+pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
     BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
@@ -91,6 +93,12 @@ pub struct ToolContext {
     /// `["md", "markdown"]`). `None` = any extension. Used to scope a sub-agent
     /// to writing only certain file types (e.g. a planner that persists Markdown).
     pub write_allow_ext: Option<Vec<String>>,
+    /// Storage root for **project-scoped** [`MemoryTool`] notes (this cwd).
+    /// `None` disables project memory.
+    pub memory_project: Option<PathBuf>,
+    /// Storage root for **global** [`MemoryTool`] notes (all projects).
+    /// `None` disables global memory.
+    pub memory_global: Option<PathBuf>,
     /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
     /// `edit`/`write` after a successful mutation.
     pub hooks: Arc<Vec<Hook>>,
@@ -109,6 +117,8 @@ impl ToolContext {
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             restrict_to_cwd: true,
             write_allow_ext: None,
+            memory_project: None,
+            memory_global: None,
             hooks: Arc::new(Vec::new()),
         }
     }

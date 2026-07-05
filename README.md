@@ -523,6 +523,28 @@ Unlike a delegated sub-agent, a primary agent keeps delegation (the `task` tool)
 and its MCP servers — it's a full session, just wearing the agent's persona and
 scope. An unknown name lists the available agents.
 
+### Memory
+
+The agent has a **`memory` tool** for durable notes that persist across sessions
+— project conventions, decisions and their rationale, your stable preferences,
+gotchas — so it doesn't re-derive them next time. Two scopes:
+
+- **project** — this working directory (default).
+- **global** — shared across all projects (e.g. personal preferences).
+
+Storage is plain Markdown under the XDG data dir (`~/.local/share/hrdr/memory/`)
+— a `MEMORY.md` **index** plus topic files, OKF-flavored: greppable,
+git-diffable, human-editable. At session start the bounded `MEMORY.md` index
+(≤200 lines / 25 KB, like Claude Code) is loaded into the prompt for each scope;
+the agent reads topic files on demand with `read`/`grep`, and the index re-loads
+after `/clear` and `/compact` so memory survives context resets. The tool
+actions are `view` (list a scope, or read a file), `write`, `append`, and
+`delete`; writes are confined to the memory store.
+
+Disable with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is distinct
+from `AGENTS.md`, which stays the human-authored, read-only project
+instructions.
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —
