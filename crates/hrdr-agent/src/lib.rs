@@ -289,11 +289,19 @@ impl hrdr_tools::Tool for SubagentTool {
         .await?;
 
         let output = output.trim();
-        Ok(if output.is_empty() {
-            "(sub-agent finished with no text output)".to_string()
-        } else {
-            output.to_string()
-        })
+        if output.is_empty() {
+            return Ok("(sub-agent finished with no text output)".to_string());
+        }
+        // A concise summary is returned inline; a large report is saved to a file
+        // and the parent gets a bounded preview + a pointer to `read`/`grep` it,
+        // so a big sub-agent result doesn't flood the main context.
+        Ok(hrdr_tools::truncate_saved(
+            output,
+            ctx.max_output,
+            ctx.max_output_lines,
+            hrdr_tools::TruncateSide::Head,
+            "task",
+        ))
     }
 }
 

@@ -13,6 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into its own tool block. A new `Tool::concurrent()` signal (defaults to
   `read_only()`) drives the tool-batcher: `task` opts in while staying
   non-read-only; the parent's own file-mutating tools stay a sequential barrier.
+- **Large sub-agent results spill to a file.** A concise `task` result is still
+  returned inline, but a large one is now saved to a temp file (over the
+  `[tool_output]` caps, the same as `bash`/`grep`) and the parent gets a bounded
+  preview + a pointer to `read` (with offset/limit) or `grep` it — so a big
+  sub-agent report doesn't flood the main context.
 
 - **Sub-agents (`task` tool).** The model can delegate a self-contained sub-task
   to a fresh sub-agent with its own context, keeping the main conversation clean

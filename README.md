@@ -382,9 +382,12 @@ The model can delegate a self-contained sub-task to a fresh **sub-agent** via
 the `task` tool — useful for broad exploration or a focused piece of
 implementation, so the main conversation stays clean. The sub-agent has its own
 context and the normal tools, runs to completion, and returns its summary as the
-result (its tool activity streams live). Issuing several `task` calls in one
-turn runs the sub-agents **in parallel** — e.g. explore several areas of the
-codebase at once — each streaming into its own tool block.
+result (its tool activity streams live). A concise summary comes back inline; a
+large report is instead **saved to a file** and the parent gets a preview + a
+pointer to `read`/`grep` it — so it doesn't flood the main context. Issuing
+several `task` calls in one turn runs the sub-agents **in parallel** — e.g.
+explore several areas of the codebase at once — each streaming into its own tool
+block.
 
 A sub-agent can run on a **different model on the same provider** — e.g. an Opus
 main agent delegating implementation to a cheaper/faster Sonnet:
