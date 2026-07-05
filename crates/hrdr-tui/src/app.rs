@@ -154,8 +154,8 @@ pub(crate) struct App {
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
-    /// Auto-compact enable carrier: `0` (or out of range) disables it.
-    pub(crate) auto_compact_ratio: f64,
+    /// Whether auto-compaction is enabled (the `auto_compact` toggle).
+    pub(crate) auto_compact_enabled: bool,
     /// Tokens reserved below the context window — auto-compaction fires at
     /// `context_window − compaction_reserved` (opencode's model).
     pub(crate) compaction_reserved: u32,
@@ -322,7 +322,7 @@ impl App {
             login: None,
             pending_goto: None,
             find: hrdr_app::FindState::default(),
-            auto_compact_ratio: auto_compact,
+            auto_compact_enabled: auto_compact,
             compaction_reserved,
             bell,
             base_url,
@@ -714,7 +714,7 @@ impl App {
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
         self.theme = Theme::load(ui.theme.as_deref());
         self.effort = cfg.effort.clone();
-        self.auto_compact_ratio = cfg.auto_compact;
+        self.auto_compact_enabled = cfg.auto_compact;
         self.compaction_reserved = cfg.compaction_reserved;
         self.bell = ui.bell;
         self.todo_ttl = ui.todo_ttl;
@@ -874,7 +874,7 @@ impl App {
                 self.last_usage.map(|(p, _)| p),
                 self.context_window,
                 self.compaction_reserved,
-                self.auto_compact_ratio > 0.0 && self.auto_compact_ratio <= 1.0,
+                self.auto_compact_enabled,
             )
     }
 
@@ -925,11 +925,14 @@ impl App {
             }
             TurnMsg::System(text) => {
                 self.push_entry(Entry::System(text));
-                self.scroll_offset = 0;
+                // Do NOT reset scroll_offset here: this is an async/passive line
+                // (e.g. a late `/models` result). Resetting would yank the user's
+                // view when they are scrolled up reading back-scroll. When the
+                // user is already following (offset == 0), it stays 0 unchanged.
             }
             TurnMsg::Diff(text) => {
                 self.push_entry(Entry::Diff(text));
-                self.scroll_offset = 0;
+                // Same rationale as TurnMsg::System above: passive async output.
             }
             TurnMsg::Done(err) => {
                 if !self.running {
@@ -1132,7 +1135,10 @@ impl App {
             }
             AgentEvent::Notice(text) => {
                 self.push_entry(Entry::System(text));
-                self.scroll_offset = 0;
+                // Do NOT reset scroll_offset: notices (MCP warnings, health
+                // alerts, step-budget exhaustion) are passive async lines. When
+                // the user is scrolled up, the new line appends without moving
+                // their view. When already following (offset == 0) it stays 0.
             }
             // Delivery signal only; the message was already shown at submit time.
             AgentEvent::Steered(_) => {}
@@ -1146,10 +1152,58 @@ mod e2e;
 
 #[cfg(test)]
 mod tests {
+    use super::HitRect;
+
     /// The TUI's TODO-panel default lifetime must track the shared UI-config
     /// default (the aging logic itself is tested in `hrdr-app`).
     #[test]
     fn ttl_matches_config_default() {
         assert_eq!(5, hrdr_app::DEFAULT_TODO_TTL);
+    }
+
+    // ---- HitRect hit-test (transcript tool-block click targeting) ----
+
+    /// `HitRect::contains` is the sole gate for all mouse hit-testing in the
+    /// TUI (tool-block expansion, sub-agent panel rows, the follow button).
+    /// Verify the boundary arithmetic is correct in all four directions.
+    #[test]
+    fn hitrect_contains_boundary() {
+        // Rectangle occupying columns 10–29, rows 5–7 (w=20, h=3).
+        let r = HitRect {
+            x: 10,
+            y: 5,
+            w: 20,
+            h: 3,
+        };
+
+        // Corners and a centre cell must be inside.
+        assert!(r.contains(10, 5), "top-left corner should be inside");
+        assert!(
+            r.contains(29, 7),
+            "bottom-right corner (x+w-1, y+h-1) should be inside"
+        );
+        assert!(r.contains(20, 6), "centre cell should be inside");
+
+        // Each boundary's immediate outside must be rejected.
+        assert!(!r.contains(9, 5), "one col left of rect should be outside");
+        assert!(!r.contains(30, 5), "x+w (exclusive) should be outside");
+        assert!(!r.contains(10, 4), "one row above rect should be outside");
+        assert!(!r.contains(10, 8), "y+h (exclusive) should be outside");
+    }
+
+    /// A zero-size HitRect never contains anything.
+    #[test]
+    fn hitrect_zero_size_never_contains() {
+        let r = HitRect {
+            x: 5,
+            y: 5,
+            w: 0,
+            h: 0,
+        };
+        assert!(
+            !r.contains(5, 5),
+            "zero-size rect must never contain any cell"
+        );
+        assert!(!r.contains(0, 0));
     }
 }

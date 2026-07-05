@@ -94,6 +94,28 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
 /// Launch the interactive TUI against the configured agent, with `ui` holding
 /// the display knobs (theme, icons, vim mode, …) split out of the agent config.
 pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<()> {
+    // Install a panic hook that restores the terminal to its normal state
+    // *before* the panic message and backtrace are printed.  Without this the
+    // message lands inside the alt screen and is immediately cleared on exit —
+    // the crash looks like a silent exit.  `TerminalGuard::drop` performs the
+    // same cleanup during the unwind, so a double-restore is harmless: every
+    // crossterm operation used here is idempotent and errors are ignored.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort restore; errors are intentionally swallowed so we never
+        // mask the real panic message with a secondary I/O failure.
+        let mut out = stdout();
+        let _ = execute!(
+            out,
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+        );
+        let _ = disable_raw_mode();
+        prev_hook(info);
+    }));
+
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal: Tui = Terminal::new(backend)?;

@@ -67,10 +67,11 @@ struct Cli {
     #[arg(long = "memory-dir", global = true, value_name = "DIR")]
     memory_dir: Option<std::path::PathBuf>,
 
-    /// Auto-compact toggle: any value in 0.0–1.0 enables it, 0 disables (the
-    /// trigger point is set by --compaction-reserved).
+    /// Auto-compact on/off toggle (the trigger point is set by
+    /// --compaction-reserved). Accepts `true`/`false` and, for backward
+    /// compatibility, the old fractional spelling (`0.85` → on, `0` → off).
     #[arg(long, global = true)]
-    auto_compact: Option<f64>,
+    auto_compact: Option<String>,
 
     /// Tokens reserved below the context window before auto-compaction fires
     /// (default 20000); compaction triggers at context_window − this.
@@ -282,8 +283,12 @@ async fn main() -> Result<()> {
             })?;
         config = hrdr_agent::config_for_agent_profile(&config, profile)?;
     }
-    if let Some(r) = cli.auto_compact {
-        config.auto_compact = r;
+    if let Some(b) = cli
+        .auto_compact
+        .as_deref()
+        .and_then(hrdr_agent::parse_toggle_or_num)
+    {
+        config.auto_compact = b;
     }
     if let Some(n) = cli.compaction_reserved {
         config.compaction_reserved = n;

@@ -23,6 +23,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use crate::sse::SseDecoder;
+
 use crate::types::{
     CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, FunctionDelta, Role, ToolCallDelta,
     ToolDef, Usage,
@@ -224,6 +226,10 @@ fn mark_last_block(blocks: &mut [Value], ttl_1h: bool) {
 
 /// Stream a completion from the native Messages API, yielding OpenAI-shaped
 /// [`ChatChunk`]s.
+///
+/// Takes slices to avoid cloning the full history on every retry. The request
+/// body is serialized before any network I/O, so the borrow does not extend
+/// into the returned [`crate::ChatStream`] future.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_stream(
     http: &reqwest::Client,
@@ -236,8 +242,8 @@ pub(crate) async fn chat_stream(
     cache: CacheMode,
     ttl_1h: bool,
     extra_headers: &[(String, String)],
-    messages: Vec<ChatMessage>,
-    tools: Vec<ToolDef>,
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
 ) -> Result<(Value, crate::ChatStream)> {
     let body = build_body(
         model,
@@ -246,8 +252,8 @@ pub(crate) async fn chat_stream(
         temperature,
         cache,
         ttl_1h,
-        &messages,
-        &tools,
+        messages,
+        tools,
     );
     let mut req = http
         .post(format!("{base_url}/messages"))
@@ -290,7 +296,6 @@ pub(crate) async fn chat_stream(
 
     let stream = async_stream::try_stream! {
         let mut bytes = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
         // Anthropic content-block index → our flat tool-call index.
         let mut tool_slot: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         let mut next_tool: usize = 0;
@@ -304,19 +309,25 @@ pub(crate) async fn chat_stream(
         let mut redacted_order: Vec<(u64, Value)> = Vec::new();
         // Whether message_stop was received (for truncation detection).
         let mut message_stop_seen = false;
-        while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.context("reading stream chunk")?;
-            buf.extend_from_slice(&chunk);
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                let line = String::from_utf8_lossy(&line[..nl]);
-                let line = line.trim_end_matches('\r');
-                // Anthropic SSE carries `event:` and `data:` lines; every `data:`
-                // payload is a complete JSON object with its own `type`, so the
-                // `event:` line is redundant and ignored.
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data.is_empty() { continue }
+        // Feed raw byte chunks into the SSE decoder. Anthropic SSE carries
+        // `event:` and `data:` lines; every `data:` payload is a complete JSON
+        // object with its own `type`, so the `event:` line is redundant and
+        // ignored (ev.event is unused). Splitting on 0x0A is safe for UTF-8.
+        let mut decoder = SseDecoder::new();
+        loop {
+            // On EOF, `finish()` flushes a final `data:` line that arrived
+            // without a blank-line terminator, so a trailing `message_stop`
+            // event isn't lost (which would falsely look like a cut stream).
+            let (events, at_eof) = match bytes.next().await {
+                Some(chunk) => {
+                    decoder.push(&chunk.context("reading stream chunk")?);
+                    (decoder.drain(), false)
+                }
+                None => (decoder.finish(), true),
+            };
+            for sse_ev in events {
+                let data = &sse_ev.data;
+                if data.is_empty() { continue; }
                 let ev: Value = serde_json::from_str(data)
                     .with_context(|| format!("decoding stream event: {data}"))?;
                 if let Some(out) = map_event(
@@ -330,6 +341,7 @@ pub(crate) async fn chat_stream(
                     yield out;
                 }
             }
+            if at_eof { break; }
         }
         // Emit all accumulated thinking blocks (thinking+signature pairs and
         // redacted blocks) as one synthetic chunk, ordered by their stream index,

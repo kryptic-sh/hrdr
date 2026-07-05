@@ -731,3 +731,107 @@ async fn timestamps_slash_command_updates_state() {
     );
     assert!(!h.app.running);
 }
+
+// ---------------------------------------------------------------------------
+// Scroll-offset preservation (Task 27 regression guard)
+// ---------------------------------------------------------------------------
+
+/// `TurnMsg::System` (async out-of-band line, e.g. a late `/models` result)
+/// must NOT reset `scroll_offset` when the user has scrolled up.  When already
+/// following (offset == 0) the value must remain 0 (still following).
+#[tokio::test]
+async fn system_msg_preserves_scroll_when_scrolled_up() {
+    let mut h = Harness::new(vec![]).await;
+
+    // Simulate the user having scrolled up.
+    h.app.scroll_offset = 10;
+    h.app
+        .on_turn_msg(TurnMsg::System("async /models result".to_string()));
+    assert_eq!(
+        h.app.scroll_offset, 10,
+        "TurnMsg::System reset scroll_offset while user was scrolled up"
+    );
+
+    // While following (offset == 0) the value must stay 0.
+    h.app.scroll_offset = 0;
+    h.app
+        .on_turn_msg(TurnMsg::System("another notice".to_string()));
+    assert_eq!(
+        h.app.scroll_offset, 0,
+        "TurnMsg::System changed scroll_offset while user was following"
+    );
+}
+
+/// `TurnMsg::Diff` (async diff block from `/diff`) must not yank the scroll
+/// position when the user is scrolled up.
+#[tokio::test]
+async fn diff_msg_preserves_scroll_when_scrolled_up() {
+    let mut h = Harness::new(vec![]).await;
+
+    h.app.scroll_offset = 5;
+    h.app.on_turn_msg(TurnMsg::Diff(
+        "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new".to_string(),
+    ));
+    assert_eq!(
+        h.app.scroll_offset, 5,
+        "TurnMsg::Diff reset scroll_offset while user was scrolled up"
+    );
+
+    h.app.scroll_offset = 0;
+    h.app.on_turn_msg(TurnMsg::Diff(
+        "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new".to_string(),
+    ));
+    assert_eq!(
+        h.app.scroll_offset, 0,
+        "TurnMsg::Diff changed scroll_offset while user was following"
+    );
+}
+
+/// `AgentEvent::Notice` (MCP warning, health alert, step-budget exhaustion,
+/// etc.) must not reset the scroll position when the user is scrolled up.
+#[tokio::test]
+async fn notice_event_preserves_scroll_when_scrolled_up() {
+    use hrdr_agent::AgentEvent;
+
+    let mut h = Harness::new(vec![]).await;
+
+    h.app.scroll_offset = 7;
+    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Notice(
+        "tool-round limit reached".to_string(),
+    )));
+    assert_eq!(
+        h.app.scroll_offset, 7,
+        "AgentEvent::Notice reset scroll_offset while user was scrolled up"
+    );
+
+    h.app.scroll_offset = 0;
+    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Notice(
+        "health warning".to_string(),
+    )));
+    assert_eq!(
+        h.app.scroll_offset, 0,
+        "AgentEvent::Notice changed scroll_offset while user was following"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transcript scroll clamp (render-driven)
+// ---------------------------------------------------------------------------
+
+/// After a render pass, `scroll_offset` must be clamped to `max_scroll` (the
+/// actual content height minus the viewport height).  Setting an absurdly large
+/// offset and then rendering must bring it back in range.
+#[tokio::test]
+async fn scroll_offset_clamped_to_max_scroll_after_render() {
+    let mut h = Harness::new(vec![MockReply::Text("hello world".to_string())]).await;
+    h.submit("hi").await;
+    // An unreachably large scroll offset.
+    h.app.scroll_offset = usize::MAX / 2;
+    h.render(); // drives draw(), which clamps scroll_offset to max_scroll
+    assert!(
+        h.app.scroll_offset <= h.app.max_scroll,
+        "scroll_offset {} exceeds max_scroll {} after render",
+        h.app.scroll_offset,
+        h.app.max_scroll
+    );
+}

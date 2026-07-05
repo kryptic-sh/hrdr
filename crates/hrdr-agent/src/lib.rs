@@ -190,6 +190,13 @@ fn spawn_background(
         }
     });
     if let Ok(mut v) = handles.lock() {
+        // Best-effort reaping: drop handles for tasks that have already
+        // finished. A finished task's result is already recorded in the
+        // registry, so dropping the JoinHandle is safe. This keeps the Vec
+        // bounded over a long session without requiring an explicit drain.
+        // Note: this is best-effort — a panicked task is also considered
+        // finished (is_finished returns true) and is reaped here.
+        v.retain(|(_, h)| !h.is_finished());
         v.push((id, handle));
     }
     format!(
@@ -565,11 +572,13 @@ pub struct AgentConfig {
     pub prompt_cache_ttl: Option<String>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
-    /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
-    /// `0` (or any value outside that range) disables it. Default
-    /// [`DEFAULT_AUTO_COMPACT`]. The value now gates on/off only; the *trigger
-    /// point* is set by [`compaction_reserved`](Self::compaction_reserved).
-    pub auto_compact: f64,
+    /// Whether auto-compaction is enabled. Default [`DEFAULT_AUTO_COMPACT`].
+    /// The *trigger point* is set by
+    /// [`compaction_reserved`](Self::compaction_reserved), not here — this is a
+    /// plain on/off toggle. For backward compatibility the config parser still
+    /// accepts the old fractional spelling (`auto_compact = 0.85`): any number
+    /// `> 0` reads as `true`, `0` as `false`.
+    pub auto_compact: bool,
     /// Token buffer reserved below the context window: auto-compaction fires when
     /// usage reaches `context_window − compaction_reserved` (opencode's reserved
     /// model). Default [`DEFAULT_COMPACTION_RESERVED`].
@@ -859,9 +868,9 @@ other file or run mutating commands.
   create it if absent, update it if it exists.
 - Return a short summary plus the path you wrote — the parent agent executes it.";
 
-/// Default auto-compaction trigger: 85% of the context window (leaves headroom
-/// so the next turn doesn't overflow).
-pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
+/// Auto-compaction on by default. The *trigger point* is set by
+/// [`AgentConfig::compaction_reserved`], not by this toggle.
+pub const DEFAULT_AUTO_COMPACT: bool = true;
 
 /// Default token buffer reserved below the context window before auto-compaction
 /// fires — compaction triggers once usage reaches `context_window − reserved`,
@@ -1218,7 +1227,8 @@ struct FileConfig {
     #[serde(default)]
     subagent: Vec<SubagentProfile>,
     effort: Option<String>,
-    auto_compact: Option<f64>,
+    #[serde(default, deserialize_with = "de_bool_or_num")]
+    auto_compact: Option<bool>,
     compaction_reserved: Option<u32>,
     auto_prune: Option<bool>,
     checkpoints: Option<String>,
@@ -1420,6 +1430,33 @@ pub fn parse_env_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// Parse a toggle that historically accepted a fraction (`auto_compact = 0.85`)
+/// and now reads as a bool: the standard bool spellings, or any number where
+/// `> 0` means enabled. Returns `None` for anything unrecognized.
+pub fn parse_toggle_or_num(v: &str) -> Option<bool> {
+    parse_env_bool(v).or_else(|| v.trim().parse::<f64>().ok().map(|n| n > 0.0))
+}
+
+/// Deserialize a config toggle that may be spelled as a bool (`true`) or, for
+/// backward compatibility, as the old fractional number (`0.85` → `true`,
+/// `0` → `false`). Used for `auto_compact`.
+fn de_bool_or_num<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrNum {
+        Bool(bool),
+        Num(f64),
+    }
+    Ok(Option::<BoolOrNum>::deserialize(d)?.map(|v| match v {
+        BoolOrNum::Bool(b) => b,
+        BoolOrNum::Num(n) => n > 0.0,
+    }))
+}
+
 /// Applies an env var's string value to the config.
 type EnvSetter = fn(&mut AgentConfig, String);
 
@@ -1437,8 +1474,8 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
         }
     }),
     ("HRDR_AUTO_COMPACT", |c, v| {
-        if let Ok(f) = v.parse() {
-            c.auto_compact = f;
+        if let Some(b) = parse_toggle_or_num(&v) {
+            c.auto_compact = b;
         }
     }),
     ("HRDR_COMPACTION_RESERVED", |c, v| {
@@ -2221,10 +2258,17 @@ impl Agent {
     }
 
     /// Number of background sub-agent tasks currently tracked (running or
-    /// completed but not yet reaped by the OS — a handle is not removed from
-    /// the list until the next `clear` / `abort_background_tasks`).
+    /// recently finished but not yet reaped). Finished handles are reaped
+    /// lazily here and in [`spawn_background`], so the count reflects live
+    /// tasks after the reap.
     pub fn bg_handle_count(&self) -> usize {
-        self.bg_handles.lock().map(|v| v.len()).unwrap_or(0)
+        if let Ok(mut v) = self.bg_handles.lock() {
+            // Best-effort reaping (see spawn_background).
+            v.retain(|(_, h)| !h.is_finished());
+            v.len()
+        } else {
+            0
+        }
     }
 
     /// Forget which files the model has "seen": once the transcript no longer
@@ -2494,7 +2538,7 @@ impl Agent {
     /// Run one no-tools request to completion, returning the streamed text.
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
     async fn plain_completion(&self, req: Vec<ChatMessage>) -> Result<String> {
-        let mut stream = self.client.chat_stream(req, vec![]).await?;
+        let mut stream = self.client.chat_stream(&req, &[]).await?;
         let acc = drain_stream(&mut stream, &mut |_| {}).await?;
         Ok(acc.into_message().content.unwrap_or_default())
     }
@@ -2864,11 +2908,7 @@ impl Agent {
         const MAX_RETRIES: usize = 4;
         let mut attempt = 0usize;
         loop {
-            match self
-                .client
-                .chat_stream(self.messages.clone(), defs.to_vec())
-                .await
-            {
+            match self.client.chat_stream(&self.messages, defs).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     // Context overflow → compact once, then retry.
@@ -4083,23 +4123,29 @@ mod tests {
 
     #[test]
     fn env_setter_numeric_ignores_bad_value() {
-        // HRDR_AUTO_COMPACT with a non-numeric string must leave the value.
+        // HRDR_AUTO_COMPACT with an unrecognized string must leave the value.
         let setter = find_setter("HRDR_AUTO_COMPACT");
         let mut cfg = AgentConfig::default();
         let original = cfg.auto_compact;
         setter(&mut cfg, "notanumber".to_string());
-        assert!(
-            (cfg.auto_compact - original).abs() < f64::EPSILON,
-            "bad numeric value should be ignored"
-        );
+        assert_eq!(cfg.auto_compact, original, "bad value should be ignored");
     }
 
     #[test]
-    fn env_setter_auto_compact_numeric() {
+    fn env_setter_auto_compact_accepts_bool_and_legacy_numeric() {
         let setter = find_setter("HRDR_AUTO_COMPACT");
         let mut cfg = AgentConfig::default();
+        // Legacy fractional spelling: any number > 0 enables.
         setter(&mut cfg, "0.5".to_string());
-        assert!((cfg.auto_compact - 0.5).abs() < f64::EPSILON);
+        assert!(cfg.auto_compact);
+        // Legacy `0` disables.
+        setter(&mut cfg, "0".to_string());
+        assert!(!cfg.auto_compact);
+        // Plain bool spellings.
+        setter(&mut cfg, "true".to_string());
+        assert!(cfg.auto_compact);
+        setter(&mut cfg, "off".to_string());
+        assert!(!cfg.auto_compact);
     }
 
     // ---- apply_file ----
@@ -4127,7 +4173,7 @@ mod tests {
             subagent_model: Some("claude-sonnet-4-6".to_string()),
             subagent: vec![],
             effort: Some("high".to_string()),
-            auto_compact: Some(0.7),
+            auto_compact: Some(true),
             compaction_reserved: Some(12_345),
             auto_prune: Some(false),
             checkpoints: Some("on".to_string()),
@@ -4170,7 +4216,7 @@ mod tests {
         );
         assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
-        assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
+        assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
         assert!(!cfg.auto_prune);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
@@ -4681,4 +4727,427 @@ mod tests {
         // Consecutive separators collapse to a single dash.
         assert_eq!(cwd_slug("a//b"), "a-b");
     }
+
+    // ---- bg_handle_count reaping ----
+
+    #[test]
+    fn bg_handle_count_reaps_finished_handles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cfg = AgentConfig {
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            let agent = Agent::new(cfg).unwrap();
+            // Inject a handle that finishes immediately.
+            {
+                let h = tokio::spawn(async {});
+                if let Ok(mut v) = agent.bg_handles.lock() {
+                    v.push((99, h));
+                }
+            }
+            // Let the spawned task finish.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // bg_handle_count must reap the finished handle and return 0.
+            assert_eq!(
+                agent.bg_handle_count(),
+                0,
+                "bg_handle_count must reap finished handles"
+            );
+        });
+    }
+
+    // ── Mock-server integration tests ─────────────────────────────────────────
+    //
+    // A minimal in-process HTTP server (tokio TcpListener) serves pre-canned
+    // SSE chat-completion responses, driving Agent::run end-to-end without any
+    // real network.
+
+    mod mock_server {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        use super::super::{Agent, AgentConfig, AgentEvent, steering_queue};
+
+        // ── helpers ──────────────────────────────────────────────────────────
+
+        /// A pre-canned HTTP response to serve for one request.
+        enum MockResp {
+            /// An SSE stream: each string is emitted as `data: <s>\n\n`.
+            Sse(Vec<String>),
+            /// A plain HTTP error status (no body).
+            HttpError(u16),
+        }
+
+        impl MockResp {
+            fn into_bytes(self) -> Vec<u8> {
+                match self {
+                    MockResp::Sse(lines) => {
+                        let mut body = String::new();
+                        for line in &lines {
+                            body.push_str(&format!("data: {line}\n\n"));
+                        }
+                        format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/event-stream\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}"
+                        )
+                        .into_bytes()
+                    }
+                    MockResp::HttpError(status) => format!(
+                        "HTTP/1.1 {status} Error\r\n\
+                         Content-Length: 0\r\n\
+                         Connection: close\r\n\
+                         \r\n"
+                    )
+                    .into_bytes(),
+                }
+            }
+        }
+
+        /// Minimal in-process HTTP server. Serves responses from the queue in
+        /// order, one per accepted connection.
+        struct MockServer {
+            port: u16,
+            _handle: tokio::task::JoinHandle<()>,
+        }
+
+        impl MockServer {
+            async fn start(responses: Vec<MockResp>) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(
+                    responses.into_iter().map(MockResp::into_bytes).collect(),
+                ));
+                let handle = tokio::spawn(async move {
+                    loop {
+                        let Ok((mut stream, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let queue = queue.clone();
+                        tokio::spawn(async move {
+                            // Read request headers (up to \r\n\r\n).
+                            let mut buf = Vec::new();
+                            let mut tmp = [0u8; 4096];
+                            let headers_end = loop {
+                                match stream.read(&mut tmp).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => {
+                                        buf.extend_from_slice(&tmp[..n]);
+                                        if let Some(p) =
+                                            buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                        {
+                                            break p + 4;
+                                        }
+                                    }
+                                }
+                            };
+                            // Consume body (Content-Length bytes).
+                            let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
+                            let content_len: usize = hdrs
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            let body_so_far = buf.len().saturating_sub(headers_end);
+                            let remaining = content_len.saturating_sub(body_so_far);
+                            if remaining > 0 {
+                                let mut body_buf = vec![0u8; remaining];
+                                let _ = stream.read_exact(&mut body_buf).await;
+                            }
+                            // Send the next queued response.
+                            if let Some(resp_bytes) = queue.lock().await.pop_front() {
+                                let _ = stream.write_all(&resp_bytes).await;
+                            }
+                        });
+                    }
+                });
+                MockServer {
+                    port,
+                    _handle: handle,
+                }
+            }
+
+            fn base_url(&self) -> String {
+                format!("http://127.0.0.1:{}/v1", self.port)
+            }
+        }
+
+        /// Build a minimal `ChatCompletionChunk` SSE line with assistant text.
+        fn text_chunk(id: &str, text: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": null}]
+            }))
+            .unwrap()
+        }
+
+        /// Build a stop chunk (finish_reason = "stop").
+        fn stop_chunk(id: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }))
+            .unwrap()
+        }
+
+        /// Build a tool-call start chunk: creates a tool call slot.
+        fn tool_start_chunk(id: &str, call_id: &str, name: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                    "function": {"name": name, "arguments": ""}}]
+                }, "finish_reason": null}]
+            }))
+            .unwrap()
+        }
+
+        /// Build a tool-call arguments delta chunk.
+        fn tool_args_chunk(id: &str, args_json: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "function": {"arguments": args_json}}]
+                }, "finish_reason": null}]
+            }))
+            .unwrap()
+        }
+
+        /// Build a tool-calls finish chunk.
+        fn tool_calls_stop_chunk(id: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }))
+            .unwrap()
+        }
+
+        /// Minimal agent config pointing at `base_url`, with checkpoints and
+        /// subagents disabled for test isolation.
+        fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
+            AgentConfig {
+                base_url,
+                model: "test-model".to_string(),
+                cwd: cwd.to_path_buf(),
+                checkpoints: Some("off".to_string()),
+                subagents: false,
+                memory: false,
+                auto_prune: false,
+                ..Default::default()
+            }
+        }
+
+        // ── (a) plain text turn ───────────────────────────────────────────────
+
+        /// Agent::run against a mock server that returns a plain text response.
+        /// Asserts that Text events carry the expected content and TurnDone fires.
+        #[tokio::test]
+        async fn agent_run_plain_text_turn() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "Hello from mock"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("hi", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Hello from mock");
+
+            assert!(
+                events.iter().any(|e| matches!(e, AgentEvent::TurnDone)),
+                "TurnDone must fire"
+            );
+        }
+
+        // ── (b) tool call then final answer ───────────────────────────────────
+
+        /// Agent::run: mock server emits a tool_call for `read`, agent executes
+        /// it, second request returns the final answer.  Asserts ToolStart,
+        /// ToolEnd, and final Text events.
+        #[tokio::test]
+        async fn agent_run_tool_call_then_final_answer() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let file_path = test_file.to_string_lossy().to_string();
+
+            // args_json is a JSON-encoded string for `function.arguments`.
+            let args_json = serde_json::to_string(&json!({"path": file_path})).unwrap();
+
+            let server = MockServer::start(vec![
+                // Request 1: tool call for `read`.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_abc", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Request 2: final answer after the tool result.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Done"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "read")),
+                "ToolStart(read) must fire"
+            );
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::ToolEnd { name, ok: true, .. } if name == "read")
+                ),
+                "ToolEnd(read, ok=true) must fire"
+            );
+            let final_text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                final_text.contains("Done"),
+                "final answer text must contain 'Done', got: {final_text:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        // ── (c) 429 then 200 retry ────────────────────────────────────────────
+
+        /// Agent::run: first request returns 429 (transient), agent retries
+        /// with backoff (≈0.5s), second request succeeds.  Asserts a Notice
+        /// event for the retry and a final Text event for the answer.
+        #[tokio::test]
+        async fn agent_run_429_then_200_retry() {
+            let server = MockServer::start(vec![
+                // Request 1: 429 → transient → retry.
+                MockResp::HttpError(429),
+                // Request 2: success.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "Retry succeeded"),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("hello", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // A Notice about the retry must have fired.
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("retrying"))),
+                "Notice about retry must fire"
+            );
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains("Retry succeeded"));
+        }
+
+        // ── incomplete stream (truncated without [DONE]) ──────────────────────
+
+        /// A stream that closes without the `[DONE]` sentinel emits a transient
+        /// ChatError, which the agent retries.  This test checks that the retry
+        /// loop fires (Notice) and ultimately succeeds.
+        #[tokio::test]
+        async fn agent_run_incomplete_stream_then_retry() {
+            // First response: SSE stream closes mid-flight (no [DONE]).
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    text_chunk("c1", "partial..."),
+                    // Intentionally omit the [DONE] sentinel — the SSE
+                    // decoder detects the missing sentinel and yields a
+                    // transient ChatError, triggering a retry.
+                ]),
+                // Second response: complete stream.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Complete answer"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("hello", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // The agent retried after the incomplete stream.
+            let has_retry_notice = events.iter().any(|e| match e {
+                AgentEvent::Notice(n) => n.contains("retrying") || n.contains("interrupted"),
+                _ => false,
+            });
+            assert!(
+                has_retry_notice,
+                "retry Notice must fire after truncated stream"
+            );
+
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains("Complete answer"));
+        }
+    } // mod mock_server
 }

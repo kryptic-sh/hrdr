@@ -402,7 +402,7 @@ fn app_view(
     // triggers at this fraction of the context window (0 disables).
     let compacting: RwSignal<bool> = create_rw_signal(false);
     // Signal so `/reload` + hot-reload pick up config edits (the TUI does).
-    let auto_compact_ratio = create_rw_signal(cfg.auto_compact);
+    let auto_compact_enabled = create_rw_signal(cfg.auto_compact);
     let compaction_reserved = create_rw_signal(cfg.compaction_reserved);
     // Streamed tokens this turn (the per-turn stats line's token count/rate).
     let out_tokens: RwSignal<usize> = create_rw_signal(0);
@@ -719,10 +719,7 @@ fn app_view(
                         usage.get_untracked().map(|(p, _)| p),
                         ctx_window.get_untracked(),
                         compaction_reserved.get_untracked(),
-                        {
-                            let r = auto_compact_ratio.get_untracked();
-                            r > 0.0 && r <= 1.0
-                        },
+                        auto_compact_enabled.get_untracked(),
                     )
                 {
                     system(
@@ -769,7 +766,7 @@ fn app_view(
                     todo_ttl,
                     bell,
                     effort,
-                    auto_compact_ratio,
+                    auto_compact_enabled,
                     compaction_reserved,
                 );
                 system(transcript, next_id, line);
@@ -883,7 +880,7 @@ fn app_view(
             todo_completed_at: todo_stamps_for_send.clone(),
             expand_all,
             bell,
-            auto_compact_ratio,
+            auto_compact_enabled,
             compaction_reserved,
             find_query,
             find_pos,
@@ -1378,10 +1375,7 @@ fn app_view(
             tokens_out: session_out.get(),
             ctx_used: usage.get().map(|(p, _)| p as usize).unwrap_or(0),
             context_window: ctx_window.get(),
-            auto_compact_enabled: {
-                let r = auto_compact_ratio.get();
-                r > 0.0 && r <= 1.0
-            },
+            auto_compact_enabled: auto_compact_enabled.get(),
             compaction_reserved: compaction_reserved.get(),
             model: &model_name,
             effort: effort_label.as_deref(),
@@ -1813,7 +1807,7 @@ struct GuiHost {
     todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>>,
     expand_all: RwSignal<bool>,
     bell: RwSignal<bool>,
-    auto_compact_ratio: RwSignal<f64>,
+    auto_compact_enabled: RwSignal<bool>,
     compaction_reserved: RwSignal<u32>,
     find_query: RwSignal<Option<String>>,
     find_pos: RwSignal<usize>,
@@ -2160,7 +2154,7 @@ impl hrdr_app::CommandHost for GuiHost {
             self.todo_ttl,
             self.bell,
             self.effort,
-            self.auto_compact_ratio,
+            self.auto_compact_enabled,
             self.compaction_reserved,
         );
         self.config_mtime_seen.set(hrdr_app::config_mtime());
@@ -2392,7 +2386,7 @@ fn apply_config_reload(
     todo_ttl: RwSignal<u64>,
     bell: RwSignal<bool>,
     effort: RwSignal<Option<String>>,
-    auto_compact_ratio: RwSignal<f64>,
+    auto_compact_enabled: RwSignal<bool>,
     compaction_reserved: RwSignal<u32>,
 ) -> String {
     match AgentConfig::load_checked() {
@@ -2408,7 +2402,7 @@ fn apply_config_reload(
                 bell,
             );
             effort.set(cfg.effort.clone());
-            auto_compact_ratio.set(cfg.auto_compact);
+            auto_compact_enabled.set(cfg.auto_compact);
             compaction_reserved.set(cfg.compaction_reserved);
             if let (Some(t), Ok(mut a)) = (cfg.temperature, agent.try_lock()) {
                 a.set_temperature(Some(t));
@@ -2533,4 +2527,49 @@ fn status_run_style(
         s = s.font_bold();
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Pure-logic unit tests (framework-free — no floem views or signals)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::CompRow;
+
+    /// `CompRow::key()` drives the dyn_stack's stable identity for completion
+    /// rows.  A wrong key causes the dropdown to flicker or duplicate rows on
+    /// every keystroke.
+    #[test]
+    fn comp_row_key_slash() {
+        let row = CompRow::Slash {
+            name: "help",
+            desc: "show available commands",
+        };
+        assert_eq!(row.key(), "/help");
+    }
+
+    #[test]
+    fn comp_row_key_file() {
+        let row = CompRow::File {
+            start: 1,
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(row.key(), "@src/main.rs");
+    }
+
+    /// Keys must be distinct between variant types (a slash `/foo` and a file
+    /// path `foo` must not produce the same key).
+    #[test]
+    fn comp_row_keys_are_distinct_across_variants() {
+        let slash = CompRow::Slash {
+            name: "foo",
+            desc: "",
+        };
+        let file = CompRow::File {
+            start: 0,
+            path: "foo".to_string(),
+        };
+        assert_ne!(slash.key(), file.key());
+    }
 }

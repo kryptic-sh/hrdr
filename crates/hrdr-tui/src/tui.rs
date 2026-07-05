@@ -65,9 +65,24 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
 }
 
 /// Hand the input buffer to `$EDITOR`/`$VISUAL`, then read it back.
+///
+/// The draft is written to a randomly-named temporary file created by
+/// [`tempfile::Builder`], which gives it 0600 permissions on Unix so other
+/// local users cannot read prompt content that may include pasted secrets.
+/// The unpredictable name also prevents symlink-planting attacks that a
+/// guessable `hrdr-input-<pid>.md` path would allow.  The `.md` suffix is
+/// preserved so editors detect markdown for syntax highlighting.
 fn open_in_editor(app: &mut App, terminal: &mut Tui) -> Result<()> {
-    let path = std::env::temp_dir().join(format!("hrdr-input-{}.md", std::process::id()));
-    std::fs::write(&path, app.editor.content())?;
+    // Random name, 0600 perms (tempfile's platform default), `.md` extension.
+    let mut named = tempfile::Builder::new()
+        .prefix("hrdr-input-")
+        .suffix(".md")
+        .tempfile()?;
+    // Write the draft through the already-open fd before the editor opens it.
+    use std::io::Write as _;
+    named.write_all(app.editor.content().as_bytes())?;
+    named.flush()?;
+    let path = named.path().to_path_buf();
 
     suspend_terminal(terminal)?;
     let status = run_editor(&path);
@@ -81,7 +96,8 @@ fn open_in_editor(app: &mut App, terminal: &mut Tui) -> Result<()> {
         let text = text.strip_suffix('\n').unwrap_or(&text);
         app.editor.set_content(text);
     }
-    let _ = std::fs::remove_file(&path);
+    // `named` drop closes the fd and deletes the temp file.
+    drop(named);
     Ok(())
 }
 

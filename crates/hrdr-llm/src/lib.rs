@@ -6,9 +6,11 @@
 
 mod anthropic;
 mod client;
+pub mod sse;
 mod types;
 
 pub use client::{ChatError, ChatErrorKind, ChatStream, Client};
+pub use sse::{SseDecoder, SseEvent};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
     FunctionDef, RequestParams, Role, ToolCall, ToolDef, Usage, apply_cache_breakpoints,

@@ -22,6 +22,5 @@ crossterm.workspace = true
 ratatui.workspace = true
 hjkl-icons.workspace = true
 chrono.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+

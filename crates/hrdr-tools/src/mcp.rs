@@ -36,6 +36,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot, watch};
 
+use hrdr_llm::SseDecoder;
+
 use crate::{Tool, ToolContext, truncate};
 
 /// MCP protocol version we advertise. Servers negotiate down if needed; the
@@ -217,17 +219,19 @@ impl McpClient {
             let pending = pending.clone();
             tokio::spawn(async move {
                 let mut stream = resp.bytes_stream();
-                let mut buf = String::new();
+                // Use the shared SseDecoder for byte-safe incremental parsing:
+                // raw bytes are fed directly (no lossy UTF-8 conversion), and
+                // the decoder handles chunk boundaries including mid-codepoint
+                // splits via per-line buffering.
+                let mut decoder = SseDecoder::new();
                 while let Some(Ok(chunk)) = stream.next().await {
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = buf.find("\n\n") {
-                        let block: String = buf.drain(..pos + 2).collect();
-                        let (event, data) = parse_sse_block(&block);
-                        if event.as_deref() == Some("endpoint") {
-                            if let Ok(u) = base.join(data.trim()) {
+                    decoder.push(&chunk);
+                    for ev in decoder.drain() {
+                        if ev.event.as_deref() == Some("endpoint") {
+                            if let Ok(u) = base.join(ev.data.trim()) {
                                 let _ = ep_tx.send(Some(u.to_string()));
                             }
-                        } else if let Ok(msg) = serde_json::from_str::<Value>(&data)
+                        } else if let Ok(msg) = serde_json::from_str::<Value>(&ev.data)
                             && let Some(id) = msg.get("id").and_then(Value::as_u64)
                             && let Some(tx) = pending.lock().await.remove(&id)
                         {
@@ -687,23 +691,6 @@ fn build_headers(headers: &[(String, String)]) -> Result<HeaderMap> {
     Ok(map)
 }
 
-/// Parse one SSE event block into its `(event, data)` — `data:` lines joined.
-fn parse_sse_block(block: &str) -> (Option<String>, String) {
-    let mut event = None;
-    let mut data = String::new();
-    for line in block.lines() {
-        if let Some(rest) = line.strip_prefix("event:") {
-            event = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-    }
-    (event, data)
-}
-
 /// Build a POST request with the MCP headers + session id.
 fn http_post(t: &HttpTransport, body: &Value) -> reqwest::RequestBuilder {
     let mut req = t
@@ -719,32 +706,23 @@ fn http_post(t: &HttpTransport, body: &Value) -> reqwest::RequestBuilder {
     req
 }
 
-/// Find the JSON-RPC message with `id` in an SSE stream body. Each event's
-/// `data:` payload is one JSON-RPC message.
+/// Find the JSON-RPC message with `id` in an SSE stream body.
+///
+/// Uses [`SseDecoder`] for correct blank-line-terminated event grouping and
+/// multi-line `data:` folding (mirrors the Streamable-HTTP inline SSE path).
+/// A trailing `\n\n` is pushed after the body to flush any event that was not
+/// terminated in the buffer (some servers omit the final blank line).
 fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
-    let mut data = String::new();
-    let check = |data: &str| -> Option<Value> {
-        serde_json::from_str::<Value>(data)
-            .ok()
-            .filter(|v| v.get("id").and_then(Value::as_u64) == Some(id))
-    };
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        } else if line.is_empty() && !data.is_empty() {
-            if let Some(v) = check(&data) {
-                return Ok(v);
-            }
-            data.clear();
+    let mut dec = SseDecoder::new();
+    dec.push(body.as_bytes());
+    // Force-flush a trailing event that isn't blank-line-terminated.
+    dec.push(b"\n\n");
+    for ev in dec.drain() {
+        if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+            && v.get("id").and_then(Value::as_u64) == Some(id)
+        {
+            return Ok(v);
         }
-    }
-    if !data.is_empty()
-        && let Some(v) = check(&data)
-    {
-        return Ok(v);
     }
     bail!("no response for request {id} in the SSE stream")
 }

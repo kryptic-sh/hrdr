@@ -585,7 +585,7 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
         tokens_out: app.session_out,
         ctx_used: app.last_usage.map(|(p, _)| p as usize).unwrap_or(0),
         context_window: app.context_window,
-        auto_compact_enabled: app.auto_compact_ratio > 0.0 && app.auto_compact_ratio <= 1.0,
+        auto_compact_enabled: app.auto_compact_enabled,
         compaction_reserved: app.compaction_reserved,
         model: &app.model,
         effort: app.effort.as_deref(),

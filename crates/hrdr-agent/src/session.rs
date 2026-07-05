@@ -232,3 +232,121 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     out.sort_by_key(|m| std::cmp::Reverse(m.updated));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sanitize_name ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_name_lowercases_and_slugifies() {
+        assert_eq!(sanitize_name("Hello World"), "hello-world");
+        assert_eq!(sanitize_name("  UPPER  "), "upper");
+        assert_eq!(sanitize_name("foo/bar.baz"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn sanitize_name_fallback_on_empty() {
+        assert_eq!(sanitize_name(""), "session");
+        assert_eq!(sanitize_name("!!!"), "session");
+    }
+
+    #[test]
+    fn sanitize_name_caps_at_48_chars() {
+        let long = "a".repeat(100);
+        let result = sanitize_name(&long);
+        assert!(result.len() <= 48, "sanitized name must be ≤48 chars");
+    }
+
+    // ── unique_session_id ─────────────────────────────────────────────────────
+
+    #[test]
+    fn unique_session_id_returns_plain_slug_when_dir_absent() {
+        // A cwd whose session directory doesn't exist → the first call returns
+        // the plain slug without any suffix.
+        let id = unique_session_id("/nonexistent/hrdr/test/path/12345", "my session");
+        assert_eq!(id, "my-session");
+    }
+
+    #[test]
+    fn unique_session_id_appends_suffix_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        // No file yet → plain slug returned.
+        assert_eq!(unique_session_id(cwd, "chat"), "chat");
+
+        // Create the first session file to simulate a collision.
+        let sess = Session::new("chat", "model", "http://x/v1", cwd, vec![]);
+        sess.save("chat").unwrap();
+
+        // Next call: "chat.json" exists → returns "chat-2".
+        assert_eq!(unique_session_id(cwd, "chat"), "chat-2");
+    }
+
+    // ── resolve_session ───────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_session_returns_none_for_unknown_id() {
+        assert!(resolve_session("/nonexistent/path/xyz", "no-such-session").is_none());
+    }
+
+    #[test]
+    fn resolve_session_exact_id_in_current_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let sess = Session::new("My Chat", "model", "http://x/v1", cwd, vec![]);
+        sess.save("my-chat").unwrap();
+
+        let (id, s) = resolve_session(cwd, "my-chat").unwrap();
+        assert_eq!(id, "my-chat");
+        assert_eq!(s.name, "My Chat");
+        assert_eq!(s.cwd, cwd);
+    }
+
+    #[test]
+    fn resolve_session_case_insensitive_display_name_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        // Save with id "work" but display name "Work Session".
+        let sess = Session::new("Work Session", "model", "http://x/v1", cwd, vec![]);
+        sess.save("work").unwrap();
+
+        // Searching by display name (case-insensitive) should find it.
+        let result = resolve_session(cwd, "WORK SESSION");
+        assert!(result.is_some(), "case-insensitive name match must work");
+        let (id, s) = result.unwrap();
+        assert_eq!(id, "work");
+        assert_eq!(s.name, "Work Session");
+    }
+
+    #[test]
+    fn resolve_session_current_cwd_preferred_over_other_cwd() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let cwd_a = tmp_a.path().to_str().unwrap();
+        let cwd_b = tmp_b.path().to_str().unwrap();
+
+        // Session "alpha" exists in both cwd_a (exact id) and cwd_b (same id).
+        Session::new("Alpha A", "m", "http://x/v1", cwd_a, vec![])
+            .save("alpha")
+            .unwrap();
+        Session::new("Alpha B", "m", "http://x/v1", cwd_b, vec![])
+            .save("alpha")
+            .unwrap();
+
+        // resolve_session from cwd_a: exact id match in the current cwd wins.
+        let (_, s) = resolve_session(cwd_a, "alpha").unwrap();
+        assert_eq!(
+            s.name, "Alpha A",
+            "current-cwd exact match takes precedence"
+        );
+
+        // resolve_session from cwd_b: its own "alpha" wins.
+        let (_, s) = resolve_session(cwd_b, "alpha").unwrap();
+        assert_eq!(s.name, "Alpha B");
+    }
+}

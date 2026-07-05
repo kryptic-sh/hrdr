@@ -958,23 +958,34 @@ impl Tool for FindTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: FindArgs = serde_json::from_value(args).context("invalid find args")?;
-        // Escape the cwd prefix: only the user's pattern is glob syntax. A cwd
-        // containing `[`, `*`, or `?` must match literally.
-        let cwd_escaped = glob::Pattern::escape(&ctx.cwd.to_string_lossy());
-        let pat = std::path::Path::new(&cwd_escaped)
-            .join(&a.pattern)
-            .to_string_lossy()
-            .to_string();
-        let mut paths: Vec<String> = glob::glob(&pat)
-            .with_context(|| format!("invalid glob pattern: {pat}"))?
-            .filter_map(|r| r.ok())
-            .map(|p| {
-                p.strip_prefix(&ctx.cwd)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
+        // Compile the glob pattern once; validated eagerly for a clear error.
+        let pat = glob::Pattern::new(&a.pattern)
+            .with_context(|| format!("invalid glob pattern: {}", a.pattern))?;
+
+        // Walk with `ignore::WalkBuilder` so `.gitignore` / `.ignore` rules are
+        // honoured and build artifacts (`target/`, `node_modules/`, …) are skipped
+        // automatically. Hidden `.git/` is also excluded by the default
+        // `hidden(true)` flag — the same walker that `grep_builtin` uses.
+        let mut paths: Vec<String> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&ctx.cwd)
+            .max_depth(Some(20))
+            .hidden(true)
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path);
+            // Match both the bare filename and the full relative path so that
+            // simple patterns like `*.rs` work without a leading `**/`, while
+            // patterns like `src/**/*.rs` still match across directory depth.
+            let name = path.file_name().map(|n| n.to_string_lossy());
+            let hit = name.as_deref().is_some_and(|n| pat.matches(n)) || pat.matches_path(rel);
+            if hit {
+                paths.push(rel.to_string_lossy().to_string());
+            }
+        }
         paths.sort();
         if paths.is_empty() {
             return Ok("(no matches)".to_string());
@@ -1736,6 +1747,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "(no matches)");
+    }
+
+    /// `find` must skip files inside a `.gitignore`-listed directory (e.g.
+    /// `target/`) while still returning files in non-ignored directories.
+    /// A minimal `.git/` directory is created so the `ignore` crate can anchor
+    /// the repository root and apply the `.gitignore` rules.
+    #[tokio::test]
+    async fn find_skips_gitignored_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // A minimal .git directory so the `ignore` crate recognises the repo
+        // root and applies `.gitignore` rules (it needs the git root anchor).
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        // A `.gitignore` that excludes `target/`.
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        // File inside the gitignored dir — must NOT appear in results.
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/ignored.rs"), "").unwrap();
+        // Normal file that should appear.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = FindTool
+            .execute(serde_json::json!({"pattern": "**/*.rs"}), &c)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("main.rs"),
+            "normal file missing from find results: {out}"
+        );
+        assert!(
+            !out.contains("ignored.rs"),
+            "gitignored file should not appear in find results: {out}"
+        );
     }
 
     // ---- todo ----

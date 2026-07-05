@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
+use crate::sse::SseDecoder;
 use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 
 /// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
@@ -316,12 +317,7 @@ impl Client {
         self.api_key = api_key;
     }
 
-    fn request(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Vec<ToolDef>,
-        stream: bool,
-    ) -> ChatRequest {
+    fn request(&self, messages: &[ChatMessage], tools: &[ToolDef], stream: bool) -> ChatRequest {
         // OpenAI reasoning models want `max_completion_tokens`, not `max_tokens`.
         let (max_tokens, max_completion_tokens) = match self.params.max_tokens {
             Some(n) if uses_max_completion_tokens(&self.model) => (None, Some(n)),
@@ -329,8 +325,8 @@ impl Client {
         };
         ChatRequest {
             model: self.model.clone(),
-            messages,
-            tools,
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
             temperature: self.temperature,
             reasoning_effort: self.effort.as_deref().and_then(crate::normalize_effort),
             max_tokens,
@@ -385,10 +381,14 @@ impl Client {
     /// Streaming completion. Yields decoded chunks as they arrive. Dispatches to
     /// the native Anthropic Messages API or the OpenAI chat-completions shape
     /// based on the detected [`Backend`].
+    ///
+    /// Takes slices to avoid cloning the full history on every retry. The
+    /// request body is serialized before any network I/O, so the borrow does
+    /// not extend into the returned [`ChatStream`] future.
     pub async fn chat_stream(
         &self,
-        messages: Vec<ChatMessage>,
-        tools: Vec<ToolDef>,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
     ) -> Result<ChatStream> {
         if self.backend == Backend::Anthropic {
             let (body, stream) = crate::anthropic::chat_stream(
@@ -450,23 +450,25 @@ impl Client {
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            // Buffer raw bytes and only decode complete lines: a multibyte
-            // codepoint split across network chunks must not be decoded lossily
-            // mid-sequence (0x0A never occurs inside a UTF-8 sequence, so
-            // splitting on it is safe).
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.context("reading stream chunk")?;
-                buf.extend_from_slice(&chunk);
-                // SSE frames are separated by a blank line; events are `data: ...`.
-                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=nl).collect();
-                    let line = String::from_utf8_lossy(&line[..nl]);
-                    let line = line.trim_end_matches('\r');
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let data = data.trim();
+            // Feed raw byte chunks into the SSE decoder, which buffers per-line
+            // and yields complete events on blank-line terminators.  Splitting
+            // on 0x0A is safe for UTF-8: the byte never appears inside a
+            // multi-byte sequence, so a codepoint split across chunks is
+            // buffered whole and decoded only when its line is complete.
+            let mut decoder = SseDecoder::new();
+            loop {
+                // On EOF, `finish()` flushes a final `data:` line that had no
+                // blank-line terminator (lenient servers end with `data: [DONE]\n`
+                // rather than a spec `\n\n`), so the sentinel isn't lost.
+                let (events, at_eof) = match bytes.next().await {
+                    Some(chunk) => {
+                        decoder.push(&chunk.context("reading stream chunk")?);
+                        (decoder.drain(), false)
+                    }
+                    None => (decoder.finish(), true),
+                };
+                for ev in events {
+                    let data = ev.data.trim();
                     if data.is_empty() {
                         continue;
                     }
@@ -477,6 +479,9 @@ impl Client {
                     let parsed: ChatChunk = serde_json::from_str(data)
                         .with_context(|| format!("decoding stream event: {data}"))?;
                     yield parsed;
+                }
+                if at_eof {
+                    break;
                 }
             }
             // Reaching here means the byte stream closed without the [DONE]
@@ -616,7 +621,7 @@ mod tests {
             max_tokens: Some(1000),
             ..Default::default()
         });
-        let r = c.request(vec![], vec![], false);
+        let r = c.request(&[], &[], false);
         assert_eq!(r.max_tokens, None);
         assert_eq!(r.max_completion_tokens, Some(1000));
 
@@ -626,7 +631,7 @@ mod tests {
             max_tokens: Some(1000),
             ..Default::default()
         });
-        let r = c.request(vec![], vec![], false);
+        let r = c.request(&[], &[], false);
         assert_eq!(r.max_tokens, Some(1000));
         assert_eq!(r.max_completion_tokens, None);
     }
