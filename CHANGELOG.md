@@ -11,11 +11,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Persistent memory (`memory` tool).** The agent can save durable notes that
   survive across sessions, in two scopes — **project** (per working directory)
   and **global** (all projects). Storage is plain Markdown under the XDG data
-  dir (`~/.local/share/hrdr/memory/`): a `MEMORY.md` index plus topic files,
-  OKF-flavored (greppable, git-diffable, fail-open). The bounded index (≤200
-  lines / 25 KB per scope, like Claude Code) auto-loads into the system prompt
-  each session and re-loads after `/clear` and compaction, so memory survives
-  context resets; topic files are read on demand via `read`/`grep`. Tool actions
+  dir (`~/.local/share/hrdr/memory/`): an index — `MEMORY.md` (Claude Code
+  style) or `index.md` (OKF style), both recognized so memory copied from either
+  ecosystem loads without renaming — plus topic files, greppable and
+  git-diffable. The bounded index (≤200 lines / 25 KB per scope, like Claude
+  Code) auto-loads into the system prompt each session and re-loads after
+  `/clear` and compaction, so memory survives context resets; topic files are
+  read on demand via `read`/`grep`. Tool actions
   `view`/`write`/`append`/`delete` are confined to the memory store (path
   -traversal guarded). Disable with `memory = false` / `$HRDR_MEMORY=0`.
   Distinct from `AGENTS.md`, which stays the human-authored, read-only

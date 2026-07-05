@@ -1472,11 +1472,24 @@ fn append_persona(mut system: String, persona: Option<&str>) -> String {
     system
 }
 
-/// The most of a memory index (`MEMORY.md`) loaded into the prompt each session,
-/// in lines / bytes — the rest is left on disk for on-demand `read`/`grep`
-/// (matching Claude Code's ~200-line / 25 KB budget).
+/// The most of a memory index loaded into the prompt each session, in lines /
+/// bytes — the rest is left on disk for on-demand `read`/`grep` (matching Claude
+/// Code's ~200-line / 25 KB budget).
 const MEMORY_INDEX_MAX_LINES: usize = 200;
 const MEMORY_INDEX_MAX_BYTES: usize = 25_600;
+
+/// Recognized index filenames, in preference order: `MEMORY.md` (Claude Code
+/// style, and hrdr's default) then `index.md` (OKF style). Supporting both means
+/// memory copied from either ecosystem loads without renaming.
+const MEMORY_INDEX_NAMES: &[&str] = &["MEMORY.md", "index.md"];
+
+/// The existing index file in `root` (first recognized name that's a file).
+fn memory_index_file(root: &std::path::Path) -> Option<PathBuf> {
+    MEMORY_INDEX_NAMES
+        .iter()
+        .map(|n| root.join(n))
+        .find(|p| p.is_file())
+}
 
 /// Storage roots for agent memory: `(project, global)` — project scoped by cwd,
 /// global shared across projects. `None` when no XDG data dir is resolvable.
@@ -1487,16 +1500,18 @@ fn memory_dirs(cwd: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
     Some((project, global))
 }
 
-/// Read a memory index (`<root>/MEMORY.md`), bounded to the prompt budget.
-/// `None` when it's missing or empty.
-fn read_memory_index(root: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(root.join("MEMORY.md")).ok()?;
+/// Read a scope's memory index (`MEMORY.md` or `index.md`), bounded to the
+/// prompt budget. Returns the resolved file path + bounded text; `None` when
+/// there's no index or it's empty.
+fn read_memory_index(root: &std::path::Path) -> Option<(PathBuf, String)> {
+    let file = memory_index_file(root)?;
+    let text = std::fs::read_to_string(&file).ok()?;
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
     if text.len() <= MEMORY_INDEX_MAX_BYTES && text.lines().count() <= MEMORY_INDEX_MAX_LINES {
-        return Some(text.to_string());
+        return Some((file, text.to_string()));
     }
     let mut out = String::new();
     for line in text.lines().take(MEMORY_INDEX_MAX_LINES) {
@@ -1507,10 +1522,10 @@ fn read_memory_index(root: &std::path::Path) -> Option<String> {
         out.push('\n');
     }
     out.push_str(&format!(
-        "… (truncated — read the full index at {}/MEMORY.md)",
-        root.display()
+        "… (truncated — read the full index at {})",
+        file.display()
     ));
-    Some(out)
+    Some((file, out))
 }
 
 /// Assemble the memory block for the system prompt from the two scopes' indexes
@@ -1522,19 +1537,15 @@ fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> Option<
         return None;
     }
     let mut out = String::new();
-    if let Some(g) = g {
+    if let Some((path, content)) = g {
         out.push_str(&format!(
-            "## Global — {}/MEMORY.md\n\n{}\n\n",
-            global.display(),
-            g
+            "## Global — {}\n\n{}\n\n",
+            path.display(),
+            content
         ));
     }
-    if let Some(p) = p {
-        out.push_str(&format!(
-            "## Project — {}/MEMORY.md\n\n{}\n",
-            project.display(),
-            p
-        ));
+    if let Some((path, content)) = p {
+        out.push_str(&format!("## Project — {}\n\n{}\n", path.display(), content));
     }
     Some(out)
 }
@@ -2959,7 +2970,14 @@ mod tests {
         assert!(mem.find("Global").unwrap() < mem.find("Project").unwrap());
         // A huge index is bounded, with a pointer to read the rest.
         std::fs::write(proj.join("MEMORY.md"), "line\n".repeat(10_000)).unwrap();
-        assert!(read_memory_index(&proj).unwrap().contains("truncated"));
+        assert!(read_memory_index(&proj).unwrap().1.contains("truncated"));
+        // OKF-style `index.md` is recognized too (copy from either ecosystem).
+        std::fs::remove_file(proj.join("MEMORY.md")).unwrap();
+        std::fs::remove_file(glob.join("MEMORY.md")).unwrap();
+        std::fs::write(glob.join("index.md"), "- okf global fact").unwrap();
+        std::fs::write(proj.join("index.md"), "- okf project fact").unwrap();
+        let mem = gather_memory(&proj, &glob).unwrap();
+        assert!(mem.contains("okf global fact") && mem.contains("okf project fact"));
     }
 
     #[test]

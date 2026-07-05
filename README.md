@@ -533,13 +533,15 @@ gotchas — so it doesn't re-derive them next time. Two scopes:
 - **global** — shared across all projects (e.g. personal preferences).
 
 Storage is plain Markdown under the XDG data dir (`~/.local/share/hrdr/memory/`)
-— a `MEMORY.md` **index** plus topic files, OKF-flavored: greppable,
-git-diffable, human-editable. At session start the bounded `MEMORY.md` index
-(≤200 lines / 25 KB, like Claude Code) is loaded into the prompt for each scope;
-the agent reads topic files on demand with `read`/`grep`, and the index re-loads
-after `/clear` and `/compact` so memory survives context resets. The tool
-actions are `view` (list a scope, or read a file), `write`, `append`, and
-`delete`; writes are confined to the memory store.
+— an **index** (`MEMORY.md`, or OKF-style `index.md`) plus topic files,
+greppable, git-diffable, human-editable. Both index names are recognized, so
+memory copied from Claude Code (`MEMORY.md`) or an OKF bundle (`index.md`) loads
+without renaming. At session start the bounded index (≤200 lines / 25 KB, like
+Claude Code) is loaded into the prompt for each scope; the agent reads topic
+files on demand with `read`/`grep`, and the index re-loads after `/clear` and
+`/compact` so memory survives context resets. The tool actions are `view` (list
+a scope, or read a file), `write`, `append`, and `delete`; writes are confined
+to the memory store.
 
 Disable with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is distinct
 from `AGENTS.md`, which stays the human-authored, read-only project

@@ -42,8 +42,9 @@ impl Tool for MemoryTool {
          conventions, decisions and their rationale, the user's stable preferences, where \
          things live, gotchas — so you don't re-derive them next time. Two scopes: `project` \
          (this repo, default) and `global` (all projects, e.g. personal preferences). Keep \
-         `MEMORY.md` as a short index and put detail in topic files (e.g. `auth.md`); it's \
-         loaded into your context at session start. Actions: `view` (no path = list the scope; \
+         a short index — `MEMORY.md` (or `index.md`) — and put detail in topic files (e.g. \
+         `auth.md`); the index is loaded into your context at session start. Actions: `view` \
+         (no path = list the scope; \
          with path = read a file), `write` (create/overwrite), `append` (add to a file, \
          creating it if needed), `delete`. Save only durable, reusable facts — not transient \
          task state. Prune entries that become wrong."
@@ -191,9 +192,9 @@ fn list_scope(scope: &str, root: &Path) -> String {
     if files.is_empty() {
         return format!("(no {scope} memory yet — save some with `memory` write/append)");
     }
-    // MEMORY.md first, then alphabetical.
+    // The index (MEMORY.md / index.md) first, then alphabetical.
     files.sort_by(|a, b| {
-        let key = |n: &str| (n != "MEMORY.md", n.to_string());
+        let key = |n: &str| (!matches!(n, "MEMORY.md" | "index.md"), n.to_string());
         key(&a.0).cmp(&key(&b.0))
     });
     let mut out = format!("{scope} memory ({}):\n", root.display());
