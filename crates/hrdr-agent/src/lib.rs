@@ -4,9 +4,12 @@
 //! complete: stream a turn, execute any requested tools, feed the results back,
 //! repeat. Emits [`AgentEvent`]s for a UI (or stdout) to render live.
 
+mod agents_dir;
 mod auth;
 mod prompt;
 mod session;
+
+pub use agents_dir::discover_agent_profiles;
 
 pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token};
 pub use session::{
@@ -1432,18 +1435,24 @@ impl Agent {
         let mut tools = ToolRegistry::with_defaults();
         // Expose the `task` delegation tool unless disabled (or this *is* a
         // sub-agent). Registered before the system prompt is rendered so it's
-        // listed for the model. The built-in `explore`/`review` read-only agents
-        // are always offered; a user `[[subagent]]` of the same name overrides.
+        // listed for the model. Profiles are layered by precedence, each source
+        // overriding a same-named agent from the one before it:
+        //   built-ins  <  discovered files (.claude/.opencode/.hrdr)  <  config.
         if config.subagents {
-            let mut profiles = builtin_subagent_profiles();
-            for up in config.subagent_profiles.clone() {
-                match profiles
+            let overlay =
+                |profiles: &mut Vec<SubagentProfile>, incoming: SubagentProfile| match profiles
                     .iter_mut()
-                    .find(|p| p.name.eq_ignore_ascii_case(&up.name))
+                    .find(|p| p.name.eq_ignore_ascii_case(&incoming.name))
                 {
-                    Some(slot) => *slot = up,
-                    None => profiles.push(up),
-                }
+                    Some(slot) => *slot = incoming,
+                    None => profiles.push(incoming),
+                };
+            let mut profiles = builtin_subagent_profiles();
+            for p in discover_agent_profiles(&config.cwd) {
+                overlay(&mut profiles, p);
+            }
+            for up in config.subagent_profiles.clone() {
+                overlay(&mut profiles, up);
             }
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),

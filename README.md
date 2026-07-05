@@ -475,6 +475,38 @@ Sub-agents can't themselves delegate (recursion is bounded to one level) and
 don't spawn MCP servers. Their file edits aren't captured by the parent's
 `/revert` yet — use git.
 
+#### Agents as files
+
+Beyond inline `[[subagent]]` config, hrdr discovers agents from **Markdown
+files** — one agent per file, the body is its system prompt, the frontmatter
+carries the fields above (`description`, `model`, `provider`, `read_only`,
+`tools`, `write_ext`, `temperature`, `effort`, `max_steps`; the `name` defaults
+to the filename). It reads both the **Claude Code** and **opencode** locations
+so existing agents work as-is:
+
+| Scope   | hrdr                     | Claude Code         | opencode                    |
+| ------- | ------------------------ | ------------------- | --------------------------- |
+| project | `.hrdr/agents/`          | `.claude/agents/`   | `.opencode/agent/`          |
+| user    | `~/.config/hrdr/agents/` | `~/.claude/agents/` | `~/.config/opencode/agent/` |
+
+```markdown
+---
+name: security-reviewer
+description: Reviews changes for auth/injection/secret bugs
+read_only: true
+effort: high
+---
+
+You are a security reviewer. Focus on authn, injection, and secrets…
+```
+
+The same agent found in more than one location is **registered once**: the first
+match in precedence order wins — project before user, and `hrdr` → `claude` →
+`opencode` within a scope. Overall precedence is `[[subagent]]` config > project
+files > user files > built-ins, so any layer overrides a same-named agent from
+the one below it. (opencode's boolean `tools:` map is ignored — only an
+allow-list `tools` is honored.)
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —

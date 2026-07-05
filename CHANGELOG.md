@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Agents as discoverable files.** hrdr now loads sub-agent definitions from
+  Markdown files (frontmatter + body-as-system-prompt), reading both the Claude
+  Code and opencode locations plus its own: project `.hrdr/agents/`,
+  `.claude/agents/`, `.opencode/agent/` and the matching user dirs
+  (`~/.config/hrdr/agents/`, `~/.claude/agents/`, `~/.config/opencode/agent/`).
+  Frontmatter maps to the profile fields (name/description/model/provider/
+  read_only/tools/write_ext/temperature/effort/max_steps, with
+  `maxTurns`/`steps` and `reasoningEffort` aliases). The same agent found in
+  multiple locations is **registered once** (first in precedence order wins:
+  project before user, hrdr → claude → opencode); overall precedence is
+  `[[subagent]]` config > project files > user files > built-ins. No new
+  dependencies — a small frontmatter parser, opencode's boolean `tools:` map is
+  ignored.
 - **Per-agent runtime knobs.** `[[subagent]]` profiles gained `temperature`,
   `effort` (`minimal`/`low`/`medium`/`high`), and `max_steps` (tool-call
   iteration cap) — each inheriting the main agent's value when omitted. Lets a
