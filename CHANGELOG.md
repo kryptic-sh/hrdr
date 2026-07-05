@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Live sub-agent panel (TUI).** While `task` sub-agents run (including several
+  in parallel), a panel lists each one with its live streaming output.
+  Collapsed, a sub-agent shows the tail of its output (a header + last few
+  lines); click it to expand the full log, click again to collapse. Finished
+  sub-agents drop from the panel (their result lands in the transcript). The
+  sub-agent now also streams its answer text to the panel, not just
+  tool-activity markers.
 - **Worktree isolation for sub-agents.** A profile with `isolation = "worktree"`
   runs its sub-agent in a fresh git worktree on a scratch branch off `HEAD`, so
   its edits don't touch the working tree. If the sub-agent made no changes the

@@ -386,8 +386,11 @@ result (its tool activity streams live). A concise summary comes back inline; a
 large report is instead **saved to a file** and the parent gets a preview + a
 pointer to `read`/`grep` it — so it doesn't flood the main context. Issuing
 several `task` calls in one turn runs the sub-agents **in parallel** — e.g.
-explore several areas of the codebase at once — each streaming into its own tool
-block.
+explore several areas of the codebase at once. While they run, the TUI shows a
+**live sub-agent panel**: each running sub-agent streams its output there,
+collapsed to the tail (a header + last few lines); **click a sub-agent to expand
+its full log** (click again to collapse). Finished sub-agents drop from the
+panel and their result lands in the transcript.
 
 Four **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:

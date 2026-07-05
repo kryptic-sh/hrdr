@@ -344,8 +344,13 @@ impl hrdr_tools::Tool for SubagentTool {
         let steering = steering_queue();
         let run = sub
             .run(prompt, steering, |ev| match ev {
-                AgentEvent::Text(t) => output.push_str(&t),
-                AgentEvent::ToolStart { name, .. } => ctx.emit(format!("  · {name}\n")),
+                // Stream the sub-agent's answer text to the parent's live output
+                // (the frontend's sub-agent panel) as well as accumulating it.
+                AgentEvent::Text(t) => {
+                    output.push_str(&t);
+                    ctx.emit(t);
+                }
+                AgentEvent::ToolStart { name, .. } => ctx.emit(format!("\n· {name}")),
                 _ => {}
             })
             .await;

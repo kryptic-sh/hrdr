@@ -22,6 +22,32 @@ const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
+/// Tail lines shown per collapsed sub-agent in the sub-agent panel.
+const SUBAGENT_TAIL_LINES: usize = 4;
+/// Max content rows the sub-agent panel occupies (plus 2 for borders); beyond
+/// this the panel scrolls its content off the top (newest at the bottom).
+const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
+
+/// Content rows one sub-agent occupies: a header line plus its body (all lines
+/// when expanded, else the last [`SUBAGENT_TAIL_LINES`]).
+fn subagent_item_rows(sa: &crate::app::SubAgent) -> usize {
+    let rest = sa.log.lines().count().saturating_sub(1);
+    let body = if sa.expanded {
+        rest
+    } else {
+        rest.min(SUBAGENT_TAIL_LINES)
+    };
+    1 + body
+}
+
+/// Outer height (with borders) of the sub-agent panel; 0 when none are running.
+fn subagent_panel_height(app: &App) -> u16 {
+    if app.subagents.is_empty() {
+        return 0;
+    }
+    let content: usize = app.subagents.iter().map(subagent_item_rows).sum();
+    (content as u16).min(SUBAGENT_PANEL_MAX_ROWS) + 2
+}
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -45,8 +71,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
         + 2;
 
+    let subagent_height = subagent_panel_height(app);
+
     // Build the row stack dynamically, remembering each section's index.
     let mut constraints = vec![Constraint::Min(3)];
+    let subagent_idx = (subagent_height > 0).then(|| {
+        constraints.push(Constraint::Length(subagent_height));
+        constraints.len() - 1
+    });
     let todo_idx = (todo_height > 0).then(|| {
         constraints.push(Constraint::Length(todo_height));
         constraints.len() - 1
@@ -74,6 +106,11 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical(constraints).split(area);
 
     draw_transcript(f, app, chunks[0]);
+    if let Some(i) = subagent_idx {
+        draw_subagents(f, app, chunks[i]);
+    } else {
+        app.subagent_hits.clear();
+    }
     if let Some(i) = todo_idx {
         draw_todos(f, app, chunks[i]);
     }
@@ -282,6 +319,65 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The live sub-agent panel: one block per running `task`, each showing a header
+/// (its `↳ task …` line) plus the tail of its output (collapsed) or the whole
+/// log (expanded). A left click on a row toggles that agent's expansion; the
+/// clickable rects are recorded in `app.subagent_hits`.
+fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect) {
+    let (accent, dim) = (app.theme.accent, app.theme.dim);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" sub-agents ({}) ", app.subagents.len()))
+        .border_style(Style::default().fg(dim));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<(crate::app::HitRect, usize)> = Vec::new();
+    for (i, sa) in app.subagents.iter().enumerate() {
+        let start = lines.len();
+        let header = sa
+            .log
+            .lines()
+            .next()
+            .unwrap_or("sub-agent starting…")
+            .trim();
+        let indicator = if sa.expanded { "▾" } else { "▸" };
+        lines.push(Line::from(Span::styled(
+            format!("{indicator} {header}"),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )));
+        let rest: Vec<&str> = sa.log.lines().skip(1).collect();
+        let shown = if sa.expanded {
+            &rest[..]
+        } else {
+            &rest[rest.len().saturating_sub(SUBAGENT_TAIL_LINES)..]
+        };
+        for l in shown {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", l.trim_end()),
+                Style::default().fg(dim),
+            )));
+        }
+        // Clickable region for this item (only while it's within the viewport).
+        let rows = (lines.len() - start) as u16;
+        if (start as u16) < inner.height {
+            let h = rows.min(inner.height - start as u16);
+            hits.push((
+                crate::app::HitRect {
+                    x: inner.x,
+                    y: inner.y + start as u16,
+                    w: inner.width,
+                    h,
+                },
+                i,
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    app.subagent_hits = hits;
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1039,4 +1135,30 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,
     )
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::{SUBAGENT_TAIL_LINES, subagent_item_rows};
+    use crate::app::SubAgent;
+
+    fn sa(log: &str, expanded: bool) -> SubAgent {
+        SubAgent {
+            id: "1".to_string(),
+            log: log.to_string(),
+            expanded,
+        }
+    }
+
+    #[test]
+    fn item_rows_collapsed_caps_the_tail_expanded_shows_all() {
+        // header + 6 body lines
+        let log = "↳ task: x\na\nb\nc\nd\ne\nf";
+        // Collapsed = header + last SUBAGENT_TAIL_LINES.
+        assert_eq!(subagent_item_rows(&sa(log, false)), 1 + SUBAGENT_TAIL_LINES);
+        // Expanded = header + all 6.
+        assert_eq!(subagent_item_rows(&sa(log, true)), 1 + 6);
+        // A just-started agent (no output yet) is one header row.
+        assert_eq!(subagent_item_rows(&sa("", false)), 1);
+    }
 }

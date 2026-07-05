@@ -65,6 +65,18 @@ impl HitRect {
     }
 }
 
+/// A running `task` sub-agent, shown live in the sub-agent panel until it
+/// finishes. `log` is the full streamed progress/output (the panel shows the
+/// tail collapsed, all of it expanded).
+pub(crate) struct SubAgent {
+    /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id).
+    pub id: String,
+    /// Accumulated live output (starts with the `↳ task (model): label` header).
+    pub log: String,
+    /// Whether the panel shows this agent's full log (toggled by a click).
+    pub expanded: bool,
+}
+
 // The transcript item model + its representation-independent queries
 // (search/count/export) live in the shared `hrdr-app` core.
 pub(crate) use hrdr_app::Entry;
@@ -198,6 +210,12 @@ pub(crate) struct App {
     /// set during draw. A left click toggles that tool's `expanded` (like a
     /// per-entry `/expand`).
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
+    /// Running `task` sub-agents, shown live in the sub-agent panel (removed on
+    /// completion). Populated from the `task` tool's `ToolOutput` stream.
+    pub(crate) subagents: Vec<SubAgent>,
+    /// Clickable screen rects for each sub-agent panel row → its `subagents`
+    /// index; a left click toggles that agent's `expanded`.
+    pub(crate) subagent_hits: Vec<(HitRect, usize)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -326,6 +344,8 @@ impl App {
             queue: VecDeque::new(),
             follow_button: None,
             tool_hits: Vec::new(),
+            subagents: Vec::new(),
+            subagent_hits: Vec::new(),
             quit_armed: false,
             turn_started: None,
             turn_started_at: None,
@@ -586,6 +606,17 @@ impl App {
                     && rect.contains(m.column, m.row)
                 {
                     self.scroll_offset = 0;
+                    return;
+                }
+                // Click a sub-agent panel row to expand/collapse its live output.
+                if let Some(idx) = self
+                    .subagent_hits
+                    .iter()
+                    .find(|(r, _)| r.contains(m.column, m.row))
+                    .map(|(_, i)| *i)
+                    && let Some(sa) = self.subagents.get_mut(idx)
+                {
+                    sa.expanded = !sa.expanded;
                     return;
                 }
                 // Click a tool block to toggle its full output (per-entry /expand).
@@ -910,6 +941,9 @@ impl App {
                 }
                 self.turn_handle = None;
                 self.running = false;
+                // The turn is over — clear any sub-agents still in the live panel
+                // (an interrupted turn may not have delivered their ToolEnd).
+                self.subagents.clear();
                 if let Some(e) = err {
                     self.push_entry(Entry::System(format!("[error] {e}")));
                 }
@@ -1038,6 +1072,14 @@ impl App {
                 self.session_out += completion_tokens as usize;
             }
             AgentEvent::ToolStart { id, name, args } => {
+                // A `task` call opens a live entry in the sub-agent panel.
+                if name == "task" {
+                    self.subagents.push(SubAgent {
+                        id: id.clone(),
+                        log: String::new(),
+                        expanded: false,
+                    });
+                }
                 self.push_entry(Entry::Tool {
                     id,
                     name,
@@ -1064,6 +1106,11 @@ impl App {
                         break;
                     }
                 }
+                // Mirror into the sub-agent panel's live log (the full stream,
+                // which the transcript discards at ToolEnd).
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.id == id) {
+                    sa.log.push_str(&chunk);
+                }
             }
             AgentEvent::ToolEnd {
                 id,
@@ -1088,6 +1135,9 @@ impl App {
                         break;
                     }
                 }
+                // The sub-agent finished — its result is now in the transcript;
+                // drop it from the live panel.
+                self.subagents.retain(|s| s.id != id);
             }
             AgentEvent::Notice(text) => {
                 self.push_entry(Entry::System(text));
