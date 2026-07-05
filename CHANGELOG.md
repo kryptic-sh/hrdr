@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-05
+
 ### Added
 
 - **Live sub-agent panel (TUI).** While `task` sub-agents run (including several
