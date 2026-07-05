@@ -392,11 +392,32 @@ subagent_model = "claude-sonnet-4-6"   # default for delegated sub-agents
 # subagents = false                    # disable the task tool entirely
 ```
 
-The model can also override the model per call (the `task` tool's `model`
-argument). Also `$HRDR_SUBAGENT_MODEL` / `--subagent-model`. Sub-agents can't
-themselves delegate (recursion is bounded to one level) and don't spawn MCP
-servers. Their file edits aren't captured by the parent's `/revert` yet — use
-git.
+Or on an **entirely different provider** via named `[[subagent]]` profiles —
+e.g. Opus on Anthropic manages, while implementation/exploration runs on another
+provider's model. Each profile pins a `provider` (a built-in or
+`[providers.<name>]`) + `model`; the model selects one with the `task` tool's
+`agent` argument:
+
+```toml
+[[subagent]]
+name = "implementer"
+provider = "openrouter"
+model = "moonshotai/kimi-k2"
+description = "focused implementation"
+
+[[subagent]]
+name = "explorer"
+provider = "zen"
+model = "grok-code"
+description = "read-only codebase exploration"
+```
+
+The sub-agent runs on that profile's provider (its own endpoint, key, headers,
+and Azure/Anthropic quirks). The model can also override the model per call
+(`model` argument); also `$HRDR_SUBAGENT_MODEL` / `--subagent-model` for the
+default. Sub-agents can't themselves delegate (recursion is bounded to one
+level) and don't spawn MCP servers. Their file edits aren't captured by the
+parent's `/revert` yet — use git.
 
 ### Guardrails
 

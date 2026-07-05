@@ -92,14 +92,91 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base
 }
 
+/// Build a sub-agent config for a named `[[subagent]]` profile: start from the
+/// sub-agent base, then (if the profile names a provider) repoint the endpoint,
+/// auth, headers, and `api-version` to that provider and adopt its model — so the
+/// sub-agent can run on a **different provider** than the main agent.
+fn subagent_config_for_profile(
+    base: &AgentConfig,
+    profile: &SubagentProfile,
+) -> Result<AgentConfig> {
+    let mut cfg = base.clone();
+    if let Some(pname) = profile.provider.as_deref() {
+        let p = base.resolve_provider(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "subagent '{}': unknown provider '{pname}' (built-ins: {}, or define \
+                 [providers.{pname}])",
+                profile.name,
+                BUILTIN_PROVIDERS.join(", ")
+            )
+        })?;
+        cfg.base_url = p.base_url.clone();
+        cfg.api_key = resolve_api_key(pname, &p);
+        cfg.api_version = p.api_version.clone();
+        cfg.headers = p
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        cfg.context_window = p.context_window;
+        if let Some(m) = &p.model {
+            cfg.model = m.clone();
+        }
+    }
+    if let Some(m) = &profile.model {
+        cfg.model = m.clone();
+    }
+    Ok(cfg)
+}
+
 /// The `task` tool: delegate a self-contained sub-task to a fresh sub-agent that
-/// has its own context and (optionally) a different model. The sub-agent runs to
-/// completion and its final text becomes the tool result; its tool activity is
-/// streamed to the parent as live output.
+/// has its own context and (optionally) a different model **or provider**. The
+/// sub-agent runs to completion and its final text becomes the tool result; its
+/// tool activity is streamed to the parent as live output.
 struct SubagentTool {
-    /// Base config for derived sub-agents (see [`subagent_base_config`]); cloned
-    /// and model-overridden per call.
+    /// Base config for derived sub-agents (see [`subagent_base_config`]).
     base: AgentConfig,
+    /// Named provider+model profiles selectable via the `agent` argument.
+    profiles: Vec<SubagentProfile>,
+    /// Description string (leaked once at startup — lists the configured
+    /// profiles so the model knows what it can delegate to).
+    description: &'static str,
+}
+
+impl SubagentTool {
+    fn new(base: AgentConfig, profiles: Vec<SubagentProfile>) -> Self {
+        let mut desc = String::from(
+            "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
+             (it can't see this conversation, so make `prompt` complete and standalone). Use \
+             it to keep the main context clean — broad exploration, or a focused piece of \
+             implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
+             but can't itself delegate. It runs to completion and returns its final summary. \
+             Run cheaper/faster work on a different `model`",
+        );
+        if profiles.is_empty() {
+            desc.push('.');
+        } else {
+            desc.push_str(", or on a different provider via `agent`:\n");
+            for p in &profiles {
+                let where_ = match (&p.provider, &p.model) {
+                    (Some(pr), Some(m)) => format!("{pr} · {m}"),
+                    (Some(pr), None) => pr.clone(),
+                    (None, Some(m)) => m.clone(),
+                    (None, None) => "main provider".to_string(),
+                };
+                desc.push_str(&format!("- {} ({where_})", p.name));
+                if let Some(d) = &p.description {
+                    desc.push_str(&format!(" — {d}"));
+                }
+                desc.push('\n');
+            }
+        }
+        Self {
+            base,
+            profiles,
+            description: Box::leak(desc.into_boxed_str()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -109,31 +186,35 @@ impl hrdr_tools::Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
-         (it can't see this conversation, so make `prompt` complete and standalone). Use \
-         it to keep the main context clean — broad exploration, or a focused piece of \
-         implementation — and to run cheaper/faster work on a different `model`. The \
-         sub-agent has the normal tools (read/write/edit/bash/grep/…) but can't itself \
-         delegate. It runs to completion and returns its final summary as the result."
+        self.description
     }
 
     fn parameters(&self) -> serde_json::Value {
+        let mut props = serde_json::json!({
+            "description": {
+                "type": "string",
+                "description": "A 3-6 word label for the sub-task (shown to the user)."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "The complete, standalone task for the sub-agent: what to do and exactly what to report back."
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional model override (on the selected provider). Defaults to the profile's / configured subagent model, else the main model."
+            }
+        });
+        if !self.profiles.is_empty() {
+            let names: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
+            props["agent"] = serde_json::json!({
+                "type": "string",
+                "enum": names,
+                "description": "Optional named sub-agent profile (see this tool's description) — runs on that profile's provider + model."
+            });
+        }
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "A 3-6 word label for the sub-task (shown to the user)."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The complete, standalone task for the sub-agent: what to do and exactly what to report back."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model to run the sub-agent on (must be available on the current provider). Defaults to the configured subagent model, else the main model."
-                }
-            },
+            "properties": props,
             "required": ["prompt"]
         })
     }
@@ -154,7 +235,26 @@ impl hrdr_tools::Tool for SubagentTool {
             .ok_or_else(|| anyhow::anyhow!("task needs a non-empty `prompt` argument"))?
             .to_string();
 
-        let mut cfg = self.base.clone();
+        // A named profile selects a provider + model; else the default sub-agent
+        // (main provider, `subagent_model`).
+        let mut cfg = match args.get("agent").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => {
+                let profile = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(name.trim()))
+                    .ok_or_else(|| {
+                        let known: Vec<&str> =
+                            self.profiles.iter().map(|p| p.name.as_str()).collect();
+                        anyhow::anyhow!(
+                            "unknown subagent '{name}' (configured: {})",
+                            known.join(", ")
+                        )
+                    })?;
+                subagent_config_for_profile(&self.base, profile)?
+            }
+            _ => self.base.clone(),
+        };
         cfg.cwd = ctx.cwd.clone();
         if let Some(m) = args
             .get("model")
@@ -290,6 +390,29 @@ pub struct AgentConfig {
     /// argument overrides per call. This is the "Opus drives, Sonnet implements"
     /// knob.
     pub subagent_model: Option<String>,
+    /// Named sub-agent profiles from `[[subagent]]` config, each pinning a
+    /// provider + model. The `task` tool's `agent` argument selects one, letting
+    /// a sub-agent run on a **different provider** than the main agent.
+    pub subagent_profiles: Vec<SubagentProfile>,
+}
+
+/// A named sub-agent profile (`[[subagent]]`): a provider + model the `task` tool
+/// can delegate to, so a sub-agent can run on a different provider than the main
+/// agent (e.g. Opus on Anthropic manages, a model on another provider implements).
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct SubagentProfile {
+    /// Name the model refers to (the `task` tool's `agent` argument).
+    pub name: String,
+    /// Provider preset / `[providers.<name>]` to run this sub-agent on. Omit to
+    /// use the main agent's provider (just a different model).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model for this sub-agent. Omit to use the provider's default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// One-line hint shown to the model so it can pick the right sub-agent.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -417,6 +540,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             subagent_model: None,
+            subagent_profiles: Vec::new(),
         }
     }
 }
@@ -639,6 +763,8 @@ struct FileConfig {
     prompt_cache_ttl: Option<String>,
     subagents: Option<bool>,
     subagent_model: Option<String>,
+    #[serde(default)]
+    subagent: Vec<SubagentProfile>,
     effort: Option<String>,
     auto_compact: Option<f64>,
     compaction_reserved: Option<u32>,
@@ -747,6 +873,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.subagent_model {
             self.subagent_model = Some(v);
+        }
+        if !fc.subagent.is_empty() {
+            self.subagent_profiles = fc.subagent;
         }
         if let Some(v) = fc.effort {
             self.effort = Some(v);
@@ -1088,9 +1217,10 @@ impl Agent {
         // sub-agent). Registered before the system prompt is rendered so it's
         // listed for the model.
         if config.subagents {
-            tools.register(Arc::new(SubagentTool {
-                base: subagent_base_config(&config),
-            }));
+            tools.register(Arc::new(SubagentTool::new(
+                subagent_base_config(&config),
+                config.subagent_profiles.clone(),
+            )));
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
@@ -2294,6 +2424,55 @@ mod tests {
     }
 
     #[test]
+    fn subagent_profile_repoints_to_a_different_provider() {
+        use super::{SubagentProfile, subagent_base_config, subagent_config_for_profile};
+        let cfg = AgentConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: Some("main-key".to_string()),
+            model: "claude-opus".to_string(),
+            ..Default::default()
+        };
+        let base = subagent_base_config(&cfg);
+        // A profile pinning a built-in provider repoints endpoint + model.
+        let prof = SubagentProfile {
+            name: "implementer".to_string(),
+            provider: Some("openrouter".to_string()),
+            model: Some("moonshotai/kimi-k2".to_string()),
+            description: None,
+        };
+        let sub = subagent_config_for_profile(&base, &prof).unwrap();
+        assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(sub.model, "moonshotai/kimi-k2");
+        assert!(!sub.subagents); // still can't nest
+        // No provider → stays on the main endpoint, just the profile's model.
+        let same = subagent_config_for_profile(
+            &base,
+            &SubagentProfile {
+                name: "x".to_string(),
+                provider: None,
+                model: Some("claude-haiku".to_string()),
+                description: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(same.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(same.model, "claude-haiku");
+        // Unknown provider → error.
+        assert!(
+            subagent_config_for_profile(
+                &base,
+                &SubagentProfile {
+                    name: "y".to_string(),
+                    provider: Some("nope".to_string()),
+                    model: None,
+                    description: None,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn task_tool_present_only_when_subagents_enabled() {
         let has_task = |subagents: bool| {
             let cfg = AgentConfig {
@@ -2534,6 +2713,7 @@ mod tests {
             prompt_cache_ttl: Some("1h".to_string()),
             subagents: Some(false),
             subagent_model: Some("claude-sonnet-4-6".to_string()),
+            subagent: vec![],
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
             compaction_reserved: Some(12_345),

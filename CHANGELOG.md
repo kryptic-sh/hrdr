@@ -20,6 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   becomes the tool result. Disable with `subagents = false` / `$HRDR_SUBAGENTS`.
   (Sub-agent file edits aren't captured by the parent's `/revert` yet — use
   git.)
+- **Cross-provider sub-agents (`[[subagent]]` profiles).** A sub-agent can now
+  run on an **entirely different provider** than the main agent, not just a
+  different model. Named profiles pin a `provider` (built-in or
+  `[providers.<name>]`) + `model`; the model selects one with the `task` tool's
+  `agent` argument, and the sub-agent runs on that provider's endpoint, key,
+  headers, and Azure/Anthropic quirks — e.g. Opus-on-Anthropic manages while
+  implementation runs on a model from OpenRouter/Zen. The profiles are listed in
+  the tool description so the model knows what it can delegate to.
 
 ## [0.2.6] - 2026-07-05
 
