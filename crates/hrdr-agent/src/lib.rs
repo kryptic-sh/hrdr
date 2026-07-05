@@ -4665,6 +4665,95 @@ mod tests {
         assert_eq!(stub.content.as_deref(), Some("[interrupted]"));
     }
 
+    #[test]
+    fn repair_only_targets_the_latest_tool_calling_turn() {
+        // Regression for `rposition` vs `position`: the function must repair the
+        // *most recent* dangling assistant turn, not the first one it encounters.
+        // If `rposition` were changed to `position`, the first (already-complete)
+        // turn would be found, all its results would appear answered, and the
+        // function would silently skip the second (unanswered) turn — leaving the
+        // history invalid for any strict server (OpenAI / infr reject a request
+        // where an assistant `tool_calls` message has no matching `role:"tool"`
+        // result).
+        let mut msgs = vec![
+            ChatMessage::user("first request"),
+            // First tool-calling turn: fully answered.
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", "result for a"),
+            // User continues; second tool-calling turn is left dangling.
+            ChatMessage::user("second request"),
+            assistant_with_calls(&["b"]),
+        ];
+        repair_dangling_tool_calls(&mut msgs);
+        // Exactly one stub for "b" appended; the already-answered "a" must be
+        // left strictly untouched (no second stub for it).
+        assert_eq!(msgs.len(), 6, "exactly one stub expected");
+        let stub = msgs.last().unwrap();
+        assert_eq!(stub.role, Role::Tool);
+        assert_eq!(stub.tool_call_id.as_deref(), Some("b"));
+        assert_eq!(stub.content.as_deref(), Some("[interrupted]"));
+        // Ensure "a" still has exactly its original result and no extra stub.
+        let a_results: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("a"))
+            .collect();
+        assert_eq!(
+            a_results.len(),
+            1,
+            "no duplicate stub for already-answered 'a'"
+        );
+    }
+
+    #[test]
+    fn compaction_tail_never_orphans_tool_round() {
+        // Regression: `compaction_tail_start` must always return an index that
+        // lands on a `Role::User` message so that the verbatim tail contains only
+        // well-formed turn boundaries. A tail that begins mid-tool-round (on an
+        // assistant `tool_calls` message or a `role:"tool"` result) would force
+        // strict servers to reject the next request — the results would have no
+        // corresponding `tool_calls` message inside the summarized head.
+        //
+        // History (7 messages):
+        //   0 system, 1 user/u1, 2 assistant/text, 3 user/u2,
+        //   4 assistant/tool_calls(["c"]), 5 role:tool/result("c"), 6 assistant/done
+        let msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("think…"),
+            ChatMessage::user("u2"),
+            assistant_with_calls(&["c"]),
+            ChatMessage::tool_result("c", "file contents"),
+            ChatMessage::assistant("done"),
+        ];
+        // Keep the last 1 turn (tail_turns=1, generous token budget).
+        // Turn 2 starts at index 3 (u2), so the tail must begin there —
+        // NOT at index 4 (the tool-calling assistant) or 5 (the result).
+        let tail_start = compaction_tail_start(&msgs, 1, 1_000_000);
+        assert_eq!(
+            msgs[tail_start].role,
+            Role::User,
+            "tail must begin on a User message, got {:?} at {tail_start}",
+            msgs[tail_start].role
+        );
+        // The extracted tail must contain the tool_calls and its result (full
+        // tool round), so no orphaned results exist in the head that's summarized.
+        let tail = &msgs[tail_start..];
+        let has_calls = tail
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.tool_calls.is_some());
+        let has_result = tail
+            .iter()
+            .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c"));
+        assert!(
+            has_calls,
+            "tail must include the tool-calling assistant turn"
+        );
+        assert!(has_result, "tail must include the matching tool result");
+        // Everything before the tail (the head to be summarized) must start with
+        // the system prompt at index 0 and end before the last user turn.
+        assert!(tail_start > 1, "something before the tail to summarize");
+    }
+
     // ---- estimate_tokens ----
 
     #[test]

@@ -1017,4 +1017,98 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn thinking_block_signature_survives_full_build_body_round_trip() {
+        // End-to-end regression for the Anthropic interleaved-thinking protocol.
+        //
+        // Anthropic requires that when an assistant turn contains both a `thinking`
+        // block and a `tool_use` block, the thinking block (with its opaque
+        // `signature`) appears **first** in the assistant message's `content`
+        // array on the follow-up request. If `assistant_blocks` were to reorder or
+        // drop the thinking block, the API would return a 400. This test drives
+        // the full `build_body` → `split_system_and_messages` → `assistant_blocks`
+        // path and asserts the final wire representation.
+        //
+        // Approach: construct a `ChatMessage` that already holds the accumulated
+        // `anthropic_thinking_blocks` (as the `Accumulator::into_message` would
+        // produce after a streaming turn), feed it through `build_body`, and check
+        // the serialized JSON body rather than individual helper functions.
+        use crate::types::{FunctionCall, ToolCall};
+
+        // Simulate the assistant message that the Accumulator produces after a
+        // streaming turn that emitted thinking_delta + signature_delta + tool_use.
+        let assistant_msg = crate::types::ChatMessage {
+            role: crate::types::Role::Assistant,
+            content: None,
+            reasoning_content: Some("I should call read".into()),
+            anthropic_thinking_blocks: vec![json!({
+                "type": "thinking",
+                "thinking": "I should call read",
+                "signature": "SIG_ROUND_TRIP"
+            })],
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_rt".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let tool_result = crate::types::ChatMessage::tool_result("toolu_rt", "content");
+
+        let history = vec![user("go"), assistant_msg, tool_result];
+        let body = build_body(
+            "claude-opus",
+            4096,
+            None,
+            None,
+            CacheMode::Off,
+            false,
+            &history,
+            &[],
+        );
+
+        let messages = body["messages"].as_array().expect("messages array");
+        // History (no system): user, assistant, user(tool_result) → 3 messages.
+        assert_eq!(messages.len(), 3);
+
+        // The assistant message is at index 1.
+        let asst = &messages[1];
+        assert_eq!(asst["role"], "assistant");
+        let blocks = asst["content"].as_array().expect("assistant content array");
+
+        // First block must be the thinking block with the signature intact.
+        assert_eq!(
+            blocks[0]["type"], "thinking",
+            "thinking block must be first; blocks: {blocks:?}"
+        );
+        assert_eq!(
+            blocks[0]["thinking"], "I should call read",
+            "thinking text must survive build_body"
+        );
+        assert_eq!(
+            blocks[0]["signature"], "SIG_ROUND_TRIP",
+            "signature must survive build_body unchanged"
+        );
+
+        // Second block must be the tool_use.
+        assert_eq!(
+            blocks[1]["type"], "tool_use",
+            "tool_use must follow thinking; blocks: {blocks:?}"
+        );
+        assert_eq!(blocks[1]["id"], "toolu_rt");
+        assert_eq!(blocks[1]["name"], "read");
+        assert_eq!(blocks[1]["input"]["path"], "Cargo.toml");
+
+        // anthropic_thinking_blocks must NOT appear as a top-level key in the
+        // message object (it is an internal hrdr field, not an Anthropic wire key).
+        assert!(
+            asst.get("anthropic_thinking_blocks").is_none(),
+            "anthropic_thinking_blocks must not be a top-level message key"
+        );
+    }
 }

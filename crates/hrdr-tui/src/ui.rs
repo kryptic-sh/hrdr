@@ -1390,3 +1390,201 @@ mod subagent_tests {
         assert_eq!(vis[0], Some((0, 4)));
     }
 }
+
+/// Test 5 — render-cache equivalence and invalidation.
+///
+/// `transcript_lines()` cannot be called in unit tests (requires a live `App`
+/// and a ratatui `Frame`), so these tests exercise the three pure building
+/// blocks that `transcript_lines()` is built on: `entry_content_hash`,
+/// `cache_entry`, and `cached_line_wrap`.  Each test targets a distinct
+/// failure mode:
+///
+/// * **wrong-content-served**: a warm cache hit returns different bytes than
+///   the closure that originally populated it (caught by `cache_entry_warm_hit_equals_cold_render`).
+/// * **cross-entry contamination**: entries stored under different keys
+///   collide and entry B's render is served for entry A (caught by
+///   `cache_entry_different_keys_do_not_collide`).
+/// * **stale expand state**: the user runs `/expand` but the collapsed render
+///   is returned because `expand_all` is not part of the hash (caught by
+///   `entry_content_hash_tool_expand_flag_changes_hash`).
+/// * **wrong wrap height**: the hit-test geometry for click-to-expand Tool
+///   regions miscalculates because width is dropped from the LINE_WRAP_CACHE
+///   key (caught by `cached_line_wrap_deterministic_and_width_sensitive`).
+#[cfg(test)]
+mod cache_tests {
+    use super::{
+        LINE_WRAP_CACHE, TRANSCRIPT_CACHE, cache_entry, cached_line_wrap, entry_content_hash,
+    };
+    use crate::app::Entry;
+    use ratatui::text::{Line, Span};
+
+    // ── entry_content_hash ─────────────────────────────────────────────────────
+
+    /// Entries differing only in their text content must produce different hashes.
+    ///
+    /// Regression: if `entry_content_hash` were stubbed to a constant (or the
+    /// text field were accidentally excluded from the `Hash` call), two messages
+    /// with distinct text would share a cache key.  After message A warms the
+    /// cache, message B would be rendered with A's lines — wrong text displayed.
+    #[test]
+    fn entry_content_hash_differs_by_text() {
+        let a = Entry::User("hello".to_string());
+        let b = Entry::User("world".to_string());
+        assert_ne!(
+            entry_content_hash(&a, false),
+            entry_content_hash(&b, false),
+            "User entries with different text must produce different hashes"
+        );
+
+        let c = Entry::Assistant("response one".to_string());
+        let d = Entry::Assistant("response two".to_string());
+        assert_ne!(
+            entry_content_hash(&c, false),
+            entry_content_hash(&d, false),
+            "Assistant entries with different text must produce different hashes"
+        );
+    }
+
+    /// For `Tool` entries the effective expand state `(*expanded || expand_all)`
+    /// is folded into the hash.  Changing `expand_all` must therefore invalidate
+    /// the cache key, otherwise the collapsed render (showing only a preview)
+    /// would be served to the user after they run `/expand all`.
+    #[test]
+    fn entry_content_hash_tool_expand_flag_changes_hash() {
+        let tool = Entry::Tool {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            args: "{}".to_string(),
+            result: "long output".to_string(),
+            ok: true,
+            done: true,
+            expanded: false, // not locally expanded
+        };
+
+        let h_collapsed = entry_content_hash(&tool, false);
+        let h_global_expand = entry_content_hash(&tool, true);
+        assert_ne!(
+            h_collapsed, h_global_expand,
+            "expand_all=true vs false must produce different hashes when \
+             the Tool entry itself is not locally expanded"
+        );
+
+        // If the Tool is already locally expanded, the effective state is
+        // `true` regardless of expand_all → both should hash identically.
+        let tool_local = Entry::Tool {
+            id: "t2".to_string(),
+            name: "bash".to_string(),
+            args: "{}".to_string(),
+            result: "long output".to_string(),
+            ok: true,
+            done: true,
+            expanded: true, // locally expanded → effective = true in both cases
+        };
+        assert_eq!(
+            entry_content_hash(&tool_local, false),
+            entry_content_hash(&tool_local, true),
+            "a Tool with expanded=true must hash identically for any expand_all \
+             value (effective state is always true)"
+        );
+    }
+
+    // ── cache_entry ────────────────────────────────────────────────────────────
+
+    /// A warm cache hit must return exactly the same `Vec<Line>` as the initial
+    /// cold render, and the render closure must not be called a second time.
+    ///
+    /// Regression: if `cache_entry` returned a fresh render on every call
+    /// (ignoring the stored value), the output would still be correct only if
+    /// the render function is deterministic.  Any theme-dependent colour or
+    /// incremental syntax-highlight state that differs between frames would
+    /// produce visually wrong output.  The panic inside the warm closure proves
+    /// the cache is actually consulted.
+    #[test]
+    fn cache_entry_warm_hit_equals_cold_render() {
+        TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+
+        // Use an unusual key that won't collide with other tests even if they
+        // run in the same thread (thread-locals are shared within a thread).
+        let key: (usize, u64, u16, bool, bool) = (0xffff, 0xdead_beef_cafe_0001, 80, false, false);
+        let expected = vec![Line::from(Span::raw("cold render content"))];
+
+        // Cold miss — closure must be invoked and its result stored.
+        let cold = cache_entry(key, || expected.clone());
+        assert_eq!(
+            cold, expected,
+            "cold render must return what the closure produced"
+        );
+
+        // Warm hit — the cached value must be returned; closure panics if called.
+        let warm = cache_entry(key, || {
+            panic!("closure must not be invoked on a warm cache hit")
+        });
+        assert_eq!(
+            warm, expected,
+            "warm cache hit must return the same lines as the cold render"
+        );
+    }
+
+    /// Two entries stored under different cache keys must never cross-serve:
+    /// looking up key B after key A is warm must still produce B's own content.
+    ///
+    /// Regression: a hash-map key collision (e.g. if the key were reduced to
+    /// fewer fields) would silently return A's render when B is looked up.
+    /// Users would see one transcript entry rendered with another entry's text.
+    #[test]
+    fn cache_entry_different_keys_do_not_collide() {
+        TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+
+        let key_a: (usize, u64, u16, bool, bool) = (10, 0xaaaa, 80, false, false);
+        let key_b: (usize, u64, u16, bool, bool) = (11, 0xbbbb, 80, false, false);
+
+        let lines_a = vec![Line::from(Span::raw("entry A — unique content"))];
+        let lines_b = vec![Line::from(Span::raw("entry B — unique content"))];
+
+        let r_a = cache_entry(key_a, || lines_a.clone());
+        let r_b = cache_entry(key_b, || lines_b.clone());
+
+        assert_eq!(r_a, lines_a, "key_a lookup must return lines_a");
+        assert_eq!(r_b, lines_b, "key_b lookup must return lines_b");
+        assert_ne!(
+            r_a, r_b,
+            "distinct cache keys must not serve each other's stored lines"
+        );
+    }
+
+    // ── cached_line_wrap ───────────────────────────────────────────────────────
+
+    /// `cached_line_wrap` must be deterministic (identical inputs → identical
+    /// output) and must treat different widths as distinct cache entries.
+    ///
+    /// Regression: if the `width` dimension were accidentally omitted from the
+    /// `LINE_WRAP_CACHE` key, a line measured at width=80 would be returned for
+    /// the same content at width=2.  This corrupts the cumulative-height array
+    /// used for click-to-expand tool-block hit-testing: every region below the
+    /// first miscalculated line would have a wrong vertical offset, making
+    /// clicks miss their targets.
+    #[test]
+    fn cached_line_wrap_deterministic_and_width_sensitive() {
+        LINE_WRAP_CACHE.with(|c| c.borrow_mut().clear());
+
+        // "abcd" at width=2 must wrap to 2 rows (2 chars per row);
+        // at width=80 it fits on 1 row.
+        let line: Line<'static> = Line::from(Span::raw("abcd"));
+
+        let at_2 = cached_line_wrap(&line, 2);
+        let at_2_again = cached_line_wrap(&line, 2); // warm hit — must not change
+        let at_80 = cached_line_wrap(&line, 80);
+
+        assert!(at_2 >= 1, "wrap height must be at least 1 (narrow)");
+        assert!(at_80 >= 1, "wrap height must be at least 1 (wide)");
+        assert_eq!(
+            at_2, at_2_again,
+            "same (line, width) must always return the same height (deterministic)"
+        );
+        assert!(
+            at_2 > at_80,
+            "width=2 must produce more rows than width=80 for a 4-char line \
+             (got narrow={at_2}, wide={at_80})"
+        );
+    }
+}

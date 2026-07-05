@@ -1017,6 +1017,66 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thinking_blocks_never_serialized_onto_openai_wire() {
+        // Regression for the `#[serde(default, skip_serializing)]` invariant on
+        // `anthropic_thinking_blocks`. These blocks (type/thinking/signature
+        // triples) are Anthropic-native; sending them on the OpenAI wire would
+        // either cause a 400 from strict providers or be silently ignored — but
+        // more dangerously, reasoning models degrade when prior reasoning is fed
+        // back verbatim. The field must be completely absent from the serialized
+        // JSON output even when non-empty.
+        let msg = ChatMessage {
+            role: Role::Assistant,
+            content: Some("I'll read that file.".into()),
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "The user wants me to read a file.",
+                "signature": "SIG_ABCDEF"
+            })],
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+
+        // The key must be completely absent — not null, not [], just missing.
+        assert!(
+            !json.contains("anthropic_thinking_blocks"),
+            "anthropic_thinking_blocks must not appear on the OpenAI wire: {json}"
+        );
+        // The text content must still be present.
+        assert!(
+            json.contains("I'll read that file."),
+            "content must survive serialization: {json}"
+        );
+
+        // Deserialization round-trip: if a JSON blob arrived with the field
+        // (e.g. from a compact non-streaming response), it must be accepted and
+        // stored for display — but then dropped on the next outbound serialization.
+        let parsed: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "assistant",
+                "content": "hi",
+                "anthropic_thinking_blocks": [{"type":"thinking","thinking":"x","signature":"S"}]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.anthropic_thinking_blocks.len(),
+            1,
+            "deserialization must accept and store the field"
+        );
+        // Re-serialize: blocks still dropped.
+        let re_json = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !re_json.contains("anthropic_thinking_blocks"),
+            "blocks must be dropped even after a round-trip: {re_json}"
+        );
+    }
+
+    #[test]
     fn chat_request_reasoning_effort_serialized_when_set() {
         let req = ChatRequest {
             model: "m".to_string(),

@@ -1297,4 +1297,108 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             "(no prompts)"
         );
     }
+
+    /// Test 6a — focused `tools/call` round-trip over stdio.
+    ///
+    /// The comprehensive `stdio_transport_tools_resources_prompts` test exercises
+    /// `tools/call` as part of a broader capabilities check.  This test is
+    /// intentionally narrow: it connects, discovers tools, calls *just* the
+    /// `echo` tool, and verifies the returned content exactly.
+    ///
+    /// Regression caught: any breakage in how `tools/call` requests are
+    /// formatted or how their `content[].text` values are extracted — without
+    /// requiring resources/prompts to also be working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tools_call_round_trip_over_stdio() {
+        let Some(py) = python() else {
+            eprintln!("skipping: no python interpreter");
+            return;
+        };
+        let args = vec![
+            "-u".to_string(),
+            "-c".to_string(),
+            MOCK_SERVER.to_string(),
+            "stdio".to_string(),
+        ];
+        let (_client, tools) = McpClient::connect_stdio("rt", py, &args, &[])
+            .await
+            .expect("connect + handshake + tools/list");
+        let ctx = ToolContext::new(".");
+        let echo = tools
+            .iter()
+            .find(|t| t.name() == "rt_echo")
+            .expect("echo tool must be discovered via tools/list");
+        let result = echo
+            .execute(json!({ "text": "round-trip" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            result, "echo: round-trip",
+            "tools/call must relay the server's content verbatim"
+        );
+    }
+
+    /// Test 6b — `stdio_request` removes the pending id on send failure.
+    ///
+    /// The real `stdio_request` code path (not just the `Pending` bookkeeping
+    /// invariant checked in `pending_id_removed_on_send_failure_path`) must be
+    /// exercised: insert the id → attempt to send → channel broken → remove the
+    /// id → return `Err`.
+    ///
+    /// Regression caught: if the early-return in `stdio_request` were removed
+    /// (e.g. the `if ... .is_err()` branch dropped), the id would remain in the
+    /// pending map forever.  On the *next* call the reader task would have
+    /// exited (reader clears pending on EOF), but future calls with the same id
+    /// would insert a new sender that the dead reader could never fulfill —
+    /// those callers would block until timeout.  The explicit remove-before-
+    /// return prevents this leak regardless of reader-task timing.
+    ///
+    /// Implementation note: constructing `StdioTransport` directly is possible
+    /// because `mod tests` is a child module of `mcp.rs` and can therefore
+    /// access its private fields.  The channel receiver is dropped before the
+    /// transport is used, guaranteeing `stdin_tx.send()` returns `Err`
+    /// synchronously — no timing dependency.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_request_send_error_removes_pending_id() {
+        use tokio::sync::mpsc;
+
+        // Drop the receiver immediately; every subsequent send will fail.
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
+        drop(stdin_rx);
+
+        // A trivial child satisfies the `_child: Child` field.  Its stdio is
+        // irrelevant since the send fails before anything is written.
+        let child = Command::new("sh")
+            .args(["-c", ""])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh must be available on unix");
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let t = StdioTransport {
+            stdin_tx,
+            pending: pending.clone(),
+            _child: child,
+        };
+
+        let id = 77u64;
+        let req = json!({"jsonrpc":"2.0","id": id,"method":"tools/call","params":{}});
+        let result = stdio_request(&t, id, req, Duration::from_millis(200)).await;
+
+        assert!(
+            result.is_err(),
+            "calling on a broken channel must return Err, not hang"
+        );
+        assert!(
+            pending.lock().await.is_empty(),
+            "stdio_request send-error path must remove the pending id before \
+             returning (found: {:?})",
+            pending.lock().await.keys().collect::<Vec<_>>()
+        );
+    }
 }
