@@ -462,6 +462,9 @@ prompt = "You are a security reviewer. Focus on authn, injection, and secrets…
 scopes it to the read-only tools; `write_ext` grants the read-only tools plus
 file writes limited to those extensions (e.g. `write_ext = ["md"]`, how `plan`
 is built); `tools` is an explicit allow-list that takes precedence over both.
+`isolation = "worktree"` runs the sub-agent in a fresh git worktree on a scratch
+branch — auto-removed if it made no changes, otherwise kept with a pointer to
+the branch to review and merge.
 
 A profile can also tune the sub-agent's runtime knobs, each inheriting the main
 agent's when omitted: `temperature`, `effort` (`minimal`/`low`/`medium`/`high`),

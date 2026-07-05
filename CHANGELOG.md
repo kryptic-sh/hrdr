@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Worktree isolation for sub-agents.** A profile with `isolation = "worktree"`
+  runs its sub-agent in a fresh git worktree on a scratch branch off `HEAD`, so
+  its edits don't touch the working tree. If the sub-agent made no changes the
+  worktree is torn down automatically; otherwise it's kept and the result points
+  at the branch/path to review and merge. Requires a git repo. Config
+  `[[subagent]]` and agent files take the `isolation` field.
 - **`@agent` mentions.** Typing `@name` where `name` matches a known sub-agent
   (built-in, discovered file, or config) routes that message to the agent — the
   main agent handles it by delegating via the `task` tool. Context-aware: an

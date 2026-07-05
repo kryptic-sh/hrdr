@@ -206,6 +206,9 @@ impl SubagentTool {
                         .join("/");
                     tags.push_str(&format!(" · read-only + writes {list}"));
                 }
+                if p.isolation.as_deref() == Some("worktree") {
+                    tags.push_str(" · isolated worktree");
+                }
                 let star = if p.proactive { "★ " } else { "" };
                 desc.push_str(&format!("- {star}{} ({tags})", p.name));
                 if let Some(d) = &p.description {
@@ -284,8 +287,9 @@ impl hrdr_tools::Tool for SubagentTool {
             .ok_or_else(|| anyhow::anyhow!("task needs a non-empty `prompt` argument"))?
             .to_string();
 
-        // A named profile selects a provider + model; else the default sub-agent
-        // (main provider, `subagent_model`).
+        // A named profile selects a provider + model (and may request isolation);
+        // else the default sub-agent (main provider, `subagent_model`).
+        let mut isolation: Option<String> = None;
         let mut cfg = match args.get("agent").and_then(|v| v.as_str()) {
             Some(name) if !name.trim().is_empty() => {
                 let profile = self
@@ -300,6 +304,7 @@ impl hrdr_tools::Tool for SubagentTool {
                             known.join(", ")
                         )
                     })?;
+                isolation = profile.isolation.clone();
                 config_for_agent_profile(&self.base, profile)?
             }
             _ => self.base.clone(),
@@ -312,6 +317,20 @@ impl hrdr_tools::Tool for SubagentTool {
         {
             cfg.model = m.trim().to_string();
         }
+
+        // `isolation = "worktree"`: run the sub-agent in a fresh git worktree so
+        // its edits don't touch the working tree until reviewed.
+        let worktree = match isolation.as_deref() {
+            Some("worktree") => {
+                let wt = Worktree::create(&ctx.cwd).await?;
+                cfg.cwd = wt.path.clone();
+                ctx.emit(format!("  · isolated worktree: {}\n", wt.path.display()));
+                Some(wt)
+            }
+            Some(other) => bail!("unknown isolation mode '{other}' (supported: worktree)"),
+            None => None,
+        };
+
         let model = cfg.model.clone();
         let label = args
             .get("description")
@@ -323,14 +342,24 @@ impl hrdr_tools::Tool for SubagentTool {
         let mut sub = Agent::new(cfg)?;
         let mut output = String::new();
         let steering = steering_queue();
-        sub.run(prompt, steering, |ev| match ev {
-            AgentEvent::Text(t) => output.push_str(&t),
-            AgentEvent::ToolStart { name, .. } => ctx.emit(format!("  · {name}\n")),
-            _ => {}
-        })
-        .await?;
+        let run = sub
+            .run(prompt, steering, |ev| match ev {
+                AgentEvent::Text(t) => output.push_str(&t),
+                AgentEvent::ToolStart { name, .. } => ctx.emit(format!("  · {name}\n")),
+                _ => {}
+            })
+            .await;
+        // Tear down / preserve the worktree before surfacing errors.
+        let worktree_note = match worktree {
+            Some(wt) => wt.finish().await,
+            None => None,
+        };
+        run?;
 
-        let output = output.trim();
+        let mut output = output.trim().to_string();
+        if let Some(note) = worktree_note {
+            output.push_str(&note);
+        }
         if output.is_empty() {
             return Ok("(sub-agent finished with no text output)".to_string());
         }
@@ -338,7 +367,7 @@ impl hrdr_tools::Tool for SubagentTool {
         // and the parent gets a bounded preview + a pointer to `read`/`grep` it,
         // so a big sub-agent result doesn't flood the main context.
         Ok(hrdr_tools::truncate_saved(
-            output,
+            &output,
             ctx.max_output,
             ctx.max_output_lines,
             hrdr_tools::TruncateSide::Head,
@@ -526,6 +555,11 @@ pub struct SubagentProfile {
     /// their `description`.
     #[serde(default)]
     pub proactive: bool,
+    /// Run this sub-agent in an isolated environment. `"worktree"` runs it in a
+    /// fresh git worktree on a scratch branch (auto-removed if it made no
+    /// changes; kept with a pointer otherwise). Omit for no isolation.
+    #[serde(default)]
+    pub isolation: Option<String>,
 }
 
 /// The full agent-profile set for `config`, layered by precedence — each source
@@ -575,6 +609,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: true,
+            isolation: None,
         },
         SubagentProfile {
             name: "review".to_string(),
@@ -594,6 +629,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: true,
+            isolation: None,
         },
         SubagentProfile {
             name: "plan".to_string(),
@@ -613,6 +649,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: false,
+            isolation: None,
         },
         SubagentProfile {
             name: "general".to_string(),
@@ -632,6 +669,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: false,
+            isolation: None,
         },
     ]
 }
@@ -1406,6 +1444,103 @@ pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
 /// directory (normal) or a file (worktrees/submodules).
 pub fn in_git_repo(cwd: &std::path::Path) -> bool {
     cwd.ancestors().any(|d| d.join(".git").exists())
+}
+
+/// A throwaway git worktree for an isolated sub-agent (`isolation = "worktree"`).
+/// Created on a scratch branch off the current `HEAD`; [`finish`](Self::finish)
+/// removes it if the sub-agent made no changes, else leaves it with a pointer.
+struct Worktree {
+    /// The repo the worktree belongs to (the sub-agent's original cwd).
+    repo: PathBuf,
+    /// The worktree checkout (the sub-agent's cwd while it runs).
+    path: PathBuf,
+    /// The scratch branch the worktree is on.
+    branch: String,
+}
+
+impl Worktree {
+    /// Create a worktree off `repo`'s current HEAD. Errors if `repo` isn't a git
+    /// repository (or git isn't available).
+    async fn create(repo: &std::path::Path) -> Result<Self> {
+        if !in_git_repo(repo) {
+            bail!("isolation = \"worktree\" requires a git repository");
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let branch = format!("hrdr/task-{stamp}");
+        let path = std::env::temp_dir()
+            .join("hrdr-worktrees")
+            .join(format!("wt-{stamp}"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(&branch)
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .await
+            .context("running `git worktree add`")?;
+        if !out.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+            branch,
+        })
+    }
+
+    /// After the sub-agent finishes: if the worktree is clean, remove it and its
+    /// branch and return `None`; otherwise leave it and return a note pointing at
+    /// the branch/path so the parent can review and merge.
+    async fn finish(self) -> Option<String> {
+        let git = |args: &[&std::ffi::OsStr]| {
+            let mut c = std::process::Command::new("git");
+            c.arg("-C").arg(&self.repo).args(args);
+            c.output().ok()
+        };
+        let dirty = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if dirty {
+            return Some(format!(
+                "\n\n[isolated worktree kept: the sub-agent's changes are on branch `{}` \
+                 at {} — review and merge them]",
+                self.branch,
+                self.path.display()
+            ));
+        }
+        // Clean: tear down the worktree and its branch.
+        let path = self.path.as_os_str().to_os_string();
+        git(&[
+            std::ffi::OsStr::new("worktree"),
+            std::ffi::OsStr::new("remove"),
+            std::ffi::OsStr::new("--force"),
+            &path,
+        ]);
+        git(&[
+            std::ffi::OsStr::new("branch"),
+            std::ffi::OsStr::new("-D"),
+            std::ffi::OsStr::new(&self.branch),
+        ]);
+        None
+    }
 }
 
 /// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
@@ -2927,6 +3062,7 @@ mod tests {
             effort: None,
             max_steps: None,
             proactive: false,
+            isolation: None,
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
@@ -2949,6 +3085,7 @@ mod tests {
                 effort: None,
                 max_steps: None,
                 proactive: false,
+                isolation: None,
             },
         )
         .unwrap();
@@ -2971,6 +3108,7 @@ mod tests {
                     effort: None,
                     max_steps: None,
                     proactive: false,
+                    isolation: None,
                 },
             )
             .is_err()
@@ -3145,6 +3283,7 @@ mod tests {
             effort: e.map(str::to_string),
             max_steps: s,
             proactive: false,
+            isolation: None,
         };
         // Set knobs override the inherited ones.
         let over =
@@ -3179,6 +3318,42 @@ mod tests {
         // Sub-agent mode: applied onto the bounded base → no delegation.
         let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
+    }
+
+    #[tokio::test]
+    async fn worktree_removed_when_clean_kept_when_dirty() {
+        use super::Worktree;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+        // Clean worktree → finish removes it, no note.
+        let wt = Worktree::create(repo).await.unwrap();
+        let p = wt.path.clone();
+        assert!(p.exists());
+        assert!(wt.finish().await.is_none());
+        assert!(!p.exists(), "a clean worktree is torn down");
+        // Dirty worktree → finish keeps it with a pointer note.
+        let wt2 = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt2.path.join("new.txt"), "x").unwrap();
+        let p2 = wt2.path.clone();
+        let note = wt2.finish().await.unwrap();
+        assert!(note.contains("branch") && p2.exists());
     }
 
     #[test]
