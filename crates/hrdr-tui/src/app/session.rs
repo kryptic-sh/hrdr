@@ -18,8 +18,12 @@ impl super::App {
             a.set_model(session.model.clone());
         });
         self.model = session.model.clone();
-        self.cfg.provider = session.provider.clone();
+        self.provider = session.provider.clone();
         self.rebuild_transcript(&session.messages);
+        // Restore saved TODOs.
+        if let Ok(mut todos) = self.todos.lock() {
+            *todos = session.todos.clone();
+        }
         self.session_id = Some(id);
         self.session_label = Some(session.name.clone());
         self.push_entry(Entry::System(format!(
@@ -41,14 +45,17 @@ impl super::App {
         let Some((msgs, cwd)) = snap else {
             return;
         };
+        // Snapshot TODOs from the shared list.
+        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         let outcome = hrdr_app::save_session(
             self.session_id.as_deref(),
             self.session_label.as_deref(),
             &self.model,
-            self.cfg.provider.as_deref(),
+            self.provider.as_deref(),
             &self.base_url,
             &cwd.display().to_string(),
             msgs,
+            todos,
         );
         if let Some(o) = outcome {
             // Notify once, when the session is first created.
@@ -82,8 +89,12 @@ impl super::App {
             a.set_model(session.model.clone());
         });
         self.model = session.model.clone();
-        self.cfg.provider = session.provider.clone();
+        self.provider = session.provider.clone();
         self.rebuild_transcript(&session.messages);
+        // Restore saved TODOs.
+        if let Ok(mut todos) = self.todos.lock() {
+            *todos = session.todos.clone();
+        }
         self.session_id = Some(id.clone());
         self.session_label = Some(session.name.clone());
         self.scroll_offset = 0;

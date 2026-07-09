@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hrdr_llm::ChatMessage;
+use hrdr_tools::TodoItem;
 use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
@@ -28,6 +29,9 @@ pub struct Session {
     pub created: u64,
     pub updated: u64,
     pub messages: Vec<ChatMessage>,
+    /// Saved TODO items from the session's todo tool.
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
 }
 
 /// Lightweight directory listing entry.
@@ -105,6 +109,7 @@ impl Session {
         base_url: impl Into<String>,
         cwd: impl Into<String>,
         messages: Vec<ChatMessage>,
+        todos: Vec<TodoItem>,
     ) -> Self {
         let t = hrdr_tools::unix_now();
         Self {
@@ -117,6 +122,7 @@ impl Session {
             created: t,
             updated: t,
             messages,
+            todos,
         }
     }
 
@@ -300,7 +306,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat");
-            let sess = Session::new("chat", "model", None, "http://x/v1", &cwd, vec![]);
+            let sess = Session::new("chat", "model", None, "http://x/v1", &cwd, vec![], vec![]);
             sess.save("chat").unwrap();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
         });
@@ -319,7 +325,15 @@ mod tests {
             let cwd = tmp.path().join("project");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            let sess = Session::new("My Chat", "model", None, "http://x/v1", &cwd, vec![]);
+            let sess = Session::new(
+                "My Chat",
+                "model",
+                None,
+                "http://x/v1",
+                &cwd,
+                vec![],
+                vec![],
+            );
             sess.save("my-chat").unwrap();
             let (id, s) = resolve_session(&cwd, "my-chat").unwrap();
             assert_eq!(id, "my-chat");
@@ -334,7 +348,15 @@ mod tests {
             let cwd = tmp.path().join("proj");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            let sess = Session::new("Work Session", "model", None, "http://x/v1", &cwd, vec![]);
+            let sess = Session::new(
+                "Work Session",
+                "model",
+                None,
+                "http://x/v1",
+                &cwd,
+                vec![],
+                vec![],
+            );
             sess.save("work").unwrap();
             let result = resolve_session(&cwd, "WORK SESSION");
             assert!(result.is_some(), "case-insensitive name match must work");
@@ -354,10 +376,10 @@ mod tests {
             let a = cwd_a.to_str().unwrap().to_string();
             let b = cwd_b.to_str().unwrap().to_string();
 
-            Session::new("Alpha A", "m", None, "http://x/v1", &a, vec![])
+            Session::new("Alpha A", "m", None, "http://x/v1", &a, vec![], vec![])
                 .save("alpha")
                 .unwrap();
-            Session::new("Alpha B", "m", None, "http://x/v1", &b, vec![])
+            Session::new("Alpha B", "m", None, "http://x/v1", &b, vec![], vec![])
                 .save("alpha")
                 .unwrap();
 

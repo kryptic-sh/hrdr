@@ -163,6 +163,8 @@ pub(crate) struct App {
     bell: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
+    /// Current provider name (e.g. "zen"), set by `/provider` and persisted in sessions.
+    provider: Option<String>,
     /// Active session's file id (stem). Assigned on first auto-save; stable.
     session_id: Option<String>,
     /// Display name override (`/rename`); falls back to the first user message.
@@ -264,6 +266,7 @@ impl App {
             .unwrap_or(hjkl_icons::IconMode::Nerd);
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
+        let provider = config.provider.clone();
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
@@ -332,6 +335,7 @@ impl App {
             compaction_reserved,
             bell,
             base_url,
+            provider,
             session_id: None,
             session_label: None,
             turn_handle: None,

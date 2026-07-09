@@ -283,6 +283,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn set_model(&mut self, model: String) {
         self.app.model = model;
     }
+    fn provider(&self) -> Option<String> {
+        self.app.provider.clone()
+    }
+    fn set_provider(&mut self, name: String) {
+        self.app.provider = Some(name);
+    }
     fn show_thinking(&self) -> bool {
         self.app.show_reasoning
     }

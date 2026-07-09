@@ -304,6 +304,11 @@ fn app_view(
         system(transcript, next_id, hrdr_app::PROJECT_DOCS_LOADED_MSG);
     }
 
+    // Endpoint + context window as signals so `/provider` updates them live.
+    let base_url: RwSignal<String> = create_rw_signal(base_url);
+    let provider: RwSignal<Option<String>> = create_rw_signal(cfg.provider.clone());
+    let ctx_window: RwSignal<Option<u32>> = create_rw_signal(ctx_window);
+
     // Startup auto-resume: pick up the most recent saved session for this
     // directory (like the TUI; `auto_resume = false` / --no-auto-resume in the
     // TUI config disables it — the GUI honors the same knob).
@@ -318,6 +323,11 @@ fn app_view(
                 a.set_model(session.model.clone());
             }
             model.set(session.model.clone());
+            provider.set(session.provider.clone());
+            // Restore saved TODOs.
+            if let Ok(mut t) = todos.lock() {
+                *t = session.todos.clone();
+            }
             rebuild_transcript(cx, transcript, next_id, &session.messages);
             session_id.set(Some(id));
             session_label.set(Some(session.name.clone()));
@@ -335,9 +345,6 @@ fn app_view(
 
     // Reasoning-effort label (status bar; `/effort` sets it).
     let effort: RwSignal<Option<String>> = create_rw_signal(None);
-    // Endpoint + context window as signals so `/provider` updates them live.
-    let base_url: RwSignal<String> = create_rw_signal(base_url);
-    let ctx_window: RwSignal<Option<u32>> = create_rw_signal(ctx_window);
     // Status-bar mode (`/statusbar`; from config).
     let statusbar_mode: RwSignal<hrdr_app::StatusBarMode> = create_rw_signal(
         hrdr_app::StatusBarMode::from_config(ui.statusbar.as_deref()),
@@ -477,6 +484,7 @@ fn app_view(
             let existing_id = session_id.get_untracked();
             let session_label = session_label.get_untracked();
             let cur_model = model.get_untracked();
+            let cur_provider = provider.get_untracked();
             let base_url = base_url.get_untracked();
             let generation = save_gen.get_untracked();
             let handle = tokio::spawn(async move {
@@ -495,7 +503,7 @@ fn app_view(
                     existing_id,
                     session_label,
                     cur_model,
-                    None,
+                    cur_provider,
                     base_url,
                 )
                 .await
@@ -582,6 +590,7 @@ fn app_view(
     let tx_for_events = tx.clone();
     let mtime_for_events = config_mtime_seen.clone();
     let base_url_for_events = base_url;
+    let provider_for_events = provider;
     let todos_for_events = todos.clone();
     let todo_stamps_for_done = todo_completed_at.clone();
     // Sub-agent panel clones for the event effect.
@@ -786,11 +795,17 @@ fn app_view(
                     let existing = session_id.get_untracked();
                     let label = session_label.get_untracked();
                     let cur_model = model.get_untracked();
+                    let cur_provider = provider_for_events.get_untracked();
                     let url = base_url_for_events.get_untracked();
                     let generation = save_gen.get_untracked();
                     tokio::spawn(async move {
                         if let Some(o) = hrdr_app::save_agent_session(
-                            agent, existing, label, cur_model, None, url,
+                            agent,
+                            existing,
+                            label,
+                            cur_model,
+                            cur_provider,
+                            url,
                         )
                         .await
                         {
@@ -899,6 +914,7 @@ fn app_view(
             agent: agent_for_send.clone(),
             tx: tx_for_send.clone(),
             base_url,
+            provider,
             login,
             steering: steering_for_send.clone(),
         };
@@ -1824,6 +1840,7 @@ struct GuiHost {
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
     base_url: RwSignal<String>,
+    provider: RwSignal<Option<String>>,
     login: RwSignal<Option<hrdr_app::LoginWizard>>,
     steering: hrdr_agent::SteeringQueue,
 }
@@ -1862,6 +1879,12 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn set_model(&mut self, model: String) {
         self.model.set(model);
+    }
+    fn provider(&self) -> Option<String> {
+        self.provider.get_untracked()
+    }
+    fn set_provider(&mut self, name: String) {
+        self.provider.set(Some(name));
     }
     fn show_thinking(&self) -> bool {
         self.show_reasoning.get_untracked()
@@ -1927,11 +1950,13 @@ impl hrdr_app::CommandHost for GuiHost {
         let existing = self.session_id.get_untracked();
         let label = self.session_label.get_untracked();
         let model = self.model.get_untracked();
+        let provider = self.provider.get_untracked();
         let base_url = self.base_url.get_untracked();
         let generation = self.save_gen.get_untracked();
         tokio::spawn(async move {
             if let Some(o) =
-                hrdr_app::save_agent_session(agent, existing, label, model, None, base_url).await
+                hrdr_app::save_agent_session(agent, existing, label, model, provider, base_url)
+                    .await
             {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
@@ -1944,6 +1969,11 @@ impl hrdr_app::CommandHost for GuiHost {
     fn resume(&mut self, id: String, session: Session) {
         let plan = hrdr_app::resume_plan(&session, &self.cwd(), &self.base_url.get_untracked());
         self.model.set(session.model.clone());
+        self.provider.set(session.provider.clone());
+        // Restore saved TODOs.
+        if let Ok(mut t) = self.todos.lock() {
+            *t = session.todos.clone();
+        }
         self.session_id.set(Some(id));
         self.session_label.set(Some(session.name.clone()));
         // Pending saves from before the resume belong to the old conversation.

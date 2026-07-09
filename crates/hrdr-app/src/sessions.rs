@@ -22,6 +22,7 @@ pub struct SaveOutcome {
 /// [`hrdr_agent::unique_session_id`]), and returns that id plus whether it was
 /// newly assigned. `label` overrides the auto-derived name (the first user line);
 /// pass `None` to use the derived one.
+#[allow(clippy::too_many_arguments)]
 pub fn save_session(
     existing_id: Option<&str>,
     label: Option<&str>,
@@ -30,6 +31,7 @@ pub fn save_session(
     base_url: &str,
     cwd: &str,
     messages: Vec<Message>,
+    todos: Vec<hrdr_tools::TodoItem>,
 ) -> Option<SaveOutcome> {
     // Non-empty == has at least one user message.
     if !messages.iter().any(|m| m.role == MessageRole::User) {
@@ -49,6 +51,7 @@ pub fn save_session(
         base_url,
         cwd,
         messages,
+        todos,
     )
     .save(&id);
     Some(SaveOutcome { id, first_save })
@@ -67,9 +70,10 @@ pub async fn save_agent_session(
     provider: Option<String>,
     base_url: String,
 ) -> Option<SaveOutcome> {
-    let (msgs, cwd) = {
+    let (msgs, cwd, todos) = {
         let a = agent.lock().await;
-        (a.messages_owned(), a.cwd().display().to_string())
+        let todos = a.todos().lock().map(|t| t.clone()).unwrap_or_default();
+        (a.messages_owned(), a.cwd().display().to_string(), todos)
     };
     save_session(
         existing_id.as_deref(),
@@ -79,6 +83,7 @@ pub async fn save_agent_session(
         &base_url,
         &cwd,
         msgs,
+        todos,
     )
 }
 
@@ -142,9 +147,11 @@ mod tests {
     fn save_session_skips_conversations_with_no_user_message() {
         // System/assistant-only histories aren't worth persisting → no id, and
         // (importantly) no file is written.
-        assert!(save_session(None, None, "m", None, "", "/tmp/x", vec![]).is_none());
+        assert!(save_session(None, None, "m", None, "", "/tmp/x", vec![], vec![]).is_none());
         let assistant_only = vec![Message::assistant("hi there")];
-        assert!(save_session(None, None, "m", None, "", "/tmp/x", assistant_only).is_none());
+        assert!(
+            save_session(None, None, "m", None, "", "/tmp/x", assistant_only, vec![]).is_none()
+        );
     }
 
     #[test]
