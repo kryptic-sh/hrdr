@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
             config.base_url = p.base_url.clone();
         }
         // Key precedence: inline > key_env var > credential saved by `/login`.
-        if let Some(key) = hrdr_agent::resolve_api_key(name, &p) {
+        if let Some(key) = hrdr_agent::resolve_api_key(name, &p, None) {
             config.api_key = Some(key);
         } else if p.remote && config.api_key.is_none() {
             let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");

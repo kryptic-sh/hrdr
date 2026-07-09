@@ -184,41 +184,29 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let (lines, msg_starts, tool_regions) = transcript_lines(app, text_area.width);
-    // Cumulative wrapped-row height at each logical-line boundary, so each tool
-    // block's span can be mapped to on-screen rows for click hit-testing. Built
-    // before `lines` is consumed by the Paragraph below.
+    // Cumulative wrapped-row height at each logical-line boundary — always built
+    // from cached per-line measurements (cheap HashMap lookups) so we never pay
+    // for ratatui's full-text re-wrap in para.line_count() every frame.
     //
-    // Use usize throughout to avoid u16 overflow on long transcripts; only
-    // the final Paragraph::scroll cast (u16) is clamped at the last moment.
-    // Per-line heights come from LINE_WRAP_CACHE so stable lines don't get
-    // re-measured every frame.
-    let cum: Vec<usize> = if tool_regions.is_empty() {
-        Vec::new()
-    } else {
-        let mut cum = Vec::with_capacity(lines.len() + 1);
-        let mut acc: usize = 0;
-        cum.push(0usize);
-        for line in &lines {
-            let h = cached_line_wrap(line, text_area.width);
-            acc = acc.saturating_add(h);
-            cum.push(acc);
-        }
-        cum
-    };
-    // Resolve a pending /goto to a from-top wrapped-row offset before `lines`
-    // is consumed by the Paragraph.
+    // Use usize throughout to avoid u16 overflow on long transcripts; only the
+    // final Paragraph::scroll cast (u16) is clamped at the last moment.
+    let mut cum = Vec::with_capacity(lines.len() + 1);
+    let mut acc: usize = 0;
+    cum.push(0usize);
+    for line in &lines {
+        let h = cached_line_wrap(line, text_area.width);
+        acc = acc.saturating_add(h);
+        cum.push(acc);
+    }
+    // Resolve a pending /goto to a from-top wrapped-row offset using cum
+    // (avoids another Paragraph::line_count allocation + re-wrap).
     let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
         let start = (*msg_starts.get(num.checked_sub(1)?)?).min(lines.len());
-        Some(
-            Paragraph::new(lines[..start].to_vec())
-                .wrap(Wrap { trim: false })
-                .line_count(text_area.width) as u16,
-        )
+        Some(cum[start] as u16)
     });
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    // Count the *wrapped* rows at this width — not the logical line count — so
-    // long messages that wrap don't push the newest content below the fold.
-    let total = para.line_count(text_area.width) as u16;
+    // Total wrapped rows at this width — from cum, not para.line_count().
+    let total = *cum.last().unwrap_or(&0) as u16;
     let max_scroll = total.saturating_sub(area.height);
     // Pin the view to the same content while scrolled up. `scroll_offset` is
     // measured from the bottom, so as streaming appends rows `max_scroll` grows
@@ -248,7 +236,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Arithmetic is in usize (cum values) to avoid overflow; only the final
     // HitRect fields are cast back to u16.
     app.tool_hits.clear();
-    if !cum.is_empty() {
+    {
         let scroll_us = scroll as usize;
         let view_end = scroll_us.saturating_add(area.height as usize);
         let last = cum.len() - 1;
@@ -810,7 +798,7 @@ thread_local! {
     // Cache rendered transcript entry content lines (excluding the per-message
     // timestamp meta line, which is always fresh).
     // Key: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
-    // Evicted in bulk at 256 entries — same policy as HL_CACHE.
+    // Evicted in bulk at 1024 entries — same policy as HL_CACHE.
     static TRANSCRIPT_CACHE: RefCell<HashMap<TranscriptKey, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
     // Cached wrapped-row height per logical line, keyed on (span-content hash,
     // width). Avoids repeated Paragraph::line_count calls for stable lines when
@@ -832,7 +820,7 @@ fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'stat
     let lines = render_code_block(lang, content, width);
     HL_CACHE.with(|c| {
         let mut m = c.borrow_mut();
-        if m.len() > 256 {
+        if m.len() > 1024 {
             m.clear();
         }
         m.insert(key, lines.clone());
@@ -955,7 +943,7 @@ where
     let lines = render();
     TRANSCRIPT_CACHE.with(|c| {
         let mut m = c.borrow_mut();
-        if m.len() > 256 {
+        if m.len() > 1024 {
             m.clear();
         }
         m.insert(key, lines.clone());
@@ -981,7 +969,7 @@ fn cached_line_wrap(line: &Line<'static>, width: u16) -> usize {
             .line_count(width)
             .max(1);
         let mut m = c.borrow_mut();
-        if m.len() > 2048 {
+        if m.len() > 8192 {
             m.clear();
         }
         m.insert(key, wc);

@@ -247,7 +247,7 @@ pub fn config_for_agent_profile(
             )
         })?;
         cfg.base_url = p.base_url.clone();
-        cfg.api_key = resolve_api_key(pname, &p);
+        cfg.api_key = resolve_api_key(pname, &p, base.api_key.as_deref());
         cfg.api_version = p.api_version.clone();
         cfg.headers = p
             .headers
@@ -1153,11 +1153,16 @@ pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "openai", "openrouter", "claude"
 /// Resolve the API key for a provider: an inline key wins, then the provider's
 /// `key_env` variable, then a credential saved by `/login`. `None` when none is
 /// available (a keyless local endpoint, or a remote that hasn't been set up).
-pub fn resolve_api_key(provider: &str, p: &ResolvedProvider) -> Option<String> {
+pub fn resolve_api_key(
+    provider: &str,
+    p: &ResolvedProvider,
+    parent_key: Option<&str>,
+) -> Option<String> {
     p.api_key
         .clone()
         .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()))
         .or_else(|| auth_token(provider))
+        .or_else(|| parent_key.map(String::from))
 }
 
 /// Resolve a built-in provider name (case-insensitive).

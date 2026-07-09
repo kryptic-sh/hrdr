@@ -42,7 +42,7 @@ pub fn apply_provider(
     if host.is_busy() {
         return Err(busy_generic());
     }
-    let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p));
+    let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p, None));
     let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
