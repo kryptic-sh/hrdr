@@ -3,7 +3,7 @@ use std::path::Path;
 use super::conversation::export_conversation;
 use super::helpers::{RESUME_BUSY_MSG, busy_generic, busy_guard, git_working_diff};
 use super::host::CommandHost;
-use super::model::{apply_provider, switch_model};
+use super::model::{apply_provider, endpoint_health_warning, switch_model};
 use super::types::ExpandMode;
 
 /// Handle a `/…` command shared by both frontends. Returns `true` if it was a
@@ -591,6 +591,49 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 Some((id, session)) => host.resume(id, session),
                 None => host.info(format!("no session matching '{arg}' (see /sessions)")),
             }
+        }
+        "cost" => {
+            let (tokens_in, tokens_out) = host.session_tokens();
+            host.info(format!(
+                "session tokens: ↑{tokens_in} input · ↓{tokens_out} output"
+            ));
+        }
+        "doctor" => {
+            let agent = host.agent();
+            let model = host.model();
+            let base_url = host.base_url();
+            let cwd = host.cwd();
+            let ctx_win = host.context_window();
+            let in_git = hrdr_agent::in_git_repo(&cwd);
+            let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
+            let config_path = hrdr_agent::config_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "—".to_string());
+            let auth_path = hrdr_agent::auth_file_path()
+                .map(|p| {
+                    let exists = p.exists();
+                    format!(
+                        "{} ({})",
+                        p.display(),
+                        if exists { "found" } else { "not found" }
+                    )
+                })
+                .unwrap_or_else(|| "—".to_string());
+            let ctx_win_str = ctx_win.map_or_else(|| "—".to_string(), |w| w.to_string());
+            host.info(format!(
+                "model: {model}\nendpoint: {base_url}\ncontext window: {ctx_win_str}\n\
+                 cwd: {} ({in_git})\nbranch: {branch}\nconfig: {config_path}\n\
+                 auth: {auth_path}\nprobing endpoint…",
+                crate::display_dir(&cwd),
+                in_git = if in_git { "git repo" } else { "not a git repo" },
+            ));
+            host.spawn_line(Box::pin(async move {
+                let ep = endpoint_health_warning(agent, model, base_url).await;
+                match ep {
+                    Some(w) => w,
+                    None => "✓ endpoint healthy".to_string(),
+                }
+            }));
         }
         _ => return false,
     }

@@ -68,6 +68,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
+    ("/cost", "session token usage"),
+    ("/doctor", "check health: endpoint, deps, config"),
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
     ("/find", "jump to text (or 'clear' to drop search)"),
     ("/next", "jump to next /find match"),
@@ -87,6 +89,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "alias of /info"),
     ("/continue", "alias of /resume"),
     ("/summarize", "alias of /compact"),
+    ("/usage", "alias of /cost"),
+    ("/health", "alias of /doctor"),
 ];
 
 /// Commands grouped by theme, for a readable help listing.
@@ -133,12 +137,12 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/paste",
         ],
     ),
-    ("Reply", &["/copy", "/export", "/retry", "/undo"]),
+    ("Reply", &["/copy", "/export", "/retry", "/undo", "/cost"]),
     (
         "Appearance",
         &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
     ),
-    ("Other", &["/reload", "/help", "/exit"]),
+    ("Other", &["/reload", "/help", "/doctor", "/exit"]),
 ];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
@@ -168,6 +172,9 @@ pub fn resolve_alias(cmd: &str) -> &str {
         "summarize" | "summary" => "compact",
         // help variants.
         "commands" | "?" => "help",
+        // usage / health variants.
+        "usage" => "cost",
+        "health" => "doctor",
         _ => cmd,
     }
 }
