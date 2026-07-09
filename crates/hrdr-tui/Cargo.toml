@@ -23,4 +23,5 @@ ratatui.workspace = true
 hjkl-icons.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+serde_json.workspace = true
 

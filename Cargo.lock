@@ -2507,6 +2507,7 @@ dependencies = [
  "hrdr-editor",
  "hrdr-tools",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

@@ -1193,22 +1193,27 @@ fn transcript_lines(
         }
     }
 
-    // Pending queued messages float at the bottom (following the output) until
-    // they're actually sent — rendered dimmed, distinct from committed entries.
+    // Pending queued messages render like user prompts, with a "Queued"
+    // badge on a distinct background at the bottom of each block.
     if !app.queue.is_empty() {
-        out.push(Line::from(Span::styled(
-            "— queued —",
-            Style::default().fg(theme.dim),
-        )));
+        let q_badge_bg = theme.warn;
+        let q_badge_fg = Color::Black;
+        let user_bg = theme.user_bg;
+        let user_fg = theme.user;
         for msg in &app.queue {
+            // Blank line before each queued message for separation.
+            out.push(Line::raw(""));
             push_text(
                 &mut out,
-                Span::styled("❯ ", Style::default().fg(theme.dim).bold()),
+                Span::styled("❯ ", Style::default().fg(user_fg).bold()),
                 msg,
-                Style::default()
-                    .fg(theme.dim)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(user_fg).bg(user_bg),
             );
+            // "Queued" badge as the last line, distinct bg from the prompt block.
+            out.push(Line::from(Span::styled(
+                "  Queued",
+                Style::default().fg(q_badge_fg).bg(q_badge_bg).bold(),
+            )));
         }
     }
 
@@ -1254,7 +1259,12 @@ fn push_tool(
     // Shell tools (bash, powershell) render the command on its own line below the
     // header, like an actual shell prompt — more readable than truncating inline.
     let is_shell = matches!(name, "bash" | "powershell");
-    let args_preview = hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW);
+    let is_read = name == "read";
+    let args_preview = if is_read {
+        read_args_summary(args)
+    } else {
+        hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW)
+    };
 
     // Header line: ✓ bash   (just name for shell tools, name + args for others)
     out.push(pad_line(
@@ -1295,8 +1305,15 @@ fn push_tool(
     let lines: Vec<&str> = result.lines().collect();
     if done {
         // Finished: show the head of the result (or all of it when expanded).
+        // For read tools, show the tail (the actual content read, not preamble).
         let shown = if expanded { lines.len() } else { preview };
-        for line in lines.iter().take(shown) {
+        let render_lines: Box<dyn Iterator<Item = (usize, &str)>> = if is_read {
+            let start = lines.len().saturating_sub(shown);
+            Box::new(lines.iter().copied().enumerate().skip(start))
+        } else {
+            Box::new(lines.iter().copied().enumerate().take(shown))
+        };
+        for (_orig_idx, line) in render_lines {
             let color = if is_diff {
                 diff_line_color(line, theme)
             } else {
@@ -1351,6 +1368,26 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,
     )
+}
+
+/// Extract a compact summary from read tool args: "path  (offset: N, limit: M)".
+fn read_args_summary(args: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+    let offset = v.get("offset").and_then(|o| o.as_u64());
+    let limit = v.get("limit").and_then(|l| l.as_u64());
+    let mut s = path.to_string();
+    let mut parts = Vec::new();
+    if let Some(o) = offset.filter(|&o| o > 1) {
+        parts.push(format!("offset: {o}"));
+    }
+    if let Some(l) = limit {
+        parts.push(format!("limit: {l}"));
+    }
+    if !parts.is_empty() {
+        s.push_str(&format!("  ({})", parts.join(", ")));
+    }
+    s
 }
 
 #[cfg(test)]
