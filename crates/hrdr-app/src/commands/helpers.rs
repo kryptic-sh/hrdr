@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hrdr_agent::{Agent, Session};
+use crate::SessionState;
+use hrdr_agent::Agent;
 use tokio::sync::Mutex;
 
 pub fn busy_guard(action: &str) -> String {
@@ -23,7 +24,16 @@ pub mod expand_msg {
 
 /// `/reload` + hot-reload status lines (both frontends).
 pub const RELOAD_MANUAL_MSG: &str = "reloaded config (theme, effort, toggles)";
-pub const RELOAD_HOT_MSG: &str = "config changed on disk — reloaded";
+
+/// Hot-reload notice, naming the config file that changed (home collapsed to
+/// `~`). Falls back to the bare notice when there's no resolvable config path
+/// (no `HOME` / `XDG_CONFIG_HOME`).
+pub fn reload_hot_message() -> String {
+    match hrdr_agent::config_file_path() {
+        Some(p) => format!("config reloaded ({})", crate::display_dir(&p)),
+        None => "config reloaded".to_string(),
+    }
+}
 /// Invalid config file on reload: keep the current settings and warn.
 pub fn reload_invalid_message(e: &dyn std::fmt::Display) -> String {
     format!("config invalid — keeping current settings: {e}")
@@ -57,7 +67,7 @@ pub struct ResumePlan {
 
 /// The shared `/resume` semantics both frontends apply: follow the session's
 /// working directory (in-process only) and surface the same notices.
-pub fn resume_plan(session: &Session, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
+pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
     let mut lines = vec![format!(
         "resumed '{}' ({} messages)",
         session.name,
@@ -189,5 +199,22 @@ pub async fn git_working_diff(cwd: &Path) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod reload_message_tests {
+    /// The hot-reload notice names the config file that changed. The path is
+    /// whatever `config_file_path()` resolves to (home collapsed to `~`), so
+    /// assert on its shape rather than an absolute path.
+    #[test]
+    fn hot_reload_notice_names_the_config_file() {
+        let msg = super::reload_hot_message();
+        assert!(msg.starts_with("config reloaded"), "{msg}");
+        // With no HOME/XDG the path is unresolvable and the bare notice is used.
+        if hrdr_agent::config_file_path().is_some() {
+            assert!(msg.contains("config.toml"), "{msg}");
+            assert!(msg.ends_with(')'), "{msg}");
+        }
     }
 }

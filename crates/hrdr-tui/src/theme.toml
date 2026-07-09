@@ -16,7 +16,11 @@ mauve    = "#bb9af7"
 
 # hrdr-specific background entries (overridable via user theme).
 bg_user  = "#24283b"
+bg_assistant = "#1b1e2e"
 bg_tool  = "#1f2335"
+bg_command = "#20223a"
+bg_stats = "#191b2b"
+bg_header = "#16182a"
 
 [ui]
 background = "$bg"

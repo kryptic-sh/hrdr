@@ -93,7 +93,10 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
 
 /// Launch the interactive TUI against the configured agent, with `ui` holding
 /// the display knobs (theme, icons, vim mode, …) split out of the agent config.
-pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<()> {
+///
+/// `logo` is the ASCII art the session header animates — the caller owns it (the
+/// binary also prints it above `--help`), so the TUI never embeds one.
+pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig, logo: &'static str) -> Result<()> {
     // Install a panic hook that restores the terminal to its normal state
     // *before* the panic message and backtrace are printed.  Without this the
     // message lands inside the alt screen and is immediately cleared on exit —
@@ -120,7 +123,7 @@ pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal: Tui = Terminal::new(backend)?;
 
-    let mut app = App::new(config, ui)?;
+    let mut app = App::new(config, ui, logo)?;
     app.connect_mcp().await;
     tui::run_loop(&mut app, &mut terminal).await?;
     Ok(())

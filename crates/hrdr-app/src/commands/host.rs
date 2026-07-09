@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hrdr_agent::{Agent, Session};
+use crate::Session;
+use hrdr_agent::Agent;
 use tokio::sync::Mutex;
 
 use super::dispatch::open_system_handler;

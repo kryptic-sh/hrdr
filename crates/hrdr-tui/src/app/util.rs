@@ -2,11 +2,6 @@
 
 use std::time::Duration;
 
-/// Current local time, for per-message timestamps.
-pub(super) fn timestamp_now() -> chrono::DateTime<chrono::Local> {
-    chrono::Local::now()
-}
-
 /// Human-readable duration: `843ms` (<1s), `2.3s` (<1m), `1m 23s` (≥1m).
 pub(super) fn format_duration(d: Duration) -> String {
     let millis = d.as_millis();

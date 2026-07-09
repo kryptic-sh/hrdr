@@ -587,7 +587,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(RESUME_BUSY_MSG.to_string());
                 return true;
             }
-            match hrdr_agent::resolve_session(&host.cwd().display().to_string(), &arg) {
+            match crate::resolve_session(&host.cwd().display().to_string(), &arg) {
                 Some((id, session)) => host.resume(id, session),
                 None => host.info(format!("no session matching '{arg}' (see /sessions)")),
             }

@@ -7,14 +7,12 @@
 mod agents_dir;
 mod auth;
 mod prompt;
-mod session;
 
 pub use agents_dir::discover_agent_profiles;
 
-pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token};
-pub use session::{
-    Session, SessionMeta, cwd_slug, list_sessions, resolve_session, sessions_dir, unique_session_id,
-};
+pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token, write_atomic};
+mod paths;
+pub use paths::cwd_slug;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -555,6 +553,15 @@ pub struct AgentConfig {
     /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
+    /// `model` was set by a CLI flag or `$HRDR_MODEL`, which outrank a resumed
+    /// session's model. A value from the config file (or a provider preset's
+    /// default) leaves this false, so a session may override it.
+    ///
+    /// Precedence: flag > env > session > config.
+    pub model_pinned: bool,
+    /// `provider` was set by a CLI flag or `$HRDR_PROVIDER`. See
+    /// [`AgentConfig::model_pinned`].
+    pub provider_pinned: bool,
     /// Model context window in tokens, for the status bar's "X of Y" display.
     /// Probed from the endpoint when unset; set in config to override.
     pub context_window: Option<u32>,
@@ -969,6 +976,8 @@ impl Default for AgentConfig {
             base_url: "http://localhost:8080/v1".to_string(),
             api_key: None,
             model: "default".to_string(),
+            model_pinned: false,
+            provider_pinned: false,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 50,
@@ -1303,6 +1312,11 @@ impl AgentConfig {
             cfg.apply_file(fc);
         }
         cfg.apply_env();
+        // Env-supplied model/provider outrank a resumed session's; config-file
+        // ones don't (flag > env > session > config). The binary ORs in its
+        // `--model` / `--provider` flags on top of these.
+        cfg.model_pinned = std::env::var_os("HRDR_MODEL").is_some();
+        cfg.provider_pinned = std::env::var_os("HRDR_PROVIDER").is_some();
         Ok(cfg)
     }
 

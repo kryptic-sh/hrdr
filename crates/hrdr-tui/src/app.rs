@@ -30,7 +30,7 @@ use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
 };
-use util::{format_duration, timestamp_now};
+use util::format_duration;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -69,7 +69,7 @@ impl HitRect {
 
 // The transcript item model + its representation-independent queries
 // (search/count/export) live in the shared `hrdr-app` core.
-pub(crate) use hrdr_app::Entry;
+pub(crate) use hrdr_app::{Entry, EntryKind};
 
 /// Messages from the background agent task back to the UI loop.
 pub(crate) enum TurnMsg {
@@ -95,30 +95,31 @@ pub(crate) struct App {
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
-    pub(crate) transcript: Vec<Entry>,
-    /// Local timestamp per transcript entry (parallel to `transcript`), rendered
-    /// as relative or absolute time at draw.
-    pub(crate) entry_times: Vec<chrono::DateTime<chrono::Local>>,
+    /// ASCII art the session header animates, owned by the caller of
+    /// [`crate::run`] — the TUI embeds no logo of its own.
+    pub(crate) logo: &'static str,
+    /// Persistent clock anchor for the header's logo animation. Captured once:
+    /// re-anchoring per frame would pin the animation's tick at 0.
+    pub(crate) header_anchor: Instant,
+    /// The whole persisted session: the display transcript (each entry carries
+    /// its own timestamp), the chat history, the TODO snapshot, the token
+    /// counters, and the session's identity. Saving serializes this; resuming
+    /// assigns it.
+    pub(crate) state: hrdr_app::SessionState,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
     pub(crate) timestamp_style: TimestampStyle,
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
     pub(crate) statusbar_mode: StatusBarMode,
     pub(crate) running: bool,
-    pub(crate) model: String,
     // ---- status bar info ----
     /// Working directory, home-shortened for display.
     pub(crate) dir: String,
     /// Current git branch, if the cwd is in a repo.
     pub(crate) branch: Option<String>,
-    /// Model context window in tokens (for "X of Y"), if known.
-    pub(crate) context_window: Option<u32>,
     /// Reasoning-effort label to display.
     pub(crate) effort: Option<String>,
     /// Icon set for the TUI chrome (status bar glyphs).
     pub(crate) icon_mode: hjkl_icons::IconMode,
-    /// Cumulative input/output tokens across the session.
-    pub(crate) session_in: usize,
-    pub(crate) session_out: usize,
     /// Config kept for mid-session provider resolution (`/provider`).
     cfg: AgentConfig,
     /// Last-seen mtime of the config file, for hot-reload polling.
@@ -161,14 +162,6 @@ pub(crate) struct App {
     pub(crate) compaction_reserved: u32,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
     bell: bool,
-    /// Current endpoint base URL (for `/info`; updated by `/provider`).
-    base_url: String,
-    /// Current provider name (e.g. "zen"), set by `/provider` and persisted in sessions.
-    provider: Option<String>,
-    /// Active session's file id (stem). Assigned on first auto-save; stable.
-    session_id: Option<String>,
-    /// Display name override (`/rename`); falls back to the first user message.
-    session_label: Option<String>,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Messages submitted while a turn runs, delivered mid-turn ("steering").
@@ -230,8 +223,6 @@ pub(crate) struct App {
     pub(crate) reasoning_start: Option<Instant>,
     /// Streamed output deltas this turn (≈ tokens).
     pub(crate) out_tokens: usize,
-    /// `(prompt_tokens, completion_tokens)` from the latest model call.
-    pub(crate) last_usage: Option<(u32, u32)>,
     /// Prompt-cache hits + reasoning tokens from the latest call, if reported.
     pub(crate) last_cached_tokens: Option<u32>,
     pub(crate) last_reasoning_tokens: Option<u32>,
@@ -241,7 +232,11 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(config: AgentConfig, ui: hrdr_app::UiConfig) -> Result<Self> {
+    pub(crate) fn new(
+        config: AgentConfig,
+        ui: hrdr_app::UiConfig,
+        logo: &'static str,
+    ) -> Result<Self> {
         let model = config.model.clone();
         let vim_mode = ui.vim_mode;
         let theme = Theme::load(ui.theme.as_deref());
@@ -288,33 +283,41 @@ impl App {
              attach a file. /help for commands; /exit (Ctrl+C twice, or Ctrl+D on an empty line) \
              to quit. Submit while a reply runs to queue follow-ups."
         };
-        let mut transcript = vec![Entry::System(welcome.to_string())];
+        // The banner opens every new session; the welcome text follows it.
+        let mut transcript = vec![Entry::header(), Entry::system(welcome)];
         // Warn (but don't fail) if the config file exists but is invalid — the
         // running config has already fallen back to defaults + env in that case.
         if let Some(warning) = hrdr_app::startup_config_warning() {
-            transcript.push(Entry::System(warning));
+            transcript.push(Entry::system(warning));
         }
         if project_docs_loaded {
-            transcript.push(Entry::System(hrdr_app::PROJECT_DOCS_LOADED_MSG.to_string()));
+            transcript.push(Entry::system(hrdr_app::PROJECT_DOCS_LOADED_MSG));
         }
-        let entry_times = vec![timestamp_now(); transcript.len()];
+        let state = hrdr_app::SessionState {
+            model,
+            provider,
+            base_url,
+            transcript,
+            usage: hrdr_app::SessionUsage {
+                context_window,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             editor,
             theme,
-            transcript,
-            entry_times,
+            logo,
+            header_anchor: Instant::now(),
+            state,
             timestamp_style,
             statusbar_mode,
             running: false,
-            model,
             dir,
             branch,
-            context_window,
             effort,
             icon_mode,
-            session_in: 0,
-            session_out: 0,
             cfg,
             config_mtime: current_config_mtime(),
             clipboard: Clipboard::new().ok(),
@@ -334,10 +337,6 @@ impl App {
             auto_compact_enabled: auto_compact,
             compaction_reserved,
             bell,
-            base_url,
-            provider,
-            session_id: None,
-            session_label: None,
             turn_handle: None,
             steering: hrdr_agent::steering_queue(),
             scroll_offset: 0,
@@ -361,7 +360,6 @@ impl App {
             first_token_at: None,
             reasoning_start: None,
             out_tokens: 0,
-            last_usage: None,
             last_cached_tokens: None,
             last_reasoning_tokens: None,
             tx,
@@ -379,8 +377,8 @@ impl App {
     /// Stays silent on success so it doesn't clutter the transcript.
     pub(crate) fn spawn_health_check(&self) {
         let agent = self.agent.clone();
-        let model = self.model.clone();
-        let base_url = self.base_url.clone();
+        let model = self.state.model.clone();
+        let base_url = self.state.base_url.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Some(warning) = hrdr_app::endpoint_health_warning(agent, model, base_url).await {
@@ -585,7 +583,7 @@ impl App {
                 // the expanded text to the running `Agent::run`, which drains
                 // steering between rounds so the model sees it after the current
                 // tool round (not only after the whole turn).
-                self.push_entry(Entry::User(input.clone()));
+                self.push_entry(Entry::user(input.clone()));
                 let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
                 if let Ok(mut q) = self.steering.lock() {
                     q.push_back(sent);
@@ -639,7 +637,8 @@ impl App {
                     .find(|(r, _)| r.contains(m.column, m.row))
                     .map(|(_, i)| *i);
                 if let Some(idx) = hit
-                    && let Some(Entry::Tool { expanded, .. }) = self.transcript.get_mut(idx)
+                    && let Some(EntryKind::Tool { expanded, .. }) =
+                        self.state.transcript.get_mut(idx).map(|e| &mut e.kind)
                 {
                     *expanded = !*expanded;
                 }
@@ -649,7 +648,7 @@ impl App {
     }
 
     pub(crate) fn system(&mut self, msg: impl Into<String>) {
-        self.push_entry(Entry::System(msg.into()));
+        self.push_entry(Entry::system(msg.into()));
     }
 
     /// Run `f` with the locked agent, returning its result — or `None` if a turn
@@ -670,11 +669,10 @@ impl App {
         result
     }
 
-    /// Append a transcript entry, stamping it with the current local time so the
-    /// `entry_times` vector stays parallel to `transcript`.
+    /// Append a transcript entry. Each entry carries its own timestamp, set when
+    /// it was constructed.
     fn push_entry(&mut self, e: Entry) {
-        self.transcript.push(e);
-        self.entry_times.push(timestamp_now());
+        self.state.transcript.push(e);
         self.prune_scrollback();
     }
 
@@ -682,43 +680,41 @@ impl App {
     /// is exceeded. The window of `System` startup entries (welcome + config
     /// warning) is always kept so the user never loses the intro banner.
     fn prune_scrollback(&mut self) {
-        if self.transcript.len() <= self.scrollback {
+        if self.state.transcript.len() <= self.scrollback {
             return;
         }
         // Count leading `System` entries: they form the intro block and should
         // never be evicted.  Everything else past them is fair game.
         let head = self
+            .state
             .transcript
             .iter()
-            .take_while(|e| matches!(e, Entry::System(_)))
+            .take_while(|e| matches!(e.kind, EntryKind::System(_)))
             .count();
-        let excess = self.transcript.len().saturating_sub(self.scrollback);
+        let excess = self.state.transcript.len().saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
-        let remove = excess.min(self.transcript.len().saturating_sub(head));
+        let remove = excess.min(self.state.transcript.len().saturating_sub(head));
         if remove == 0 {
             return;
         }
         // Drop the oldest non-head entries.
-        let keep_start = head.saturating_add(remove).min(self.transcript.len());
-        self.transcript.drain(head..keep_start);
-        self.entry_times.drain(head..keep_start);
+        let keep_start = head.saturating_add(remove).min(self.state.transcript.len());
+        self.state.transcript.drain(head..keep_start);
         // Prune the render cache: any key with an entry_idx that has shifted
         // is stale.  Easiest way: clear the whole thread-local transcript cache
         // once (cheap — it rebuilds lazily on the next frame).
         crate::ui::clear_transcript_cache();
     }
 
-    /// Clear the transcript (and its parallel timestamps).
+    /// Clear the transcript.
     fn clear_transcript(&mut self) {
-        self.transcript.clear();
-        self.entry_times.clear();
+        self.state.transcript.clear();
         crate::ui::clear_transcript_cache();
     }
 
-    /// Truncate the transcript (and its parallel timestamps) to `len`.
+    /// Truncate the transcript to `len`.
     fn truncate_transcript(&mut self, len: usize) {
-        self.transcript.truncate(len);
-        self.entry_times.truncate(len);
+        self.state.transcript.truncate(len);
         crate::ui::clear_transcript_cache();
     }
 
@@ -784,9 +780,9 @@ impl App {
                 self.apply_runtime_config(&cfg, &hrdr_app::UiConfig::load());
                 self.cfg = cfg;
                 self.system(if manual {
-                    hrdr_app::RELOAD_MANUAL_MSG
+                    hrdr_app::RELOAD_MANUAL_MSG.to_string()
                 } else {
-                    hrdr_app::RELOAD_HOT_MSG
+                    hrdr_app::reload_hot_message()
                 });
             }
             Err(e) => self.system(hrdr_app::reload_invalid_message(&e)),
@@ -848,13 +844,13 @@ impl App {
         if let Ok(mut q) = self.steering.lock() {
             q.clear();
         }
-        self.push_entry(Entry::System(hrdr_app::cancel_message(dropped)));
+        self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
     }
 
     fn spawn_turn(&mut self, input: String) {
         // Commit the message into history at send time (a queued message lives
         // as a pending bottom item until this point).
-        self.push_entry(Entry::User(input.clone()));
+        self.push_entry(Entry::user(input.clone()));
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
         let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
@@ -896,7 +892,7 @@ impl App {
     pub(crate) async fn connect_mcp(&mut self) {
         let notices = self.agent.lock().await.connect_mcp().await;
         for n in notices {
-            self.push_entry(Entry::System(n));
+            self.push_entry(Entry::system(n));
         }
     }
 
@@ -917,8 +913,8 @@ impl App {
     fn should_auto_compact(&self) -> bool {
         !self.compacting
             && hrdr_app::should_auto_compact(
-                self.last_usage.map(|(p, _)| p),
-                self.context_window,
+                self.state.usage.last().map(|(p, _)| p),
+                self.state.usage.context_window,
                 self.compaction_reserved,
                 self.auto_compact_enabled,
             )
@@ -971,14 +967,14 @@ impl App {
                 }
             }
             TurnMsg::System(text) => {
-                self.push_entry(Entry::System(text));
+                self.push_entry(Entry::system(text));
                 // Do NOT reset scroll_offset here: this is an async/passive line
                 // (e.g. a late `/models` result). Resetting would yank the user's
                 // view when they are scrolled up reading back-scroll. When the
                 // user is already following (offset == 0), it stays 0 unchanged.
             }
             TurnMsg::Diff(text) => {
-                self.push_entry(Entry::Diff(text));
+                self.push_entry(Entry::diff(text));
                 // Same rationale as TurnMsg::System above: passive async output.
             }
             TurnMsg::Done(err) => {
@@ -992,12 +988,12 @@ impl App {
                 // (an interrupted turn may not have delivered their ToolEnd).
                 self.subagent_panel.clear();
                 if let Some(e) = err {
-                    self.push_entry(Entry::System(format!("[error] {e}")));
+                    self.push_entry(Entry::system(format!("[error] {e}")));
                 }
                 // Append the final stats for the turn (before stats are reset by
                 // any queued turn that spawns next).
                 if let Some(stats) = self.turn_stats() {
-                    self.push_entry(Entry::Stats(stats));
+                    self.push_entry(Entry::stats(stats));
                 }
                 // Age out completed TODOs once per turn.
                 self.todo_turn += 1;
@@ -1023,7 +1019,7 @@ impl App {
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.
                 if self.should_auto_compact() {
-                    self.push_entry(Entry::System(
+                    self.push_entry(Entry::system(
                         "context near the limit — auto-compacting…".to_string(),
                     ));
                     self.spawn_compaction(None);
@@ -1042,7 +1038,7 @@ impl App {
             TurnMsg::ContextWindow(tokens) => {
                 // A model/provider switch re-probed the endpoint; honor the new
                 // advertised max (drives "X of Y" + the auto-compaction trigger).
-                self.context_window = Some(tokens);
+                self.state.usage.context_window = Some(tokens);
             }
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
@@ -1051,10 +1047,10 @@ impl App {
                 self.compacting = false;
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
-                self.last_usage = None;
+                self.state.usage.set_last(None);
                 self.last_cached_tokens = None;
                 self.last_reasoning_tokens = None;
-                self.push_entry(Entry::System(hrdr_app::compaction_message(&res)));
+                self.push_entry(Entry::system(hrdr_app::compaction_message(&res)));
                 if res.is_ok() {
                     self.autosave();
                 }
@@ -1076,7 +1072,7 @@ impl App {
             self.first_token_at
                 .map(|t0| t0.duration_since(started).as_secs_f64()),
             self.out_tokens,
-            self.last_usage,
+            self.state.usage.last(),
             self.last_cached_tokens,
             self.last_reasoning_tokens,
         )
@@ -1097,7 +1093,8 @@ impl App {
         };
         let elapsed = start.elapsed();
         let dur_str = format_duration(elapsed);
-        if let Some(Entry::Reasoning(s)) = self.transcript.last_mut() {
+        if let Some(EntryKind::Reasoning(s)) = self.state.transcript.last_mut().map(|e| &mut e.kind)
+        {
             // Prepend the footer so it renders at the top of the think block.
             s.insert_str(0, &format!("Thought: {dur_str}\n\n"));
         }
@@ -1113,9 +1110,9 @@ impl App {
         match ev {
             AgentEvent::Text(t) => {
                 self.count_token();
-                match self.transcript.last_mut() {
-                    Some(Entry::Assistant(s)) => s.push_str(&t),
-                    _ => self.push_entry(Entry::Assistant(t)),
+                match self.state.transcript.last_mut().map(|e| &mut e.kind) {
+                    Some(EntryKind::Assistant(s)) => s.push_str(&t),
+                    _ => self.push_entry(Entry::assistant(t)),
                 }
             }
             AgentEvent::Reasoning(t) => {
@@ -1123,9 +1120,9 @@ impl App {
                 if self.reasoning_start.is_none() {
                     self.reasoning_start = Some(Instant::now());
                 }
-                match self.transcript.last_mut() {
-                    Some(Entry::Reasoning(s)) => s.push_str(&t),
-                    _ => self.push_entry(Entry::Reasoning(t)),
+                match self.state.transcript.last_mut().map(|e| &mut e.kind) {
+                    Some(EntryKind::Reasoning(s)) => s.push_str(&t),
+                    _ => self.push_entry(Entry::reasoning(t)),
                 }
             }
             AgentEvent::Usage {
@@ -1134,36 +1131,28 @@ impl App {
                 cached_prompt_tokens,
                 reasoning_tokens,
             } => {
-                self.last_usage = Some((prompt_tokens, completion_tokens));
+                self.state
+                    .usage
+                    .record_call(prompt_tokens, completion_tokens);
                 self.last_cached_tokens = cached_prompt_tokens;
                 self.last_reasoning_tokens = reasoning_tokens;
-                self.session_in += prompt_tokens as usize;
-                self.session_out += completion_tokens as usize;
             }
             AgentEvent::ToolStart { id, name, args } => {
                 // A `task` call opens a live entry in the sub-agent panel.
                 if name == "task" {
                     self.subagent_panel.on_tool_start(id.clone());
                 }
-                self.push_entry(Entry::Tool {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args,
-                    result: String::new(),
-                    ok: true,
-                    done: false,
-                    expanded: false,
-                });
+                self.push_entry(Entry::tool_running(id.clone(), name.clone(), args));
             }
             AgentEvent::ToolOutput { id, chunk } => {
                 // Append live output to the running tool's entry.
-                for entry in self.transcript.iter_mut().rev() {
-                    if let Entry::Tool {
+                for entry in self.state.transcript.iter_mut().rev() {
+                    if let EntryKind::Tool {
                         id: tid,
                         result: r,
                         done,
                         ..
-                    } = entry
+                    } = &mut entry.kind
                         && *tid == id
                         && !*done
                     {
@@ -1181,14 +1170,14 @@ impl App {
                 ok,
                 name: _,
             } => {
-                for entry in self.transcript.iter_mut().rev() {
-                    if let Entry::Tool {
+                for entry in self.state.transcript.iter_mut().rev() {
+                    if let EntryKind::Tool {
                         id: tid,
                         result: r,
                         ok: o,
                         done,
                         ..
-                    } = entry
+                    } = &mut entry.kind
                         && *tid == id
                         && !*done
                     {
@@ -1203,7 +1192,7 @@ impl App {
                 self.subagent_panel.on_tool_end(&id);
             }
             AgentEvent::Notice(text) => {
-                self.push_entry(Entry::System(text));
+                self.push_entry(Entry::system(text));
                 // Do NOT reset scroll_offset: notices (MCP warnings, health
                 // alerts, step-budget exhaustion) are passive async lines. When
                 // the user is scrolled up, the new line appends without moving

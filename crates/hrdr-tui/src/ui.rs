@@ -12,8 +12,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
+use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
 use hrdr_app::{
     PanelHit, PanelItem, panel_item_body, panel_item_header, panel_item_rows, panel_items,
@@ -430,7 +431,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
         _ => 0.0,
     };
 
-    let ctx = match app.last_usage {
+    let ctx = match app.state.usage.last() {
         Some((prompt, completion)) => {
             let ratio = if completion > 0 {
                 prompt as f64 / completion as f64
@@ -578,13 +579,13 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
     let inputs = hrdr_app::StatusInputs {
         dir: &app.dir,
         branch: app.branch.as_deref(),
-        tokens_in: app.session_in,
-        tokens_out: app.session_out,
-        ctx_used: app.last_usage.map(|(p, _)| p as usize).unwrap_or(0),
-        context_window: app.context_window,
+        tokens_in: app.state.usage.tokens_in,
+        tokens_out: app.state.usage.tokens_out,
+        ctx_used: app.state.usage.ctx_used(),
+        context_window: app.state.usage.context_window,
         auto_compact_enabled: app.auto_compact_enabled,
         compaction_reserved: app.compaction_reserved,
-        model: &app.model,
+        model: &app.state.model,
         effort: app.effort.as_deref(),
         ttft,
         nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,
@@ -831,7 +832,6 @@ fn highlight_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec
 }
 
 fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Line<'static>> {
-    let bg_only = Style::default().bg(bg);
     let w = width as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -839,7 +839,7 @@ fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Li
     if !lang.is_empty() {
         out.push(pad_line(
             vec![Span::styled(
-                format!(" {lang} "),
+                format!("{lang} "),
                 Style::default()
                     .fg(Color::Gray)
                     .bg(bg)
@@ -849,47 +849,323 @@ fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Li
             bg,
         ));
     }
-
-    // Incremental: a streaming block only highlights its new lines per frame
-    // (the shared cache resumes syntect state from the last call).
-    let hl_lines = INC_HL.with(|c| c.borrow_mut().highlight(lang, content));
-    for ranges in hl_lines {
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(" ", bg_only)]; // left gutter
-        for (style, piece) in ranges {
-            let piece = piece.trim_end_matches(['\n', '\r']);
-            if piece.is_empty() {
-                continue;
-            }
-            let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-            spans.push(Span::styled(
-                piece.to_string(),
-                Style::default().fg(fg).bg(bg),
-            ));
-        }
-        out.push(pad_line(spans, w, bg));
+    for line in highlight_lines(lang, content, bg) {
+        out.push(pad_line(line.spans, w, bg));
     }
     out
 }
 
-/// Pad a line of spans to full `width` with `bg`-coloured spaces. A leading
-/// bg space is always prepended for the block's left padding.
-fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
-    spans.insert(0, Span::styled(" ", Style::default().bg(bg)));
-    let used: usize = spans.iter().map(Span::width).sum();
-    if used < width {
-        spans.push(Span::styled(
-            " ".repeat(width - used),
-            Style::default().bg(bg),
-        ));
-    }
-    Line::from(spans)
+/// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
+/// `Line` per source line, no gutter and no width fill. Callers that want a
+/// solid code rectangle (fenced markdown blocks) pad it themselves; callers
+/// rendering into an already-padded block (the `write` tool body) use it as-is.
+fn highlight_lines(lang: &str, content: &str, bg: Color) -> Vec<Line<'static>> {
+    // Incremental: a streaming block only highlights its new lines per frame
+    // (the shared cache resumes syntect state from the last call).
+    let hl_lines = INC_HL.with(|c| c.borrow_mut().highlight(lang, content));
+    hl_lines
+        .into_iter()
+        .map(|ranges| {
+            let spans: Vec<Span<'static>> = ranges
+                .into_iter()
+                .filter_map(|(style, piece)| {
+                    let piece = piece.trim_end_matches(['\n', '\r']);
+                    if piece.is_empty() {
+                        return None;
+                    }
+                    let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                    Some(Span::styled(
+                        piece.to_string(),
+                        Style::default().fg(fg).bg(bg),
+                    ))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
-/// Pad every line in `lines` to full `width` with `bg`-colored spaces.
-fn pad_lines(lines: &mut Vec<Line<'static>>, width: usize, bg: Color) {
-    for line in lines {
-        *line = pad_line(std::mem::take(line).spans, width, bg);
+// ── Session header ─────────────────────────────────────────────────────────
+
+/// Columns between the logo and the details column.
+const HEADER_GAP: usize = 4;
+
+/// Width of the details column's key field; values start after it, so they all
+/// line up regardless of key length.
+const DETAIL_KEY_W: usize = 9;
+
+/// The cursor path the splash animation traces through `art`: every glyph cell,
+/// column by column, so the highlight sweeps left-to-right across the letters.
+///
+/// Derived from the art rather than hand-listed (as `hjkl_splash::presets` does)
+/// so changing the art can't silently desynchronise the two. Recomputed per
+/// frame — it's a hundred-odd cells, and caching it globally would pin the first
+/// art the process ever rendered.
+fn logo_path(art: &str) -> Vec<(u8, u8, char)> {
+    let rows: Vec<Vec<char>> = art.lines().map(|l| l.chars().collect()).collect();
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut path = Vec::new();
+    for col in 0..cols {
+        for (row_idx, row) in rows.iter().enumerate() {
+            match row.get(col) {
+                Some(&ch) if !ch.is_whitespace() => path.push((row_idx as u8, col as u8, ch)),
+                _ => {}
+            }
+        }
     }
+    path
+}
+
+/// Rows and columns `art` occupies.
+fn logo_size(art: &str) -> (u16, u16) {
+    let rows = art.lines().count() as u16;
+    let cols = art.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    (rows, cols)
+}
+
+/// The session banner: the animated logo on the left, session details on the
+/// right. `anchor` is the app's persistent animation clock — passing
+/// `Instant::now()` here would re-anchor every frame and freeze the tick at 0.
+fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'static>> {
+    use hjkl_splash::{CellKind, Layout, Rgb, Splash, default_trail_color};
+
+    let theme = &app.theme;
+    let art = app.logo;
+    let (rows, cols) = logo_size(art);
+    let path = logo_path(art);
+    let splash = Splash::new(art, &path).with_anchor(anchor);
+    let layout = Layout {
+        origin_x: 0,
+        origin_y: 0,
+        rows,
+        cols,
+    };
+
+    // Paint the animation's cells into a grid, then flatten each row to a Line.
+    // `cells()` yields art first, then the trail (oldest → cursor), and later
+    // cells overwrite earlier ones — so a plain grid write in iteration order
+    // gives the same result the crate's own renderer produces.
+    let blank = (' ', Style::default().fg(theme.dim));
+    let mut grid = vec![vec![blank; cols as usize]; rows as usize];
+    let rgb = |Rgb(r, g, b): Rgb| Color::Rgb(r, g, b);
+    for cell in splash.cells(layout) {
+        let (Some(row), true) = (grid.get_mut(cell.y as usize), cell.x < cols) else {
+            continue;
+        };
+        let style = match cell.kind {
+            CellKind::Art => Style::default().fg(theme.dim),
+            CellKind::Trail { age } => Style::default().fg(rgb(default_trail_color(age))),
+            CellKind::Cursor => Style::default().fg(theme.user).bold(),
+        };
+        row[cell.x as usize] = (cell.ch, style);
+    }
+
+    // The details column, beside the logo. Every row is a `key value` pair on
+    // the same two columns, so the values line up down the block.
+    let key = Style::default().fg(theme.dim);
+    let val = Style::default().fg(theme.assistant);
+    let mut details: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut field = |name: &str, value: String, style: Style| {
+        details.push(vec![
+            Span::styled(format!("{name:<w$}", w = DETAIL_KEY_W), key),
+            Span::styled(value, style),
+        ]);
+    };
+    field(
+        "version",
+        env!("CARGO_PKG_VERSION").to_string(),
+        Style::default().fg(theme.user).bold(),
+    );
+    field("model", app.state.model.clone(), val);
+    field(
+        "provider",
+        app.state.provider.clone().unwrap_or_else(|| "—".into()),
+        val,
+    );
+    if let Some(e) = &app.effort {
+        field("effort", e.clone(), val);
+    }
+    field("cwd", app.dir.clone(), val);
+
+    // Zip the two columns, padding the logo side to a fixed width so the
+    // details always start at the same column.
+    let logo_w = cols as usize + HEADER_GAP;
+    let inner = inner_width(width as usize) as usize;
+    (0..grid.len().max(details.len()))
+        .map(|i| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0;
+            if let Some(row) = grid.get(i) {
+                for (ch, style) in row {
+                    spans.push(Span::styled(ch.to_string(), *style));
+                }
+                used = cols as usize;
+            }
+            if let Some(detail) = details.get(i)
+                && !detail.is_empty()
+            {
+                // Skip the details entirely on a viewport too narrow for them.
+                if logo_w + 12 <= inner {
+                    spans.push(Span::raw(" ".repeat(logo_w - used)));
+                    spans.extend(detail.iter().cloned());
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+// ── Block rendering ────────────────────────────────────────────────────────
+//
+// Every transcript entry is a *block*: a full-width rectangle on its own
+// background with one column of padding on the left/right and one blank row
+// above/below. `render_block` is the single code path all entry kinds go
+// through, so a change to block chrome lands everywhere at once.
+
+/// Columns of padding between a block's edge and its content, per side.
+const BLOCK_PAD_X: usize = 1;
+
+/// The visual identity of a transcript block. `bg` is the only thing that
+/// varies between kinds today; text styling is decided by each body builder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// The session banner: animated logo + session details.
+    Header,
+    User,
+    Assistant,
+    Reasoning,
+    Tool,
+    /// Slash-command output and system notices (`/diff`, `/sessions`, …).
+    Command,
+    /// The per-turn stats line.
+    Stats,
+    /// A queued user message, awaiting its turn.
+    Queued,
+}
+
+impl BlockKind {
+    /// The block's background. This is the override point: give a kind its own
+    /// theme slot here and every line it renders picks it up.
+    fn bg(self, theme: &Theme) -> Color {
+        match self {
+            BlockKind::Header => theme.header_bg,
+            BlockKind::User | BlockKind::Queued => theme.user_bg,
+            BlockKind::Tool => theme.tool_bg,
+            BlockKind::Command => theme.command_bg,
+            // Reasoning shares the assistant background: it's the same voice,
+            // just quieter text.
+            BlockKind::Assistant | BlockKind::Reasoning => theme.assistant_bg,
+            BlockKind::Stats => theme.stats_bg,
+        }
+    }
+}
+
+/// Width available to a block's *content*, i.e. minus the horizontal padding.
+fn inner_width(width: usize) -> u16 {
+    width.saturating_sub(BLOCK_PAD_X * 2).max(1) as u16
+}
+
+/// Wrap `body` (built at [`inner_width`]) in the shared block chrome: a blank
+/// padded row above and below, and one padded column either side, all filled
+/// with `bg`. Empty bodies render nothing.
+fn render_block(body: Vec<Line<'static>>, width: usize, bg: Color) -> Vec<Line<'static>> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let inner = inner_width(width) as usize;
+    let mut out = Vec::with_capacity(body.len() + 2);
+    out.push(pad_line(Vec::new(), width, bg));
+    for mut line in body {
+        // Body spans inherit the block's background unless they set their own
+        // (a fenced code block inside a message keeps its distinct bg).
+        for span in &mut line.spans {
+            if span.style.bg.is_none() {
+                span.style = span.style.bg(bg);
+            }
+        }
+        // Wrap to the content width here rather than letting ratatui re-wrap the
+        // padded line: its continuation rows would start at column 0, outside
+        // the block's padding and background.
+        for rows in wrap_spans(line.spans, inner) {
+            out.push(pad_line(rows, width, bg));
+        }
+    }
+    out.push(pad_line(Vec::new(), width, bg));
+    out
+}
+
+/// Wrap `spans` to `max_w` display columns, preferring to break at the last
+/// whitespace on the row and falling back to a hard break for a single word
+/// longer than the row. Each returned row is a fresh span vector carrying the
+/// original styles.
+fn wrap_spans(spans: Vec<Span<'static>>, max_w: usize) -> Vec<Vec<Span<'static>>> {
+    let total: usize = spans.iter().map(Span::width).sum();
+    if total <= max_w {
+        return vec![spans];
+    }
+    // Flatten to styled characters — the only representation where a break can
+    // land mid-span.
+    let chars: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        // Advance by display columns, not chars: a CJK glyph is two columns
+        // wide, and overshooting would push the row past the block's padding.
+        let mut end = start;
+        let mut used = 0usize;
+        while end < chars.len() {
+            let cw = UnicodeWidthChar::width(chars[end].0).unwrap_or(0);
+            if used + cw > max_w {
+                break;
+            }
+            used += cw;
+            end += 1;
+        }
+        // A single glyph wider than the row would loop forever otherwise.
+        if end == start {
+            end += 1;
+        }
+        if end < chars.len() {
+            // Break after the last space that fits, when there is one.
+            if let Some(pos) = chars[start..end]
+                .iter()
+                .rposition(|(c, _)| c.is_whitespace())
+            {
+                end = start + pos + 1;
+            }
+        }
+        rows.push(spans_from_chars(&chars[start..end]));
+        start = end;
+    }
+    rows
+}
+
+/// Rebuild spans from styled characters, coalescing runs that share a style.
+fn spans_from_chars(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for &(c, style) in chars {
+        match out.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push(c),
+            _ => out.push(Span::styled(c.to_string(), style)),
+        }
+    }
+    out
+}
+
+/// Pad a line of spans to full `width` with `bg`-coloured spaces: `BLOCK_PAD_X`
+/// leading columns, then a right fill.
+fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let bg_only = Style::default().bg(bg);
+    spans.insert(0, Span::styled(" ".repeat(BLOCK_PAD_X), bg_only));
+    let used: usize = spans.iter().map(Span::width).sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), bg_only));
+    }
+    Line::from(spans)
 }
 
 /// Compute a stable fingerprint for the content-dependent parts of a transcript
@@ -898,14 +1174,16 @@ fn pad_lines(lines: &mut Vec<Line<'static>>, width: usize, bg: Color) {
 /// is intentionally excluded so timestamp-only frames still get cache hits.
 fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
     let mut h = DefaultHasher::new();
-    match entry {
-        Entry::User(t)
-        | Entry::Assistant(t)
-        | Entry::Reasoning(t)
-        | Entry::System(t)
-        | Entry::Stats(t)
-        | Entry::Diff(t) => t.hash(&mut h),
-        Entry::Tool {
+    match &entry.kind {
+        // The header animates and reads live session state; it is never cached.
+        EntryKind::Header => {}
+        EntryKind::User(t)
+        | EntryKind::Assistant(t)
+        | EntryKind::Reasoning(t)
+        | EntryKind::System(t)
+        | EntryKind::Stats(t)
+        | EntryKind::Diff(t) => t.hash(&mut h),
+        EntryKind::Tool {
             name,
             args,
             result,
@@ -994,27 +1272,39 @@ fn transcript_lines(
     let mut tool_regions: Vec<(usize, usize, usize)> = Vec::new();
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
-    let meta = |out: &mut Vec<Line<'static>>, i: usize, num: usize, role: &str| {
+    // The `#N you · 2m ago` row that closes a message block, preceded by a blank
+    // row separating it from the message. Both are block *body* lines (not
+    // chrome outside the block), so they sit on the block's background like
+    // everything else. Kept out of the render cache: the relative time changes
+    // every frame.
+    let meta = |i: usize, num: usize, role: &str| -> Vec<Line<'static>> {
         if app.timestamp_style == TimestampStyle::None {
-            return;
+            return Vec::new();
         }
         let time = app
-            .entry_times
+            .state
+            .transcript
             .get(i)
-            .map(|t| {
+            .map(|e| {
                 if app.timestamp_style == TimestampStyle::Relative {
-                    relative_time(*t)
+                    relative_time(e.time)
                 } else {
-                    t.format("%H:%M").to_string()
+                    e.time.format("%H:%M").to_string()
                 }
             })
             .unwrap_or_default();
-        out.push(Line::from(Span::styled(
-            format!("#{num} {role} · {time}"),
-            Style::default().fg(theme.dim),
-        )));
+        vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                format!("#{num} {role} · {time}"),
+                Style::default().fg(theme.dim),
+            )),
+        ]
     };
-    for (i, entry) in app.transcript.iter().enumerate() {
+    // Block width and the width its content is laid out at (minus padding).
+    let w = width as usize;
+    let inner = inner_width(w);
+    for (i, entry) in app.state.transcript.iter().enumerate() {
         // Cache key shared by all arms (Reasoning skip happens before this).
         let ck = (
             i,
@@ -1023,119 +1313,62 @@ fn transcript_lines(
             app.expand_tools,
             app.show_reasoning,
         );
-        match entry {
-            Entry::User(text) => {
+        // Every arm produces (kind, header rows, cached body rows, footer rows)
+        // and is then funneled through the one `render_block` call below — no
+        // entry paints its own chrome.
+        let mut header: Vec<Line<'static>> = Vec::new();
+        let mut footer: Vec<Line<'static>> = Vec::new();
+        let (kind, body) = match &entry.kind {
+            // Rebuilt every frame: the logo animation advances with the wall
+            // clock, and the details mirror the live model/provider.
+            EntryKind::Header => (
+                BlockKind::Header,
+                header_lines(app, app.header_anchor, width),
+            ),
+            EntryKind::User(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
-                meta(&mut out, i, msg_num, "you");
-                let user_color = theme.user;
-                let user_bg = theme.user_bg;
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    push_text(
-                        &mut buf,
-                        Span::raw(""),
-                        text,
-                        Style::default().fg(user_color).bg(user_bg),
-                    );
-                    pad_lines(&mut buf, w, user_bg);
-                    buf
-                }));
+                footer.extend(meta(i, msg_num, "you"));
+                let (fg, bg) = (theme.user, BlockKind::User.bg(theme));
+                let body = cache_entry(ck, || text_lines(text, Style::default().fg(fg).bg(bg)));
+                (BlockKind::User, body)
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
             // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
             // out and syntax-highlighted with syntect on a distinct background.
-            Entry::Assistant(text) => {
+            EntryKind::Assistant(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
-                meta(&mut out, i, msg_num, "assistant");
-                let md_theme_c = md_theme.clone();
-                let tool_bg = theme.tool_bg;
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
-                    for ev in hjkl_markdown::parse(text) {
-                        if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
-                            if !ev_buf.is_empty() {
-                                buf.extend(hjkl_markdown_tui::to_lines(
-                                    &ev_buf,
-                                    &md_theme_c,
-                                    width.max(1),
-                                ));
-                                ev_buf.clear();
-                            }
-                            buf.extend(highlight_code_block(
-                                &lang,
-                                &content,
-                                width.max(1),
-                                tool_bg,
-                            ));
-                        } else {
-                            ev_buf.push(ev);
-                        }
-                    }
-                    if !ev_buf.is_empty() {
-                        buf.extend(hjkl_markdown_tui::to_lines(
-                            &ev_buf,
-                            &md_theme_c,
-                            width.max(1),
-                        ));
-                    }
-                    pad_lines(&mut buf, w, Color::Reset);
-                    buf
-                }));
+                footer.extend(meta(i, msg_num, "assistant"));
+                let md = md_theme.clone();
+                let code_bg = theme.tool_bg;
+                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                (BlockKind::Assistant, body)
             }
-            Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
-            Entry::Reasoning(text) => {
-                let dim = theme.dim;
-                let w = width as usize;
-                let is_streaming =
-                    app.running && app.reasoning_start.is_some() && i == app.transcript.len() - 1;
+            EntryKind::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
+            EntryKind::Reasoning(text) => {
+                let is_streaming = app.running
+                    && app.reasoning_start.is_some()
+                    && i == app.state.transcript.len() - 1;
+                // The thinking spinner animates, so it's a header row rather
+                // than part of the cached body.
                 if is_streaming && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed()) {
                     let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
-                    out.push(Line::from(Span::styled(
-                        format!(" {frame} Thinking"),
-                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                    header.push(Line::from(Span::styled(
+                        format!("{frame} Thinking"),
+                        Style::default()
+                            .fg(theme.dim)
+                            .add_modifier(Modifier::ITALIC),
                     )));
                 }
-                // Same markdown pipeline as assistant, but fully dimmed.
-                let dim_md = hjkl_markdown_tui::MdTheme::new(
-                    dim, dim, dim, dim, dim, dim, dim, dim, dim, dim,
-                );
-                let tool_bg = theme.tool_bg;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
-                    for ev in hjkl_markdown::parse(text) {
-                        if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
-                            if !ev_buf.is_empty() {
-                                buf.extend(hjkl_markdown_tui::to_lines(
-                                    &ev_buf,
-                                    &dim_md,
-                                    width.max(1),
-                                ));
-                                ev_buf.clear();
-                            }
-                            buf.extend(highlight_code_block(
-                                &lang,
-                                &content,
-                                width.max(1),
-                                tool_bg,
-                            ));
-                        } else {
-                            ev_buf.push(ev);
-                        }
-                    }
-                    if !ev_buf.is_empty() {
-                        buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, &dim_md, width.max(1)));
-                    }
-                    pad_lines(&mut buf, w, Color::Reset);
-                    buf
-                }));
+                // Same markdown pipeline as assistant, in the same colors —
+                // only dimmer, so thoughts read as a quieter version of output.
+                let md = theme.md_theme_dim();
+                let code_bg = theme.tool_bg;
+                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                (BlockKind::Reasoning, body)
             }
-            Entry::Tool {
+            EntryKind::Tool {
                 name,
                 args,
                 result,
@@ -1144,16 +1377,12 @@ fn transcript_lines(
                 expanded,
                 ..
             } => {
-                let start = out.len();
                 let expand = *expanded || app.expand_tools;
                 let (ok_v, done_v) = (*ok, *done);
                 let (name_s, args_s, result_s) = (name.clone(), args.clone(), result.clone());
                 let theme_snap = theme.clone();
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    push_tool(
-                        &mut buf,
+                let body = cache_entry(ck, || {
+                    tool_lines(
                         &theme_snap,
                         &name_s,
                         &args_s,
@@ -1161,59 +1390,48 @@ fn transcript_lines(
                         ok_v,
                         done_v,
                         expand,
-                        w,
-                    );
-                    buf
-                }));
-                tool_regions.push((start, out.len(), i));
+                    )
+                });
+                (BlockKind::Tool, body)
             }
-            Entry::System(text) => {
+            // Slash-command output reads like assistant output — same markdown,
+            // same colors, no dimming — on its own background.
+            EntryKind::System(text) => {
+                let md = md_theme.clone();
+                let code_bg = theme.tool_bg;
+                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                (BlockKind::Command, body)
+            }
+            EntryKind::Stats(text) => {
                 let dim = theme.dim;
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    push_text(
-                        &mut buf,
-                        Span::raw(""),
-                        text,
-                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
-                    );
-                    pad_lines(&mut buf, w, Color::Reset);
-                    buf
-                }));
+                let body = cache_entry(ck, || text_lines(text, Style::default().fg(dim)));
+                (BlockKind::Stats, body)
             }
-            Entry::Stats(text) => {
-                let dim = theme.dim;
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    push_text(
-                        &mut buf,
-                        Span::styled("└ ", Style::default().fg(dim)),
-                        text,
-                        Style::default().fg(dim),
-                    );
-                    pad_lines(&mut buf, w, Color::Reset);
-                    buf
-                }));
-            }
-            Entry::Diff(text) => {
+            // `/diff` is slash-command output too, but with diff coloring
+            // instead of markdown.
+            EntryKind::Diff(text) => {
                 let theme_snap = theme.clone();
-                let w = width as usize;
-                out.extend(cache_entry(ck, || {
-                    let mut buf = Vec::new();
-                    for line in text.lines() {
-                        buf.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(diff_line_color(line, &theme_snap)),
-                        )));
-                    }
-                    pad_lines(&mut buf, w, Color::Reset);
-                    buf
-                }));
+                let body = cache_entry(ck, || {
+                    text.lines()
+                        .map(|line| {
+                            Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(diff_line_color(line, &theme_snap)),
+                            ))
+                        })
+                        .collect()
+                });
+                (BlockKind::Command, body)
             }
+        };
+        let start = out.len();
+        header.extend(body);
+        header.extend(footer);
+        out.extend(render_block(header, w, kind.bg(theme)));
+        if matches!(entry.kind, EntryKind::Tool { .. }) {
+            tool_regions.push((start, out.len(), i));
         }
-        out.push(Line::raw(""));
+        // One blank row between blocks; each block carries its own top/bottom pad.
         out.push(Line::raw(""));
     }
 
@@ -1234,58 +1452,65 @@ fn transcript_lines(
         }
     }
 
-    // Pending queued messages render like user prompts, with a "Queued"
-    // badge on a distinct background at the bottom of each block.
+    // Pending queued messages render like user prompts, with a "Queued" badge
+    // as the block's last row — through the same block path as everything else,
+    // so they pick up the same padding and background.
     if !app.queue.is_empty() {
-        let q_badge_bg = theme.warn;
-        let q_badge_fg = Color::Black;
-        let user_bg = theme.user_bg;
-        let user_fg = theme.user;
-        let w = width as usize;
+        let bg = BlockKind::Queued.bg(theme);
+        let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
         for msg in &app.queue {
+            let mut body = text_lines(msg, Style::default().fg(theme.user).bg(bg));
+            body.push(Line::from(Span::styled(" Queued ", badge)));
+            out.extend(render_block(body, w, bg));
             out.push(Line::raw(""));
-            let start = out.len();
-            push_text(
-                &mut out,
-                Span::raw(""),
-                msg,
-                Style::default().fg(user_fg).bg(user_bg),
-            );
-            // Pad the message lines to full block width with user_bg.
-            for line in &mut out[start..] {
-                *line = pad_line(std::mem::take(line).spans, w, user_bg);
-            }
-            // "Queued" badge — padded to full width on its own bg.
-            out.push(pad_line(
-                vec![Span::styled(
-                    "  Queued",
-                    Style::default().fg(q_badge_fg).bg(q_badge_bg).bold(),
-                )],
-                w,
-                q_badge_bg,
-            ));
         }
     }
 
     (out, msg_starts, tool_regions)
 }
 
-fn push_text(out: &mut Vec<Line<'static>>, prefix: Span<'static>, text: &str, style: Style) {
-    for (i, raw) in text.split('\n').enumerate() {
-        if i == 0 {
-            out.push(Line::from(vec![
-                prefix.clone(),
-                Span::styled(raw.to_string(), style),
-            ]));
-        } else {
-            out.push(Line::from(Span::styled(raw.to_string(), style)));
-        }
-    }
+/// Split plain text into styled block-body lines (no padding — [`render_block`]
+/// adds that).
+fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|raw| Line::from(Span::styled(raw.to_string(), style)))
+        .collect()
 }
 
+/// Render markdown into block-body lines: prose through hjkl-markdown, fenced
+/// code blocks pulled out and syntax-highlighted on `code_bg`. Shared by the
+/// assistant and reasoning blocks (which differ only in `md`'s colors).
+fn markdown_lines(
+    text: &str,
+    md: &hjkl_markdown_tui::MdTheme,
+    code_bg: Color,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut buf = Vec::new();
+    let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
+    for ev in hjkl_markdown::parse(text) {
+        if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
+            if !ev_buf.is_empty() {
+                buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));
+                ev_buf.clear();
+            }
+            buf.extend(highlight_code_block(&lang, &content, width.max(1), code_bg));
+        } else {
+            ev_buf.push(ev);
+        }
+    }
+    if !ev_buf.is_empty() {
+        buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));
+    }
+    buf
+}
+
+/// Block body for one tool call: a status header (`… / ✓ / ✗` + tool name +
+/// headline) followed by tool-specific detail — the command and its output for
+/// shell calls, the file contents for `write`, the patch for `edit`/`patch`,
+/// the tail of the file for `read`, plain output otherwise.
 #[allow(clippy::too_many_arguments)]
-fn push_tool(
-    out: &mut Vec<Line<'static>>,
+fn tool_lines(
     theme: &Theme,
     name: &str,
     args: &str,
@@ -1293,11 +1518,8 @@ fn push_tool(
     ok: bool,
     done: bool,
     expanded: bool,
-    width: usize,
-) {
-    // Tool blocks sit on the shared panel background (like code blocks), so each
-    // line's spans carry `bg` and are padded out to the full width.
-    let bg = theme.tool_bg;
+) -> Vec<Line<'static>> {
+    let bg = BlockKind::Tool.bg(theme);
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
     let mark = if !done {
         ("…", theme.warn)
@@ -1306,47 +1528,55 @@ fn push_tool(
     } else {
         ("✗", theme.error)
     };
-    // Shell tools (bash, powershell) render the command on its own line below the
-    // header, like an actual shell prompt — more readable than truncating inline.
-    let is_shell = matches!(name, "bash" | "powershell");
-    let is_read = name == "read";
-    let args_preview = if is_read {
-        read_args_summary(args)
-    } else {
-        hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW)
-    };
-
-    // Header line: mark name args — pad_line prepends the left-padding space.
-    out.push(pad_line(
-        vec![
-            Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
-            Span::styled(
-                name.to_string(),
-                Style::default().fg(theme.warn).bg(bg).bold(),
-            ),
-            if is_shell {
-                Span::styled("", dim_bg)
-            } else {
-                Span::styled(format!(" {args_preview}"), dim_bg)
-            },
-        ],
-        width,
-        bg,
-    ));
-
-    // Shell tools: render the raw command on its own line (monospaced feel).
-    if let Some(cmd) = hrdr_app::extract_shell_command(name, args) {
-        out.push(pad_line(
-            vec![Span::styled(format!("$ {cmd}"), dim_bg)],
-            width,
-            bg,
-        ));
+    let disp = hrdr_app::tool_display(name, args);
+    let mut header = vec![
+        Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(theme.warn).bg(bg).bold(),
+        ),
+    ];
+    if !disp.headline.is_empty() {
+        header.push(Span::styled(format!(" {}", disp.headline), dim_bg));
     }
+    let mut out: Vec<Line<'static>> = vec![Line::from(header)];
+
+    // The `write` body is the file contents from the args, not the result diff.
+    // Rendered raw — no gutter, no width fill, no language bar: the block's own
+    // padding is the only indent, so the contents read as the file's own text.
+    if let hrdr_app::ToolBody::Code { lang, content } = &disp.body {
+        let mut code = highlight_lines(lang, content, bg);
+        if !expanded && code.len() > DIFF_PREVIEW_LINES {
+            let extra = code.len() - DIFF_PREVIEW_LINES;
+            code.truncate(DIFF_PREVIEW_LINES);
+            code.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
+        }
+        out.extend(code);
+        // Only the failure is worth showing; the success diff duplicates the
+        // contents we just rendered.
+        if done && !ok {
+            out.extend(text_lines(result, Style::default().fg(theme.error).bg(bg)));
+        }
+        return out;
+    }
+
+    // Shell calls: the command on its own line, like an actual shell prompt.
+    if let hrdr_app::ToolBody::Shell { command } = &disp.body {
+        for (i, line) in command.lines().enumerate() {
+            let prefix = if i == 0 { "$ " } else { "  " };
+            out.push(Line::from(Span::styled(
+                format!("{prefix}{line}"),
+                Style::default().fg(theme.assistant).bg(bg),
+            )));
+        }
+    }
+
     if result.is_empty() {
-        return;
+        return out;
     }
-    // edit/write/patch return a unified diff — color it and show more lines.
-    let is_diff = matches!(name, "edit" | "write" | "patch");
+    let is_diff = disp.body == hrdr_app::ToolBody::Diff;
+    let is_read = disp.body == hrdr_app::ToolBody::Read;
+    // A diff is the point of an edit/patch block, so it gets a taller preview.
     let preview = if is_diff {
         DIFF_PREVIEW_LINES
     } else {
@@ -1357,57 +1587,50 @@ fn push_tool(
         // Finished: show the head of the result (or all of it when expanded).
         // For read tools, show the tail (the actual content read, not preamble).
         let shown = if expanded { lines.len() } else { preview };
-        let render_lines: Box<dyn Iterator<Item = (usize, &str)>> = if is_read {
-            let start = lines.len().saturating_sub(shown);
-            Box::new(lines.iter().copied().enumerate().skip(start))
+        let extra = lines.len().saturating_sub(shown);
+        // read shows the tail, so its hidden lines are *above* the preview —
+        // the hint goes there too. Everything else hides its tail.
+        let (start, end) = if is_read {
+            (extra, lines.len())
         } else {
-            Box::new(lines.iter().copied().enumerate().take(shown))
+            (0, shown.min(lines.len()))
         };
-        for (_orig_idx, line) in render_lines {
+        if extra > 0 && is_read {
+            out.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
+        }
+        for line in &lines[start..end] {
             let color = if is_diff {
                 diff_line_color(line, theme)
             } else {
                 theme.dim
             };
-            out.push(pad_line(
-                vec![Span::styled(
-                    line.to_string(),
-                    Style::default().fg(color).bg(bg),
-                )],
-                width,
-                bg,
-            ));
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(color).bg(bg),
+            )));
         }
-        let extra = lines.len().saturating_sub(shown);
-        if extra > 0 {
-            let hint = if expanded {
-                "⌃ (click or /expand off to collapse)".to_string()
-            } else {
-                format!("… (+{extra} more lines · click or /expand)")
-            };
-            out.push(pad_line(vec![Span::styled(hint, dim_bg)], width, bg));
+        if extra > 0 && !is_read {
+            out.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
         }
     } else {
         // Still running: show the live tail so the newest output is visible.
         let start = lines.len().saturating_sub(preview);
         if start > 0 {
-            out.push(pad_line(
-                vec![Span::styled(
-                    format!("⋮ (live · {start} earlier line(s))"),
-                    dim_bg,
-                )],
-                width,
-                bg,
-            ));
+            out.push(Line::from(Span::styled(
+                format!("⋮ (live · {start} earlier line(s))"),
+                dim_bg,
+            )));
         }
         for line in &lines[start..] {
-            out.push(pad_line(
-                vec![Span::styled(line.to_string(), dim_bg)],
-                width,
-                bg,
-            ));
+            out.push(Line::from(Span::styled(line.to_string(), dim_bg)));
         }
     }
+    out
+}
+
+/// The collapsed-block footer hint.
+fn more_hint(extra: usize) -> String {
+    format!("… (+{extra} more lines · click or /expand)")
 }
 
 /// Color for one unified-diff line: additions green, deletions red, hunk
@@ -1418,26 +1641,6 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,
     )
-}
-
-/// Extract a compact summary from read tool args: "path  (offset: N, limit: M)".
-fn read_args_summary(args: &str) -> String {
-    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-    let offset = v.get("offset").and_then(|o| o.as_u64());
-    let limit = v.get("limit").and_then(|l| l.as_u64());
-    let mut s = path.to_string();
-    let mut parts = Vec::new();
-    if let Some(o) = offset.filter(|&o| o > 1) {
-        parts.push(format!("offset: {o}"));
-    }
-    if let Some(l) = limit {
-        parts.push(format!("limit: {l}"));
-    }
-    if !parts.is_empty() {
-        s.push_str(&format!("  ({})", parts.join(", ")));
-    }
-    s
 }
 
 #[cfg(test)]
@@ -1533,7 +1736,7 @@ mod cache_tests {
     use super::{
         LINE_WRAP_CACHE, TRANSCRIPT_CACHE, cache_entry, cached_line_wrap, entry_content_hash,
     };
-    use crate::app::Entry;
+    use crate::app::{Entry, EntryKind};
     use ratatui::text::{Line, Span};
 
     // ── entry_content_hash ─────────────────────────────────────────────────────
@@ -1546,16 +1749,16 @@ mod cache_tests {
     /// cache, message B would be rendered with A's lines — wrong text displayed.
     #[test]
     fn entry_content_hash_differs_by_text() {
-        let a = Entry::User("hello".to_string());
-        let b = Entry::User("world".to_string());
+        let a = Entry::user("hello");
+        let b = Entry::user("world");
         assert_ne!(
             entry_content_hash(&a, false),
             entry_content_hash(&b, false),
             "User entries with different text must produce different hashes"
         );
 
-        let c = Entry::Assistant("response one".to_string());
-        let d = Entry::Assistant("response two".to_string());
+        let c = Entry::assistant("response one");
+        let d = Entry::assistant("response two");
         assert_ne!(
             entry_content_hash(&c, false),
             entry_content_hash(&d, false),
@@ -1569,7 +1772,7 @@ mod cache_tests {
     /// would be served to the user after they run `/expand all`.
     #[test]
     fn entry_content_hash_tool_expand_flag_changes_hash() {
-        let tool = Entry::Tool {
+        let tool = Entry::now(EntryKind::Tool {
             id: "t1".to_string(),
             name: "bash".to_string(),
             args: "{}".to_string(),
@@ -1577,7 +1780,7 @@ mod cache_tests {
             ok: true,
             done: true,
             expanded: false, // not locally expanded
-        };
+        });
 
         let h_collapsed = entry_content_hash(&tool, false);
         let h_global_expand = entry_content_hash(&tool, true);
@@ -1589,7 +1792,7 @@ mod cache_tests {
 
         // If the Tool is already locally expanded, the effective state is
         // `true` regardless of expand_all → both should hash identically.
-        let tool_local = Entry::Tool {
+        let tool_local = Entry::now(EntryKind::Tool {
             id: "t2".to_string(),
             name: "bash".to_string(),
             args: "{}".to_string(),
@@ -1597,7 +1800,7 @@ mod cache_tests {
             ok: true,
             done: true,
             expanded: true, // locally expanded → effective = true in both cases
-        };
+        });
         assert_eq!(
             entry_content_hash(&tool_local, false),
             entry_content_hash(&tool_local, true),
@@ -1704,5 +1907,370 @@ mod cache_tests {
             "width=2 must produce more rows than width=80 for a 4-char line \
              (got narrow={at_2}, wide={at_80})"
         );
+    }
+}
+
+/// Block chrome + tool detail routing — the parts of the transcript renderer
+/// that don't need a live `App`.
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// Total display width of a rendered line.
+    fn w(line: &Line<'_>) -> usize {
+        line.spans.iter().map(Span::width).sum()
+    }
+
+    /// The rendered text of a line, padding included.
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Every block is padded on all four sides: a blank row above and below, one
+    /// column of background either side of the content, and every row filled to
+    /// the full block width so the background paints a solid rectangle.
+    ///
+    /// Regression: dropping the top/bottom rows (or the right-hand fill) makes
+    /// user prompts and tool blocks bleed into the terminal background — the
+    /// visual separation between transcript entries disappears.
+    #[test]
+    fn render_block_pads_all_four_sides() {
+        let body = vec![Line::from(Span::raw("hi"))];
+        let lines = render_block(body, 10, Color::Blue);
+
+        assert_eq!(lines.len(), 3, "1 body row + a blank row above and below");
+        assert_eq!(text(&lines[0]).trim(), "", "top pad row is blank");
+        assert_eq!(text(&lines[2]).trim(), "", "bottom pad row is blank");
+        assert_eq!(text(&lines[1]), " hi       ", "left pad + right fill");
+        for line in &lines {
+            assert_eq!(w(line), 10, "every row fills the block width");
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg,
+                    Some(Color::Blue),
+                    "every span carries the bg"
+                );
+            }
+        }
+    }
+
+    /// A body line longer than the content width wraps *inside* the block: every
+    /// continuation row keeps the left padding and the background.
+    ///
+    /// Regression: letting ratatui re-wrap the padded line put continuation rows
+    /// at column 0 with no background — the stats line visibly broke out of its
+    /// block.
+    #[test]
+    fn render_block_wraps_long_lines_inside_the_block() {
+        let body = vec![Line::from(Span::raw("aaa bbb ccc ddd"))];
+        let lines = render_block(body, 10, Color::Blue); // content width 8
+        assert!(lines.len() > 3, "the long line wrapped: {lines:?}");
+        for line in &lines {
+            assert_eq!(w(line), 10, "every row still fills the block width");
+            assert!(text(line).starts_with(' '), "left padding on every row");
+            for span in &line.spans {
+                assert_eq!(span.style.bg, Some(Color::Blue));
+            }
+        }
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows[1].trim_end(), " aaa bbb", "breaks at whitespace");
+    }
+
+    /// Wrapping prefers a whitespace break, hard-breaks a word too long to fit,
+    /// and measures in display columns so wide glyphs don't overshoot the row.
+    #[test]
+    fn wrap_spans_breaks_on_words_then_falls_back_to_a_hard_break() {
+        let row_text =
+            |r: &Vec<Span<'static>>| -> String { r.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Short enough: one row, untouched.
+        assert_eq!(wrap_spans(vec![Span::raw("abc")], 8).len(), 1);
+
+        // Word break.
+        let rows = wrap_spans(vec![Span::raw("aaa bbb ccc")], 8);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["aaa bbb ", "ccc"]);
+
+        // No whitespace to break on → hard break at the row width.
+        let rows = wrap_spans(vec![Span::raw("aaaaaaaaaaaa")], 4);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["aaaa", "aaaa", "aaaa"]);
+
+        // CJK glyphs are two columns wide: 2 per 4-column row, not 4.
+        let rows = wrap_spans(vec![Span::raw("日本語だ")], 4);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["日本", "語だ"]);
+        for r in &rows {
+            assert!(r.iter().map(Span::width).sum::<usize>() <= 4);
+        }
+    }
+
+    /// Wrapping preserves each span's style across the break, and coalesces
+    /// same-style runs rather than emitting one span per character.
+    #[test]
+    fn wrap_spans_preserves_styles_across_the_break() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let rows = wrap_spans(
+            vec![Span::styled("aaaa", red), Span::styled("bbbb", blue)],
+            4,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 1, "one coalesced span, not four");
+        assert_eq!(rows[0][0].style.fg, Some(Color::Red));
+        assert_eq!(rows[1][0].style.fg, Some(Color::Blue));
+    }
+
+    /// An empty body renders nothing at all — no stray padded rows for entries
+    /// that produced no content (e.g. an assistant message before its first token).
+    #[test]
+    fn render_block_of_an_empty_body_is_empty() {
+        assert!(render_block(Vec::new(), 20, Color::Reset).is_empty());
+    }
+
+    /// Content is laid out at width minus one padding column per side, so a body
+    /// line that exactly fills `inner_width` still leaves both margins intact.
+    #[test]
+    fn inner_width_reserves_a_column_on_each_side() {
+        assert_eq!(inner_width(10), 8);
+        // Degenerate widths must not underflow or produce a zero-width layout.
+        assert_eq!(inner_width(2), 1);
+        assert_eq!(inner_width(0), 1);
+
+        let body = vec![Line::from(Span::raw("x".repeat(inner_width(10) as usize)))];
+        let lines = render_block(body, 10, Color::Reset);
+        assert_eq!(text(&lines[1]), " xxxxxxxx ", "one bg column either side");
+    }
+
+    /// every content kind resolves its own, visually distinct background, so a
+    /// reader can see where each block starts and stops.
+    #[test]
+    fn block_kinds_have_distinct_backgrounds() {
+        let t = Theme::default();
+        assert_eq!(BlockKind::User.bg(&t), t.user_bg);
+        assert_eq!(BlockKind::Tool.bg(&t), t.tool_bg);
+        assert_eq!(BlockKind::Assistant.bg(&t), t.assistant_bg);
+        // Reasoning is the assistant's voice, just quieter — same background.
+        assert_eq!(BlockKind::Reasoning.bg(&t), t.assistant_bg);
+        assert_eq!(BlockKind::Stats.bg(&t), t.stats_bg);
+        assert_eq!(BlockKind::Header.bg(&t), t.header_bg);
+
+        let bgs = [
+            BlockKind::Header.bg(&t),
+            BlockKind::User.bg(&t),
+            BlockKind::Assistant.bg(&t),
+            BlockKind::Tool.bg(&t),
+            BlockKind::Command.bg(&t),
+            BlockKind::Stats.bg(&t),
+        ];
+        for (i, a) in bgs.iter().enumerate() {
+            assert_ne!(*a, Color::Reset, "content blocks carry their own bg");
+            for b in &bgs[i + 1..] {
+                assert_ne!(a, b, "block backgrounds must differ: {bgs:?}");
+            }
+        }
+    }
+
+    /// The tool header always leads with a status mark that reflects the call's
+    /// state: running, succeeded, or failed.
+    #[test]
+    fn tool_header_mark_tracks_call_status() {
+        let t = Theme::default();
+        let head = |ok, done| {
+            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, false);
+            text(&lines[0])
+        };
+        assert!(head(false, false).starts_with('…'), "running");
+        assert!(head(true, true).starts_with('✓'), "succeeded");
+        assert!(head(false, true).starts_with('✗'), "failed");
+        // The headline follows the tool name on the same row.
+        assert!(head(true, true).contains("ls src"));
+    }
+
+    /// Shell calls render the command on its own `$ …` row (continuation rows
+    /// indented), with the command's output below it.
+    #[test]
+    fn shell_tool_shows_the_command_then_its_output() {
+        let t = Theme::default();
+        let lines = tool_lines(
+            &t,
+            "bash",
+            r#"{"command":"ls\nwc -l"}"#,
+            "a.rs\nb.rs",
+            true,
+            true,
+            false,
+        );
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows[0].trim(), "✓ bash", "no args preview on the header");
+        assert_eq!(rows[1], "$ ls");
+        assert_eq!(
+            rows[2], "  wc -l",
+            "continuation lines align under the command"
+        );
+        assert_eq!(rows[3], "a.rs");
+        assert_eq!(rows[4], "b.rs");
+    }
+
+    /// A `write` shows the file name and the contents it wrote — not the unified
+    /// diff the tool returns, which would repeat them.
+    #[test]
+    fn write_tool_shows_the_path_and_the_file_contents() {
+        let t = Theme::default();
+        let args = r#"{"path":"a.rs","content":"fn main() {}\n"}"#;
+        let diff_result = "--- a/a.rs\n+++ b/a.rs\n+fn main() {}";
+        let rows: Vec<String> = tool_lines(&t, "write", args, diff_result, true, true, false)
+            .iter()
+            .map(text)
+            .collect();
+        assert!(rows[0].contains("write a.rs"));
+        // Contents render raw: no gutter, no width fill, no language bar. The
+        // block's own padding is the only indent the reader sees.
+        assert_eq!(rows[1], "fn main() {}", "raw contents: {rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.trim() == "rs"),
+            "no language tag bar: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("+++ b/a.rs")),
+            "the result diff is not repeated: {rows:?}"
+        );
+    }
+
+    /// Indented file contents keep their own indentation exactly — the renderer
+    /// must not add to it, or every written file reads as over-indented.
+    #[test]
+    fn write_tool_preserves_the_files_own_indentation() {
+        let t = Theme::default();
+        let args = r#"{"path":"a.rs","content":"fn main() {\n    let x = 1;\n}"}"#;
+        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, false)
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(rows[1], "fn main() {");
+        assert_eq!(rows[2], "    let x = 1;", "4 spaces, not 5 or 6");
+        assert_eq!(rows[3], "}");
+    }
+
+    /// A failed `write` still surfaces the error the tool returned.
+    #[test]
+    fn failed_write_shows_the_error_result() {
+        let t = Theme::default();
+        let args = r#"{"path":"a.rs","content":"x"}"#;
+        let rows: Vec<String> = tool_lines(&t, "write", args, "Error: denied", false, true, false)
+            .iter()
+            .map(text)
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("Error: denied")), "{rows:?}");
+    }
+
+    /// `edit` colors its result as a unified diff: additions in success green,
+    /// deletions in error red.
+    #[test]
+    fn edit_tool_colors_the_patch() {
+        let t = Theme::default();
+        let args = r#"{"path":"a.rs","old_string":"a","new_string":"b"}"#;
+        let lines = tool_lines(&t, "edit", args, "@@ -1 +1 @@\n-a\n+b", true, true, false);
+        assert!(text(&lines[0]).contains("edit a.rs"));
+        let color = |i: usize| lines[i].spans[0].style.fg;
+        assert_eq!(color(2), Some(t.error), "deletion is red");
+        assert_eq!(color(3), Some(t.success), "addition is green");
+    }
+
+    /// Collapsed results are capped at a preview and advertise the remainder;
+    /// expanding shows every line with no hint.
+    #[test]
+    fn long_results_are_previewed_until_expanded() {
+        let t = Theme::default();
+        let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 5)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let args = r#"{"path":"src"}"#;
+
+        let collapsed = tool_lines(&t, "ls", args, &result, true, true, false);
+        let rows: Vec<String> = collapsed.iter().map(text).collect();
+        assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 1, "{rows:?}");
+        assert!(rows.last().unwrap().contains("+5 more lines"), "{rows:?}");
+
+        let expanded = tool_lines(&t, "ls", args, &result, true, true, true);
+        let rows: Vec<String> = expanded.iter().map(text).collect();
+        assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 5, "{rows:?}");
+        assert!(!rows.last().unwrap().contains("more lines"), "{rows:?}");
+    }
+
+    /// `read` previews the *tail* of its result — the file content, not the
+    /// preamble the tool prints above it.
+    #[test]
+    fn read_tool_previews_the_tail_of_its_result() {
+        let t = Theme::default();
+        let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 3)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let rows: Vec<String> =
+            tool_lines(&t, "read", r#"{"path":"a.rs"}"#, &result, true, true, false)
+                .iter()
+                .map(text)
+                .collect();
+        // 11 result lines, 8 previewed: lines 3..=10, with the hint above them
+        // (for `read` the hidden lines are the ones scrolled off the top).
+        assert!(rows[1].contains("+3 more lines"), "hint above: {rows:?}");
+        assert_eq!(rows[2], "line 3", "{rows:?}");
+        assert_eq!(rows.last().unwrap(), "line 10", "tail is last: {rows:?}");
+        assert!(
+            !rows.iter().any(|r| r == "line 0"),
+            "head dropped: {rows:?}"
+        );
+    }
+
+    /// A running tool shows the live tail of its output, flagged as such.
+    #[test]
+    fn running_tool_shows_the_live_tail() {
+        let t = Theme::default();
+        let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 2)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "bash",
+            r#"{"command":"x"}"#,
+            &result,
+            false,
+            false,
+            false,
+        )
+        .iter()
+        .map(text)
+        .collect();
+        // 10 result lines, 8 shown live: the 2 oldest are summarized instead.
+        assert!(rows[2].contains("live · 2 earlier line(s)"), "{rows:?}");
+        assert_eq!(rows[3], "line 2", "{rows:?}");
+        assert_eq!(rows.last().unwrap(), "line 9", "newest is last: {rows:?}");
+    }
+
+    /// Reasoning uses the same markdown roles as assistant output, only dimmer —
+    /// same hue, lower brightness.
+    #[test]
+    fn reasoning_markdown_is_a_dimmer_assistant() {
+        let t = Theme::default();
+        let (bright, dim) = (t.md_theme(), t.md_theme_dim());
+        assert_ne!(bright.text, dim.text, "reasoning text is dimmed");
+        let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (bright.text, dim.text) else {
+            panic!("default theme resolves to RGB");
+        };
+        assert!(r2 < r1 && g2 < g1 && b2 < b1, "every channel is darkened");
+    }
+
+    /// The animation path covers every glyph cell of whatever art it's given, so
+    /// changing the art can't leave the cursor tracing cells that aren't there.
+    #[test]
+    fn the_logo_path_is_derived_from_the_art() {
+        const ART: &str = "█ █\n███\n█ █";
+        let (rows, cols) = logo_size(ART);
+        let glyphs = ART.chars().filter(|c| !c.is_whitespace()).count();
+        let path = logo_path(ART);
+        assert_eq!(path.len(), glyphs, "one path cell per glyph");
+        for (row, col, _) in &path {
+            assert!((*row as u16) < rows && (*col as u16) < cols, "in bounds");
+        }
     }
 }

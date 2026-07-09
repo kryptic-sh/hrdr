@@ -26,12 +26,20 @@ pub struct ChatPalette {
     pub user_bg: Option<Rgb>,
     /// Assistant message text.
     pub assistant: Option<Rgb>,
+    /// Assistant (and reasoning) block background.
+    pub assistant_bg: Option<Rgb>,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints.
     pub dim: Option<Rgb>,
     /// Attention color: tool names, the inference loader.
     pub warn: Option<Rgb>,
     /// Tool-call block background.
     pub tool_bg: Option<Rgb>,
+    /// Slash-command output block background.
+    pub command_bg: Option<Rgb>,
+    /// Per-turn stats block background.
+    pub stats_bg: Option<Rgb>,
+    /// Session-header (banner) block background.
+    pub header_bg: Option<Rgb>,
     /// Success marks (tool ✓).
     pub success: Option<Rgb>,
     /// Error marks (tool ✗).
@@ -71,11 +79,17 @@ impl ChatPalette {
                 .or_else(|| pal("ui_selection"))
                 .or(Some((0, 48, 60))),
             assistant: t.ui.foreground.map(rgb).or_else(|| pal("fg")),
+            assistant_bg: pal("bg_assistant").or_else(|| pal("ui_cursorline")),
             dim: t.ui.gutter.map(rgb).or_else(|| pal("comment")),
             warn: pal("yellow"),
             tool_bg: pal("bg_tool")
                 .or_else(|| pal("ui_cursorline"))
                 .or(Some(panel)),
+            command_bg: pal("bg_command")
+                .or_else(|| pal("ui_cursorline"))
+                .or(Some(panel)),
+            stats_bg: pal("bg_stats").or_else(|| pal("ui_cursorline")),
+            header_bg: pal("bg_header").or_else(|| pal("ui_cursorline")),
             success: pal("green"),
             error: t.ui.diagnostic_error.map(rgb).or_else(|| pal("red")),
             accent: pal("blue").or_else(|| pal("teal")),

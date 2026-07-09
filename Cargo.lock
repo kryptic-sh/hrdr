@@ -2326,6 +2326,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-splash"
+version = "0.33.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e28ef5e6e8fb6c2215b14c2aead690570d10794da586cb6fcac510b5eed1d71"
+
+[[package]]
 name = "hjkl-theme"
 version = "0.33.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2410,6 +2416,7 @@ dependencies = [
 name = "hrdr-app"
 version = "0.2.8"
 dependencies = [
+ "anyhow",
  "chrono",
  "hjkl-clipboard",
  "hjkl-theme",
@@ -2503,6 +2510,7 @@ dependencies = [
  "hjkl-icons",
  "hjkl-markdown",
  "hjkl-markdown-tui",
+ "hjkl-splash",
  "hjkl-theme",
  "hrdr-agent",
  "hrdr-app",
@@ -2512,6 +2520,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

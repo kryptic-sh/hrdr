@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 hrdr-agent.workspace = true
 hrdr-tools.workspace = true
 hjkl-clipboard.workspace = true

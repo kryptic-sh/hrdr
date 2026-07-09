@@ -63,7 +63,7 @@ fn load_tokens_at(path: &Path) -> HashMap<String, String> {
 ///
 /// The parent directory must already exist. A rename failure removes the temp
 /// so no stray file is left behind.
-pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     // Write to a temp file in the same directory, then rename atomically.
     // tempfile is a dev-dependency only, so we build the temp name manually.

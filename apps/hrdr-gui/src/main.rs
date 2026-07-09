@@ -20,7 +20,8 @@ use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
 
 mod md;
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, Session};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent};
+use hrdr_app::{Entry, EntryKind, Session, SessionState, SessionUsage};
 use tokio::sync::Mutex as TokioMutex;
 
 // ---- colors -------------------------------------------------------------
@@ -308,6 +309,10 @@ fn app_view(
     let base_url: RwSignal<String> = create_rw_signal(base_url);
     let provider: RwSignal<Option<String>> = create_rw_signal(cfg.provider.clone());
     let ctx_window: RwSignal<Option<u32>> = create_rw_signal(ctx_window);
+    // Session-cumulative token counters (the status bar's ↑/↓). Declared before
+    // the auto-resume below, which restores them from the saved session.
+    let session_in: RwSignal<usize> = create_rw_signal(0);
+    let session_out: RwSignal<usize> = create_rw_signal(0);
 
     // Startup auto-resume: pick up the most recent saved session for this
     // directory (like the TUI; `auto_resume = false` / --no-auto-resume in the
@@ -318,26 +323,29 @@ fn app_view(
             .map(|a| a.cwd().display().to_string())
             .unwrap_or_default();
         if let Some((id, session)) = hrdr_app::latest_session_for_cwd(&cwd) {
+            // A tool call left mid-run can never finish now.
+            let restored = session.state.restored();
             if let Ok(mut a) = agent.try_lock() {
-                a.set_messages(session.messages.clone());
-                a.set_model(session.model.clone());
+                a.set_messages(restored.messages.clone());
+                a.set_model(restored.model.clone());
             }
-            model.set(session.model.clone());
-            provider.set(session.provider.clone());
+            model.set(restored.model.clone());
+            provider.set(restored.provider.clone());
             // Restore saved TODOs.
             if let Ok(mut t) = todos.lock() {
-                *t = session.todos.clone();
+                *t = restored.todos.clone();
             }
-            rebuild_transcript(cx, transcript, next_id, &session.messages);
+            rebuild_from_entries(cx, transcript, next_id, &restored.transcript);
+            restore_usage(&restored.usage, session_in, session_out, usage, ctx_window);
             session_id.set(Some(id));
-            session_label.set(Some(session.name.clone()));
+            session_label.set(Some(restored.name.clone()));
             system(
                 transcript,
                 next_id,
                 format!(
                     "resumed most recent session '{}' ({} messages) — /clear to start fresh",
-                    session.name,
-                    session.messages.len()
+                    restored.name,
+                    restored.messages.len()
                 ),
             );
         }
@@ -354,9 +362,6 @@ fn app_view(
     let start_cwd = hrdr_app::agent_cwd(&agent);
     let dir_sig: RwSignal<String> = create_rw_signal(hrdr_app::display_dir(&start_cwd));
     let branch_sig: RwSignal<Option<String>> = create_rw_signal(hrdr_app::git_branch(&start_cwd));
-    // Session-cumulative token counters (the status bar's ↑/↓).
-    let session_in: RwSignal<usize> = create_rw_signal(0);
-    let session_out: RwSignal<usize> = create_rw_signal(0);
     // Per-message timestamp style (`/timestamps`; from config).
     let timestamp_style: RwSignal<hrdr_app::TimestampStyle> = create_rw_signal(
         hrdr_app::TimestampStyle::from_config(ui.timestamps.as_deref()),
@@ -479,14 +484,6 @@ fn app_view(
             let agent = agent.clone();
             let steering = steering.clone();
             let tx = tx.clone();
-            // Snapshot session state for the post-turn auto-save (signals
-            // can't be read from the spawned task).
-            let existing_id = session_id.get_untracked();
-            let session_label = session_label.get_untracked();
-            let cur_model = model.get_untracked();
-            let cur_provider = provider.get_untracked();
-            let base_url = base_url.get_untracked();
-            let generation = save_gen.get_untracked();
             let handle = tokio::spawn(async move {
                 let tx_ev = tx.clone();
                 let result = agent
@@ -496,24 +493,10 @@ fn app_view(
                         let _ = tx_ev.send(UiMsg::Event(ev));
                     })
                     .await;
+                // The post-turn auto-save runs in the `Done` handler, not here:
+                // it needs the transcript's per-item timestamps, and signals are
+                // only readable from the UI thread.
                 let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
-                // Auto-save the (now-updated) conversation, best-effort.
-                if let Some(o) = hrdr_app::save_agent_session(
-                    agent,
-                    existing_id,
-                    session_label,
-                    cur_model,
-                    cur_provider,
-                    base_url,
-                )
-                .await
-                {
-                    let _ = tx.send(UiMsg::Saved {
-                        id: o.id,
-                        first_save: o.first_save,
-                        generation,
-                    });
-                }
             });
             *th.borrow_mut() = Some(handle);
         })
@@ -664,6 +647,38 @@ fn app_view(
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
                 }
+                // Auto-save the (now-updated) conversation, best-effort. Done
+                // here rather than in the turn's task so the entry timestamps
+                // can be read off the transcript; must precede the steering /
+                // auto-compaction early returns below.
+                {
+                    let agent = agent_for_events.clone();
+                    let tx = tx_for_events.clone();
+                    let existing = session_id.get_untracked();
+                    let label = session_label.get_untracked();
+                    let cur_model = model.get_untracked();
+                    let cur_provider = provider_for_events.get_untracked();
+                    let url = base_url_for_events.get_untracked();
+                    let generation = save_gen.get_untracked();
+                    let state = gui_session_state(
+                        transcript,
+                        existing,
+                        label,
+                        cur_model,
+                        cur_provider,
+                        url,
+                        usage_snapshot(session_in, session_out, usage, ctx_window),
+                    );
+                    tokio::spawn(async move {
+                        if let Some(o) = hrdr_app::save_agent_session(agent, state).await {
+                            let _ = tx.send(UiMsg::Saved {
+                                id: o.id,
+                                first_save: o.first_save,
+                                generation,
+                            });
+                        }
+                    });
+                }
                 // Finish nudge — the GUI's bell (shared gate with the TUI:
                 // enabled + the turn ran long enough to be worth it).
                 if hrdr_app::should_bell(
@@ -798,17 +813,17 @@ fn app_view(
                     let cur_provider = provider_for_events.get_untracked();
                     let url = base_url_for_events.get_untracked();
                     let generation = save_gen.get_untracked();
+                    let state = gui_session_state(
+                        transcript,
+                        existing,
+                        label,
+                        cur_model,
+                        cur_provider,
+                        url,
+                        usage_snapshot(session_in, session_out, usage, ctx_window),
+                    );
                     tokio::spawn(async move {
-                        if let Some(o) = hrdr_app::save_agent_session(
-                            agent,
-                            existing,
-                            label,
-                            cur_model,
-                            cur_provider,
-                            url,
-                        )
-                        .await
-                        {
+                        if let Some(o) = hrdr_app::save_agent_session(agent, state).await {
                             let _ = tx.send(UiMsg::Saved {
                                 id: o.id,
                                 first_save: o.first_save,
@@ -1544,61 +1559,212 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
     push_item(transcript, next_id, Body::System(msg.into()));
 }
 
-/// Rebuild the display transcript from a restored message history (for
-/// `/resume`). The entry construction is shared with the TUI
-/// ([`hrdr_app::messages_to_entries`]); this only wraps each entry in the
-/// GUI's reactive signals.
-fn rebuild_transcript(
+/// Unix-second timestamps of the items a `/resume` will rebuild, in transcript
+/// order — the GUI's side of the transcript that a session file stores.
+/// Snapshot the status bar's token counters for the session file — the GUI's
+/// side of `hrdr_app::SessionUsage`.
+fn usage_snapshot(
+    session_in: RwSignal<usize>,
+    session_out: RwSignal<usize>,
+    usage: RwSignal<Option<(u32, u32)>>,
+    ctx_window: RwSignal<Option<u32>>,
+) -> SessionUsage {
+    let last = usage.get_untracked();
+    SessionUsage {
+        tokens_in: session_in.get_untracked(),
+        tokens_out: session_out.get_untracked(),
+        last_prompt_tokens: last.map(|(p, _)| p),
+        last_completion_tokens: last.map(|(_, c)| c),
+        context_window: ctx_window.get_untracked(),
+    }
+}
+
+/// Adopt a restored session's token counters, so the status bar continues the
+/// session's totals rather than counting from zero. A saved `context_window` is
+/// only a stand-in until the endpoint is re-probed; don't clobber a known one.
+fn restore_usage(
+    u: &SessionUsage,
+    session_in: RwSignal<usize>,
+    session_out: RwSignal<usize>,
+    usage: RwSignal<Option<(u32, u32)>>,
+    ctx_window: RwSignal<Option<u32>>,
+) {
+    session_in.set(u.tokens_in);
+    session_out.set(u.tokens_out);
+    usage.set(u.last());
+    if ctx_window.get_untracked().is_none() {
+        ctx_window.set(u.context_window);
+    }
+}
+
+/// Serialize the GUI's items for the session file: every item the user saw, in
+/// order, each carrying its own timestamp.
+/// Assemble the GUI's signals into the session state a save writes. The
+/// agent-owned mirrors (chat messages, TODOs, cwd) are filled in by
+/// `save_agent_session` under the agent lock.
+#[allow(clippy::too_many_arguments)]
+fn gui_session_state(
+    transcript: RwSignal<Vec<Item>>,
+    session_id: Option<String>,
+    label: Option<String>,
+    model: String,
+    provider: Option<String>,
+    base_url: String,
+    usage: SessionUsage,
+) -> SessionState {
+    SessionState {
+        name: label.unwrap_or_default(),
+        id: session_id,
+        model,
+        provider,
+        base_url,
+        transcript: items_to_entries(transcript),
+        usage,
+        ..Default::default()
+    }
+}
+
+fn items_to_entries(transcript: RwSignal<Vec<Item>>) -> Vec<Entry> {
+    transcript.with_untracked(|t| {
+        let mut out = Vec::with_capacity(t.len());
+        for item in t {
+            let at = |kind| Entry::at(kind, item.time);
+            match &item.body {
+                Body::User(text) => out.push(at(EntryKind::User(text.clone()))),
+                // The GUI folds an assistant turn's thinking into the same item;
+                // on disk they're separate entries, as in the TUI.
+                Body::Assistant(a) => {
+                    let reasoning = a.reasoning.get_untracked();
+                    if !reasoning.is_empty() {
+                        out.push(at(EntryKind::Reasoning(reasoning)));
+                    }
+                    out.push(at(EntryKind::Assistant(a.text.get_untracked())));
+                }
+                Body::Tool(tool) => out.push(at(EntryKind::Tool {
+                    id: tool.call_id.clone(),
+                    name: tool.name.clone(),
+                    args: tool.args.clone(),
+                    result: tool.result.get_untracked(),
+                    ok: tool.ok.get_untracked(),
+                    done: tool.done.get_untracked(),
+                    expanded: false,
+                })),
+                Body::System(text) => out.push(at(EntryKind::System(text.clone()))),
+                // An error banner is a system notice with different paint.
+                Body::Error(text) => out.push(at(EntryKind::System(text.clone()))),
+                Body::Diff(text) => out.push(at(EntryKind::Diff(text.clone()))),
+            }
+        }
+        out
+    })
+}
+
+/// Rebuild the GUI's items from a session's transcript — the inverse of
+/// [`items_to_entries`]. A `Reasoning` entry is folded back into the assistant
+/// item that follows it (the GUI renders the two as one); a `Stats` entry
+/// becomes a system line, which is how the GUI shows it live.
+fn rebuild_from_entries(
     cx: Scope,
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
-    msgs: &[Message],
+    entries: &[Entry],
 ) {
     clear_items(transcript);
     next_id.set(0);
-    for e in hrdr_app::messages_to_entries(msgs) {
-        match e {
-            hrdr_app::Entry::User(c) => push_item(transcript, next_id, Body::User(c)),
-            hrdr_app::Entry::Assistant(c) => {
+    let mut pending_reasoning: Option<String> = None;
+
+    // Flush a reasoning entry that no assistant text followed.
+    let flush =
+        |transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, pending: &mut Option<String>| {
+            if let Some(r) = pending.take() {
                 let item_cx = cx.create_child();
                 push_item_scoped(
                     transcript,
                     next_id,
                     Body::Assistant(Assistant {
-                        reasoning: item_cx.create_rw_signal(String::new()),
-                        text: item_cx.create_rw_signal(c),
+                        reasoning: item_cx.create_rw_signal(r),
+                        text: item_cx.create_rw_signal(String::new()),
                     }),
                     Some(item_cx),
-                )
+                );
             }
-            hrdr_app::Entry::Tool {
+        };
+
+    for e in entries {
+        if let EntryKind::Reasoning(text) = &e.kind {
+            flush(transcript, next_id, &mut pending_reasoning);
+            pending_reasoning = Some(text.clone());
+            continue;
+        }
+        match &e.kind {
+            EntryKind::User(text) => {
+                flush(transcript, next_id, &mut pending_reasoning);
+                push_item(transcript, next_id, Body::User(text.clone()));
+            }
+            EntryKind::Assistant(text) => {
+                let item_cx = cx.create_child();
+                push_item_scoped(
+                    transcript,
+                    next_id,
+                    Body::Assistant(Assistant {
+                        reasoning: item_cx
+                            .create_rw_signal(pending_reasoning.take().unwrap_or_default()),
+                        text: item_cx.create_rw_signal(text.clone()),
+                    }),
+                    Some(item_cx),
+                );
+            }
+            EntryKind::Tool {
                 id,
                 name,
                 args,
                 result,
                 ok,
+                done,
                 ..
             } => {
+                flush(transcript, next_id, &mut pending_reasoning);
                 let item_cx = cx.create_child();
                 push_item_scoped(
                     transcript,
                     next_id,
                     Body::Tool(Tool {
-                        call_id: id,
-                        name,
-                        args,
+                        call_id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
                         output: item_cx.create_rw_signal(String::new()),
-                        result: item_cx.create_rw_signal(result),
-                        ok: item_cx.create_rw_signal(ok),
-                        done: item_cx.create_rw_signal(true),
+                        result: item_cx.create_rw_signal(result.clone()),
+                        ok: item_cx.create_rw_signal(*ok),
+                        done: item_cx.create_rw_signal(*done),
                         collapsed: item_cx.create_rw_signal(true),
                     }),
                     Some(item_cx),
-                )
+                );
             }
-            _ => {}
+            EntryKind::System(text) | EntryKind::Stats(text) => {
+                flush(transcript, next_id, &mut pending_reasoning);
+                push_item(transcript, next_id, Body::System(text.clone()));
+            }
+            EntryKind::Diff(text) => {
+                flush(transcript, next_id, &mut pending_reasoning);
+                push_item(transcript, next_id, Body::Diff(text.clone()));
+            }
+            // The GUI has no banner item; a header entry from a TUI-written
+            // session is simply not shown.
+            EntryKind::Header => {
+                flush(transcript, next_id, &mut pending_reasoning);
+                continue;
+            }
+            EntryKind::Reasoning(_) => unreachable!("handled above"),
         }
+        // Stamp the item just pushed with the entry's saved time.
+        transcript.update(|t| {
+            if let Some(last) = t.last_mut() {
+                last.time = e.time;
+            }
+        });
     }
+    flush(transcript, next_id, &mut pending_reasoning);
 }
 
 /// The Nth (1-based) user/assistant message's text — numbering matches the
@@ -1953,11 +2119,22 @@ impl hrdr_app::CommandHost for GuiHost {
         let provider = self.provider.get_untracked();
         let base_url = self.base_url.get_untracked();
         let generation = self.save_gen.get_untracked();
+        let state = gui_session_state(
+            self.transcript,
+            existing,
+            label,
+            model,
+            provider,
+            base_url,
+            usage_snapshot(
+                self.session_in,
+                self.session_out,
+                self.usage,
+                self.ctx_window,
+            ),
+        );
         tokio::spawn(async move {
-            if let Some(o) =
-                hrdr_app::save_agent_session(agent, existing, label, model, provider, base_url)
-                    .await
-            {
+            if let Some(o) = hrdr_app::save_agent_session(agent, state).await {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
                     first_save: o.first_save,
@@ -1967,22 +2144,32 @@ impl hrdr_app::CommandHost for GuiHost {
         });
     }
     fn resume(&mut self, id: String, session: Session) {
-        let plan = hrdr_app::resume_plan(&session, &self.cwd(), &self.base_url.get_untracked());
-        self.model.set(session.model.clone());
-        self.provider.set(session.provider.clone());
+        let plan =
+            hrdr_app::resume_plan(&session.state, &self.cwd(), &self.base_url.get_untracked());
+        // A tool call left mid-run can never finish now (see `SessionState::restored`).
+        let state = session.state.restored();
+        self.model.set(state.model.clone());
+        self.provider.set(state.provider.clone());
         // Restore saved TODOs.
         if let Ok(mut t) = self.todos.lock() {
-            *t = session.todos.clone();
+            *t = state.todos.clone();
         }
         self.session_id.set(Some(id));
-        self.session_label.set(Some(session.name.clone()));
+        self.session_label.set(Some(state.name.clone()));
         // Pending saves from before the resume belong to the old conversation.
         self.save_gen.update(|g| *g += 1);
-        rebuild_transcript(self.cx, self.transcript, self.next_id, &session.messages);
+        rebuild_from_entries(self.cx, self.transcript, self.next_id, &state.transcript);
+        restore_usage(
+            &state.usage,
+            self.session_in,
+            self.session_out,
+            self.usage,
+            self.ctx_window,
+        );
         // Synchronous when the lock is free (see clear_conversation) so a
         // send right after /resume can't race the message swap.
-        let msgs = session.messages;
-        let m = session.model;
+        let msgs = state.messages;
+        let m = state.model;
         let cwd_for_agent = plan.new_cwd.clone();
         let apply = move |a: &mut Agent| {
             a.set_messages(msgs);
@@ -2440,7 +2627,7 @@ fn apply_config_reload(
             if manual {
                 hrdr_app::RELOAD_MANUAL_MSG.to_string()
             } else {
-                hrdr_app::RELOAD_HOT_MSG.to_string()
+                hrdr_app::reload_hot_message()
             }
         }
         Err(e) => hrdr_app::reload_invalid_message(&e),

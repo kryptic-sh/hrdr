@@ -16,12 +16,16 @@ use clap::{Parser, Subcommand};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use hrdr_llm::Client;
 
+/// The `hrdr` wordmark: printed above `--help`, and animated in the TUI's
+/// session header (passed to [`hrdr_tui::run`], which embeds no art of its own).
+const LOGO_ART: &str = include_str!("../art.txt");
+
 #[derive(Parser)]
 #[command(
     name = "hrdr",
     version,
     about = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models.",
-    before_help = include_str!("../art.txt"),
+    before_help = LOGO_ART,
 )]
 struct Cli {
     /// OpenAI-compatible base URL (default: $HRDR_BASE_URL or http://localhost:8080/v1).
@@ -245,13 +249,23 @@ async fn main() -> Result<()> {
         config.headers = p.headers.into_iter().collect();
         config.api_version = p.api_version;
         remote_provider = p.remote;
+        // Record which provider is in force (`--provider` may have overridden
+        // the config's). The status bar, the session header, and saved sessions
+        // all read it from here.
+        config.provider = Some(name.clone());
     }
 
     if let Some(u) = cli.base_url {
         config.base_url = u;
     }
+    // A `--model` / `--provider` flag outranks everything, including a resumed
+    // session's (flag > env > session > config).
     if let Some(m) = cli.model {
         config.model = m;
+        config.model_pinned = true;
+    }
+    if cli.provider.is_some() {
+        config.provider_pinned = true;
     }
     if cli.vim {
         ui.vim_mode = true;
@@ -372,7 +386,7 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
-        None => hrdr_tui::run(config, ui).await,
+        None => hrdr_tui::run(config, ui, LOGO_ART).await,
     }
 }
 

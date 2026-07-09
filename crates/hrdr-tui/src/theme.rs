@@ -22,12 +22,20 @@ pub struct Theme {
     pub user_bg: Color,
     /// Assistant message text.
     pub assistant: Color,
+    /// Assistant / reasoning block background.
+    pub assistant_bg: Color,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints, scrollbar.
     pub dim: Color,
     /// Attention color: tool names, the inference loader, the follow button.
     pub warn: Color,
     /// Tool-call block background.
     pub tool_bg: Color,
+    /// Slash-command output block background.
+    pub command_bg: Color,
+    /// Per-turn stats block background.
+    pub stats_bg: Color,
+    /// Session-header (banner) block background.
+    pub header_bg: Color,
     /// Success marks (tool ✓).
     pub success: Color,
     /// Error marks (tool ✗) and the quit-confirm banner.
@@ -61,9 +69,13 @@ impl Theme {
             user: c(p.user, Color::Cyan),
             user_bg: c(p.user_bg, Color::Rgb(0, 48, 60)),
             assistant: c(p.assistant, Color::White),
+            assistant_bg: c(p.assistant_bg, Color::Rgb(27, 30, 46)),
             dim: c(p.dim, Color::DarkGray),
             warn: c(p.warn, Color::Yellow),
             tool_bg: c(p.tool_bg, Color::Rgb(30, 32, 40)),
+            command_bg: c(p.command_bg, Color::Rgb(32, 34, 58)),
+            stats_bg: c(p.stats_bg, Color::Rgb(25, 27, 43)),
+            header_bg: c(p.header_bg, Color::Rgb(22, 24, 42)),
             success: c(p.success, Color::Green),
             error: c(p.error, Color::Red),
             accent: c(p.accent, Color::Blue),
@@ -86,6 +98,37 @@ impl Theme {
             self.assistant, // italic
             self.dim,       // rule
         )
+    }
+
+    /// [`Self::md_theme`] with every role dimmed: reasoning renders with the
+    /// same structure and colors as output, only quieter.
+    pub fn md_theme_dim(&self) -> MdTheme {
+        let d = |c: Color| dim_color(c, REASONING_DIM);
+        MdTheme::new(
+            d(self.assistant),
+            d(self.user),
+            d(self.warn),
+            d(self.success),
+            d(self.success),
+            d(self.user),
+            d(self.warn),
+            d(self.assistant),
+            d(self.assistant),
+            d(self.dim),
+        )
+    }
+}
+
+/// How much of a color's brightness reasoning text keeps.
+const REASONING_DIM: f32 = 0.55;
+
+/// Scale an RGB color's brightness by `factor`. Named/indexed terminal colors
+/// have no components to scale, so they pass through unchanged.
+fn dim_color(c: Color, factor: f32) -> Color {
+    let s = |v: u8| (v as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(s(r), s(g), s(b)),
+        other => other,
     }
 }
 

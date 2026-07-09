@@ -1,15 +1,39 @@
-//! The transcript data model shared by hrdr's frontends: the [`Entry`] enum (one
-//! rendered item in the conversation) plus the representation-independent queries
-//! over a slice of entries — search, message counting/indexing, and text/JSON
-//! export. How an `Entry` is painted is the frontend's business; what counts as a
-//! "message", how `/find` matches, and the export formats are shared here so the
-//! TUI and GUI stay consistent.
+//! The transcript data model shared by hrdr's frontends: the [`Entry`] struct
+//! (one rendered item in the conversation, with the time it arrived) plus the
+//! representation-independent queries over a slice of entries — search, message
+//! counting/indexing, and text/JSON export. How an `Entry` is painted is the
+//! frontend's business; what counts as a "message", how `/find` matches, and the
+//! export formats are shared here so the TUI and GUI stay consistent.
+//!
+//! `Entry` is also the on-disk form: a session file stores its transcript as
+//! exactly these entries (see [`crate::Session`]), so a resume restores what was
+//! on screen without a lossy rebuild from the chat messages.
 
 use chrono::{DateTime, Local};
-use hrdr_agent::{Message, MessageRole};
+use serde::{Deserialize, Serialize};
 
-/// One rendered item in the transcript.
-pub enum Entry {
+/// One rendered item in the transcript, stamped with the local time it was
+/// added. Serializes as a flat object: `{"kind": "user", "data": "hi",
+/// "time": 1700000000}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    #[serde(flatten)]
+    pub kind: EntryKind,
+    /// When this entry was added, stored as unix seconds.
+    #[serde(with = "unix_time")]
+    pub time: DateTime<Local>,
+}
+
+/// What an [`Entry`] holds. Everything here round-trips through the session
+/// file except a tool block's `expanded` flag, which is view state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum EntryKind {
+    /// The session banner: logo animation on the left, session details on the
+    /// right. Carries no data — the details are read from the live session
+    /// state at render time, so a resumed header shows the *current* model and
+    /// provider rather than whatever was in use when it was written.
+    Header,
     User(String),
     Assistant(String),
     Reasoning(String),
@@ -21,6 +45,8 @@ pub enum Entry {
         ok: bool,
         done: bool,
         /// Show the full result instead of a truncated preview (`/expand`).
+        /// View state: never persisted, so a restored block starts collapsed.
+        #[serde(skip)]
         expanded: bool,
     },
     System(String),
@@ -28,6 +54,100 @@ pub enum Entry {
     Stats(String),
     /// A unified diff (e.g. `/diff`), rendered with diff coloring.
     Diff(String),
+}
+
+impl Entry {
+    /// An entry stamped with the current local time.
+    pub fn now(kind: EntryKind) -> Self {
+        Self {
+            kind,
+            time: Local::now(),
+        }
+    }
+
+    /// An entry stamped with an explicit time (restoring, or in tests).
+    pub fn at(kind: EntryKind, time: DateTime<Local>) -> Self {
+        Self { kind, time }
+    }
+
+    /// The banner that opens a new session.
+    pub fn header() -> Self {
+        Self::now(EntryKind::Header)
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::User(text.into()))
+    }
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Assistant(text.into()))
+    }
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Reasoning(text.into()))
+    }
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::System(text.into()))
+    }
+    pub fn stats(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Stats(text.into()))
+    }
+    pub fn diff(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Diff(text.into()))
+    }
+
+    /// A tool call that has not finished yet.
+    pub fn tool_running(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        args: impl Into<String>,
+    ) -> Self {
+        Self::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: args.into(),
+            result: String::new(),
+            ok: false,
+            done: false,
+            expanded: false,
+        })
+    }
+}
+
+/// A tool call restored from disk can never finish, so `done: false` would spin
+/// its spinner forever — settle it as failed instead.
+pub fn settle_restored_tools(entries: &mut [Entry]) {
+    for e in entries {
+        if let EntryKind::Tool { ok, done, .. } = &mut e.kind
+            && !*done
+        {
+            *done = true;
+            *ok = false;
+        }
+    }
+}
+
+/// A unix-second timestamp as a local time, falling back to `fallback` for a
+/// value chrono can't represent — a corrupt file shouldn't wrap into a
+/// plausible pre-epoch date (which `as i64` would do), nor panic.
+pub fn time_from_unix(secs: i64, fallback: DateTime<Local>) -> DateTime<Local> {
+    DateTime::from_timestamp(secs, 0)
+        .map(|utc| utc.with_timezone(&Local))
+        .unwrap_or(fallback)
+}
+
+/// `DateTime<Local>` as unix seconds, for [`Entry`]'s `time` field.
+mod unix_time {
+    use chrono::{DateTime, Local, TimeZone};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &DateTime<Local>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i64(t.timestamp())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Local>, D::Error> {
+        let secs = i64::deserialize(d)?;
+        let epoch = Local.timestamp_opt(0, 0).unwrap();
+        Ok(super::time_from_unix(secs, epoch))
+    }
 }
 
 /// Extract the `command` field from a JSON tool-args string, if any.
@@ -41,70 +161,128 @@ pub fn extract_shell_command(name: &str, args: &str) -> Option<String> {
         .and_then(|v| v.get("command")?.as_str().map(String::from))
 }
 
+/// How a tool call's detail area should be painted. Frontends map each variant
+/// onto their own renderer; the classification (which tool shows what) lives
+/// here so the TUI and GUI agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolBody {
+    /// Shell call: the command, rendered as its own `$ …` line above the output.
+    Shell {
+        command: String,
+    },
+    /// `write`: the file contents from the args, syntax-highlighted as `lang`
+    /// (the path's extension, which syntect resolves as a token).
+    Code {
+        lang: String,
+        content: String,
+    },
+    /// `edit`/`patch`: the result is a unified diff — color it as one.
+    Diff,
+    /// `read`: the result's *tail* is the interesting part (the file content,
+    /// not the preamble).
+    Read,
+    Text,
+}
+
+/// The headline (shown after the tool name) plus the detail body for one tool
+/// call, derived from its name and raw JSON args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDisplay {
+    /// Short summary shown on the header line: a path, a pattern, or an args
+    /// preview. Empty when the detail body already says it (shell).
+    pub headline: String,
+    pub body: ToolBody,
+}
+
+/// Pull a string field out of a JSON tool-args object.
+fn arg_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)?.as_str().map(String::from)
+}
+
+/// Classify a tool call for display: what goes on the header line, and how the
+/// detail area is rendered. Falls back to a truncated args preview + plain text
+/// for tools with no special treatment (including MCP tools).
+pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    let plain = |headline: String| ToolDisplay {
+        headline,
+        body: ToolBody::Text,
+    };
+    match name {
+        "bash" | "powershell" => ToolDisplay {
+            headline: String::new(),
+            body: ToolBody::Shell {
+                command: arg_str(&v, "command").unwrap_or_default(),
+            },
+        },
+        "write" => {
+            let path = arg_str(&v, "path").unwrap_or_else(|| "?".into());
+            let lang = std::path::Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            ToolDisplay {
+                headline: path,
+                body: ToolBody::Code {
+                    lang,
+                    content: arg_str(&v, "content").unwrap_or_default(),
+                },
+            }
+        }
+        "edit" | "patch" => ToolDisplay {
+            headline: arg_str(&v, "path").unwrap_or_else(|| "?".into()),
+            body: ToolBody::Diff,
+        },
+        "read" => ToolDisplay {
+            headline: read_args_summary(&v),
+            body: ToolBody::Read,
+        },
+        "grep" | "find" => {
+            let mut s = arg_str(&v, "pattern").unwrap_or_default();
+            if let Some(p) = arg_str(&v, "path") {
+                s.push_str(&format!("  in {p}"));
+            }
+            if let Some(g) = arg_str(&v, "glob") {
+                s.push_str(&format!("  ({g})"));
+            }
+            plain(s)
+        }
+        "ls" | "tree" => plain(arg_str(&v, "path").unwrap_or_else(|| ".".into())),
+        _ => plain(hrdr_tools::truncate_inline(args, crate::TOOL_ARGS_PREVIEW)),
+    }
+}
+
+/// Compact summary of `read` args: `path  (offset: N, limit: M)`.
+fn read_args_summary(v: &serde_json::Value) -> String {
+    let mut s = v
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let mut parts = Vec::new();
+    if let Some(o) = v.get("offset").and_then(|o| o.as_u64()).filter(|&o| o > 1) {
+        parts.push(format!("offset: {o}"));
+    }
+    if let Some(l) = v.get("limit").and_then(|l| l.as_u64()) {
+        parts.push(format!("limit: {l}"));
+    }
+    if !parts.is_empty() {
+        s.push_str(&format!("  ({})", parts.join(", ")));
+    }
+    s
+}
+
 impl Entry {
     /// The displayable text of a user/assistant message, if this entry is one.
     /// These are the only entries that count as numbered "messages" for `/find`,
     /// `/goto`, `/copy msg N`, and export.
     pub fn message_text(&self) -> Option<&str> {
-        match self {
-            Entry::User(s) | Entry::Assistant(s) => Some(s),
+        match &self.kind {
+            EntryKind::User(s) | EntryKind::Assistant(s) => Some(s),
             _ => None,
         }
     }
-}
-
-/// Rebuild display entries from a restored message history (`/resume`, startup
-/// auto-resume) — shared so the TUI and GUI reconstruct identically. User and
-/// non-empty assistant texts become entries; each assistant `tool_calls` entry
-/// is paired with its `role:"tool"` result by call id (the `Error:` prefix
-/// convention marks a failed call). Other roles are skipped. Frontends map the
-/// returned entries into their own representation (the TUI stores them as-is,
-/// the GUI wraps each in its reactive signals).
-pub fn messages_to_entries(msgs: &[Message]) -> Vec<Entry> {
-    use std::collections::HashMap;
-    // Map tool_call_id → (result, ok) from the tool-result messages.
-    let mut results: HashMap<&str, (&str, bool)> = HashMap::new();
-    for m in msgs {
-        if m.role == MessageRole::Tool
-            && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
-        {
-            results.insert(id, (content, !content.starts_with("Error:")));
-        }
-    }
-    let mut out = Vec::new();
-    for m in msgs {
-        match m.role {
-            MessageRole::User => {
-                if let Some(c) = &m.content {
-                    out.push(Entry::User(c.clone()));
-                }
-            }
-            MessageRole::Assistant => {
-                if let Some(c) = &m.content
-                    && !c.is_empty()
-                {
-                    out.push(Entry::Assistant(c.clone()));
-                }
-                for call in m.tool_calls.iter().flatten() {
-                    let (result, ok) = results
-                        .get(call.id.as_str())
-                        .map(|(r, ok)| (r.to_string(), *ok))
-                        .unwrap_or_default();
-                    out.push(Entry::Tool {
-                        id: call.id.clone(),
-                        name: call.function.name.clone(),
-                        args: call.function.arguments.clone(),
-                        result,
-                        ok,
-                        done: true,
-                        expanded: false,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// 1-based message numbers whose user/assistant text contains `query`
@@ -147,16 +325,12 @@ pub fn nth_message_text(entries: &[Entry], n: usize) -> Option<String> {
 
 /// The number of the first user/assistant message stamped at/after `cutoff`.
 /// `times` is parallel to `entries` (index i is entry i's local timestamp).
-pub fn first_message_since(
-    entries: &[Entry],
-    times: &[DateTime<Local>],
-    cutoff: DateTime<Local>,
-) -> Option<usize> {
+pub fn first_message_since(entries: &[Entry], cutoff: DateTime<Local>) -> Option<usize> {
     let mut num = 0;
-    for (i, e) in entries.iter().enumerate() {
+    for e in entries {
         if e.message_text().is_some() {
             num += 1;
-            if times.get(i).is_some_and(|t| *t >= cutoff) {
+            if e.time >= cutoff {
                 return Some(num);
             }
         }
@@ -299,13 +473,13 @@ impl FindState {
 pub fn transcript_to_text(entries: &[Entry]) -> String {
     let mut out = String::new();
     for e in entries {
-        match e {
-            Entry::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
-            Entry::Assistant(s) => out.push_str(&format!("## Assistant\n{s}\n\n")),
-            Entry::System(s) => out.push_str(&format!("[{s}]\n\n")),
-            Entry::Diff(s) => out.push_str(&format!("{s}\n\n")),
-            Entry::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
-            Entry::Reasoning(_) | Entry::Stats(_) => {}
+        match &e.kind {
+            EntryKind::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
+            EntryKind::Assistant(s) => out.push_str(&format!("## Assistant\n{s}\n\n")),
+            EntryKind::System(s) => out.push_str(&format!("[{s}]\n\n")),
+            EntryKind::Diff(s) => out.push_str(&format!("{s}\n\n")),
+            EntryKind::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
+            EntryKind::Reasoning(_) | EntryKind::Stats(_) | EntryKind::Header => {}
         }
     }
     out.trim_end().to_string()
@@ -317,11 +491,11 @@ mod tests {
 
     fn sample() -> Vec<Entry> {
         vec![
-            Entry::System("welcome".into()),
-            Entry::User("Fix the parser bug".into()),
-            Entry::Reasoning("thinking…".into()),
-            Entry::Assistant("Done — it was an off-by-one.".into()),
-            Entry::User("thanks".into()),
+            Entry::system("welcome"),
+            Entry::user("Fix the parser bug"),
+            Entry::reasoning("thinking…"),
+            Entry::assistant("Done — it was an off-by-one."),
+            Entry::user("thanks"),
         ]
     }
 
@@ -448,5 +622,71 @@ mod tests {
         assert!(matches!(st.find("clear", hits), FindAction::Info(l) if l == "search cleared"));
         assert!(st.query.is_none() && st.pos == 0);
         assert!(matches!(st.find("off", hits), FindAction::Info(l) if l == "no active search"));
+    }
+}
+
+#[cfg(test)]
+mod tool_display_tests {
+    use super::*;
+
+    #[test]
+    fn shell_puts_the_command_in_the_body_not_the_headline() {
+        let d = tool_display("bash", r#"{"command":"ls -la"}"#);
+        assert!(d.headline.is_empty());
+        assert_eq!(
+            d.body,
+            ToolBody::Shell {
+                command: "ls -la".into()
+            }
+        );
+    }
+
+    #[test]
+    fn write_shows_path_and_contents_with_the_extension_as_lang() {
+        let d = tool_display("write", r#"{"path":"src/a.rs","content":"fn main() {}"}"#);
+        assert_eq!(d.headline, "src/a.rs");
+        assert_eq!(
+            d.body,
+            ToolBody::Code {
+                lang: "rs".into(),
+                content: "fn main() {}".into()
+            }
+        );
+    }
+
+    #[test]
+    fn edit_and_patch_show_the_path_and_render_a_diff() {
+        for name in ["edit", "patch"] {
+            let d = tool_display(name, r#"{"path":"x.rs","old_string":"a","new_string":"b"}"#);
+            assert_eq!(d.headline, "x.rs");
+            assert_eq!(d.body, ToolBody::Diff);
+        }
+    }
+
+    #[test]
+    fn read_summarizes_offset_and_limit() {
+        let d = tool_display("read", r#"{"path":"x.rs","offset":10,"limit":5}"#);
+        assert_eq!(d.headline, "x.rs  (offset: 10, limit: 5)");
+        assert_eq!(d.body, ToolBody::Read);
+        // offset 1 is the default — not worth the noise.
+        let d = tool_display("read", r#"{"path":"x.rs","offset":1}"#);
+        assert_eq!(d.headline, "x.rs");
+    }
+
+    #[test]
+    fn grep_shows_pattern_scope_and_glob() {
+        let d = tool_display("grep", r#"{"pattern":"fn ","path":"src","glob":"*.rs"}"#);
+        assert_eq!(d.headline, "fn   in src  (*.rs)");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    /// Unknown tools (including MCP ones) fall back to a truncated args preview.
+    #[test]
+    fn unknown_tool_falls_back_to_an_args_preview() {
+        let d = tool_display("mcp__x__y", r#"{"a":1}"#);
+        assert_eq!(d.headline, r#"{"a":1}"#);
+        assert_eq!(d.body, ToolBody::Text);
+        // Malformed args must not panic.
+        assert_eq!(tool_display("write", "not json").headline, "?");
     }
 }

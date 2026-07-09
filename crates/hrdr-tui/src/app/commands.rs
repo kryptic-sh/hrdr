@@ -27,7 +27,7 @@ impl super::App {
             "prev" | "previous" => self.find_cycle(false),
             // help, clear, model, models, tools, copy, diff, rename, thinking,
             // sessions, resume, export → shared dispatcher (TuiHost overrides
-            // route /diff to the colored Entry::Diff rendering).
+            // route /diff to the colored EntryKind::Diff rendering).
             _ => {
                 let mut host = TuiHost { app: self };
                 return hrdr_app::dispatch(&mut host, input);
@@ -58,6 +58,8 @@ impl super::App {
             });
         }
         self.clear_transcript();
+        // `/clear` starts a new session, so it opens with the banner again.
+        self.push_entry(Entry::header());
         self.queue.clear();
         if let Ok(mut q) = self.steering.lock() {
             q.clear();
@@ -69,13 +71,16 @@ impl super::App {
         self.todo_completed_at.clear();
         self.scroll_offset = 0;
         self.max_scroll = 0;
-        self.session_in = 0;
-        self.session_out = 0;
-        self.last_usage = None;
+        // Reset the counters, but keep the probed context window: it describes
+        // the model/endpoint, not the conversation.
+        self.state.usage = hrdr_app::SessionUsage {
+            context_window: self.state.usage.context_window,
+            ..Default::default()
+        };
         self.last_cached_tokens = None;
         self.last_reasoning_tokens = None;
-        self.session_id = None; // detach; next message starts a new session
-        self.session_label = None;
+        self.state.id = None; // detach; next message starts a new session
+        self.state.name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.pending_edit = None;
@@ -93,18 +98,23 @@ impl super::App {
             }
             hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
-                for e in self.transcript.iter_mut() {
-                    if let Entry::Tool { expanded, .. } = e {
+                for e in self.state.transcript.iter_mut() {
+                    if let EntryKind::Tool { expanded, .. } = &mut e.kind {
                         *expanded = false;
                     }
                 }
                 hrdr_app::expand_msg::OFF.to_string()
             }
             hrdr_app::ExpandMode::ToggleLast => {
-                let last = self.transcript.iter_mut().rev().find_map(|e| match e {
-                    Entry::Tool { expanded, .. } => Some(expanded),
-                    _ => None,
-                });
+                let last = self
+                    .state
+                    .transcript
+                    .iter_mut()
+                    .rev()
+                    .find_map(|e| match &mut e.kind {
+                        EntryKind::Tool { expanded, .. } => Some(expanded),
+                        _ => None,
+                    });
                 match last {
                     Some(expanded) => {
                         *expanded = !*expanded;
@@ -134,9 +144,10 @@ impl super::App {
             .ok()
             .and_then(|mut a| a.rewind_last_user())?;
         if let Some(idx) = self
+            .state
             .transcript
             .iter()
-            .rposition(|e| matches!(e, Entry::User(_)))
+            .rposition(|e| matches!(e.kind, EntryKind::User(_)))
         {
             self.truncate_transcript(idx);
         }
@@ -157,7 +168,7 @@ impl super::App {
     /// `/find clear` (or `off`/`discard`) drops the search + highlight.
     fn find_cmd(&mut self, arg: &str) {
         let mut st = std::mem::take(&mut self.find);
-        let act = st.find(arg, |q| hrdr_app::find_hits(&self.transcript, q));
+        let act = st.find(arg, |q| hrdr_app::find_hits(&self.state.transcript, q));
         self.find = st;
         self.apply_find_action(act);
     }
@@ -165,7 +176,7 @@ impl super::App {
     /// wrapping around; used by `/next` and `/prev`.
     fn find_cycle(&mut self, forward: bool) {
         let mut st = std::mem::take(&mut self.find);
-        let act = st.cycle(forward, |q| hrdr_app::find_hits(&self.transcript, q));
+        let act = st.cycle(forward, |q| hrdr_app::find_hits(&self.state.transcript, q));
         self.find = st;
         self.apply_find_action(act);
     }
@@ -185,15 +196,15 @@ impl super::App {
     }
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {
-        hrdr_app::message_count(&self.transcript)
+        hrdr_app::message_count(&self.state.transcript)
     }
     /// The number of the first user/assistant message sent at/after `cutoff`.
     fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
-        hrdr_app::first_message_since(&self.transcript, &self.entry_times, cutoff)
+        hrdr_app::first_message_since(&self.state.transcript, cutoff)
     }
     /// The text of the Nth (1-based) user/assistant message in the transcript.
     fn nth_message_text(&self, n: usize) -> Option<String> {
-        hrdr_app::nth_message_text(&self.transcript, n)
+        hrdr_app::nth_message_text(&self.state.transcript, n)
     }
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
@@ -202,21 +213,29 @@ impl super::App {
     }
     /// The most recent assistant message text.
     fn last_assistant_text(&self) -> Option<String> {
-        self.transcript.iter().rev().find_map(|e| match e {
-            Entry::Assistant(s) => Some(s.clone()),
-            _ => None,
-        })
+        self.state
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EntryKind::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
     }
     /// The most recent fenced code block across assistant messages.
     fn last_code_block(&self) -> Option<String> {
-        self.transcript.iter().rev().find_map(|e| match e {
-            Entry::Assistant(s) => last_fenced_block(s),
-            _ => None,
-        })
+        self.state
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EntryKind::Assistant(s) => last_fenced_block(s),
+                _ => None,
+            })
     }
     /// A plain-text rendering of the conversation for `/copy all`.
     fn transcript_text(&self) -> String {
-        hrdr_app::transcript_to_text(&self.transcript)
+        hrdr_app::transcript_to_text(&self.state.transcript)
     }
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
     fn edit_file_cmd(&mut self, arg: &str) {
@@ -275,19 +294,19 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         hrdr_app::agent_cwd(&self.app.agent)
     }
     fn base_url(&self) -> String {
-        self.app.base_url.clone()
+        self.app.state.base_url.clone()
     }
     fn model(&self) -> String {
-        self.app.model.clone()
+        self.app.state.model.clone()
     }
     fn set_model(&mut self, model: String) {
-        self.app.model = model;
+        self.app.state.model = model;
     }
     fn provider(&self) -> Option<String> {
-        self.app.provider.clone()
+        self.app.state.provider.clone()
     }
     fn set_provider(&mut self, name: String) {
-        self.app.provider = Some(name);
+        self.app.state.provider = Some(name);
     }
     fn show_thinking(&self) -> bool {
         self.app.show_reasoning
@@ -301,15 +320,15 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.clear_all();
     }
     fn session_id(&self) -> Option<String> {
-        self.app.session_id.clone()
+        self.app.state.id.clone()
     }
     fn set_session_label(&mut self, name: String) {
-        self.app.session_label = Some(name);
+        self.app.state.name = name;
     }
     fn autosave(&mut self) {
         self.app.autosave();
     }
-    fn resume(&mut self, id: String, session: hrdr_agent::Session) {
+    fn resume(&mut self, id: String, session: hrdr_app::Session) {
         self.app.apply_session(id, session);
     }
     fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
@@ -375,16 +394,19 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.effort.clone()
     }
     fn session_label(&self) -> Option<String> {
-        self.app.session_label.clone()
+        Some(self.app.state.name.clone()).filter(|n| !n.is_empty())
     }
     fn context_usage(&self) -> Option<(u32, u32)> {
-        self.app.last_usage
+        self.app.state.usage.last()
     }
     fn context_window(&self) -> Option<u32> {
-        self.app.context_window
+        self.app.state.usage.context_window
     }
     fn session_tokens(&self) -> (usize, usize) {
-        (self.app.session_in, self.app.session_out)
+        (
+            self.app.state.usage.tokens_in,
+            self.app.state.usage.tokens_out,
+        )
     }
     fn set_effort(&mut self, label: String) {
         self.app.effort = Some(label);
@@ -426,11 +448,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.cfg.resolve_provider(name)
     }
     fn set_base_url(&mut self, url: String) {
-        self.app.base_url = url;
+        self.app.state.base_url = url;
     }
     fn set_context_window(&mut self, tokens: Option<u32>) {
         if tokens.is_some() {
-            self.app.context_window = tokens;
+            self.app.state.usage.context_window = tokens;
         }
     }
     fn begin_login(&mut self) {
