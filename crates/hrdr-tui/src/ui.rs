@@ -540,12 +540,14 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.editor.render(f, inner);
 
-    // Overlay on the top padding row. The quit-confirm hint takes priority over
-    // the "follow output" button when both would apply.
+    // Overlays. The quit-confirm hint sits on the pane's top padding row; the
+    // "follow output" button two rows higher, clear of the pane. The hint takes
+    // priority when both would apply.
     if app.quit_armed {
-        top_row_button(
+        overlay_button(
             f,
             area,
+            area.y,
             " Press Ctrl+C again to quit ",
             Style::default()
                 .fg(Color::White)
@@ -555,10 +557,13 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         // Not clickable; and it sits over the follow button's spot.
         app.follow_button = None;
     } else if app.scroll_offset > 0 {
-        let rect = top_row_button(
+        // Two rows above the pane, clear of its top padding, with an arrow at
+        // each end pointing at the output it returns to.
+        let rect = overlay_button(
             f,
             area,
-            " Press END to follow output ↓ ",
+            area.y.saturating_sub(2),
+            " ↓ Press END to follow output ↓ ",
             Style::default()
                 .fg(Color::Black)
                 .bg(app.theme.warn)
@@ -575,14 +580,14 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Render a centered, single-row label over the top padding row of `area` and
-/// return its screen rect (for click hit-testing).
-fn top_row_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Rect {
+/// Render a centered, single-row label at screen row `y`, horizontally centered
+/// on `area`, and return its rect (for click hit-testing).
+fn overlay_button(f: &mut Frame, area: Rect, y: u16, label: &str, style: Style) -> Rect {
     let w = (label.chars().count() as u16).min(area.width);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let rect = Rect {
         x,
-        y: area.y,
+        y,
         width: w,
         height: 1,
     };
@@ -773,10 +778,10 @@ fn status_wrap_lines(sections: &[StatusSection], width: usize, t: &Theme) -> Vec
     lines
 }
 
-/// Help / keybind line, below the input pane. Also carries the chrome the
-/// input's border used to hold: the editor's mode, and a rough size of the draft
-/// on the right (~4 chars/token). (Turn state is shown by the loader above the
-/// input, so no ready/thinking status is repeated here.)
+/// The footer below the input pane: the editor's mode, the queue/scroll hints,
+/// and a rough size of the draft on the right (~4 chars/token). The keybindings
+/// themselves live in `/help` — repeating them on every frame was noise. (Turn
+/// state is shown by the loader above the input.)
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let scroll_hint = if app.scroll_offset > 0 {
         format!("  [scroll: {}↑]", app.scroll_offset)
@@ -789,11 +794,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         format!("  [{} queued]", app.queue.len())
     };
     let dim = Style::default().fg(app.theme.dim);
-    let text = format!(
-        "[{}] {}{queue_hint}{scroll_hint}",
-        app.editor.mode_label(),
-        app.editor.keybind_hint()
-    );
+    let text = format!("[{}]{queue_hint}{scroll_hint}", app.editor.mode_label());
     f.render_widget(Paragraph::new(text).style(dim), area);
 
     let chars = app.editor.content().chars().count();

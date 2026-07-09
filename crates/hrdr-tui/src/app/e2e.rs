@@ -2231,7 +2231,7 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     }));
     h.app.push_entry(Entry::assistant("after"));
 
-    let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
     // Scroll up until the tool header is on screen, mid-viewport.
@@ -2239,7 +2239,7 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let header_row = |term: &Terminal<TestBackend>| -> Option<u16> {
         let buf = term.backend().buffer();
-        (0..16).find(|&y| {
+        (0..20).find(|&y| {
             (0..39)
                 .filter_map(|x| {
                     buf.cell(Position::new(x, y))
@@ -2433,16 +2433,18 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(help.contains("~3 tok · 11 ch"), "the draft size:\n{screen}");
 }
 
-/// The "follow output" button overlays the input pane's top padding row (it used
-/// to sit on the top border), and clicking it returns to following.
+/// The "follow output" button floats two rows above the input pane, with an
+/// arrow at each end, and clicking it returns to following the newest output.
 #[tokio::test]
-async fn the_follow_button_sits_on_the_input_pad_row_and_is_clickable() {
+async fn the_follow_button_floats_above_the_input_and_is_clickable() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     let mut h = Harness::new(vec![]).await;
     for i in 0..30 {
         h.app.push_entry(Entry::system(format!("filler {i}")));
     }
+    h.type_str("draft");
+
     let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert!(h.app.follow_button.is_none(), "no button while following");
@@ -2453,13 +2455,30 @@ async fn the_follow_button_sits_on_the_input_pad_row_and_is_clickable() {
     let rect = h.app.follow_button.expect("the follow button is drawn");
     let buf = term.backend().buffer();
     let screen = buffer_to_string(buf);
-    let row: String = (0..50)
+
+    // An arrow at each end of the label. Read only the button's own columns —
+    // the rest of the row is still transcript.
+    let label: String = (rect.x..rect.x + rect.w)
         .filter_map(|x| {
             buf.cell(Position::new(x, rect.y))
                 .map(|c| c.symbol().to_string())
         })
         .collect();
-    assert!(row.contains("follow output"), "on its own row:\n{screen}");
+    let trimmed = label.trim();
+    assert!(trimmed.starts_with('↓'), "left arrow: {label:?}\n{screen}");
+    assert!(trimmed.ends_with('↓'), "right arrow: {label:?}\n{screen}");
+    assert!(trimmed.contains("Press END to follow output"), "{screen}");
+
+    // Two rows above the input pane, so it doesn't sit on the pane itself.
+    let pane_top = (0..20)
+        .find(|&y| buf.cell(Position::new(2, y)).unwrap().bg == h.app.theme.user_bg)
+        .expect("the input pane renders");
+    assert_eq!(rect.y + 2, pane_top, "two rows above the pane:\n{screen}");
+    assert_ne!(
+        buf.cell(Position::new(2, rect.y)).unwrap().bg,
+        h.app.theme.user_bg,
+        "the button is clear of the pane:\n{screen}"
+    );
 
     // Clicking it resumes following.
     h.app.on_mouse(MouseEvent {
@@ -2600,12 +2619,60 @@ async fn the_status_bar_is_a_padded_block() {
         row(status_y).starts_with("  "),
         "two columns of padding:\n{screen}"
     );
-    assert!(
-        !row(status_y).ends_with(|c: char| !c.is_whitespace()),
-        "and two on the right:\n{screen}"
-    );
+    // The content is laid out at the inner width, so the last two columns are
+    // always padding.
+    for x in [52u16, 53] {
+        assert_eq!(
+            buf.cell(Position::new(x, status_y)).unwrap().symbol(),
+            " ",
+            "column {x} is padding:\n{screen}"
+        );
+    }
     assert_eq!(row(status_y - 1).trim(), "", "blank row above:\n{screen}");
     assert_eq!(row(status_y + 1).trim(), "", "blank row below:\n{screen}");
-    // The help line follows it.
-    assert!(row(status_y + 2).contains("Enter=send"), "{screen}");
+    // The footer follows it, carrying the editor's mode.
+    assert!(row(status_y + 2).contains("[TEXT]"), "{screen}");
+}
+
+/// The footer carries the editor's mode and the draft size, but no keybindings —
+/// those moved into `/help`, which advertises the active input discipline's own
+/// keys.
+#[tokio::test]
+async fn keybindings_moved_from_the_footer_into_help() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("draft");
+
+    let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(screen.contains("[TEXT]"), "the mode stays:\n{screen}");
+    assert!(
+        screen.contains("~2 tok · 5 ch"),
+        "the draft size stays:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Enter=send"),
+        "the keybindings left the footer:\n{screen}"
+    );
+
+    // `/help` now lists them, including the plain engine's own hint. (A fresh
+    // harness: the draft above would otherwise prefix the command.)
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("/help");
+    h.press(KeyCode::Enter);
+    let help = h
+        .app
+        .state
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EntryKind::Notice(t) | EntryKind::System(t) if t.contains("Keys:") => Some(t.clone()),
+            _ => None,
+        })
+        .expect("/help output");
+    assert!(help.contains("Enter=send"), "the engine's keys:\n{help}");
+    assert!(help.contains("Ctrl+G=$EDITOR"), "{help}");
+    assert!(help.contains("@path attaches a file"), "{help}");
+    assert!(help.contains("click a tool block"), "{help}");
 }

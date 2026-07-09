@@ -264,9 +264,11 @@ impl super::App {
     }
 }
 
-/// Keybinding tips appended to the shared `/help` body (TUI-specific).
-const HELP_TIPS: &str =
-    "Tips: @path attaches a file · Up/Down recalls history · Ctrl+L redraws · Ctrl+C twice quits";
+/// Tips appended to the shared `/help` body (TUI-specific). The input
+/// discipline's own keys are added ahead of these, from
+/// [`hrdr_editor::EditorEngine::keybind_hint`], so vim and plain mode each
+/// advertise their own.
+const HELP_TIPS: &str = "  @path attaches a file · Up/Down recalls history\n       Ctrl+L redraws · Ctrl+C twice quits · click a tool block to expand it\n       PgUp/PgDn scrolls · Home/End jumps · END follows new output";
 
 /// The TUI's [`hrdr_app::CommandHost`] — a thin adapter over `App` so the shared
 /// slash-command dispatcher can drive it. Commands with a richer TUI rendering
@@ -468,7 +470,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.login = Some(wizard);
     }
     fn help_tips(&self) -> Option<String> {
-        Some(HELP_TIPS.to_string())
+        // The footer no longer repeats these, so `/help` is where they live.
+        Some(format!(
+            "Keys:\n  {}\n{HELP_TIPS}",
+            self.app.editor.keybind_hint()
+        ))
     }
 }
 

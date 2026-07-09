@@ -60,6 +60,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A `┃` bar down the left of the user's own surfaces** — the prompt block and
   the input pane — in Tokyo Night Moon's magenta (`#c099ff`). Tool calls share
   the prompt's background but not its bar.
+- **The footer no longer repeats the keybindings.** It keeps the editor's mode,
+  the queue/scroll hints, and the draft's size; the keys moved into `/help`,
+  which now lists the active input discipline's own bindings plus the mouse and
+  scroll shortcuts.
+- **The "follow output" button floats two rows above the input pane**, with an
+  arrow at each end.
 - **The status bar renders through the block renderer**: two columns of padding
   either side, a blank row above and below.
 - **Thinking blocks lost their `⠋ Thinking` / `Thought: 1.2s` label.** The
