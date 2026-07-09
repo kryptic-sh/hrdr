@@ -93,7 +93,10 @@ pub struct SessionState {
     #[serde(default)]
     pub cwd: String,
     /// The chat history the model sees (the `Agent` is its runtime owner).
-    #[serde(default)]
+    ///
+    /// Serialized through [`persisted_messages`], not `Message`'s own impl —
+    /// that one is the OpenAI wire format and drops the model's thinking.
+    #[serde(default, with = "persisted_messages")]
     pub messages: Vec<Message>,
     /// TODO items from the `todo` tool (the shared list is its runtime owner).
     #[serde(default)]
@@ -105,6 +108,56 @@ pub struct SessionState {
     /// Token counters for the status bar (see [`SessionUsage`]).
     #[serde(default)]
     pub usage: SessionUsage,
+}
+
+/// Serialize chat messages *for the session file*, which is not the OpenAI wire.
+///
+/// `Message`'s own `Serialize` is the wire format: it drops `reasoning_content`
+/// and `anthropic_thinking_blocks` via `skip_serializing`, because replaying a
+/// prior turn's thinking degrades reasoning models, and because those fields are
+/// Anthropic-only. `ChatRequest` serializes `Vec<Message>` straight onto the
+/// wire, so that invariant has to live on the type.
+///
+/// A session file has the opposite requirement: it must preserve them. Losing
+/// `anthropic_thinking_blocks` breaks a resumed Anthropic conversation whose
+/// last assistant turn has a pending `tool_use` — the API requires the signed
+/// thinking block on the follow-up turn.
+///
+/// Encoding therefore round-trips each message through its wire form and adds
+/// the two dropped fields back. Decoding needs no help: `skip_serializing` only
+/// affects the encode side, and both fields are `#[serde(default)]`.
+mod persisted_messages {
+    use super::Message;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(messages: &[Message], s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        let mut out = Vec::with_capacity(messages.len());
+        for m in messages {
+            let mut v = serde_json::to_value(m).map_err(S::Error::custom)?;
+            let Some(obj) = v.as_object_mut() else {
+                return Err(S::Error::custom("message did not serialize to an object"));
+            };
+            if let Some(r) = &m.reasoning_content {
+                obj.insert(
+                    "reasoning_content".into(),
+                    serde_json::Value::from(r.clone()),
+                );
+            }
+            if !m.anthropic_thinking_blocks.is_empty() {
+                obj.insert(
+                    "anthropic_thinking_blocks".into(),
+                    serde_json::Value::Array(m.anthropic_thinking_blocks.clone()),
+                );
+            }
+            out.push(v);
+        }
+        out.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Message>, D::Error> {
+        Vec::<Message>::deserialize(d)
+    }
 }
 
 impl SessionState {
@@ -345,7 +398,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
-    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
+    pub(super) fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
@@ -358,7 +411,7 @@ mod tests {
     }
 
     /// A saveable state: one user message, named, rooted at `cwd`.
-    fn state(name: &str, cwd: &str) -> SessionState {
+    pub(super) fn state(name: &str, cwd: &str) -> SessionState {
         SessionState {
             name: name.to_string(),
             model: "model".to_string(),
@@ -568,6 +621,7 @@ mod tests {
 
 #[cfg(test)]
 mod roundtrip_audit {
+    use super::tests::{state, with_test_env};
     use super::*;
     use crate::EntryKind;
 
@@ -690,29 +744,88 @@ mod roundtrip_audit {
         assert!(!*expanded, "expanded is view state, not persisted");
     }
 
-    /// `ChatMessage` drops `reasoning_content` and `anthropic_thinking_blocks`
-    /// on serialize — a wire-protocol invariant (never feed a prior turn's
-    /// thinking back to the model) that the session file inherits, since it
-    /// reuses the same `Serialize` impl.
+    /// A session file must preserve the model's thinking, even though
+    /// `Message`'s own `Serialize` (the OpenAI wire format) drops it.
     ///
-    /// Consequence: `state.messages` is the one part of the state that is *not*
-    /// a lossless round-trip. The displayed reasoning survives — it lives in
-    /// `transcript` as an `EntryKind::Reasoning` — but Anthropic's signed
-    /// thinking blocks do not.
+    /// Regression: the session file reused that wire impl, so `reasoning_content`
+    /// and `anthropic_thinking_blocks` were silently discarded. Losing the latter
+    /// breaks a resumed Anthropic conversation whose last assistant turn has a
+    /// pending `tool_use`: the API requires the signed thinking block on the
+    /// follow-up turn, and it was gone.
     #[test]
-    fn message_reasoning_does_not_survive_the_file() {
+    fn message_thinking_survives_the_file() {
+        let block = serde_json::json!({
+            "type": "thinking",
+            "thinking": "step by step",
+            "signature": "sig-abc",
+        });
         let mut assistant = Message::assistant("hello");
         assistant.reasoning_content = Some("secret thoughts".into());
+        assistant.anthropic_thinking_blocks = vec![block.clone()];
+
         let state = SessionState {
-            messages: vec![assistant],
+            messages: vec![Message::user("hi"), assistant],
             ..Default::default()
         };
         let json = serde_json::to_string(&Session::new(state)).unwrap();
-        assert!(
-            !json.contains("secret thoughts"),
-            "reasoning_content is never written to disk: {json}"
-        );
         let back = serde_json::from_str::<Session>(&json).unwrap().state;
+
+        assert_eq!(
+            back.messages[1].reasoning_content.as_deref(),
+            Some("secret thoughts"),
+            "reasoning survives: {json}"
+        );
+        assert_eq!(
+            back.messages[1].anthropic_thinking_blocks,
+            vec![block],
+            "the signed thinking block survives verbatim: {json}"
+        );
+        // Messages with no thinking don't grow empty keys.
         assert_eq!(back.messages[0].reasoning_content, None);
+        assert!(back.messages[0].anthropic_thinking_blocks.is_empty());
+        assert!(
+            !json.contains("\"anthropic_thinking_blocks\":[]"),
+            "no empty thinking arrays written: {json}"
+        );
+    }
+
+    /// The same, through an actual file: save, load, and the signed thinking
+    /// block is still there for the follow-up Anthropic turn.
+    #[test]
+    fn thinking_survives_a_real_save_and_load() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let block = serde_json::json!({"type": "thinking", "signature": "sig-1"});
+            let mut assistant = Message::assistant("hi");
+            assistant.anthropic_thinking_blocks = vec![block.clone()];
+
+            let mut st = state("Thinking", &cwd);
+            st.messages.push(assistant);
+            Session::new(st).save("thinking").unwrap();
+
+            let back = Session::load(&cwd, "thinking").unwrap().state;
+            assert_eq!(
+                back.messages.last().unwrap().anthropic_thinking_blocks,
+                vec![block]
+            );
+        });
+    }
+
+    /// The wire invariant is untouched: `Message`'s own `Serialize` — what
+    /// `ChatRequest` puts on the OpenAI wire — still drops both fields. Only the
+    /// session file's encoding adds them back.
+    #[test]
+    fn the_openai_wire_form_still_drops_thinking() {
+        let mut assistant = Message::assistant("hello");
+        assistant.reasoning_content = Some("secret thoughts".into());
+        assistant.anthropic_thinking_blocks = vec![serde_json::json!({"type": "thinking"})];
+
+        let wire = serde_json::to_string(&assistant).unwrap();
+        assert!(!wire.contains("secret thoughts"), "{wire}");
+        assert!(!wire.contains("anthropic_thinking_blocks"), "{wire}");
+        assert!(!wire.contains("reasoning_content"), "{wire}");
     }
 }
