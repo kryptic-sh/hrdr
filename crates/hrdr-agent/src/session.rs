@@ -236,6 +236,27 @@ pub fn list_sessions() -> Vec<SessionMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Global lock so env-var-dependent session tests don't race on HOME / XDG
+    /// vars (std::env::set_var is not thread-safe in Rust tests).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set HOME and XDG_DATA_HOME to an isolated temp dir for the duration of
+    /// `f`. Returns the guard — drop it to restore.
+    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+        f(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("HOME");
+        }
+    }
 
     // ── sanitize_name ─────────────────────────────────────────────────────────
 
@@ -271,18 +292,16 @@ mod tests {
 
     #[test]
     fn unique_session_id_appends_suffix_on_collision() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_str().unwrap();
-
-        // No file yet → plain slug returned.
-        assert_eq!(unique_session_id(cwd, "chat"), "chat");
-
-        // Create the first session file to simulate a collision.
-        let sess = Session::new("chat", "model", "http://x/v1", cwd, vec![]);
-        sess.save("chat").unwrap();
-
-        // Next call: "chat.json" exists → returns "chat-2".
-        assert_eq!(unique_session_id(cwd, "chat"), "chat-2");
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(unique_session_id(&cwd, "chat"), "chat");
+            let sess = Session::new("chat", "model", "http://x/v1", &cwd, vec![]);
+            sess.save("chat").unwrap();
+            assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
+        });
     }
 
     // ── resolve_session ───────────────────────────────────────────────────────
@@ -294,59 +313,60 @@ mod tests {
 
     #[test]
     fn resolve_session_exact_id_in_current_cwd() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_str().unwrap();
-
-        let sess = Session::new("My Chat", "model", "http://x/v1", cwd, vec![]);
-        sess.save("my-chat").unwrap();
-
-        let (id, s) = resolve_session(cwd, "my-chat").unwrap();
-        assert_eq!(id, "my-chat");
-        assert_eq!(s.name, "My Chat");
-        assert_eq!(s.cwd, cwd);
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("project");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            let sess = Session::new("My Chat", "model", "http://x/v1", &cwd, vec![]);
+            sess.save("my-chat").unwrap();
+            let (id, s) = resolve_session(&cwd, "my-chat").unwrap();
+            assert_eq!(id, "my-chat");
+            assert_eq!(s.name, "My Chat");
+            assert_eq!(s.cwd, cwd);
+        });
     }
 
     #[test]
     fn resolve_session_case_insensitive_display_name_match() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_str().unwrap();
-
-        // Save with id "work" but display name "Work Session".
-        let sess = Session::new("Work Session", "model", "http://x/v1", cwd, vec![]);
-        sess.save("work").unwrap();
-
-        // Searching by display name (case-insensitive) should find it.
-        let result = resolve_session(cwd, "WORK SESSION");
-        assert!(result.is_some(), "case-insensitive name match must work");
-        let (id, s) = result.unwrap();
-        assert_eq!(id, "work");
-        assert_eq!(s.name, "Work Session");
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("proj");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            let sess = Session::new("Work Session", "model", "http://x/v1", &cwd, vec![]);
+            sess.save("work").unwrap();
+            let result = resolve_session(&cwd, "WORK SESSION");
+            assert!(result.is_some(), "case-insensitive name match must work");
+            let (id, s) = result.unwrap();
+            assert_eq!(id, "work");
+            assert_eq!(s.name, "Work Session");
+        });
     }
 
     #[test]
     fn resolve_session_current_cwd_preferred_over_other_cwd() {
-        let tmp_a = tempfile::tempdir().unwrap();
-        let tmp_b = tempfile::tempdir().unwrap();
-        let cwd_a = tmp_a.path().to_str().unwrap();
-        let cwd_b = tmp_b.path().to_str().unwrap();
+        with_test_env(|tmp| {
+            let cwd_a = tmp.path().join("a");
+            let cwd_b = tmp.path().join("b");
+            std::fs::create_dir(&cwd_a).unwrap();
+            std::fs::create_dir(&cwd_b).unwrap();
+            let a = cwd_a.to_str().unwrap().to_string();
+            let b = cwd_b.to_str().unwrap().to_string();
 
-        // Session "alpha" exists in both cwd_a (exact id) and cwd_b (same id).
-        Session::new("Alpha A", "m", "http://x/v1", cwd_a, vec![])
-            .save("alpha")
-            .unwrap();
-        Session::new("Alpha B", "m", "http://x/v1", cwd_b, vec![])
-            .save("alpha")
-            .unwrap();
+            Session::new("Alpha A", "m", "http://x/v1", &a, vec![])
+                .save("alpha")
+                .unwrap();
+            Session::new("Alpha B", "m", "http://x/v1", &b, vec![])
+                .save("alpha")
+                .unwrap();
 
-        // resolve_session from cwd_a: exact id match in the current cwd wins.
-        let (_, s) = resolve_session(cwd_a, "alpha").unwrap();
-        assert_eq!(
-            s.name, "Alpha A",
-            "current-cwd exact match takes precedence"
-        );
+            let (_, s) = resolve_session(&a, "alpha").unwrap();
+            assert_eq!(
+                s.name, "Alpha A",
+                "current-cwd exact match takes precedence"
+            );
 
-        // resolve_session from cwd_b: its own "alpha" wins.
-        let (_, s) = resolve_session(cwd_b, "alpha").unwrap();
-        assert_eq!(s.name, "Alpha B");
+            let (_, s) = resolve_session(&b, "alpha").unwrap();
+            assert_eq!(s.name, "Alpha B");
+        });
     }
 }
