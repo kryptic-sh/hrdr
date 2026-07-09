@@ -175,7 +175,7 @@ mod theme_tests {
         assert_eq!(hex(t.accent), "#7aa2f7", "blue");
         assert_eq!(hex(t.accent2), "#bb9af7", "magenta");
 
-        assert_eq!(hex(t.user_bg), "#283457", "bg_visual");
+        assert_eq!(hex(t.user_bg), "#1e2030", "bg_dark (moon)");
         assert_eq!(hex(t.command_bg), "#24283b", "bg_storm");
         assert_eq!(hex(t.stats_bg), "#222436", "bg_moon");
         assert_eq!(hex(t.header_bg), "#292e42", "bg_highlight");

@@ -13,8 +13,9 @@ bg_dark1     = "#1f2335"
 bg           = "#1a1b26"
 bg_highlight = "#292e42"
 bg_visual    = "#283457"
-# Two sibling variants' backgrounds, for the extra block surfaces below.
+# Sibling variants' surfaces, used for the extra block backgrounds below.
 bg_moon      = "#222436"
+bg_moon_dark = "#1e2030"
 bg_storm     = "#24283b"
 
 # Text.
@@ -41,7 +42,7 @@ red1    = "#db4b4b"
 # starts and stops. Each is a palette value above; a user theme may override any
 # of them.
 # (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
-bg_user      = "#283457"  # bg_visual — also the tool-call block's background
+bg_user      = "#1e2030"  # bg_dark (moon) — also the tool-call block's background
 bg_command   = "#24283b"  # bg_storm
 bg_stats     = "#222436"  # bg_moon
 bg_header    = "#292e42"  # bg_highlight
