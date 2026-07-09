@@ -724,7 +724,10 @@ mod debounce_tests {
     /// printed the "config reloaded" notice — a handful of times per save.
     #[test]
     fn a_burst_of_events_fires_once() {
-        let window = Duration::from_millis(60);
+        // A wide window relative to the 20ms gaps: on a loaded CI runner a
+        // `sleep(20ms)` can overshoot by a lot, and any gap that outgrows the
+        // window would fire mid-burst and fail the assert below.
+        let window = Duration::from_millis(750);
         let (tx, hits, handle) = spawn(window);
 
         // 10 pings, 20ms apart — every gap is well inside the window.
@@ -735,9 +738,9 @@ mod debounce_tests {
         // Still quiet-period; nothing should have fired during the burst.
         assert_eq!(hits.load(Ordering::SeqCst), 0, "fired mid-burst");
 
-        assert_eq!(wait_for(&hits, 1, Duration::from_secs(2)), 1);
+        assert_eq!(wait_for(&hits, 1, Duration::from_secs(5)), 1);
         // And it stays at one — no trailing fire per swallowed event.
-        std::thread::sleep(window * 3);
+        std::thread::sleep(window);
         assert_eq!(hits.load(Ordering::SeqCst), 1, "one reload per burst");
 
         drop(tx);

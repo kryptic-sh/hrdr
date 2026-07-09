@@ -1328,6 +1328,11 @@ async fn a_new_session_opens_with_the_header_banner() {
         "the header is the transcript's first entry"
     );
 
+    // The harness runs in a temp dir, and macOS hands out long `/var/folders/…`
+    // paths that push the cwd's value onto a wrapped row of its own — which the
+    // column check below can't read. Pin it short so the row stays one line.
+    h.app.state.cwd = "/w".into();
+
     let mut term = Terminal::new(TestBackend::new(64, 32)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
@@ -2597,6 +2602,10 @@ async fn the_prompt_and_input_wear_a_left_bar() {
 #[tokio::test]
 async fn the_status_bar_is_a_padded_block() {
     let mut h = Harness::new(vec![]).await;
+    // One row, so the gauge label this test keys off can't be split across a
+    // wrap. Where the bar wraps depends on the section widths, which vary with
+    // the platform's temp paths — the padding under test does not.
+    h.app.statusbar_mode = hrdr_app::StatusBarMode::Truncate;
     let mut term = Terminal::new(TestBackend::new(54, 26)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
