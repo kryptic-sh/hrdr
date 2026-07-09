@@ -286,7 +286,15 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         .track_symbol(Some("│"))
         .thumb_symbol("█")
         .style(Style::default().fg(app.theme.dim));
-    f.render_stateful_widget(scrollbar, area, &mut sb_state);
+    // Scrollbar lives in the rightmost 1-column strip so it never overlaps the
+    // transcript content (important for markdown tables whose right-border
+    // characters — ┐, ┤, ┘, │ — would otherwise get clobbered by the track).
+    let sb_area = Rect {
+        x: area.x + area.width.saturating_sub(1),
+        width: 1,
+        ..area
+    };
+    f.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) {
