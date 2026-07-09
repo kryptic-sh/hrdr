@@ -106,12 +106,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         constraints.len() - 1
     });
     // With no status bar there's nothing to separate the tinted input pane from
-    // the help line, so supply the blank row directly.
+    // the bottom of the screen, so supply the blank row directly.
     if sb_height == 0 {
         constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Length(1)); // help / keybind line
-    let help_idx = constraints.len() - 1;
 
     let chunks = Layout::vertical(constraints).split(area);
 
@@ -139,7 +137,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     if let Some(i) = statusbar_idx {
         draw_statusbar(f, app, chunks[i], &sb_sections);
     }
-    draw_help(f, app, chunks[help_idx]);
 
     // Completion popup (slash command or `@file`), overlaid above the input.
     if let Some(comp) = app.active_completions() {
@@ -543,10 +540,13 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     // Both banners float on the same row above the pane; the quit confirmation
     // takes the spot when both would apply. Only the follow banner is clickable.
     if app.quit_armed {
+        // `●` (U+25CF) is neutral-width and lives in the same geometric-shapes
+        // block as the bars and blocks the TUI already draws, so it can't be
+        // emoji-substituted or rendered double-wide the way `⚠` was.
         banner(
             f,
             area,
-            "⚠",
+            "●",
             "Press Ctrl+C again to quit",
             Color::White,
             app.theme.error,
@@ -777,37 +777,6 @@ fn status_wrap_lines(sections: &[StatusSection], width: usize, t: &Theme) -> Vec
         lines.push(Line::from(""));
     }
     lines
-}
-
-/// The footer below the input pane: the editor's mode, the queue/scroll hints,
-/// and a rough size of the draft on the right (~4 chars/token). The keybindings
-/// themselves live in `/help` — repeating them on every frame was noise. (Turn
-/// state is shown by the loader above the input.)
-fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let scroll_hint = if app.scroll_offset > 0 {
-        format!("  [scroll: {}↑]", app.scroll_offset)
-    } else {
-        String::new()
-    };
-    let queue_hint = if app.queue.is_empty() {
-        String::new()
-    } else {
-        format!("  [{} queued]", app.queue.len())
-    };
-    let dim = Style::default().fg(app.theme.dim);
-    let text = format!("[{}]{queue_hint}{scroll_hint}", app.editor.mode_label());
-    f.render_widget(Paragraph::new(text).style(dim), area);
-
-    let chars = app.editor.content().chars().count();
-    if chars > 0 {
-        let toks = chars.div_ceil(4);
-        f.render_widget(
-            Paragraph::new(
-                Line::from(Span::styled(format!("~{toks} tok · {chars} ch "), dim)).right_aligned(),
-            ),
-            area,
-        );
-    }
 }
 
 /// Restyle every (ASCII case-insensitive) occurrence of `needle` within `line`

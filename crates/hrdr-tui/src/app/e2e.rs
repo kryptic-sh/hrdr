@@ -2425,12 +2425,10 @@ async fn the_input_pane_matches_the_user_prompt_block() {
         "and it is not tinted:\n{screen}"
     );
 
-    // The chrome the border used to carry moved to the help line below.
-    let help = (text_y + 1..26)
-        .map(row)
-        .find(|r| r.contains("[TEXT]"))
-        .unwrap_or_else(|| panic!("no help line with the editor mode:\n{screen}"));
-    assert!(help.contains("~3 tok · 11 ch"), "the draft size:\n{screen}");
+    // Nothing below the pane but the status bar: the footer row is gone, so the
+    // editor's mode and the draft size no longer render anywhere.
+    assert!(!screen.contains("[TEXT]"), "no mode footer:\n{screen}");
+    assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
 /// The "follow output" button floats two rows above the input pane, with an
@@ -2629,33 +2627,41 @@ async fn the_status_bar_is_a_padded_block() {
         );
     }
     assert_eq!(row(status_y - 1).trim(), "", "blank row above:\n{screen}");
+    // Its own trailing pad row is the last row on the screen — the status bar is
+    // the bottom-most chrome now that the footer is gone.
     assert_eq!(row(status_y + 1).trim(), "", "blank row below:\n{screen}");
-    // The footer follows it, carrying the editor's mode.
-    assert!(row(status_y + 2).contains("[TEXT]"), "{screen}");
+    assert_eq!(
+        status_y + 1,
+        25,
+        "the status bar sits at the bottom:\n{screen}"
+    );
 }
 
-/// The footer carries the editor's mode and the draft size, but no keybindings —
-/// those moved into `/help`, which advertises the active input discipline's own
-/// keys.
+/// There is no footer: the row that used to carry the editor's mode, the draft
+/// size and the keybindings is gone entirely. The keys live in `/help`, and the
+/// mode is signalled by the cursor's shape (see `tui::sync_cursor`).
 #[tokio::test]
-async fn keybindings_moved_from_the_footer_into_help() {
+async fn the_footer_is_gone_and_the_keys_live_in_help() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("draft");
 
     let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
-    assert!(screen.contains("[TEXT]"), "the mode stays:\n{screen}");
     assert!(
-        screen.contains("~2 tok · 5 ch"),
-        "the draft size stays:\n{screen}"
+        !screen.contains("[TEXT]"),
+        "the mode left the screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("~2 tok · 5 ch"),
+        "the draft size left the screen:\n{screen}"
     );
     assert!(
         !screen.contains("Enter=send"),
-        "the keybindings left the footer:\n{screen}"
+        "the keybindings left the screen:\n{screen}"
     );
 
-    // `/help` now lists them, including the plain engine's own hint. (A fresh
+    // `/help` lists them, including the plain engine's own hint. (A fresh
     // harness: the draft above would otherwise prefix the command.)
     let mut h = Harness::new(vec![]).await;
     h.type_str("/help");
@@ -2711,8 +2717,8 @@ async fn both_banners_render_through_the_same_path() {
     assert_eq!((fg, bg), (Color::Black, h.app.theme.warn));
     assert!(m.contains(ratatui::style::Modifier::BOLD), "bold");
 
-    // Arming the quit takes the same row, in the error colors, flanked by the
-    // warning icon, and is not clickable.
+    // Arming the quit takes the same row, in the error colors, flanked by its
+    // icon, and is not clickable.
     h.app.quit_armed = true;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert!(
@@ -2733,8 +2739,8 @@ async fn both_banners_render_through_the_same_path() {
         .unwrap_or_else(|| panic!("the quit banner takes the follow banner's row:\n{screen}"));
     // The icon flanks the label on both sides.
     assert!(
-        quit_row.contains("⚠ Press Ctrl+C again to quit ⚠"),
-        "the warning icon flanks the label: {quit_row:?}"
+        quit_row.contains("● Press Ctrl+C again to quit ●"),
+        "the icon flanks the label: {quit_row:?}"
     );
     // Sample the quit banner's own cells — it is a different width, so it is
     // centered on different columns.
