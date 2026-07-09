@@ -2163,6 +2163,10 @@ async fn fenced_code_has_no_extra_indent_or_language_row() {
 /// background already begins and ends in a blank row, so it needs no separator
 /// on either side.
 ///
+/// Two untinted blocks are the other way round: each contributes a plain blank
+/// pad row, and two is one too many between the model's thought and its output —
+/// so one is dropped.
+///
 /// prompt │ tool │ tool │ thought │ tool │ output
 ///        ↑blank ↑blank ↑         ↑      ↑
 #[tokio::test]
@@ -2189,6 +2193,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
     h.app.push_entry(Entry::reasoning("thought"));
     h.app.push_entry(tool("c", "grep"));
     h.app.push_entry(Entry::assistant("output"));
+    h.app.push_entry(tool("d", "wc"));
 
     let mut term = Terminal::new(TestBackend::new(40, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -2245,5 +2250,76 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         gap(grep_end, row_of("output")),
         2,
         "tool → output:\n{screen}"
+    );
+}
+
+/// The model's thought and the output that follows it are separated by a single
+/// blank row, not two.
+///
+/// Regression: each block contributes a blank padded row (below and above), and
+/// with neither tinted they stacked into a two-row gap.
+#[tokio::test]
+async fn a_thought_and_the_output_after_it_share_one_blank_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Reasoning {
+        text: "thinking here".into(),
+        took_ms: Some(1_100),
+    }));
+    h.app.push_entry(Entry::assistant("the output"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "ls".into(),
+        args: "{}".into(),
+        result: "res".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row_of = |needle: &str| -> u16 {
+        (0..30)
+            .find(|&y| {
+                (0..39)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    let blank = |y: u16| {
+        (0..39)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect::<String>()
+            .trim()
+            .is_empty()
+    };
+    let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
+
+    // Untinted → untinted: exactly one blank row.
+    assert_eq!(
+        gap(row_of("thinking here"), row_of("the output")),
+        1,
+        "thought → output:\n{screen}"
+    );
+    // Untinted → tinted is unchanged: the two blocks' own pads.
+    assert_eq!(
+        gap(row_of("#1 assistant"), row_of("ls")),
+        2,
+        "output → tool:\n{screen}"
     );
 }

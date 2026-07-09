@@ -1242,12 +1242,16 @@ impl PendingBlock {
 /// Paint a held block, recording where its messages start and (for a tool call)
 /// the row span a click can hit.
 ///
-/// `next_bg` is the background of the block that follows, if any. A blank
-/// separator row is emitted only between two *tinted* blocks: their padded rows
-/// carry their backgrounds, so a prompt followed by the tool call it triggered
-/// (or two tool calls) would otherwise merge into one slab. A block on the
-/// terminal background already begins and ends in a blank row, so pairing it
-/// with anything needs no separator.
+/// `next_bg` is the background of the block that follows, if any. Every block
+/// carries a blank padded row above and below, so the gap between two blocks is
+/// tuned by what sits on either side:
+///
+/// * **tinted → tinted** — those pads carry their backgrounds, so a prompt and
+///   the tool call it triggered (or two tool calls) would merge into one slab.
+///   A separator row is added between them.
+/// * **untinted → untinted** — both pads are plain blank rows, and two of them
+///   is one too many between the model's thought and its output. One is dropped.
+/// * **mixed** — the two pads already read as a single gap. Left alone.
 fn flush(
     out: &mut Vec<Line<'static>>,
     msg_starts: &mut Vec<usize>,
@@ -1267,8 +1271,13 @@ fn flush(
     if let Some(i) = block.tool_idx {
         tool_regions.push((start, out.len(), i));
     }
-    if bg != Color::Reset && next_bg.is_some_and(|n| n != Color::Reset) {
-        out.push(Line::raw(""));
+    match (bg == Color::Reset, next_bg.map(|n| n == Color::Reset)) {
+        (false, Some(false)) => out.push(Line::raw("")),
+        // Drop this block's bottom pad; the next block's top pad is the gap.
+        (true, Some(true)) => {
+            out.pop();
+        }
+        _ => {}
     }
 }
 
@@ -2188,6 +2197,140 @@ mod block_tests {
                 assert_ne!(a, b, "block backgrounds must differ: {bgs:?}");
             }
         }
+    }
+
+    /// The gap between two blocks, for every pairing of tinted / untinted.
+    ///
+    /// Each block carries a blank padded row above and below, so a naive
+    /// concatenation always yields two blank rows between them. The rule tunes
+    /// that: a separator is added between two tinted blocks (whose pads carry
+    /// their backgrounds and would otherwise merge into one slab), and one pad
+    /// is dropped between two untinted ones (two plain blanks is one too many).
+    #[test]
+    fn the_gap_between_blocks_depends_on_both_backgrounds() {
+        let theme = Theme::default();
+        let tinted = BlockKind::User; // user_bg
+        let plain = BlockKind::Assistant; // Color::Reset
+        assert_ne!(tinted.bg(&theme), Color::Reset);
+        assert_eq!(plain.bg(&theme), Color::Reset);
+
+        // Paint `first`, then `second`, and count the blank rows between their
+        // one content row each.
+        let gap = |first: BlockKind, second: Option<BlockKind>| -> usize {
+            let mut out = Vec::new();
+            let (mut starts, mut regions) = (Vec::new(), Vec::new());
+            let block = |kind| PendingBlock {
+                kind,
+                lines: vec![Line::from(Span::raw("x"))],
+                tool_idx: None,
+                msgs: 0,
+                footer_len: 0,
+            };
+            flush(
+                &mut out,
+                &mut starts,
+                &mut regions,
+                Some(block(first)),
+                second.map(|k| k.bg(&theme)),
+                10,
+                &theme,
+            );
+            let after_first = out.len();
+            if let Some(second) = second {
+                flush(
+                    &mut out,
+                    &mut starts,
+                    &mut regions,
+                    Some(block(second)),
+                    None,
+                    10,
+                    &theme,
+                );
+            }
+            // Rows after the first block's content row, before the second's.
+            let content = |l: &Line<'_>| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            };
+            let first_content = out.iter().position(|l| content(l) == "x").unwrap();
+            let next_content = out
+                .iter()
+                .skip(after_first)
+                .position(|l| content(l) == "x")
+                .map(|i| i + after_first)
+                .unwrap_or(out.len());
+            next_content - first_content - 1
+        };
+
+        // tinted → tinted: bottom pad + separator + top pad.
+        assert_eq!(
+            gap(tinted, Some(tinted)),
+            3,
+            "two tinted blocks merge without a separator"
+        );
+        // untinted → untinted: one pad is dropped.
+        assert_eq!(gap(plain, Some(plain)), 1, "a thought and its output");
+        // Mixed: the two pads already read as one gap.
+        assert_eq!(gap(tinted, Some(plain)), 2, "tinted → untinted");
+        assert_eq!(gap(plain, Some(tinted)), 2, "untinted → tinted");
+
+        // Nothing follows: a tinted block gets no trailing separator, and an
+        // untinted one keeps its bottom pad.
+        let trailing = |kind: BlockKind| -> usize {
+            let mut out = Vec::new();
+            let (mut starts, mut regions) = (Vec::new(), Vec::new());
+            flush(
+                &mut out,
+                &mut starts,
+                &mut regions,
+                Some(PendingBlock {
+                    kind,
+                    lines: vec![Line::from(Span::raw("x"))],
+                    tool_idx: None,
+                    msgs: 0,
+                    footer_len: 0,
+                }),
+                None,
+                10,
+                &theme,
+            );
+            out.len() - 2 // minus the content row and the top pad
+        };
+        assert_eq!(trailing(tinted), 1, "bottom pad only, no separator");
+        assert_eq!(trailing(plain), 1, "bottom pad kept");
+    }
+
+    /// `flush` still records where a block's messages start and, for a tool
+    /// call, the rows a click can land on — even as the gap rules shift rows.
+    #[test]
+    fn flush_records_message_starts_and_tool_regions() {
+        let theme = Theme::default();
+        let mut out = vec![Line::raw("existing")];
+        let (mut starts, mut regions) = (Vec::new(), Vec::new());
+        flush(
+            &mut out,
+            &mut starts,
+            &mut regions,
+            Some(PendingBlock {
+                kind: BlockKind::Tool,
+                lines: vec![Line::from(Span::raw("x"))],
+                tool_idx: Some(7),
+                msgs: 2, // a block carrying a borrowed assistant label
+                footer_len: 0,
+            }),
+            None,
+            10,
+            &theme,
+        );
+        assert_eq!(starts, vec![1, 1], "both messages start at the block");
+        assert_eq!(regions.len(), 1);
+        let (start, end, idx) = regions[0];
+        assert_eq!((start, idx), (1, 7));
+        assert!(end > start, "the tool block spans rows");
     }
 
     /// The tool header always leads with a status mark that reflects the call's
