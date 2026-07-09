@@ -30,6 +30,17 @@ pub enum Entry {
     Diff(String),
 }
 
+/// Extract the `command` field from a JSON tool-args string, if any.
+/// Returns `None` for non-shell tools or malformed args.
+pub fn extract_shell_command(name: &str, args: &str) -> Option<String> {
+    if name != "bash" && name != "powershell" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("command")?.as_str().map(String::from))
+}
+
 impl Entry {
     /// The displayable text of a user/assistant message, if this entry is one.
     /// These are the only entries that count as numbered "messages" for `/find`,

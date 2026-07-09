@@ -1077,8 +1077,8 @@ impl App {
                     self.subagent_panel.on_tool_start(id.clone());
                 }
                 self.push_entry(Entry::Tool {
-                    id,
-                    name,
+                    id: id.clone(),
+                    name: name.clone(),
                     args,
                     result: String::new(),
                     ok: true,

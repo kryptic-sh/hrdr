@@ -1249,13 +1249,6 @@ fn push_tool(
     // Shell tools (bash, powershell) render the command on its own line below the
     // header, like an actual shell prompt — more readable than truncating inline.
     let is_shell = matches!(name, "bash" | "powershell");
-    let shell_cmd: Option<String> = if is_shell {
-        serde_json::from_str::<serde_json::Value>(args)
-            .ok()
-            .and_then(|v| v.get("command")?.as_str().map(String::from))
-    } else {
-        None
-    };
     let args_preview = hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW);
 
     // Header line: ✓ bash   (just name for shell tools, name + args for others)
@@ -1277,7 +1270,7 @@ fn push_tool(
     ));
 
     // Shell tools: render the raw command on its own line (monospaced feel).
-    if let Some(cmd) = shell_cmd {
+    if let Some(cmd) = hrdr_app::extract_shell_command(name, args) {
         out.push(pad_line(
             vec![Span::styled(format!("   $ {cmd}"), dim_bg)],
             width,

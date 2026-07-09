@@ -16,7 +16,6 @@ hjkl-clipboard.workspace = true
 hjkl-markdown.workspace = true
 hjkl-markdown-tui.workspace = true
 anyhow.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 crossterm.workspace = true
