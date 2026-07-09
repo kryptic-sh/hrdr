@@ -1588,3 +1588,60 @@ async fn resume_notices_do_not_accumulate() {
         .count();
     assert_eq!(user_msgs, 1, "the conversation is not duplicated");
 }
+
+/// `/clear` (and its aliases `/new`, `/reset`) take an optional name for the
+/// fresh session, so it saves under that name instead of one derived from its
+/// first message.
+#[tokio::test]
+async fn clear_and_new_take_a_session_name() {
+    let data_home = tempfile::tempdir().unwrap();
+    // SAFETY: `sessions_dir()` reads this; only this test uses the value.
+    unsafe { std::env::set_var("XDG_DATA_HOME", data_home.path()) };
+
+    let mut h = Harness::new(vec![
+        MockReply::Text("ok".into()),
+        MockReply::Text("ok".into()),
+    ])
+    .await;
+    h.submit("first message").await;
+    assert_eq!(
+        h.app.state.name, "first message",
+        "name derived from the message"
+    );
+
+    // Bare `/clear` starts an unnamed session.
+    h.type_str("/clear");
+    h.press(KeyCode::Enter);
+    assert!(h.app.state.name.is_empty(), "no name yet");
+    assert!(
+        h.app.state.id.is_none(),
+        "detached from the old session file"
+    );
+
+    // `/new <name>` — the alias — names it up front.
+    h.type_str("/new Project X");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.name, "Project X");
+    assert!(
+        h.app.state.id.is_none(),
+        "id assigned on first save, not now"
+    );
+
+    // The next turn's autosave writes it under that name, slugified.
+    h.submit("second message").await;
+    assert_eq!(h.app.state.name, "Project X", "the name survives the turn");
+    assert_eq!(
+        h.app.state.id.as_deref(),
+        Some("project-x"),
+        "file id from the name"
+    );
+    let cwd = h.app.current_cwd();
+    assert_eq!(
+        hrdr_app::Session::load(&cwd, "project-x")
+            .unwrap()
+            .state
+            .name,
+        "Project X",
+        "the named session is on disk"
+    );
+}

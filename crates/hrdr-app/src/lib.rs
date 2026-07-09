@@ -38,7 +38,7 @@ pub use util::*;
 /// The slash commands, as `(name, one-line description)`. Frontends render this
 /// however they like (a completion popup, a `/` menu, a help screen).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/clear", "reset the conversation"),
+    ("/clear", "reset the conversation (optional name)"),
     ("/compact", "summarize the conversation to reclaim context"),
     (
         "/sessions",
@@ -85,7 +85,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/exit", "quit"),
     // Aliases for users switching from other agents (resolved by resolve_alias).
-    ("/new", "alias of /clear"),
+    ("/new", "alias of /clear (optional name)"),
     ("/reset", "alias of /clear"),
     ("/cd", "alias of /cwd"),
     ("/status", "alias of /info"),

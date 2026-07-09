@@ -25,9 +25,16 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             host.info(s);
         }
+        // `/clear`, `/new`, `/reset` — optionally naming the fresh session, so it
+        // saves under that name instead of one derived from its first message.
         "clear" => {
             host.clear_conversation();
-            host.info("conversation cleared".to_string());
+            if arg.is_empty() {
+                host.info("conversation cleared".to_string());
+            } else {
+                host.set_session_label(arg.clone());
+                host.info(format!("new session '{arg}'"));
+            }
         }
         "model" => {
             if arg.is_empty() {

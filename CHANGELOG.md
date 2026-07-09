@@ -29,6 +29,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`/clear` takes an optional session name** (as do its aliases `/new` and
+  `/reset`): `/new Project X` starts a fresh conversation that saves under that
+  name instead of one derived from its first message.
 - **Unified block rendering.** Every transcript entry renders through one
   `render_block`: padded on all four sides, each kind with its own overridable
   background (header, user, assistant, tool, command, stats). Slash-command

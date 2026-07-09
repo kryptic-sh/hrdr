@@ -125,8 +125,9 @@ the input pane instead of the default plain input.
 
 Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 
-- **Session** — `/clear`, `/sessions`, `/resume <id|name>`, `/rename`,
-  `/compact`, `/info`, `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
+- **Session** — `/clear [name]` (aliases `/new`, `/reset`), `/sessions`,
+  `/resume <id|name>`, `/rename`, `/compact`, `/info`, `/goto <N|5m|top|end>`,
+  `/find <text>` (`/next` `/prev`)
 - **Model** — `/model`, `/models`, `/provider`, `/login` (guided provider + key
   setup), `/temp`, `/effort <minimal|low|medium|high>` (sent as
   `reasoning_effort` to OpenAI-style reasoning models, or a `thinking` budget on
