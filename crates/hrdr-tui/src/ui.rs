@@ -1022,6 +1022,7 @@ fn transcript_lines(
                 meta(&mut out, i, msg_num, "you");
                 let user_color = theme.user;
                 let user_bg = theme.user_bg;
+                let w = width as usize;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     push_text(
@@ -1030,6 +1031,10 @@ fn transcript_lines(
                         text,
                         Style::default().fg(user_color).bg(user_bg),
                     );
+                    // Pad every line to full width so the background is a solid block.
+                    for line in &mut buf {
+                        *line = pad_line(std::mem::take(line).spans, w, user_bg);
+                    }
                     buf
                 }));
             }
