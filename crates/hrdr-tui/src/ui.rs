@@ -1049,14 +1049,13 @@ impl BlockKind {
     /// theme slot here and every line it renders picks it up.
     fn bg(self, theme: &Theme) -> Color {
         match self {
-            BlockKind::Header => theme.header_bg,
             // A tool call is something the user's turn set in motion, so it
             // sits on the prompt's background rather than a surface of its own.
             BlockKind::User | BlockKind::Queued | BlockKind::Tool => theme.user_bg,
             BlockKind::Command => theme.command_bg,
-            // The model's output and its thinking sit on the terminal's own
-            // background — no override, so they read as the page itself.
-            BlockKind::Assistant | BlockKind::Reasoning => Color::Reset,
+            // The banner, the model's output, and its thinking sit on the
+            // terminal's own background — no override, so they read as the page.
+            BlockKind::Header | BlockKind::Assistant | BlockKind::Reasoning => Color::Reset,
             BlockKind::Stats => theme.stats_bg,
         }
     }
@@ -2192,7 +2191,8 @@ mod block_tests {
     fn block_kinds_have_the_right_backgrounds() {
         let t = Theme::default();
 
-        // No override for the model's output or its thinking.
+        // No override for the banner, the model's output, or its thinking.
+        assert_eq!(BlockKind::Header.bg(&t), Color::Reset);
         assert_eq!(BlockKind::Assistant.bg(&t), Color::Reset);
         assert_eq!(BlockKind::Reasoning.bg(&t), Color::Reset);
 
@@ -2203,11 +2203,9 @@ mod block_tests {
 
         assert_eq!(BlockKind::Command.bg(&t), t.command_bg);
         assert_eq!(BlockKind::Stats.bg(&t), t.stats_bg);
-        assert_eq!(BlockKind::Header.bg(&t), t.header_bg);
 
         // The tinted surfaces differ from each other and from the terminal.
         let bgs = [
-            BlockKind::Header.bg(&t),
             BlockKind::User.bg(&t),
             BlockKind::Command.bg(&t),
             BlockKind::Stats.bg(&t),

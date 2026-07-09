@@ -34,8 +34,6 @@ pub struct ChatPalette {
     pub command_bg: Option<Rgb>,
     /// Per-turn stats block background.
     pub stats_bg: Option<Rgb>,
-    /// Session-header (banner) block background.
-    pub header_bg: Option<Rgb>,
     /// Success marks (tool ✓).
     pub success: Option<Rgb>,
     /// Error marks (tool ✗).
@@ -82,7 +80,6 @@ impl ChatPalette {
                 .or_else(|| pal("ui_cursorline"))
                 .or(Some(panel)),
             stats_bg: pal("bg_stats").or_else(|| pal("ui_cursorline")),
-            header_bg: pal("bg_header").or_else(|| pal("ui_cursorline")),
             success: pal("green"),
             error: t.ui.diagnostic_error.map(rgb).or_else(|| pal("red")),
             accent: pal("blue").or_else(|| pal("cyan")),

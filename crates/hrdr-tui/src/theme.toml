@@ -36,16 +36,15 @@ teal    = "#1abc9c"
 red     = "#f7768e"
 red1    = "#db4b4b"
 
-# Transcript block backgrounds. The model's output and thinking use the
-# terminal's own background (no override), and fenced code inherits whatever
-# block it sits in; the rest get a surface so a reader can see where each block
-# starts and stops. Each is a palette value above; a user theme may override any
-# of them.
+# Transcript block backgrounds. The banner, the model's output, and its thinking
+# use the terminal's own background (no override), and fenced code inherits
+# whatever block it sits in; the rest get a surface so a reader can see where
+# each block starts and stops. Each is a palette value above; a user theme may
+# override any of them.
 # (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
 bg_user      = "#1e2030"  # bg_dark (moon) — also the tool-call block's background
 bg_command   = "#24283b"  # bg_storm
 bg_stats     = "#222436"  # bg_moon
-bg_header    = "#292e42"  # bg_highlight
 
 [ui]
 background = "$bg"

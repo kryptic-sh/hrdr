@@ -32,10 +32,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`/clear` takes an optional session name** (as do its aliases `/new` and
   `/reset`): `/new Project X` starts a fresh conversation that saves under that
   name instead of one derived from its first message.
-- **Fewer block surfaces.** The model's output and its thinking use the
-  terminal's own background; a tool call shares the user prompt's; and fenced
-  code inherits whatever block it sits in rather than painting a slab of its
-  own. Only the header, prompt/tool, command output, and stats rows are tinted.
+- **Fewer block surfaces.** The session banner, the model's output, and its
+  thinking use the terminal's own background; a tool call shares the user
+  prompt's; and fenced code inherits whatever block it sits in rather than
+  painting a slab of its own. Only the prompt (and tool calls), command output,
+  and the stats row are tinted.
 - **Unified block rendering.** Every transcript entry renders through one
   `render_block`: two columns of padding either side and one blank row above and
   below, each kind with its own overridable background (header, user, assistant,
