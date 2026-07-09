@@ -33,10 +33,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/reset`): `/new Project X` starts a fresh conversation that saves under that
   name instead of one derived from its first message.
 - **Unified block rendering.** Every transcript entry renders through one
-  `render_block`: padded on all four sides, each kind with its own overridable
-  background (header, user, assistant, tool, command, stats). Slash-command
-  output renders as markdown in undimmed colors; reasoning shares the assistant
-  colors, dimmer. The `#N you` / `#N assistant` labels close their block.
+  `render_block`: two columns of padding either side and one blank row above and
+  below, each kind with its own overridable background (header, user, assistant,
+  tool, command, stats). Slash-command output renders as markdown in undimmed
+  colors; reasoning shares the assistant colors, dimmer. The `#N you` /
+  `#N assistant` labels close their block.
+- **The `⠋ Thinking` and `Thought: 1.2s` labels render identically** — one label
+  row, one blank row, then the thought. The elapsed time is now data on the
+  entry (`EntryKind::Reasoning { text, took_ms }`) rather than a string spliced
+  into the thought's text, so it no longer passes through markdown or gets
+  persisted into the transcript.
 - **Tool blocks show tool-specific detail**: the shell command and its output,
   `write`'s path and raw file contents, `edit`/`patch`'s diff, `read`'s tail.
 - **One `SessionState` is the on-disk payload.** `Entry` is now `{ kind, time }`

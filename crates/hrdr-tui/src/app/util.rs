@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 /// Human-readable duration: `843ms` (<1s), `2.3s` (<1m), `1m 23s` (≥1m).
-pub(super) fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     let millis = d.as_millis();
     if millis < 1_000 {
         return format!("{millis}ms");

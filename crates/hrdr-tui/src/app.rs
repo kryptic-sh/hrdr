@@ -30,7 +30,7 @@ use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
 };
-use util::format_duration;
+pub(crate) use util::format_duration;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -1094,23 +1094,24 @@ impl App {
         self.out_tokens += 1;
     }
 
-    /// Stamp a "Thought:" marker on the last reasoning entry when thinking ends.
+    /// Record how long the last reasoning block took, when thinking ends. The
+    /// renderer turns it into the block's `Thought: 1.2s` label — it is never
+    /// spliced into the entry's text.
     fn finish_reasoning(&mut self) {
         let Some(start) = self.reasoning_start.take() else {
             return;
         };
-        let elapsed = start.elapsed();
-        let dur_str = format_duration(elapsed);
-        if let Some(EntryKind::Reasoning(s)) = self.state.transcript.last_mut().map(|e| &mut e.kind)
+        let elapsed = start.elapsed().as_millis() as u64;
+        if let Some(EntryKind::Reasoning { took_ms, .. }) =
+            self.state.transcript.last_mut().map(|e| &mut e.kind)
         {
-            // Prepend the footer so it renders at the top of the think block.
-            s.insert_str(0, &format!("Thought: {dur_str}\n\n"));
+            *took_ms = Some(elapsed);
         }
     }
 
     fn apply_event(&mut self, ev: AgentEvent) {
-        // Stamp a "Thought:" footer on the last reasoning block when thinking
-        // ends (the next event after Reasoning is something else).
+        // Stamp the elapsed thinking time on the last reasoning block when
+        // thinking ends (the next event after Reasoning is something else).
         let end_reasoning = !matches!(ev, AgentEvent::Reasoning(_));
         if end_reasoning {
             self.finish_reasoning();
@@ -1129,7 +1130,10 @@ impl App {
                     self.reasoning_start = Some(Instant::now());
                 }
                 match self.state.transcript.last_mut().map(|e| &mut e.kind) {
-                    Some(EntryKind::Reasoning(s)) => s.push_str(&t),
+                    Some(EntryKind::Reasoning {
+                        text,
+                        took_ms: None,
+                    }) => text.push_str(&t),
                     _ => self.push_entry(Entry::reasoning(t)),
                 }
             }

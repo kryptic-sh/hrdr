@@ -36,7 +36,15 @@ pub enum EntryKind {
     Header,
     User(String),
     Assistant(String),
-    Reasoning(String),
+    /// A block of the model's thinking. `took_ms` is set when the block ends,
+    /// and drives the `Thought: 1.2s` label; while `None` the block is still
+    /// streaming and the frontend shows a spinner instead. The label is never
+    /// part of `text` — it's chrome the renderer adds.
+    Reasoning {
+        text: String,
+        #[serde(default)]
+        took_ms: Option<u64>,
+    },
     Tool {
         id: String,
         name: String,
@@ -87,7 +95,10 @@ impl Entry {
         Self::now(EntryKind::Assistant(text.into()))
     }
     pub fn reasoning(text: impl Into<String>) -> Self {
-        Self::now(EntryKind::Reasoning(text.into()))
+        Self::now(EntryKind::Reasoning {
+            text: text.into(),
+            took_ms: None,
+        })
     }
     pub fn system(text: impl Into<String>) -> Self {
         Self::now(EntryKind::System(text.into()))
@@ -489,7 +500,7 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
             EntryKind::Diff(s) => out.push_str(&format!("{s}\n\n")),
             EntryKind::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
             EntryKind::Notice(s) => out.push_str(&format!("[{s}]\n\n")),
-            EntryKind::Reasoning(_) | EntryKind::Stats(_) | EntryKind::Header => {}
+            EntryKind::Reasoning { .. } | EntryKind::Stats(_) | EntryKind::Header => {}
         }
     }
     out.trim_end().to_string()

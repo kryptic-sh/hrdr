@@ -478,7 +478,13 @@ mod tests {
             let t = crate::time_from_unix(1_700_000_000, chrono::Local::now());
             st.transcript = vec![
                 Entry::at(EntryKind::User("hi".into()), t),
-                Entry::at(EntryKind::Reasoning("hmm".into()), t),
+                Entry::at(
+                    EntryKind::Reasoning {
+                        text: "hmm".into(),
+                        took_ms: Some(900),
+                    },
+                    t,
+                ),
                 Entry::at(EntryKind::Assistant("hello".into()), t),
                 Entry::at(EntryKind::Stats("✓ 1 tok".into()), t),
             ];
@@ -666,7 +672,13 @@ mod roundtrip_audit {
             transcript: vec![
                 Entry::at(EntryKind::Header, t),
                 Entry::at(EntryKind::User("hi".into()), t),
-                Entry::at(EntryKind::Reasoning("thinking".into()), t),
+                Entry::at(
+                    EntryKind::Reasoning {
+                        text: "thinking".into(),
+                        took_ms: Some(900),
+                    },
+                    t,
+                ),
                 Entry::at(EntryKind::Assistant("hello".into()), t),
                 Entry::at(
                     EntryKind::Tool {

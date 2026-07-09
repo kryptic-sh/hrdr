@@ -636,12 +636,9 @@ async fn reasoning_entry_appended_to_transcript() {
     assert!(h.app.show_reasoning, "show_reasoning must default to true");
     h.submit("think").await;
     assert!(!h.app.running);
-    let has_reasoning = h
-        .app
-        .state
-        .transcript
-        .iter()
-        .any(|e| matches!(&e.kind, EntryKind::Reasoning(t) if t.contains("I am thinking.")));
+    let has_reasoning = h.app.state.transcript.iter().any(
+        |e| matches!(&e.kind, EntryKind::Reasoning { text, .. } if text.contains("I am thinking.")),
+    );
     assert!(
         has_reasoning,
         "EntryKind::Reasoning missing from transcript"
@@ -880,9 +877,14 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     let bg_at = |x: u16, y: u16| buf.cell(Position::new(x, y)).unwrap().bg;
     let find_row = |needle: &str| (0..40).find(|&y| row_text(y).contains(needle));
 
+    // Content is inset by the block's horizontal padding, on both sides.
+    let pad = " ".repeat(crate::ui::BLOCK_PAD_X);
     let user_y = find_row("run it").expect("user prompt rendered");
     // Padded one column in, on the user background, filled to the block's width.
-    assert!(row_text(user_y).starts_with(" run it"), "left padding");
+    assert!(
+        row_text(user_y).starts_with(&format!("{pad}run it")),
+        "left padding"
+    );
     for x in 0..59 {
         assert_eq!(bg_at(x, user_y), theme.user_bg, "user row bg at x={x}");
     }
@@ -890,7 +892,10 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     // chrome outside the block), sitting on the block background below the
     // message text, separated from it by a blank row.
     let meta_y = user_y + 2;
-    assert!(row_text(meta_y).starts_with(" #1 you · "), "meta row");
+    assert!(
+        row_text(meta_y).starts_with(&format!("{pad}#1 you · ")),
+        "meta row"
+    );
     assert_eq!(
         bg_at(0, meta_y),
         theme.user_bg,
@@ -920,7 +925,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     let tool_y = find_row("✓ bash").expect("tool header rendered");
     assert_eq!(bg_at(0, tool_y), theme.tool_bg, "tool block bg");
     assert!(
-        row_text(tool_y + 1).starts_with(" $ echo hi"),
+        row_text(tool_y + 1).starts_with(&format!("{pad}$ echo hi")),
         "command line"
     );
     assert!(
@@ -943,7 +948,13 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
     let t = |secs: i64| hrdr_app::time_from_unix(secs, chrono::Local::now());
     let transcript = vec![
         Entry::at(EntryKind::User("hi".into()), t(1_700_000_000)),
-        Entry::at(EntryKind::Reasoning("thinking".into()), t(1_700_000_001)),
+        Entry::at(
+            EntryKind::Reasoning {
+                text: "thinking".into(),
+                took_ms: Some(1_200),
+            },
+            t(1_700_000_001),
+        ),
         Entry::at(EntryKind::Assistant("hello".into()), t(1_700_000_002)),
         Entry::at(
             EntryKind::Tool {
@@ -1252,7 +1263,7 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
             .state
             .transcript
             .iter()
-            .any(|e| matches!(e.kind, EntryKind::Reasoning(_))),
+            .any(|e| matches!(e.kind, EntryKind::Reasoning { .. })),
         "the model's thoughts are persisted"
     );
     assert!(
@@ -1644,4 +1655,81 @@ async fn clear_and_new_take_a_session_name() {
         "Project X",
         "the named session is on disk"
     );
+}
+
+/// The `⠋ Thinking` and `Thought: 1.2s` labels render the same way: one label
+/// row, then exactly one blank row, then the thought text.
+///
+/// Regression: the streaming spinner was a header row, while the finished label
+/// was spliced into the entry's *text* as `"Thought: 1.2s\n\n"` — so it went
+/// through markdown, was persisted into the transcript, and the two states had
+/// different spacing.
+#[tokio::test]
+async fn thinking_and_thought_labels_render_identically() {
+    // The rightmost column is the scrollbar, not block content.
+    let content = |l: &str| -> String {
+        let mut c: Vec<char> = l.chars().collect();
+        c.pop();
+        c.into_iter().collect::<String>().trim().to_string()
+    };
+    let rows_after_label = |screen: &str, label: &str| -> (String, String) {
+        let mut it = screen.lines().skip_while(|l| !l.contains(label)).skip(1);
+        (
+            content(it.next().unwrap_or_default()),
+            content(it.next().unwrap_or_default()),
+        )
+    };
+    let render = |app: &mut App| {
+        let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        // Scroll to the top so the block is on screen, then redraw.
+        app.scroll_offset = app.max_scroll;
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        buffer_to_string(term.backend().buffer())
+    };
+
+    // Finished: the duration is data on the entry, not text inside it.
+    let mut h = Harness::new(vec![MockReply::TextWithReasoning {
+        reasoning: "let me think".into(),
+        text: "done".into(),
+    }])
+    .await;
+    h.submit("go").await;
+    let reasoning = h
+        .app
+        .state
+        .transcript
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::Reasoning { text, took_ms } => Some((text.clone(), *took_ms)),
+            _ => None,
+        })
+        .expect("a reasoning entry");
+    assert_eq!(
+        reasoning.0, "let me think",
+        "the label is not spliced into the text"
+    );
+    assert!(
+        reasoning.1.is_some(),
+        "the elapsed time is recorded as data"
+    );
+
+    let screen = render(&mut h.app);
+    let (blank, text) = rows_after_label(&screen, "Thought:");
+    assert_eq!(blank, "", "exactly one blank row after the label");
+    assert_eq!(text, "let me think", "then the thought");
+
+    // Streaming: same shape, spinner label.
+    let mut h2 = Harness::new(vec![]).await;
+    h2.app
+        .state
+        .transcript
+        .push(Entry::reasoning("streaming thoughts"));
+    h2.app.running = true;
+    h2.app.reasoning_start = Some(std::time::Instant::now());
+
+    let screen = render(&mut h2.app);
+    let (blank, text) = rows_after_label(&screen, "Thinking");
+    assert_eq!(blank, "", "exactly one blank row after the label");
+    assert_eq!(text, "streaming thoughts", "then the thought");
 }

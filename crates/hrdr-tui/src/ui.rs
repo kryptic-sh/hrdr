@@ -1022,8 +1022,9 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
 // above/below. `render_block` is the single code path all entry kinds go
 // through, so a change to block chrome lands everywhere at once.
 
-/// Columns of padding between a block's edge and its content, per side.
-const BLOCK_PAD_X: usize = 1;
+/// Columns of padding between a block's edge and its content, per side. The
+/// vertical padding is one blank row above and below (see [`render_block`]).
+pub(crate) const BLOCK_PAD_X: usize = 2;
 
 /// The visual identity of a transcript block. `bg` is the only thing that
 /// varies between kinds today; text styling is decided by each body builder.
@@ -1177,9 +1178,12 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
     match &entry.kind {
         // The header animates and reads live session state; it is never cached.
         EntryKind::Header => {}
+        EntryKind::Reasoning { text, took_ms } => {
+            text.hash(&mut h);
+            took_ms.hash(&mut h);
+        }
         EntryKind::User(t)
         | EntryKind::Assistant(t)
-        | EntryKind::Reasoning(t)
         | EntryKind::System(t)
         | EntryKind::Notice(t)
         | EntryKind::Stats(t)
@@ -1346,21 +1350,35 @@ fn transcript_lines(
                 let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
                 (BlockKind::Assistant, body)
             }
-            EntryKind::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
-            EntryKind::Reasoning(text) => {
-                let is_streaming = app.running
-                    && app.reasoning_start.is_some()
-                    && i == app.state.transcript.len() - 1;
-                // The thinking spinner animates, so it's a header row rather
-                // than part of the cached body.
-                if is_streaming && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed()) {
-                    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+            EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
+            EntryKind::Reasoning { text, took_ms } => {
+                // One label row, then exactly one blank row, whether the block is
+                // still streaming (`⠋ Thinking`) or finished (`Thought: 1.2s`).
+                // The label is chrome, never part of the entry's text — and the
+                // spinner animates, so it stays out of the cached body.
+                let streaming_for = (app.running && i == app.state.transcript.len() - 1)
+                    .then_some(app.reasoning_start)
+                    .flatten();
+                let label = match (streaming_for, took_ms) {
+                    (Some(start), _) => {
+                        let elapsed = start.elapsed();
+                        let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+                        Some(format!("{frame} Thinking"))
+                    }
+                    (None, Some(ms)) => Some(format!(
+                        "Thought: {}",
+                        crate::app::format_duration(std::time::Duration::from_millis(*ms))
+                    )),
+                    (None, None) => None,
+                };
+                if let Some(label) = label {
                     header.push(Line::from(Span::styled(
-                        format!("{frame} Thinking"),
+                        label,
                         Style::default()
                             .fg(theme.dim)
                             .add_modifier(Modifier::ITALIC),
                     )));
+                    header.push(Line::raw(""));
                 }
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
@@ -1942,7 +1960,16 @@ mod block_tests {
         assert_eq!(lines.len(), 3, "1 body row + a blank row above and below");
         assert_eq!(text(&lines[0]).trim(), "", "top pad row is blank");
         assert_eq!(text(&lines[2]).trim(), "", "bottom pad row is blank");
-        assert_eq!(text(&lines[1]), " hi       ", "left pad + right fill");
+        let body_row = text(&lines[1]);
+        assert!(
+            body_row.starts_with(&" ".repeat(BLOCK_PAD_X)),
+            "BLOCK_PAD_X columns of left padding: {body_row:?}"
+        );
+        assert_eq!(body_row.trim(), "hi");
+        assert!(
+            body_row.ends_with(&" ".repeat(BLOCK_PAD_X)),
+            "at least BLOCK_PAD_X columns on the right: {body_row:?}"
+        );
         for line in &lines {
             assert_eq!(w(line), 10, "every row fills the block width");
             for span in &line.spans {
@@ -1964,17 +1991,22 @@ mod block_tests {
     #[test]
     fn render_block_wraps_long_lines_inside_the_block() {
         let body = vec![Line::from(Span::raw("aaa bbb ccc ddd"))];
-        let lines = render_block(body, 10, Color::Blue); // content width 8
+        let lines = render_block(body, 12, Color::Blue); // content width 8
         assert!(lines.len() > 3, "the long line wrapped: {lines:?}");
+        let pad = " ".repeat(BLOCK_PAD_X);
         for line in &lines {
-            assert_eq!(w(line), 10, "every row still fills the block width");
-            assert!(text(line).starts_with(' '), "left padding on every row");
+            assert_eq!(w(line), 12, "every row still fills the block width");
+            assert!(text(line).starts_with(&pad), "left padding on every row");
             for span in &line.spans {
                 assert_eq!(span.style.bg, Some(Color::Blue));
             }
         }
         let rows: Vec<String> = lines.iter().map(text).collect();
-        assert_eq!(rows[1].trim_end(), " aaa bbb", "breaks at whitespace");
+        assert_eq!(
+            rows[1].trim_end(),
+            format!("{pad}aaa bbb"),
+            "breaks at whitespace"
+        );
     }
 
     /// Wrapping prefers a whitespace break, hard-breaks a word too long to fit,
@@ -2032,15 +2064,23 @@ mod block_tests {
     /// Content is laid out at width minus one padding column per side, so a body
     /// line that exactly fills `inner_width` still leaves both margins intact.
     #[test]
-    fn inner_width_reserves_a_column_on_each_side() {
-        assert_eq!(inner_width(10), 8);
+    fn inner_width_reserves_the_padding_on_each_side() {
+        assert_eq!(inner_width(12) as usize, 12 - BLOCK_PAD_X * 2);
         // Degenerate widths must not underflow or produce a zero-width layout.
-        assert_eq!(inner_width(2), 1);
+        assert_eq!(inner_width(BLOCK_PAD_X * 2), 1);
         assert_eq!(inner_width(0), 1);
 
-        let body = vec![Line::from(Span::raw("x".repeat(inner_width(10) as usize)))];
-        let lines = render_block(body, 10, Color::Reset);
-        assert_eq!(text(&lines[1]), " xxxxxxxx ", "one bg column either side");
+        // A body line that exactly fills the content width still leaves both
+        // margins intact.
+        let inner = inner_width(12) as usize;
+        let body = vec![Line::from(Span::raw("x".repeat(inner)))];
+        let lines = render_block(body, 12, Color::Reset);
+        let pad = " ".repeat(BLOCK_PAD_X);
+        assert_eq!(
+            text(&lines[1]),
+            format!("{pad}{}{pad}", "x".repeat(inner)),
+            "BLOCK_PAD_X bg columns either side"
+        );
     }
 
     /// every content kind resolves its own, visually distinct background, so a
