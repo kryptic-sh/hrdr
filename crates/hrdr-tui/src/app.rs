@@ -30,7 +30,6 @@ use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
 };
-pub(crate) use util::format_duration;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;

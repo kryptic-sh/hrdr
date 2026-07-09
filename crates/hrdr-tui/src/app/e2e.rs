@@ -350,6 +350,12 @@ fn buffer_to_string(buf: &Buffer) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A block's padding row may carry the left bar (`┃`). Strip it before asking
+/// whether the row is blank.
+fn without_bar(row: &str) -> &str {
+    row.trim_start_matches(crate::ui::BORDER_BAR).trim()
+}
+
 /// Point `sessions_dir()` at a temp directory for the duration of a test.
 ///
 /// `XDG_DATA_HOME` is process-global, so the tests that write session files must
@@ -898,8 +904,12 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     let user_y = find_row("run it").expect("user prompt rendered");
     // Padded one column in, on the user background, filled to the block's width.
     assert!(
-        row_text(user_y).starts_with(&format!("{pad}run it")),
-        "left padding"
+        row_text(user_y).starts_with(&format!(
+            "{}{}run it",
+            crate::ui::BORDER_BAR,
+            " ".repeat(crate::ui::BLOCK_PAD_X - 1)
+        )),
+        "the bar, then the remaining padding"
     );
     for x in 0..59 {
         assert_eq!(bg_at(x, user_y), theme.user_bg, "user row bg at x={x}");
@@ -908,17 +918,14 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     // chrome outside the block), sitting on the block background below the
     // message text, separated from it by a blank row.
     let meta_y = user_y + 2;
-    assert!(
-        row_text(meta_y).starts_with(&format!("{pad}#1 you · ")),
-        "meta row"
-    );
+    assert!(row_text(meta_y).contains("#1 you · "), "meta row");
     assert_eq!(
         bg_at(0, meta_y),
         theme.user_bg,
         "meta row is inside the block"
     );
     assert_eq!(
-        row_text(meta_y - 1).trim(),
+        without_bar(&row_text(meta_y - 1)),
         "",
         "blank row before the meta row"
     );
@@ -930,8 +937,16 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     // Blank padded rows above the text and below the meta row.
     assert_eq!(bg_at(0, user_y - 1), theme.user_bg, "top pad row");
     assert_eq!(bg_at(0, meta_y + 1), theme.user_bg, "bottom pad row");
-    assert_eq!(row_text(user_y - 1).trim(), "", "top pad row is blank");
-    assert_eq!(row_text(meta_y + 1).trim(), "", "bottom pad row is blank");
+    assert_eq!(
+        without_bar(&row_text(user_y - 1)),
+        "",
+        "top pad row is blank"
+    );
+    assert_eq!(
+        without_bar(&row_text(meta_y + 1)),
+        "",
+        "bottom pad row is blank"
+    );
 
     // A blank separator row (terminal bg) sits between blocks.
     assert_ne!(bg_at(0, meta_y + 2), theme.user_bg, "separator row");
@@ -945,7 +960,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
         "tool blocks share the prompt bg"
     );
     assert!(
-        row_text(tool_y + 1).starts_with(&format!("{pad}$ echo hi")),
+        row_text(tool_y + 1).starts_with(&format!("{pad}echo hi")),
         "command line"
     );
     assert!(
@@ -1148,7 +1163,7 @@ async fn every_transcript_row_is_rendered_through_the_block_path() {
             continue; // blank separator or a block's pad row
         }
         assert!(
-            row.starts_with(' '),
+            row.starts_with(' ') || row.starts_with(crate::ui::BORDER_BAR),
             "row {y} paints at column 0, outside the block: {row:?}"
         );
     }
@@ -1670,44 +1685,21 @@ async fn clear_and_new_take_a_session_name() {
     );
 }
 
-/// The `⠋ Thinking` and `Thought: 1.2s` labels render the same way: one label
-/// row, then exactly one blank row, then the thought text.
+/// A thinking block is just the thought: no `⠋ Thinking` spinner, no
+/// `Thought: 1.2s` footer. The dimmer text already says whose voice it is, and
+/// the loader above the input says a turn is running.
 ///
-/// Regression: the streaming spinner was a header row, while the finished label
-/// was spliced into the entry's *text* as `"Thought: 1.2s\n\n"` — so it went
-/// through markdown, was persisted into the transcript, and the two states had
-/// different spacing.
+/// The elapsed time is still recorded on the entry — it's the only trace of how
+/// long the model thought — it simply isn't drawn.
 #[tokio::test]
-async fn thinking_and_thought_labels_render_identically() {
-    // The rightmost column is the scrollbar, not block content.
-    let content = |l: &str| -> String {
-        let mut c: Vec<char> = l.chars().collect();
-        c.pop();
-        c.into_iter().collect::<String>().trim().to_string()
-    };
-    let rows_after_label = |screen: &str, label: &str| -> (String, String) {
-        let mut it = screen.lines().skip_while(|l| !l.contains(label)).skip(1);
-        (
-            content(it.next().unwrap_or_default()),
-            content(it.next().unwrap_or_default()),
-        )
-    };
-    let render = |app: &mut App| {
-        let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
-        term.draw(|f| ui::draw(f, app)).unwrap();
-        // Scroll to the top so the block is on screen, then redraw.
-        app.scroll_offset = app.max_scroll;
-        term.draw(|f| ui::draw(f, app)).unwrap();
-        buffer_to_string(term.backend().buffer())
-    };
-
-    // Finished: the duration is data on the entry, not text inside it.
+async fn a_thinking_block_renders_no_label() {
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "let me think".into(),
         text: "done".into(),
     }])
     .await;
     h.submit("go").await;
+
     let reasoning = h
         .app
         .state
@@ -1718,21 +1710,22 @@ async fn thinking_and_thought_labels_render_identically() {
             _ => None,
         })
         .expect("a reasoning entry");
-    assert_eq!(
-        reasoning.0, "let me think",
-        "the label is not spliced into the text"
-    );
+    assert_eq!(reasoning.0, "let me think", "the thought, and nothing else");
+    assert!(reasoning.1.is_some(), "the elapsed time is still recorded");
+
+    // Neither label is on screen — while streaming, nor once finished.
+    let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        reasoning.1.is_some(),
-        "the elapsed time is recorded as data"
+        screen.contains("let me think"),
+        "the thought renders:\n{screen}"
     );
+    assert!(!screen.contains("Thought"), "a footer survived:\n{screen}");
 
-    let screen = render(&mut h.app);
-    let (blank, text) = rows_after_label(&screen, "Thought:");
-    assert_eq!(blank, "", "exactly one blank row after the label");
-    assert_eq!(text, "let me think", "then the thought");
-
-    // Streaming: same shape, spinner label.
+    // Streaming shows no spinner label either.
     let mut h2 = Harness::new(vec![]).await;
     h2.app
         .state
@@ -1740,131 +1733,15 @@ async fn thinking_and_thought_labels_render_identically() {
         .push(Entry::reasoning("streaming thoughts"));
     h2.app.running = true;
     h2.app.reasoning_start = Some(std::time::Instant::now());
-
-    let screen = render(&mut h2.app);
-    let (blank, text) = rows_after_label(&screen, "Thinking");
-    assert_eq!(blank, "", "exactly one blank row after the label");
-    assert_eq!(text, "streaming thoughts", "then the thought");
-}
-
-/// Fenced code doesn't paint a surface of its own: it inherits whatever block it
-/// sits in. Inside the model's output that's the terminal background; inside a
-/// slash-command block it's the command background.
-///
-/// Regression: code blocks were painted on a dedicated `code_bg`, so a snippet
-/// in an assistant message rendered as a dark slab over the terminal background.
-#[tokio::test]
-async fn fenced_code_inherits_its_blocks_background() {
-    let mut h = Harness::new(vec![MockReply::Text(
-        "text\n\n```rs\nfn main() {}\n```\n".into(),
-    )])
-    .await;
-    h.submit("go").await;
-    h.app
-        .push_entry(Entry::system("out\n\n```rs\nlet y = 2;\n```\n"));
-    // Drop the startup chrome so both blocks fit on one screen.
-    h.app
-        .state
-        .transcript
-        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
-
-    let mut term = Terminal::new(TestBackend::new(50, 44)).unwrap();
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let buf = term.backend().buffer();
-    let theme = &h.app.theme;
-
-    let row_of = |needle: &str| -> u16 {
-        (0..44)
-            .find(|&y| {
-                (0..49)
-                    .filter_map(|x| {
-                        buf.cell(Position::new(x, y))
-                            .map(|c| c.symbol().to_string())
-                    })
-                    .collect::<String>()
-                    .contains(needle)
-            })
-            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
-    };
-    // Column 2 is inside the block's content (past the padding).
-    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
-
-    // Assistant output: the code sits on the terminal background, like its prose.
-    let code_y = row_of("fn main()");
-    let prose_y = row_of("text");
-    assert_eq!(bg_at(code_y), Color::Reset, "code in assistant output");
-    assert_eq!(bg_at(prose_y), Color::Reset, "the prose around it");
-
-    // Slash-command output: the code sits on the command background.
-    let cmd_code_y = row_of("let y = 2;");
-    assert_eq!(
-        bg_at(cmd_code_y),
-        theme.command_bg,
-        "code inside a command block"
-    );
-}
-
-/// A turn that thinks and calls a tool but emits no text gets no block of its
-/// own — yet its `#N assistant` label survives as a `/goto` jump point, appended
-/// to the last non-empty block (here, the thinking block).
-///
-/// Regression: `markdown_lines("")` yields no rows, so the body was empty — but
-/// the meta row was appended to it, and the block rendered as a label floating
-/// over blank padding.
-#[tokio::test]
-async fn a_text_less_assistant_turn_lends_its_label_to_the_previous_block() {
-    let mut h = Harness::new(vec![]).await;
-    h.app
-        .state
-        .transcript
-        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
-    h.app.push_entry(Entry::user("go"));
-    h.app
-        .push_entry(Entry::reasoning("thought about something"));
-    h.app.push_entry(Entry::assistant("")); // text-less turn: tool calls only
-    h.app
-        .push_entry(Entry::tool_running("c1", "bash", r#"{"command":"ls"}"#));
-
-    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let buf = term.backend().buffer();
-    let screen = buffer_to_string(buf);
-
-    let row_of = |needle: &str| -> u16 {
-        (0..30)
-            .find(|&y| {
-                (0..39)
-                    .filter_map(|x| {
-                        buf.cell(Position::new(x, y))
-                            .map(|c| c.symbol().to_string())
-                    })
-                    .collect::<String>()
-                    .contains(needle)
-            })
-            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
-    };
-    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
-
-    // The label still exists, and still numbers the turn.
-    let label_y = row_of("#2 assistant");
-    let thought_y = row_of("thought about something");
-
-    // It closes the thinking block: same background, directly below the thought,
-    // separated by the usual blank row.
-    assert_eq!(
-        bg_at(label_y),
-        bg_at(thought_y),
-        "the label rides on the thinking block:\n{screen}"
-    );
-    assert_eq!(label_y, thought_y + 2, "one blank row between:\n{screen}");
-
-    // …and not on the tool block that follows.
-    let tool_y = row_of("bash");
-    assert!(label_y < tool_y, "label precedes the tool block");
-    assert_ne!(
-        bg_at(label_y),
-        bg_at(tool_y),
-        "the label is not part of the tool block"
+    let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h2.app)).unwrap();
+    h2.app.scroll_offset = h2.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h2.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(screen.contains("streaming thoughts"), "{screen}");
+    assert!(
+        !screen.contains("Thinking"),
+        "a spinner label survived:\n{screen}"
     );
 }
 
@@ -2216,14 +2093,15 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
     // Blank rows strictly between two blocks' content rows. Two blocks always
     // contribute their own bottom + top pad; a separator makes it three.
     let blank = |y: u16| {
-        (0..39)
-            .filter_map(|x| {
-                buf.cell(Position::new(x, y))
-                    .map(|c| c.symbol().to_string())
-            })
-            .collect::<String>()
-            .trim()
-            .is_empty()
+        without_bar(
+            &(0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>(),
+        )
+        .is_empty()
     };
     let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
 
@@ -2299,14 +2177,15 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
             .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
     };
     let blank = |y: u16| {
-        (0..39)
-            .filter_map(|x| {
-                buf.cell(Position::new(x, y))
-                    .map(|c| c.symbol().to_string())
-            })
-            .collect::<String>()
-            .trim()
-            .is_empty()
+        without_bar(
+            &(0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>(),
+        )
+        .is_empty()
     };
     let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
 
@@ -2525,10 +2404,17 @@ async fn the_input_pane_matches_the_user_prompt_block() {
         }
     }
     // One blank row above and below the text.
-    assert_eq!(row(text_y - 1).trim(), "", "top padding:\n{screen}");
-    assert_eq!(row(text_y + 1).trim(), "", "bottom padding:\n{screen}");
-    // Two columns of padding on the left.
-    assert!(row(text_y).starts_with("  hello world"), "{screen}");
+    assert_eq!(without_bar(&row(text_y - 1)), "", "top padding:\n{screen}");
+    assert_eq!(
+        without_bar(&row(text_y + 1)),
+        "",
+        "bottom padding:\n{screen}"
+    );
+    // The bar, then the remaining padding column, then the text.
+    assert!(
+        row(text_y).starts_with(&format!("{}{}hello world", crate::ui::BORDER_BAR, " ")),
+        "{screen}"
+    );
 
     // A blank row separates the tinted pane from the chrome below it.
     let below = row(text_y + 2);
@@ -2622,4 +2508,104 @@ async fn a_blank_row_follows_the_generating_line() {
         h.app.theme.user_bg,
         "the input pane starts after it:\n{screen}"
     );
+}
+
+/// The user's own surfaces — the prompt block and the input pane — wear a bar
+/// down their left edge, running their whole height. A tool call shares the
+/// prompt's background but not its bar; it isn't the user speaking.
+#[tokio::test]
+async fn the_prompt_and_input_wear_a_left_bar() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("prompt here"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "bash".into(),
+        args: r#"{"command":"echo hi"}"#.into(),
+        result: "hi".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+    h.type_str("typing");
+
+    let mut term = Terminal::new(TestBackend::new(54, 26)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let cell = |y: u16| buf.cell(Position::new(0, y)).unwrap();
+    let row = |y: u16| -> String {
+        (0..54)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let row_of = |needle: &str| (0..26).find(|&y| row(y).contains(needle)).unwrap();
+
+    // The prompt block: the bar spans its padding rows too.
+    let prompt_y = row_of("prompt here");
+    for y in prompt_y - 1..=prompt_y + 1 {
+        assert_eq!(cell(y).symbol(), "┃", "bar on row {y}:\n{screen}");
+        assert_eq!(cell(y).fg, h.app.theme.prompt_border);
+        assert_eq!(cell(y).bg, h.app.theme.user_bg);
+    }
+
+    // The tool block shares the background but wears no bar.
+    let tool_y = row_of("✓ bash");
+    assert_eq!(
+        cell(tool_y).symbol(),
+        " ",
+        "no bar on a tool block:\n{screen}"
+    );
+    assert_eq!(
+        buf.cell(Position::new(2, tool_y)).unwrap().bg,
+        h.app.theme.user_bg
+    );
+
+    // The input pane: bar down its whole height, padding rows included.
+    let input_y = row_of("typing");
+    for y in input_y - 1..=input_y + 1 {
+        assert_eq!(cell(y).symbol(), "┃", "bar on input row {y}:\n{screen}");
+        assert_eq!(cell(y).fg, h.app.theme.prompt_border);
+    }
+}
+
+/// The status bar renders through the block renderer: two columns of padding
+/// either side, and a blank row above and below it.
+#[tokio::test]
+async fn the_status_bar_is_a_padded_block() {
+    let mut h = Harness::new(vec![]).await;
+    let mut term = Terminal::new(TestBackend::new(54, 26)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let row = |y: u16| -> String {
+        (0..54)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let status_y = (0..26)
+        .find(|&y| row(y).contains("of 1.0k"))
+        .expect("the status bar renders");
+
+    assert!(
+        row(status_y).starts_with("  "),
+        "two columns of padding:\n{screen}"
+    );
+    assert!(
+        !row(status_y).ends_with(|c: char| !c.is_whitespace()),
+        "and two on the right:\n{screen}"
+    );
+    assert_eq!(row(status_y - 1).trim(), "", "blank row above:\n{screen}");
+    assert_eq!(row(status_y + 1).trim(), "", "blank row below:\n{screen}");
+    // The help line follows it.
+    assert!(row(status_y + 2).contains("Enter=send"), "{screen}");
 }

@@ -34,6 +34,9 @@ pub struct ChatPalette {
     pub command_bg: Option<Rgb>,
     /// Per-turn stats block background.
     pub stats_bg: Option<Rgb>,
+    /// The bar drawn down the left of the user's own surfaces (the prompt block
+    /// and the input pane).
+    pub prompt_border: Option<Rgb>,
     /// Success marks (tool ✓).
     pub success: Option<Rgb>,
     /// Error marks (tool ✗).
@@ -80,6 +83,9 @@ impl ChatPalette {
                 .or_else(|| pal("ui_cursorline"))
                 .or(Some(panel)),
             stats_bg: pal("bg_stats").or_else(|| pal("ui_cursorline")),
+            prompt_border: pal("border_prompt")
+                .or_else(|| pal("magenta_moon"))
+                .or_else(|| pal("magenta")),
             success: pal("green"),
             error: t.ui.diagnostic_error.map(rgb).or_else(|| pal("red")),
             accent: pal("blue").or_else(|| pal("cyan")),

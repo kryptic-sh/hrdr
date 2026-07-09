@@ -30,6 +30,8 @@ pub struct Theme {
     pub command_bg: Color,
     /// Per-turn stats block background.
     pub stats_bg: Color,
+    /// The bar down the left of the user's own surfaces (prompt + input pane).
+    pub prompt_border: Color,
     /// Success marks (tool ✓).
     pub success: Color,
     /// Error marks (tool ✗) and the quit-confirm banner.
@@ -67,6 +69,7 @@ impl Theme {
             warn: c(p.warn, Color::Yellow),
             command_bg: c(p.command_bg, Color::Rgb(32, 34, 58)),
             stats_bg: c(p.stats_bg, Color::Rgb(25, 27, 43)),
+            prompt_border: c(p.prompt_border, Color::Rgb(0xc0, 0x99, 0xff)),
             success: c(p.success, Color::Green),
             error: c(p.error, Color::Red),
             accent: c(p.accent, Color::Blue),
@@ -175,6 +178,7 @@ mod theme_tests {
         assert_eq!(hex(t.user_bg), "#1e2030", "bg_dark (moon)");
         assert_eq!(hex(t.command_bg), "#24283b", "bg_storm");
         assert_eq!(hex(t.stats_bg), "#222436", "bg_moon");
+        assert_eq!(hex(t.prompt_border), "#c099ff", "magenta (moon)");
     }
 
     /// The two accents must differ.

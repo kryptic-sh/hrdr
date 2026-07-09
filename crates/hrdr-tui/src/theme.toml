@@ -28,6 +28,7 @@ comment   = "#565f89"
 blue    = "#7aa2f7"
 cyan    = "#7dcfff"
 magenta = "#bb9af7"
+magenta_moon = "#c099ff"
 purple  = "#9d7cd8"
 orange  = "#ff9e64"
 yellow  = "#e0af68"
@@ -45,6 +46,9 @@ red1    = "#db4b4b"
 bg_user      = "#1e2030"  # bg_dark (moon) — also the tool-call block's background
 bg_command   = "#24283b"  # bg_storm
 bg_stats     = "#222436"  # bg_moon
+
+# The bar drawn down the left of the user's own surfaces (prompt + input).
+border_prompt = "#c099ff"  # magenta (moon)
 
 [ui]
 background = "$bg"

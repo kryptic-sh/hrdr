@@ -57,6 +57,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mode. `EditorEngine::is_insert()` — long documented as a cursor-shape hint —
   finally drives it. The terminal's own shape is restored on exit and while
   `$EDITOR` has the screen.
+- **A `┃` bar down the left of the user's own surfaces** — the prompt block and
+  the input pane — in Tokyo Night Moon's magenta (`#c099ff`). Tool calls share
+  the prompt's background but not its bar.
+- **The status bar renders through the block renderer**: two columns of padding
+  either side, a blank row above and below.
+- **Thinking blocks lost their `⠋ Thinking` / `Thought: 1.2s` label.** The
+  dimmer text already says whose voice it is, and the loader says a turn is
+  running. The elapsed time is still recorded on the entry.
+- **Shell tool blocks drop the `$ ` prompt.** The block's `bash` header says
+  what it is; the command renders verbatim.
 - **The input pane is borderless**, on the user prompt's background, with one
   blank row above and below and two columns either side — the same chrome a
   transcript block wears. The editor mode and the draft's size moved from the

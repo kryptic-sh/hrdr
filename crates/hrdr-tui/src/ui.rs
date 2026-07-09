@@ -89,21 +89,27 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     });
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
-    // A blank row separating the input pane from the chrome below it. The pane
-    // is tinted, so it would otherwise butt straight up against the status bar —
-    // the same rule the transcript's trailing tinted block follows.
-    constraints.push(Constraint::Length(1));
-    // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows).
+    // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
+    // renders as a block, so it carries the same padding as the transcript's —
+    // two columns either side, and a blank row above and below. That top row is
+    // what separates it from the tinted input pane above.
     let sb_sections = build_status_sections(app);
-    let sb_height: u16 = match app.statusbar_mode {
+    let sb_inner = inner_width(area.width as usize);
+    let sb_rows: u16 = match app.statusbar_mode {
         StatusBarMode::None => 0,
         StatusBarMode::Truncate => 1,
-        StatusBarMode::Wrap => status_wrap_rows(&sb_sections, area.width as usize).clamp(1, 4),
+        StatusBarMode::Wrap => status_wrap_rows(&sb_sections, sb_inner as usize).clamp(1, 4),
     };
+    let sb_height = if sb_rows > 0 { sb_rows + 2 } else { 0 };
     let statusbar_idx = (sb_height > 0).then(|| {
         constraints.push(Constraint::Length(sb_height));
         constraints.len() - 1
     });
+    // With no status bar there's nothing to separate the tinted input pane from
+    // the help line, so supply the blank row directly.
+    if sb_height == 0 {
+        constraints.push(Constraint::Length(1));
+    }
     constraints.push(Constraint::Length(1)); // help / keybind line
     let help_idx = constraints.len() - 1;
 
@@ -520,6 +526,18 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         .padding(Padding::new(INPUT_PAD_X as u16, INPUT_PAD_X as u16, 1, 1));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // The same bar the user's prompt blocks wear, down the pane's left edge.
+    let bar: Vec<Line> = (0..area.height)
+        .map(|_| {
+            Line::from(Span::styled(
+                BORDER_BAR,
+                Style::default().fg(app.theme.prompt_border).bg(bg),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(bar), Rect { width: 1, ..area });
+
     app.editor.render(f, inner);
 
     // Overlay on the top padding row. The quit-confirm hint takes priority over
@@ -675,11 +693,17 @@ fn status_wrap_rows(sections: &[StatusSection], width: usize) -> u16 {
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect, sections: &[StatusSection]) {
     let t = &app.theme;
     let width = area.width as usize;
+    let inner = inner_width(width) as usize;
     let lines = match app.statusbar_mode {
-        StatusBarMode::Wrap => status_wrap_lines(sections, width, t),
-        _ => vec![status_truncate_line(sections, width, t)],
+        StatusBarMode::Wrap => status_wrap_lines(sections, inner, t),
+        _ => vec![status_truncate_line(sections, inner, t)],
     };
-    f.render_widget(Paragraph::new(lines), area);
+    // The same chrome a transcript block wears: two columns either side, a blank
+    // row above and below. No background of its own, and no bar.
+    f.render_widget(
+        Paragraph::new(render_block(lines, width, Color::Reset, None)),
+        area,
+    );
 }
 
 /// One-row status bar that drops the least-important sections until it fits.
@@ -1010,6 +1034,9 @@ pub(crate) const BLOCK_PAD_X: usize = 2;
 /// The input pane wears the same horizontal padding as a transcript block.
 const INPUT_PAD_X: usize = BLOCK_PAD_X;
 
+/// The bar drawn down the left edge of the user's own surfaces.
+pub(crate) const BORDER_BAR: &str = "┃";
+
 /// The visual identity of a transcript block. `bg` is the only thing that
 /// varies between kinds today; text styling is decided by each body builder.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1029,6 +1056,12 @@ enum BlockKind {
 }
 
 impl BlockKind {
+    /// The bar drawn down the block's left edge, if any. Marks the surfaces that
+    /// are the user's own: the prompt, and a prompt still queued.
+    fn border(self, theme: &Theme) -> Option<Color> {
+        matches!(self, BlockKind::User | BlockKind::Queued).then_some(theme.prompt_border)
+    }
+
     /// The block's background. This is the override point: give a kind its own
     /// theme slot here and every line it renders picks it up.
     fn bg(self, theme: &Theme) -> Color {
@@ -1053,13 +1086,18 @@ fn inner_width(width: usize) -> u16 {
 /// Wrap `body` (built at [`inner_width`]) in the shared block chrome: a blank
 /// padded row above and below, and one padded column either side, all filled
 /// with `bg`. Empty bodies render nothing.
-fn render_block(body: Vec<Line<'static>>, width: usize, bg: Color) -> Vec<Line<'static>> {
+fn render_block(
+    body: Vec<Line<'static>>,
+    width: usize,
+    bg: Color,
+    border: Option<Color>,
+) -> Vec<Line<'static>> {
     if body.is_empty() {
         return Vec::new();
     }
     let inner = inner_width(width) as usize;
     let mut out = Vec::with_capacity(body.len() + 2);
-    out.push(pad_line(Vec::new(), width, bg));
+    out.push(pad_line(Vec::new(), width, bg, border));
     for mut line in body {
         // Body spans inherit the block's background unless they set their own
         // (a fenced code block inside a message keeps its distinct bg).
@@ -1072,10 +1110,10 @@ fn render_block(body: Vec<Line<'static>>, width: usize, bg: Color) -> Vec<Line<'
         // padded line: its continuation rows would start at column 0, outside
         // the block's padding and background.
         for rows in wrap_spans(line.spans, inner) {
-            out.push(pad_line(rows, width, bg));
+            out.push(pad_line(rows, width, bg, border));
         }
     }
-    out.push(pad_line(Vec::new(), width, bg));
+    out.push(pad_line(Vec::new(), width, bg, border));
     out
 }
 
@@ -1142,10 +1180,23 @@ fn spans_from_chars(chars: &[(char, Style)]) -> Vec<Span<'static>> {
 }
 
 /// Pad a line of spans to full `width` with `bg`-coloured spaces: `BLOCK_PAD_X`
-/// leading columns, then a right fill.
-fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+/// leading columns, then a right fill. When `border` is set, the first of those
+/// columns is a [`BORDER_BAR`] in that color, so the bar runs the block's whole
+/// height — padding rows included.
+fn pad_line(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    bg: Color,
+    border: Option<Color>,
+) -> Line<'static> {
     let bg_only = Style::default().bg(bg);
-    spans.insert(0, Span::styled(" ".repeat(BLOCK_PAD_X), bg_only));
+    match border {
+        Some(fg) => {
+            spans.insert(0, Span::styled(" ".repeat(BLOCK_PAD_X - 1), bg_only));
+            spans.insert(0, Span::styled(BORDER_BAR, Style::default().fg(fg).bg(bg)));
+        }
+        None => spans.insert(0, Span::styled(" ".repeat(BLOCK_PAD_X), bg_only)),
+    }
     let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
         spans.push(Span::styled(" ".repeat(width - used), bg_only));
@@ -1162,10 +1213,8 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
     match &entry.kind {
         // The header animates and reads live session state; it is never cached.
         EntryKind::Header => {}
-        EntryKind::Reasoning { text, took_ms } => {
-            text.hash(&mut h);
-            took_ms.hash(&mut h);
-        }
+        // `took_ms` doesn't affect the rendered rows.
+        EntryKind::Reasoning { text, .. } => text.hash(&mut h),
         EntryKind::User(t)
         | EntryKind::Assistant(t)
         | EntryKind::System(t)
@@ -1300,7 +1349,12 @@ fn flush(
     let Some(block) = pending else { return };
     let start = out.len();
     let bg = block.kind.bg(theme);
-    out.extend(render_block(block.lines, width, bg));
+    out.extend(render_block(
+        block.lines,
+        width,
+        bg,
+        block.kind.border(theme),
+    ));
     for _ in 0..block.msgs {
         msg_starts.push(start);
     }
@@ -1429,35 +1483,11 @@ fn transcript_lines(
                 (BlockKind::Assistant, body)
             }
             EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
-            EntryKind::Reasoning { text, took_ms } => {
-                // One label row, then exactly one blank row, whether the block is
-                // still streaming (`⠋ Thinking`) or finished (`Thought: 1.2s`).
-                // The label is chrome, never part of the entry's text — and the
-                // spinner animates, so it stays out of the cached body.
-                let streaming_for = (app.running && i == app.state.transcript.len() - 1)
-                    .then_some(app.reasoning_start)
-                    .flatten();
-                let label = match (streaming_for, took_ms) {
-                    (Some(start), _) => {
-                        let elapsed = start.elapsed();
-                        let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
-                        Some(format!("{frame} Thinking"))
-                    }
-                    (None, Some(ms)) => Some(format!(
-                        "Thought: {}",
-                        crate::app::format_duration(std::time::Duration::from_millis(*ms))
-                    )),
-                    (None, None) => None,
-                };
-                if let Some(label) = label {
-                    header.push(Line::from(Span::styled(
-                        label,
-                        Style::default()
-                            .fg(theme.dim)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                    header.push(Line::raw(""));
-                }
+            // No `⠋ Thinking` / `Thought: 1.2s` label: the dimmer text already
+            // says it's the model thinking, and the loader above the input shows
+            // that a turn is running. (`took_ms` is still recorded — it's the
+            // only trace of how long the model thought.)
+            EntryKind::Reasoning { text, .. } => {
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
                 let md = theme.md_theme_dim();
@@ -1594,7 +1624,7 @@ fn transcript_lines(
         for msg in &app.queue {
             let mut body = markdown_lines(msg, &md_theme, bg, inner);
             body.push(Line::from(Span::styled(" Queued ", badge)));
-            out.extend(render_block(body, w, bg));
+            out.extend(render_block(body, w, bg, BlockKind::Queued.border(theme)));
             // Queued blocks are tinted: a blank row separates them from each
             // other, and the last one from the input pane below.
             out.push(Line::raw(""));
@@ -1696,12 +1726,12 @@ fn tool_lines(
         return out;
     }
 
-    // Shell calls: the command on its own line, like an actual shell prompt.
+    // Shell calls: the command on its own lines, verbatim. The block's `bash`
+    // header already says what it is, so no `$ ` prompt is drawn.
     if let hrdr_app::ToolBody::Shell { command } = &disp.body {
-        for (i, line) in command.lines().enumerate() {
-            let prefix = if i == 0 { "$ " } else { "  " };
+        for line in command.lines() {
             out.push(Line::from(Span::styled(
-                format!("{prefix}{line}"),
+                line.to_string(),
                 Style::default().fg(theme.assistant).bg(bg),
             )));
         }
@@ -2072,7 +2102,7 @@ mod block_tests {
     #[test]
     fn render_block_pads_all_four_sides() {
         let body = vec![Line::from(Span::raw("hi"))];
-        let lines = render_block(body, 10, Color::Blue);
+        let lines = render_block(body, 10, Color::Blue, None);
 
         assert_eq!(lines.len(), 3, "1 body row + a blank row above and below");
         assert_eq!(text(&lines[0]).trim(), "", "top pad row is blank");
@@ -2108,7 +2138,7 @@ mod block_tests {
     #[test]
     fn render_block_wraps_long_lines_inside_the_block() {
         let body = vec![Line::from(Span::raw("aaa bbb ccc ddd"))];
-        let lines = render_block(body, 12, Color::Blue); // content width 8
+        let lines = render_block(body, 12, Color::Blue, None); // content width 8
         assert!(lines.len() > 3, "the long line wrapped: {lines:?}");
         let pad = " ".repeat(BLOCK_PAD_X);
         for line in &lines {
@@ -2175,7 +2205,7 @@ mod block_tests {
     /// that produced no content (e.g. an assistant message before its first token).
     #[test]
     fn render_block_of_an_empty_body_is_empty() {
-        assert!(render_block(Vec::new(), 20, Color::Reset).is_empty());
+        assert!(render_block(Vec::new(), 20, Color::Reset, None).is_empty());
     }
 
     /// Content is laid out at width minus one padding column per side, so a body
@@ -2191,7 +2221,7 @@ mod block_tests {
         // margins intact.
         let inner = inner_width(12) as usize;
         let body = vec![Line::from(Span::raw("x".repeat(inner)))];
-        let lines = render_block(body, 12, Color::Reset);
+        let lines = render_block(body, 12, Color::Reset, None);
         let pad = " ".repeat(BLOCK_PAD_X);
         assert_eq!(
             text(&lines[1]),
@@ -2245,9 +2275,11 @@ mod block_tests {
     #[test]
     fn the_gap_between_blocks_depends_on_both_backgrounds() {
         let theme = Theme::default();
-        let tinted = BlockKind::User; // user_bg
+        // A tinted kind without a left bar, so a content row is exactly "x".
+        let tinted = BlockKind::Command;
         let plain = BlockKind::Assistant; // Color::Reset
         assert_ne!(tinted.bg(&theme), Color::Reset);
+        assert!(tinted.border(&theme).is_none());
         assert_eq!(plain.bg(&theme), Color::Reset);
 
         // Paint `first`, then `second`, and count the blank rows between their
@@ -2385,8 +2417,9 @@ mod block_tests {
         assert!(head(true, true).contains("ls src"));
     }
 
-    /// Shell calls render the command on its own `$ …` row (continuation rows
-    /// indented), with the command's output below it.
+    /// Shell calls render the command verbatim on its own rows, with the
+    /// command's output below it. No `$ ` prompt — the block's header says
+    /// `bash` already.
     #[test]
     fn shell_tool_shows_the_command_then_its_output() {
         let t = Theme::default();
@@ -2401,11 +2434,8 @@ mod block_tests {
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert_eq!(rows[0].trim(), "✓ bash", "no args preview on the header");
-        assert_eq!(rows[1], "$ ls");
-        assert_eq!(
-            rows[2], "  wc -l",
-            "continuation lines align under the command"
-        );
+        assert_eq!(rows[1], "ls", "the command, verbatim");
+        assert_eq!(rows[2], "wc -l", "its continuation lines too");
         assert_eq!(rows[3], "a.rs");
         assert_eq!(rows[4], "b.rs");
     }
