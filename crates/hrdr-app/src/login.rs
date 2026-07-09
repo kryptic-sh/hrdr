@@ -35,6 +35,7 @@ fn parse_provider_pick(line: &str, builtins: &[&str]) -> String {
 fn provider_label(name: &str) -> &'static str {
     match name {
         "zen" => "OpenCode Zen",
+        "go" => "OpenCode Go",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
         "claude" => "Anthropic (Claude)",

@@ -452,6 +452,12 @@ impl hrdr_tools::Tool for SubagentTool {
         {
             cfg.model = m.trim().to_string();
         }
+        if cfg.model == "default" {
+            bail!(
+                "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
+                 `--model` / `--subagent-model` on the CLI"
+            );
+        }
         let label = args
             .get("description")
             .and_then(|v| v.as_str())
@@ -1149,7 +1155,7 @@ pub struct ResolvedProvider {
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
 /// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
-pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "openai", "openrouter", "claude", "local"];
+pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "go", "openai", "openrouter", "claude", "local"];
 
 /// Resolve the API key for a provider: an inline key wins, then the provider's
 /// `key_env` variable, then a credential saved by `/login`. `None` when none is
@@ -1176,6 +1182,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         "zen" | "opencode" | "opencode-zen" => {
             ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", true)
         }
+        "go" | "opencode-go" => ("https://opencode.ai/zen/go/v1", "OPENCODE_API_KEY", true),
         "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", true),
         "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", true),
         // Anthropic's own host → hrdr uses the native Messages API (`x-api-key`),
@@ -4047,6 +4054,15 @@ mod tests {
         assert_eq!(p.key_env.as_deref(), Some("OPENCODE_API_KEY"));
         assert!(p.remote);
         assert!(builtin_provider("opencode").is_some());
+    }
+
+    #[test]
+    fn go_builtin_is_remote_with_opencode_key() {
+        let p = builtin_provider("GO").expect("go resolves (case-insensitive)");
+        assert_eq!(p.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(p.key_env.as_deref(), Some("OPENCODE_API_KEY"));
+        assert!(p.remote);
+        assert!(builtin_provider("opencode-go").is_some());
     }
 
     #[test]
