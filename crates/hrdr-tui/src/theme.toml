@@ -1,30 +1,30 @@
 # hrdr default theme — compiled into the binary as the fallback.
-# Colours follow the hjkl-theme format. Add hrdr-specific entries
-# prefixed `bg_` for background roles.
+# Tokyo Night colour palette, originally by folke (https://github.com/folke/tokyonight.nvim).
+# Licensed under Apache-2.0.
 
 [palette]
-bg       = "#0d1117"
-fg       = "#c9d1d9"
-comment  = "#484f58"
-red      = "#f85149"
-orange   = "#d29922"
-yellow   = "#e3b341"
-green    = "#3fb950"
-teal     = "#40c9a2"
-blue     = "#58a6ff"
-mauve    = "#bc8cff"
+bg       = "#1a1b26"
+fg       = "#c0caf5"
+comment  = "#565f89"
+red      = "#f7768e"
+orange   = "#ff9e64"
+yellow   = "#e0af68"
+green    = "#9ece6a"
+teal     = "#7dcfff"
+blue     = "#7aa2f7"
+mauve    = "#bb9af7"
 
 # hrdr-specific background entries (overridable via user theme).
-bg_user  = "#0d2b36"
-bg_tool  = "#161b22"
+bg_user  = "#24283b"
+bg_tool  = "#1f2335"
 
 [ui]
 background = "$bg"
 foreground = "$fg"
 cursor     = "$blue"
-cursorline = "#1c2128"
+cursorline = "#292e42"
 gutter     = "$comment"
 diagnostic_error = "$red"
 
 [ui.selection]
-bg = "#21262d"
+bg = "#3b4261"
