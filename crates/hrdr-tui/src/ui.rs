@@ -1337,7 +1337,7 @@ fn push_tool(
     // Shell tools: render the raw command on its own line (monospaced feel).
     if let Some(cmd) = hrdr_app::extract_shell_command(name, args) {
         out.push(pad_line(
-            vec![Span::styled(format!("  $ {cmd}"), dim_bg)],
+            vec![Span::styled(format!("$ {cmd}"), dim_bg)],
             width,
             bg,
         ));
@@ -1371,7 +1371,7 @@ fn push_tool(
             };
             out.push(pad_line(
                 vec![Span::styled(
-                    format!("  {line}"),
+                    line.to_string(),
                     Style::default().fg(color).bg(bg),
                 )],
                 width,
@@ -1381,9 +1381,9 @@ fn push_tool(
         let extra = lines.len().saturating_sub(shown);
         if extra > 0 {
             let hint = if expanded {
-                " ⌃ (click or /expand off to collapse)".to_string()
+                "⌃ (click or /expand off to collapse)".to_string()
             } else {
-                format!(" … (+{extra} more lines · click or /expand)")
+                format!("… (+{extra} more lines · click or /expand)")
             };
             out.push(pad_line(vec![Span::styled(hint, dim_bg)], width, bg));
         }
@@ -1393,7 +1393,7 @@ fn push_tool(
         if start > 0 {
             out.push(pad_line(
                 vec![Span::styled(
-                    format!("  ⋮ (live · {start} earlier line(s))"),
+                    format!("⋮ (live · {start} earlier line(s))"),
                     dim_bg,
                 )],
                 width,
@@ -1402,7 +1402,7 @@ fn push_tool(
         }
         for line in &lines[start..] {
             out.push(pad_line(
-                vec![Span::styled(format!(" {line}"), dim_bg)],
+                vec![Span::styled(line.to_string(), dim_bg)],
                 width,
                 bg,
             ));
