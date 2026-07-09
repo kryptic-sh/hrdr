@@ -106,6 +106,14 @@ impl super::App {
                 hrdr_app::expand_msg::OFF.to_string()
             }
             hrdr_app::ExpandMode::ToggleLast => {
+                // Keep the toggled block's top where the reader is looking; its
+                // height is about to change (see `pending_scroll_entry`).
+                let idx = self
+                    .state
+                    .transcript
+                    .iter()
+                    .rposition(|e| matches!(e.kind, EntryKind::Tool { .. }));
+                self.pending_scroll_entry = idx;
                 let last = self
                     .state
                     .transcript

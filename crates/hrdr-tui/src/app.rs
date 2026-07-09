@@ -152,6 +152,11 @@ pub(crate) struct App {
     login: Option<hrdr_app::LoginWizard>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
+    /// A transcript index whose block should be pulled to the top of the
+    /// viewport at the next draw. Set when a tool block is expanded or
+    /// collapsed: the row count changes under the reader, and `scroll_offset` is
+    /// measured from the bottom, so the block would otherwise jump.
+    pub(crate) pending_scroll_entry: Option<usize>,
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
@@ -334,6 +339,7 @@ impl App {
             pending_edit: None,
             login: None,
             pending_goto: None,
+            pending_scroll_entry: None,
             find: hrdr_app::FindState::default(),
             auto_compact_enabled: auto_compact,
             compaction_reserved,
@@ -642,6 +648,9 @@ impl App {
                         self.state.transcript.get_mut(idx).map(|e| &mut e.kind)
                 {
                     *expanded = !*expanded;
+                    // The block's height just changed; keep its top where the
+                    // reader is looking instead of letting it slide.
+                    self.pending_scroll_entry = Some(idx);
                 }
             }
             _ => {}

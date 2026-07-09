@@ -2323,3 +2323,111 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
         "output → tool:\n{screen}"
     );
 }
+
+/// Collapsing a long tool block pulls its top to the top of the viewport rather
+/// than letting it slide.
+///
+/// Regression: `scroll_offset` is measured from the *bottom*, so shrinking the
+/// transcript kept the view the same distance from the end — the block the user
+/// was reading jumped up by however many rows it lost.
+#[tokio::test]
+async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: long,
+        ok: true,
+        done: true,
+        expanded: true, // long and open
+    }));
+    h.app.push_entry(Entry::assistant("after"));
+
+    let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    // Scroll up until the tool header is on screen, mid-viewport.
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let header_row = |term: &Terminal<TestBackend>| -> Option<u16> {
+        let buf = term.backend().buffer();
+        (0..16).find(|&y| {
+            (0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>()
+                .contains("✓ bash")
+        })
+    };
+    let before = header_row(&term).expect("tool header on screen");
+    assert!(h.app.scroll_offset > 0, "the reader is scrolled up");
+
+    // Click it: the block collapses, and its top comes to the viewport's top.
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    assert!(rect.contains(2, before));
+    h.app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 2,
+        row: before,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let after = header_row(&term).expect("tool header still on screen");
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        after <= 1,
+        "the collapsed block should sit at the top of the viewport, got row {after}:\n{screen}"
+    );
+}
+
+/// Collapsing while following the newest output must not scroll away from the
+/// bottom: the view is already pinned there, and there's nothing to keep in
+/// place.
+#[tokio::test]
+async fn collapsing_while_following_stays_at_the_bottom() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: long,
+        ok: true,
+        done: true,
+        expanded: true,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert_eq!(h.app.scroll_offset, 0, "following the newest output");
+
+    // The header is off the top of a long expanded block; click its last row.
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    h.app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 2,
+        row: rect.y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    assert_eq!(h.app.scroll_offset, 0, "still following the newest output");
+}

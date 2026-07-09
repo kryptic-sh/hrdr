@@ -206,6 +206,16 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         let start = (*msg_starts.get(num.checked_sub(1)?)?).min(lines.len());
         Some(cum[start] as u16)
     });
+    // A tool block that was just expanded or collapsed changed height. While the
+    // reader is scrolled up, pull its top to the top of the viewport: the offset
+    // is measured from the bottom, so the block would otherwise slide by however
+    // many rows it gained or lost. Following the newest output is left alone —
+    // the bottom is already pinned.
+    let entry_top: Option<u16> = app.pending_scroll_entry.take().and_then(|idx| {
+        let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
+        (app.scroll_offset > 0).then(|| cum[(*start).min(lines.len())] as u16)
+    });
+    let goto_top = goto_top.or(entry_top);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Total wrapped rows at this width — from cum, not para.line_count().
     let total = *cum.last().unwrap_or(&0) as u16;
