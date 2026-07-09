@@ -1399,17 +1399,20 @@ fn transcript_lines(
             }
             // A thinking block with no thought in it renders nothing at all.
             EntryKind::Reasoning { text, .. } if text.trim().is_empty() => continue,
+            // A user prompt renders exactly like the model's output — same
+            // markdown, same colors. Only the block's background differs.
             EntryKind::User(text) => {
                 msg_num += 1;
                 msg_here += 1;
                 footer.extend(meta(i, msg_num, "you"));
-                let (fg, bg) = (theme.user, BlockKind::User.bg(theme));
-                let body = cache_entry(ck, || text_lines(text, Style::default().fg(fg).bg(bg)));
+                let md = md_theme.clone();
+                let bg = BlockKind::User.bg(theme);
+                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::User, body)
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
             // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
-            // out and syntax-highlighted with syntect on a distinct background.
+            // out and syntax-highlighted with syntect.
             EntryKind::Assistant(text) => {
                 msg_num += 1;
                 msg_here += 1;
@@ -1578,7 +1581,7 @@ fn transcript_lines(
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
         for msg in &app.queue {
-            let mut body = text_lines(msg, Style::default().fg(theme.user).bg(bg));
+            let mut body = markdown_lines(msg, &md_theme, bg, inner);
             body.push(Line::from(Span::styled(" Queued ", badge)));
             out.extend(render_block(body, w, bg));
             out.push(Line::raw(""));

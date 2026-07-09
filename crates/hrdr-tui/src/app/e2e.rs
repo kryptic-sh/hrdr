@@ -2053,3 +2053,58 @@ async fn the_stats_line_rides_on_the_turns_block() {
     // A user prompt block sits above, on its own background.
     assert_ne!(bg_at(reply_y), bg_at(row_of("run it")));
 }
+
+/// A user prompt renders through the same path as the model's output: markdown
+/// is parsed, and the text uses the same foreground color. Only the block's
+/// background differs.
+///
+/// Regression: prompts were emitted as raw styled lines in a bespoke `user`
+/// color, so `**bold**` showed its asterisks and the two spoke in different
+/// colors.
+#[tokio::test]
+async fn user_prompts_render_like_the_models_output() {
+    let mut h = Harness::new(vec![MockReply::Text("**reply** text".into())]).await;
+    h.submit("**prompt** text").await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+
+    let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    // Markdown is parsed on both sides: no literal `**` survives.
+    assert!(!screen.contains('*'), "markdown not rendered:\n{screen}");
+    assert!(screen.contains("prompt text"), "{screen}");
+    assert!(screen.contains("reply text"), "{screen}");
+
+    let cell_of = |needle: &str| {
+        let y = (0..30)
+            .find(|&y| {
+                (0..43)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"));
+        // Column 2 is the first content column; `**bold**` starts there.
+        let c = buf.cell(Position::new(2, y)).unwrap();
+        (c.fg, c.bg, c.modifier)
+    };
+    let (prompt_fg, prompt_bg, prompt_mod) = cell_of("prompt text");
+    let (reply_fg, reply_bg, reply_mod) = cell_of("reply text");
+
+    // Same foreground, and the bold span survived on both.
+    assert_eq!(prompt_fg, reply_fg, "prompt and reply share a foreground");
+    assert!(prompt_mod.contains(ratatui::style::Modifier::BOLD));
+    assert!(reply_mod.contains(ratatui::style::Modifier::BOLD));
+
+    // Only the background differs.
+    assert_eq!(prompt_bg, h.app.theme.user_bg);
+    assert_eq!(reply_bg, Color::Reset);
+}

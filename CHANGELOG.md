@@ -48,6 +48,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry (`EntryKind::Reasoning { text, took_ms }`) rather than a string spliced
   into the thought's text, so it no longer passes through markdown or gets
   persisted into the transcript.
+- **User prompts render like the model's output**: same markdown pipeline, same
+  foreground colors. Only the block's background differs. Queued messages too.
 - **Tool blocks show tool-specific detail**: the shell command and its output,
   `write`'s path and raw file contents, `edit`/`patch`'s diff, `read`'s tail.
 - **One `SessionState` is the on-disk payload.** `Entry` is now `{ kind, time }`
