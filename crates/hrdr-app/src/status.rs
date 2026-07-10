@@ -91,7 +91,12 @@ pub fn status_role_style(role: StatusRole) -> RoleStyle {
         StatusRole::Model => RoleStyle::fg(ThemeSlot::Assistant),
         StatusRole::Effort => RoleStyle::fg(ThemeSlot::Warn),
         StatusRole::Ttft => RoleStyle::fg(ThemeSlot::Dim),
-        StatusRole::Session => RoleStyle::fg(ThemeSlot::Dim),
+        // A badge: inverted (black) text on a filled accent background.
+        StatusRole::Session => RoleStyle {
+            fg: None,
+            bg: Some(ThemeSlot::Accent2),
+            bold: false,
+        },
     }
 }
 
@@ -326,7 +331,8 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
 pub fn status_right_sections(i: &StatusInputs) -> Vec<StatusSeg> {
     let mut sections = Vec::new();
     if let Some(name) = i.session.filter(|s| !s.is_empty()) {
-        sections.push(StatusSeg::one(0, name.to_string(), StatusRole::Session));
+        // A space either side so the colored background reads as a badge.
+        sections.push(StatusSeg::one(0, format!(" {name} "), StatusRole::Session));
     }
     sections
 }
@@ -412,7 +418,8 @@ mod tests {
     fn the_session_is_a_right_side_section() {
         let right = status_right_sections(&inputs());
         assert_eq!(right.len(), 1);
-        assert_eq!(right[0].runs[0].text, "my-session");
+        // Padded a space either side so its background reads as a badge.
+        assert_eq!(right[0].runs[0].text, " my-session ");
         assert_eq!(right[0].runs[0].role, StatusRole::Session);
 
         let unnamed = StatusInputs {
