@@ -89,16 +89,17 @@ mod tests {
         assert!(out.contains("hello world"), "{out}");
     }
 
+    /// A `.env` *inside* the project is still refused by the secret deny-list —
+    /// the case cwd-confinement doesn't cover (an in-project credential file).
+    /// A `../.env` escape to the parent is caught earlier by confinement (see
+    /// the per-tool `*_refuses_a_path_outside_cwd` tests).
     #[tokio::test]
-    async fn read_rejects_dotdot_escape_to_secret() {
+    async fn read_rejects_in_project_dotenv_via_secret_deny_list() {
         let dir = tempfile::tempdir().unwrap();
-        let secrets = dir.path().join("secrets");
-        std::fs::create_dir_all(&secrets).unwrap();
         std::fs::write(dir.path().join(".env"), "TOKEN=abc\n").unwrap();
-        let c = ctx(secrets.clone());
-        // From <cwd>/secrets, `../.env` resolves to the denied dotenv file.
+        let c = ctx(dir.path().to_path_buf());
         let err = ReadTool
-            .execute(json!({ "path": "../.env" }), &c)
+            .execute(json!({ "path": ".env" }), &c)
             .await
             .unwrap_err()
             .to_string();
