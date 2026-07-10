@@ -3889,6 +3889,72 @@ mod tests {
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
     }
 
+    /// The exact tool set each built-in sub-agent gets — the security boundary,
+    /// asserted rather than assumed.
+    ///
+    /// `read_only` is not a flag the sub-agent is asked to respect: the tool
+    /// registry is *pruned* before it runs, so `explore` and `review` have no
+    /// `bash` at all and cannot write by shelling out. `plan` keeps `write`/
+    /// `edit` but no shell, and its writes are extension-gated to markdown.
+    #[test]
+    fn each_builtin_subagent_gets_exactly_the_tools_it_should() {
+        let base = AgentConfig {
+            model: "m".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let base = super::subagent_base_config(&base);
+        let tools = |name: &str| -> Vec<String> {
+            let profile = super::builtin_subagent_profiles()
+                .into_iter()
+                .find(|p| p.name == name)
+                .unwrap();
+            let cfg = super::config_for_agent_profile(&base, &profile).unwrap();
+            let agent = Agent::new(cfg).unwrap();
+            let mut names: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
+            names.sort();
+            names
+        };
+
+        // Read-only: no writer, no shell, no delegation. `fetch`/`search` are in
+        // the set — read-only means "does not mutate the working tree", not
+        // "no network".
+        let readers = ["fetch", "find", "grep", "ls", "read", "search", "tree"];
+        assert_eq!(tools("explore"), readers);
+        assert_eq!(tools("review"), readers);
+
+        // `plan` adds the three writers — still no shell. Each of them gates on
+        // `ensure_within_cwd`, which enforces `write_ext`, so its writes are
+        // confined to markdown (patch validates before it writes anything).
+        let mut planner = readers.to_vec();
+        planner.extend(["edit", "patch", "write"]);
+        planner.sort();
+        assert_eq!(tools("plan"), planner);
+
+        // A general sub-agent has the full set, shell included…
+        let general = tools("general");
+        for t in ["bash", "edit", "write", "read", "grep", "todo"] {
+            assert!(general.contains(&t.to_string()), "general should have {t}");
+        }
+        // …but still cannot delegate further: sub-agents don't nest.
+        assert!(
+            !general.contains(&"task".to_string()),
+            "no nested delegation"
+        );
+
+        // No sub-agent gets `bash` unless it is write-capable in the first place.
+        for ro in ["explore", "review", "plan"] {
+            let t = tools(ro);
+            for shell in ["bash", "powershell"] {
+                assert!(
+                    !t.contains(&shell.to_string()),
+                    "{ro} must not have {shell}"
+                );
+            }
+            assert!(!t.contains(&"task".to_string()), "{ro} must not delegate");
+        }
+    }
+
     /// Which pool a sub-agent lands in: the read-only cap or the (lower)
     /// write-capable one. Capability is `!read_only`, so a profile that writes
     /// only `.md` (`plan`) still counts as a writer — it touches the shared
