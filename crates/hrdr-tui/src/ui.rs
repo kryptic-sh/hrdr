@@ -96,12 +96,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // renders as a block, so it carries the same padding as the transcript's —
     // two columns either side, and a blank row above and below. That top row is
     // what separates it from the tinted input pane above.
-    let sb_sections = build_status_sections(app);
+    let (sb_left, sb_right) = build_status_sections(app);
     let sb_inner = inner_width(area.width as usize);
     let sb_rows: u16 = match app.statusbar_mode {
         StatusBarMode::None => 0,
         StatusBarMode::Truncate => 1,
-        StatusBarMode::Wrap => status_wrap_rows(&sb_sections, sb_inner as usize).clamp(1, 4),
+        StatusBarMode::Wrap => {
+            // Wrap packs both sides into the flow; size for the combined set.
+            let combined: Vec<StatusSection> = sb_left.iter().chain(&sb_right).cloned().collect();
+            status_wrap_rows(&combined, sb_inner as usize).clamp(1, 4)
+        }
     };
     let sb_height = if sb_rows > 0 { sb_rows + 2 } else { 0 };
     let statusbar_idx = (sb_height > 0).then(|| {
@@ -130,7 +134,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_input(f, app, chunks[input_idx]);
     if let Some(i) = statusbar_idx {
-        draw_statusbar(f, app, chunks[i], &sb_sections);
+        draw_statusbar(f, app, chunks[i], &sb_left, &sb_right);
     }
 
     // The `/model` selector is a full modal; when it's open it owns the screen
@@ -185,15 +189,7 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
     ));
 
     let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
-    // Widest model label among the visible rows, capped so the provider column
-    // always has room.
-    let model_cap = (inner.width as usize * 3 / 5).max(1);
-    let model_w = rows
-        .iter()
-        .map(|c| c.model_label.chars().count())
-        .max()
-        .unwrap_or(1)
-        .clamp(1, model_cap);
+    let inner_w = inner.width as usize;
     // Scroll so the selected row stays visible.
     let start = if sel.selected >= list_height {
         (sel.selected + 1).saturating_sub(list_height)
@@ -210,26 +206,32 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
     }
     for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
         let selected = i == sel.selected;
-        let label = truncate_chars(&c.model_label, model_w);
-        let name = format!("{label:<model_w$}");
-        let name_span = if selected {
-            Span::styled(
-                name,
+        // Provider on the left, model name right-aligned; the row fills the full
+        // inner width so a selected row highlights end to end.
+        let provider = truncate_chars(&c.provider_label, (inner_w / 2).max(1));
+        let avail = inner_w.saturating_sub(provider.chars().count() + 1).max(1);
+        let model = truncate_chars(&c.model_label, avail);
+        let pad = inner_w
+            .saturating_sub(provider.chars().count() + model.chars().count())
+            .max(1);
+        let line = if selected {
+            Line::from(Span::styled(
+                format!("{provider}{}{model}", " ".repeat(pad)),
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.user)
                     .add_modifier(Modifier::BOLD),
-            )
+            ))
         } else {
-            Span::styled(name, Style::default().fg(theme.user))
+            Line::from(vec![
+                Span::styled(provider, Style::default().fg(theme.dim)),
+                Span::styled(
+                    format!("{}{model}", " ".repeat(pad)),
+                    Style::default().fg(theme.user),
+                ),
+            ])
         };
-        lines.push(Line::from(vec![
-            name_span,
-            Span::styled(
-                format!("  {}", c.provider_label),
-                Style::default().fg(theme.dim),
-            ),
-        ]));
+        lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -722,12 +724,17 @@ fn status_section_width(s: &StatusSection) -> usize {
 /// Build the status-bar sections from the shared content model
 /// ([`hrdr_app::status_sections`] — the shared sections/priorities),
 /// mapping each color role onto the terminal theme.
-fn build_status_sections(app: &App) -> Vec<StatusSection> {
+/// Build the status bar's `(left, right)` sections. The left side carries the
+/// dir/branch/tokens/context/model chrome; the right side carries the session
+/// name, laid out flush-right by [`draw_statusbar`].
+fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) {
     let t = &app.theme;
     let ttft = match (app.turn_started, app.first_token_at) {
         (Some(start), Some(first)) => Some(first.duration_since(start).as_secs_f64()),
         _ => None,
     };
+    // Cap the session name so a long one can't crowd out the left side.
+    let session = truncate_chars(&app.state.name, 28);
     let inputs = hrdr_app::StatusInputs {
         dir: &app.dir,
         branch: app.branch.as_deref(),
@@ -739,21 +746,27 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
         compaction_reserved: app.compaction_reserved,
         provider: app.state.provider.as_deref(),
         model: &app.state.model,
+        session: Some(session.as_str()),
         effort: app.effort.as_deref(),
         ttft,
         nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,
     };
-    hrdr_app::status_sections(&inputs)
-        .into_iter()
-        .map(|seg| {
-            let spans = seg
-                .runs
-                .into_iter()
-                .map(|run| Span::styled(run.text, status_role_style(run.role, t)))
-                .collect();
-            (seg.priority, spans)
-        })
-        .collect()
+    let to_sections = |segs: Vec<hrdr_app::StatusSeg>| -> Vec<StatusSection> {
+        segs.into_iter()
+            .map(|seg| {
+                let spans = seg
+                    .runs
+                    .into_iter()
+                    .map(|run| Span::styled(run.text, status_role_style(run.role, t)))
+                    .collect();
+                (seg.priority, spans)
+            })
+            .collect()
+    };
+    (
+        to_sections(hrdr_app::status_sections(&inputs)),
+        to_sections(hrdr_app::status_right_sections(&inputs)),
+    )
 }
 
 /// Resolve a shared theme slot to this theme's concrete color.
@@ -811,14 +824,26 @@ fn status_wrap_rows(sections: &[StatusSection], width: usize) -> u16 {
 }
 
 /// Render the status bar into `area` according to the active mode (Truncate or
-/// Wrap; None is handled by the caller not allocating a row).
-fn draw_statusbar(f: &mut Frame, app: &App, area: Rect, sections: &[StatusSection]) {
+/// Wrap; None is handled by the caller not allocating a row). The `left`
+/// sections flow from the left; the `right` sections (the session) sit flush
+/// against the right edge.
+fn draw_statusbar(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    left: &[StatusSection],
+    right: &[StatusSection],
+) {
     let t = &app.theme;
     let width = area.width as usize;
     let inner = inner_width(width) as usize;
     let lines = match app.statusbar_mode {
-        StatusBarMode::Wrap => status_wrap_lines(sections, inner, t),
-        _ => vec![status_truncate_line(sections, inner, t)],
+        StatusBarMode::Wrap => {
+            // Wrap has no right edge to pin to; pack both sides into the flow.
+            let combined: Vec<StatusSection> = left.iter().chain(right).cloned().collect();
+            status_wrap_lines(&combined, inner, t)
+        }
+        _ => vec![status_truncate_line_split(left, right, inner, t)],
     };
     // The same chrome a transcript block wears: two columns either side, a blank
     // row above and below. No background of its own, and no bar.
@@ -826,6 +851,38 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect, sections: &[StatusSectio
         Paragraph::new(render_block(lines, width, Color::Reset, None)),
         area,
     );
+}
+
+/// One-row status bar with a left-flowing group and a right-aligned group: the
+/// right sections are pinned to the right edge, the left sections truncate into
+/// whatever width is left over.
+fn status_truncate_line_split(
+    left: &[StatusSection],
+    right: &[StatusSection],
+    width: usize,
+    t: &Theme,
+) -> Line<'static> {
+    // Right group: joined verbatim (it's small — just the session).
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    for (i, (_, ss)) in right.iter().enumerate() {
+        if i > 0 {
+            right_spans.push(Span::styled(" │ ", Style::default().fg(t.dim)));
+        }
+        right_spans.extend(ss.iter().cloned());
+    }
+    let right_w: usize = right_spans.iter().map(Span::width).sum();
+    let gap = if right_w > 0 { 2 } else { 0 };
+
+    let left_line = status_truncate_line(left, width.saturating_sub(right_w + gap), t);
+    let left_w: usize = left_line.spans.iter().map(Span::width).sum();
+
+    let mut spans = left_line.spans;
+    if right_w > 0 {
+        let pad = width.saturating_sub(left_w + right_w).max(1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(right_spans);
+    }
+    Line::from(spans)
 }
 
 /// One-row status bar that drops the least-important sections until it fits.

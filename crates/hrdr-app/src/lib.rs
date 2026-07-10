@@ -46,8 +46,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/resume", "resume a saved session by id or name"),
     ("/rename", "rename the current session"),
-    ("/model", "show or switch model"),
-    ("/models", "list models from the endpoint"),
+    ("/model", "browse & switch model (interactive selector)"),
     ("/provider", "switch provider preset"),
     ("/login", "set up a provider + API key (wizard)"),
     ("/theme", "switch theme (path, or reset)"),
@@ -116,7 +115,6 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Model & sampling",
         &[
             "/model",
-            "/models",
             "/provider",
             "/login",
             "/temp",

@@ -25,7 +25,7 @@ impl super::App {
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),
             "prev" | "previous" => self.find_cycle(false),
-            // help, clear, model, models, tools, copy, diff, rename, thinking,
+            // help, clear, model, tools, copy, diff, rename, thinking,
             // sessions, resume, export → shared dispatcher (TuiHost overrides
             // route /diff to the colored EntryKind::Diff rendering).
             _ => {

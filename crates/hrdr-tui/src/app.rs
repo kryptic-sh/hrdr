@@ -704,6 +704,17 @@ impl App {
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
         self.quit_armed = false;
+        // The `/model` selector owns the mouse while open: the wheel scrolls its
+        // list (moving the highlight, which the view follows); other events are
+        // swallowed so they don't reach the transcript beneath the modal.
+        if let Some(sel) = &mut self.model_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(MOUSE_SCROLL_LINES);

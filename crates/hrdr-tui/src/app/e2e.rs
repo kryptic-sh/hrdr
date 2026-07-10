@@ -2143,6 +2143,10 @@ async fn user_prompts_render_like_the_models_output() {
         .state
         .transcript
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // The auto-derived session name echoes the first message (so it carries the
+    // literal `**`); it now shows in the status bar, but this test is about the
+    // transcript, so clear it to keep the `*`-free assertion focused there.
+    h.app.state.name.clear();
 
     let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3774,6 +3778,14 @@ async fn model_selector_renders_columns_filters_and_closes() {
         !screen.contains("Claude Fable 5.0"),
         "filtered the non-match out: {screen}"
     );
+    // Provider left, model right: on the row, the provider precedes the model.
+    let row = screen
+        .lines()
+        .find(|l| l.contains("DeepSeek V4 Pro"))
+        .expect("the DeepSeek row");
+    let prov_at = row.find("OpenCode Go").expect("provider on the row");
+    let model_at = row.find("DeepSeek V4 Pro").expect("model on the row");
+    assert!(prov_at < model_at, "provider is left of the model: {row:?}");
 
     // Esc closes the modal.
     h.press(KeyCode::Esc);

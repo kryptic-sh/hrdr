@@ -53,18 +53,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(format!("model → {arg}"));
             }
         }
-        "models" => {
-            let agent = host.agent();
-            host.info("fetching models…".to_string());
-            host.spawn_line(Box::pin(async move {
-                let client = agent.lock().await.client();
-                match client.list_models().await {
-                    Ok(m) if !m.is_empty() => format!("models:\n  {}", m.join("\n  ")),
-                    Ok(_) => "endpoint reported no models".to_string(),
-                    Err(e) => format!("models error: {e}"),
-                }
-            }));
-        }
         "tools" => {
             let agent = host.agent();
             host.spawn_line(Box::pin(async move {

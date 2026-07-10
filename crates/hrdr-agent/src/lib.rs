@@ -2595,7 +2595,8 @@ impl Agent {
         self.provider = provider;
     }
 
-    /// A clone of the model client (for out-of-band calls like `/models`).
+    /// A clone of the model client (for out-of-band calls like the startup
+    /// endpoint health check's `list_models`).
     pub fn client(&self) -> Client {
         self.client.clone()
     }

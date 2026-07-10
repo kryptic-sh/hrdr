@@ -30,6 +30,8 @@ pub enum StatusRole {
     Effort,
     /// Time-to-first-token of the latest turn (dim).
     Ttft,
+    /// Session name, right-aligned (dim).
+    Session,
 }
 
 /// Theme slot a semantic role colors from. Both frontends' themes expose
@@ -89,6 +91,7 @@ pub fn status_role_style(role: StatusRole) -> RoleStyle {
         StatusRole::Model => RoleStyle::fg(ThemeSlot::Assistant),
         StatusRole::Effort => RoleStyle::fg(ThemeSlot::Warn),
         StatusRole::Ttft => RoleStyle::fg(ThemeSlot::Dim),
+        StatusRole::Session => RoleStyle::fg(ThemeSlot::Dim),
     }
 }
 
@@ -187,6 +190,8 @@ pub struct StatusInputs<'a> {
     /// Active provider name, shown before the model when set.
     pub provider: Option<&'a str>,
     pub model: &'a str,
+    /// Session name, right-aligned on the status bar (empty/None → no right side).
+    pub session: Option<&'a str>,
     pub effort: Option<&'a str>,
     /// Time-to-first-token of the latest turn, seconds.
     pub ttft: Option<f64>,
@@ -314,6 +319,18 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
     sections
 }
 
+/// The right-aligned status sections — currently just the session name, shown
+/// flush to the right edge. Empty when there's no named session yet. Kept
+/// separate from [`status_sections`] (the left side) so a frontend can lay the
+/// two out on opposite ends of the bar.
+pub fn status_right_sections(i: &StatusInputs) -> Vec<StatusSeg> {
+    let mut sections = Vec::new();
+    if let Some(name) = i.session.filter(|s| !s.is_empty()) {
+        sections.push(StatusSeg::one(0, name.to_string(), StatusRole::Session));
+    }
+    sections
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +347,7 @@ mod tests {
             compaction_reserved: 150, // critical at 1000 − 150 = 850 ≤ 900
             provider: Some("zen"),
             model: "qwen3",
+            session: Some("my-session"),
             effort: None,
             ttft: Some(1.5),
             nerd_icons: false,
@@ -387,6 +405,26 @@ mod tests {
             .unwrap();
         let text2: String = model_seg2.runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(text2, "qwen3");
+    }
+
+    /// The session name is a right-side section, absent when unnamed.
+    #[test]
+    fn the_session_is_a_right_side_section() {
+        let right = status_right_sections(&inputs());
+        assert_eq!(right.len(), 1);
+        assert_eq!(right[0].runs[0].text, "my-session");
+        assert_eq!(right[0].runs[0].role, StatusRole::Session);
+
+        let unnamed = StatusInputs {
+            session: None,
+            ..inputs()
+        };
+        assert!(status_right_sections(&unnamed).is_empty());
+        let empty = StatusInputs {
+            session: Some(""),
+            ..inputs()
+        };
+        assert!(status_right_sections(&empty).is_empty());
     }
 
     #[test]
