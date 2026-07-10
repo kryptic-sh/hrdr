@@ -73,16 +73,20 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     );
     let subagent_height = subagent_panel_height(&subagent_items);
 
-    // Build the row stack dynamically, remembering each section's index.
+    // Build the row stack dynamically, remembering each section's index. Each
+    // panel above the input carries a blank row of its own, so it never butts up
+    // against the panel (or the scrollback) above it — and costs nothing when it
+    // isn't rendered.
     let mut constraints = vec![Constraint::Min(3)];
-    let subagent_idx = (subagent_height > 0).then(|| {
-        constraints.push(Constraint::Length(subagent_height));
-        constraints.len() - 1
-    });
-    let todo_idx = (todo_height > 0).then(|| {
-        constraints.push(Constraint::Length(todo_height));
-        constraints.len() - 1
-    });
+    let panel = |constraints: &mut Vec<Constraint>, height: u16| {
+        (height > 0).then(|| {
+            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Length(height));
+            constraints.len() - 1
+        })
+    };
+    let subagent_idx = panel(&mut constraints, subagent_height);
+    let todo_idx = panel(&mut constraints, todo_height);
     let loader_idx = (loader_height > 0).then(|| {
         constraints.push(Constraint::Length(loader_height));
         constraints.len() - 1

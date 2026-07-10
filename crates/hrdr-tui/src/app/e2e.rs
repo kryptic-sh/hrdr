@@ -2550,6 +2550,85 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     );
 }
 
+/// Every panel above the input carries a blank row above itself, so it never
+/// butts up against the scrollback (whose last block no longer trails one) — and
+/// that row costs nothing when the panel isn't rendered.
+#[tokio::test]
+async fn each_panel_above_the_input_owns_a_blank_row_above_it() {
+    let mut h = Harness::new(vec![]).await;
+    // Overflow the transcript so its last block runs up to whatever is below.
+    for i in 0..40 {
+        h.app.push_entry(Entry::system(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
+    let draw = |h: &mut Harness, term: &mut Terminal<TestBackend>| -> Vec<String> {
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..24)
+            .map(|y| {
+                (0..50)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let tinted_at = |h: &Harness, term: &Terminal<TestBackend>, y: u16| -> bool {
+        term.backend()
+            .buffer()
+            .cell(Position::new(2, y))
+            .unwrap()
+            .bg
+            == h.app.theme.user_bg
+    };
+
+    // No panel: the transcript's filler runs right down to the input's own gap.
+    let rows = draw(&mut h, &mut term);
+    assert!(
+        rows.iter().all(|r| !r.contains("ship it")),
+        "no todo panel yet"
+    );
+
+    // With todos, the panel's first row is preceded by a blank, untinted row.
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "ship it".to_string(),
+        status: "in_progress".to_string(),
+    }];
+    let rows = draw(&mut h, &mut term);
+    let text_y = rows
+        .iter()
+        .position(|r| r.contains("ship it"))
+        .expect("the todo renders") as u16;
+    // text_y − 1 is the panel's tinted top pad; the row above it is the spacer.
+    let spacer_y = text_y - 2;
+    assert!(
+        tinted_at(&h, &term, text_y - 1),
+        "the panel's top pad:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        rows[spacer_y as usize].trim(),
+        "",
+        "blank spacer above the panel:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !tinted_at(&h, &term, spacer_y),
+        "the spacer is not the panel's own padding:\n{}",
+        rows.join("\n")
+    );
+    // The spacer is the layout's, not the panel's: dropping it would put the
+    // panel's tinted pad directly under the transcript's last row.
+    assert!(
+        rows[spacer_y as usize - 1].contains("filler") || !tinted_at(&h, &term, spacer_y - 1),
+        "the transcript, or its block's own bottom pad, sits above the spacer:\n{}",
+        rows.join("\n")
+    );
+}
+
 /// Exactly one untinted row separates the scrollback from the input pane, even
 /// when a tinted block (a user prompt) runs right up to the bottom of it.
 ///
