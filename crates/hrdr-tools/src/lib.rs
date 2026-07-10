@@ -218,6 +218,31 @@ impl ToolContext {
         ))
     }
 
+    /// Confinement for the content-reading/listing tools (`read`, `grep`,
+    /// `ls`, `tree`): `Err` when `path` resolves outside the working directory
+    /// while [`restrict_to_cwd`](Self::restrict_to_cwd) is on. Stricter than
+    /// [`ensure_inside_cwd`](Self::ensure_inside_cwd), which also admits the
+    /// system temp dir as write scratch — reading arbitrary temp is an
+    /// exfiltration path (another session's tool output, other users' files),
+    /// so reads are confined to the project alone. `..`-escapes are resolved
+    /// before the check.
+    pub fn ensure_read_inside_cwd(&self, path: &std::path::Path) -> Result<()> {
+        if !self.restrict_to_cwd {
+            return Ok(());
+        }
+        let canon = canonicalize_nearest(path);
+        let cwd = canonicalize_nearest(&self.cwd);
+        if canon.starts_with(&cwd) {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "{} is outside the working directory ({}) — reads are confined to the \
+             project; ask the user to change it themselves (or to set allow_outside_cwd)",
+            path.display(),
+            self.cwd.display()
+        ))
+    }
+
     /// Guard for [`write_allow_ext`](Self::write_allow_ext): `Err` when a
     /// mutating tool targets a file whose extension isn't in the allow-list.
     /// A no-op when no list is set.

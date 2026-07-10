@@ -100,10 +100,14 @@ impl Tool for GrepTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: GrepArgs = crate::tool_args("grep", args)?;
-        // Refuse to scope a search directly at a credential/secret file — grep
-        // reads file *contents*, so it's an exfiltration vector like `read`.
+        // A search scoped at an explicit path must stay inside the project and
+        // off the credential deny-list: grep reads file *contents*, so an
+        // out-of-cwd or secret root is an exfiltration vector like `read`. With
+        // no path it searches cwd, which is confined by construction.
         if let Some(p) = &a.path {
-            crate::guard_secret_read(&ctx.resolve(p))?;
+            let root = ctx.resolve(p);
+            ctx.ensure_read_inside_cwd(&root)?;
+            crate::guard_secret_read(&root)?;
         }
         match self.backend {
             GrepBackend::Rg => grep_ripgrep(&a, ctx).await,
@@ -328,6 +332,33 @@ fn emit_context_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A search scoped at an explicit path outside the project is refused
+    /// before any backend runs — grep reads file contents, so an out-of-cwd
+    /// root is an exfiltration vector. Backend-independent: the guard lives in
+    /// `execute`, so `GrepTool::detect()`'s chosen backend doesn't matter.
+    #[tokio::test]
+    async fn grep_refuses_a_path_outside_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
+
+        let ctx = ToolContext::new(cwd.path());
+        let err = GrepTool::detect()
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": outside.path().to_str().unwrap(),
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("grepping outside cwd must be denied");
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "unexpected error: {err}"
+        );
+    }
 
     /// With `context > 0`, a `.env` line adjacent to a match must not leak via
     /// a `-C` context line (`path-NN-content`) — the secret filter used to
