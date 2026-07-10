@@ -3732,3 +3732,51 @@ async fn a_transcript_taller_than_u16_max_rows_does_not_wrap_the_scroll_math() {
         h.app.max_scroll
     );
 }
+
+/// The `/model` selector renders both columns (friendly model · provider),
+/// narrows as you type into its fuzzy filter, and closes on Esc.
+#[tokio::test]
+async fn model_selector_renders_columns_filters_and_closes() {
+    let mut h = Harness::new(vec![]).await;
+    let choices = vec![
+        hrdr_agent::ModelChoice {
+            provider: "zen".into(),
+            model: "claude-fable-5".into(),
+            provider_label: "OpenCode Zen".into(),
+            model_label: "Claude Fable 5.0".into(),
+        },
+        hrdr_agent::ModelChoice {
+            provider: "go".into(),
+            model: "deepseek-v4-pro".into(),
+            provider_label: "OpenCode Go".into(),
+            model_label: "DeepSeek V4 Pro".into(),
+        },
+    ];
+    h.app.model_selector = Some(crate::app::ModelSelector::new(choices));
+
+    let screen = h.render();
+    assert!(screen.contains("Search"), "search line missing: {screen}");
+    assert!(
+        screen.contains("Claude Fable 5.0"),
+        "model column: {screen}"
+    );
+    assert!(screen.contains("OpenCode Zen"), "provider column: {screen}");
+    assert!(screen.contains("DeepSeek V4 Pro"), "second row: {screen}");
+
+    // Typing filters to just the DeepSeek row (matches the model name).
+    h.type_str("deepseek");
+    let screen = h.render();
+    assert!(
+        screen.contains("DeepSeek V4 Pro"),
+        "kept the match: {screen}"
+    );
+    assert!(
+        !screen.contains("Claude Fable 5.0"),
+        "filtered the non-match out: {screen}"
+    );
+
+    // Esc closes the modal.
+    h.press(KeyCode::Esc);
+    assert!(h.app.model_selector.is_none(), "Esc closes the selector");
+    assert!(!h.render().contains("Search"), "modal is gone after Esc");
+}

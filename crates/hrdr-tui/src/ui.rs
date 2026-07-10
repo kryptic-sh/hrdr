@@ -133,11 +133,114 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_statusbar(f, app, chunks[i], &sb_sections);
     }
 
-    // Completion popup (slash command or `@file`), overlaid above the input.
-    if let Some(comp) = app.active_completions() {
+    // The `/model` selector is a full modal; when it's open it owns the screen
+    // (and every key), so the completion popup stands down.
+    if let Some(sel) = &app.model_selector {
+        draw_model_selector(f, &app.theme, sel);
+    } else if let Some(comp) = app.active_completions() {
+        // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
         draw_completion(f, app, chunks[input_idx], &comp);
     }
+}
+
+/// The `/model` selector modal: a search line, a hint, and a two-column list
+/// (friendly model name · friendly provider name) of every model across the
+/// configured providers, narrowed by the fuzzy filter. Same chrome as the
+/// blocks and the completion popup — solid background, 1×2 padding, no border.
+fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSelector) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 92);
+    let height = area.height.saturating_sub(2).clamp(1, 32);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    let rows: Vec<&hrdr_agent::ModelChoice> = sel.rows().collect();
+    // Search line + a dim hint, then a blank row, then the list.
+    let search = Line::from(vec![
+        Span::styled("Search  ", Style::default().fg(theme.dim)),
+        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+    ]);
+    let hint = Line::from(Span::styled(
+        format!(
+            "{} model{} · ↑↓ select · Enter switch · Esc cancel",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(theme.dim),
+    ));
+
+    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
+    // Widest model label among the visible rows, capped so the provider column
+    // always has room.
+    let model_cap = (inner.width as usize * 3 / 5).max(1);
+    let model_w = rows
+        .iter()
+        .map(|c| c.model_label.chars().count())
+        .max()
+        .unwrap_or(1)
+        .clamp(1, model_cap);
+    // Scroll so the selected row stays visible.
+    let start = if sel.selected >= list_height {
+        (sel.selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no models match",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
+        let selected = i == sel.selected;
+        let label = truncate_chars(&c.model_label, model_w);
+        let name = format!("{label:<model_w$}");
+        let name_span = if selected {
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(name, Style::default().fg(theme.user))
+        };
+        lines.push(Line::from(vec![
+            name_span,
+            Span::styled(
+                format!("  {}", c.provider_label),
+                Style::default().fg(theme.dim),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Truncate `s` to at most `max` characters, appending `…` when it was cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    format!("{}…", s.chars().take(keep).collect::<String>())
 }
 
 fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app::Completions) {

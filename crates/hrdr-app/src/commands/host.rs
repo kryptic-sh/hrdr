@@ -268,6 +268,13 @@ pub trait CommandHost {
         self.info("/login isn't available in this frontend".to_string());
     }
 
+    /// Open the interactive `/model` selector — a filterable list of every model
+    /// across the configured providers. A frontend that supports it stashes the
+    /// selector in a modal slot; the default lists the models as text instead.
+    fn begin_model_selector(&mut self) {
+        self.info("model selector isn't available in this frontend".to_string());
+    }
+
     /// Whether this frontend supports `cmd` (used to filter `/help`).
     fn supports_command(&self, _cmd: &str) -> bool {
         true

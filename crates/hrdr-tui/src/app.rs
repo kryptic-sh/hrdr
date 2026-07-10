@@ -21,6 +21,7 @@ use crate::theme::Theme;
 
 mod commands;
 mod completion;
+mod model_selector;
 mod session;
 mod util;
 
@@ -30,6 +31,7 @@ use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
 };
+pub(crate) use model_selector::ModelSelector;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -149,6 +151,8 @@ pub(crate) struct App {
     /// An in-progress `/login` wizard; while `Some`, submitted lines feed it
     /// instead of the model or the slash dispatcher.
     login: Option<hrdr_app::LoginWizard>,
+    /// The open `/model` selector modal; while `Some`, it captures every key.
+    pub(crate) model_selector: Option<ModelSelector>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -366,6 +370,7 @@ impl App {
             pending_init: false,
             pending_edit: None,
             login: None,
+            model_selector: None,
             pending_goto: None,
             pending_scroll_entry: None,
             pending_focus_entry: None,
@@ -468,6 +473,12 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !is_ctrl_c {
             self.quit_armed = false;
+        }
+
+        // The `/model` selector modal captures every key while it is open.
+        if self.model_selector.is_some() {
+            self.model_selector_key(key);
+            return Action::None;
         }
 
         // Completion popup (slash command or `@file`): Tab accepts the selection,

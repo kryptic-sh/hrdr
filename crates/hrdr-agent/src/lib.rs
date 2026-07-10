@@ -13,6 +13,8 @@ pub use agents_dir::discover_agent_profiles;
 pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token, write_atomic};
 mod paths;
 pub use paths::cwd_slug;
+mod models;
+pub use models::{ModelChoice, builtin_catalog_key, filter_model_choices, model_choices};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

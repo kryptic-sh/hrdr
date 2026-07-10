@@ -469,6 +469,18 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let wizard = hrdr_app::LoginWizard::start(self);
         self.app.login = Some(wizard);
     }
+    fn begin_model_selector(&mut self) {
+        let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
+        if choices.is_empty() {
+            self.info(
+                "no models to choose from yet — configure a provider (or run a turn so the \
+                 models.dev catalog is cached), then try /model again"
+                    .to_string(),
+            );
+            return;
+        }
+        self.app.model_selector = Some(super::ModelSelector::new(choices));
+    }
     fn help_tips(&self) -> Option<String> {
         // The footer no longer repeats these, so `/help` is where they live.
         Some(format!(
@@ -479,6 +491,62 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
 }
 
 impl super::App {
+    /// Route one key to the open `/model` selector: Esc/Ctrl+C closes it,
+    /// Up/Down move the highlight, Enter applies the highlighted model (switching
+    /// provider + model), and any other character edits the fuzzy filter. Caller
+    /// checks `self.model_selector.is_some()` first.
+    pub(super) fn model_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.model_selector = None,
+            KeyCode::Char('c') if ctrl => self.model_selector = None,
+            KeyCode::Up => {
+                if let Some(s) = &mut self.model_selector {
+                    s.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut self.model_selector {
+                    s.down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut self.model_selector {
+                    s.backspace();
+                }
+            }
+            KeyCode::Enter => {
+                let choice = self
+                    .model_selector
+                    .as_ref()
+                    .and_then(|s| s.current())
+                    .cloned();
+                self.model_selector = None;
+                if let Some(c) = choice {
+                    // Scope the host borrow so the confirmation line can be pushed
+                    // afterwards.
+                    let line = {
+                        let mut host = TuiHost { app: self };
+                        match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone()) {
+                            Ok(()) => {
+                                format!("model → {} · {}", c.model_label, c.provider_label)
+                            }
+                            Err(e) => e,
+                        }
+                    };
+                    self.system(line);
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(s) = &mut self.model_selector {
+                    s.push_char(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Feed one submitted line to the active `/login` wizard, dropping the modal
     /// slot when it finishes. Caller checks `self.login.is_some()` first.
     pub(super) fn login_feed(&mut self, line: &str) {

@@ -38,7 +38,9 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "model" => {
             if arg.is_empty() {
-                host.info(format!("model: {}", host.model()));
+                // No argument: open the interactive selector (a frontend that
+                // supports it; the default lists models as text).
+                host.begin_model_selector();
             } else if host.is_busy() {
                 // `switch_model` updates the displayed model immediately but
                 // the actual `agent.set_model` waits on the turn's mutex —

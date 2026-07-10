@@ -34,6 +34,46 @@ const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Give up on a slow catalog rather than delay the probe indefinitely.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The catalog read synchronously from the cache (or `HRDR_MODELS_PATH`), for
+/// the `/model` selector — it builds a UI list on a keypress and can't await a
+/// fetch. `None` when no cache exists yet (the async [`context_window`] path
+/// populates it on startup). Never fetches.
+pub fn load_cached() -> Option<Value> {
+    let read = |p: &std::path::Path| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok();
+    if let Some(pinned) = std::env::var_os("HRDR_MODELS_PATH") {
+        return read(std::path::Path::new(&pinned));
+    }
+    read(&cache_path()?)
+}
+
+/// For catalog provider `key`, its friendly display name and every model it
+/// lists as `(model_id, friendly_name)`. Friendly names fall back to the id/key
+/// when the catalog omits a `name`. `None` when the key isn't in the catalog.
+/// Pure, so the selector's list-building is testable without a cache.
+pub fn provider_models(catalog: &Value, key: &str) -> Option<(String, Vec<(String, String)>)> {
+    let p = catalog.get(key)?;
+    let provider_name = p
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(key)
+        .to_string();
+    let mut models: Vec<(String, String)> = p
+        .get("models")?
+        .as_object()?
+        .iter()
+        .map(|(id, m)| {
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(id)
+                .to_string();
+            (id.clone(), name)
+        })
+        .collect();
+    models.sort_by_key(|(_, name)| name.to_lowercase());
+    Some((provider_name, models))
+}
+
 /// The context window for `model`, from the models.dev catalog.
 ///
 /// `provider` is the configured provider name (`opencode-go`, `openrouter`, …)
@@ -181,6 +221,35 @@ mod tests {
                 "weird": { "id": "weird" },
             }},
         })
+    }
+
+    /// `provider_models` returns the provider's friendly name and its models,
+    /// each with a friendly name (falling back to the id), sorted by that name.
+    #[test]
+    fn provider_models_returns_friendly_names_sorted() {
+        let c = json!({
+            "opencode": { "name": "OpenCode Zen", "models": {
+                "z-gpt": { "name": "GPT-5.6" },
+                "a-claude": { "name": "Claude Fable 5.0" },
+                "no-name-model": {},
+            }},
+        });
+        let (provider, models) = provider_models(&c, "opencode").unwrap();
+        assert_eq!(provider, "OpenCode Zen");
+        // Sorted by friendly name: "Claude Fable 5.0" < "GPT-5.6" < "no-name-model".
+        assert_eq!(
+            models,
+            vec![
+                ("a-claude".to_string(), "Claude Fable 5.0".to_string()),
+                ("z-gpt".to_string(), "GPT-5.6".to_string()),
+                ("no-name-model".to_string(), "no-name-model".to_string()),
+            ]
+        );
+        // An unknown provider key yields nothing.
+        assert!(provider_models(&c, "nope").is_none());
+        // A provider with no `name` falls back to its key.
+        let c2 = json!({ "x": { "models": { "m": {} } } });
+        assert_eq!(provider_models(&c2, "x").unwrap().0, "x");
     }
 
     /// The configured provider's own number wins — the same model is served with
