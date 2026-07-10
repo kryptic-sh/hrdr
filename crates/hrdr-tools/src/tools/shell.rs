@@ -53,7 +53,7 @@ impl Tool for BashTool {
         shell_parameters("Shell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ShellArgs = serde_json::from_value(args).context("invalid bash args")?;
+        let a: ShellArgs = crate::tool_args("bash", args)?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
@@ -301,7 +301,7 @@ impl Tool for PowerShellTool {
         shell_parameters("PowerShell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ShellArgs = serde_json::from_value(args).context("invalid powershell args")?;
+        let a: ShellArgs = crate::tool_args("powershell", args)?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }

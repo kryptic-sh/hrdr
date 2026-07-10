@@ -78,8 +78,7 @@ impl Tool for MemoryTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let a: MemoryArgs = serde_json::from_value(args)
-            .map_err(|e| anyhow::anyhow!("invalid memory args: {e}"))?;
+        let a: MemoryArgs = crate::tool_args("memory", args)?;
         let scope = a.scope.as_deref().unwrap_or("project");
         let root = match scope {
             "project" => ctx.memory_project.as_ref(),

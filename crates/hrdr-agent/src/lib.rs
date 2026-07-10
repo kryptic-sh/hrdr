@@ -169,6 +169,17 @@ fn bg_handles() -> BgHandles {
 /// `done = true` with an error message rather than leaving the registry entry
 /// live forever. The outer [`JoinHandle`](tokio::task::JoinHandle) is stored in
 /// `handles` so [`Agent::clear`] can abort running tasks on session reset.
+/// Render a tool's error for the model: the full `anyhow` context chain, not
+/// just the outermost frame.
+///
+/// `{e}` prints only the last `.context(...)`, which is the summary a *human*
+/// wants and the opposite of what the model needs — "invalid edit args" without
+/// "missing field `old_string`" gives it nothing to correct. `{e:#}` appends
+/// each source, `outer: inner: root`.
+fn tool_error_text(e: &anyhow::Error) -> String {
+    format!("Error: {e:#}")
+}
+
 /// Whether a `task` call runs detached.
 ///
 /// Detached by default: a sub-agent must not block the main conversation. An
@@ -2970,7 +2981,7 @@ impl Agent {
     ) {
         let (ok, mut body) = match result {
             Ok(s) => (true, s),
-            Err(e) => (false, format!("Error: {e}")),
+            Err(e) => (false, tool_error_text(&e)),
         };
         if let Some(nudge) = repeat.record(&call.function.name, &call.function.arguments, ok) {
             body.push_str(&nudge);
@@ -3894,6 +3905,27 @@ mod tests {
         // Sub-agent mode: applied onto the bounded base → no delegation.
         let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
+    }
+
+    /// A tool's error reaches the model with its **whole** context chain, not
+    /// just the outermost frame. `anyhow`'s default `Display` prints only the
+    /// last `.context(...)`, so `serde_json::from_value(..).context("invalid
+    /// write args")` would tell the model "invalid write args" and hide the one
+    /// fact it needs — *which field* was missing.
+    #[test]
+    fn a_tool_error_carries_its_whole_context_chain() {
+        let root = anyhow::anyhow!("missing field `path` at line 1 column 12");
+        let err = root.context("invalid write args");
+
+        // What the model used to be told.
+        assert_eq!(format!("{err}"), "invalid write args");
+        // What it is told now: the cause is spelled out.
+        let shown = format!("{err:#}");
+        assert!(shown.contains("invalid write args"), "{shown}");
+        assert!(shown.contains("missing field `path`"), "{shown}");
+
+        // And that is exactly what `record_tool_result` formats.
+        assert_eq!(super::tool_error_text(&err), format!("Error: {shown}"));
     }
 
     /// The exact tool set each built-in sub-agent gets — the security boundary,

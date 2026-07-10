@@ -69,7 +69,7 @@ impl Tool for PatchTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: PatchArgs = serde_json::from_value(args).context("invalid patch args")?;
+        let a: PatchArgs = crate::tool_args("patch", args)?;
         let files = split_patch(&a.patch);
         if files.is_empty() {
             bail!("no file sections in the patch — need `--- `/`+++ ` headers per file");

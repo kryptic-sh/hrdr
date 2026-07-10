@@ -130,7 +130,7 @@ impl Tool for GitTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: GitArgs = serde_json::from_value(args).context("invalid git args")?;
+        let a: GitArgs = crate::tool_args("git", args)?;
         let sub = a.subcommand.trim();
         if !ALLOWED.contains(&sub) {
             bail!(

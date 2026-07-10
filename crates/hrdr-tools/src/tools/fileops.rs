@@ -28,7 +28,12 @@ fn guard_dest(ctx: &ToolContext, path: &std::path::Path) -> Result<()> {
 async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> Result<()> {
     ctx.ensure_within_cwd(path)?;
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        bail!("{} does not exist", path.display());
+        bail!(
+            "{} does not exist — relative paths resolve against the project root ({}); \
+             use ls or find to locate it",
+            path.display(),
+            ctx.cwd.display()
+        );
     }
     if path.is_file() && !ctx.was_read(path) {
         bail!(
@@ -73,7 +78,7 @@ impl Tool for MoveTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: MoveArgs = serde_json::from_value(args).context("invalid move args")?;
+        let a: MoveArgs = crate::tool_args("move", args)?;
         let from = ctx.resolve(&a.from);
         let to = ctx.resolve(&a.to);
         guard_victim(ctx, &from, "move").await?;
@@ -177,7 +182,7 @@ impl Tool for DeleteTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: DeleteArgs = serde_json::from_value(args).context("invalid delete args")?;
+        let a: DeleteArgs = crate::tool_args("delete", args)?;
         let path = ctx.resolve(&a.path);
         guard_victim(ctx, &path, "delete").await?;
 
@@ -264,14 +269,19 @@ impl Tool for CopyTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: CopyArgs = serde_json::from_value(args).context("invalid copy args")?;
+        let a: CopyArgs = crate::tool_args("copy", args)?;
         let from = ctx.resolve(&a.from);
         let to = ctx.resolve(&a.to);
         // The source survives a copy, so it needs confinement but not the
         // read-before-destroy gate.
         ctx.ensure_within_cwd(&from)?;
         if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
-            bail!("{} does not exist", from.display());
+            bail!(
+                "{} does not exist — relative paths resolve against the project root ({}); \
+                 use ls or find to locate it",
+                from.display(),
+                ctx.cwd.display()
+            );
         }
         guard_dest(ctx, &to)?;
 

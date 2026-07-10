@@ -36,7 +36,7 @@ impl Tool for WriteTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: WriteArgs = serde_json::from_value(args).context("invalid write args")?;
+        let a: WriteArgs = crate::tool_args("write", args)?;
         let path = ctx.resolve(&a.path);
         ctx.ensure_within_cwd(&path)?;
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);

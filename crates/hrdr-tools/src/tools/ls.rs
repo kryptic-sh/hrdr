@@ -36,7 +36,7 @@ impl Tool for LsTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: LsArgs = serde_json::from_value(args).context("invalid ls args")?;
+        let a: LsArgs = crate::tool_args("ls", args)?;
         let dir = ctx.resolve(a.path.as_deref().unwrap_or("."));
         let mut rd = tokio::fs::read_dir(&dir)
             .await

@@ -45,7 +45,7 @@ impl Tool for ReadTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ReadArgs = serde_json::from_value(args).context("invalid read args")?;
+        let a: ReadArgs = crate::tool_args("read", args)?;
         let path = ctx.resolve(&a.path);
         crate::guard_secret_read(&path)?;
         let text = match tokio::fs::read_to_string(&path).await {

@@ -99,7 +99,7 @@ impl Tool for GrepTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: GrepArgs = serde_json::from_value(args).context("invalid grep args")?;
+        let a: GrepArgs = crate::tool_args("grep", args)?;
         // Refuse to scope a search directly at a credential/secret file — grep
         // reads file *contents*, so it's an exfiltration vector like `read`.
         if let Some(p) = &a.path {

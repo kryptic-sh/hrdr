@@ -45,7 +45,7 @@ impl Tool for EditTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: EditArgs = serde_json::from_value(args).context("invalid edit args")?;
+        let a: EditArgs = crate::tool_args("edit", args)?;
         let path = ctx.resolve(&a.path);
         ctx.ensure_within_cwd(&path)?;
         if !ctx.was_read(&path) {

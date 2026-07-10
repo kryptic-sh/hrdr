@@ -514,8 +514,75 @@ impl ToolRegistry {
         let tool = self
             .tools
             .get(name)
-            .ok_or_else(|| anyhow!("unknown tool: {name}"))?;
+            .ok_or_else(|| anyhow!("{}", self.unknown_tool_message(name)))?;
         tool.execute(args, ctx).await
+    }
+
+    /// Why `name` isn't callable, and what to call instead. A model that
+    /// mistypes or invents a tool gets the available set — and, when one is
+    /// close enough, the name it probably meant.
+    fn unknown_tool_message(&self, name: &str) -> String {
+        let mut msg = format!("unknown tool `{name}`");
+        if let Some(near) = self.nearest_tool(name) {
+            msg.push_str(&format!(" — did you mean `{near}`?"));
+        }
+        if self.order.is_empty() {
+            msg.push_str(" (no tools are available)");
+        } else {
+            msg.push_str(&format!("\nAvailable tools: {}", self.order.join(", ")));
+        }
+        msg
+    }
+
+    /// The registered tool within one edit of `name` (case-insensitively), if
+    /// any — enough to catch `grepp`, `Read`, `mv`-for-`move` typos without
+    /// suggesting something unrelated.
+    fn nearest_tool(&self, name: &str) -> Option<&'static str> {
+        let lower = name.to_ascii_lowercase();
+        self.order
+            .iter()
+            .map(|n| (*n, edit_distance(&lower, &n.to_ascii_lowercase())))
+            .filter(|(_, d)| *d <= 2)
+            .min_by_key(|(_, d)| *d)
+            .map(|(n, _)| n)
+    }
+}
+
+/// Levenshtein distance, iterative with one row of state.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Deserialize a tool's arguments, naming the offending field when it fails.
+///
+/// `serde_json::from_value` reports *what* was wrong ("invalid type: integer
+/// `7`, expected a string") but not *where*, which leaves a model guessing which
+/// argument to fix. `serde_path_to_error` carries the path, so the message
+/// becomes `invalid edit args: path: invalid type: integer …`.
+pub fn tool_args<T: serde::de::DeserializeOwned>(tool: &str, args: serde_json::Value) -> Result<T> {
+    match serde_path_to_error::deserialize::<_, T>(args) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let path = e.path().to_string();
+            let inner = e.into_inner();
+            // A missing field is reported at the root, where a path adds nothing.
+            if path.is_empty() || path == "." {
+                Err(anyhow!("invalid {tool} args: {inner}"))
+            } else {
+                Err(anyhow!("invalid {tool} args: {path}: {inner}"))
+            }
+        }
     }
 }
 
@@ -1119,6 +1186,92 @@ b:2:y"
         // …and the knob disables the gate entirely.
         ctx.restrict_to_cwd = false;
         assert!(ctx.ensure_within_cwd(Path::new("/usr/lib/x.txt")).is_ok());
+    }
+
+    /// A malformed tool call names the offending field. Each tool wraps
+    /// `serde_json::from_value` in a `.context("invalid <tool> args")`, which is
+    /// a summary — the field name lives in the *source*, and only the alternate
+    /// `{:#}` formatting (used by the agent when relaying to the model) shows
+    /// it. A model told merely "invalid write args" cannot fix its call.
+    #[tokio::test]
+    async fn a_malformed_call_names_the_field_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let registry = ToolRegistry::with_defaults();
+
+        let err = registry
+            .execute("write", serde_json::json!({"path": "a.txt"}), &ctx)
+            .await
+            .unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("invalid write args"), "{shown}");
+        assert!(shown.contains("missing field `content`"), "{shown}");
+
+        // A wrong type names the field it was found on — `serde_json` alone
+        // reports only "invalid type: integer `7`, expected a string".
+        let err = registry
+            .execute("edit", serde_json::json!({"path": 7}), &ctx)
+            .await
+            .unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("invalid edit args"), "{shown}");
+        assert!(shown.contains("path:"), "names the field: {shown}");
+        assert!(
+            shown.contains("invalid type"),
+            "and what was wrong: {shown}"
+        );
+
+        // A nested field carries its whole path.
+        let err = registry
+            .execute("todo", serde_json::json!({"todos": "not an array"}), &ctx)
+            .await
+            .unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("todo"), "{shown}");
+    }
+
+    /// A mistyped or invented tool name tells the model what it can call, and
+    /// what it probably meant — not just "unknown tool".
+    #[tokio::test]
+    async fn an_unknown_tool_names_the_alternatives_and_the_near_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let registry = ToolRegistry::with_defaults();
+
+        let err = registry
+            .execute("reed", serde_json::json!({}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown tool `reed`"), "{err}");
+        assert!(err.contains("did you mean `read`?"), "{err}");
+        assert!(err.contains("Available tools:"), "{err}");
+        assert!(err.contains("write"), "the set is listed: {err}");
+
+        // Nothing close: still lists the set, but invents no suggestion.
+        let err = registry
+            .execute("frobnicate_the_widget", serde_json::json!({}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("did you mean"), "no bogus suggestion: {err}");
+        assert!(err.contains("Available tools:"), "{err}");
+    }
+
+    /// Levenshtein, including the transposition-adjacent cases the suggestion
+    /// relies on.
+    #[test]
+    fn edit_distance_counts_single_character_changes() {
+        assert_eq!(edit_distance("read", "read"), 0);
+        assert_eq!(edit_distance("reed", "read"), 1); // substitution
+        assert_eq!(edit_distance("rea", "read"), 1); // deletion
+        assert_eq!(edit_distance("readd", "read"), 1); // insertion
+        assert_eq!(edit_distance("", "read"), 4);
+        assert_eq!(
+            edit_distance("grep", "write"),
+            4,
+            "unrelated names are far apart"
+        );
     }
 
     #[test]

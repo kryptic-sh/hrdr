@@ -36,7 +36,7 @@ impl Tool for FindTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: FindArgs = serde_json::from_value(args).context("invalid find args")?;
+        let a: FindArgs = crate::tool_args("find", args)?;
         // Compile the glob pattern once; validated eagerly for a clear error.
         let pat = glob::Pattern::new(&a.pattern)
             .with_context(|| format!("invalid glob pattern: {}", a.pattern))?;

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -74,7 +74,7 @@ impl Tool for TreeTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: TreeArgs = serde_json::from_value(args).context("invalid tree args")?;
+        let a: TreeArgs = crate::tool_args("tree", args)?;
         let depth = a.max_depth.min(10);
         let max_entries = a.max_entries;
 

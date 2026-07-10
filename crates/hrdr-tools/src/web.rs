@@ -83,7 +83,7 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let args: FetchArgs = serde_json::from_value(args)?;
+        let args: FetchArgs = crate::tool_args("fetch", args)?;
         let url = args.url.trim();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             bail!("url must start with http:// or https://");
@@ -176,7 +176,7 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
-        let args: SearchArgs = serde_json::from_value(args)?;
+        let args: SearchArgs = crate::tool_args("search", args)?;
         let query = args.query.trim();
         if query.is_empty() {
             bail!("query must not be empty");

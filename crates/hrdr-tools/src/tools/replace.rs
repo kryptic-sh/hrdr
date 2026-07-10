@@ -78,7 +78,7 @@ impl Tool for ReplaceTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ReplaceArgs = serde_json::from_value(args).context("invalid replace args")?;
+        let a: ReplaceArgs = crate::tool_args("replace", args)?;
         if a.find.is_empty() {
             bail!("`find` is empty — that would match at every position in every file");
         }
