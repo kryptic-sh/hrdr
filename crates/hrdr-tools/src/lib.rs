@@ -339,23 +339,88 @@ pub(crate) fn secret_file_reason(path: &std::path::Path) -> Option<&'static str>
     let n = comps.len();
     let file = comps.last().map(String::as_str).unwrap_or("");
     let parent = if n >= 2 { comps[n - 2].as_str() } else { "" };
+    let has_component = |name: &str| comps.iter().any(|c| c == name);
 
     // hrdr credential store: `<config>/hrdr/auth.toml` (XDG or ~/.config).
     if parent == "hrdr" && file == "auth.toml" {
         return Some("hrdr credential store (auth.toml)");
     }
-    // SSH keys/config — the whole ~/.ssh directory is off-limits.
-    if comps.iter().any(|c| c == ".ssh") {
+
+    // --- Whole directories that only ever hold key material / secrets. ---
+    if has_component(".ssh") {
         return Some("SSH directory (~/.ssh)");
     }
-    // AWS static credentials.
-    if parent == ".aws" && file == "credentials" {
-        return Some("AWS credentials file");
+    if has_component(".gnupg") {
+        return Some("GnuPG keyring (~/.gnupg)");
     }
-    // GitHub CLI stored host tokens.
-    if parent == "gh" && (file == "hosts.yml" || file == "hosts.yaml") {
-        return Some("GitHub CLI host tokens (gh/hosts.yml)");
+    if has_component(".password-store") {
+        return Some("pass password store (~/.password-store)");
     }
+
+    // --- Cloud / tool credential files by (parent dir, filename). ---
+    match (parent, file) {
+        (".aws", "credentials") => return Some("AWS credentials file"),
+        ("gh", "hosts.yml" | "hosts.yaml") => return Some("GitHub CLI host tokens (gh/hosts.yml)"),
+        (".docker", "config.json") => return Some("Docker registry auth (.docker/config.json)"),
+        (".kube", "config") => return Some("Kubernetes config (~/.kube/config)"),
+        (".config" | "containers", "auth.json") => {
+            return Some("container registry auth (auth.json)");
+        }
+        _ => {}
+    }
+    // Google Cloud stores tokens/ADC under a `gcloud` config dir.
+    if has_component("gcloud")
+        && (file.ends_with(".json")
+            || file.ends_with(".db")
+            || file.contains("credential")
+            || file.contains("token"))
+    {
+        return Some("gcloud credentials/tokens (~/.config/gcloud)");
+    }
+
+    // --- Exact filenames, wherever they appear. ---
+    // SSH/other private keys frequently live outside ~/.ssh; the matching
+    // `.pub` public keys are safe and excluded by using exact names (no suffix).
+    if matches!(
+        file,
+        "id_rsa"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+            | "id_ecdsa_sk"
+            | "id_ed25519_sk"
+            | "identity"
+    ) {
+        return Some("SSH private key");
+    }
+    if matches!(
+        file,
+        ".netrc"
+            | "_netrc"          // Windows netrc spelling
+            | ".npmrc"          // may hold _authToken
+            | ".pypirc"         // PyPI upload credentials
+            | ".pgpass"         // PostgreSQL passwords
+            | ".my.cnf"         // MySQL client password
+            | ".git-credentials"
+            | ".terraformrc"    // Terraform Cloud token
+            | ".htpasswd"
+            | ".s3cfg"          // s3cmd
+            | ".boto"           // boto/gsutil
+            | "kubeconfig"
+            | "credentials.json"            // common service-account / OAuth dump
+            | "application_default_credentials.json" // gcloud ADC
+    ) {
+        return Some("credential/token file");
+    }
+    // Rails encrypted secrets + master key.
+    if file == "master.key" || file.ends_with(".key.enc") || file == "credentials.yml.enc" {
+        return Some("encrypted secrets / master key");
+    }
+    // System password databases.
+    if matches!(file, "shadow" | "gshadow") && has_component("etc") {
+        return Some("system password database (/etc/shadow)");
+    }
+
     // dotenv files (.env, .env.local, .env.production, …) — but NOT the
     // non-secret template variants (.env.example/.sample/.template/.dist) that
     // coding agents legitimately read to learn which vars a project expects.
@@ -368,9 +433,17 @@ pub(crate) fn secret_file_reason(path: &std::path::Path) -> Option<&'static str>
     {
         return Some("environment/secrets file (.env)");
     }
-    // Private key material by extension.
-    if file.ends_with(".pem") || file.ends_with(".key") {
-        return Some("private key file (.pem/.key)");
+
+    // --- Private key / keystore material by extension. ---
+    if file.ends_with(".pem")
+        || file.ends_with(".key")
+        || file.ends_with(".p12")
+        || file.ends_with(".pfx")
+        || file.ends_with(".jks")
+        || file.ends_with(".keystore")
+        || file.ends_with(".ppk")
+    {
+        return Some("private key / keystore file");
     }
     None
 }
@@ -999,6 +1072,36 @@ mod tests {
     }
 
     #[test]
+    fn secret_file_reason_matches_expanded_sensitive_files() {
+        // Cloud / tool credential files.
+        assert!(secret_file_reason(Path::new("/home/u/.docker/config.json")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.kube/config")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.config/gcloud/access_tokens.db")).is_some());
+        assert!(
+            secret_file_reason(Path::new(
+                "/home/u/.config/gcloud/application_default_credentials.json"
+            ))
+            .is_some()
+        );
+        // Dotfile credential stores.
+        assert!(secret_file_reason(Path::new("/home/u/.netrc")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.npmrc")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.pypirc")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.pgpass")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.git-credentials")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.terraformrc")).is_some());
+        // Private keys outside ~/.ssh, and keystores by extension.
+        assert!(secret_file_reason(Path::new("/tmp/backup/id_rsa")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/keystore.p12")).is_some());
+        assert!(secret_file_reason(Path::new("/srv/app/cert.pfx")).is_some());
+        // Whole keyring directories.
+        assert!(secret_file_reason(Path::new("/home/u/.gnupg/secring.gpg")).is_some());
+        // Rails encrypted secrets + system password DB.
+        assert!(secret_file_reason(Path::new("/srv/app/config/master.key")).is_some());
+        assert!(secret_file_reason(Path::new("/etc/shadow")).is_some());
+    }
+
+    #[test]
     fn secret_file_reason_allows_normal_files() {
         assert!(secret_file_reason(Path::new("/srv/app/src/main.rs")).is_none());
         assert!(secret_file_reason(Path::new("/srv/app/README.md")).is_none());
@@ -1010,6 +1113,10 @@ mod tests {
         assert!(secret_file_reason(Path::new("/srv/app/.env.example")).is_none());
         assert!(secret_file_reason(Path::new("/srv/app/.env.sample")).is_none());
         assert!(secret_file_reason(Path::new("/srv/app/.env.template")).is_none());
+        // Public SSH keys are safe — only the private counterparts are blocked.
+        assert!(secret_file_reason(Path::new("/home/u/.config/id_ed25519.pub")).is_none());
+        // A plain `shadow` file outside /etc is not the system password DB.
+        assert!(secret_file_reason(Path::new("/srv/app/shadow")).is_none());
     }
 
     // ---- tool_output_dir private permissions ----

@@ -2,8 +2,8 @@
 //! results). `search` uses a zero-config DuckDuckGo HTML backend by default,
 //! or a SearXNG instance when `SEARXNG_URL` is set (a JSON API — more robust).
 
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
-use std::sync::LazyLock;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -31,22 +31,66 @@ const FETCH_BODY_FLOOR: usize = 256 * 1024;
 /// re-check work and stop a redirect loop.
 const MAX_REDIRECTS: usize = 10;
 
+/// A [`reqwest::dns::Resolve`] that resolves a host and then drops every
+/// internal/loopback/private address from the answer, returning only public
+/// ones (or an error when nothing public remains). Because reqwest connects to
+/// exactly the addresses this resolver returns — the *same* resolution used to
+/// validate them — there is no time-of-check/time-of-use gap: a DNS-rebinding
+/// answer that points at `169.254.169.254` (or `127.0.0.1`, a private range,
+/// …) can never be connected to, whether it arrives on the initial request or
+/// any redirect hop. This is the authoritative SSRF guard; the hostname checks
+/// in [`is_blocked_host`]/the redirect policy are just earlier, clearer errors.
+struct SsrfGuardResolver;
+
+impl reqwest::dns::Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // GAI is blocking; keep it off the async runtime's worker.
+            let resolved = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<SocketAddr>>())
+            })
+            .await;
+
+            let addrs: Vec<SocketAddr> = match resolved {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            };
+
+            let safe: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| !is_blocked_ip(a.ip()))
+                .collect();
+            if safe.is_empty() {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "refusing to connect: host resolves only to internal/loopback/private \
+                     addresses (SSRF guard)",
+                ));
+            }
+            Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
 /// timeout. Built once and reused for every web tool call so connection pools
 /// and DNS results are shared. A build failure (TLS-backend misconfiguration)
 /// is stored as an error string and surfaced per call via [`http_client`], so a
 /// broken environment yields a recoverable tool error rather than a panic.
 ///
-/// The SSRF guard on the *initial* URL (see [`is_blocked_host`]) is worthless
-/// on its own: a server can 302 to `http://169.254.169.254/` and reqwest would
-/// follow by default with no re-check. The custom redirect policy re-runs the
-/// same host/IP check on every hop's URL (and caps the hop count), so a
-/// redirect to an internal target is refused just like a direct request would
-/// be.
+/// SSRF defence is layered: [`SsrfGuardResolver`] filters resolved IPs at
+/// connect time (the authoritative, TOCTOU-free guard, covering the initial
+/// request *and* every redirect target), while the initial [`is_blocked_host`]
+/// check and the custom redirect policy reject obviously-internal hostnames
+/// earlier with a clearer message and cap the hop count.
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(HTTP_TIMEOUT)
+        .dns_resolver(Arc::new(SsrfGuardResolver))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many redirects");
@@ -703,6 +747,25 @@ mod tests {
         assert!(is_blocked_ip("fe80::1".parse().unwrap()));
         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_blocked_ip("2001:4860:4860::8888".parse().unwrap())); // public v6
+    }
+
+    /// The connect-time resolver drops internal addresses and fails closed when
+    /// nothing public is left: `localhost` resolves only to loopback, so the
+    /// resolver returns an error rather than any address for reqwest to dial.
+    /// This is the guarantee that closes the DNS-rebinding TOCTOU — reqwest can
+    /// only connect to the (public) addresses this resolver hands back.
+    #[tokio::test]
+    async fn resolver_refuses_a_host_that_resolves_to_loopback() {
+        use reqwest::dns::Resolve;
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        // `Addrs` (the Ok type) isn't `Debug`, so match rather than `expect_err`.
+        match SsrfGuardResolver.resolve(name).await {
+            Ok(_) => panic!("localhost resolves only to loopback — must be refused"),
+            Err(e) => assert!(
+                e.to_string().contains("SSRF guard"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[test]
