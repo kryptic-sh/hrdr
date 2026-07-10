@@ -516,32 +516,10 @@ impl super::App {
                     s.backspace();
                 }
             }
-            KeyCode::Enter => {
-                let choice = self
-                    .model_selector
-                    .as_ref()
-                    .and_then(|s| s.current())
-                    .cloned();
-                self.model_selector = None;
-                if let Some(c) = choice {
-                    // Scope the host borrow so the confirmation line can be pushed
-                    // afterwards.
-                    let result = {
-                        let mut host = TuiHost { app: self };
-                        hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone())
-                    };
-                    let line = match result {
-                        Ok(()) => {
-                            // Bump this model's selection count so it sorts higher
-                            // next time the selector opens.
-                            hrdr_agent::record_model_use(&c.provider, &c.model);
-                            format!("model → {} · {}", c.model_label, c.provider_label)
-                        }
-                        Err(e) => e,
-                    };
-                    self.system(line);
-                }
-            }
+            // Enter switches for this session; Ctrl+D also persists the pick as
+            // the config default (provider + model), so it sticks next launch.
+            KeyCode::Enter => self.apply_selected_model(false),
+            KeyCode::Char('d') if ctrl => self.apply_selected_model(true),
             KeyCode::Char(ch) if !ctrl => {
                 if let Some(s) = &mut self.model_selector {
                     s.push_char(ch);
@@ -549,6 +527,52 @@ impl super::App {
             }
             _ => {}
         }
+    }
+
+    /// Apply the highlighted model from the `/model` selector and close it. When
+    /// `set_default` is true, also persist the pick as the config default
+    /// (top-level `provider` + `model`), so it survives a restart.
+    fn apply_selected_model(&mut self, set_default: bool) {
+        let Some(c) = self
+            .model_selector
+            .as_ref()
+            .and_then(|s| s.current())
+            .cloned()
+        else {
+            self.model_selector = None;
+            return;
+        };
+        self.model_selector = None;
+        if set_default {
+            self.persist_setting("provider", hrdr_agent::ConfigValue::Str(&c.provider));
+            self.persist_setting("model", hrdr_agent::ConfigValue::Str(&c.model));
+        }
+        // Scope the host borrow so the confirmation line can be pushed after.
+        let line = {
+            let mut host = TuiHost { app: self };
+            match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone()) {
+                Ok(()) => {
+                    // Bump the selection count (selector ordering).
+                    hrdr_agent::record_model_use(&c.provider, &c.model);
+                    let what = if set_default {
+                        "default set"
+                    } else {
+                        "model →"
+                    };
+                    format!("{what} {} · {}", c.model_label, c.provider_label)
+                }
+                // A turn is running: the live switch is rejected, but a default
+                // written to config still took effect for next launch.
+                Err(e) if set_default => {
+                    format!(
+                        "default set: {} · {} — {e}",
+                        c.model_label, c.provider_label
+                    )
+                }
+                Err(e) => e,
+            }
+        };
+        self.system(line);
     }
 
     /// Feed one submitted line to the active `/login` wizard, dropping the modal

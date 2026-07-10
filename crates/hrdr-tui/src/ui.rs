@@ -181,7 +181,7 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
     ]);
     let hint = Line::from(Span::styled(
         format!(
-            "{} model{} · ↑↓ select · Enter switch · Esc cancel",
+            "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel",
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
         ),

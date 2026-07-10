@@ -196,6 +196,46 @@ pub fn record_model_use(provider: &str, model: &str) {
     let _ = write_atomic(&path, json.as_bytes());
 }
 
+/// The last-used `(provider, model)` store's path,
+/// `<XDG data>/hrdr/last_model.json`.
+fn last_model_path() -> Option<PathBuf> {
+    Some(hjkl_xdg::data_dir("hrdr").ok()?.join("last_model.json"))
+}
+
+/// The most recently switched-to `(provider, model)`, if any has been recorded.
+/// The startup resolver falls back to this when neither a flag, env var, session,
+/// nor config pins a provider/model — so a fresh launch resumes where you left
+/// off. An empty provider (a keyless local endpoint) yields `None`, since it
+/// can't be resolved back to a provider preset.
+pub fn load_last_model() -> Option<(String, String)> {
+    let v: Value = last_model_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    parse_last_model(&v)
+}
+
+/// Pull a valid `(provider, model)` out of the stored JSON. Both must be present
+/// and non-empty (an empty provider can't be resolved to a preset). Pure, so the
+/// parse rules are testable without a file.
+fn parse_last_model(v: &Value) -> Option<(String, String)> {
+    let provider = v.get("provider")?.as_str()?.to_string();
+    let model = v.get("model")?.as_str()?.to_string();
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+}
+
+/// Record `(provider, model)` as the most recently used combo. Best-effort: any
+/// I/O error is swallowed.
+pub fn record_last_model(provider: &str, model: &str) {
+    let Some(path) = last_model_path() else {
+        return;
+    };
+    let json = serde_json::json!({ "provider": provider, "model": model }).to_string();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = write_atomic(&path, json.as_bytes());
+}
+
 /// Every model the user can pick, across their configured providers, with
 /// friendly labels — the `/model` selector's list. Reads the models.dev catalog
 /// synchronously from cache (no network); a provider the catalog doesn't cover
@@ -347,6 +387,18 @@ mod tests {
         assert_eq!(filter_model_choices(&out, "  ").len(), out.len());
         // No match.
         assert!(filter_model_choices(&out, "zzzzz").is_empty());
+    }
+
+    #[test]
+    fn last_model_parses_a_valid_pair_only() {
+        assert_eq!(
+            parse_last_model(&json!({"provider": "zen", "model": "grok-code"})),
+            Some(("zen".to_string(), "grok-code".to_string()))
+        );
+        // An empty provider (keyless local) can't resolve to a preset → None.
+        assert!(parse_last_model(&json!({"provider": "", "model": "m"})).is_none());
+        assert!(parse_last_model(&json!({"provider": "zen"})).is_none());
+        assert!(parse_last_model(&json!({})).is_none());
     }
 
     #[test]

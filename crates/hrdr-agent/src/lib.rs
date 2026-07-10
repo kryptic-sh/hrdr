@@ -15,8 +15,8 @@ mod paths;
 pub use paths::cwd_slug;
 mod models;
 pub use models::{
-    ModelChoice, builtin_catalog_key, filter_model_choices, load_model_usage, model_choices,
-    record_model_use,
+    ModelChoice, builtin_catalog_key, filter_model_choices, load_last_model, load_model_usage,
+    model_choices, record_last_model, record_model_use,
 };
 
 use std::collections::HashMap;

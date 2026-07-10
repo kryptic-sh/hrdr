@@ -227,7 +227,17 @@ async fn main() -> Result<()> {
     // Apply a provider preset (CLI > config/env) before explicit CLI overrides.
     // Custom `[providers.<name>]` from config shadow the built-ins.
     let mut remote_provider = false;
-    let provider_name = cli.provider.clone().or_else(|| config.provider.clone());
+    // Last-used fallback: when nothing pins a provider/model, resume the last
+    // combo the user switched to (recorded by the `/model` selector, `/provider`,
+    // and `/model`). Captured before the resolution below sets `config.provider`.
+    let last_used = hrdr_agent::load_last_model();
+    let config_had_provider = config.provider.is_some();
+    let config_had_model = config.model != "default";
+    let provider_name = cli
+        .provider
+        .clone()
+        .or_else(|| config.provider.clone())
+        .or_else(|| last_used.as_ref().map(|(p, _)| p.clone()));
     if let Some(name) = &provider_name {
         let p = config.resolve_provider(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -262,6 +272,18 @@ async fn main() -> Result<()> {
         // the config's). The status bar, the session header, and saved sessions
         // all read it from here.
         config.provider = Some(name.clone());
+    }
+
+    // Restore the last-used model as the final fallback: only when neither a
+    // flag/env nor config pinned a provider *or* a model (the pure fresh case),
+    // so the last-used pair's model beats a preset's default.
+    let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
+    if !model_overridden
+        && !config_had_provider
+        && !config_had_model
+        && let Some((_, m)) = &last_used
+    {
+        config.model = m.clone();
     }
 
     if let Some(u) = cli.base_url {

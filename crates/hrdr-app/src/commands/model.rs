@@ -13,6 +13,8 @@ use super::host::CommandHost;
 /// old model against the switch.
 pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
     host.set_model(name.clone());
+    // Remember (current provider, new model) as the last-used combo.
+    hrdr_agent::record_last_model(&host.provider().unwrap_or_default(), &name);
     let agent = host.agent();
     let post = host.context_window_poster();
     host.spawn_line(Box::pin(async move {
@@ -69,6 +71,8 @@ pub fn apply_provider(
     }));
     if let Some(m) = &p.model {
         host.set_model(m.clone());
+        // Remember (provider, its model) as the last-used combo.
+        hrdr_agent::record_last_model(name, m);
     }
     if p.context_window.is_some() {
         host.set_context_window(p.context_window);
@@ -116,12 +120,14 @@ pub fn apply_choice(
         }
         String::new()
     }));
-    host.set_model(model);
+    host.set_model(model.clone());
     if p.context_window.is_some() {
         host.set_context_window(p.context_window);
     }
     host.set_base_url(p.base_url.clone());
     host.set_provider(provider_name.to_string());
+    // Remember this combo so a later launch with nothing pinned resumes it.
+    hrdr_agent::record_last_model(provider_name, &model);
     Ok(())
 }
 
