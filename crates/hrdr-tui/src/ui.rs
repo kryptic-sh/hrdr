@@ -51,8 +51,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
-    // The inference loader sits just above the input while a turn runs. One row:
-    // the blank below it is the input pane's own gap row.
+    // The inference loader sits just above the input while a turn runs, in place
+    // of the blank row that otherwise separates the input from the scrollback.
     let loader_height: u16 = if app.running { 1 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
@@ -89,8 +89,11 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     });
     // A blank row between the scrollback (or whatever panel is above) and the
     // tinted input pane, so the two never butt up against each other. It is the
-    // only separator: transcript blocks no longer trail one of their own.
-    constraints.push(Constraint::Length(1));
+    // only separator: transcript blocks no longer trail one of their own. While
+    // a turn runs the loader takes that row instead of stacking below it.
+    if loader_idx.is_none() {
+        constraints.push(Constraint::Length(1));
+    }
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
