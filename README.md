@@ -32,6 +32,7 @@ brew install kryptic-sh/tap/hrdr
 
 # AUR (Arch Linux)
 yay -S hrdr-bin
+paru -S hrdr-bin
 
 # Scoop (Windows)
 scoop bucket add kryptic-sh https://github.com/kryptic-sh/scoop-bucket
