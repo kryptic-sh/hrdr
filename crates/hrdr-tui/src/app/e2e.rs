@@ -3778,14 +3778,14 @@ async fn model_selector_renders_columns_filters_and_closes() {
         !screen.contains("Claude Fable 5.0"),
         "filtered the non-match out: {screen}"
     );
-    // Provider left, model right: on the row, the provider precedes the model.
+    // Model left, provider right: on the row, the model precedes the provider.
     let row = screen
         .lines()
         .find(|l| l.contains("DeepSeek V4 Pro"))
         .expect("the DeepSeek row");
-    let prov_at = row.find("OpenCode Go").expect("provider on the row");
     let model_at = row.find("DeepSeek V4 Pro").expect("model on the row");
-    assert!(prov_at < model_at, "provider is left of the model: {row:?}");
+    let prov_at = row.find("OpenCode Go").expect("provider on the row");
+    assert!(model_at < prov_at, "model is left of the provider: {row:?}");
 
     // Esc closes the modal.
     h.press(KeyCode::Esc);

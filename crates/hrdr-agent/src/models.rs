@@ -3,11 +3,12 @@
 //! catalog. Pure and catalog-driven so the list (and its fuzzy filter) is
 //! testable without a network or a live endpoint.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, resolve_api_key};
+use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, resolve_api_key, write_atomic};
 
 /// One pickable model in the selector: the ids to switch to plus the friendly
 /// labels to show.
@@ -105,12 +106,17 @@ fn pretty_provider(name: &str) -> String {
         .join(" ")
 }
 
-/// Build the sorted list of every model across the configured providers, using
-/// `catalog` for model lists and friendly names. Sorted by (model, provider),
-/// case-insensitive. A provider with no catalog entry contributes its single
-/// configured model. Pure — the runtime entry point [`model_choices`] supplies
-/// the cached catalog.
-fn choices_from(providers: &[ConfiguredProvider], catalog: Option<&Value>) -> Vec<ModelChoice> {
+/// Build the list of every model across the configured providers, using
+/// `catalog` for model lists and friendly names. Ordered by **usage** (the
+/// most-often-selected first, from `usage`), then by model name
+/// (case-insensitive) to break ties. A provider with no catalog entry
+/// contributes its single configured model. Pure — the runtime entry point
+/// [`model_choices`] supplies the cached catalog and usage counts.
+fn choices_from(
+    providers: &[ConfiguredProvider],
+    catalog: Option<&Value>,
+    usage: &HashMap<String, u64>,
+) -> Vec<ModelChoice> {
     let mut out: Vec<ModelChoice> = Vec::new();
     for p in providers {
         let from_catalog =
@@ -138,17 +144,56 @@ fn choices_from(providers: &[ConfiguredProvider], catalog: Option<&Value>) -> Ve
             }
         }
     }
+    let uses = |c: &ModelChoice| {
+        usage
+            .get(&usage_key(&c.provider, &c.model))
+            .copied()
+            .unwrap_or(0)
+    };
     out.sort_by(|a, b| {
-        a.model_label
-            .to_lowercase()
-            .cmp(&b.model_label.to_lowercase())
-            .then_with(|| {
-                a.provider_label
-                    .to_lowercase()
-                    .cmp(&b.provider_label.to_lowercase())
-            })
+        // Most-used first; ties fall back to the model name (case-insensitive).
+        uses(b).cmp(&uses(a)).then_with(|| {
+            a.model_label
+                .to_lowercase()
+                .cmp(&b.model_label.to_lowercase())
+        })
     });
     out
+}
+
+/// The usage-count store's path, `<XDG data>/hrdr/model_usage.json`.
+fn usage_path() -> Option<PathBuf> {
+    Some(hjkl_xdg::data_dir("hrdr").ok()?.join("model_usage.json"))
+}
+
+/// The store key for a `(provider, model)` pick.
+fn usage_key(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
+}
+
+/// Load the per-model selection counts; empty when nothing has been picked yet
+/// (or the file is missing/corrupt — usage stats are a nicety, never fatal).
+pub fn load_model_usage() -> HashMap<String, u64> {
+    usage_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Record that the user selected `model` on `provider` in the `/model` selector,
+/// bumping its count so it sorts higher next time. Best-effort: any I/O error is
+/// swallowed.
+pub fn record_model_use(provider: &str, model: &str) {
+    let Some(path) = usage_path() else { return };
+    let mut usage = load_model_usage();
+    *usage.entry(usage_key(provider, model)).or_insert(0) += 1;
+    let Ok(json) = serde_json::to_string(&usage) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = write_atomic(&path, json.as_bytes());
 }
 
 /// Every model the user can pick, across their configured providers, with
@@ -158,7 +203,8 @@ fn choices_from(providers: &[ConfiguredProvider], catalog: Option<&Value>) -> Ve
 pub fn model_choices(config: &AgentConfig, active: Option<&str>) -> Vec<ModelChoice> {
     let providers = configured_providers(config, active);
     let catalog = hrdr_llm::catalog::load_cached();
-    choices_from(&providers, catalog.as_ref())
+    let usage = load_model_usage();
+    choices_from(&providers, catalog.as_ref(), &usage)
 }
 
 /// Case-insensitive fuzzy filter over the choices: the query's characters must
@@ -220,8 +266,9 @@ mod tests {
 
     #[test]
     fn choices_are_friendly_and_sorted_across_providers() {
-        let out = choices_from(&providers(), Some(&catalog()));
-        // Alphabetical by friendly model name across both providers.
+        // With no usage recorded yet, the order is the model-name tie-break:
+        // alphabetical by friendly model name across both providers.
+        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new());
         let rows: Vec<(&str, &str, &str)> = out
             .iter()
             .map(|c| {
@@ -246,13 +293,35 @@ mod tests {
     }
 
     #[test]
+    fn usage_orders_the_list_most_used_first_then_by_name() {
+        // GPT is used twice, DeepSeek once, Claude never.
+        let usage = HashMap::from([
+            (usage_key("zen", "gpt-5-6"), 2),
+            (usage_key("go", "deepseek-v4-pro"), 1),
+        ]);
+        let out = choices_from(&providers(), Some(&catalog()), &usage);
+        let order: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(order, vec!["gpt-5-6", "deepseek-v4-pro", "claude-fable-5"]);
+
+        // A tie in usage falls back to the model name: give both the same count.
+        let tied = HashMap::from([
+            (usage_key("zen", "gpt-5-6"), 1),
+            (usage_key("go", "deepseek-v4-pro"), 1),
+            (usage_key("zen", "claude-fable-5"), 1),
+        ]);
+        let out = choices_from(&providers(), Some(&catalog()), &tied);
+        let order: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(order, vec!["claude-fable-5", "deepseek-v4-pro", "gpt-5-6"]);
+    }
+
+    #[test]
     fn a_provider_without_a_catalog_entry_offers_its_configured_model() {
         let ps = vec![ConfiguredProvider {
             name: "mylocal".into(),
             catalog_key: "mylocal".into(),
             configured_model: Some("Qwen3-30B".into()),
         }];
-        let out = choices_from(&ps, Some(&catalog()));
+        let out = choices_from(&ps, Some(&catalog()), &HashMap::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].provider, "mylocal");
         assert_eq!(out[0].model, "Qwen3-30B");
@@ -262,7 +331,7 @@ mod tests {
 
     #[test]
     fn filter_matches_model_and_provider_case_insensitively() {
-        let out = choices_from(&providers(), Some(&catalog()));
+        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new());
         // Matches on the model name.
         let deepseek = filter_model_choices(&out, "deepseek");
         assert_eq!(deepseek.len(), 1);

@@ -526,14 +526,18 @@ impl super::App {
                 if let Some(c) = choice {
                     // Scope the host borrow so the confirmation line can be pushed
                     // afterwards.
-                    let line = {
+                    let result = {
                         let mut host = TuiHost { app: self };
-                        match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone()) {
-                            Ok(()) => {
-                                format!("model → {} · {}", c.model_label, c.provider_label)
-                            }
-                            Err(e) => e,
+                        hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone())
+                    };
+                    let line = match result {
+                        Ok(()) => {
+                            // Bump this model's selection count so it sorts higher
+                            // next time the selector opens.
+                            hrdr_agent::record_model_use(&c.provider, &c.model);
+                            format!("model → {} · {}", c.model_label, c.provider_label)
                         }
+                        Err(e) => e,
                     };
                     self.system(line);
                 }

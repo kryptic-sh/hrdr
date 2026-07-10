@@ -14,7 +14,10 @@ pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token, wr
 mod paths;
 pub use paths::cwd_slug;
 mod models;
-pub use models::{ModelChoice, builtin_catalog_key, filter_model_choices, model_choices};
+pub use models::{
+    ModelChoice, builtin_catalog_key, filter_model_choices, load_model_usage, model_choices,
+    record_model_use,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

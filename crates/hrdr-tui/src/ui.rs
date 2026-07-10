@@ -206,17 +206,17 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
     }
     for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
         let selected = i == sel.selected;
-        // Provider on the left, model name right-aligned; the row fills the full
+        // Model name on the left, provider right-aligned; the row fills the full
         // inner width so a selected row highlights end to end.
         let provider = truncate_chars(&c.provider_label, (inner_w / 2).max(1));
         let avail = inner_w.saturating_sub(provider.chars().count() + 1).max(1);
         let model = truncate_chars(&c.model_label, avail);
         let pad = inner_w
-            .saturating_sub(provider.chars().count() + model.chars().count())
+            .saturating_sub(model.chars().count() + provider.chars().count())
             .max(1);
         let line = if selected {
             Line::from(Span::styled(
-                format!("{provider}{}{model}", " ".repeat(pad)),
+                format!("{model}{}{provider}", " ".repeat(pad)),
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.user)
@@ -224,10 +224,10 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
             ))
         } else {
             Line::from(vec![
-                Span::styled(provider, Style::default().fg(theme.dim)),
+                Span::styled(model, Style::default().fg(theme.user)),
                 Span::styled(
-                    format!("{}{model}", " ".repeat(pad)),
-                    Style::default().fg(theme.user),
+                    format!("{}{provider}", " ".repeat(pad)),
+                    Style::default().fg(theme.dim),
                 ),
             ])
         };
