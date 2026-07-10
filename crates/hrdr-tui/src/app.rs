@@ -173,7 +173,6 @@ pub(crate) struct App {
     turn_handle: Option<JoinHandle<()>>,
     /// Messages submitted while a turn runs, delivered mid-turn ("steering").
     /// Shared with the running `Agent::run`, which drains it between rounds.
-    steering: hrdr_agent::SteeringQueue,
     /// Transcript scroll offset in raw lines from the natural bottom.
     /// 0 = auto-follow (pin to newest content).
     pub(crate) scroll_offset: usize,
@@ -347,7 +346,6 @@ impl App {
             compaction_reserved,
             bell,
             turn_handle: None,
-            steering: hrdr_agent::steering_queue(),
             scroll_offset: 0,
             transcript_height: 24,
             scrollback,
@@ -604,19 +602,12 @@ impl App {
             }
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
-            if self.compacting {
-                // The agent is summarizing, not in `run()` — queue for after.
+            if self.running || self.compacting {
+                // A turn (or a compaction) is in flight. Never interrupt it: the
+                // message waits its turn, shown as a pending block below the
+                // transcript, and is sent when the model finishes. Processed
+                // FIFO by the `Done`/`Compacted` handlers.
                 self.queue.push_back(input);
-            } else if self.running {
-                // A turn is in flight — steer it: show the message now and hand
-                // the expanded text to the running `Agent::run`, which drains
-                // steering between rounds so the model sees it after the current
-                // tool round (not only after the whole turn).
-                self.push_entry(Entry::user(input.clone()));
-                let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
-                if let Ok(mut q) = self.steering.lock() {
-                    q.push_back(sent);
-                }
             } else {
                 self.spawn_turn(input);
             }
@@ -888,11 +879,6 @@ impl App {
         self.compacting = false;
         let dropped = self.queue.len();
         self.queue.clear();
-        // Drop any steering message that raced in mid-turn but wasn't drained —
-        // otherwise the cancelled turn's steer silently leaks into the next one.
-        if let Ok(mut q) = self.steering.lock() {
-            q.clear();
-        }
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
     }
 
@@ -918,7 +904,9 @@ impl App {
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
-        let steering = self.steering.clone();
+        // Nothing steers a running turn any more: a message submitted mid-turn
+        // waits in `queue` and is sent as its own turn once this one finishes.
+        let steering = hrdr_agent::steering_queue();
         let tx = self.tx.clone();
         let tx_events = tx.clone();
         let handle = tokio::spawn(async move {
@@ -1055,15 +1043,6 @@ impl App {
                 if self.pending_init {
                     self.pending_init = false;
                     self.reload_project_docs();
-                }
-                // A steering message that raced past the turn's end (submitted
-                // after `run()` returned but before `running` cleared) is still
-                // in the queue — flush it as a continuation (already displayed;
-                // `run("")` drains steering before its first request).
-                let has_steering = self.steering.lock().map(|q| !q.is_empty()).unwrap_or(false);
-                if has_steering {
-                    self.launch_turn(String::new());
-                    return;
                 }
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.

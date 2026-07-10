@@ -1147,6 +1147,76 @@ async fn slash_command_output_renders_as_markdown_on_the_command_background() {
 /// with the block's one-column left padding. The only bare rows are the blank
 /// separators between blocks.
 ///
+/// A message submitted while a turn runs never interrupts it: it waits in the
+/// queue, unsent and absent from the conversation, and is spawned as its own
+/// turn once the model finishes.
+///
+/// Regression: a mid-turn submit *steered* the running turn — the text was
+/// pushed straight into the transcript and handed to the live `Agent::run`,
+/// which delivered it to the model between tool rounds.
+#[tokio::test]
+async fn a_mid_turn_submit_waits_for_the_turn_to_finish() {
+    let mut h = Harness::new(vec![MockReply::Text("first reply".into())]).await;
+
+    // A turn is in flight.
+    h.app.running = true;
+    h.type_str("second question");
+    h.press(KeyCode::Enter);
+
+    assert_eq!(
+        h.app.queue.iter().collect::<Vec<_>>(),
+        ["second question"],
+        "the message is queued"
+    );
+    assert!(
+        !h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
+        "and not yet in the conversation"
+    );
+    assert!(h.app.running, "the running turn was not disturbed");
+    assert_eq!(h.app.editor.content(), "", "the draft was taken");
+
+    // The turn ends: the queued message becomes its own turn.
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert!(h.app.queue.is_empty(), "the queue drained");
+    assert!(
+        h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
+        "the queued message was sent after the turn"
+    );
+    assert!(h.app.running, "as a turn of its own");
+}
+
+/// Several mid-turn submits queue up and are sent one per completed turn, in the
+/// order they were typed.
+#[tokio::test]
+async fn queued_messages_are_sent_fifo_one_turn_at_a_time() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+    for msg in ["one", "two"] {
+        h.type_str(msg);
+        h.press(KeyCode::Enter);
+    }
+    assert_eq!(h.app.queue.iter().collect::<Vec<_>>(), ["one", "two"]);
+
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert_eq!(
+        h.app.queue.iter().collect::<Vec<_>>(),
+        ["two"],
+        "one turn spawns per completion, oldest first"
+    );
+
+    // Cancelling drops what is still waiting rather than sending it later.
+    h.app.cancel_turn();
+    assert!(h.app.queue.is_empty(), "a cancel discards the queue");
+}
+
 /// Regression: meta lines, the thinking spinner, stats lines, and queued-message
 /// badges each used to render their own ad-hoc chrome at column 0.
 #[tokio::test]
