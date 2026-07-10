@@ -1551,6 +1551,9 @@ fn transcript_lines(
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
         for msg in &app.queue {
             let mut body = markdown_lines(msg, &md_theme, bg, inner);
+            // A blank row inside the block, so the badge doesn't sit flush
+            // against the message text above it.
+            body.push(Line::raw(""));
             body.push(Line::from(Span::styled(" Queued ", badge)));
             out.extend(render_block(body, w, bg, BlockKind::Queued.border(theme)));
             // Queued blocks are tinted: a blank row separates them from each

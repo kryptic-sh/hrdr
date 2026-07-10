@@ -2695,6 +2695,52 @@ async fn a_sub_agent_row_lists_the_agent_and_jumps_to_its_tool_call() {
     assert_eq!(h.app.pending_focus_entry, None, "the focus was consumed");
 }
 
+/// A pending message renders as a tinted block, with a blank row between its
+/// text and the `Queued` badge that closes it.
+#[tokio::test]
+async fn the_queued_badge_sits_below_a_blank_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+    h.type_str("hold this thought");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.queue.len(), 1, "the message is pending");
+
+    let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    // Columns 0..49: the last one is the transcript's scrollbar, not content.
+    let row = |y: u16| -> String {
+        (0..49)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+
+    let text_y = (0..24)
+        .find(|&y| row(y).contains("hold this thought"))
+        .expect("the pending message renders");
+    let badge_y = (0..24)
+        .find(|&y| row(y).contains("Queued"))
+        .expect("the badge renders");
+
+    assert_eq!(
+        badge_y,
+        text_y + 2,
+        "one row between the text and the badge"
+    );
+    let gap = row(text_y + 1);
+    assert_eq!(without_bar(&gap), "", "and it is blank:\n{screen}");
+    // Inside the block, so it carries the block's own background.
+    assert_eq!(
+        buf.cell(Position::new(2, text_y + 1)).unwrap().bg,
+        h.app.theme.user_bg,
+        "the blank row is inside the block:\n{screen}"
+    );
+}
+
 /// The todo panel wears the input pane's chrome — no border, the prompt's
 /// background, two columns of padding either side and a blank row above and
 /// below — differing only in the color of its left rule, which is green.
