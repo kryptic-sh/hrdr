@@ -3889,6 +3889,37 @@ mod tests {
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
     }
 
+    /// Which pool a sub-agent lands in: the read-only cap or the (lower)
+    /// write-capable one. Capability is `!read_only`, so a profile that writes
+    /// only `.md` (`plan`) still counts as a writer — it touches the shared
+    /// working tree.
+    ///
+    /// Pins the arithmetic: 5 `explore` + 2 `general` may run at once.
+    #[test]
+    fn profiles_land_in_the_pool_their_capability_implies() {
+        let base = AgentConfig {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let base = super::subagent_base_config(&base);
+        let pool = |name: &str| -> &'static str {
+            let profile = super::builtin_subagent_profiles()
+                .into_iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("no builtin profile {name}"));
+            let cfg = super::config_for_agent_profile(&base, &profile).unwrap();
+            if cfg.read_only { "read-only" } else { "write" }
+        };
+        assert_eq!(pool("explore"), "read-only");
+        assert_eq!(pool("review"), "read-only");
+        assert_eq!(pool("general"), "write");
+        // Writes markdown only, but still writes: the stricter cap applies.
+        assert_eq!(pool("plan"), "write");
+
+        // A bare `task` with no profile inherits the base, which can write.
+        assert!(!base.read_only, "an unprofiled sub-agent is write-capable");
+    }
+
     /// Sub-agent slots cap how many run *at once*, per capability, and are
     /// released when each finishes — including on panic, via the guard's `Drop`.
     #[test]
