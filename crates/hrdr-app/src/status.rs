@@ -22,6 +22,8 @@ pub enum StatusRole {
     CtxRest,
     /// Plain context count when the window size is unknown (warn).
     CtxPlain,
+    /// Provider name, shown before the model (dim).
+    Provider,
     /// Model name (default foreground).
     Model,
     /// Reasoning-effort label (warn).
@@ -83,6 +85,7 @@ pub fn status_role_style(role: StatusRole) -> RoleStyle {
             bold: false,
         },
         StatusRole::CtxPlain => RoleStyle::fg(ThemeSlot::Warn),
+        StatusRole::Provider => RoleStyle::fg(ThemeSlot::Dim),
         StatusRole::Model => RoleStyle::fg(ThemeSlot::Assistant),
         StatusRole::Effort => RoleStyle::fg(ThemeSlot::Warn),
         StatusRole::Ttft => RoleStyle::fg(ThemeSlot::Dim),
@@ -181,6 +184,8 @@ pub struct StatusInputs<'a> {
     /// Token buffer reserved below the window — the gauge turns red once usage
     /// reaches `context_window − compaction_reserved` (opencode's model).
     pub compaction_reserved: u32,
+    /// Active provider name, shown before the model when set.
+    pub provider: Option<&'a str>,
     pub model: &'a str,
     pub effort: Option<&'a str>,
     /// Time-to-first-token of the latest turn, seconds.
@@ -274,7 +279,28 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
             StatusRole::CtxPlain,
         )),
     }
-    sections.push(StatusSeg::one(2, i.model.to_string(), StatusRole::Model));
+    // Provider + model share one section so they never split across a wrap or
+    // get dropped independently under truncation.
+    let mut model_runs = Vec::new();
+    if let Some(provider) = i.provider {
+        model_runs.push(StatusRun {
+            text: provider.to_string(),
+            role: StatusRole::Provider,
+        });
+        model_runs.push(StatusRun {
+            text: "/".to_string(),
+            role: StatusRole::Provider,
+        });
+    }
+    model_runs.push(StatusRun {
+        text: i.model.to_string(),
+        role: StatusRole::Model,
+    });
+    sections.push(StatusSeg {
+        priority: 2,
+        runs: model_runs,
+        gauge: None,
+    });
     if let Some(effort) = i.effort {
         sections.push(StatusSeg::one(5, effort.to_string(), StatusRole::Effort));
     }
@@ -302,6 +328,7 @@ mod tests {
             context_window: Some(1000),
             auto_compact_enabled: true,
             compaction_reserved: 150, // critical at 1000 − 150 = 850 ≤ 900
+            provider: Some("zen"),
             model: "qwen3",
             effort: None,
             ttft: Some(1.5),
@@ -329,6 +356,37 @@ mod tests {
         assert_eq!(label("/home/me/proj"), " proj");
         assert_eq!(label(r"C:\Users\me\proj"), " proj");
         assert_eq!(label(r"C:\Users\me\proj\"), " proj");
+    }
+
+    /// The model section carries the provider before the model (one section, so
+    /// they never split), and drops to just the model when no provider is set.
+    #[test]
+    fn the_model_section_shows_provider_and_model() {
+        let segs = status_sections(&inputs());
+        let model_seg = segs
+            .iter()
+            .find(|s| s.runs.iter().any(|r| r.role == StatusRole::Model))
+            .expect("a model section exists");
+        let text: String = model_seg.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "zen/qwen3");
+        assert!(
+            model_seg
+                .runs
+                .iter()
+                .any(|r| r.role == StatusRole::Provider)
+        );
+
+        let i2 = StatusInputs {
+            provider: None,
+            ..inputs()
+        };
+        let segs2 = status_sections(&i2);
+        let model_seg2 = segs2
+            .iter()
+            .find(|s| s.runs.iter().any(|r| r.role == StatusRole::Model))
+            .unwrap();
+        let text2: String = model_seg2.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text2, "qwen3");
     }
 
     #[test]

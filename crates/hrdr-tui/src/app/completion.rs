@@ -96,12 +96,3 @@ pub(crate) enum CompletionKind {
     /// Replace the `@…` token starting at this byte offset with `@<path> `.
     File { token_start: usize },
 }
-impl Completions {
-    /// Popup title shown on the border.
-    pub(crate) fn title(&self) -> &'static str {
-        match self.kind {
-            CompletionKind::Slash => " commands · Tab ",
-            CompletionKind::File { .. } => " files · Tab ",
-        }
-    }
-}

@@ -5,8 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Wrap,
+    Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -148,14 +147,16 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     // than exist, leaving its border/top items rendered outside the visible
     // area (ratatui clips silently — no panic, but nothing there to click).
     let frame_area = f.area();
+    // Height: one row per item, plus the block's one padded row above and below.
     let height = (comp.items.len() as u16 + 2).min(frame_area.height.max(1));
     let widest = comp
         .items
         .iter()
-        .map(|(n, d)| n.chars().count() + d.chars().count() + 5)
+        .map(|(n, d)| n.chars().count() + d.chars().count() + 3)
         .max()
         .unwrap_or(24);
-    let width = (widest as u16)
+    // Outer width adds the block's two padding columns on each side.
+    let width = ((widest + BLOCK_PAD_X * 2) as u16)
         .clamp(20, input_area.width.max(20))
         .min(frame_area.width.max(1));
     let rect = Rect {
@@ -165,10 +166,11 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
         height,
     };
     f.render_widget(Clear, rect);
+    // Same chrome as the transcript blocks: solid background, two columns of
+    // padding either side and one padded row above and below, no border.
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title(comp.title())
-        .border_style(Style::default().fg(theme.dim));
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -632,6 +634,7 @@ fn build_status_sections(app: &App) -> Vec<StatusSection> {
         context_window: app.state.usage.context_window,
         auto_compact_enabled: app.auto_compact_enabled,
         compaction_reserved: app.compaction_reserved,
+        provider: app.state.provider.as_deref(),
         model: &app.state.model,
         effort: app.effort.as_deref(),
         ttft,
