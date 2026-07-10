@@ -154,10 +154,15 @@ fn content_length(headers: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// `max_model_len` is vLLM's non-standard context-window field, which the client
+/// reads to fill the status bar's "X of Y".
+const MOCK_CONTEXT_WINDOW: u32 = 4096;
+
 fn models_body() -> String {
-    "{\"object\":\"list\",\"data\":[{\"id\":\"test-model\",\"object\":\"model\",\
-     \"owned_by\":\"local\"}]}"
-        .to_string()
+    format!(
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"test-model\",\"object\":\"model\",\
+         \"owned_by\":\"local\",\"max_model_len\":{MOCK_CONTEXT_WINDOW}}}]}}"
+    )
 }
 
 /// Build a full SSE body (role delta → payload → finish → usage → `[DONE]`) for
@@ -1240,6 +1245,47 @@ async fn a_saved_context_window_never_clobbers_the_probed_one() {
         Some(999),
         "saved window fills the gap"
     );
+}
+
+/// On startup the endpoint is asked for the model's context window, so the
+/// status bar's gauge has an "of Y" side without one being configured.
+///
+/// Regression: the only context probe ran on a `/model` switch, so a session
+/// against an endpoint that advertises its window (vLLM's `max_model_len` here)
+/// still opened with a bare token count and no compaction threshold.
+#[tokio::test]
+async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
+    let mut h = Harness::new(vec![]).await;
+
+    // Nothing configured: the probe asks the endpoint and posts what it says.
+    h.app.state.usage.context_window = None;
+    h.app.spawn_context_probe();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("the probe posts a context window")
+        .expect("the channel is open");
+    assert!(
+        matches!(msg, TurnMsg::ContextWindow(w) if w == MOCK_CONTEXT_WINDOW),
+        "the probe posts the endpoint's advertised window"
+    );
+    h.app.on_turn_msg(msg);
+    assert_eq!(
+        h.app.state.usage.context_window,
+        Some(MOCK_CONTEXT_WINDOW),
+        "the probed window reaches the status bar"
+    );
+
+    // Already known (config, provider entry, or restored session): left alone,
+    // and no request is made.
+    h.app.state.usage.context_window = Some(1000);
+    h.app.spawn_context_probe();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), h.rx.recv())
+            .await
+            .is_err(),
+        "a configured window is not re-probed"
+    );
+    assert_eq!(h.app.state.usage.context_window, Some(1000));
 }
 
 /// The app's state is the session file's payload: a turn's autosave writes it

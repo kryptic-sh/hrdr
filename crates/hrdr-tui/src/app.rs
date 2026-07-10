@@ -393,6 +393,27 @@ impl App {
         });
     }
 
+    /// Ask the endpoint what the model's context window is, on a background task.
+    ///
+    /// Only when nothing has already supplied one — a `context_window` in the
+    /// config, on the provider entry, or restored from the session all pin it,
+    /// and the user chose those deliberately. Without this the status bar's
+    /// gauge had no "of Y" side on any endpoint that doesn't declare a window
+    /// up front, because the only other probe ran on a `/model` switch.
+    pub(crate) fn spawn_context_probe(&self) {
+        if self.state.usage.context_window.is_some() {
+            return;
+        }
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let window = agent.lock().await.probe_context_window().await;
+            if let Some(w) = window {
+                let _ = tx.send(TurnMsg::ContextWindow(w));
+            }
+        });
+    }
+
     /// Start the shared config-file watch, piping change pings into the UI
     /// loop (dedup happens in [`Self::maybe_reload_config`]'s mtime guard).
     /// The returned guard must be kept alive for the watch to stay active.

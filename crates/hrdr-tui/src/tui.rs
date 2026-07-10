@@ -46,6 +46,9 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     // Probe the endpoint in the background and warn if it's unreachable or
     // doesn't have the configured model — surfaced before the first turn.
     app.spawn_health_check();
+    // The endpoint's advertised context window drives the status bar's gauge and
+    // the auto-compaction threshold; probed once, in the background.
+    app.spawn_context_probe();
     let mut events = EventStream::new();
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.
