@@ -39,6 +39,10 @@ pub fn render_system(
         cwd => cwd.display().to_string(),
         os => os_context(),
         tool_names => tool_names,
+        // Gate the edit/git guidance: a purely read-only sub-agent has no
+        // mutating tools, so those sections would be dead weight (and mildly
+        // contradict its persona).
+        can_write => tools.has_write_tool(),
         instructions => instructions,
     })
     .context("rendering system template")
@@ -170,6 +174,22 @@ mod tests {
         // The OS line names the platform (and, where detectable, the distro +
         // package manager) so system-wide installs use the right tool.
         assert!(p.contains(&format!("- OS: {}", std::env::consts::OS)));
+    }
+
+    #[test]
+    fn read_only_tool_set_omits_edit_and_git_guidance() {
+        let mut tools = ToolRegistry::with_defaults();
+        let ro = tools.read_only_names();
+        tools.retain_only(&ro);
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        // No mutating tools → the editing/git sections are dropped entirely.
+        assert!(!p.contains("old_string"), "{p}");
+        assert!(!p.contains("git add -A"), "{p}");
+        assert!(!p.contains("force-push"), "{p}");
+        assert!(!p.contains("Read a file before editing it"), "{p}");
+        // The read/search workflow and the confinement safety line remain.
+        assert!(p.contains("grep/find/ls/tree/read"), "{p}");
+        assert!(p.contains("confined to the working directory"), "{p}");
     }
 
     #[test]

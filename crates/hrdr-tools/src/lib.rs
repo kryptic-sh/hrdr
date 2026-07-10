@@ -617,6 +617,13 @@ impl ToolRegistry {
         self.tools.get(name).is_some_and(|t| t.read_only())
     }
 
+    /// Whether the registry holds any mutating (non-read-only) tool. Drives
+    /// whether the system prompt bothers with the edit/git guidance — a purely
+    /// read-only sub-agent (`explore`/`review`) has none of those tools.
+    pub fn has_write_tool(&self) -> bool {
+        self.order.iter().any(|n| !self.is_read_only(n))
+    }
+
     /// Scope the registry to an allow-list of tool names (for a restricted
     /// sub-agent). Anything not in `allowed` is dropped; unknown names in
     /// `allowed` are simply ignored. Registration order is preserved.
