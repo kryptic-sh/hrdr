@@ -16,9 +16,10 @@ pub use auth::{
 mod oauth;
 pub use oauth::{
     OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI,
-    OpenAiTokens, await_oauth_code, generate_pkce, generate_state, load_oauth, oauth_file_path,
-    openai_authorize_url, openai_exchange, openai_refresh, openrouter_authorize_url,
-    openrouter_exchange, parse_account_id, save_oauth, valid_access_token,
+    OpenAiTokens, await_oauth_code, canonical_oauth_key, generate_pkce, generate_state,
+    has_oauth_credentials, load_oauth, load_oauth_for, oauth_file_path, openai_authorize_url,
+    openai_exchange, openai_refresh, openrouter_authorize_url, openrouter_exchange,
+    parse_account_id, save_oauth, save_oauth_for, valid_access_token,
 };
 mod paths;
 pub use paths::cwd_slug;
@@ -1324,6 +1325,10 @@ impl AgentConfig {
                 context_window: c.context_window,
                 headers: c.headers.clone(),
                 api_version: c.api_version.clone(),
+                // A user-defined entry is Custom — never OAuth-trusted, even when
+                // spelled `chatgpt`/`codex`/`openai-oauth`. This branch runs
+                // BEFORE `builtin_provider`, so it shadows the built-in name.
+                kind: ResolvedProviderKind::Custom,
             });
         }
         builtin_provider(name)
@@ -1469,6 +1474,41 @@ pub struct LspServerEntry {
     pub extensions: Vec<String>,
 }
 
+/// The canonical Codex OAuth endpoint for built-in ChatGPT subscription login.
+/// Single owner of the endpoint literal — built-in resolution, refresh trust
+/// gating, catalog requests, and tests all reference this constant.
+pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Trust identity stamped onto a [`ResolvedProvider`] by
+/// [`AgentConfig::resolve_provider`] — the SOLE trust gate. A provider that
+/// matches a user's `[providers.<name>]` entry resolves to `Custom` BEFORE the
+/// built-in fallback runs, so a custom provider spelled `chatgpt`/`codex`/
+/// `openai-oauth` can never earn `ChatGptOAuth` trust by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedProviderKind {
+    /// A user-defined `[providers.<name>]` entry. Never OAuth-trusted.
+    Custom,
+    /// A built-in preset that authenticates with an API key.
+    BuiltIn,
+    /// The built-in ChatGPT subscription login (Codex OAuth). The only kind that
+    /// may read the canonical `chatgpt` OAuth credential slot or receive the
+    /// `Authorization`/`ChatGPT-Account-Id` header injection.
+    ChatGptOAuth,
+}
+
+/// Whether a resolved provider is ready to use, and how it authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthState {
+    /// An API key is available (inline, env, saved `/login`, or shared parent).
+    Key,
+    /// Trusted ChatGPT OAuth with usable or refreshable credentials.
+    OAuth,
+    /// A keyless local endpoint (`remote = false`); no credential needed.
+    Keyless,
+    /// A remote provider with no key and no usable OAuth credential.
+    Missing,
+}
+
 /// A fully-resolved provider preset.
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
@@ -1482,6 +1522,9 @@ pub struct ResolvedProvider {
     pub headers: HashMap<String, String>,
     /// Azure OpenAI API version, if this is an Azure endpoint.
     pub api_version: Option<String>,
+    /// Trust identity — set only by [`AgentConfig::resolve_provider`]. See
+    /// [`ResolvedProviderKind`].
+    pub kind: ResolvedProviderKind,
 }
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
@@ -1530,6 +1573,54 @@ pub fn resolve_api_key(
         })
 }
 
+/// Unified readiness for a resolved provider: how it authenticates, or that it
+/// is unconfigured. Precedence, matching the existing key resolution:
+///
+/// 1. an API key ([`resolve_api_key`]) → [`ProviderAuthState::Key`];
+/// 2. trusted ChatGPT OAuth with usable/refreshable credentials
+///    ([`has_oauth_credentials`]) → [`ProviderAuthState::OAuth`];
+/// 3. a keyless local endpoint (`remote = false`) → [`ProviderAuthState::Keyless`];
+/// 4. otherwise → [`ProviderAuthState::Missing`].
+///
+/// OAuth trust is gated on `resolved.kind`, so a custom provider spelled
+/// `chatgpt` (kind `Custom`) can never report `OAuth`.
+pub fn provider_auth_state(
+    name: &str,
+    resolved: &ResolvedProvider,
+    parent_key: Option<&str>,
+    parent_base_url: Option<&str>,
+) -> ProviderAuthState {
+    // Readiness of the trusted ChatGPT OAuth store is only consulted for the
+    // trusted kind; passing the real store result into the pure core keeps the
+    // core deterministically testable (no HOME dependency).
+    let oauth_ready = resolved.kind == ResolvedProviderKind::ChatGptOAuth
+        && has_oauth_credentials(resolved.kind, name);
+    provider_auth_state_with(name, resolved, parent_key, parent_base_url, oauth_ready)
+}
+
+/// Pure core of [`provider_auth_state`]: `oauth_ready` is the caller-supplied
+/// trusted-OAuth readiness bit (see [`has_oauth_credentials`]). Only honored
+/// when `resolved.kind == ChatGptOAuth`, so a custom shadow can never report
+/// `OAuth` even if a caller passed `true`.
+fn provider_auth_state_with(
+    name: &str,
+    resolved: &ResolvedProvider,
+    parent_key: Option<&str>,
+    parent_base_url: Option<&str>,
+    oauth_ready: bool,
+) -> ProviderAuthState {
+    if resolve_api_key(name, resolved, parent_key, parent_base_url).is_some() {
+        return ProviderAuthState::Key;
+    }
+    if resolved.kind == ResolvedProviderKind::ChatGptOAuth && oauth_ready {
+        return ProviderAuthState::OAuth;
+    }
+    if !resolved.remote {
+        return ProviderAuthState::Keyless;
+    }
+    ProviderAuthState::Missing
+}
+
 /// Resolve a built-in provider name (case-insensitive).
 ///
 /// - `zen` / `opencode` — OpenCode Zen gateway (`OPENCODE_API_KEY`).
@@ -1544,7 +1635,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         "chatgpt" | "codex" | "openai-oauth"
     ) {
         return Some(ResolvedProvider {
-            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             key_env: None,
             api_key: None,
             model: Some("gpt-5.5".to_string()),
@@ -1552,6 +1643,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
             context_window: Some(400_000),
             headers: HashMap::new(),
             api_version: None,
+            kind: ResolvedProviderKind::ChatGptOAuth,
         });
     }
     let (base_url, key_env, remote) = match name.trim().to_ascii_lowercase().as_str() {
@@ -1576,6 +1668,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         context_window: None,
         headers: HashMap::new(),
         api_version: None,
+        kind: ResolvedProviderKind::BuiltIn,
     })
 }
 
@@ -4266,6 +4359,164 @@ mod tests {
         assert_eq!(subagent_base_config(&cfg).model, "opus");
     }
 
+    // ── Trusted provider identity (Task 1) ───────────────────────────────────
+
+    #[test]
+    fn builtin_chatgpt_aliases_resolve_to_chatgpt_oauth() {
+        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
+        let cfg = AgentConfig::default();
+        for alias in ["chatgpt", "codex", "openai-oauth", "ChatGPT", "CODEX"] {
+            let p = cfg.resolve_provider(alias).expect("resolves");
+            assert_eq!(
+                p.kind,
+                ResolvedProviderKind::ChatGptOAuth,
+                "{alias} must be trusted ChatGPT OAuth"
+            );
+            assert_eq!(p.base_url, CHATGPT_CODEX_BASE_URL);
+        }
+    }
+
+    #[test]
+    fn other_builtins_resolve_to_builtin_kind() {
+        use super::ResolvedProviderKind;
+        let cfg = AgentConfig::default();
+        for name in ["openrouter", "openai", "claude", "zen", "local"] {
+            let p = cfg.resolve_provider(name).expect("resolves");
+            assert_eq!(
+                p.kind,
+                ResolvedProviderKind::BuiltIn,
+                "{name} must be an API-key built-in, never OAuth-trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_shadow_names_resolve_to_custom_not_oauth() {
+        use super::{ProviderConfig, ResolvedProviderKind};
+        // A user defines [providers.chatgpt] / [providers.codex] pointing at some
+        // other endpoint — it must shadow the built-in and stay untrusted.
+        let mut providers = HashMap::new();
+        for shadow in ["chatgpt", "codex", "openai-oauth"] {
+            providers.insert(
+                shadow.to_string(),
+                ProviderConfig {
+                    base_url: "https://evil.example/v1".to_string(),
+                    key_env: None,
+                    api_key: Some("shadow-key".to_string()),
+                    model: None,
+                    remote: None,
+                    context_window: None,
+                    headers: HashMap::new(),
+                    api_version: None,
+                },
+            );
+        }
+        let cfg = AgentConfig {
+            providers,
+            ..Default::default()
+        };
+        for shadow in ["chatgpt", "codex", "openai-oauth"] {
+            let p = cfg.resolve_provider(shadow).expect("resolves");
+            assert_eq!(
+                p.kind,
+                ResolvedProviderKind::Custom,
+                "custom {shadow} must resolve to Custom, never ChatGptOAuth"
+            );
+            assert_eq!(p.base_url, "https://evil.example/v1", "custom entry wins");
+        }
+    }
+
+    #[test]
+    fn chatgpt_codex_base_url_owns_the_endpoint_literal() {
+        use super::{CHATGPT_CODEX_BASE_URL, builtin_provider};
+        assert_eq!(
+            CHATGPT_CODEX_BASE_URL,
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            builtin_provider("chatgpt").unwrap().base_url,
+            CHATGPT_CODEX_BASE_URL
+        );
+    }
+
+    #[test]
+    fn provider_auth_state_precedence() {
+        use super::{
+            ProviderAuthState, ResolvedProvider, ResolvedProviderKind, provider_auth_state_with,
+        };
+        let make = |remote: bool, api_key: Option<&str>, kind| ResolvedProvider {
+            base_url: "https://api.example/v1".to_string(),
+            key_env: Some("HRDR_TEST_NONEXISTENT_ENV_KEY_zzz".to_string()),
+            api_key: api_key.map(String::from),
+            model: None,
+            remote,
+            context_window: None,
+            headers: HashMap::new(),
+            api_version: None,
+            kind,
+        };
+
+        // 1. An API key wins regardless of kind.
+        assert_eq!(
+            provider_auth_state_with(
+                "p",
+                &make(true, Some("k"), ResolvedProviderKind::BuiltIn),
+                None,
+                None,
+                false,
+            ),
+            ProviderAuthState::Key
+        );
+
+        // 2. Trusted ChatGPT OAuth, no key, ready credentials → OAuth.
+        assert_eq!(
+            provider_auth_state_with(
+                "chatgpt",
+                &make(true, None, ResolvedProviderKind::ChatGptOAuth),
+                None,
+                None,
+                true,
+            ),
+            ProviderAuthState::OAuth
+        );
+
+        // 2b. A custom shadow can NEVER be OAuth, even if a caller passes ready.
+        assert_eq!(
+            provider_auth_state_with(
+                "chatgpt",
+                &make(true, None, ResolvedProviderKind::Custom),
+                None,
+                None,
+                true,
+            ),
+            ProviderAuthState::Missing
+        );
+
+        // 3. Keyless local endpoint (remote = false), no key → Keyless.
+        assert_eq!(
+            provider_auth_state_with(
+                "local",
+                &make(false, None, ResolvedProviderKind::BuiltIn),
+                None,
+                None,
+                false,
+            ),
+            ProviderAuthState::Keyless
+        );
+
+        // 4. Remote, no key, not OAuth-ready → Missing.
+        assert_eq!(
+            provider_auth_state_with(
+                "openrouter",
+                &make(true, None, ResolvedProviderKind::BuiltIn),
+                None,
+                None,
+                false,
+            ),
+            ProviderAuthState::Missing
+        );
+    }
+
     #[test]
     fn subagent_profile_repoints_to_a_different_provider() {
         use super::{SubagentProfile, config_for_agent_profile, subagent_base_config};
@@ -4345,7 +4596,7 @@ mod tests {
 
     #[test]
     fn resolve_api_key_does_not_leak_parent_key_across_providers() {
-        use super::{ResolvedProvider, resolve_api_key};
+        use super::{ResolvedProvider, ResolvedProviderKind, resolve_api_key};
         // A sub-agent provider with no key of its own and a different
         // base_url than the parent must NOT receive the parent's key — that
         // would send the parent's credential to a different host.
@@ -4358,6 +4609,7 @@ mod tests {
             context_window: None,
             headers: HashMap::new(),
             api_version: None,
+            kind: ResolvedProviderKind::BuiltIn,
         };
         let key = resolve_api_key(
             "test-provider-does-not-exist-xyz",

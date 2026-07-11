@@ -383,6 +383,68 @@ pub fn load_oauth(provider: &str) -> Option<OAuthCreds> {
     load_oauth_at(&oauth_file_path()?, provider)
 }
 
+/// The store key for a provider's OAuth credentials, canonicalized ONLY for
+/// trusted ChatGPT OAuth. Returns the fixed `"chatgpt"` slot when — and only
+/// when — `kind == ChatGptOAuth`, so the built-in ChatGPT login shares one
+/// credential slot across its aliases (`chatgpt`/`codex`/`openai-oauth`). For
+/// every other kind it returns the exact `name` unchanged.
+///
+/// The canonicalization is driven by the trusted [`ResolvedProviderKind`],
+/// never by the provider spelling or its `base_url`. A custom-shadow call
+/// (kind `Custom`) therefore never resolves to the built-in `chatgpt` slot,
+/// even when spelled `chatgpt` — it reads/writes its own exact-name entry.
+pub fn canonical_oauth_key(kind: crate::ResolvedProviderKind, name: &str) -> &str {
+    match kind {
+        crate::ResolvedProviderKind::ChatGptOAuth => "chatgpt",
+        _ => name,
+    }
+}
+
+/// Kind-gated wrapper over [`save_oauth`]: computes the store key via
+/// [`canonical_oauth_key`] before handing it to the exact-key store helper, so
+/// the exact-key core is never given a canonicalized alias by an untrusted path.
+pub fn save_oauth_for(
+    kind: crate::ResolvedProviderKind,
+    name: &str,
+    creds: &OAuthCreds,
+) -> Result<PathBuf> {
+    save_oauth(canonical_oauth_key(kind, name), creds)
+}
+
+/// Kind-gated wrapper over [`load_oauth`]; see [`save_oauth_for`].
+pub fn load_oauth_for(kind: crate::ResolvedProviderKind, name: &str) -> Option<OAuthCreds> {
+    load_oauth(canonical_oauth_key(kind, name))
+}
+
+/// Whether trusted ChatGPT OAuth has usable or refreshable credentials for
+/// `name` — a synchronous readiness check with NO network refresh and NO secret
+/// return. Returns `false` for any kind other than `ChatGptOAuth` (so the
+/// built-in credential-presence bit is not a spelling-reachable oracle for a
+/// custom shadow), and resolves the store key via the kind-gated
+/// [`canonical_oauth_key`], never the raw name.
+///
+/// Time-aware: ready when a non-expired access token exists OR a non-empty
+/// refresh token exists (refreshable). Expired access with no refresh, empty
+/// tokens, and unrelated providers are all not ready.
+pub fn has_oauth_credentials(kind: crate::ResolvedProviderKind, name: &str) -> bool {
+    match oauth_file_path() {
+        Some(path) => has_oauth_credentials_at(&path, kind, name),
+        None => false,
+    }
+}
+
+/// Path-based core of [`has_oauth_credentials`].
+fn has_oauth_credentials_at(path: &Path, kind: crate::ResolvedProviderKind, name: &str) -> bool {
+    if kind != crate::ResolvedProviderKind::ChatGptOAuth {
+        return false;
+    }
+    let Some(creds) = load_oauth_at(path, canonical_oauth_key(kind, name)) else {
+        return false;
+    };
+    let has_valid_access = !creds.access.is_empty() && !access_expired(creds.expires_ms, now_ms());
+    has_valid_access || !creds.refresh.is_empty()
+}
+
 /// Path-based core of [`save_oauth`].
 fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> {
     let mut map = load_all(path);
@@ -708,6 +770,100 @@ mod tests {
     fn oauth_store_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_oauth_at(&dir.path().join("nope.json"), "openai"), None);
+    }
+
+    // ── Kind-gated key + readiness ───────────────────────────────────────────
+    use crate::ResolvedProviderKind as K;
+
+    #[test]
+    fn canonical_oauth_key_canonicalizes_only_for_chatgpt_oauth() {
+        // Trusted ChatGPT OAuth: every alias collapses to the one slot.
+        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "chatgpt"), "chatgpt");
+        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "codex"), "chatgpt");
+        assert_eq!(
+            canonical_oauth_key(K::ChatGptOAuth, "openai-oauth"),
+            "chatgpt"
+        );
+        // Any other kind keeps the exact name — no canonicalization by spelling.
+        assert_eq!(canonical_oauth_key(K::Custom, "chatgpt"), "chatgpt");
+        assert_eq!(canonical_oauth_key(K::Custom, "my-provider"), "my-provider");
+        assert_eq!(canonical_oauth_key(K::BuiltIn, "openrouter"), "openrouter");
+    }
+
+    /// Store a `chatgpt` OAuth entry with an `expires_ms` relative to real now.
+    fn seed_chatgpt(path: &Path, access: &str, refresh: &str, expires_ms: u64) {
+        save_oauth_at(
+            path,
+            "chatgpt",
+            &OAuthCreds {
+                access: access.to_string(),
+                refresh: refresh.to_string(),
+                expires_ms,
+                account_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readiness_valid_access_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
+        assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
+    }
+
+    #[test]
+    fn readiness_expired_access_with_refresh_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "acc", "ref", 1); // long past
+        assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
+    }
+
+    #[test]
+    fn readiness_refresh_only_is_ready() {
+        // Selectable with refresh-only credentials (empty access, refresh present).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "", "ref", 1);
+        assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
+    }
+
+    #[test]
+    fn readiness_expired_access_without_refresh_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "acc", "", 1); // expired, no refresh
+        assert!(!has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
+    }
+
+    #[test]
+    fn readiness_empty_tokens_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "", "", now_ms() + 3_600_000);
+        assert!(!has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
+    }
+
+    #[test]
+    fn readiness_unrelated_provider_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
+        // Nothing stored under "openrouter"; and its kind is not ChatGptOAuth.
+        assert!(!has_oauth_credentials_at(&path, K::BuiltIn, "openrouter"));
+    }
+
+    #[test]
+    fn custom_shadow_cannot_read_builtin_oauth_credentials() {
+        // Built-in ChatGPT creds are present in the slot...
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
+        // ...but a custom provider spelled "chatgpt" resolves to kind Custom, and
+        // the kind gate returns false before any load — not a spelling oracle.
+        assert!(!has_oauth_credentials_at(&path, K::Custom, "chatgpt"));
     }
 
     // ── encoding helpers ─────────────────────────────────────────────────────

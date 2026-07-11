@@ -256,9 +256,14 @@ async fn main() -> Result<()> {
             config.base_url = p.base_url.clone();
         }
         // Key precedence: inline > key_env var > credential saved by `/login`.
+        // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT
+        // login with usable/refreshable credentials is `OAuth` (no key), so it
+        // must not draw the missing-key warning. Only a genuinely unconfigured
+        // remote provider (`Missing`) warns; the copy is unchanged.
+        let auth_state = hrdr_agent::provider_auth_state(name, &p, None, None);
         if let Some(key) = hrdr_agent::resolve_api_key(name, &p, None, None) {
             config.api_key = Some(key);
-        } else if p.remote && config.api_key.is_none() {
+        } else if config.api_key.is_none() && auth_state == hrdr_agent::ProviderAuthState::Missing {
             let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
             eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
         }
