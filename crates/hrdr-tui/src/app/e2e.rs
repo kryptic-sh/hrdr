@@ -3841,6 +3841,30 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     }
 }
 
+/// Esc cancels a running `!command`: the child is killed, the tool block
+/// closes as "(cancelled)", and the slot frees for the next command.
+#[cfg(unix)]
+#[tokio::test]
+async fn esc_cancels_a_running_user_shell_command() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("!sleep 30");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "the shell task is tracked");
+
+    h.press(KeyCode::Esc);
+    assert!(h.app.user_shell.is_none(), "Esc cleared the slot");
+    let cancelled = h.app.state.transcript.iter().any(|e| {
+        matches!(&e.kind, EntryKind::Tool { done: true, ok: false, result, .. }
+            if result.contains("cancelled"))
+    });
+    assert!(cancelled, "the tool block closed as cancelled");
+
+    // The slot is free: a new command runs fine.
+    h.type_str("!echo after-cancel");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "a new command is accepted");
+}
+
 /// `/skills` opens a picker of the discovered skills; Enter inserts the
 /// `:name ` invocation into the input and hands the cursor back.
 #[tokio::test]

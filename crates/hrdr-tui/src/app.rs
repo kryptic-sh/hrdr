@@ -40,6 +40,19 @@ pub(crate) use selector::{
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
 
+/// A running user `!command`: enough to cancel it (abort the task — the
+/// child is `kill_on_drop`) and close its transcript block coherently.
+pub(crate) struct UserShell {
+    /// Tool-block id, to mark the entry cancelled.
+    id: String,
+    /// Tool name shown on the block ("bash" / "powershell").
+    name: String,
+    /// The command, for the model's history note on cancel.
+    command: String,
+    /// The streaming task; aborting it kills the child process.
+    handle: tokio::task::JoinHandle<()>,
+}
+
 /// The `/login` modal's two phases: pick a provider from a fuzzy list, then —
 /// for a remote key-based provider — enter the API key in a masked field.
 /// OAuth and keyless providers finish straight from the first phase.
@@ -190,6 +203,8 @@ pub(crate) struct App {
     /// The open `/login` modal (provider list, then masked key entry); while
     /// `Some`, it captures every key (and pasted text, for the key field).
     pub(crate) login_modal: Option<LoginModal>,
+    /// The running user `!command`, if any — Esc cancels it.
+    pub(crate) user_shell: Option<UserShell>,
     /// USD already spent when the current session was adopted (a resumed
     /// session's saved spend); the agent's live counter adds on top of it.
     pub(crate) cost_base: f64,
@@ -421,6 +436,7 @@ impl App {
             effort_selector: None,
             skill_selector: None,
             login_modal: None,
+            user_shell: None,
             cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
@@ -653,6 +669,16 @@ impl App {
             self.cancel_turn();
             return Action::None;
         }
+        // Likewise Esc cancels a running user `!command` (never concurrent
+        // with a turn — `!` is rejected while one runs).
+        if self.user_shell.is_some()
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.editor.mode_label() != "INSERT"
+        {
+            self.cancel_user_shell();
+            return Action::None;
+        }
 
         // Transcript scroll: PageUp/PageDown (any mode); End follows the output
         // when scrolled up (otherwise End falls through to the editor's line-end).
@@ -816,11 +842,23 @@ impl App {
             name: shell_name.to_string(),
             args: format!("! {command}"),
         });
+        let task_id = id.clone();
+        if self
+            .user_shell
+            .as_ref()
+            .is_some_and(|u| !u.handle.is_finished())
+        {
+            self.system(
+                "a !command is already running — wait for it (or cancel with Esc)".to_string(),
+            );
+            return;
+        }
         let cwd = hrdr_app::agent_cwd(&self.agent);
         let tx = self.tx.clone();
         let agent = self.agent.clone();
         args.push(command.clone());
-        tokio::spawn(async move {
+        let task_command = command.clone();
+        let handle = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut child = tokio::process::Command::new(&program);
             child
@@ -834,7 +872,7 @@ impl App {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
-                        id,
+                        id: task_id,
                         name: shell_name.to_string(),
                         result: format!("couldn't run {program}: {e}"),
                         ok: false,
@@ -860,7 +898,7 @@ impl App {
                                 let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
                                 out.push_str(&chunk);
                                 let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
-                                    id: id.clone(),
+                                    id: task_id.clone(),
                                     chunk,
                                 }));
                             }
@@ -873,7 +911,7 @@ impl App {
                                 let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
                                 out.push_str(&chunk);
                                 let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
-                                    id: id.clone(),
+                                    id: task_id.clone(),
                                     chunk,
                                 }));
                             }
@@ -895,7 +933,7 @@ impl App {
                 bounded.clone()
             };
             let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
-                id,
+                id: task_id,
                 name: shell_name.to_string(),
                 result,
                 ok,
@@ -907,12 +945,45 @@ impl App {
                 Err(e) => format!("spawn error: {e}"),
             };
             let note = format!(
-                "I ran `{command}` in the shell (exit {exit}). Output:
+                "I ran `{task_command}` in the shell (exit {exit}). Output:
 ```
 {}
 ```",
                 bounded.trim_end()
             );
+            agent.lock().await.push_user_note(note);
+        });
+        self.user_shell = Some(UserShell {
+            id,
+            name: shell_name.to_string(),
+            command,
+            handle,
+        });
+    }
+
+    /// Cancel the running `!command`: abort its task (killing the child via
+    /// `kill_on_drop`), close the transcript block as cancelled, and leave a
+    /// history note so the model knows the command didn't finish.
+    pub(crate) fn cancel_user_shell(&mut self) {
+        let Some(shell) = self.user_shell.take() else {
+            return;
+        };
+        if shell.handle.is_finished() {
+            return; // it completed; the ToolEnd event already closed the block
+        }
+        shell.handle.abort();
+        self.apply_event(AgentEvent::ToolEnd {
+            id: shell.id,
+            name: shell.name,
+            result: "(cancelled)".to_string(),
+            ok: false,
+        });
+        let note = format!(
+            "I ran `{}` in the shell but cancelled it before it finished.",
+            shell.command
+        );
+        let agent = self.agent.clone();
+        tokio::spawn(async move {
             agent.lock().await.push_user_note(note);
         });
     }
@@ -1425,7 +1496,12 @@ impl App {
                     self.apply_event(ev);
                 }
             }
-            TurnMsg::UserShell(ev) => self.apply_event(ev),
+            TurnMsg::UserShell(ev) => {
+                if matches!(ev, AgentEvent::ToolEnd { .. }) {
+                    self.user_shell = None;
+                }
+                self.apply_event(ev);
+            }
             TurnMsg::System(text) => {
                 self.push_entry(Entry::notice(text));
                 // Do NOT reset scroll_offset here: this is an async/passive line
