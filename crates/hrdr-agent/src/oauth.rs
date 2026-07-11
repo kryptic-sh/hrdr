@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 // ── OpenAI (Codex) constants — mirror codex.ts ──────────────────────────────
 
@@ -404,15 +404,56 @@ struct CredentialState {
 }
 
 struct CredentialCoordinator {
-    state: Mutex<CredentialState>,
+    // A synchronous mutex: the guard is never held across an `.await` (every
+    // await point sits between an explicit `drop` and the next `lock`), so this
+    // stays cheap and, crucially, lets [`RefreshGuard::drop`] reset state from a
+    // sync `Drop` on cancellation.
+    state: std::sync::Mutex<CredentialState>,
     changed: Notify,
+}
+
+impl CredentialCoordinator {
+    /// Lock the state, recovering from poisoning — a panic mid-critical-section
+    /// must not permanently wedge token acquisition.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CredentialState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Clears the in-flight `refreshing` flag if a refresher future is dropped
+/// (cancelled) before it records a terminal result — otherwise `refreshing`
+/// would stay true and every later waiter would park forever. Disarmed once the
+/// refresher reaches its own terminal bookkeeping.
+struct RefreshGuard<'a> {
+    coordinator: &'a CredentialCoordinator,
+    completion: u64,
+    armed: bool,
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.coordinator.lock();
+            if state.refreshing {
+                state.refreshing = false;
+                state.completion = self.completion.wrapping_add(1);
+                state.last_result = None;
+            }
+        }
+        self.coordinator.changed.notify_waiters();
+    }
 }
 
 fn coordinator() -> &'static Arc<CredentialCoordinator> {
     static COORDINATOR: OnceLock<Arc<CredentialCoordinator>> = OnceLock::new();
     COORDINATOR.get_or_init(|| {
         Arc::new(CredentialCoordinator {
-            state: Mutex::new(CredentialState::default()),
+            state: std::sync::Mutex::new(CredentialState::default()),
             changed: Notify::new(),
         })
     })
@@ -438,7 +479,7 @@ pub async fn save_oauth_coordinated(provider: &str, creds: OAuthCreds) -> Result
     if canonical_provider_key(provider).is_none() {
         bail!("provider does not support ChatGPT authorization");
     }
-    let mut state = coordinator().state.lock().await;
+    let mut state = coordinator().lock();
     state.generation = state.generation.wrapping_add(1);
     state.latest = Some(creds.clone());
     let saved = save_oauth(provider, &creds);
@@ -500,11 +541,20 @@ pub async fn valid_access_token_result(provider: &str) -> Result<OAuthAccess> {
         bail!("provider does not support ChatGPT authorization");
     }
     let coordinator = coordinator().clone();
+    // Outcome of one locked decision: wait on an in-flight refresh (carrying the
+    // completion counter to gate the result) or become the refresher.
+    enum Step {
+        Wait(u64),
+        Refresh(OAuthCreds, u64, u64),
+    }
     loop {
         let disk_creds = load_oauth(provider);
         let notified = coordinator.changed.notified();
-        let (creds, generation, completion) = {
-            let mut state = coordinator.state.lock().await;
+        tokio::pin!(notified);
+        // Decide under the lock, then drop the (sync, non-`Send`) guard at the
+        // block boundary — no guard may be alive across the awaits below.
+        let step = {
+            let mut state = coordinator.lock();
             let creds = state.latest.clone().or(disk_creds);
             let Some(creds) = creds else {
                 bail!("no saved ChatGPT authorization");
@@ -521,10 +571,40 @@ pub async fn valid_access_token_result(provider: &str) -> Result<OAuthAccess> {
                 bail!("saved ChatGPT authorization is expired and cannot be refreshed");
             }
             if state.refreshing {
-                let completion = state.completion;
-                drop(state);
+                // Register with `changed` while still holding the lock. We
+                // observed `refreshing == true`, so the refresher has not yet
+                // entered its terminal section — and that section must re-acquire
+                // this same lock before it can `notify_waiters()`. Enabling under
+                // the lock therefore happens-before any notify that carries our
+                // result, closing the window where a notify firing between our
+                // unlock and our first poll would be lost. (`notify_waiters()`
+                // stores no permit, so an unregistered waiter would otherwise park
+                // until the next refresh — possibly a token lifetime away.)
+                notified.as_mut().enable();
+                Step::Wait(state.completion)
+            } else {
+                state.refreshing = true;
+                Step::Refresh(creds, state.generation, state.completion)
+            }
+        };
+
+        let (creds, generation, completion) = match step {
+            Step::Wait(completion) => {
                 notified.await;
-                let state = coordinator.state.lock().await;
+                let state = coordinator.lock();
+                // Prefer creds installed while we waited (e.g. a newer browser
+                // login) over a stale `last_result`, so we never hand back a
+                // superseded or errored token when a valid one is now available.
+                if let Some(creds) = &state.latest
+                    && !access_expired(creds.expires_ms, now_ms())
+                    && !creds.access.trim().is_empty()
+                {
+                    return Ok(OAuthAccess {
+                        access: creds.access.clone(),
+                        account_id: creds.account_id.clone(),
+                        persistence_warning: None,
+                    });
+                }
                 if let Some((finished, result)) = &state.last_result
                     && *finished > completion
                 {
@@ -532,49 +612,52 @@ pub async fn valid_access_token_result(provider: &str) -> Result<OAuthAccess> {
                 }
                 continue;
             }
-            state.refreshing = true;
-            (creds, state.generation, state.completion)
+            Step::Refresh(creds, generation, completion) => (creds, generation, completion),
         };
 
-        let fresh = match refresh_creds(&creds).await {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                let mut state = coordinator.state.lock().await;
-                if state.generation != generation {
-                    state.refreshing = false;
-                    state.completion = completion.wrapping_add(1);
-                    state.last_result = None;
-                    coordinator.changed.notify_waiters();
-                    continue;
-                }
-                state.refreshing = false;
-                state.completion = completion.wrapping_add(1);
-                let result = Err(error.to_string());
-                state.last_result = Some((state.completion, result.clone()));
-                coordinator.changed.notify_waiters();
-                return result.map_err(anyhow::Error::msg);
-            }
+        // Arm a guard over the one cancellable await below: if this future is
+        // dropped during `refresh_creds`, the guard clears `refreshing` and
+        // wakes waiters instead of stranding them. Disarmed the instant we
+        // re-lock to record our own terminal result.
+        let mut guard = RefreshGuard {
+            coordinator: &coordinator,
+            completion,
+            armed: true,
         };
-        let mut state = coordinator.state.lock().await;
+        let fresh = refresh_creds(&creds).await;
+        let mut state = coordinator.lock();
         if state.generation != generation {
+            // A newer login superseded this refresh: discard our result. Disarm
+            // only after the state writes, so a panic mid-write still lets the
+            // guard recover `refreshing` (Drop's own `refreshing` check keeps a
+            // late fire a harmless no-op).
             state.refreshing = false;
             state.completion = completion.wrapping_add(1);
             state.last_result = None;
+            guard.armed = false;
+            drop(state);
             coordinator.changed.notify_waiters();
             continue;
         }
-        state.latest = Some(fresh.clone());
-        let persistence_warning = save_oauth(provider, &fresh)
-            .err()
-            .map(|e| format!("refreshed authorization is active but could not be saved: {e}"));
-        let result = Ok(OAuthAccess {
-            access: fresh.access,
-            account_id: fresh.account_id,
-            persistence_warning,
-        });
+        let result = match fresh {
+            Ok(fresh) => {
+                state.latest = Some(fresh.clone());
+                let persistence_warning = save_oauth(provider, &fresh).err().map(|e| {
+                    format!("refreshed authorization is active but could not be saved: {e}")
+                });
+                Ok(OAuthAccess {
+                    access: fresh.access,
+                    account_id: fresh.account_id,
+                    persistence_warning,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        };
         state.refreshing = false;
         state.completion = completion.wrapping_add(1);
         state.last_result = Some((state.completion, result.clone()));
+        guard.armed = false;
+        drop(state);
         coordinator.changed.notify_waiters();
         return result.map_err(anyhow::Error::msg);
     }
@@ -871,6 +954,59 @@ mod tests {
     async fn coordinator_rejects_non_chatgpt_provider() {
         let error = valid_access_token_result("custom").await.unwrap_err();
         assert!(error.to_string().contains("does not support"));
+    }
+
+    #[tokio::test]
+    async fn dropped_refresher_clears_refreshing_and_wakes_waiters() {
+        // A refresher whose future is cancelled mid-refresh must not leave
+        // `refreshing` stuck true — otherwise every later waiter parks forever.
+        let coord = Arc::new(CredentialCoordinator {
+            state: std::sync::Mutex::new(CredentialState::default()),
+            changed: Notify::new(),
+        });
+        {
+            let mut state = coord.lock();
+            state.refreshing = true;
+            state.completion = 5;
+        }
+        // Simulate the cancellation: an armed guard dropped without disarming.
+        drop(RefreshGuard {
+            coordinator: &coord,
+            completion: 5,
+            armed: true,
+        });
+        let state = coord.lock();
+        assert!(!state.refreshing, "cancel-drop clears the refreshing flag");
+        assert_eq!(
+            state.completion, 6,
+            "completion advances so waiters re-eval"
+        );
+        assert!(state.last_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn disarmed_refresher_guard_is_a_noop() {
+        // The normal terminal path disarms the guard; its drop must not clobber
+        // the result the refresher just recorded.
+        let coord = Arc::new(CredentialCoordinator {
+            state: std::sync::Mutex::new(CredentialState::default()),
+            changed: Notify::new(),
+        });
+        {
+            let mut state = coord.lock();
+            state.refreshing = true;
+            state.completion = 5;
+        }
+        let mut guard = RefreshGuard {
+            coordinator: &coord,
+            completion: 5,
+            armed: true,
+        };
+        guard.armed = false;
+        drop(guard);
+        let state = coord.lock();
+        assert!(state.refreshing, "disarmed guard leaves state untouched");
+        assert_eq!(state.completion, 5);
     }
 
     // ── Store round-trip ─────────────────────────────────────────────────────
