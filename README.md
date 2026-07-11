@@ -760,14 +760,18 @@ Warnings and hints are dropped (signal over lint noise).
 
 It's presence-aware, like the rest of the tool set: a server only spawns if its
 binary is on PATH, then stays warm for the session (shared with delegated
-sub-agents). Built-ins: `rust-analyzer` (.rs), `typescript-language-server`
-(.ts/.tsx/.js/…), `pyright-langserver` (.py), `gopls` (.go), `clangd`
-(.c/.cpp/…). Diagnostics run on what's actually on disk — after any formatter
-hooks. Each edit waits at most `wait_ms` (default 2000 ms) for the server; a
-slow or dead server degrades to "no diagnostics", never to a failed edit. Files
-outside the workspace the servers were initialized against — a worktree-isolated
-sub-agent's tree, temp-dir scratch files — are deliberately skipped rather than
-left to server-dependent behavior.
+sub-agents). The project's primary language server(s) are **pre-warmed at
+session start** (detected from root manifests — `Cargo.toml`, `package.json`,
+`go.mod`, `pyproject.toml`, …), so indexing-heavy servers like rust-analyzer
+overlap their warm-up with your first prompt instead of missing the first edit's
+diagnostics. `/doctor` shows each server's status. Built-ins: `rust-analyzer`
+(.rs), `typescript-language-server` (.ts/.tsx/.js/…), `pyright-langserver`
+(.py), `gopls` (.go), `clangd` (.c/.cpp/…). Diagnostics run on what's actually
+on disk — after any formatter hooks. Each edit waits at most `wait_ms` (default
+2000 ms) for the server; a slow or dead server degrades to "no diagnostics",
+never to a failed edit. Files outside the workspace the servers were initialized
+against — a worktree-isolated sub-agent's tree, temp-dir scratch files — are
+deliberately skipped rather than left to server-dependent behavior.
 
 ```toml
 [lsp]

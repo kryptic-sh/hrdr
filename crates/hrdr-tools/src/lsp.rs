@@ -236,6 +236,24 @@ impl LspRegistry {
     pub fn wait_ms(&self) -> u64 {
         self.wait_ms
     }
+
+    /// Spawn + initialize the servers for `extensions` now instead of on the
+    /// first edit, so indexing-heavy servers (rust-analyzer) overlap their
+    /// warm-up with the session's first prompt rather than its first edit.
+    /// Presence-aware and silent like the lazy path — this is just
+    /// [`Self::client_for`] called early; results land in the same cache.
+    pub async fn pre_warm(&self, extensions: &[String]) {
+        for ext in extensions {
+            let Some(config) = self
+                .configs
+                .iter()
+                .find(|c| c.extensions.iter().any(|e| e == ext))
+            else {
+                continue;
+            };
+            let _ = self.client_for(config).await;
+        }
+    }
 }
 
 /// The latest `publishDiagnostics` per URI: `(version, diagnostics)`.
@@ -648,6 +666,37 @@ mod tests {
                 .diagnostics_note(Path::new("/elsewhere/a.xyz"), "boom")
                 .await,
             None
+        );
+    }
+
+    /// `pre_warm` spawns the matching server without any edit having
+    /// happened; unknown extensions are skipped silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_warm_spawns_the_server_before_any_edit() {
+        if which::which("python3").is_err() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("fake_lsp.py");
+        std::fs::write(&server, FAKE_LSP_PY).unwrap();
+        let registry = LspRegistry::new(
+            dir.path().to_path_buf(),
+            vec![LspServerConfig {
+                command: "python3".to_string(),
+                args: vec![server.display().to_string()],
+                extensions: vec!["xyz".to_string()],
+            }],
+            Some(5_000),
+        );
+        registry
+            .pre_warm(&["xyz".to_string(), "unknown-ext".to_string()])
+            .await;
+        assert_eq!(
+            registry.statuses().await[0].status,
+            LspServerStatus::Running,
+            "pre-warm spawned the server"
         );
     }
 

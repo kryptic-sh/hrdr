@@ -18,7 +18,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dropped; each edit waits at most `[lsp] wait_ms` (default 2000 ms); failures
   degrade to "no diagnostics", never a failed edit. Configure via `[lsp]`
   (`enabled`, `wait_ms`, custom `[[lsp.servers]]` with
-  `command`/`args`/`extensions`) or `$HRDR_LSP=0`.
+  `command`/`args`/`extensions`) or `$HRDR_LSP=0`. The project's primary
+  server(s) are **pre-warmed at session start** (detected from root manifests:
+  `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, …) so indexing-heavy
+  servers don't miss the first edit; `/doctor` reports each configured server's
+  status (running / not installed / failed / not yet used); files outside the
+  servers' workspace root (worktree-isolated sub-agents, temp scratch files) are
+  deliberately skipped.
 - **Lifecycle hooks.** A `[[hooks]]` config entry with an `event` runs on agent
   lifecycle events: `pre_tool` (exit 2 **vetoes the tool call**, stderr becomes
   the error the model sees; `on` filters by tool name), `post_tool` (failures

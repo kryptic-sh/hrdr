@@ -337,6 +337,31 @@ fn spawn_background(
 /// same provider/endpoint and cwd, but the sub-agent model, no nested `task` tool
 /// (recursion is bounded to one level), and no MCP servers (subs don't spawn
 /// them). The `task` tool clones this per call and may override the model.
+/// The file extensions whose language servers are worth pre-warming for
+/// `cwd`, from the project's manifest files — a cheap root-level probe, no
+/// tree walk. One representative extension per server is enough:
+/// [`hrdr_tools::LspRegistry::pre_warm`] resolves it to the server.
+fn project_lsp_extensions(cwd: &std::path::Path) -> Vec<String> {
+    let manifests: &[(&str, &str)] = &[
+        ("Cargo.toml", "rs"),
+        ("go.mod", "go"),
+        ("package.json", "ts"),
+        ("tsconfig.json", "ts"),
+        ("pyproject.toml", "py"),
+        ("setup.py", "py"),
+        ("requirements.txt", "py"),
+        ("CMakeLists.txt", "c"),
+        ("compile_commands.json", "c"),
+    ];
+    let mut exts: Vec<String> = manifests
+        .iter()
+        .filter(|(file, _)| cwd.join(file).exists())
+        .map(|(_, ext)| (*ext).to_string())
+        .collect();
+    exts.dedup();
+    exts
+}
+
 fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     let mut base = config.clone();
     base.subagents = false;
@@ -2461,6 +2486,19 @@ impl Agent {
                 config.lsp_wait_ms,
             ))
         });
+        // Pre-warm the project's language server(s) in the background so
+        // indexing-heavy servers (rust-analyzer) overlap their warm-up with
+        // the first prompt instead of missing the first edit's diagnostics.
+        // `try_current` keeps this a no-op outside a runtime (sync tests).
+        if let Some(lsp) = &lsp
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let exts = project_lsp_extensions(&config.cwd);
+            if !exts.is_empty() {
+                let lsp = Arc::clone(lsp);
+                handle.spawn(async move { lsp.pre_warm(&exts).await });
+            }
+        }
         if config.subagents {
             let profiles = resolve_agent_profiles(&config);
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -5532,6 +5570,20 @@ mod tests {
         assert_eq!(cfg.guardrails.len(), 2);
         assert_eq!(cfg.guardrails[0].message, "no recursive force-remove");
         assert_eq!(cfg.guardrails[1].pattern, r"\bnpm\s+publish\b");
+    }
+
+    #[test]
+    fn project_lsp_extensions_probe_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::project_lsp_extensions(dir.path()).is_empty());
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            super::project_lsp_extensions(dir.path()),
+            vec!["rs".to_string(), "ts".to_string()],
+            "one representative extension per detected language, deduped"
+        );
     }
 
     #[test]
