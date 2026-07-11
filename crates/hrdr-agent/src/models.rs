@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, resolve_api_key, write_atomic};
+use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, write_atomic};
 
 /// One pickable model in the selector: the ids to switch to plus the friendly
 /// labels to show.
@@ -22,6 +22,14 @@ pub struct ModelChoice {
     pub provider_label: String,
     /// Friendly model name (e.g. "Claude Fable 5.0").
     pub model_label: String,
+    pub context_window: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelChoicesResult {
+    pub choices: Vec<ModelChoice>,
+    pub chatgpt_source: Option<crate::CatalogSource>,
+    pub warning: Option<String>,
 }
 
 /// The models.dev catalog key for a built-in preset (or a catalog-matching
@@ -74,7 +82,10 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
     // keyless by design (a self-hosted endpoint), so it's always offered.
     for name in BUILTIN_PROVIDERS {
         if let Some(p) = builtin_provider(name)
-            && (*name == "local" || resolve_api_key(name, &p, None, None).is_some())
+            && !matches!(
+                crate::provider_auth_state(name, &p),
+                crate::ProviderAuthState::Missing
+            )
         {
             push((*name).to_string(), p.model);
         }
@@ -128,6 +139,7 @@ fn choices_from(
                         model: id,
                         provider_label: provider_label.clone(),
                         model_label: name,
+                        context_window: None,
                     });
                 }
             }
@@ -144,6 +156,7 @@ fn choices_from(
                     model: m.clone(),
                     provider_label: pretty_provider(&p.name),
                     model_label: m,
+                    context_window: None,
                 });
             }
         }
@@ -249,6 +262,60 @@ pub fn model_choices(config: &AgentConfig, active: Option<&str>) -> Vec<ModelCho
     let catalog = hrdr_llm::catalog::load_cached();
     let usage = load_model_usage();
     choices_from(&providers, catalog.as_ref(), &usage)
+}
+
+pub async fn load_model_choices(
+    config: &AgentConfig,
+    active: Option<&str>,
+    force_refresh: bool,
+) -> ModelChoicesResult {
+    let mut choices = model_choices(config, active);
+    let has_chatgpt = choices.iter().any(|choice| {
+        config
+            .resolve_provider(&choice.provider)
+            .is_some_and(|provider| provider.kind == crate::ResolvedProviderKind::ChatGptOAuth)
+    });
+    if !has_chatgpt {
+        return ModelChoicesResult {
+            choices,
+            chatgpt_source: None,
+            warning: None,
+        };
+    }
+    let catalog = crate::load_chatgpt_catalog(force_refresh).await;
+    choices.retain(|choice| {
+        !config
+            .resolve_provider(&choice.provider)
+            .is_some_and(|provider| provider.kind == crate::ResolvedProviderKind::ChatGptOAuth)
+    });
+    let mut seen = HashSet::new();
+    choices.extend(
+        catalog
+            .models
+            .iter()
+            .filter(|model| seen.insert(model.slug.to_ascii_lowercase()))
+            .map(|model| ModelChoice {
+                provider: "chatgpt".to_string(),
+                model: model.slug.clone(),
+                provider_label: "ChatGPT".to_string(),
+                model_label: model.display_name.clone(),
+                context_window: model.context_window,
+            }),
+    );
+    let usage = load_model_usage();
+    choices.sort_by_key(|choice| {
+        std::cmp::Reverse(
+            usage
+                .get(&usage_key(&choice.provider, &choice.model))
+                .copied()
+                .unwrap_or(0),
+        )
+    });
+    ModelChoicesResult {
+        choices,
+        chatgpt_source: Some(catalog.source),
+        warning: catalog.warning,
+    }
 }
 
 /// Case-insensitive fuzzy filter over the choices: the query's characters must

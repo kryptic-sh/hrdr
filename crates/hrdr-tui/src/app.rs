@@ -91,10 +91,35 @@ pub(crate) enum TurnMsg {
     Compacted(Result<(usize, usize), String>),
     /// A model/provider switch re-probed the endpoint's advertised context window.
     ContextWindow(u32),
+    ContextWindowFor(Option<String>, String, u32),
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
     /// The config file changed on disk (from the shared watcher).
     ConfigChanged,
+    ModelChoices(u64, hrdr_agent::ModelChoicesResult),
+}
+
+pub(crate) struct PendingBrowserLogin {
+    pub(crate) login_id: u64,
+    pub(crate) provider: String,
+    pub(crate) default_saved: Option<bool>,
+    pub(crate) phase: PendingBrowserLoginPhase,
+}
+
+pub(crate) enum PendingBrowserLoginPhase {
+    Authorizing {
+        authorization_url: String,
+        task: JoinHandle<hrdr_app::BrowserLoginOutcome>,
+    },
+    Switching {
+        task: JoinHandle<(u64, Result<BrowserSwitchApplied, String>)>,
+    },
+}
+
+pub(crate) struct BrowserSwitchApplied {
+    provider: hrdr_agent::ResolvedProvider,
+    provider_name: String,
+    model: String,
 }
 
 pub(crate) struct App {
@@ -157,8 +182,10 @@ pub(crate) struct App {
     /// An in-progress `/login` wizard; while `Some`, submitted lines feed it
     /// instead of the model or the slash dispatcher.
     login: Option<hrdr_app::LoginWizard>,
+    pub(crate) pending_browser_login: Option<PendingBrowserLogin>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
     pub(crate) model_selector: Option<ModelSelector>,
+    model_selector_generation: u64,
     /// The open `/resume` session picker modal; while `Some`, it captures every key.
     pub(crate) session_selector: Option<SessionSelector>,
     /// The open `/theme` picker modal; while `Some`, it captures every key and
@@ -289,6 +316,222 @@ pub(crate) struct App {
 }
 
 impl App {
+    pub(crate) fn cancel_pending_browser_login(&mut self) {
+        match self
+            .pending_browser_login
+            .as_mut()
+            .map(|pending| &mut pending.phase)
+        {
+            Some(PendingBrowserLoginPhase::Authorizing { task, .. }) => {
+                task.abort();
+                self.pending_browser_login = None;
+                self.system("login cancelled; authorization may already have been saved");
+            }
+            Some(PendingBrowserLoginPhase::Switching { .. }) => {
+                self.system("finishing login switch");
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) async fn poll_browser_login(&mut self) {
+        let finished =
+            self.pending_browser_login
+                .as_ref()
+                .is_some_and(|pending| match &pending.phase {
+                    PendingBrowserLoginPhase::Authorizing { task, .. } => task.is_finished(),
+                    PendingBrowserLoginPhase::Switching { task } => task.is_finished(),
+                });
+        if !finished {
+            return;
+        }
+        let Some(mut pending) = self.pending_browser_login.take() else {
+            return;
+        };
+        let login_id = pending.login_id;
+        if let PendingBrowserLoginPhase::Switching { task } = pending.phase {
+            let (result_id, result) = task
+                .await
+                .unwrap_or_else(|error| (login_id, Err(error.to_string())));
+            if result_id != login_id {
+                return;
+            }
+            self.reduce_browser_switch(login_id, pending.default_saved, result);
+            return;
+        }
+        let PendingBrowserLoginPhase::Authorizing { task, .. } = pending.phase else {
+            return;
+        };
+        let outcome = match task.await {
+            Ok(outcome) if outcome.login_id == login_id => outcome,
+            Ok(_) => return,
+            Err(error) if error.is_cancelled() => return,
+            Err(error) => {
+                self.system(format!("login task failed: {error}"));
+                return;
+            }
+        };
+        if let Some(error) = outcome.error {
+            self.system(format!("{} login failed: {error}", outcome.provider));
+            return;
+        }
+        if !outcome.token_saved {
+            self.system(format!(
+                "{} login did not save authorization",
+                outcome.provider
+            ));
+            return;
+        }
+
+        if outcome.provider == "chatgpt" {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let catalog = hrdr_agent::load_chatgpt_catalog(true).await;
+                let source = match catalog.source {
+                    hrdr_agent::CatalogSource::Fresh => "fresh",
+                    hrdr_agent::CatalogSource::Stale => "stale cache",
+                    hrdr_agent::CatalogSource::BuiltInFallback => "built-in fallback",
+                };
+                let mut message = format!("ChatGPT models loaded from {source}");
+                if let Some(warning) = catalog.warning {
+                    message.push_str(&format!(": {warning}"));
+                }
+                let _ = tx.send(TurnMsg::System(message));
+            });
+        }
+
+        let persisted = hrdr_agent::persist_setting(
+            "provider",
+            hrdr_agent::ConfigValue::Str(&outcome.provider),
+        );
+        if persisted.is_ok() {
+            self.config_mtime = current_config_mtime();
+        }
+        if self.running {
+            self.system(format!(
+                "authorization saved{}; live switch deferred — use /model after this turn",
+                if persisted.is_ok() {
+                    " and set as default"
+                } else {
+                    "; could not save default"
+                }
+            ));
+            return;
+        }
+        let Some(provider) = self.cfg.resolve_provider(&outcome.provider) else {
+            self.system(format!(
+                "authorization saved{}; provider configuration no longer resolves",
+                if persisted.is_ok() {
+                    " and set as default"
+                } else {
+                    "; could not save default"
+                }
+            ));
+            return;
+        };
+        let model = provider
+            .model
+            .clone()
+            .unwrap_or_else(|| self.state.model.clone());
+        let key = hrdr_agent::resolve_api_key(&outcome.provider, &provider, None, None);
+        let headers = provider.headers.clone().into_iter().collect();
+        let agent = self.agent.clone();
+        let provider_name = outcome.provider;
+        let switch_provider = provider.clone();
+        let switch_name = provider_name.clone();
+        let switch_model = model.clone();
+        let task = tokio::spawn(async move {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                let mut agent = agent.lock().await;
+                agent.set_endpoint(switch_provider.base_url.clone(), key);
+                agent.set_headers(headers);
+                agent.set_api_version(switch_provider.api_version.clone());
+                agent.set_provider(Some(switch_name.clone()), switch_provider.kind);
+                agent.set_model(switch_model.clone());
+                BrowserSwitchApplied {
+                    provider: switch_provider,
+                    provider_name: switch_name,
+                    model: switch_model,
+                }
+            })
+            .await
+            .map_err(|_| "agent lock timed out; live switch deferred".to_string());
+            (login_id, result)
+        });
+        pending.default_saved = Some(persisted.is_ok());
+        pending.phase = PendingBrowserLoginPhase::Switching { task };
+        self.pending_browser_login = Some(pending);
+    }
+
+    pub(crate) async fn finish_pending_browser_login(&mut self) {
+        let Some(pending) = self.pending_browser_login.take() else {
+            return;
+        };
+        match pending.phase {
+            PendingBrowserLoginPhase::Authorizing { task, .. } => task.abort(),
+            PendingBrowserLoginPhase::Switching { task } => {
+                let (result_id, result) = task
+                    .await
+                    .unwrap_or_else(|error| (pending.login_id, Err(error.to_string())));
+                if result_id != pending.login_id {
+                    return;
+                }
+                self.reduce_browser_switch(pending.login_id, pending.default_saved, result);
+            }
+        }
+    }
+
+    fn reduce_browser_switch(
+        &mut self,
+        login_id: u64,
+        default_saved: Option<bool>,
+        result: Result<BrowserSwitchApplied, String>,
+    ) {
+        debug_assert!(login_id > 0);
+        match result {
+            Ok(applied) => {
+                self.state.provider = Some(applied.provider_name.clone());
+                self.state.base_url = applied.provider.base_url;
+                self.state.model = applied.model;
+                self.state.usage.context_window = applied.provider.context_window;
+                self.autosave();
+                let default = if default_saved == Some(true) {
+                    "; set as default"
+                } else {
+                    "; could not save default"
+                };
+                self.system(format!(
+                    "signed in with {}; using it now{default}; refreshing models",
+                    applied.provider_name
+                ));
+            }
+            Err(error) => self.system(format!(
+                "authorization saved{}; {error}",
+                if default_saved == Some(true) {
+                    " and set as default"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+
+    fn spawn_model_choices(&mut self, force_refresh: bool) {
+        self.model_selector_generation = self.model_selector_generation.wrapping_add(1);
+        let generation = self.model_selector_generation;
+        let config = self.cfg.clone();
+        let active = self.state.provider.clone();
+        let tx = self.tx.clone();
+        if let Some(selector) = &mut self.model_selector {
+            selector.loading = true;
+        }
+        tokio::spawn(async move {
+            let result =
+                hrdr_agent::load_model_choices(&config, active.as_deref(), force_refresh).await;
+            let _ = tx.send(TurnMsg::ModelChoices(generation, result));
+        });
+    }
+
     pub(crate) fn new(
         config: AgentConfig,
         ui: hrdr_app::UiConfig,
@@ -391,7 +634,9 @@ impl App {
             pending_init: false,
             pending_edit: None,
             login: None,
+            pending_browser_login: None,
             model_selector: None,
+            model_selector_generation: 0,
             session_selector: None,
             theme_selector: None,
             effort_selector: None,
@@ -472,9 +717,14 @@ impl App {
         let agent = self.agent.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let window = agent.lock().await.probe_context_window().await;
+            let (client, provider) = {
+                let agent = agent.lock().await;
+                (agent.client(), agent.provider_name().map(str::to_string))
+            };
+            let model = client.model.clone();
+            let window = Agent::probe_context_window_for(client, provider.clone()).await;
             if let Some(w) = window {
-                let _ = tx.send(TurnMsg::ContextWindow(w));
+                let _ = tx.send(TurnMsg::ContextWindowFor(provider, model, w));
             }
         });
     }
@@ -491,6 +741,35 @@ impl App {
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
+            return Action::None;
+        }
+        if self.pending_browser_login.is_some()
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Esc
+        {
+            self.cancel_pending_browser_login();
+            return Action::None;
+        }
+        if self.pending_browser_login.is_some()
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('c')
+            && self.editor.content().trim().is_empty()
+        {
+            if let Some(url) =
+                self.pending_browser_login
+                    .as_ref()
+                    .and_then(|pending| match &pending.phase {
+                        PendingBrowserLoginPhase::Authorizing {
+                            authorization_url, ..
+                        } => Some(authorization_url.clone()),
+                        PendingBrowserLoginPhase::Switching { .. } => None,
+                    })
+            {
+                let status = self.clipboard_status(&url, "login URL");
+                self.system(status);
+            } else {
+                self.system("finishing login switch");
+            }
             return Action::None;
         }
 
@@ -674,6 +953,22 @@ impl App {
                 self.login_feed(input.trim());
                 self.editor.set_content("");
                 self.scroll_offset = 0;
+                return Action::None;
+            }
+            if self.pending_browser_login.is_some() {
+                if input.trim() == "/cancel" {
+                    self.cancel_pending_browser_login();
+                } else {
+                    let switching = self.pending_browser_login.as_ref().is_some_and(|pending| {
+                        matches!(pending.phase, PendingBrowserLoginPhase::Switching { .. })
+                    });
+                    self.system(if switching {
+                        "finishing login switch"
+                    } else {
+                        "finish browser login, or /cancel it first"
+                    });
+                }
+                self.editor.set_content("");
                 return Action::None;
             }
             self.record_history(&input);
@@ -1297,7 +1592,22 @@ impl App {
                 // advertised max (drives "X of Y" + the auto-compaction trigger).
                 self.state.usage.context_window = Some(tokens);
             }
+            TurnMsg::ContextWindowFor(provider, model, tokens) => {
+                if self.state.provider == provider && self.state.model == model {
+                    self.state.usage.context_window = Some(tokens);
+                }
+            }
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
+            TurnMsg::ModelChoices(generation, result) => {
+                if generation == self.model_selector_generation
+                    && let Some(selector) = &mut self.model_selector
+                {
+                    selector.replace(result.choices, result.chatgpt_source);
+                    if let Some(warning) = result.warning {
+                        self.push_entry(Entry::notice(warning));
+                    }
+                }
+            }
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;
                 self.running = false;

@@ -240,15 +240,26 @@ hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
 #### `/login` — guided setup
 
 Rather than exporting an env var, run **`/login`** in the TUI: pick a provider,
-paste its API key, and hrdr saves it as your default. The key is resolved at
-startup in the order **inline config → `key_env` → saved credential**, so a
-running server or an exported env var still wins.
+paste its API key, or authorize a ChatGPT subscription in the browser. During
+browser authorization, press `c` with an empty input to copy the exact login
+URL; press Esc or submit `/cancel` to cancel. hrdr saves the provider as your
+default. An API key is resolved at startup in the order **inline config →
+`key_env` → saved credential**, so a running server or an exported env var still
+wins.
 
 Credentials are stored **separately from `config.toml`**, in a dedicated
 `~/.config/hrdr/auth.toml` (`0600` on unix) — a flat `provider = "key"` map. The
 wizard prints the exact path and a plaintext-storage warning before it saves.
 Keeping keys out of `config.toml` means you can share or version that file
 without leaking secrets.
+
+ChatGPT subscription tokens are stored separately in `~/.config/hrdr/oauth.json`
+(`0600` on unix), refreshed before requests, and never added to the transcript
+or session file. ChatGPT models are discovered for the authorized account and
+cached for five minutes at `$XDG_CACHE_HOME/hrdr/chatgpt_models.json`. `/model`
+labels stale or built-in fallback data and `Ctrl+R` refreshes it.
+`HRDR_DISABLE_MODELS_FETCH` disables both this request and models.dev fetching
+while retaining available cache data.
 
 #### Custom providers
 
@@ -271,7 +282,7 @@ key_env = "OPENCODE_API_KEY"    # or inline `api_key = "..."`
 model = "grok-build-0.1"
 context_window = 256000
 
-[providers.chatgpt]
+[providers.openai-api]
 base_url = "https://api.openai.com/v1"
 key_env = "OPENAI_API_KEY"
 model = "gpt-5.5"

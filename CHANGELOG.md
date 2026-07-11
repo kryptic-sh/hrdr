@@ -21,6 +21,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names (+ `reset`) for `/theme`, session ids for `/resume`, file paths for
   `/edit`/`/add`, and a skill's frontmatter-declared `args:` values after
   `:name `. Anchored at the argument column; Tab fills just the argument.
+- **ChatGPT subscription model discovery and login controls.** Browser login now
+  keeps its authorization URL out of transcripts and sessions, supports `c` to
+  copy the exact URL and Esc or `/cancel` to abort, switches the live session
+  after authorization, and loads the account's available Codex models into the
+  asynchronous `/model` picker. Catalog data uses an account-isolated
+  five-minute cache with explicit stale and built-in fallback states; `Ctrl+R`
+  refreshes it.
 - **Custom skills (`:name`).** Reusable Markdown prompt templates invoked with a
   `:` prefix (`:review error paths`): `$ARGUMENTS` substitution, discovery from
   `.hrdr/skills/` + `.claude/commands/` + `.opencode/command/` (project then
@@ -29,6 +36,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transcript keeps the raw invocation; the model gets the expanded prompt (skill
   bodies' own `@file`/`@agent` mentions expand too). Works in `hrdr run` as well
   — expansion lives in `prepare_outgoing`.
+
+### Fixed
+
+- **ChatGPT OAuth readiness and provider isolation.** Saved subscription tokens
+  now make ChatGPT selectable without an API key, refresh safely across
+  concurrent response/model requests, and cannot be injected into custom
+  providers that shadow a built-in name. Provider identity also follows
+  sub-agent profiles and resumed sessions correctly.
 
 ## [0.2.10] - 2026-07-11
 

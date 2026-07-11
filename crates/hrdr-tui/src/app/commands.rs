@@ -15,6 +15,23 @@ impl super::App {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let cmd = resolve_alias(parts.next().unwrap_or(""));
         let arg = parts.next().unwrap_or("").trim();
+        if self.pending_browser_login.is_some()
+            && matches!(
+                cmd,
+                "clear"
+                    | "new"
+                    | "resume"
+                    | "cwd"
+                    | "login"
+                    | "model"
+                    | "retry"
+                    | "undo"
+                    | "compact"
+            )
+        {
+            self.system("finish or cancel browser login first");
+            return true;
+        }
         // Commands with a richer TUI rendering or that touch terminal-only state
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so every frontend runs one implementation).
@@ -280,6 +297,23 @@ struct TuiHost<'a> {
 }
 
 impl hrdr_app::CommandHost for TuiHost<'_> {
+    fn begin_browser_login(&mut self, start: hrdr_app::BrowserLoginStart) -> bool {
+        if self.app.pending_browser_login.is_some() {
+            self.app.system("a browser login is already in progress");
+            return false;
+        }
+        let task = tokio::spawn(start.future);
+        self.app.pending_browser_login = Some(super::PendingBrowserLogin {
+            login_id: start.login_id,
+            provider: start.provider,
+            default_saved: None,
+            phase: super::PendingBrowserLoginPhase::Authorizing {
+                authorization_url: start.authorization_url,
+                task,
+            },
+        });
+        true
+    }
     fn info(&mut self, line: String) {
         self.app.system(line);
     }
@@ -297,6 +331,20 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let tx = self.app.tx.clone();
         Box::new(move |tokens| {
             let _ = tx.send(TurnMsg::ContextWindow(tokens));
+        })
+    }
+    fn context_window_poster_for(
+        &self,
+        provider: Option<String>,
+        model: String,
+    ) -> Box<dyn Fn(u32) + Send> {
+        let tx = self.app.tx.clone();
+        Box::new(move |tokens| {
+            let _ = tx.send(TurnMsg::ContextWindowFor(
+                provider.clone(),
+                model.clone(),
+                tokens,
+            ));
         })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
@@ -476,16 +524,8 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.login = Some(wizard);
     }
     fn begin_model_selector(&mut self) {
-        let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
-        if choices.is_empty() {
-            self.info(
-                "no models to choose from yet — configure a provider (or run a turn so the \
-                 models.dev catalog is cached), then try /model again"
-                    .to_string(),
-            );
-            return;
-        }
-        self.app.model_selector = Some(super::ModelSelector::new(choices));
+        self.app.model_selector = Some(super::ModelSelector::loading());
+        self.app.spawn_model_choices(false);
     }
     fn begin_session_selector(&mut self) {
         // Every directory's sessions, newest first — the cwd column tells them
@@ -528,8 +568,14 @@ impl super::App {
         use crossterm::event::{KeyCode, KeyModifiers};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.model_selector = None,
-            KeyCode::Char('c') if ctrl => self.model_selector = None,
+            KeyCode::Esc => {
+                self.model_selector = None;
+                self.model_selector_generation = self.model_selector_generation.wrapping_add(1);
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.model_selector = None;
+                self.model_selector_generation = self.model_selector_generation.wrapping_add(1);
+            }
             KeyCode::Up => {
                 if let Some(s) = &mut self.model_selector {
                     s.up();
@@ -549,6 +595,7 @@ impl super::App {
             // the config default (provider + model), so it sticks next launch.
             KeyCode::Enter => self.apply_selected_model(false),
             KeyCode::Char('d') if ctrl => self.apply_selected_model(true),
+            KeyCode::Char('r') if ctrl => self.spawn_model_choices(true),
             KeyCode::Char(ch) if !ctrl => {
                 if let Some(s) = &mut self.model_selector {
                     s.push_char(ch);
@@ -572,6 +619,7 @@ impl super::App {
             return;
         };
         self.model_selector = None;
+        self.model_selector_generation = self.model_selector_generation.wrapping_add(1);
         if set_default {
             self.persist_setting("provider", hrdr_agent::ConfigValue::Str(&c.provider));
             self.persist_setting("model", hrdr_agent::ConfigValue::Str(&c.model));
@@ -579,7 +627,8 @@ impl super::App {
         // Scope the host borrow so the confirmation line can be pushed after.
         let line = {
             let mut host = TuiHost { app: self };
-            match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone()) {
+            match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone(), c.context_window)
+            {
                 Ok(()) => {
                     // Bump the selection count (selector ordering).
                     hrdr_agent::record_model_use(&c.provider, &c.model);

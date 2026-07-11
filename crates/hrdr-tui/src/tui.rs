@@ -64,6 +64,7 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
         // A detached sub-agent that finished while the agent was idle wakes it,
         // so its result reaches the model without waiting for the user to type.
         app.maybe_deliver_background();
+        app.poll_browser_login().await;
         terminal.draw(|f| ui::draw(f, app))?;
         sync_cursor(
             terminal.backend_mut(),
@@ -71,6 +72,7 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
             &mut cursor_insert,
         )?;
         if app.should_quit {
+            app.finish_pending_browser_login().await;
             // Reap a turn cancelled on the quit path first: awaiting the aborted
             // task drops its future and releases the agent lock, so the save
             // below can't lose the race and skip. Then the final save — a
@@ -105,7 +107,10 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
                     app.editor.paste(&text);
                 }
                 Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
+                Some(Err(_)) | None => {
+                    app.finish_pending_browser_login().await;
+                    break;
+                },
             },
             Some(msg) = rx.recv() => {
                 app.on_turn_msg(msg);

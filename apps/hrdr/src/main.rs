@@ -258,9 +258,17 @@ async fn main() -> Result<()> {
         // Key precedence: inline > key_env var > credential saved by `/login`.
         if let Some(key) = hrdr_agent::resolve_api_key(name, &p, None, None) {
             config.api_key = Some(key);
-        } else if p.remote && config.api_key.is_none() {
-            let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
-            eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
+        } else if matches!(
+            hrdr_agent::provider_auth_state(name, &p),
+            hrdr_agent::ProviderAuthState::Missing
+        ) && config.api_key.is_none()
+        {
+            if p.kind == hrdr_agent::ResolvedProviderKind::ChatGptOAuth {
+                eprintln!("hrdr: provider '{name}' needs ChatGPT authorization — run /login");
+            } else {
+                let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
+                eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
+            }
         }
         // Provider's default model, unless the user set one explicitly.
         let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
@@ -272,6 +280,11 @@ async fn main() -> Result<()> {
         }
         config.headers = p.headers.into_iter().collect();
         config.api_version = p.api_version;
+        config.provider_kind = if base_overridden {
+            hrdr_agent::ResolvedProviderKind::Unresolved
+        } else {
+            p.kind
+        };
         remote_provider = p.remote;
         // Record which provider is in force (`--provider` may have overridden
         // the config's). The status bar, the session header, and saved sessions

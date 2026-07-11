@@ -165,6 +165,9 @@ pub struct Client {
     params: crate::RequestParams,
     /// Extra HTTP headers (provider-configured) sent with every request.
     extra_headers: Vec<(String, String)>,
+    /// OAuth-managed ChatGPT account identity, kept separate from provider
+    /// headers so switching accounts/providers cannot leave a stale value.
+    oauth_account_id: Option<String>,
     /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
     /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
     /// the OpenAI chat-completions wire, just a different URL + auth).
@@ -257,6 +260,7 @@ impl Client {
             effort: None,
             params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
+            oauth_account_id: None,
             api_version: None,
             backend,
         }
@@ -314,6 +318,10 @@ impl Client {
     /// Set the provider-configured extra headers sent with every request.
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
         self.extra_headers = headers;
+    }
+
+    pub fn set_oauth_account_id(&mut self, account_id: Option<String>) {
+        self.oauth_account_id = account_id;
     }
 
     /// Set the Azure OpenAI API version (enables the Azure URL + `api-key` auth
@@ -453,6 +461,10 @@ impl Client {
             return Ok(stream);
         }
         if self.backend == Backend::Codex {
+            let mut headers = self.extra_headers.clone();
+            if let Some(account_id) = &self.oauth_account_id {
+                headers.push(("ChatGPT-Account-Id".to_string(), account_id.clone()));
+            }
             let (body, stream) = crate::codex::chat_stream(
                 &self.http,
                 &self.base_url,
@@ -462,9 +474,9 @@ impl Client {
                 self.temperature,
                 self.params.top_p,
                 self.params.max_tokens,
-                // `ChatGPT-Account-Id` rides here (set via `set_headers`);
+                // `ChatGPT-Account-Id` rides here from OAuth-managed state;
                 // `originator: hrdr` + `Authorization: Bearer` are added inside.
-                &self.extra_headers,
+                &headers,
                 messages,
                 tools,
             )

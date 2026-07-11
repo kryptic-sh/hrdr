@@ -5,6 +5,23 @@ use std::pin::Pin;
 /// spawns it on its runtime and pipes the result to its transcript.
 pub type LineFuture = Pin<Box<dyn Future<Output = String> + Send>>;
 
+pub type BrowserLoginFuture = Pin<Box<dyn Future<Output = BrowserLoginOutcome> + Send>>;
+
+#[derive(Debug, Clone)]
+pub struct BrowserLoginOutcome {
+    pub login_id: u64,
+    pub provider: String,
+    pub token_saved: bool,
+    pub error: Option<String>,
+}
+
+pub struct BrowserLoginStart {
+    pub login_id: u64,
+    pub provider: String,
+    pub authorization_url: String,
+    pub future: BrowserLoginFuture,
+}
+
 /// How an async result line should be displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {

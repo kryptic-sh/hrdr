@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, Notify};
 
 // ── OpenAI (Codex) constants — mirror codex.ts ──────────────────────────────
 
@@ -44,6 +46,16 @@ const PKCE_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 const PKCE_VERIFIER_LEN: usize = 64;
 /// The callback server gives up after this long (matches codex.ts).
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Stable credential-store key shared by the built-in ChatGPT aliases.
+pub fn canonical_provider_key(provider: &str) -> Option<&'static str> {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "chatgpt" | "codex" | "openai-oauth"
+    )
+    .then_some("chatgpt")
+}
 
 // ── PKCE ────────────────────────────────────────────────────────────────────
 
@@ -86,13 +98,22 @@ pub fn generate_state() -> String {
 /// anything without a `code`/`error` query (favicon probes and the like), and
 /// on the real callback returns a small success (or error) page to the browser.
 pub async fn await_oauth_code(port: u16, expected_state: &str) -> Result<String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("binding 127.0.0.1:{port} for the OAuth callback"))?;
-    match tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, expected_state)).await {
+    match tokio::time::timeout(
+        CALLBACK_TIMEOUT,
+        await_oauth_code_unbounded(port, expected_state),
+    )
+    .await
+    {
         Ok(res) => res,
         Err(_) => bail!("timed out waiting for the OAuth callback (5 minutes)"),
     }
+}
+
+pub async fn await_oauth_code_unbounded(port: u16, expected_state: &str) -> Result<String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{port} for the OAuth callback"))?;
+    accept_callback(&listener, expected_state).await
 }
 
 /// Accept connections until one is the OAuth callback, then resolve it.
@@ -302,6 +323,7 @@ async fn post_token(params: &[(&str, &str)]) -> Result<OpenAiTokens> {
     let url = format!("{OPENAI_ISSUER}/oauth/token");
     let resp = reqwest::Client::new()
         .post(&url)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
         .form(params)
         .send()
         .await
@@ -365,6 +387,37 @@ pub struct OAuthCreds {
     pub account_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthAccess {
+    pub access: String,
+    pub account_id: Option<String>,
+    pub persistence_warning: Option<String>,
+}
+
+#[derive(Default)]
+struct CredentialState {
+    generation: u64,
+    completion: u64,
+    latest: Option<OAuthCreds>,
+    refreshing: bool,
+    last_result: Option<(u64, Result<OAuthAccess, String>)>,
+}
+
+struct CredentialCoordinator {
+    state: Mutex<CredentialState>,
+    changed: Notify,
+}
+
+fn coordinator() -> &'static Arc<CredentialCoordinator> {
+    static COORDINATOR: OnceLock<Arc<CredentialCoordinator>> = OnceLock::new();
+    COORDINATOR.get_or_init(|| {
+        Arc::new(CredentialCoordinator {
+            state: Mutex::new(CredentialState::default()),
+            changed: Notify::new(),
+        })
+    })
+}
+
 /// Path to the OAuth token store (`~/.config/hrdr/oauth.json`), if `HOME` is set.
 pub fn oauth_file_path() -> Option<PathBuf> {
     Some(crate::config_dir()?.join("oauth.json"))
@@ -372,15 +425,48 @@ pub fn oauth_file_path() -> Option<PathBuf> {
 
 /// Persist `creds` for `provider` (atomic write, `0600` on unix), preserving any
 /// other providers' entries. Returns the file path.
-pub fn save_oauth(provider: &str, creds: &OAuthCreds) -> Result<PathBuf> {
+pub(crate) fn save_oauth(provider: &str, creds: &OAuthCreds) -> Result<PathBuf> {
     let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate oauth.json"))?;
-    save_oauth_at(&path, provider, creds)?;
+    let key = canonical_provider_key(provider).unwrap_or(provider);
+    save_oauth_at(&path, key, creds)?;
     Ok(path)
+}
+
+/// Install credentials from a completed browser login without allowing an
+/// older in-flight refresh to overwrite them.
+pub async fn save_oauth_coordinated(provider: &str, creds: OAuthCreds) -> Result<PathBuf> {
+    if canonical_provider_key(provider).is_none() {
+        bail!("provider does not support ChatGPT authorization");
+    }
+    let mut state = coordinator().state.lock().await;
+    state.generation = state.generation.wrapping_add(1);
+    state.latest = Some(creds.clone());
+    let saved = save_oauth(provider, &creds);
+    drop(state);
+    coordinator().changed.notify_waiters();
+    saved
 }
 
 /// The stored OAuth credentials for `provider`, if any.
 pub fn load_oauth(provider: &str) -> Option<OAuthCreds> {
-    load_oauth_at(&oauth_file_path()?, provider)
+    let path = oauth_file_path()?;
+    let key = canonical_provider_key(provider).unwrap_or(provider);
+    load_oauth_at(&path, key).or_else(|| {
+        (key != provider)
+            .then(|| load_oauth_at(&path, provider))
+            .flatten()
+    })
+}
+
+/// Whether stored credentials can authenticate synchronously: a safely valid
+/// access token, or a refresh token capable of replacing an expired one.
+pub fn has_oauth_credentials(provider: &str) -> bool {
+    load_oauth(provider).is_some_and(|creds| oauth_credentials_usable(&creds, now_ms()))
+}
+
+fn oauth_credentials_usable(creds: &OAuthCreds, now: u64) -> bool {
+    (!creds.access.trim().is_empty() && !access_expired(creds.expires_ms, now))
+        || !creds.refresh.trim().is_empty()
 }
 
 /// Path-based core of [`save_oauth`].
@@ -409,27 +495,112 @@ fn load_all(path: &Path) -> HashMap<String, OAuthCreds> {
 /// A valid access token for `provider`, refreshing it first if it has (or is
 /// about to) expire. Returns `(access, account_id)`, or `None` when there are no
 /// stored credentials or a needed refresh fails.
-pub async fn valid_access_token(provider: &str) -> Option<(String, Option<String>)> {
-    let creds = load_oauth(provider)?;
-    if !access_expired(creds.expires_ms, now_ms()) {
-        return Some((creds.access, creds.account_id));
+pub async fn valid_access_token_result(provider: &str) -> Result<OAuthAccess> {
+    if canonical_provider_key(provider).is_none() {
+        bail!("provider does not support ChatGPT authorization");
     }
-    // Expired (or within the safety margin): refresh, persist, and return fresh.
-    let tokens = openai_refresh(&creds.refresh).await.ok()?;
+    let coordinator = coordinator().clone();
+    loop {
+        let disk_creds = load_oauth(provider);
+        let notified = coordinator.changed.notified();
+        let (creds, generation, completion) = {
+            let mut state = coordinator.state.lock().await;
+            let creds = state.latest.clone().or(disk_creds);
+            let Some(creds) = creds else {
+                bail!("no saved ChatGPT authorization");
+            };
+            if !access_expired(creds.expires_ms, now_ms()) && !creds.access.trim().is_empty() {
+                state.latest = Some(creds.clone());
+                return Ok(OAuthAccess {
+                    access: creds.access,
+                    account_id: creds.account_id,
+                    persistence_warning: None,
+                });
+            }
+            if creds.refresh.trim().is_empty() {
+                bail!("saved ChatGPT authorization is expired and cannot be refreshed");
+            }
+            if state.refreshing {
+                let completion = state.completion;
+                drop(state);
+                notified.await;
+                let state = coordinator.state.lock().await;
+                if let Some((finished, result)) = &state.last_result
+                    && *finished > completion
+                {
+                    return result.clone().map_err(anyhow::Error::msg);
+                }
+                continue;
+            }
+            state.refreshing = true;
+            (creds, state.generation, state.completion)
+        };
+
+        let fresh = match refresh_creds(&creds).await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                let mut state = coordinator.state.lock().await;
+                if state.generation != generation {
+                    state.refreshing = false;
+                    state.completion = completion.wrapping_add(1);
+                    state.last_result = None;
+                    coordinator.changed.notify_waiters();
+                    continue;
+                }
+                state.refreshing = false;
+                state.completion = completion.wrapping_add(1);
+                let result = Err(error.to_string());
+                state.last_result = Some((state.completion, result.clone()));
+                coordinator.changed.notify_waiters();
+                return result.map_err(anyhow::Error::msg);
+            }
+        };
+        let mut state = coordinator.state.lock().await;
+        if state.generation != generation {
+            state.refreshing = false;
+            state.completion = completion.wrapping_add(1);
+            state.last_result = None;
+            coordinator.changed.notify_waiters();
+            continue;
+        }
+        state.latest = Some(fresh.clone());
+        let persistence_warning = save_oauth(provider, &fresh)
+            .err()
+            .map(|e| format!("refreshed authorization is active but could not be saved: {e}"));
+        let result = Ok(OAuthAccess {
+            access: fresh.access,
+            account_id: fresh.account_id,
+            persistence_warning,
+        });
+        state.refreshing = false;
+        state.completion = completion.wrapping_add(1);
+        state.last_result = Some((state.completion, result.clone()));
+        coordinator.changed.notify_waiters();
+        return result.map_err(anyhow::Error::msg);
+    }
+}
+
+async fn refresh_creds(creds: &OAuthCreds) -> Result<OAuthCreds> {
+    let tokens = openai_refresh(&creds.refresh).await?;
     let account_id = tokens
         .id_token
         .as_deref()
         .and_then(parse_account_id)
         .or_else(|| parse_account_id(&tokens.access_token))
-        .or(creds.account_id);
-    let fresh = OAuthCreds {
+        .or_else(|| creds.account_id.clone());
+    Ok(OAuthCreds {
         access: tokens.access_token,
         refresh: tokens.refresh_token,
         expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
         account_id,
-    };
-    let _ = save_oauth(provider, &fresh);
-    Some((fresh.access, fresh.account_id))
+    })
+}
+
+pub async fn valid_access_token(provider: &str) -> Option<(String, Option<String>)> {
+    valid_access_token_result(provider)
+        .await
+        .ok()
+        .map(|token| (token.access, token.account_id))
 }
 
 /// Whether an access token expiring at `expires_ms` should be treated as
@@ -665,6 +836,41 @@ mod tests {
         assert!(access_expired(1_000_000, 950_000));
         // Exactly 60s + 1ms out → still valid.
         assert!(!access_expired(1_000_000, 939_999));
+    }
+
+    #[test]
+    fn oauth_readiness_is_time_aware() {
+        let creds = |access: &str, refresh: &str, expires_ms| OAuthCreds {
+            access: access.to_string(),
+            refresh: refresh.to_string(),
+            expires_ms,
+            account_id: None,
+        };
+        assert!(oauth_credentials_usable(
+            &creds("access", "", 1_000_000),
+            900_000
+        ));
+        assert!(oauth_credentials_usable(&creds("", "refresh", 0), 900_000));
+        assert!(oauth_credentials_usable(
+            &creds("expired", "refresh", 1),
+            900_000
+        ));
+        assert!(!oauth_credentials_usable(&creds("expired", "", 1), 900_000));
+        assert!(!oauth_credentials_usable(&creds("", "", 0), 900_000));
+    }
+
+    #[test]
+    fn chatgpt_aliases_share_a_canonical_key() {
+        for alias in ["chatgpt", "codex", "openai-oauth", "ChatGPT"] {
+            assert_eq!(canonical_provider_key(alias), Some("chatgpt"));
+        }
+        assert_eq!(canonical_provider_key("openai"), None);
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_non_chatgpt_provider() {
+        let error = valid_access_token_result("custom").await.unwrap_err();
+        assert!(error.to_string().contains("does not support"));
     }
 
     // ── Store round-trip ─────────────────────────────────────────────────────

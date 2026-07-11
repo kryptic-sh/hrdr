@@ -1415,7 +1415,7 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
         .expect("the probe posts a context window")
         .expect("the channel is open");
     assert!(
-        matches!(msg, TurnMsg::ContextWindow(w) if w == MOCK_CONTEXT_WINDOW),
+        matches!(msg, TurnMsg::ContextWindowFor(_, _, w) if w == MOCK_CONTEXT_WINDOW),
         "the probe posts the endpoint's advertised window"
     );
     h.app.on_turn_msg(msg);
@@ -3789,12 +3789,14 @@ async fn model_selector_renders_columns_filters_and_closes() {
             model: "claude-fable-5".into(),
             provider_label: "OpenCode Zen".into(),
             model_label: "Claude Fable 5.0".into(),
+            context_window: None,
         },
         hrdr_agent::ModelChoice {
             provider: "go".into(),
             model: "deepseek-v4-pro".into(),
             provider_label: "OpenCode Go".into(),
             model_label: "DeepSeek V4 Pro".into(),
+            context_window: None,
         },
     ];
     h.app.model_selector = Some(crate::app::ModelSelector::new(choices));
@@ -3832,6 +3834,110 @@ async fn model_selector_renders_columns_filters_and_closes() {
     h.press(KeyCode::Esc);
     assert!(h.app.model_selector.is_none(), "Esc closes the selector");
     assert!(!h.render().contains("Search"), "modal is gone after Esc");
+}
+
+#[tokio::test]
+async fn browser_login_banner_keeps_url_out_of_transcript_and_cancels() {
+    let mut h = Harness::new(vec![]).await;
+    let url = "https://auth.example/authorize?secret=query".to_string();
+    let task =
+        tokio::spawn(async { std::future::pending::<hrdr_app::BrowserLoginOutcome>().await });
+    h.app.pending_browser_login = Some(super::PendingBrowserLogin {
+        login_id: 7,
+        provider: "chatgpt".to_string(),
+        default_saved: None,
+        phase: super::PendingBrowserLoginPhase::Authorizing {
+            authorization_url: url.clone(),
+            task,
+        },
+    });
+    let screen = h.render();
+    assert!(screen.contains("Authorizing chatgpt"));
+    assert!(screen.contains("c copy login URL"));
+    assert!(!screen.contains(&url));
+    assert!(!serde_json::to_string(&h.app.state).unwrap().contains(&url));
+
+    h.app.cancel_pending_browser_login();
+    assert!(h.app.pending_browser_login.is_none());
+    assert!(!serde_json::to_string(&h.app.state).unwrap().contains(&url));
+}
+
+#[tokio::test]
+async fn browser_switch_is_non_cancellable_and_shutdown_reduces_it() {
+    let mut h = Harness::new(vec![]).await;
+    let provider = hrdr_agent::builtin_provider("chatgpt").unwrap();
+    let applied = super::BrowserSwitchApplied {
+        provider,
+        provider_name: "chatgpt".to_string(),
+        model: "gpt-test".to_string(),
+    };
+    h.app.pending_browser_login = Some(super::PendingBrowserLogin {
+        login_id: 9,
+        provider: "chatgpt".to_string(),
+        default_saved: Some(true),
+        phase: super::PendingBrowserLoginPhase::Switching {
+            task: tokio::spawn(async move { (9, Ok(applied)) }),
+        },
+    });
+
+    h.app.cancel_pending_browser_login();
+    assert!(
+        h.app.pending_browser_login.is_some(),
+        "switch commit cannot be aborted"
+    );
+    h.app.finish_pending_browser_login().await;
+    assert!(h.app.pending_browser_login.is_none());
+    assert_eq!(h.app.state.provider.as_deref(), Some("chatgpt"));
+    assert_eq!(h.app.state.model, "gpt-test");
+}
+
+#[tokio::test]
+async fn stale_browser_switch_id_cannot_mutate_session() {
+    let mut h = Harness::new(vec![]).await;
+    let original_provider = h.app.state.provider.clone();
+    let original_model = h.app.state.model.clone();
+    let applied = super::BrowserSwitchApplied {
+        provider: hrdr_agent::builtin_provider("chatgpt").unwrap(),
+        provider_name: "chatgpt".to_string(),
+        model: "stale-model".to_string(),
+    };
+    h.app.pending_browser_login = Some(super::PendingBrowserLogin {
+        login_id: 10,
+        provider: "chatgpt".to_string(),
+        default_saved: Some(true),
+        phase: super::PendingBrowserLoginPhase::Switching {
+            task: tokio::spawn(async move { (11, Ok(applied)) }),
+        },
+    });
+    tokio::task::yield_now().await;
+    h.app.poll_browser_login().await;
+    assert_eq!(h.app.state.provider, original_provider);
+    assert_eq!(h.app.state.model, original_model);
+}
+
+#[tokio::test]
+async fn typed_cancel_stays_modal_and_never_enters_history() {
+    let mut h = Harness::new(vec![]).await;
+    let task =
+        tokio::spawn(async { std::future::pending::<hrdr_app::BrowserLoginOutcome>().await });
+    h.app.pending_browser_login = Some(super::PendingBrowserLogin {
+        login_id: 12,
+        provider: "chatgpt".to_string(),
+        default_saved: None,
+        phase: super::PendingBrowserLoginPhase::Authorizing {
+            authorization_url: "https://auth.example/exact".to_string(),
+            task,
+        },
+    });
+    h.type_str("/cancel");
+    h.press(KeyCode::Enter);
+    assert!(h.app.pending_browser_login.is_none());
+    assert!(h.app.editor.content().is_empty());
+    assert!(
+        !serde_json::to_string(&h.app.state)
+            .unwrap()
+            .contains("auth.example")
+    );
 }
 
 /// The `/resume` session picker mirrors the `/model` selector: columns

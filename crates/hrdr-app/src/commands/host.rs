@@ -6,10 +6,22 @@ use hrdr_agent::Agent;
 use tokio::sync::Mutex;
 
 use super::dispatch::open_system_handler;
-use super::types::{ExpandMode, LineFuture, LineKind};
+use super::types::{BrowserLoginStart, ExpandMode, LineFuture, LineKind};
 
 /// The capabilities a frontend exposes so the shared commands can drive it.
 pub trait CommandHost {
+    fn begin_browser_login(&mut self, start: BrowserLoginStart) -> bool {
+        let poster = self.line_poster();
+        tokio::spawn(async move {
+            let result = start.future.await;
+            let line = result.error.map_or_else(
+                || format!("authorization saved for {}", result.provider),
+                |error| format!("{} login failed: {error}", result.provider),
+            );
+            poster(LineKind::System, line);
+        });
+        true
+    }
     /// Emit a system line immediately (on the UI thread).
     fn info(&mut self, line: String);
     /// Spawn `fut`; when it resolves, show its non-empty string as a system line.
@@ -261,6 +273,13 @@ pub trait CommandHost {
     /// switch can honor the new model's advertised max context.
     fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
         Box::new(|_| {})
+    }
+    fn context_window_poster_for(
+        &self,
+        _provider: Option<String>,
+        _model: String,
+    ) -> Box<dyn Fn(u32) + Send> {
+        self.context_window_poster()
     }
 
     /// Begin the `/login` wizard. A frontend that supports it stashes

@@ -147,9 +147,27 @@ impl super::App {
         // The resumed session's saved spend is the display base; the agent's
         // live counter tracks only what this process spends on top of it.
         self.cost_base = self.state.usage.cost_usd;
+        let provider_identity = self.state.provider.as_deref().map(|name| {
+            let kind = self
+                .cfg
+                .resolve_provider(name)
+                .filter(|provider| {
+                    provider.base_url.trim_end_matches('/')
+                        == self.state.base_url.trim_end_matches('/')
+                })
+                .map_or(hrdr_agent::ResolvedProviderKind::Unresolved, |provider| {
+                    provider.kind
+                });
+            (name.to_string(), kind)
+        });
         self.with_agent(|a| {
             a.set_messages(self.state.messages.clone());
             a.set_model(self.state.model.clone());
+            if let Some((provider, kind)) = provider_identity {
+                a.set_provider(Some(provider), kind);
+            } else {
+                a.set_provider(None, hrdr_agent::ResolvedProviderKind::Unresolved);
+            }
             a.reset_session_cost();
         });
         if let Ok(mut todos) = self.todos.lock() {

@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
@@ -140,7 +140,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // The `/model` selector and `/resume` picker are full modals; when one is
     // open it owns the screen (and every key), so the completion popup stands
     // down.
-    if let Some(sel) = &app.model_selector {
+    if let Some(pending) = &app.pending_browser_login {
+        draw_browser_login(f, &app.theme, pending);
+    } else if let Some(sel) = &app.model_selector {
         draw_model_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.session_selector {
         draw_session_selector(f, &app.theme, sel);
@@ -153,6 +155,53 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
         draw_completion(f, app, chunks[input_idx], &comp);
     }
+}
+
+fn draw_browser_login(f: &mut Frame, theme: &Theme, pending: &crate::app::PendingBrowserLogin) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 72);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: area.height.saturating_sub(7) / 2,
+        width,
+        height: 7.min(area.height),
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let text = Text::from(vec![
+        Line::styled(
+            format!(
+                "{} {}…",
+                if matches!(
+                    pending.phase,
+                    crate::app::PendingBrowserLoginPhase::Authorizing { .. }
+                ) {
+                    "Authorizing"
+                } else {
+                    "Switching to"
+                },
+                pending.provider
+            ),
+            Style::default().fg(theme.user),
+        ),
+        Line::from(""),
+        Line::styled(
+            if matches!(
+                &pending.phase,
+                crate::app::PendingBrowserLoginPhase::Authorizing { .. }
+            ) {
+                "c copy login URL · Esc or /cancel cancel"
+            } else {
+                "finishing login switch · please wait"
+            },
+            Style::default().fg(theme.dim),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
 }
 
 /// The `/model` selector modal: a search line, a hint, and a two-column list
@@ -188,9 +237,16 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
     ]);
     let hint = Line::from(Span::styled(
         format!(
-            "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel",
+            "{}{} model{}{} · ↑↓ select · Enter switch · ^D default · ^R refresh · Esc cancel",
+            if sel.loading { "loading · " } else { "" },
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
+            match sel.source {
+                Some(hrdr_agent::CatalogSource::Fresh) => " · ChatGPT fresh",
+                Some(hrdr_agent::CatalogSource::Stale) => " · ChatGPT stale",
+                Some(hrdr_agent::CatalogSource::BuiltInFallback) => " · ChatGPT fallback",
+                None => "",
+            },
         ),
         Style::default().fg(theme.dim),
     ));

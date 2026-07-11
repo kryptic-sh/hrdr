@@ -13,6 +13,8 @@ pub(crate) struct ModelSelector {
     filtered: Vec<usize>,
     /// Selected row within `filtered`.
     pub(crate) selected: usize,
+    pub(crate) loading: bool,
+    pub(crate) source: Option<hrdr_agent::CatalogSource>,
 }
 
 impl ModelSelector {
@@ -23,7 +25,39 @@ impl ModelSelector {
             filter: String::new(),
             filtered,
             selected: 0,
+            loading: false,
+            source: None,
         }
+    }
+
+    pub(crate) fn loading() -> Self {
+        let mut selector = Self::new(Vec::new());
+        selector.loading = true;
+        selector
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        choices: Vec<ModelChoice>,
+        source: Option<hrdr_agent::CatalogSource>,
+    ) {
+        let selected = self
+            .current()
+            .map(|c| (c.provider.clone(), c.model.clone()));
+        self.choices = choices;
+        self.filtered = filter_model_choices(&self.choices, &self.filter);
+        self.selected = selected
+            .and_then(|needle| {
+                self.filtered.iter().position(|&i| {
+                    (
+                        self.choices[i].provider.clone(),
+                        self.choices[i].model.clone(),
+                    ) == needle
+                })
+            })
+            .unwrap_or(0);
+        self.loading = false;
+        self.source = source;
     }
 
     fn refilter(&mut self) {
@@ -72,6 +106,7 @@ mod tests {
             model: model.to_string(),
             provider_label: provider.to_string(),
             model_label: model.to_string(),
+            context_window: None,
         }
     }
 
@@ -110,5 +145,27 @@ mod tests {
             s.push_char(c);
         }
         assert!(s.current().is_none());
+    }
+
+    #[test]
+    fn loading_replacement_preserves_filter_and_selection() {
+        let mut selector = ModelSelector::loading();
+        selector.push_char('g');
+        selector.replace(
+            vec![choice("gpt-5", "chatgpt"), choice("claude", "anthropic")],
+            Some(hrdr_agent::CatalogSource::Fresh),
+        );
+        assert!(!selector.loading);
+        assert_eq!(selector.source, Some(hrdr_agent::CatalogSource::Fresh));
+        assert_eq!(selector.filter, "g");
+        assert_eq!(selector.rows().count(), 1);
+        assert_eq!(selector.current().unwrap().model, "gpt-5");
+
+        selector.replace(
+            vec![choice("gpt-5", "chatgpt"), choice("gemini", "google")],
+            Some(hrdr_agent::CatalogSource::Stale),
+        );
+        assert_eq!(selector.current().unwrap().model, "gpt-5");
+        assert_eq!(selector.source, Some(hrdr_agent::CatalogSource::Stale));
     }
 }

@@ -15,17 +15,23 @@ pub use auth::{
 };
 mod oauth;
 pub use oauth::{
-    OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI,
-    OpenAiTokens, await_oauth_code, generate_pkce, generate_state, load_oauth, oauth_file_path,
-    openai_authorize_url, openai_exchange, openai_refresh, openrouter_authorize_url,
-    openrouter_exchange, parse_account_id, save_oauth, valid_access_token,
+    OAuthAccess, OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT,
+    OPENAI_REDIRECT_URI, OpenAiTokens, await_oauth_code, await_oauth_code_unbounded, generate_pkce,
+    generate_state, load_oauth, oauth_file_path, openai_authorize_url, openai_exchange,
+    openai_refresh, openrouter_authorize_url, openrouter_exchange, parse_account_id,
+    save_oauth_coordinated, valid_access_token, valid_access_token_result,
 };
 mod paths;
 pub use paths::cwd_slug;
+mod chatgpt_models;
 mod models;
+pub use chatgpt_models::{
+    CODEX_CATALOG_COMPAT_VERSION, CatalogSource, ChatGptCatalogResult, ChatGptModel,
+    load_chatgpt_catalog,
+};
 pub use models::{
-    ModelChoice, builtin_catalog_key, filter_model_choices, load_last_model, load_model_usage,
-    model_choices, record_last_model, record_model_use,
+    ModelChoice, ModelChoicesResult, builtin_catalog_key, filter_model_choices, load_last_model,
+    load_model_choices, load_model_usage, model_choices, record_last_model, record_model_use,
 };
 
 use std::collections::HashMap;
@@ -371,6 +377,8 @@ pub fn config_for_agent_profile(
             )
         })?;
         cfg.base_url = p.base_url.clone();
+        cfg.provider = Some(pname.to_string());
+        cfg.provider_kind = p.kind;
         cfg.api_key = resolve_api_key(
             pname,
             &p,
@@ -738,6 +746,9 @@ pub struct AgentConfig {
     /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
+    /// Trusted provider identity. Unlike `provider`, this cannot be conferred by
+    /// a user-controlled provider name that shadows a built-in.
+    pub provider_kind: ResolvedProviderKind,
     /// `model` was set by a CLI flag or `$HRDR_MODEL`, which outrank a resumed
     /// session's model. A value from the config file (or a provider preset's
     /// default) leaves this false, so a session may override it.
@@ -1205,6 +1216,7 @@ impl Default for AgentConfig {
             max_steps: 50,
             max_cost: None,
             provider: None,
+            provider_kind: ResolvedProviderKind::Unresolved,
             context_window: None,
             max_tokens: None,
             top_p: None,
@@ -1256,6 +1268,7 @@ impl AgentConfig {
             .find(|(k, _)| k.to_ascii_lowercase() == lname)
         {
             return Some(ResolvedProvider {
+                kind: ResolvedProviderKind::Custom,
                 base_url: c.base_url.clone(),
                 key_env: c.key_env.clone(),
                 api_key: c.api_key.clone(),
@@ -1375,6 +1388,7 @@ fn default_hook_on() -> String {
 /// A fully-resolved provider preset.
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
+    pub kind: ResolvedProviderKind,
     pub base_url: String,
     pub key_env: Option<String>,
     pub api_key: Option<String>,
@@ -1385,6 +1399,42 @@ pub struct ResolvedProvider {
     pub headers: HashMap<String, String>,
     /// Azure OpenAI API version, if this is an Azure endpoint.
     pub api_version: Option<String>,
+}
+
+/// Security-relevant origin of a resolved provider preset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResolvedProviderKind {
+    ChatGptOAuth,
+    BuiltIn,
+    Custom,
+    Keyless,
+    #[default]
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthState {
+    Key,
+    OAuth,
+    Keyless,
+    Missing,
+}
+
+pub fn provider_auth_state(provider: &str, resolved: &ResolvedProvider) -> ProviderAuthState {
+    if resolved.kind == ResolvedProviderKind::ChatGptOAuth {
+        return if oauth::has_oauth_credentials(provider) {
+            ProviderAuthState::OAuth
+        } else {
+            ProviderAuthState::Missing
+        };
+    }
+    if resolve_api_key(provider, resolved, None, None).is_some() {
+        ProviderAuthState::Key
+    } else if !resolved.remote {
+        ProviderAuthState::Keyless
+    } else {
+        ProviderAuthState::Missing
+    }
 }
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
@@ -1447,6 +1497,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         "chatgpt" | "codex" | "openai-oauth"
     ) {
         return Some(ResolvedProvider {
+            kind: ResolvedProviderKind::ChatGptOAuth,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             key_env: None,
             api_key: None,
@@ -1471,6 +1522,11 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         _ => return None,
     };
     Some(ResolvedProvider {
+        kind: if remote {
+            ResolvedProviderKind::BuiltIn
+        } else {
+            ResolvedProviderKind::Keyless
+        },
         base_url: base_url.to_string(),
         key_env: Some(key_env.to_string()),
         api_key: None,
@@ -2170,6 +2226,7 @@ pub struct Agent {
     /// keyed `provider/model`, so the fallback probe needs it to disambiguate a
     /// model several providers serve with different context windows.
     provider: Option<String>,
+    provider_kind: ResolvedProviderKind,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -2492,6 +2549,7 @@ impl Agent {
         Ok(Self {
             client,
             provider: config.provider.clone(),
+            provider_kind: config.provider_kind,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -2699,8 +2757,12 @@ impl Agent {
 
     /// Repoint the agent at a named provider (for the catalog lookup; the
     /// endpoint itself is set by [`Self::set_endpoint`]).
-    pub fn set_provider(&mut self, provider: Option<String>) {
+    pub fn set_provider(&mut self, provider: Option<String>, kind: ResolvedProviderKind) {
         self.provider = provider;
+        self.provider_kind = kind;
+        if kind != ResolvedProviderKind::ChatGptOAuth {
+            self.client.set_oauth_account_id(None);
+        }
     }
 
     /// A clone of the model client (for out-of-band calls like the startup
@@ -2746,10 +2808,18 @@ impl Agent {
     }
 
     pub async fn probe_context_window(&self) -> Option<u32> {
-        if let Some(n) = self.client.context_window().await {
+        Self::probe_context_window_for(self.client.clone(), self.provider.clone()).await
+    }
+
+    pub async fn probe_context_window_for(client: Client, provider: Option<String>) -> Option<u32> {
+        if let Some(n) = client.context_window().await {
             return Some(n);
         }
-        hrdr_llm::catalog::context_window(self.provider.as_deref(), &self.client.model).await
+        hrdr_llm::catalog::context_window(provider.as_deref(), &client.model).await
+    }
+
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     /// Working directory the tools operate in.
@@ -2832,6 +2902,7 @@ impl Agent {
         let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &base_url);
         self.client.set_base_url(base_url);
         self.client.set_api_key(api_key);
+        self.client.set_oauth_account_id(None);
         self.client.set_cache(cache);
     }
 
@@ -3374,17 +3445,25 @@ impl Agent {
     /// current one is near expiry — and set the `ChatGPT-Account-Id` header. A
     /// no-op for every key-based provider (no OAuth creds are stored for it), so
     /// it costs at most one fast missing-file check per request.
-    async fn refresh_oauth_if_needed(&mut self) {
-        let Some(provider) = self.provider.clone() else {
-            return;
-        };
-        if let Some((access, account_id)) = oauth::valid_access_token(&provider).await {
-            self.client.set_api_key(Some(access));
-            if let Some(id) = account_id {
-                self.client
-                    .set_headers(vec![("ChatGPT-Account-Id".to_string(), id)]);
-            }
+    async fn refresh_oauth_if_needed(&mut self) -> Result<Option<String>> {
+        if self.provider_kind != ResolvedProviderKind::ChatGptOAuth
+            || self.client.base_url().trim_end_matches('/')
+                != "https://chatgpt.com/backend-api/codex"
+        {
+            return Ok(None);
         }
+        let Some(provider) = self.provider.clone() else {
+            return Ok(None);
+        };
+        let token = oauth::valid_access_token_result(&provider)
+            .await
+            .inspect_err(|_error| {
+                self.client.set_api_key(None);
+                self.client.set_oauth_account_id(None);
+            })?;
+        self.client.set_api_key(Some(token.access));
+        self.client.set_oauth_account_id(token.account_id);
+        Ok(token.persistence_warning)
     }
 
     /// Open a chat stream, retrying transient network/server errors with
@@ -3396,7 +3475,9 @@ impl Agent {
         overflow_compacted: &mut bool,
         on_event: &mut F,
     ) -> Result<ChatStream> {
-        self.refresh_oauth_if_needed().await;
+        if let Some(warning) = self.refresh_oauth_if_needed().await? {
+            on_event(AgentEvent::Notice(warning));
+        }
         const MAX_RETRIES: usize = 4;
         let mut attempt = 0usize;
         loop {
@@ -3823,9 +3904,10 @@ mod tests {
     use super::{
         Agent, AgentConfig, AgentEvent, DEFAULT_MAX_READONLY_SUBAGENTS,
         DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
-        PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
-        compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
-        in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
+        PRUNE_PLACEHOLDER, ProviderAuthState, ProviderConfig, ResolvedProviderKind, SubagentSlots,
+        ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
+        estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
+        is_transient, parse_env_bool, provider_auth_state, prune_tool_messages,
         repair_dangling_tool_calls, retry_after_hint, steering_queue, tail_window,
         wants_background,
     };
@@ -3955,6 +4037,8 @@ mod tests {
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(sub.provider.as_deref(), Some("openrouter"));
+        assert_eq!(sub.provider_kind, ResolvedProviderKind::BuiltIn);
         assert_eq!(sub.model, "moonshotai/kimi-k2");
         assert!(!sub.subagents); // still can't nest
         assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));
@@ -4011,6 +4095,7 @@ mod tests {
         // base_url than the parent must NOT receive the parent's key — that
         // would send the parent's credential to a different host.
         let other_provider = ResolvedProvider {
+            kind: ResolvedProviderKind::Custom,
             base_url: "https://openrouter.ai/api/v1".to_string(),
             key_env: None,
             api_key: None,
@@ -4971,6 +5056,7 @@ mod tests {
             assert!(p.key_env.is_none(), "OAuth provider has no key_env");
             assert_eq!(p.model.as_deref(), Some("gpt-5.5"));
             assert!(p.remote);
+            assert_eq!(p.kind, ResolvedProviderKind::ChatGptOAuth);
         }
         assert!(crate::BUILTIN_PROVIDERS.contains(&"chatgpt"));
     }
@@ -4991,6 +5077,10 @@ mod tests {
                 api_version: None,
             },
         );
+        assert_eq!(
+            cfg.resolve_provider("zen").unwrap().kind,
+            ResolvedProviderKind::Custom
+        );
         // Custom "zen" shadows the built-in; an unknown custom name resolves too.
         let p = cfg.resolve_provider("zen").unwrap();
         assert_eq!(p.base_url, "https://my.zen/v1");
@@ -5000,6 +5090,30 @@ mod tests {
         // Built-ins still resolve when not shadowed.
         assert!(cfg.resolve_provider("openai").is_some());
         assert!(cfg.resolve_provider("nope").is_none());
+    }
+
+    #[test]
+    fn custom_non_remote_provider_is_keyless_without_gaining_builtin_trust() {
+        let mut cfg = AgentConfig::default();
+        cfg.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                base_url: "http://localhost:9999/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(false),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        let provider = cfg.resolve_provider("chatgpt").unwrap();
+        assert_eq!(provider.kind, ResolvedProviderKind::Custom);
+        assert_eq!(
+            provider_auth_state("chatgpt", &provider),
+            ProviderAuthState::Keyless
+        );
     }
 
     // ---- parse_env_bool ----

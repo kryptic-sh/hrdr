@@ -16,11 +16,14 @@ pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
     // Remember (current provider, new model) as the last-used combo.
     hrdr_agent::record_last_model(&host.provider().unwrap_or_default(), &name);
     let agent = host.agent();
-    let post = host.context_window_poster();
+    let post = host.context_window_poster_for(host.provider(), name.clone());
     host.spawn_line(Box::pin(async move {
-        let mut a = agent.lock().await;
-        a.set_model(name);
-        if let Some(w) = a.probe_context_window().await {
+        let (client, provider) = {
+            let mut a = agent.lock().await;
+            a.set_model(name);
+            (a.client(), a.provider_name().map(str::to_string))
+        };
+        if let Some(w) = Agent::probe_context_window_for(client, provider).await {
             post(w);
         }
         String::new()
@@ -54,17 +57,23 @@ pub fn apply_provider(
     // Probe the new endpoint for its advertised context window unless the
     // provider config already declares one (which wins).
     let probe_after = p.context_window.is_none();
-    let post = host.context_window_poster();
+    let post = host.context_window_poster_for(
+        Some(name.to_string()),
+        p.model.clone().unwrap_or_else(|| host.model()),
+    );
     host.spawn_line(Box::pin(async move {
-        let mut a = agent.lock().await;
-        a.set_endpoint(url, key);
-        a.set_headers(headers);
-        a.set_api_version(api_version);
-        a.set_provider(Some(provider));
-        if let Some(m) = model {
-            a.set_model(m);
-        }
-        if probe_after && let Some(w) = a.probe_context_window().await {
+        let (client, provider) = {
+            let mut a = agent.lock().await;
+            a.set_endpoint(url, key);
+            a.set_headers(headers);
+            a.set_api_version(api_version);
+            a.set_provider(Some(provider.clone()), p.kind);
+            if let Some(m) = model {
+                a.set_model(m);
+            }
+            (a.client(), Some(provider))
+        };
+        if probe_after && let Some(w) = Agent::probe_context_window_for(client, provider).await {
             post(w);
         }
         String::new()
@@ -92,6 +101,7 @@ pub fn apply_choice(
     host: &mut dyn CommandHost,
     provider_name: &str,
     model: String,
+    choice_context_window: Option<u32>,
 ) -> Result<(), String> {
     let Some(p) = host.resolve_provider(provider_name) else {
         return Err(format!("unknown provider '{provider_name}'"));
@@ -105,24 +115,28 @@ pub fn apply_choice(
     let provider = provider_name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     let api_version = p.api_version.clone();
-    let probe_after = p.context_window.is_none();
-    let post = host.context_window_poster();
+    let context_window = choice_context_window.or(p.context_window);
+    let probe_after = context_window.is_none();
+    let post = host.context_window_poster_for(Some(provider_name.to_string()), model.clone());
     let model_for_agent = model.clone();
     host.spawn_line(Box::pin(async move {
-        let mut a = agent.lock().await;
-        a.set_endpoint(url, key);
-        a.set_headers(headers);
-        a.set_api_version(api_version);
-        a.set_provider(Some(provider));
-        a.set_model(model_for_agent);
-        if probe_after && let Some(w) = a.probe_context_window().await {
+        let (client, provider) = {
+            let mut a = agent.lock().await;
+            a.set_endpoint(url, key);
+            a.set_headers(headers);
+            a.set_api_version(api_version);
+            a.set_provider(Some(provider.clone()), p.kind);
+            a.set_model(model_for_agent);
+            (a.client(), Some(provider))
+        };
+        if probe_after && let Some(w) = Agent::probe_context_window_for(client, provider).await {
             post(w);
         }
         String::new()
     }));
     host.set_model(model.clone());
-    if p.context_window.is_some() {
-        host.set_context_window(p.context_window);
+    if context_window.is_some() {
+        host.set_context_window(context_window);
     }
     host.set_base_url(p.base_url.clone());
     host.set_provider(provider_name.to_string());

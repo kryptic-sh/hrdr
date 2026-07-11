@@ -5,6 +5,9 @@
 //! [`LoginWizard::step`] instead of the model or the slash dispatcher.
 
 use crate::commands::{CommandHost, apply_provider};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_LOGIN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A running `/login` conversation. Cloneable so a frontend can hold it in
 /// whatever state cell it uses.
@@ -47,8 +50,9 @@ fn provider_label(name: &str) -> &'static str {
 
 /// Whether `name` authenticates via an OAuth browser flow rather than a pasted
 /// API key.
-fn is_oauth_login(name: &str) -> bool {
-    matches!(name, "openrouter" | "chatgpt" | "codex" | "openai-oauth")
+fn is_oauth_login(name: &str, kind: hrdr_agent::ResolvedProviderKind) -> bool {
+    kind == hrdr_agent::ResolvedProviderKind::ChatGptOAuth
+        || (kind == hrdr_agent::ResolvedProviderKind::BuiltIn && name == "openrouter")
 }
 
 /// Milliseconds since the Unix epoch, for OAuth token expiry.
@@ -127,7 +131,7 @@ impl LoginWizard {
             return false;
         };
         // OAuth providers log in through the browser, not a pasted key.
-        if is_oauth_login(&name) {
+        if is_oauth_login(&name, p.kind) {
             return start_oauth_login(&name, host);
         }
         // A keyless (self-hosted) endpoint needs no API key — apply and finish.
@@ -199,15 +203,9 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
         const PORT: u16 = 1456;
         let callback = format!("http://localhost:{PORT}/auth/callback");
         let url = hrdr_agent::openrouter_authorize_url(&callback, &challenge);
-        open_browser(&url, label, host);
-        host.spawn_line(Box::pin(async move {
-            match openrouter_oauth_flow(PORT, &verifier).await {
-                Ok(()) => "✓ logged in to OpenRouter. Key saved and set as your default \
-                           — pick a model with /model to use it now."
-                    .to_string(),
-                Err(e) => format!("OpenRouter login failed: {e}"),
-            }
-        }));
+        begin_browser_login(name, label, url, host, async move {
+            openrouter_oauth_flow(PORT, &verifier).await
+        });
         return true;
     }
 
@@ -216,44 +214,72 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
     let redirect = hrdr_agent::OPENAI_REDIRECT_URI.to_string();
     let url = hrdr_agent::openai_authorize_url(&redirect, &challenge, &state);
     host.info(
-        "⚠ This signs in with your ChatGPT subscription for use in a third-party tool.".to_string(),
+        "This signs in with your ChatGPT subscription for use in a third-party tool.".to_string(),
     );
-    open_browser(&url, label, host);
-    host.spawn_line(Box::pin(async move {
-        match chatgpt_oauth_flow(&verifier, &state, &redirect).await {
-            Ok(()) => "✓ signed in with ChatGPT. Tokens saved and set as your default \
-                       — pick a model with /model to use it now."
-                .to_string(),
-            Err(e) => format!("ChatGPT login failed: {e}"),
-        }
-    }));
+    begin_browser_login("chatgpt", label, url, host, async move {
+        chatgpt_oauth_flow(&verifier, &state, &redirect).await
+    });
     true
 }
 
-/// Print the authorize URL (a fallback if the browser can't open) and launch it.
-fn open_browser(url: &str, label: &str, host: &mut dyn CommandHost) {
-    host.info(format!(
-        "🔑 Opening your browser to authorize {label}…\n\
-         If it doesn't open, visit:\n{url}\n\
-         Waiting for you to finish in the browser (/cancel time is ~5 min)."
-    ));
-    let _ = crate::open_system_handler(std::path::Path::new(url));
+fn begin_browser_login<F>(
+    provider: &str,
+    label: &str,
+    url: String,
+    host: &mut dyn CommandHost,
+    flow: F,
+) where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let login_id = NEXT_LOGIN_ID.fetch_add(1, Ordering::Relaxed);
+    let provider = provider.to_string();
+    let outcome_provider = provider.clone();
+    let label = label.to_string();
+    let accepted = host.begin_browser_login(crate::BrowserLoginStart {
+        login_id,
+        provider,
+        authorization_url: url.clone(),
+        future: Box::pin(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(5 * 60), flow).await {
+                Ok(Ok(())) => crate::BrowserLoginOutcome {
+                    login_id,
+                    provider: outcome_provider,
+                    token_saved: true,
+                    error: None,
+                },
+                Ok(Err(error)) => crate::BrowserLoginOutcome {
+                    login_id,
+                    provider: outcome_provider,
+                    token_saved: false,
+                    error: Some(error.to_string()),
+                },
+                Err(_) => crate::BrowserLoginOutcome {
+                    login_id,
+                    provider: outcome_provider,
+                    token_saved: false,
+                    error: Some(format!("{label} authorization timed out")),
+                },
+            }
+        }),
+    });
+    if accepted {
+        let _ = crate::open_system_handler(std::path::Path::new(&url));
+    }
 }
 
 /// OpenRouter: wait for the callback code, exchange it for a normal API key, and
 /// save it to the credential store like any other key.
 async fn openrouter_oauth_flow(port: u16, verifier: &str) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code(port, "").await?;
+    let code = hrdr_agent::await_oauth_code_unbounded(port, "").await?;
     let key = hrdr_agent::openrouter_exchange(&code, verifier).await?;
     hrdr_agent::save_auth_token("openrouter", &key)?;
-    let _ = hrdr_agent::persist_setting("provider", hrdr_agent::ConfigValue::Str("openrouter"));
     Ok(())
 }
 
 /// ChatGPT: wait for the callback code, exchange it for the access/refresh token
 /// set, and store it in the OAuth credential store.
 async fn chatgpt_oauth_flow(verifier: &str, state: &str, redirect: &str) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code(hrdr_agent::OPENAI_OAUTH_PORT, state).await?;
+    let code = hrdr_agent::await_oauth_code_unbounded(hrdr_agent::OPENAI_OAUTH_PORT, state).await?;
     let tokens = hrdr_agent::openai_exchange(&code, redirect, verifier).await?;
     let account_id = tokens
         .id_token
@@ -266,8 +292,7 @@ async fn chatgpt_oauth_flow(verifier: &str, state: &str, redirect: &str) -> anyh
         expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
         account_id,
     };
-    hrdr_agent::save_oauth("chatgpt", &creds)?;
-    let _ = hrdr_agent::persist_setting("provider", hrdr_agent::ConfigValue::Str("chatgpt"));
+    hrdr_agent::save_oauth_coordinated("chatgpt", creds).await?;
     Ok(())
 }
 
@@ -287,6 +312,18 @@ mod tests {
         // Out-of-range numbers are treated as a literal name (not an index).
         assert_eq!(parse_provider_pick("0", b), "0");
         assert_eq!(parse_provider_pick("9", b), "9");
+    }
+
+    #[test]
+    fn oauth_login_requires_trusted_builtin_identity() {
+        use hrdr_agent::ResolvedProviderKind;
+        assert!(is_oauth_login(
+            "chatgpt",
+            ResolvedProviderKind::ChatGptOAuth
+        ));
+        assert!(is_oauth_login("openrouter", ResolvedProviderKind::BuiltIn));
+        assert!(!is_oauth_login("chatgpt", ResolvedProviderKind::Custom));
+        assert!(!is_oauth_login("openrouter", ResolvedProviderKind::Custom));
     }
 
     /// The frontend masks the input pane only while the wizard is waiting for
