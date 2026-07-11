@@ -624,16 +624,39 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 in_git = if in_git { "git repo" } else { "not a git repo" },
             ));
             host.spawn_line(Box::pin(async move {
-                let ep = endpoint_health_warning(agent, model, base_url).await;
-                match ep {
+                let ep = endpoint_health_warning(agent.clone(), model, base_url).await;
+                let mut out = match ep {
                     Some(w) => w,
                     None => "✓ endpoint healthy".to_string(),
-                }
+                };
+                out.push('\n');
+                out.push_str(&lsp_status_text(&agent).await);
+                out
             }));
         }
         _ => return false,
     }
     true
+}
+
+/// The `/doctor` LSP block: whether post-edit diagnostics are enabled, and one
+/// line per configured server with its lifecycle status.
+async fn lsp_status_text(agent: &std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>) -> String {
+    match agent.lock().await.lsp_statuses().await {
+        None => "lsp: disabled".to_string(),
+        Some((wait_ms, reports)) => {
+            let mut out = format!("lsp: enabled (wait {wait_ms}ms)");
+            for r in reports {
+                out.push_str(&format!(
+                    "\n  {} (.{}): {}",
+                    r.command,
+                    r.extensions.join("/."),
+                    r.status.label()
+                ));
+            }
+            out
+        }
+    }
 }
 
 /// Launch the OS default handler for `path` (`xdg-open` on Linux/BSD, `open`

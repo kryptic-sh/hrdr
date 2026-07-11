@@ -102,6 +102,45 @@ fn file_uri(path: &Path) -> String {
     }
 }
 
+/// A configured server's lifecycle state (for `/doctor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspServerStatus {
+    /// No matching file has been touched yet, so it hasn't been probed.
+    NotYetUsed,
+    /// Spawned and initialized this session.
+    Running,
+    /// Probed and the binary isn't on PATH.
+    NotInstalled,
+    /// The binary exists but spawn/initialize failed.
+    Failed,
+}
+
+impl LspServerStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotYetUsed => "not yet used",
+            Self::Running => "running",
+            Self::NotInstalled => "not installed",
+            Self::Failed => "failed to start",
+        }
+    }
+}
+
+/// One row of [`LspRegistry::statuses`].
+#[derive(Debug, Clone)]
+pub struct LspServerReport {
+    pub command: String,
+    pub extensions: Vec<String>,
+    pub status: LspServerStatus,
+}
+
+/// A probed server slot: running, or remembered-unavailable (so an absent
+/// server isn't re-probed on every edit).
+enum ClientSlot {
+    Running(Arc<LspClient>),
+    Unavailable(LspServerStatus),
+}
+
 /// The session's language servers, spawned lazily per command and kept warm.
 /// Lives in [`crate::ToolContext`] (`ctx.lsp`), shared by every mutating tool.
 pub struct LspRegistry {
@@ -109,9 +148,8 @@ pub struct LspRegistry {
     configs: Vec<LspServerConfig>,
     /// Per-edit wait for diagnostics.
     wait_ms: u64,
-    /// Command → running client, or `None` when it failed/isn't installed
-    /// (remembered so an absent server isn't re-probed on every edit).
-    clients: tokio::sync::Mutex<HashMap<String, Option<Arc<LspClient>>>>,
+    /// Command → probed slot; absent = not yet used.
+    clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
 }
 
 impl LspRegistry {
@@ -156,16 +194,47 @@ impl LspRegistry {
     /// the binary is absent or it failed to start (cached — no re-probing).
     async fn client_for(&self, config: &LspServerConfig) -> Option<Arc<LspClient>> {
         let mut clients = self.clients.lock().await;
-        if let Some(known) = clients.get(&config.command) {
-            return known.clone();
+        match clients.get(&config.command) {
+            Some(ClientSlot::Running(c)) => return Some(Arc::clone(c)),
+            Some(ClientSlot::Unavailable(_)) => return None,
+            None => {}
         }
-        let started = if which::which(&config.command).is_ok() {
-            LspClient::start(config, &self.root).await.ok()
+        let slot = if which::which(&config.command).is_err() {
+            ClientSlot::Unavailable(LspServerStatus::NotInstalled)
         } else {
-            None
+            match LspClient::start(config, &self.root).await {
+                Ok(c) => ClientSlot::Running(c),
+                Err(_) => ClientSlot::Unavailable(LspServerStatus::Failed),
+            }
         };
-        clients.insert(config.command.clone(), started.clone());
+        let started = match &slot {
+            ClientSlot::Running(c) => Some(Arc::clone(c)),
+            ClientSlot::Unavailable(_) => None,
+        };
+        clients.insert(config.command.clone(), slot);
         started
+    }
+
+    /// One status row per configured server, in config order (for `/doctor`).
+    pub async fn statuses(&self) -> Vec<LspServerReport> {
+        let clients = self.clients.lock().await;
+        self.configs
+            .iter()
+            .map(|c| LspServerReport {
+                command: c.command.clone(),
+                extensions: c.extensions.clone(),
+                status: match clients.get(&c.command) {
+                    None => LspServerStatus::NotYetUsed,
+                    Some(ClientSlot::Running(_)) => LspServerStatus::Running,
+                    Some(ClientSlot::Unavailable(s)) => *s,
+                },
+            })
+            .collect()
+    }
+
+    /// The configured per-edit diagnostics wait (for `/doctor`).
+    pub fn wait_ms(&self) -> u64 {
+        self.wait_ms
     }
 }
 
@@ -531,6 +600,33 @@ mod tests {
         assert!(note.contains("…and 4 more"), "{note}");
     }
 
+    /// `/doctor`'s status rows track the probe lifecycle: unprobed → "not yet
+    /// used"; a probe that finds no binary → "not installed" (cached).
+    #[tokio::test]
+    async fn statuses_track_probe_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = LspRegistry::new(
+            dir.path().to_path_buf(),
+            vec![LspServerConfig {
+                command: "definitely-missing-lsp-server".to_string(),
+                args: vec![],
+                extensions: vec!["xyz".to_string()],
+            }],
+            None,
+        );
+        assert_eq!(
+            registry.statuses().await[0].status,
+            LspServerStatus::NotYetUsed
+        );
+        let _ = registry
+            .diagnostics_note(&dir.path().join("a.xyz"), "x")
+            .await;
+        assert_eq!(
+            registry.statuses().await[0].status,
+            LspServerStatus::NotInstalled
+        );
+    }
+
     /// Paths outside the registry's root are skipped before any server is
     /// consulted (or spawned): the servers were initialized against the root
     /// workspace, so out-of-root files — a worktree-isolated sub-agent's
@@ -592,6 +688,11 @@ mod tests {
 
         // Clean content → no note (didChange path, same warm server).
         assert_eq!(registry.diagnostics_note(&file, "all good\n").await, None);
+        assert_eq!(
+            registry.statuses().await[0].status,
+            LspServerStatus::Running,
+            "the warm server reports as running"
+        );
 
         // No server registered for the extension → silent no-op.
         assert_eq!(

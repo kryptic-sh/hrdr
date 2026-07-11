@@ -29,7 +29,10 @@ pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_MS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,
 };
-pub use lsp::{DEFAULT_LSP_WAIT_MS, LspRegistry, LspServerConfig, default_lsp_servers};
+pub use lsp::{
+    DEFAULT_LSP_WAIT_MS, LspRegistry, LspServerConfig, LspServerReport, LspServerStatus,
+    default_lsp_servers,
+};
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;

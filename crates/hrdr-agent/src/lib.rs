@@ -2878,6 +2878,13 @@ impl Agent {
         *self.cost_total.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
     }
 
+    /// Status of the post-edit LSP layer for `/doctor`:
+    /// `(wait_ms, one row per configured server)`, or `None` when disabled.
+    pub async fn lsp_statuses(&self) -> Option<(u64, Vec<hrdr_tools::LspServerReport>)> {
+        let reg = self.ctx.lsp.as_ref()?;
+        Some((reg.wait_ms(), reg.statuses().await))
+    }
+
     pub async fn probe_context_window(&self) -> Option<u32> {
         if let Some(n) = self.client.context_window().await {
             return Some(n);
