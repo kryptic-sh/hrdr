@@ -47,13 +47,20 @@ pub struct ChatPalette {
     pub accent2: Option<Rgb>,
 }
 
-/// Load an hjkl theme TOML from `path`, falling back to hjkl's bundled default
-/// when `path` is `None` or fails to parse (both frontends' load policy).
-pub fn load_hjkl_theme(path: Option<&str>) -> HjklTheme {
-    match path {
-        Some(p) => HjklTheme::from_path(std::path::Path::new(p))
-            .unwrap_or_else(|_| loader::default_theme()),
-        None => loader::default_theme(),
+/// Load an hjkl theme from a spec — a baked-in theme name
+/// ([`crate::BUILTIN_THEMES`]) or a theme TOML path. `None`, an unknown name,
+/// or a file that fails to parse all fall back to the default baked-in theme
+/// (Tokyo Night), and — should that ever fail to parse — to hjkl's bundled
+/// default.
+pub fn load_hjkl_theme(spec: Option<&str>) -> HjklTheme {
+    let fallback = || {
+        HjklTheme::from_toml_str(crate::BUILTIN_THEMES[0].1)
+            .unwrap_or_else(|_| loader::default_theme())
+    };
+    let Some(s) = spec else { return fallback() };
+    match crate::builtin_theme_toml(s) {
+        Some(toml) => HjklTheme::from_toml_str(toml).unwrap_or_else(|_| fallback()),
+        None => HjklTheme::from_path(std::path::Path::new(s)).unwrap_or_else(|_| fallback()),
     }
 }
 

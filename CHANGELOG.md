@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **`/provider`** — folded into `/model`. The picker already switches endpoint,
+  key, and model per choice; a separate name-based switch was redundant.
+  `/login` still sets up providers and applies them via the same
+  `apply_provider` path.
+- **`/model <name>`** — the argument form (switch model by name on the current
+  endpoint) is gone; `/model` always opens the picker, whose fuzzy filter covers
+  by-name switching. `/retry <model>` still takes a model name.
+
+### Added
+
+- **`local` in the `/model` picker.** The keyless `local` preset
+  (`http://localhost:8080/v1`) now always appears in the picker; a provider with
+  no catalog entry and no configured model contributes a `default` entry (the
+  server's own model pick) instead of being hidden.
+- **`/theme` picker + four new baked-in themes.** A bare `/theme` opens a
+  fuzzy-searchable picker (same chrome as `/model`) over the baked-in themes and
+  any `~/.config/hrdr/themes/*.toml`, **live-previewing** the highlighted theme
+  — Enter applies and persists it, Esc restores the original. Catppuccin Mocha,
+  Dracula, Gruvbox Dark, and Nord now ship in the binary alongside the Tokyo
+  Night default, and `/theme <name>` accepts built-in names as well as paths
+  (`/theme reset` restores the default). The Tokyo Night TOML moved from
+  `hrdr-tui` into the shared `hrdr-app` theme registry (`BUILTIN_THEMES`).
+- **`/resume` session picker.** A bare `/resume` (or `/continue`) opens an
+  interactive picker — same chrome as `/model` — listing every saved session
+  newest first in four columns (id · name · age · cwd), narrowed by a fuzzy
+  filter over id + name + cwd. Enter resumes, Esc cancels; `/resume <id|name>`
+  still resumes directly. Frontends without the modal fall back to the text
+  listing (`session_list_text`).
+
+### Changed
+
+- **Alias rows hidden from slash-command autocomplete.** `slash_completions` no
+  longer lists alias entries (`/new`, `/reset`, `/cd`, …); typing an alias still
+  matches and surfaces its canonical command (`/new` → `/clear`, `/usage` →
+  `/cost`). Ranking: name-prefix, alias-prefix, name-substring, alias-substring,
+  description.
+- **`/info` renamed to `/status`** (the Claude Code name); `/info` stays as an
+  alias.
+- **`/sessions` is now an alias of `/resume`** — both open the session picker.
+  The `--all` flag is gone (the picker always lists every directory, with a cwd
+  column); `session_list_text()` (the no-modal text fallback) lost its
+  `all`/`cwd` params and always lists everything, and `sessions_all_flag` is
+  removed.
+
 ## [0.2.9] - 2026-07-11
 
 ### Removed

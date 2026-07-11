@@ -1,4 +1,4 @@
-# hrdr default theme — compiled into the binary as the fallback.
+# hrdr default theme — compiled into the binary as the fallback ("tokyonight").
 # Tokyo Night (the "night" variant), originally by folke
 # (https://github.com/folke/tokyonight.nvim). Licensed under Apache-2.0.
 #

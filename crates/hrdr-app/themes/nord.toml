@@ -1,0 +1,45 @@
+# Nord — https://github.com/nordtheme/nord (MIT).
+# Palette values are upstream's (nord0–nord15), verbatim. hrdr's chat roles are
+# mapped onto them by `hrdr_app::ChatPalette`.
+
+[palette]
+# Polar Night (surfaces).
+bg        = "#2e3440" # nord0
+bg_darker = "#242933" # the darker canvas shade used by Nord ports
+nord1     = "#3b4252"
+nord2     = "#434c5e"
+nord3     = "#4c566a"
+
+# Snow Storm (text).
+fg      = "#d8dee9" # nord4
+comment = "#616e88" # the de-facto Nord comment shade (nord3 brightened)
+
+# Frost + Aurora (accents).
+teal    = "#8fbcbb" # nord7
+cyan    = "#88c0d0" # nord8
+blue    = "#81a1c1" # nord9
+red     = "#bf616a" # nord11
+orange  = "#d08770" # nord12
+yellow  = "#ebcb8b" # nord13
+green   = "#a3be8c" # nord14
+magenta = "#b48ead" # nord15
+
+# Transcript block backgrounds.
+# (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
+bg_user    = "#242933" # also the tool-call block's background
+bg_command = "#3b4252" # nord1
+bg_stats   = "#292f3b"
+
+# The bar drawn down the left of the user's own surfaces (prompt + input).
+border_prompt = "#b48ead" # nord15
+
+[ui]
+background = "$bg"
+foreground = "$fg"
+cursor     = "$cyan"
+cursorline = "$nord1"
+gutter     = "$comment"
+diagnostic_error = "$red"
+
+[ui.selection]
+bg = "$nord2"

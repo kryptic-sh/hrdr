@@ -133,18 +133,21 @@ the input pane instead of the default plain input.
 
 Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 
-- **Session** — `/clear [name]` (aliases `/new`, `/reset`), `/sessions`,
-  `/resume <id|name>`, `/rename`, `/compact`, `/info`, `/goto <N|5m|top|end>`,
-  `/find <text>` (`/next` `/prev`)
-- **Model** — `/model`, `/models`, `/provider`, `/login` (guided provider + key
-  setup), `/temp`, `/effort <minimal|low|medium|high>` (sent as
-  `reasoning_effort` to OpenAI-style reasoning models, or a `thinking` budget on
-  the native Anthropic backend), `/reasoning`
+- **Session** — `/clear [name]` (aliases `/new`, `/reset`), `/resume` (aliases
+  `/continue`, `/sessions`; a fuzzy-searchable picker of saved sessions, newest
+  first — or `/resume <id|name>` directly), `/rename`, `/compact`, `/status`
+  (alias `/info`), `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
+- **Model** — `/model` (picker: switches model _and_ provider, includes the
+  keyless `local` endpoint), `/login` (guided provider + key setup), `/temp`,
+  `/effort <minimal|low|medium|high>` (sent as `reasoning_effort` to
+  OpenAI-style reasoning models, or a `thinking` budget on the native Anthropic
+  backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
   `/undo`
-- **Appearance** — `/theme`, `/timestamps [none|relative|exact]`,
+- **Appearance** — `/theme` (picker with live preview; 5 built-in palettes +
+  `~/.config/hrdr/themes/*.toml`), `/timestamps [none|relative|exact]`,
   `/statusbar [none|truncate|wrap]`, `/todo-ttl [turns]`
 - **Other** — `/reload`, `/help`, `/exit`
 
@@ -250,7 +253,8 @@ X-Title = "your-app"
 
 Each provider can carry `[providers.<name>.headers]` — arbitrary HTTP headers
 sent on every request (OpenRouter's `HTTP-Referer`/`X-Title`, or a custom
-auth/routing header). They apply at startup and follow a `/provider` switch.
+auth/routing header). They apply at startup and follow a provider switch (the
+`/model` picker or `/login`).
 
 **Azure OpenAI:** set `api_version` — hrdr then appends `?api-version=<v>` to
 requests and authenticates with an `api-key` header (instead of `Bearer`). Point
@@ -265,8 +269,8 @@ model = "<deployment>"
 ```
 
 `context_window` is optional: if you omit it, hrdr detects one — at startup
-**and** again after a `/model` or `/provider` switch, so the compaction
-threshold always tracks the current model's real max. Detection tries, in order:
+**and** again after a `/model` switch, so the compaction threshold always tracks
+the current model's real max. Detection tries, in order:
 
 1. **What the endpoint advertises** — vLLM's `max_model_len`, LM Studio's
    `max_context_length`, llama.cpp's `/props` `n_ctx`, and similar.
@@ -337,7 +341,7 @@ because sending an unknown `cache_control` field isn't universally safe: OpenAI,
 Groq, and xAI **reject it with a 400**, while others (DeepSeek, Gemini, and
 OpenAI itself) already cache automatically. Set `prompt_cache = "on"` to force
 it on an endpoint you know accepts it (env `$HRDR_PROMPT_CACHE`, flag
-`--prompt-cache off|on|auto`); `/info` shows whether it's currently active.
+`--prompt-cache off|on|auto`); `/status` shows whether it's currently active.
 
 ### Sampling & limits
 
@@ -666,11 +670,14 @@ run = "prettier --write {path}"
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.
-`--theme <path>` (or `theme = "..."` in config / `$HRDR_THEME`) points at an
-hjkl theme TOML (palette + `[ui]` styles); without one, hjkl's bundled dark
-theme is used. hrdr maps the theme's palette onto its chat roles (user,
-assistant, dim chrome, tool/loader accent, success/error), so any hjkl theme
-works.
+Five popular palettes ship baked into the binary — `tokyonight` (the default),
+`catppuccin-mocha`, `dracula`, `gruvbox-dark`, and `nord` — and `/theme` opens a
+picker over them plus any TOMLs in `~/.config/hrdr/themes/`, live-previewing the
+highlighted theme (Enter applies + persists, Esc restores).
+`--theme <name-or-path>` (or `theme = "..."` in config / `$HRDR_THEME`) sets one
+directly: a built-in name or the path of an hjkl theme TOML (palette + `[ui]`
+styles). hrdr maps the theme's palette onto its chat roles (user, assistant, dim
+chrome, tool/loader accent, success/error), so any hjkl theme works.
 
 Configuration (CLI flags override env):
 

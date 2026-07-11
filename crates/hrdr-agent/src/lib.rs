@@ -2727,13 +2727,13 @@ impl Agent {
         self.client.set_effort(effort);
     }
 
-    /// Replace the provider-configured extra HTTP headers (used on a `/provider`
+    /// Replace the provider-configured extra HTTP headers (used on a provider
     /// switch so the new provider's headers apply).
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
         self.client.set_headers(headers);
     }
 
-    /// Set the Azure OpenAI API version (used on a `/provider` switch); `None`
+    /// Set the Azure OpenAI API version (used on a provider switch); `None`
     /// for a standard endpoint.
     pub fn set_api_version(&mut self, api_version: Option<String>) {
         self.client.set_api_version(api_version);

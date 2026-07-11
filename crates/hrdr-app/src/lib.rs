@@ -18,6 +18,7 @@ mod session;
 mod sessions;
 mod status;
 mod subagents;
+mod themes;
 mod transcript;
 mod util;
 pub use commands::*;
@@ -32,6 +33,7 @@ pub use session::*;
 pub use sessions::*;
 pub use status::*;
 pub use subagents::*;
+pub use themes::*;
 pub use transcript::*;
 pub use util::*;
 
@@ -40,16 +42,11 @@ pub use util::*;
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation (optional name)"),
     ("/compact", "summarize the conversation to reclaim context"),
-    (
-        "/sessions",
-        "list this dir's saved sessions (--all for every dir)",
-    ),
-    ("/resume", "resume a saved session by id or name"),
+    ("/resume", "resume a session (picker, or id/name)"),
     ("/rename", "rename the current session"),
-    ("/model", "browse & switch model (interactive selector)"),
-    ("/provider", "switch provider preset"),
+    ("/model", "browse & switch model/provider (picker)"),
     ("/login", "set up a provider + API key (wizard)"),
-    ("/theme", "switch theme (path, or reset)"),
+    ("/theme", "switch theme (picker, name/path, reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
     ("/prompt", "show the rendered system prompt"),
@@ -68,7 +65,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
-    ("/info", "session info"),
+    ("/status", "session info"),
     ("/cost", "session token usage"),
     ("/doctor", "check health: endpoint, deps, config"),
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
@@ -87,8 +84,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "alias of /clear (optional name)"),
     ("/reset", "alias of /clear"),
     ("/cd", "alias of /cwd"),
-    ("/status", "alias of /info"),
+    ("/info", "alias of /status"),
     ("/continue", "alias of /resume"),
+    ("/sessions", "alias of /resume"),
     ("/summarize", "alias of /compact"),
     ("/usage", "alias of /cost"),
     ("/health", "alias of /doctor"),
@@ -99,28 +97,13 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Session",
         &[
-            "/clear",
-            "/sessions",
-            "/resume",
-            "/rename",
-            "/compact",
-            "/info",
-            "/goto",
-            "/find",
-            "/next",
+            "/clear", "/resume", "/rename", "/compact", "/status", "/goto", "/find", "/next",
             "/prev",
         ],
     ),
     (
         "Model & sampling",
-        &[
-            "/model",
-            "/provider",
-            "/login",
-            "/temp",
-            "/effort",
-            "/thinking",
-        ],
+        &["/model", "/login", "/temp", "/effort", "/thinking"],
     ),
     (
         "Files & context",
@@ -164,10 +147,10 @@ pub fn resolve_alias(cmd: &str) -> &str {
         "new" | "reset" => "clear",
         // aider/shell-style directory change.
         "cd" => "cwd",
-        // Claude Code status line.
-        "status" => "info",
-        // opencode/Claude Code resume.
-        "continue" => "resume",
+        // hrdr's pre-Claude-style name for the session summary.
+        "info" => "status",
+        // opencode/Claude Code resume; /sessions is the picker too now.
+        "continue" | "sessions" => "resume",
         // descriptive name for compaction.
         "summarize" | "summary" => "compact",
         // help variants.
@@ -253,8 +236,9 @@ mod tests {
         assert_eq!(resolve_alias("new"), "clear");
         assert_eq!(resolve_alias("RESET"), "clear"); // case-insensitive
         assert_eq!(resolve_alias("cd"), "cwd");
-        assert_eq!(resolve_alias("status"), "info");
+        assert_eq!(resolve_alias("info"), "status");
         assert_eq!(resolve_alias("continue"), "resume");
+        assert_eq!(resolve_alias("sessions"), "resume");
         assert_eq!(resolve_alias("summarize"), "compact");
         assert_eq!(resolve_alias("?"), "help");
         assert_eq!(resolve_alias("model"), "model"); // unknown passes through

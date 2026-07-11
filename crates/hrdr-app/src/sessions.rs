@@ -1,9 +1,9 @@
 //! Session listing + auto-save shared by hrdr's frontends. The listing text
-//! (which sessions to show for the current cwd, or all, and how to render each
-//! row) and the auto-save policy (when to write, how the file id is assigned)
-//! are representation-independent, so a frontend's `/sessions` + continuous
-//! auto-save build them from here. Resuming itself is per-frontend (it swaps in
-//! the saved [`crate::SessionState`]), so that stays in the frontends.
+//! (the `/resume` picker's text fallback) and the auto-save policy (when to
+//! write, how the file id is assigned) are representation-independent, so a
+//! frontend's session listing + continuous auto-save build them from here.
+//! Resuming itself is per-frontend (it swaps in the saved
+//! [`crate::SessionState`]), so that stays in the frontends.
 
 use crate::{Session, SessionState};
 
@@ -63,40 +63,39 @@ pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, Session)> {
     (session.state.messages.len() > 1).then_some((meta.id, session))
 }
 
-/// The `/sessions` listing as a display string. With `all`, every directory's
-/// sessions are shown (each row tagged with its cwd); otherwise only those whose
-/// cwd matches `cwd`. Returns a friendly empty-state message when there are none.
-pub fn session_list_text(all: bool, cwd: &str) -> String {
-    let cur = hrdr_agent::cwd_slug(cwd);
-    let sessions: Vec<_> = crate::list_sessions()
-        .into_iter()
-        .filter(|m| all || hrdr_agent::cwd_slug(&m.cwd) == cur)
-        .collect();
+/// Every saved session as a display string, newest first, each row tagged with
+/// its cwd — the text fallback for frontends without the `/resume` picker
+/// modal. Returns a friendly empty-state message when there are none.
+pub fn session_list_text() -> String {
+    let sessions = crate::list_sessions();
     if sessions.is_empty() {
-        return if all {
-            format!("no saved sessions in {}", crate::sessions_dir().display())
-        } else {
-            "no saved sessions for this directory (try /sessions --all)".to_string()
-        };
+        return format!("no saved sessions in {}", crate::sessions_dir().display());
     }
-    let mut s = if all {
-        String::from("all sessions (resume by id or name):")
-    } else {
-        String::from("sessions here (resume by id or name; /sessions --all for every dir):")
-    };
+    let mut s = String::from("saved sessions (newest first; resume by id or name):");
     for m in sessions {
-        if all {
-            s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
-        } else {
-            s.push_str(&format!("\n  {} — {}", m.id, m.name));
-        }
+        s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
     }
     s
 }
 
-/// Whether a `/sessions` argument requests every directory's sessions.
-pub fn sessions_all_flag(arg: &str) -> bool {
-    matches!(arg.trim(), "--all" | "-a" | "all")
+/// Case-insensitive fuzzy filter over session rows for the `/resume` picker:
+/// the query's characters must appear in order somewhere within
+/// `"id name cwd"`. Returns matching indices in input order (callers pass
+/// [`crate::list_sessions`]'s newest-first list); an empty query matches
+/// everything.
+pub fn filter_sessions(sessions: &[crate::SessionMeta], query: &str) -> Vec<usize> {
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if q.is_empty() {
+        return (0..sessions.len()).collect();
+    }
+    sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let hay = format!("{} {} {}", m.id, m.name, m.cwd).to_lowercase();
+            crate::is_subsequence(&q, &hay).then_some(i)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -116,12 +115,26 @@ mod tests {
     }
 
     #[test]
-    fn sessions_all_flag_recognizes_variants() {
-        for a in ["--all", "-a", "all", "  all  "] {
-            assert!(sessions_all_flag(a), "{a:?}");
-        }
-        for a in ["", "here", "--foo"] {
-            assert!(!sessions_all_flag(a), "{a:?}");
-        }
+    fn filter_sessions_matches_id_name_and_cwd() {
+        let meta = |id: &str, name: &str, cwd: &str| crate::SessionMeta {
+            id: id.to_string(),
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            updated: 0,
+            path: std::path::PathBuf::new(),
+        };
+        let sessions = vec![
+            meta("fix-auth", "Fix the auth bug", "/home/u/proj-a"),
+            meta("tui-work", "TUI polish", "/home/u/proj-b"),
+        ];
+        // Empty query keeps everything in input (newest-first) order.
+        assert_eq!(filter_sessions(&sessions, ""), vec![0, 1]);
+        // Matches on id, name (case-insensitive), and cwd.
+        assert_eq!(filter_sessions(&sessions, "auth"), vec![0]);
+        assert_eq!(filter_sessions(&sessions, "POLISH"), vec![1]);
+        assert_eq!(filter_sessions(&sessions, "proj-b"), vec![1]);
+        // Fuzzy subsequence across the combined text.
+        assert_eq!(filter_sessions(&sessions, "fx bug"), vec![0]);
+        assert!(filter_sessions(&sessions, "zzz").is_empty());
     }
 }

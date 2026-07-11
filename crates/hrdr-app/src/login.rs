@@ -203,7 +203,7 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
         host.spawn_line(Box::pin(async move {
             match openrouter_oauth_flow(PORT, &verifier).await {
                 Ok(()) => "✓ logged in to OpenRouter. Key saved and set as your default \
-                           — run /provider openrouter to use it now."
+                           — pick a model with /model to use it now."
                     .to_string(),
                 Err(e) => format!("OpenRouter login failed: {e}"),
             }
@@ -222,7 +222,7 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
     host.spawn_line(Box::pin(async move {
         match chatgpt_oauth_flow(&verifier, &state, &redirect).await {
             Ok(()) => "✓ signed in with ChatGPT. Tokens saved and set as your default \
-                       — run /provider chatgpt to use it now."
+                       — pick a model with /model to use it now."
                 .to_string(),
             Err(e) => format!("ChatGPT login failed: {e}"),
         }

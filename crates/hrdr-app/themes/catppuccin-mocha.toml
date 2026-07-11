@@ -1,0 +1,46 @@
+# Catppuccin (Mocha) — https://github.com/catppuccin/catppuccin (MIT).
+# Palette values are upstream's, verbatim. hrdr's chat roles are mapped onto
+# them by `hrdr_app::ChatPalette`.
+
+[palette]
+# Surfaces.
+bg       = "#1e1e2e" # base
+mantle   = "#181825"
+crust    = "#11111b"
+surface0 = "#313244"
+surface1 = "#45475a"
+
+# Text.
+fg      = "#cdd6f4" # text
+comment = "#6c7086" # overlay0
+
+# Accents.
+blue    = "#89b4fa"
+cyan    = "#89dceb" # sky
+teal    = "#94e2d5"
+green   = "#a6e3a1"
+yellow  = "#f9e2af"
+orange  = "#fab387" # peach
+red     = "#f38ba8"
+magenta = "#cba6f7" # mauve
+pink    = "#f5c2e7"
+
+# Transcript block backgrounds.
+# (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
+bg_user    = "#181825" # mantle — also the tool-call block's background
+bg_command = "#313244" # surface0
+bg_stats   = "#11111b" # crust
+
+# The bar drawn down the left of the user's own surfaces (prompt + input).
+border_prompt = "#cba6f7" # mauve
+
+[ui]
+background = "$bg"
+foreground = "$fg"
+cursor     = "$blue"
+cursorline = "$surface0"
+gutter     = "$comment"
+diagnostic_error = "$red"
+
+[ui.selection]
+bg = "$surface1"

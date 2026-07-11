@@ -177,6 +177,13 @@ fn collapse_home(path: &str, home: &str) -> String {
     path.to_string()
 }
 
+/// Whether `needle`'s chars appear in order within `haystack` — the fuzzy
+/// match shared by the picker filters (sessions, themes).
+pub(crate) fn is_subsequence(needle: &[char], haystack: &str) -> bool {
+    let mut it = haystack.chars();
+    needle.iter().all(|&c| it.any(|h| h == c))
+}
+
 /// Modified-time of the user config file, for hot-reload dedup guards.
 pub fn config_mtime() -> Option<std::time::SystemTime> {
     hrdr_agent::config_file_path()

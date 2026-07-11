@@ -23,6 +23,8 @@ mod commands;
 mod completion;
 mod model_selector;
 mod session;
+mod session_selector;
+mod theme_selector;
 mod util;
 
 use completion::CompletionKind;
@@ -32,6 +34,8 @@ use hrdr_app::{
     SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
 };
 pub(crate) use model_selector::ModelSelector;
+pub(crate) use session_selector::SessionSelector;
+pub(crate) use theme_selector::ThemeSelector;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -121,7 +125,7 @@ pub(crate) struct App {
     pub(crate) effort: Option<String>,
     /// Icon set for the TUI chrome (status bar glyphs).
     pub(crate) icon_mode: hjkl_icons::IconMode,
-    /// Config kept for mid-session provider resolution (`/provider`).
+    /// Config kept for mid-session provider resolution (the `/model` picker).
     cfg: AgentConfig,
     /// Last-seen mtime of the config file, for hot-reload polling.
     config_mtime: Option<SystemTime>,
@@ -153,6 +157,11 @@ pub(crate) struct App {
     login: Option<hrdr_app::LoginWizard>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
     pub(crate) model_selector: Option<ModelSelector>,
+    /// The open `/resume` session picker modal; while `Some`, it captures every key.
+    pub(crate) session_selector: Option<SessionSelector>,
+    /// The open `/theme` picker modal; while `Some`, it captures every key and
+    /// live-previews the highlighted theme.
+    pub(crate) theme_selector: Option<ThemeSelector>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -371,6 +380,8 @@ impl App {
             pending_edit: None,
             login: None,
             model_selector: None,
+            session_selector: None,
+            theme_selector: None,
             pending_goto: None,
             pending_scroll_entry: None,
             pending_focus_entry: None,
@@ -478,6 +489,16 @@ impl App {
         // The `/model` selector modal captures every key while it is open.
         if self.model_selector.is_some() {
             self.model_selector_key(key);
+            return Action::None;
+        }
+
+        // Likewise the `/resume` session picker and the `/theme` picker.
+        if self.session_selector.is_some() {
+            self.session_selector_key(key);
+            return Action::None;
+        }
+        if self.theme_selector.is_some() {
+            self.theme_selector_key(key);
             return Action::None;
         }
 
@@ -713,6 +734,25 @@ impl App {
                 MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
                 _ => {}
             }
+            return;
+        }
+        // The `/resume` and `/theme` pickers get the same treatment (the theme
+        // picker also live-previews the newly-highlighted row).
+        if let Some(sel) = &mut self.session_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(sel) = &mut self.theme_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
+            self.preview_selected_theme();
             return;
         }
         match m.kind {

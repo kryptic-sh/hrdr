@@ -14,7 +14,7 @@ use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, resolve_api_key, w
 /// labels to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
-    /// App provider name — the `/provider` switch target.
+    /// App provider name — the provider the picker switches to.
     pub provider: String,
     /// Model id to set on the agent.
     pub model: String,
@@ -39,7 +39,7 @@ pub fn builtin_catalog_key(name: &str) -> Option<&'static str> {
 
 /// A provider the user can pick a model from.
 struct ConfiguredProvider {
-    /// App provider name — the `/provider` switch target.
+    /// App provider name — the provider the picker switches to.
     name: String,
     /// models.dev catalog key (a built-in mapping, else the name itself).
     catalog_key: String,
@@ -49,8 +49,8 @@ struct ConfiguredProvider {
 }
 
 /// The providers the user can switch a model to: every custom `[providers.*]`,
-/// each built-in preset whose API key resolves (so it's actually set up), and
-/// the active provider — deduped by name.
+/// each built-in preset whose API key resolves (so it's actually set up), the
+/// keyless `local` preset, and the active provider — deduped by name.
 fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<ConfiguredProvider> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<ConfiguredProvider> = Vec::new();
@@ -70,13 +70,11 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
     for (name, c) in &config.providers {
         push(name.clone(), c.model.clone());
     }
-    // Built-in presets the user has a resolvable key for (skip keyless `local`).
+    // Built-in presets the user has a resolvable key for, plus `local` —
+    // keyless by design (a self-hosted endpoint), so it's always offered.
     for name in BUILTIN_PROVIDERS {
-        if *name == "local" {
-            continue;
-        }
         if let Some(p) = builtin_provider(name)
-            && resolve_api_key(name, &p, None, None).is_some()
+            && (*name == "local" || resolve_api_key(name, &p, None, None).is_some())
         {
             push((*name).to_string(), p.model);
         }
@@ -110,8 +108,9 @@ fn pretty_provider(name: &str) -> String {
 /// `catalog` for model lists and friendly names. Ordered by **usage** (the
 /// most-often-selected first, from `usage`), then by model name
 /// (case-insensitive) to break ties. A provider with no catalog entry
-/// contributes its single configured model. Pure — the runtime entry point
-/// [`model_choices`] supplies the cached catalog and usage counts.
+/// contributes its single configured model (or "default" when it names none).
+/// Pure — the runtime entry point [`model_choices`] supplies the cached
+/// catalog and usage counts.
 fn choices_from(
     providers: &[ConfiguredProvider],
     catalog: Option<&Value>,
@@ -133,14 +132,19 @@ fn choices_from(
                 }
             }
             None => {
-                if let Some(m) = &p.configured_model {
-                    out.push(ModelChoice {
-                        provider: p.name.clone(),
-                        model: m.clone(),
-                        provider_label: pretty_provider(&p.name),
-                        model_label: m.clone(),
-                    });
-                }
+                // No catalog entry: offer the configured model, or "default"
+                // (the server's own pick) when none is named — keyless `local`
+                // endpoints land here.
+                let m = p
+                    .configured_model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                out.push(ModelChoice {
+                    provider: p.name.clone(),
+                    model: m.clone(),
+                    provider_label: pretty_provider(&p.name),
+                    model_label: m,
+                });
             }
         }
     }
@@ -367,6 +371,23 @@ mod tests {
         assert_eq!(out[0].model, "Qwen3-30B");
         assert_eq!(out[0].provider_label, "Mylocal"); // prettified fallback
         assert_eq!(out[0].model_label, "Qwen3-30B");
+    }
+
+    #[test]
+    fn a_keyless_provider_without_a_model_offers_the_server_default() {
+        // `local` has no catalog entry and no configured model; it still shows
+        // up as a pickable "default" (the server's own pick) entry.
+        let ps = vec![ConfiguredProvider {
+            name: "local".into(),
+            catalog_key: "local".into(),
+            configured_model: None,
+        }];
+        let out = choices_from(&ps, Some(&catalog()), &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].provider, "local");
+        assert_eq!(out[0].model, "default");
+        assert_eq!(out[0].provider_label, "Local");
+        assert_eq!(out[0].model_label, "default");
     }
 
     #[test]

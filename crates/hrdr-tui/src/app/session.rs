@@ -96,7 +96,7 @@ impl super::App {
     /// Three fields are not simply overwritten:
     ///
     /// * `base_url` — the endpoint belongs to this process (`--base-url`,
-    ///   `/provider`), not to the saved conversation. The resume notice reports
+    ///   the `/model` picker), not to the saved conversation. The resume notice reports
     ///   a mismatch rather than silently switching endpoints.
     /// * `context_window` — a saved one is a stand-in until the endpoint is
     ///   re-probed, so it never clobbers a window this process already knows.

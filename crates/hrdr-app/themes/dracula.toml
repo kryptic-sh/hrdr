@@ -1,0 +1,44 @@
+# Dracula — https://github.com/dracula/dracula-theme (MIT).
+# Palette values are upstream's, verbatim. hrdr's chat roles are mapped onto
+# them by `hrdr_app::ChatPalette`.
+
+[palette]
+# Surfaces.
+bg           = "#282a36" # background
+bg_darker    = "#21222c"
+bg_darkest   = "#191a21"
+current_line = "#44475a"
+
+# Text.
+fg      = "#f8f8f2" # foreground
+comment = "#6272a4"
+
+# Accents. Dracula has no blue; purple fills the magenta slot and pink the
+# prompt border, so the two accents stay distinct.
+cyan    = "#8be9fd"
+green   = "#50fa7b"
+orange  = "#ffb86c"
+yellow  = "#f1fa8c"
+red     = "#ff5555"
+magenta = "#bd93f9" # purple
+pink    = "#ff79c6"
+
+# Transcript block backgrounds.
+# (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
+bg_user    = "#21222c" # also the tool-call block's background
+bg_command = "#343746"
+bg_stats   = "#191a21"
+
+# The bar drawn down the left of the user's own surfaces (prompt + input).
+border_prompt = "#ff79c6" # pink
+
+[ui]
+background = "$bg"
+foreground = "$fg"
+cursor     = "$cyan"
+cursorline = "$current_line"
+gutter     = "$comment"
+diagnostic_error = "$red"
+
+[ui.selection]
+bg = "$current_line"

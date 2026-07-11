@@ -4,7 +4,7 @@
 //! stored as JSON under `$XDG_DATA_HOME/hrdr/sessions` (default
 //! `~/.local/share/hrdr/sessions`). Sessions are partitioned by working
 //! directory: each lives at `sessions/<cwd-slug>/<name-slug>.json`, so the
-//! files are easy to manage by hand and `/sessions` can scope to one project.
+//! files are easy to manage by hand and startup auto-resume scopes to a project.
 
 use std::path::{Path, PathBuf};
 

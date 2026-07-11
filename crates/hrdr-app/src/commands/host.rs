@@ -38,7 +38,7 @@ pub trait CommandHost {
     fn provider(&self) -> Option<String> {
         None
     }
-    /// Update the active provider name (used by `/provider` / auto-save).
+    /// Update the active provider name (used by a `/model` provider switch / auto-save).
     fn set_provider(&mut self, name: String) {
         let _ = name;
     }
@@ -134,7 +134,7 @@ pub trait CommandHost {
     fn effort(&self) -> Option<String> {
         None
     }
-    /// The session's display-name override (`/rename`), for `/info`.
+    /// The session's display-name override (`/rename`), for `/status`.
     fn session_label(&self) -> Option<String> {
         None
     }
@@ -241,11 +241,11 @@ pub trait CommandHost {
         let _ = name;
         None
     }
-    /// Update the displayed endpoint after a `/provider` switch.
+    /// Update the displayed endpoint after a provider switch (`/model` picker or `/login`).
     fn set_base_url(&mut self, url: String) {
         let _ = url;
     }
-    /// Update the displayed context window after a `/provider` switch.
+    /// Update the displayed context window after a provider switch (`/model` picker or `/login`).
     fn set_context_window(&mut self, tokens: Option<u32>) {
         let _ = tokens;
     }
@@ -273,6 +273,24 @@ pub trait CommandHost {
     /// selector in a modal slot; the default lists the models as text instead.
     fn begin_model_selector(&mut self) {
         self.info("model selector isn't available in this frontend".to_string());
+    }
+
+    /// Open the interactive `/resume` session picker — a filterable list of
+    /// saved sessions, newest first. A frontend that supports it stashes the
+    /// selector in a modal slot; the default falls back to the text listing.
+    fn begin_session_selector(&mut self) {
+        self.info(crate::session_list_text());
+    }
+
+    /// Open the interactive `/theme` picker — the baked-in themes plus any
+    /// user theme files. A frontend that supports it stashes the selector in a
+    /// modal slot; the default lists the choices as text.
+    fn begin_theme_selector(&mut self) {
+        let mut s = String::from("themes (apply with /theme <name or path>):");
+        for c in crate::theme_choices() {
+            s.push_str(&format!("\n  {}  [{}]", c.name, c.source));
+        }
+        self.info(s);
     }
 
     /// Whether this frontend supports `cmd` (used to filter `/help`).

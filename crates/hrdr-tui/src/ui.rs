@@ -137,10 +137,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_statusbar(f, app, chunks[i], &sb_left, &sb_right);
     }
 
-    // The `/model` selector is a full modal; when it's open it owns the screen
-    // (and every key), so the completion popup stands down.
+    // The `/model` selector and `/resume` picker are full modals; when one is
+    // open it owns the screen (and every key), so the completion popup stands
+    // down.
     if let Some(sel) = &app.model_selector {
         draw_model_selector(f, &app.theme, sel);
+    } else if let Some(sel) = &app.session_selector {
+        draw_session_selector(f, &app.theme, sel);
+    } else if let Some(sel) = &app.theme_selector {
+        draw_theme_selector(f, &app.theme, sel);
     } else if let Some(comp) = app.active_completions() {
         // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
@@ -229,6 +234,210 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
                     format!("{}{provider}", " ".repeat(pad)),
                     Style::default().fg(theme.dim),
                 ),
+            ])
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/theme` picker modal: a search line, a hint, and a two-column list
+/// (theme name · source) of the baked-in themes plus any user theme files,
+/// narrowed by the fuzzy filter. Same chrome as the `/model` selector — and
+/// since the highlighted theme is live-previewed, the modal itself repaints in
+/// the candidate's colors as the highlight moves.
+fn draw_theme_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ThemeSelector) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 92);
+    let height = area.height.saturating_sub(2).clamp(1, 32);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    let rows: Vec<&hrdr_app::ThemeChoice> = sel.rows().collect();
+    let search = Line::from(vec![
+        Span::styled("Search  ", Style::default().fg(theme.dim)),
+        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+    ]);
+    let hint = Line::from(Span::styled(
+        format!(
+            "{} theme{} · ↑↓ preview · Enter apply · Esc cancel",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(theme.dim),
+    ));
+
+    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
+    let inner_w = inner.width as usize;
+    let start = if sel.selected >= list_height {
+        (sel.selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no themes match",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
+        let selected = i == sel.selected;
+        // Theme name on the left, source right-aligned — the same two-column
+        // layout as the `/model` selector.
+        let source = truncate_chars(&c.source, (inner_w / 2).max(1));
+        let avail = inner_w.saturating_sub(source.chars().count() + 1).max(1);
+        let name = truncate_chars(&c.name, avail);
+        let pad = inner_w
+            .saturating_sub(name.chars().count() + source.chars().count())
+            .max(1);
+        let line = if selected {
+            Line::from(Span::styled(
+                format!("{name}{}{source}", " ".repeat(pad)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(name, Style::default().fg(theme.user)),
+                Span::styled(
+                    format!("{}{source}", " ".repeat(pad)),
+                    Style::default().fg(theme.dim),
+                ),
+            ])
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/resume` session picker modal: a search line, a hint, and a
+/// four-column list (id · name · age · cwd) of every saved session, newest
+/// first, narrowed by the fuzzy filter. Same chrome as the `/model` selector.
+fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SessionSelector) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 110);
+    let height = area.height.saturating_sub(2).clamp(1, 32);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    // Pre-render each visible row's cells: id · name · age · cwd.
+    let rows: Vec<(String, String, String, String)> = sel
+        .rows()
+        .map(|m| {
+            let ts = chrono::DateTime::from_timestamp(m.updated as i64, 0)
+                .map(|t| hrdr_app::relative_time(t.with_timezone(&chrono::Local)))
+                .unwrap_or_else(|| "—".to_string());
+            let cwd = hrdr_app::display_dir(std::path::Path::new(&m.cwd));
+            (m.id.clone(), m.name.clone(), ts, cwd)
+        })
+        .collect();
+
+    let search = Line::from(vec![
+        Span::styled("Search  ", Style::default().fg(theme.dim)),
+        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+    ]);
+    let hint = Line::from(Span::styled(
+        format!(
+            "{} session{} · ↑↓ select · Enter resume · Esc cancel",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(theme.dim),
+    ));
+
+    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
+    let inner_w = inner.width as usize;
+    let start = if sel.selected >= list_height {
+        (sel.selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    // Column widths from the data: id and age fit their longest value (capped),
+    // the cwd gets up to a third of the width, and the name takes the rest.
+    let id_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .max()
+        .unwrap_or(2)
+        .min(20);
+    let ts_w = rows
+        .iter()
+        .map(|r| r.2.chars().count())
+        .max()
+        .unwrap_or(2)
+        .min(12);
+    let cwd_w = rows
+        .iter()
+        .map(|r| r.3.chars().count())
+        .max()
+        .unwrap_or(2)
+        .min(inner_w / 3);
+    let gaps = 3 * 2; // three two-space column separators
+    let name_w = inner_w.saturating_sub(id_w + ts_w + cwd_w + gaps).max(4);
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no sessions match",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    let cell = |s: &str, w: usize| format!("{:<w$}", truncate_chars(s, w), w = w);
+    for (i, (id, name, ts, cwd)) in rows.iter().enumerate().skip(start).take(list_height) {
+        let selected = i == sel.selected;
+        let (id, name, ts, cwd) = (
+            cell(id, id_w),
+            cell(name, name_w),
+            cell(ts, ts_w),
+            truncate_chars(cwd, cwd_w),
+        );
+        let line = if selected {
+            let row = format!("{id}  {name}  {ts}  {cwd}");
+            Line::from(Span::styled(
+                format!("{row:<inner_w$}"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(format!("{id}  "), Style::default().fg(theme.accent)),
+                Span::styled(format!("{name}  "), Style::default().fg(theme.user)),
+                Span::styled(format!("{ts}  {cwd}"), Style::default().fg(theme.dim)),
             ])
         };
         lines.push(line);

@@ -3792,3 +3792,96 @@ async fn model_selector_renders_columns_filters_and_closes() {
     assert!(h.app.model_selector.is_none(), "Esc closes the selector");
     assert!(!h.render().contains("Search"), "modal is gone after Esc");
 }
+
+/// The `/resume` session picker mirrors the `/model` selector: columns
+/// (id · name · age · cwd), fuzzy filter across all three text columns, and
+/// Esc to close.
+#[tokio::test]
+async fn session_selector_renders_columns_filters_and_closes() {
+    let mut h = Harness::new(vec![]).await;
+    // A recent timestamp so the age cell reads "2m ago" (epoch 0 would render
+    // a "20644d…" age too wide for the column and get truncated).
+    let two_min_ago = (chrono::Local::now().timestamp() - 120) as u64;
+    let meta = |id: &str, name: &str, cwd: &str| hrdr_app::SessionMeta {
+        id: id.to_string(),
+        name: name.to_string(),
+        cwd: cwd.to_string(),
+        updated: two_min_ago,
+        path: std::path::PathBuf::from(format!("/tmp/{id}.json")),
+    };
+    h.app.session_selector = Some(crate::app::SessionSelector::new(vec![
+        meta("fix-auth", "Fix the auth bug", "/home/u/api"),
+        meta("tui-polish", "TUI polish pass", "/home/u/hrdr"),
+    ]));
+
+    let screen = h.render();
+    assert!(screen.contains("Search"), "search line missing: {screen}");
+    assert!(screen.contains("Enter resume"), "hint line: {screen}");
+    assert!(screen.contains("fix-auth"), "id column: {screen}");
+    assert!(screen.contains("Fix the auth bug"), "name column: {screen}");
+    assert!(screen.contains("ago"), "age column: {screen}");
+    assert!(screen.contains("/home/u/api"), "cwd column: {screen}");
+
+    // Column order on a row: id, name, age, cwd.
+    let row = screen
+        .lines()
+        .find(|l| l.contains("fix-auth"))
+        .expect("the fix-auth row");
+    let id_at = row.find("fix-auth").unwrap();
+    let name_at = row.find("Fix the auth bug").unwrap();
+    let ts_at = row.find("ago").unwrap();
+    let cwd_at = row.find("/home/u/api").unwrap();
+    assert!(
+        id_at < name_at && name_at < ts_at && ts_at < cwd_at,
+        "columns ordered id·name·age·cwd: {row:?}"
+    );
+
+    // Typing filters (matches the cwd of the second session only).
+    h.type_str("hrdr");
+    let screen = h.render();
+    assert!(screen.contains("tui-polish"), "kept the match: {screen}");
+    assert!(
+        !screen.contains("fix-auth"),
+        "filtered the non-match out: {screen}"
+    );
+
+    // Esc closes the modal.
+    h.press(KeyCode::Esc);
+    assert!(h.app.session_selector.is_none(), "Esc closes the picker");
+    assert!(!h.render().contains("Search"), "modal is gone after Esc");
+}
+
+/// The `/theme` picker lists the baked-in themes, live-previews the highlight
+/// (moving it swaps the app theme), and Esc restores the original theme.
+#[tokio::test]
+async fn theme_selector_previews_and_esc_restores() {
+    let mut h = Harness::new(vec![]).await;
+    let original_user = h.app.theme.user;
+
+    h.submit("/theme").await;
+    assert!(h.app.theme_selector.is_some(), "/theme opens the picker");
+    let screen = h.render();
+    for name in [
+        "tokyonight",
+        "catppuccin-mocha",
+        "dracula",
+        "gruvbox-dark",
+        "nord",
+    ] {
+        assert!(screen.contains(name), "{name} listed: {screen}");
+    }
+    assert!(screen.contains("built-in"), "source column: {screen}");
+
+    // Filter down to dracula: the preview applies it immediately.
+    h.type_str("dracula");
+    assert_eq!(
+        h.app.theme.user,
+        ratatui::style::Color::Rgb(0x8b, 0xe9, 0xfd),
+        "highlighted theme (dracula cyan) is live-previewed"
+    );
+
+    // Esc restores the theme that was in force when the picker opened.
+    h.press(KeyCode::Esc);
+    assert!(h.app.theme_selector.is_none(), "Esc closes the picker");
+    assert_eq!(h.app.theme.user, original_user, "original theme restored");
+}

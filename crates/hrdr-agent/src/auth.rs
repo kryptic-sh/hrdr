@@ -2,7 +2,7 @@
 //! in a file users commit or share. Plaintext TOML at
 //! `$XDG_CONFIG_HOME/hrdr/auth.toml` (`0600` on unix), a flat map of provider
 //! name → API key. Written by the `/login` wizard, read at startup and on a
-//! live `/provider` switch.
+//! live provider switch (the `/model` picker or `/login`).
 
 use std::collections::HashMap;
 use std::io::Write;

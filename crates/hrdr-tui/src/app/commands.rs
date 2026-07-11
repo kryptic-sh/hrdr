@@ -481,6 +481,24 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         }
         self.app.model_selector = Some(super::ModelSelector::new(choices));
     }
+    fn begin_session_selector(&mut self) {
+        // Every directory's sessions, newest first — the cwd column tells them
+        // apart, and the fuzzy filter narrows by it too.
+        let sessions = hrdr_app::list_sessions();
+        if sessions.is_empty() {
+            self.info(format!(
+                "no saved sessions yet in {}",
+                hrdr_app::sessions_dir().display()
+            ));
+            return;
+        }
+        self.app.session_selector = Some(super::SessionSelector::new(sessions));
+    }
+    fn begin_theme_selector(&mut self) {
+        let choices = hrdr_app::theme_choices();
+        let original = self.app.theme.clone();
+        self.app.theme_selector = Some(super::ThemeSelector::new(choices, original));
+    }
     fn help_tips(&self) -> Option<String> {
         // The footer no longer repeats these, so `/help` is where they live.
         Some(format!(
@@ -573,6 +591,135 @@ impl super::App {
             }
         };
         self.system(line);
+    }
+
+    /// Route one key to the open `/resume` session picker: Esc/Ctrl+C closes
+    /// it, Up/Down move the highlight, Enter resumes the highlighted session,
+    /// and any other character edits the fuzzy filter. Caller checks
+    /// `self.session_selector.is_some()` first.
+    pub(super) fn session_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.session_selector = None,
+            KeyCode::Char('c') if ctrl => self.session_selector = None,
+            KeyCode::Up => {
+                if let Some(s) = &mut self.session_selector {
+                    s.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut self.session_selector {
+                    s.down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut self.session_selector {
+                    s.backspace();
+                }
+            }
+            KeyCode::Enter => self.apply_selected_session(),
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(s) = &mut self.session_selector {
+                    s.push_char(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resume the highlighted session from the `/resume` picker and close it.
+    /// `apply_session` re-checks the busy guard, so a mid-turn Enter is
+    /// rejected with the shared message rather than corrupting the swap.
+    fn apply_selected_session(&mut self) {
+        let Some(m) = self
+            .session_selector
+            .as_ref()
+            .and_then(|s| s.current())
+            .cloned()
+        else {
+            self.session_selector = None;
+            return;
+        };
+        self.session_selector = None;
+        match hrdr_app::Session::load_path(&m.path) {
+            Ok(session) => self.apply_session(m.id, session),
+            Err(e) => self.system(format!("can't load session {}: {e}", m.id)),
+        }
+    }
+
+    /// Route one key to the open `/theme` picker: Esc/Ctrl+C closes it and
+    /// restores the original theme, Up/Down move the highlight (live-previewing
+    /// the highlighted theme), Enter applies + persists it, and any other
+    /// character edits the fuzzy filter. Caller checks
+    /// `self.theme_selector.is_some()` first.
+    pub(super) fn theme_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.close_theme_selector(),
+            KeyCode::Char('c') if ctrl => self.close_theme_selector(),
+            KeyCode::Up => {
+                if let Some(s) = &mut self.theme_selector {
+                    s.up();
+                }
+                self.preview_selected_theme();
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut self.theme_selector {
+                    s.down();
+                }
+                self.preview_selected_theme();
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut self.theme_selector {
+                    s.backspace();
+                }
+                self.preview_selected_theme();
+            }
+            KeyCode::Enter => self.apply_selected_theme(),
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(s) = &mut self.theme_selector {
+                    s.push_char(ch);
+                }
+                self.preview_selected_theme();
+            }
+            _ => {}
+        }
+    }
+
+    /// Cancel the `/theme` picker, restoring the theme in force when it opened.
+    fn close_theme_selector(&mut self) {
+        if let Some(sel) = self.theme_selector.take() {
+            self.theme = sel.original;
+        }
+    }
+
+    /// Live preview: paint the highlighted theme (the whole UI redraws with it
+    /// next frame). No row under the filter → show the original again.
+    pub(super) fn preview_selected_theme(&mut self) {
+        let Some(sel) = &self.theme_selector else {
+            return;
+        };
+        self.theme = match sel.current() {
+            Some(c) => crate::theme::Theme::load(Some(&c.spec)),
+            None => sel.original.clone(),
+        };
+    }
+
+    /// Apply the highlighted theme from the `/theme` picker, persist it as the
+    /// config default, and close the picker.
+    fn apply_selected_theme(&mut self) {
+        let Some(sel) = self.theme_selector.take() else {
+            return;
+        };
+        let Some(c) = sel.current().cloned() else {
+            self.theme = sel.original;
+            return;
+        };
+        self.theme = crate::theme::Theme::load(Some(&c.spec));
+        self.persist_setting("theme", hrdr_agent::ConfigValue::Str(&c.spec));
+        self.system(format!("theme → {} ({})", c.name, c.source));
     }
 
     /// Feed one submitted line to the active `/login` wizard, dropping the modal

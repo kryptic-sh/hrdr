@@ -32,7 +32,7 @@ pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
 /// displayed chrome. `key` overrides the resolved credential — the `/login`
 /// wizard passes the freshly-entered key. Returns the resolved provider on
 /// success; `Err(message)` when the name is unknown or a turn is running.
-/// Shared by `/provider` and `/login`.
+/// Used by the `/login` wizard.
 pub fn apply_provider(
     host: &mut dyn CommandHost,
     name: &str,

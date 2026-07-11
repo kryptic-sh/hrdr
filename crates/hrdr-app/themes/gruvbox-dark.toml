@@ -1,0 +1,44 @@
+# Gruvbox (dark, medium contrast) — https://github.com/morhetz/gruvbox (MIT).
+# Palette values are upstream's bright variants on the medium dark background,
+# verbatim. hrdr's chat roles are mapped onto them by `hrdr_app::ChatPalette`.
+
+[palette]
+# Surfaces.
+bg     = "#282828" # bg0
+bg0_h  = "#1d2021" # hard-contrast background
+bg0_s  = "#32302f" # soft-contrast background
+bg1    = "#3c3836"
+bg2    = "#504945"
+
+# Text.
+fg      = "#ebdbb2" # fg1
+comment = "#928374" # gray
+
+# Accents.
+blue    = "#83a598"
+cyan    = "#8ec07c" # aqua
+green   = "#b8bb26"
+yellow  = "#fabd2f"
+orange  = "#fe8019"
+red     = "#fb4934"
+magenta = "#d3869b" # purple
+
+# Transcript block backgrounds.
+# (`[palette]` values must be literal hex — only `[ui]` resolves `$refs`.)
+bg_user    = "#1d2021" # bg0_h — also the tool-call block's background
+bg_command = "#3c3836" # bg1
+bg_stats   = "#32302f" # bg0_s
+
+# The bar drawn down the left of the user's own surfaces (prompt + input).
+border_prompt = "#d3869b" # purple
+
+[ui]
+background = "$bg"
+foreground = "$fg"
+cursor     = "$orange"
+cursorline = "$bg1"
+gutter     = "$comment"
+diagnostic_error = "$red"
+
+[ui.selection]
+bg = "$bg2"

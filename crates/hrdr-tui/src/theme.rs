@@ -6,12 +6,8 @@
 //! converts the resolved RGB roles to ratatui colors.
 
 use hjkl_markdown_tui::MdTheme;
-use hjkl_theme::Theme as HjklTheme;
 use hrdr_app::ChatPalette;
 use ratatui::style::Color;
-
-/// The default theme, baked into the binary at compile time.
-const DEFAULT_THEME_TOML: &str = include_str!("theme.toml");
 
 /// Resolved colors for hrdr's chat surfaces.
 #[derive(Debug, Clone)]
@@ -43,15 +39,12 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Load a theme from `path` (an hjkl theme TOML). When `path` is `None` or
-    /// fails to parse, falls back to the baked-in default theme.
-    pub fn load(path: Option<&str>) -> Self {
-        let hjkl = match path {
-            Some(p) => HjklTheme::from_path(std::path::Path::new(p))
-                .unwrap_or_else(|_| default_hjkl_theme()),
-            None => default_hjkl_theme(),
-        };
-        Self::from_palette(&ChatPalette::from_hjkl(&hjkl))
+    /// Load a theme from a spec — a baked-in theme name (`tokyonight`,
+    /// `dracula`, …) or an hjkl theme TOML path. When `spec` is `None`,
+    /// unknown, or fails to parse, falls back to the baked-in default theme
+    /// (Tokyo Night). Resolution lives in [`hrdr_app::load_hjkl_theme`].
+    pub fn load(spec: Option<&str>) -> Self {
+        Self::from_palette(&ChatPalette::load(spec))
     }
 
     /// Apply terminal fallback colors to any palette role that the theme
@@ -132,12 +125,6 @@ impl Default for Theme {
     }
 }
 
-/// Parse the baked-in default theme TOML.
-fn default_hjkl_theme() -> HjklTheme {
-    HjklTheme::from_toml_str(DEFAULT_THEME_TOML)
-        .unwrap_or_else(|_| hjkl_theme::loader::default_theme())
-}
-
 #[cfg(test)]
 mod theme_tests {
     use super::*;
@@ -149,16 +136,17 @@ mod theme_tests {
         }
     }
 
-    /// The bundled theme must *parse*. `Theme::load` swallows a parse error and
-    /// silently falls back to hjkl's bundled default (a different palette
-    /// entirely), so a typo here would ship the wrong colors with no warning.
-    ///
-    /// Regression: `[palette]` values must be literal hex — only `[ui]` resolves
-    /// `$refs` — and writing `bg_user = "$bg_visual"` broke the whole file.
+    /// A baked-in theme name resolves — the picker's specs go through the
+    /// same `Theme::load` as paths do. (Each bundled TOML's parse/coverage is
+    /// tested in `hrdr_app::themes`.)
     #[test]
-    fn the_bundled_theme_parses() {
-        hjkl_theme::Theme::from_toml_str(DEFAULT_THEME_TOML)
-            .expect("the bundled theme must parse, or Theme::load silently uses another palette");
+    fn a_builtin_name_loads_its_own_palette() {
+        let dracula = Theme::load(Some("dracula"));
+        assert_eq!(hex(dracula.user), "#8be9fd", "dracula cyan");
+        assert_eq!(hex(dracula.error), "#ff5555", "dracula red");
+        // An unknown name falls back to the default (Tokyo Night).
+        let fallback = Theme::load(Some("no-such-theme"));
+        assert_eq!(hex(fallback.user), "#7dcfff", "tokyonight cyan");
     }
 
     /// Every chat role resolves to its Tokyo Night (night) value — i.e. the

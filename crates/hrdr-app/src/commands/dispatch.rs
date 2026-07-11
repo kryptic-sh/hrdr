@@ -3,7 +3,7 @@ use std::path::Path;
 use super::conversation::export_conversation;
 use super::helpers::{RESUME_BUSY_MSG, busy_generic, busy_guard, git_working_diff};
 use super::host::CommandHost;
-use super::model::{apply_provider, endpoint_health_warning, switch_model};
+use super::model::{endpoint_health_warning, switch_model};
 use super::types::ExpandMode;
 
 /// Handle a `/…` command shared by both frontends. Returns `true` if it was a
@@ -37,21 +37,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
         }
         "model" => {
-            if arg.is_empty() {
-                // No argument: open the interactive selector (a frontend that
-                // supports it; the default lists models as text).
-                host.begin_model_selector();
-            } else if host.is_busy() {
-                // `switch_model` updates the displayed model immediately but
-                // the actual `agent.set_model` waits on the turn's mutex —
-                // switching mid-turn would show the new model before it
-                // actually takes effect. Reject it instead, consistent with
-                // `/cwd` and the other mutating commands above.
-                host.info(busy_generic());
-            } else {
-                switch_model(host, arg.clone());
-                host.info(format!("model → {arg}"));
-            }
+            // Always the interactive picker (a frontend that supports it; the
+            // default lists models as text). Switching provider + model by
+            // name still works via the picker's fuzzy filter.
+            host.begin_model_selector();
         }
         "tools" => {
             let agent = host.agent();
@@ -87,7 +76,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 msg
             }));
         }
-        "info" => {
+        "status" => {
             let agent = host.agent();
             let model = host.model();
             let base_url = host.base_url();
@@ -526,7 +515,13 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
         }
         "theme" => {
-            let path = (!arg.is_empty()).then(|| arg.clone());
+            if arg.is_empty() {
+                // No argument: open the interactive picker (a frontend that
+                // supports it; the default lists the themes as text).
+                host.begin_theme_selector();
+                return true;
+            }
+            let path = (!matches!(arg.as_str(), "reset" | "default")).then(|| arg.clone());
             host.set_theme(path.clone());
             match path {
                 Some(p) => {
@@ -583,27 +578,12 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             );
         }
         "reload" => host.reload_config(),
-        "provider" => {
-            if arg.is_empty() {
-                host.info("usage: /provider <name>  (or /login for guided setup)".to_string());
-                return true;
-            }
-            match apply_provider(host, &arg, None) {
-                Ok(p) => host.info(format!("provider → {arg} ({})", p.base_url)),
-                Err(e) => host.info(e),
-            }
-        }
         "login" => host.begin_login(),
-        "sessions" => {
-            let all = crate::sessions_all_flag(&arg);
-            host.info(crate::session_list_text(
-                all,
-                &host.cwd().display().to_string(),
-            ));
-        }
         "resume" | "load" => {
             if arg.is_empty() {
-                host.info("usage: /resume <id or name> (see /sessions)".to_string());
+                // No argument: open the interactive session picker (a frontend
+                // that supports it; the default lists sessions as text).
+                host.begin_session_selector();
                 return true;
             }
             if host.is_busy() {
@@ -612,7 +592,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             match crate::resolve_session(&host.cwd().display().to_string(), &arg) {
                 Some((id, session)) => host.resume(id, session),
-                None => host.info(format!("no session matching '{arg}' (see /sessions)")),
+                None => host.info(format!("no session matching '{arg}' (see /resume)")),
             }
         }
         "cost" => {
@@ -857,44 +837,23 @@ mod tests {
         assert!(host.input.contains("hello from small"), "{:?}", host.input);
     }
 
-    /// `/model` must not switch mid-turn: `switch_model` updates the
-    /// displayed model immediately, but the real `agent.set_model` waits on
-    /// the turn's mutex — switching while busy would show the new model
-    /// before it actually takes effect. Rejected instead, consistent with
-    /// `/cwd`.
+    /// `/model` always opens the picker — an argument no longer switches
+    /// directly (the picker's fuzzy filter covers that), so the displayed
+    /// model must not change from dispatch alone.
     #[tokio::test]
-    async fn model_switch_is_rejected_while_a_turn_is_running() {
+    async fn model_opens_the_picker_and_ignores_arguments() {
         let mut host = TestHost::new(std::env::temp_dir());
-        host.busy = true;
 
         assert!(dispatch(&mut host, "/model other-model"));
         assert_eq!(
             host.model, "test-model",
-            "the displayed model must not change mid-turn"
+            "/model must not switch the model directly"
         );
         assert!(
             host.info_log
                 .iter()
-                .any(|l| l.to_lowercase().contains("busy")),
-            "{:?}",
-            host.info_log
-        );
-    }
-
-    /// Idle, `/model` switches immediately (the displayed half is
-    /// synchronous; the real agent switch happens on a background task).
-    #[tokio::test]
-    async fn model_switch_applies_when_idle() {
-        let mut host = TestHost::new(std::env::temp_dir());
-
-        assert!(dispatch(&mut host, "/model other-model"));
-        assert_eq!(host.model, "other-model");
-        assert!(
-            !host
-                .info_log
-                .iter()
-                .any(|l| l.to_lowercase().contains("busy")),
-            "{:?}",
+                .any(|l| l.contains("model selector isn't available")),
+            "the default host reports the picker as unavailable: {:?}",
             host.info_log
         );
     }
