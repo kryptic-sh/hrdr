@@ -168,12 +168,6 @@ pub fn arg_completions(
             .collect()
     } else {
         match resolve_alias(cmd) {
-            "effort" => set(&[
-                ("minimal", "fastest, least reasoning"),
-                ("low", ""),
-                ("medium", ""),
-                ("high", "most reasoning"),
-            ]),
             "thinking" | "reasoning" | "think" => {
                 set(&[("on", "show model reasoning"), ("off", "hide it")])
             }
@@ -348,7 +342,7 @@ mod tests {
                 .unwrap_or_default()
         };
         // Enum arguments: prefix match, and the empty partial lists all.
-        assert_eq!(vals("/effort h"), vec!["high"]);
+        assert_eq!(vals("/statusbar tr"), vec!["truncate"]);
         assert_eq!(vals("/timestamps ").len(), 3);
         // Dispatch-level alt names and registry aliases both resolve.
         assert_eq!(vals("/ts ex"), vec!["exact"]);
@@ -360,13 +354,13 @@ mod tests {
         assert_eq!(vals(":deploy st"), vec!["staging"]);
         assert_eq!(vals(":deploy ").len(), 2);
         // No argument yet, unknown command, or no match → nothing.
-        assert!(arg_completions("/effort", &skills).is_none());
+        assert!(arg_completions("/statusbar", &skills).is_none());
         assert!(arg_completions("/help x", &skills).is_none());
-        assert!(arg_completions("/effort zz", &skills).is_none());
+        assert!(arg_completions("/statusbar zz", &skills).is_none());
         assert!(arg_completions("hello there", &skills).is_none());
         // The offset points at the argument, past the whitespace run.
-        let (start, _) = arg_completions("/effort   hi", &skills).unwrap();
-        assert_eq!(&"/effort   hi"[start..], "hi");
+        let (start, _) = arg_completions("/goto   to", &skills).unwrap();
+        assert_eq!(&"/goto   to"[start..], "to");
     }
 
     #[test]

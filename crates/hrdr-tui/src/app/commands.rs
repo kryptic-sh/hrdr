@@ -500,6 +500,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         }
         self.app.session_selector = Some(super::SessionSelector::new(sessions));
     }
+    fn begin_effort_selector(&mut self) {
+        let choices =
+            hrdr_app::effort_choices(self.app.state.provider.as_deref(), &self.app.state.model);
+        self.app.effort_selector = Some(super::EffortSelector::new(choices));
+    }
     fn begin_theme_selector(&mut self) {
         let choices = hrdr_app::theme_choices();
         let original = self.app.theme.clone();
@@ -726,6 +731,72 @@ impl super::App {
         self.theme = crate::theme::Theme::load(Some(&c.spec));
         self.persist_setting("theme", hrdr_agent::ConfigValue::Str(&c.spec));
         self.system(format!("theme → {} ({})", c.name, c.source));
+    }
+
+    /// Route one key to the open `/effort` picker: Esc/Ctrl+C closes it,
+    /// Up/Down move the highlight, Enter applies the highlighted level, and
+    /// any other character edits the fuzzy filter. Caller checks
+    /// `self.effort_selector.is_some()` first.
+    pub(super) fn effort_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.effort_selector = None,
+            KeyCode::Char('c') if ctrl => self.effort_selector = None,
+            KeyCode::Up => {
+                if let Some(s) = &mut self.effort_selector {
+                    s.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut self.effort_selector {
+                    s.down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut self.effort_selector {
+                    s.backspace();
+                }
+            }
+            KeyCode::Enter => self.apply_selected_effort(),
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(s) = &mut self.effort_selector {
+                    s.push_char(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the highlighted effort from the `/effort` picker and close it:
+    /// set (or, for "Default", clear) the status-bar label, persist the pick
+    /// as the config default, and push it to the model client so it's sent as
+    /// `reasoning_effort` (or an Anthropic thinking budget) on the next call.
+    fn apply_selected_effort(&mut self) {
+        let Some(c) = self
+            .effort_selector
+            .as_ref()
+            .and_then(|s| s.current())
+            .cloned()
+        else {
+            self.effort_selector = None;
+            return;
+        };
+        self.effort_selector = None;
+        self.effort = c.value.clone();
+        match &c.value {
+            Some(v) => self.persist_setting("effort", hrdr_agent::ConfigValue::Str(v)),
+            None => self.unpersist_setting("effort"),
+        }
+        let agent = self.agent.clone();
+        let value = c.value.clone();
+        tokio::spawn(async move {
+            agent.lock().await.set_effort(value);
+        });
+        self.system(match &c.value {
+            Some(v) => format!("effort → {} ({v})", c.label),
+            None => "effort → default (the model/provider default)".to_string(),
+        });
     }
 
     /// Feed one submitted line to the active `/login` wizard, dropping the modal

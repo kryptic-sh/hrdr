@@ -136,6 +136,9 @@ pub(crate) fn thinking_budget(effort: Option<&str>, max_tokens: u32) -> Option<u
         "low" => 0.40,
         "medium" => 0.60,
         "high" => 0.75,
+        "xhigh" => 0.85,
+        "max" => 0.95,
+        // "none" (and anything unmapped) leaves extended thinking off.
         _ => return None,
     };
     // Reserve at least 1024 tokens below `max_tokens` for the actual answer.

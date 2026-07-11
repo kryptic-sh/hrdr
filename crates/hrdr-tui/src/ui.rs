@@ -146,6 +146,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_session_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.theme_selector {
         draw_theme_selector(f, &app.theme, sel);
+    } else if let Some(sel) = &app.effort_selector {
+        draw_effort_selector(f, &app.theme, sel);
     } else if let Some(comp) = app.active_completions() {
         // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
@@ -232,6 +234,91 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
                 Span::styled(model, Style::default().fg(theme.user)),
                 Span::styled(
                     format!("{}{provider}", " ".repeat(pad)),
+                    Style::default().fg(theme.dim),
+                ),
+            ])
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/effort` picker modal: a search line, a hint, and a two-column list
+/// (level label · detail) of the reasoning levels the current model accepts,
+/// highest first with "Default" on top, narrowed by the fuzzy filter. Same
+/// chrome as the other pickers.
+fn draw_effort_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::EffortSelector) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 64);
+    let height = area.height.saturating_sub(2).clamp(1, 20);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    let rows: Vec<&hrdr_app::EffortChoice> = sel.rows().collect();
+    let search = Line::from(vec![
+        Span::styled("Search  ", Style::default().fg(theme.dim)),
+        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+    ]);
+    let hint = Line::from(Span::styled(
+        format!(
+            "{} level{} · ↑↓ select · Enter apply · Esc cancel",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(theme.dim),
+    ));
+
+    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
+    let inner_w = inner.width as usize;
+    let start = if sel.selected >= list_height {
+        (sel.selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no levels match",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
+        let selected = i == sel.selected;
+        // Label on the left, detail right-aligned — the pickers' shared layout.
+        let detail = truncate_chars(&c.detail, (inner_w / 2).max(1));
+        let avail = inner_w.saturating_sub(detail.chars().count() + 1).max(1);
+        let label = truncate_chars(&c.label, avail);
+        let pad = inner_w
+            .saturating_sub(label.chars().count() + detail.chars().count())
+            .max(1);
+        let line = if selected {
+            Line::from(Span::styled(
+                format!("{label}{}{detail}", " ".repeat(pad)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(theme.user)),
+                Span::styled(
+                    format!("{}{detail}", " ".repeat(pad)),
                     Style::default().fg(theme.dim),
                 ),
             ])

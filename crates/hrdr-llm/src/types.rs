@@ -207,10 +207,15 @@ impl Default for RequestParams {
 
 /// Normalize a reasoning-effort label to a value worth sending as
 /// `reasoning_effort`, or `None` for anything unrecognized (a display-only label
-/// like `off`, or garbage) so it's never put on the wire.
+/// like `off`, or garbage) so it's never put on the wire. The full ladder is
+/// what models.dev catalogs across models (`none` … `max`); which subset a
+/// given model accepts is the model's own `reasoning_options` — the `/effort`
+/// picker only offers that subset.
 pub fn normalize_effort(label: &str) -> Option<String> {
     match label.trim().to_ascii_lowercase().as_str() {
-        s @ ("minimal" | "low" | "medium" | "high") => Some(s.to_string()),
+        s @ ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => {
+            Some(s.to_string())
+        }
         _ => None,
     }
 }

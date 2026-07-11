@@ -286,6 +286,25 @@ pub trait CommandHost {
         self.info(crate::session_list_text());
     }
 
+    /// Open the interactive `/effort` picker — the reasoning levels the
+    /// current model accepts (models.dev catalog), highest first, "Default"
+    /// on top. A frontend that supports it stashes the selector in a modal
+    /// slot; the default lists the levels as text.
+    fn begin_effort_selector(&mut self) {
+        let choices = crate::effort_choices(self.provider().as_deref(), &self.model());
+        let mut s = format!(
+            "effort: {} — levels for this model:",
+            self.effort().unwrap_or_else(|| "default".into())
+        );
+        for c in choices {
+            s.push_str(&format!("\n  {}", c.label));
+            if !c.detail.is_empty() {
+                s.push_str(&format!(" — {}", c.detail));
+            }
+        }
+        self.info(s);
+    }
+
     /// Open the interactive `/theme` picker — the baked-in themes plus any
     /// user theme files. A frontend that supports it stashes the selector in a
     /// modal slot; the default lists the choices as text.

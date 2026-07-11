@@ -3434,6 +3434,9 @@ impl Agent {
 // Re-exports consumers need without reaching into sub-crates.
 pub use hrdr_llm::ChatMessage as Message;
 pub use hrdr_llm::Role as MessageRole;
+/// The models.dev catalog (context windows, price cards, effort levels) —
+/// re-exported so frontends don't need a direct `hrdr-llm` dependency.
+pub use hrdr_llm::catalog;
 /// Whether a reasoning-effort label is a level actually sent as `reasoning_effort`
 /// (`minimal`/`low`/`medium`/`high`) rather than a display-only label.
 pub use hrdr_llm::normalize_effort;

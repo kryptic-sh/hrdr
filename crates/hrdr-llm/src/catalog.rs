@@ -176,6 +176,39 @@ fn lookup_cost(catalog: &Value, provider: Option<&str>, model: &str) -> Option<M
         .max_by(|a, b| (a.input + a.output).total_cmp(&(b.input + b.output)))
 }
 
+/// The reasoning-effort levels `model` accepts, from the catalog's
+/// `reasoning_options` (`{type: "effort", values: […]}` entries). Values come
+/// back in the catalog's order (lowest effort first). Resolution mirrors
+/// [`context_window`]: the configured provider's entry wins, else the first
+/// provider serving this model id that declares effort levels. `None` when the
+/// catalog doesn't know the model (or it has no effort control).
+pub fn lookup_effort_levels(
+    catalog: &Value,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<Vec<String>> {
+    let efforts = |p: &Value| -> Option<Vec<String>> {
+        let opts = p.get("models")?.get(model)?.get("reasoning_options")?;
+        let values: Vec<String> = opts
+            .as_array()?
+            .iter()
+            .find(|o| o.get("type").and_then(Value::as_str) == Some("effort"))?
+            .get("values")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        (!values.is_empty()).then_some(values)
+    };
+    if let Some(name) = provider
+        && let Some(p) = catalog.get(name)
+        && let Some(v) = efforts(p)
+    {
+        return Some(v);
+    }
+    catalog.as_object()?.values().find_map(efforts)
+}
+
 /// The cache file, `$XDG_CACHE_HOME/hrdr/models.json`.
 fn cache_path() -> Option<PathBuf> {
     Some(hjkl_xdg::cache_dir("hrdr").ok()?.join("models.json"))
@@ -342,6 +375,36 @@ mod tests {
             cache_read: None,
         };
         assert!((flat.call_cost(1_000_000, 0, Some(1_000_000)) - 10.0).abs() < 1e-9);
+    }
+
+    /// Effort-level resolution: the configured provider wins, else the first
+    /// provider declaring effort values; models without them yield `None`.
+    #[test]
+    fn lookup_effort_levels_reads_reasoning_options() {
+        let c = json!({
+            "a": { "models": {
+                "m": { "reasoning_options": [
+                    { "type": "effort", "values": ["low", "medium", "high"] },
+                ]},
+                "budget-only": { "reasoning_options": [
+                    { "type": "budget_tokens", "min": 1024 },
+                ]},
+            }},
+            "b": { "models": {
+                "m": { "reasoning_options": [
+                    { "type": "effort", "values": ["minimal", "low"] },
+                ]},
+            }},
+        });
+        assert_eq!(
+            lookup_effort_levels(&c, Some("b"), "m"),
+            Some(vec!["minimal".to_string(), "low".to_string()])
+        );
+        // No provider → first one that declares effort levels.
+        assert!(lookup_effort_levels(&c, None, "m").is_some());
+        // budget_tokens-only models have no effort *values*.
+        assert_eq!(lookup_effort_levels(&c, Some("a"), "budget-only"), None);
+        assert_eq!(lookup_effort_levels(&c, None, "unknown"), None);
     }
 
     /// `provider_models` returns the provider's friendly name and its models,

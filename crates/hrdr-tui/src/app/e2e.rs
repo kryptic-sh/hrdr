@@ -361,18 +361,22 @@ fn without_bar(row: &str) -> &str {
     row.trim_start_matches(crate::ui::BORDER_BAR).trim()
 }
 
-/// Point `sessions_dir()` at a temp directory for the duration of a test.
+/// Point `sessions_dir()` *and* the user config at a temp directory for the
+/// duration of a test.
 ///
-/// `XDG_DATA_HOME` is process-global, so the tests that write session files must
-/// not run concurrently — they'd overwrite each other's `sessions/` root. The
-/// returned guard holds a lock for the whole test and keeps the temp dir alive.
+/// `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-global, so the tests that
+/// write session files or persist settings must not run concurrently — they'd
+/// overwrite each other's roots (or, unisolated, the developer's real config).
+/// The returned guard holds a lock for the whole test and keeps the temp dir
+/// alive.
 fn isolated_data_home() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A previous test's panic must not poison the lock for everyone else.
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: the lock above serializes every writer and reader of this var.
+    // SAFETY: the lock above serializes every writer and reader of these vars.
     unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
     (guard, tmp)
 }
 
@@ -3972,21 +3976,54 @@ Run the release checklist for $ARGUMENTS",
     assert_eq!(user, "Run the release checklist for v0.3");
 }
 
+/// `/effort` opens a picker of the model's own levels, "Default" on top,
+/// highest effort first; picking a level sets + persists it, and picking
+/// Default clears the override.
+#[tokio::test]
+async fn effort_picker_lists_levels_default_first_and_applies() {
+    // Enter persists the pick — keep it away from the developer's real config.
+    let _env = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.submit("/effort").await;
+    assert!(h.app.effort_selector.is_some(), "/effort opens the picker");
+    let screen = h.render();
+    assert!(screen.contains("Default"), "Default row:\n{screen}");
+    assert!(screen.contains("High"), "levels listed:\n{screen}");
+    // Default is on top; "test-model" isn't in the catalog, so the fallback
+    // ladder applies and High is the first real level.
+    let d = screen.find("Default").unwrap();
+    let hi = screen.find("High").unwrap();
+    assert!(d < hi, "Default sorts above the levels");
+
+    // Fuzzy filter + Enter applies the level. ("medium", not "med": the
+    // subsequence filter would also keep Default via "the ModEl/proviDer".)
+    h.type_str("medium");
+    h.press(KeyCode::Enter);
+    assert!(h.app.effort_selector.is_none(), "Enter closes the picker");
+    assert_eq!(h.app.effort.as_deref(), Some("medium"));
+    let screen = h.render();
+    assert!(
+        screen.contains("effort → Medium (medium)"),
+        "confirmation line:\n{screen}"
+    );
+
+    // Reopen and pick Default: the override clears.
+    h.submit("/effort").await;
+    h.press(KeyCode::Enter); // Default is the first row
+    assert_eq!(h.app.effort, None, "Default clears the override");
+}
+
 /// Argument completion: after a command name + space, the popup offers the
 /// argument's candidate values, anchored at the argument column, and Tab
 /// completes just the argument.
 #[tokio::test]
 async fn argument_completion_offers_values_and_tab_fills_the_argument() {
     let mut h = Harness::new(vec![]).await;
-    h.type_str("/effort h");
+    h.type_str("/timestamps rel");
     let screen = h.render();
-    assert!(screen.contains("high"), "candidate offered:\n{screen}");
-    assert!(
-        !screen.contains("/effort  "),
-        "popup shows values, not command rows"
-    );
+    assert!(screen.contains("relative"), "candidate offered:\n{screen}");
     h.press(KeyCode::Tab);
-    assert_eq!(h.app.editor.content(), "/effort high ");
+    assert_eq!(h.app.editor.content(), "/timestamps relative ");
 
     // Theme names complete too (built-ins are always registered).
     h.app.editor.set_content("");

@@ -9,6 +9,7 @@
 mod commands;
 mod completion;
 mod config;
+mod effort;
 mod format;
 mod highlight;
 mod history;
@@ -25,6 +26,7 @@ mod util;
 pub use commands::*;
 pub use completion::*;
 pub use config::*;
+pub use effort::*;
 pub use format::*;
 pub use highlight::*;
 pub use history::*;
@@ -67,7 +69,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/todo-ttl", "turns a finished todo stays shown"),
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
-    ("/effort", "show or set effort label"),
+    ("/effort", "reasoning effort (picker)"),
     ("/status", "session info"),
     ("/cost", "session token usage"),
     ("/doctor", "check health: endpoint, deps, config"),

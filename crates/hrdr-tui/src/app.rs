@@ -21,6 +21,7 @@ use crate::theme::Theme;
 
 mod commands;
 mod completion;
+mod effort_selector;
 mod model_selector;
 mod session;
 mod session_selector;
@@ -29,6 +30,7 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
+pub(crate) use effort_selector::EffortSelector;
 use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
@@ -162,6 +164,8 @@ pub(crate) struct App {
     /// The open `/theme` picker modal; while `Some`, it captures every key and
     /// live-previews the highlighted theme.
     pub(crate) theme_selector: Option<ThemeSelector>,
+    /// The open `/effort` picker modal; while `Some`, it captures every key.
+    pub(crate) effort_selector: Option<EffortSelector>,
     /// USD already spent when the current session was adopted (a resumed
     /// session's saved spend); the agent's live counter adds on top of it.
     pub(crate) cost_base: f64,
@@ -390,6 +394,7 @@ impl App {
             model_selector: None,
             session_selector: None,
             theme_selector: None,
+            effort_selector: None,
             cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
@@ -509,6 +514,10 @@ impl App {
         }
         if self.theme_selector.is_some() {
             self.theme_selector_key(key);
+            return Action::None;
+        }
+        if self.effort_selector.is_some() {
+            self.effort_selector_key(key);
             return Action::None;
         }
 
@@ -763,6 +772,14 @@ impl App {
                 _ => {}
             }
             self.preview_selected_theme();
+            return;
+        }
+        if let Some(sel) = &mut self.effort_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
             return;
         }
         match m.kind {
