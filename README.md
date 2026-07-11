@@ -854,7 +854,9 @@ The shell and search tools adapt to the host:
       Homebrew, Scoop, Alpine
 - [x] MCP client (stdio + Streamable-HTTP + legacy HTTP+SSE) — `[[mcp]]`
       servers' tools, resources, and prompts join the set
-- [ ] LSP diagnostics feedback
+- [x] LSP diagnostics feedback: post-edit errors from the file's language server
+      (presence-aware, lazy-spawned, session-warm) ride back with the tool
+      result — see "LSP diagnostics"
 
 ## License
 
