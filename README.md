@@ -764,7 +764,10 @@ sub-agents). Built-ins: `rust-analyzer` (.rs), `typescript-language-server`
 (.ts/.tsx/.js/…), `pyright-langserver` (.py), `gopls` (.go), `clangd`
 (.c/.cpp/…). Diagnostics run on what's actually on disk — after any formatter
 hooks. Each edit waits at most `wait_ms` (default 2000 ms) for the server; a
-slow or dead server degrades to "no diagnostics", never to a failed edit.
+slow or dead server degrades to "no diagnostics", never to a failed edit. Files
+outside the workspace the servers were initialized against — a worktree-isolated
+sub-agent's tree, temp-dir scratch files — are deliberately skipped rather than
+left to server-dependent behavior.
 
 ```toml
 [lsp]
