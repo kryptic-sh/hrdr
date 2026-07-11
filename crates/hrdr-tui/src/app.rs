@@ -165,6 +165,10 @@ pub(crate) struct App {
     /// USD already spent when the current session was adopted (a resumed
     /// session's saved spend); the agent's live counter adds on top of it.
     pub(crate) cost_base: f64,
+    /// Discovered `:skill` prompt templates for the current cwd, for the
+    /// completion popup (refreshed on cwd change and `/reload`; the send path
+    /// re-discovers on its own, so a stale list only affects completion).
+    pub(crate) skills: Vec<hrdr_app::Skill>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -291,6 +295,7 @@ impl App {
         let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
         let branch = git_branch(&config.cwd);
+        let cwd_for_skills = config.cwd.clone();
         let context_window = config.context_window;
         let auto_compact = config.auto_compact;
         let compaction_reserved = config.compaction_reserved;
@@ -386,6 +391,7 @@ impl App {
             session_selector: None,
             theme_selector: None,
             cost_base: 0.0,
+            skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
             pending_scroll_entry: None,
             pending_focus_entry: None,
@@ -940,6 +946,7 @@ impl App {
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
+        self.skills = hrdr_app::discover_skills(&new);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does

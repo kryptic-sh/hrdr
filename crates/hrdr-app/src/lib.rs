@@ -16,6 +16,7 @@ mod login;
 mod palette;
 mod session;
 mod sessions;
+mod skills;
 mod status;
 mod subagents;
 mod themes;
@@ -31,6 +32,7 @@ pub use login::*;
 pub use palette::*;
 pub use session::*;
 pub use sessions::*;
+pub use skills::*;
 pub use status::*;
 pub use subagents::*;
 pub use themes::*;
@@ -49,6 +51,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (picker, name/path, reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
+    ("/skills", "list custom :skills (prompt templates)"),
     ("/prompt", "show the rendered system prompt"),
     ("/guardrails", "list active shell guardrails"),
     ("/expand", "expand tool output (last, or 'all'/'off')"),
@@ -124,7 +127,10 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Appearance",
         &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
     ),
-    ("Other", &["/reload", "/help", "/doctor", "/exit"]),
+    (
+        "Other",
+        &["/skills", "/reload", "/help", "/doctor", "/exit"],
+    ),
 ];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a

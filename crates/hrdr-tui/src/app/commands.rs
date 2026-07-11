@@ -143,6 +143,7 @@ impl super::App {
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
         self.reload_project_docs();
+        self.skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.current_cwd()));
     }
     /// Rewind the last user turn out of the agent history + transcript,
     /// returning the user's text (shared `/undo` and `/retry` core).
@@ -429,6 +430,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.dir = hrdr_app::display_dir(new);
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
+        self.app.skills = hrdr_app::discover_skills(new);
     }
     fn files_changed(&mut self) {
         self.app.file_index_cwd = None;

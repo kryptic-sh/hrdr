@@ -134,12 +134,28 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
     out
 }
 
-/// Prepare an outgoing user message for sending to the model: expand `@file`
-/// mentions into their contents (via [`expand_mentions`]) and, when an `@agent`
-/// mention matches a known sub-agent name, wrap the body in a delegation
-/// directive (via [`agent_mention_message`]). This is the canonical "input →
-/// sent" transform shared by the TUI and the headless runner.
+/// Prepare an outgoing user message for sending to the model: expand a
+/// `:skill` invocation into its prompt template (via [`crate::expand_skill`]),
+/// then `@file` mentions into their contents (via [`expand_mentions`]) and,
+/// when an `@agent` mention matches a known sub-agent name, wrap the body in a
+/// delegation directive (via [`agent_mention_message`]). This is the canonical
+/// "input → sent" transform shared by the TUI and the headless runner; the
+/// display copy keeps the raw input.
 pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
+    // A `:skill` template may itself carry `@file` / `@agent` mentions — they
+    // get the same expansion below.
+    let expanded;
+    let input = if input.trim_start().starts_with(':') {
+        match crate::expand_skill(input, &crate::discover_skills(cwd)) {
+            Some(prompt) => {
+                expanded = prompt;
+                expanded.as_str()
+            }
+            None => input, // not a known skill: send verbatim
+        }
+    } else {
+        input
+    };
     match extract_agent_mention(input, names) {
         Some((agent, body)) => agent_mention_message(&agent, &expand_mentions(&body, cwd)),
         None => expand_mentions(input, cwd),
@@ -592,6 +608,24 @@ mod tests {
         // The directive names the agent and carries the body.
         let msg = agent_mention_message("explore", "find X");
         assert!(msg.contains("`explore`") && msg.ends_with("find X"));
+    }
+
+    #[test]
+    fn prepare_outgoing_expands_a_skill_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join(".hrdr/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("ship.md"), "Run the checklist for $ARGUMENTS").unwrap();
+
+        let out = prepare_outgoing(":ship v2", &[], dir.path());
+        assert_eq!(out, "Run the checklist for v2");
+        // An unknown :name goes to the model verbatim.
+        assert_eq!(prepare_outgoing(":nope", &[], dir.path()), ":nope");
+        // A skill body's own @file mentions expand too.
+        std::fs::write(dir.path().join("notes.txt"), "note body").unwrap();
+        std::fs::write(skills.join("review.md"), "Review @notes.txt please").unwrap();
+        let out = prepare_outgoing(":review", &[], dir.path());
+        assert!(out.contains("note body"), "{out}");
     }
 
     #[test]

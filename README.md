@@ -114,8 +114,30 @@ JSON-per-line.
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
-and typing `/` opens a slash-command menu. Both share one popup: at most five
-rows (scroll for more), anchored above the token being completed.
+typing `/` opens a slash-command menu, and `:` invokes a custom skill. All share
+one popup: at most five rows (scroll for more), anchored above the token being
+completed.
+
+### Skills
+
+A skill is a reusable prompt template: a Markdown file whose body is sent to the
+model when you type `:name [arguments]`. `$ARGUMENTS` in the body is replaced
+with everything after the name (no placeholder → arguments append on their own
+line), and the template's own `@file` / `@agent` mentions expand as usual. Files
+are discovered from `.hrdr/skills/`, `.claude/commands/`, and
+`.opencode/command/` in the project, then `~/.config/hrdr/skills/`,
+`~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
+wins. Optional `name:` / `description:` frontmatter; the file stem names it
+otherwise. `/skills` lists what's loaded; the transcript shows the raw
+`:name args` you typed while the model receives the expanded prompt.
+
+```markdown
+## <!-- .hrdr/skills/review.md -->
+
+## description: focused diff review
+
+Review the working-tree diff. Focus on: $ARGUMENTS
+```
 
 ### Keybindings
 

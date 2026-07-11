@@ -3923,6 +3923,55 @@ async fn theme_selector_previews_and_esc_restores() {
     assert_eq!(h.app.theme.user, original_user, "original theme restored");
 }
 
+/// A `:skill` invocation sends the expanded template to the model while the
+/// transcript shows the raw `:name args` the user typed; the `:` prefix also
+/// drives the shared completion popup.
+#[tokio::test]
+async fn skill_invocation_expands_for_the_model_and_completes() {
+    let mut h = Harness::new(vec![MockReply::Text("shipped".to_string())]).await;
+    let skills_dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("ship.md"),
+        "---
+description: release checklist
+---
+Run the release checklist for $ARGUMENTS",
+    )
+    .unwrap();
+    // The popup lists the skill (the App cache was built before the file
+    // existed — refresh the way /reload and a cwd change do).
+    h.app.skills = hrdr_app::discover_skills(std::path::Path::new(&h.app.current_cwd()));
+    h.type_str(":sh");
+    let screen = h.render();
+    assert!(screen.contains(":ship"), "popup lists the skill:\n{screen}");
+    assert!(
+        screen.contains("release checklist"),
+        "popup shows the description:\n{screen}"
+    );
+    for _ in 0..3 {
+        h.press(KeyCode::Backspace);
+    }
+
+    h.submit(":ship v0.3").await;
+    let screen = h.render();
+    assert!(
+        screen.contains(":ship v0.3"),
+        "the transcript shows the raw invocation:\n{screen}"
+    );
+    // The model got the expanded template (synced into the session state by
+    // the turn-end autosave).
+    let user = h
+        .app
+        .state
+        .messages
+        .iter()
+        .find(|m| m.role == hrdr_agent::MessageRole::User)
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    assert_eq!(user, "Run the release checklist for v0.3");
+}
+
 /// The completion popup shows at most 5 rows plus a "… N more" hint, and
 /// slides its window to keep the selection visible.
 #[tokio::test]

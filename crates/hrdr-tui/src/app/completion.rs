@@ -1,7 +1,9 @@
 //! Slash-command and `@` mention completion (sub-agent names + file paths),
 //! sharing one popup.
 
-use hrdr_app::{active_file_token, rank_agent_matches, rank_file_matches, slash_completions};
+use hrdr_app::{
+    active_file_token, rank_agent_matches, rank_file_matches, skill_completions, slash_completions,
+};
 
 impl super::App {
     /// The active completion popup contents: slash commands when the line
@@ -19,6 +21,14 @@ impl super::App {
                     .into_iter()
                     .map(|(n, d)| (n.to_string(), d.to_string()))
                     .collect(),
+            });
+        }
+        let skills = skill_completions(&content, &self.skills);
+        if !skills.is_empty() {
+            return Some(Completions {
+                kind: CompletionKind::Skill,
+                anchor_col: 0,
+                items: skills,
             });
         }
         if let Some((start, query)) = active_file_token(&content) {
@@ -56,7 +66,7 @@ impl super::App {
     ) {
         let chosen = &comp.items[idx].0;
         match comp.kind {
-            CompletionKind::Slash => {
+            CompletionKind::Slash | CompletionKind::Skill => {
                 if trailing_space {
                     self.editor.set_content(&format!("{chosen} "));
                 } else {
@@ -113,6 +123,8 @@ pub(crate) struct Completions {
 pub(crate) enum CompletionKind {
     /// Replace the whole input with the chosen command.
     Slash,
+    /// Replace the whole input with the chosen `:skill` invocation.
+    Skill,
     /// Replace the `@…` token starting at this byte offset with `@<label> `
     /// (a sub-agent name or a file path — both insert the same way).
     Mention { token_start: usize },

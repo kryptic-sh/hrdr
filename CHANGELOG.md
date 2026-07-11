@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Custom skills (`:name`).** Reusable Markdown prompt templates invoked with a
+  `:` prefix (`:review error paths`): `$ARGUMENTS` substitution, discovery from
+  `.hrdr/skills/` + `.claude/commands/` + `.opencode/command/` (project then
+  user scopes, first name wins), optional `name:`/`description:` frontmatter,
+  `/skills` listing, and `:`-triggered rows in the shared completion popup. The
+  transcript keeps the raw invocation; the model gets the expanded prompt (skill
+  bodies' own `@file`/`@agent` mentions expand too). Works in `hrdr run` as well
+  — expansion lives in `prepare_outgoing`.
+
 ## [0.2.10] - 2026-07-11
 
 ### Removed
