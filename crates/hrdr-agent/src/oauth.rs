@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -309,9 +310,28 @@ async fn post_token(params: &[(&str, &str)]) -> Result<OpenAiTokens> {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("OpenAI token request failed ({status}): {text}");
+        bail!("{}", sanitized_token_error(status, &text));
     }
-    serde_json::from_str(&text).with_context(|| format!("parsing OpenAI token response: {text}"))
+    // Never echo the response body: it carries access/refresh tokens.
+    serde_json::from_str(&text).map_err(|_| anyhow!("could not parse the OpenAI token response"))
+}
+
+/// A bounded, secret-free diagnostic for a failed token request. The raw body
+/// carries access/refresh tokens, authorization codes, and PKCE verifiers, so
+/// only the short OAuth `error` code (e.g. `invalid_grant`) is surfaced — never
+/// the body itself.
+fn sanitized_token_error(status: reqwest::StatusCode, body: &str) -> String {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|s| s.chars().take(64).collect::<String>())
+        });
+    match code {
+        Some(c) => format!("OpenAI token request failed ({status}): {c}"),
+        None => format!("OpenAI token request failed ({status})"),
+    }
 }
 
 /// Extract the ChatGPT account id from a JWT (id or access token), reading the
@@ -471,27 +491,209 @@ fn load_all(path: &Path) -> HashMap<String, OAuthCreds> {
 /// A valid access token for `provider`, refreshing it first if it has (or is
 /// about to) expire. Returns `(access, account_id)`, or `None` when there are no
 /// stored credentials or a needed refresh fails.
+///
+/// This is the uncoordinated path, kept for non-ChatGPT callers. Trusted
+/// ChatGPT OAuth goes through [`coordinated_oauth_access`], which single-flights
+/// concurrent refreshes.
 pub async fn valid_access_token(provider: &str) -> Option<(String, Option<String>)> {
     let creds = load_oauth(provider)?;
     if !access_expired(creds.expires_ms, now_ms()) {
         return Some((creds.access, creds.account_id));
     }
     // Expired (or within the safety margin): refresh, persist, and return fresh.
-    let tokens = openai_refresh(&creds.refresh).await.ok()?;
+    let fresh = refresh_to_creds(&creds.refresh, creds.account_id)
+        .await
+        .ok()?;
+    let _ = save_oauth(provider, &fresh);
+    Some((fresh.access, fresh.account_id))
+}
+
+/// Refresh an access token from its refresh token, folding the account id out
+/// of the new id/access JWT (falling back to `prev_account`).
+async fn refresh_to_creds(refresh_token: &str, prev_account: Option<String>) -> Result<OAuthCreds> {
+    let tokens = openai_refresh(refresh_token).await?;
     let account_id = tokens
         .id_token
         .as_deref()
         .and_then(parse_account_id)
         .or_else(|| parse_account_id(&tokens.access_token))
-        .or(creds.account_id);
-    let fresh = OAuthCreds {
+        .or(prev_account);
+    Ok(OAuthCreds {
         access: tokens.access_token,
         refresh: tokens.refresh_token,
         expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
         account_id,
-    };
-    let _ = save_oauth(provider, &fresh);
-    Some((fresh.access, fresh.account_id))
+    })
+}
+
+// ── Cancel-safe refresh coordinator ─────────────────────────────────────────
+
+/// A usable access token plus the optional ChatGPT account id — the output of
+/// [`coordinated_oauth_access`].
+///
+/// Deliberately NO `Debug` derive: it holds a bearer token, and a `{:?}` (or
+/// `anyhow` context) must never leak it. `account_id` is the account-digest and
+/// `ChatGPT-Account-Id` header input; callers should not re-read the store for
+/// it.
+pub struct OAuthAccess {
+    pub access: String,
+    pub account_id: Option<String>,
+}
+
+/// Process-global single-flight coordinator for one ChatGPT credential slot.
+/// Shared by main agents and all sub-agents so concurrent refreshes collapse to
+/// one token request (concurrent writers would otherwise race on the atomic
+/// `oauth.json` replace and could strand a rotated refresh chain).
+struct RefreshCoordinator {
+    state: Mutex<CoordState>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct CoordState {
+    /// A refresh is in flight; other callers wait rather than start their own.
+    refreshing: bool,
+}
+
+static CHATGPT_COORD: OnceLock<RefreshCoordinator> = OnceLock::new();
+
+fn chatgpt_coord() -> &'static RefreshCoordinator {
+    CHATGPT_COORD.get_or_init(|| RefreshCoordinator {
+        state: Mutex::new(CoordState::default()),
+        notify: tokio::sync::Notify::new(),
+    })
+}
+
+/// RAII guard for the in-flight refresher: on drop (normal return, `?`, panic,
+/// or task cancellation) it clears `refreshing` and wakes every waiter, so a
+/// cancelled refresh can never wedge the gate or lose a wakeup.
+struct RefresherGuard<'a> {
+    coord: &'a RefreshCoordinator,
+}
+
+impl Drop for RefresherGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut st = self.coord.state.lock().unwrap_or_else(|p| p.into_inner());
+            st.refreshing = false;
+        }
+        self.coord.notify.notify_waiters();
+    }
+}
+
+/// A valid access token for trusted ChatGPT OAuth, single-flighting concurrent
+/// refreshes. Gated on both the trusted [`ResolvedProviderKind::ChatGptOAuth`]
+/// kind and the canonical [`CHATGPT_CODEX_BASE_URL`] — never callable for a
+/// custom shadow or a different endpoint.
+///
+/// [`ResolvedProviderKind::ChatGptOAuth`]: crate::ResolvedProviderKind::ChatGptOAuth
+/// [`CHATGPT_CODEX_BASE_URL`]: crate::CHATGPT_CODEX_BASE_URL
+pub async fn coordinated_oauth_access(
+    kind: crate::ResolvedProviderKind,
+    base_url: &str,
+) -> Result<OAuthAccess> {
+    if kind != crate::ResolvedProviderKind::ChatGptOAuth
+        || base_url != crate::CHATGPT_CODEX_BASE_URL
+    {
+        bail!("coordinated_oauth_access is only valid for trusted ChatGPT OAuth");
+    }
+    let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate oauth.json"))?;
+    coordinated_access_core(
+        chatgpt_coord(),
+        || load_oauth_at(&path, "chatgpt"),
+        |c| {
+            let _ = save_oauth_at(&path, "chatgpt", c);
+        },
+        |refresh_token, prev| async move { refresh_to_creds(&refresh_token, prev).await },
+    )
+    .await
+}
+
+/// Injectable core of [`coordinated_oauth_access`]: `load`/`persist` abstract
+/// the credential store and `refresh` the token request, so concurrency and
+/// newer-credential-wins behaviour are testable without HOME or the network.
+async fn coordinated_access_core<L, P, R, Fut>(
+    coord: &RefreshCoordinator,
+    load: L,
+    persist: P,
+    refresh: R,
+) -> Result<OAuthAccess>
+where
+    L: Fn() -> Option<OAuthCreds>,
+    P: Fn(&OAuthCreds),
+    R: Fn(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<OAuthCreds>>,
+{
+    loop {
+        // ── Decision section: synchronous lock only, never held across .await ──
+        let wait = {
+            let mut st = coord.state.lock().unwrap_or_else(|p| p.into_inner());
+            match load() {
+                None => bail!("no ChatGPT credentials; run /login"),
+                Some(c) => {
+                    // A currently-usable credential wins immediately — including
+                    // one a browser login installed while we waited.
+                    if !c.access.is_empty() && !access_expired(c.expires_ms, now_ms()) {
+                        return Ok(OAuthAccess {
+                            access: c.access,
+                            account_id: c.account_id,
+                        });
+                    }
+                    if c.refresh.is_empty() {
+                        bail!(
+                            "ChatGPT credentials are expired and have no refresh token; run /login"
+                        );
+                    }
+                }
+            }
+            if st.refreshing {
+                // Register the waiter WHILE holding the lock so the refresher's
+                // `notify_waiters()` (which only wakes already-registered
+                // waiters) cannot fire between our decision and our await.
+                let mut fut = Box::pin(coord.notify.notified());
+                fut.as_mut().enable();
+                Some(fut)
+            } else {
+                st.refreshing = true;
+                None
+            }
+        };
+
+        if let Some(fut) = wait {
+            fut.await;
+            continue; // Re-decide: usually a fresh credential now exists.
+        }
+
+        // ── We are the refresher. The guard clears the gate + wakes waiters on
+        //    every exit path (return, ?, panic, cancellation). ──
+        let _guard = RefresherGuard { coord };
+        let cur = load().ok_or_else(|| anyhow!("credentials vanished before refresh"))?;
+        // A concurrent login may have installed a usable credential already.
+        if !cur.access.is_empty() && !access_expired(cur.expires_ms, now_ms()) {
+            return Ok(OAuthAccess {
+                access: cur.access,
+                account_id: cur.account_id,
+            });
+        }
+        let fresh = refresh(cur.refresh.clone(), cur.account_id.clone()).await?;
+        // Prefer a newer browser-installed credential over our refresh output if
+        // the store changed under us during the request (login wins).
+        if let Some(latest) = load()
+            && latest.access != cur.access
+            && !latest.access.is_empty()
+            && !access_expired(latest.expires_ms, now_ms())
+        {
+            return Ok(OAuthAccess {
+                access: latest.access,
+                account_id: latest.account_id,
+            });
+        }
+        persist(&fresh);
+        return Ok(OAuthAccess {
+            access: fresh.access,
+            account_id: fresh.account_id,
+        });
+    }
 }
 
 /// Whether an access token expiring at `expires_ms` should be treated as
@@ -864,6 +1066,206 @@ mod tests {
         // ...but a custom provider spelled "chatgpt" resolves to kind Custom, and
         // the kind gate returns false before any load — not a spelling oracle.
         assert!(!has_oauth_credentials_at(&path, K::Custom, "chatgpt"));
+    }
+
+    // ── Refresh coordinator (Task 2) ─────────────────────────────────────────
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn new_coord() -> RefreshCoordinator {
+        RefreshCoordinator {
+            state: Mutex::new(CoordState::default()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn expired_with_refresh() -> Arc<Mutex<Option<OAuthCreds>>> {
+        Arc::new(Mutex::new(Some(OAuthCreds {
+            access: "old".to_string(),
+            refresh: "refresh-tok".to_string(),
+            expires_ms: 1, // long past
+            account_id: None,
+        })))
+    }
+
+    fn store_load(store: &Arc<Mutex<Option<OAuthCreds>>>) -> impl Fn() -> Option<OAuthCreds> {
+        let store = store.clone();
+        move || store.lock().unwrap().clone()
+    }
+
+    fn store_persist(store: &Arc<Mutex<Option<OAuthCreds>>>) -> impl Fn(&OAuthCreds) {
+        let store = store.clone();
+        move |c: &OAuthCreds| *store.lock().unwrap() = Some(c.clone())
+    }
+
+    fn fresh_creds(access: &str) -> OAuthCreds {
+        OAuthCreds {
+            access: access.to_string(),
+            refresh: "refresh-tok-2".to_string(),
+            expires_ms: now_ms() + 3_600_000,
+            account_id: Some("acct".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_single_flights_concurrent_refreshes() {
+        let coord = new_coord();
+        let store = expired_with_refresh();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mk = || {
+            let refresh = {
+                let calls = calls.clone();
+                move |_rt: String, _prev: Option<String>| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok(fresh_creds("fresh"))
+                    }
+                }
+            };
+            coordinated_access_core(&coord, store_load(&store), store_persist(&store), refresh)
+        };
+
+        let (a, b, c) = tokio::join!(mk(), mk(), mk());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent callers share ONE refresh"
+        );
+        for r in [a, b, c] {
+            assert_eq!(r.unwrap().access, "fresh");
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_prefers_newer_browser_install_over_refresh_output() {
+        let coord = new_coord();
+        let store = expired_with_refresh();
+
+        let refresh = {
+            let store = store.clone();
+            move |_rt: String, _prev: Option<String>| {
+                let store = store.clone();
+                async move {
+                    // A browser login lands a NEWER credential mid-refresh.
+                    *store.lock().unwrap() = Some(fresh_creds("browser-installed"));
+                    // Our (now stale) refresh returns a different token.
+                    Ok(fresh_creds("stale-refresh-output"))
+                }
+            }
+        };
+        let got =
+            coordinated_access_core(&coord, store_load(&store), store_persist(&store), refresh)
+                .await
+                .unwrap();
+        assert_eq!(
+            got.access, "browser-installed",
+            "a newer browser-installed credential wins over stale refresh output"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresher_clears_the_gate() {
+        let coord = new_coord();
+        let store = expired_with_refresh();
+
+        // First caller's refresh never completes; force-cancel via timeout.
+        let never = coordinated_access_core(
+            &coord,
+            store_load(&store),
+            store_persist(&store),
+            |_rt: String, _prev: Option<String>| std::future::pending::<Result<OAuthCreds>>(),
+        );
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(20), never).await;
+        assert!(timed_out.is_err(), "the refresher was cancelled");
+
+        // The RAII guard must have cleared `refreshing`: a new caller can refresh.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresh = {
+            let calls = calls.clone();
+            move |_rt: String, _prev: Option<String>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_creds("after-cancel"))
+                }
+            }
+        };
+        let got =
+            coordinated_access_core(&coord, store_load(&store), store_persist(&store), refresh)
+                .await
+                .unwrap();
+        assert_eq!(got.access, "after-cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "gate was not wedged");
+    }
+
+    #[tokio::test]
+    async fn coordinator_returns_valid_credential_without_refreshing() {
+        let coord = new_coord();
+        let store = Arc::new(Mutex::new(Some(fresh_creds("already-valid"))));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresh = {
+            let calls = calls.clone();
+            move |_rt: String, _prev: Option<String>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_creds("should-not-run"))
+                }
+            }
+        };
+        let got =
+            coordinated_access_core(&coord, store_load(&store), store_persist(&store), refresh)
+                .await
+                .unwrap();
+        assert_eq!(got.access, "already-valid");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no refresh when still valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinated_access_refuses_untrusted_kind_or_endpoint() {
+        use crate::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind as PK};
+        // Wrong kind (custom/built-in) or wrong endpoint → refuse before any I/O.
+        assert!(
+            coordinated_oauth_access(PK::Custom, CHATGPT_CODEX_BASE_URL)
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinated_oauth_access(PK::BuiltIn, CHATGPT_CODEX_BASE_URL)
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinated_oauth_access(PK::ChatGptOAuth, "https://evil.example/v1")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitized_token_error_never_echoes_body_secrets() {
+        let body = r#"{"error":"invalid_grant","access_token":"SENTINEL_ACCESS","refresh_token":"SENTINEL_REFRESH"}"#;
+        let msg = sanitized_token_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert!(
+            msg.contains("invalid_grant"),
+            "surfaces the safe error code"
+        );
+        assert!(!msg.contains("SENTINEL_ACCESS"));
+        assert!(!msg.contains("SENTINEL_REFRESH"));
+        // Non-JSON body is not echoed at all.
+        let msg2 = sanitized_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "authorization code SENTINEL_CODE verifier SENTINEL_VERIFIER",
+        );
+        assert!(!msg2.contains("SENTINEL_CODE"));
+        assert!(!msg2.contains("SENTINEL_VERIFIER"));
     }
 
     // ── encoding helpers ─────────────────────────────────────────────────────

@@ -316,6 +316,13 @@ impl Client {
         self.extra_headers = headers;
     }
 
+    /// Whether an extra header with `name` (case-insensitive) is currently set.
+    pub fn extra_headers_contains(&self, name: &str) -> bool {
+        self.extra_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
     /// Set the Azure OpenAI API version (enables the Azure URL + `api-key` auth
     /// quirks); `None` for a standard OpenAI-compatible endpoint.
     pub fn set_api_version(&mut self, api_version: Option<String>) {

@@ -51,6 +51,9 @@ pub fn apply_provider(
     let provider = name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     let api_version = p.api_version.clone();
+    // Trust identity travels with the endpoint: a stale kind would misgate OAuth
+    // injection on the next request.
+    let kind = p.kind;
     // Probe the new endpoint for its advertised context window unless the
     // provider config already declares one (which wins).
     let probe_after = p.context_window.is_none();
@@ -58,9 +61,10 @@ pub fn apply_provider(
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
         a.set_endpoint(url, key);
-        a.set_headers(headers);
+        a.set_headers(headers.clone());
         a.set_api_version(api_version);
         a.set_provider(Some(provider));
+        a.set_provider_identity(kind, headers);
         if let Some(m) = model {
             a.set_model(m);
         }
@@ -105,15 +109,17 @@ pub fn apply_choice(
     let provider = provider_name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     let api_version = p.api_version.clone();
+    let kind = p.kind;
     let probe_after = p.context_window.is_none();
     let post = host.context_window_poster();
     let model_for_agent = model.clone();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
         a.set_endpoint(url, key);
-        a.set_headers(headers);
+        a.set_headers(headers.clone());
         a.set_api_version(api_version);
         a.set_provider(Some(provider));
+        a.set_provider_identity(kind, headers);
         a.set_model(model_for_agent);
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);

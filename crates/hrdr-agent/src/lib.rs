@@ -15,11 +15,12 @@ pub use auth::{
 };
 mod oauth;
 pub use oauth::{
-    OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI,
-    OpenAiTokens, await_oauth_code, canonical_oauth_key, generate_pkce, generate_state,
-    has_oauth_credentials, load_oauth, load_oauth_for, oauth_file_path, openai_authorize_url,
-    openai_exchange, openai_refresh, openrouter_authorize_url, openrouter_exchange,
-    parse_account_id, save_oauth, save_oauth_for, valid_access_token,
+    OAuthAccess, OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT,
+    OPENAI_REDIRECT_URI, OpenAiTokens, await_oauth_code, canonical_oauth_key,
+    coordinated_oauth_access, generate_pkce, generate_state, has_oauth_credentials, load_oauth,
+    load_oauth_for, oauth_file_path, openai_authorize_url, openai_exchange, openai_refresh,
+    openrouter_authorize_url, openrouter_exchange, parse_account_id, save_oauth, save_oauth_for,
+    valid_access_token,
 };
 mod paths;
 pub use paths::cwd_slug;
@@ -2377,6 +2378,14 @@ pub struct Agent {
     /// keyed `provider/model`, so the fallback probe needs it to disambiguate a
     /// model several providers serve with different context windows.
     provider: Option<String>,
+    /// Trust identity of the current provider — gates OAuth bearer/account
+    /// injection together with the canonical endpoint. Updated atomically with
+    /// the endpoint on every provider switch via [`Agent::set_provider_identity`].
+    provider_kind: ResolvedProviderKind,
+    /// The provider's configured (non-OAuth) headers. Held separately so an
+    /// OAuth refresh can rebuild the effective header set (configured + account)
+    /// and switching away restores exactly the configured headers.
+    configured_headers: Vec<(String, String)>,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -2740,6 +2749,18 @@ impl Agent {
             .flatten()
             .and_then(|dir| Checkpoints::open(dir).ok())
             .map(|c| Arc::new(Mutex::new(c)));
+
+        // Resolve the trust identity for the configured provider BEFORE `config`
+        // is partially moved into the client below. Falls back to `BuiltIn` when
+        // no provider is named (a raw --base-url endpoint) — never to
+        // `ChatGptOAuth`, so OAuth injection requires an explicit trusted name.
+        let provider_kind = config
+            .provider
+            .as_deref()
+            .and_then(|n| config.resolve_provider(n))
+            .map(|p| p.kind)
+            .unwrap_or(ResolvedProviderKind::BuiltIn);
+        let configured_headers = config.headers.clone();
         ctx.checkpoints = checkpoints.clone();
 
         let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
@@ -2764,6 +2785,8 @@ impl Agent {
         Ok(Self {
             client,
             provider: config.provider.clone(),
+            provider_kind,
+            configured_headers,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -3801,21 +3824,48 @@ impl Agent {
         }
     }
 
-    /// For an OAuth provider (currently `chatgpt`), swap in a fresh access token
-    /// before a request — refreshing via the stored refresh token when the
-    /// current one is near expiry — and set the `ChatGPT-Account-Id` header. A
-    /// no-op for every key-based provider (no OAuth creds are stored for it), so
-    /// it costs at most one fast missing-file check per request.
+    /// Update the trust identity when the endpoint changes. Called by every
+    /// provider switch so `provider_kind`/`configured_headers` stay in lockstep
+    /// with the client's `base_url` — a stale kind would misgate OAuth injection.
+    pub fn set_provider_identity(
+        &mut self,
+        kind: ResolvedProviderKind,
+        configured_headers: Vec<(String, String)>,
+    ) {
+        self.provider_kind = kind;
+        self.configured_headers = configured_headers;
+    }
+
+    /// Before a request, inject fresh OAuth credentials for trusted ChatGPT, or
+    /// strip any stale OAuth state when this is not ChatGPT.
+    ///
+    /// Injection is gated on BOTH the trusted [`ResolvedProviderKind::ChatGptOAuth`]
+    /// kind AND the canonical [`CHATGPT_CODEX_BASE_URL`] endpoint — a custom
+    /// shadow or a `--base-url` override never receives the bearer/account
+    /// header. On the non-ChatGPT path the configured headers are restored
+    /// (dropping any `ChatGPT-Account-Id` left over from a prior ChatGPT turn);
+    /// the API key is left untouched (it is the key provider's real credential).
     async fn refresh_oauth_if_needed(&mut self) {
-        let Some(provider) = self.provider.clone() else {
-            return;
-        };
-        if let Some((access, account_id)) = oauth::valid_access_token(&provider).await {
-            self.client.set_api_key(Some(access));
-            if let Some(id) = account_id {
-                self.client
-                    .set_headers(vec![("ChatGPT-Account-Id".to_string(), id)]);
+        let base_url = self.client.base_url().to_string();
+        let is_chatgpt = self.provider_kind == ResolvedProviderKind::ChatGptOAuth
+            && base_url == CHATGPT_CODEX_BASE_URL;
+        if !is_chatgpt {
+            // Defensive: ensure no stale bearer/account header survives a switch
+            // away from ChatGPT. Idempotent for a steady-state key provider.
+            if self.client.extra_headers_contains("ChatGPT-Account-Id") {
+                self.client.set_headers(self.configured_headers.clone());
             }
+            return;
+        }
+        // A failed refresh leaves the previous state untouched; the authenticated
+        // catalog/health path (Task 3/5) surfaces a genuine auth warning.
+        if let Ok(access) = oauth::coordinated_oauth_access(self.provider_kind, &base_url).await {
+            self.client.set_api_key(Some(access.access));
+            let mut headers = self.configured_headers.clone();
+            if let Some(id) = access.account_id {
+                headers.push(("ChatGPT-Account-Id".to_string(), id));
+            }
+            self.client.set_headers(headers);
         }
     }
 
