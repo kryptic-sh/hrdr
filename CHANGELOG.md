@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/effort` picker.** A bare `/effort` (the argument form is gone) opens a
+  fuzzy-searchable picker of the reasoning levels the **current model actually
+  accepts**, read from the models.dev catalog's `reasoning_options` — ordered
+  highest effort first with human-readable labels ("Max", "Extra high", …) and a
+  "Default" row on top that clears the override so the model/provider default
+  applies. The effort ladder now covers `none`…`max` (`normalize_effort`), and
+  the native Anthropic backend maps `xhigh`/`max` to larger thinking budgets.
 - **Argument completion.** The completion popup no longer dies at the first
   space: it completes command arguments — enum values (`/effort`, `/thinking`,
   `/timestamps`, `/statusbar`, `/expand`, `/goto`, `/copy`, `/find`), theme

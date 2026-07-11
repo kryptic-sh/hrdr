@@ -117,7 +117,7 @@ names (routing the message to that agent) and file paths (attaching the file),
 typing `/` opens a slash-command menu, and `:` invokes a custom skill. All share
 one popup: at most five rows (scroll for more), anchored above the token being
 completed. After a command name + space the popup completes the **argument** too
-— enum values (`/effort high`, `/timestamps relative`), theme names, session ids
+— enum values (`/thinking on`, `/timestamps relative`), theme names, session ids
 for `/resume`, file paths for `/edit`/`/add`, and a skill's declared `args:`
 values.
 
@@ -170,9 +170,10 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
   (alias `/info`), `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
 - **Model** — `/model` (picker: switches model _and_ provider, includes the
   keyless `local` endpoint), `/login` (guided provider + key setup), `/temp`,
-  `/effort <minimal|low|medium|high>` (sent as `reasoning_effort` to
-  OpenAI-style reasoning models, or a `thinking` budget on the native Anthropic
-  backend), `/reasoning`
+  `/effort` (picker: the reasoning levels the current model actually accepts —
+  per the models.dev catalog — highest first, "Default" on top to clear the
+  override; sent as `reasoning_effort` to OpenAI-style reasoning models, or a
+  `thinking` budget on the native Anthropic backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
