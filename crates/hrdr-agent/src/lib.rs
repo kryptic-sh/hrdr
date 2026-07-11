@@ -78,6 +78,13 @@ pub enum AgentEvent {
         /// any call has been priced.
         session_cost_usd: Option<f64>,
     },
+    /// The durable chat history right after a completed tool round — every
+    /// result committed, no dangling `tool_calls`. Emitted so a frontend can
+    /// persist mid-turn (the turn task holds the agent lock for its whole
+    /// duration, so the frontend can't read the history itself). With this
+    /// saved, a crash mid-turn loses at most the round in flight; the resume
+    /// path's `repair_dangling_tool_calls` covers the rest.
+    History(Vec<ChatMessage>),
     /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
     /// surfaced to the user as a system line.
     Notice(String),
@@ -3182,6 +3189,11 @@ impl Agent {
                 self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
             }
 
+            // Mid-turn durability: every result of this round is committed, so
+            // hand the frontend a history snapshot to persist. A crash from
+            // here on loses at most the next round.
+            on_event(AgentEvent::History(self.messages.clone()));
+
             // Near the budget: tell the model so it wraps up instead of
             // getting cut off mid-plan.
             let remaining = self.max_steps - step - 1;
@@ -6139,6 +6151,28 @@ mod tests {
                 "final answer text must contain 'Done', got: {final_text:?}"
             );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+
+            // Mid-turn durability: a History snapshot follows the tool round,
+            // and it is well-formed — its final message is the committed tool
+            // result (no dangling `tool_calls`), so persisting it verbatim
+            // gives a resumable session.
+            let hist = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::History(m) => Some(m),
+                    _ => None,
+                })
+                .next_back()
+                .expect("a History snapshot follows the tool round");
+            assert_eq!(
+                hist.last().map(|m| m.role),
+                Some(hrdr_llm::Role::Tool),
+                "snapshot ends on the committed tool result: {hist:?}"
+            );
+            assert!(
+                hist.iter().any(|m| m.role == hrdr_llm::Role::User),
+                "snapshot carries the whole conversation"
+            );
         }
 
         /// A steering message pushed while the model is calling tools is drained

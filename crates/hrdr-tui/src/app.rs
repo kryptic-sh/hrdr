@@ -1427,6 +1427,7 @@ impl App {
                     _ => self.push_entry(Entry::reasoning(t)),
                 }
             }
+            AgentEvent::History(messages) => self.persist_mid_turn(messages),
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,

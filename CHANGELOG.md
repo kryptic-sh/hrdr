@@ -51,6 +51,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Retry jitter.** The transient-error backoff (connect and mid-stream) now
   carries ±25% jitter so parallel sub-agents tripping the same rate limit don't
   retry in lockstep.
+- **Mid-turn durability.** The agent emits a `History` snapshot after every
+  committed tool round, and the TUI persists it into the session file
+  immediately — the regular autosave can't run mid-turn (the turn task holds the
+  agent lock). A crash or kill during a long turn now loses at most the round in
+  flight; the existing resume path (auto-resume + `repair_dangling_tool_calls`)
+  picks the session up cleanly. `hrdr run --json` reports the snapshots as
+  `{"type":"history","messages":N}`.
 
 ### Changed
 

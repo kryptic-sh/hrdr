@@ -1434,6 +1434,43 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
     assert_eq!(h.app.state.usage.context_window, Some(1000));
 }
 
+/// Mid-turn durability: a `History` snapshot (emitted after each committed
+/// tool round) persists the session *while the turn is still running* — the
+/// regular autosave can't (the turn holds the agent lock). A crash mid-turn
+/// then loses at most the round in flight.
+#[tokio::test]
+async fn history_snapshot_persists_the_session_mid_turn() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+
+    // Simulate a running turn: the turn task would hold the agent lock; here
+    // the flag alone shows the regular autosave path is not what saves us.
+    h.app.running = true;
+    h.app.push_entry(Entry::user("do the thing"));
+    let snapshot = vec![
+        hrdr_agent::Message::user("do the thing"),
+        hrdr_agent::Message::assistant("on it"),
+    ];
+    h.app
+        .on_turn_msg(TurnMsg::Event(hrdr_agent::AgentEvent::History(
+            snapshot.clone(),
+        )));
+
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("the mid-turn snapshot assigned a session id");
+    let loaded =
+        hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written mid-turn");
+    assert_eq!(
+        loaded.state.messages.len(),
+        snapshot.len(),
+        "the snapshot's messages were persisted"
+    );
+}
+
 /// The app's state is the session file's payload: a turn's autosave writes it
 /// to disk, and loading it back yields the same transcript, usage and identity —
 /// no conversion layer in between.

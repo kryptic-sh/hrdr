@@ -29,6 +29,26 @@ impl super::App {
         )));
     }
 
+    /// Mid-turn durability: the agent just committed a tool round and sent a
+    /// history snapshot ([`hrdr_agent::AgentEvent::History`]). The turn task
+    /// holds the agent lock, so [`Self::autosave`]'s try_lock read would skip —
+    /// adopt the snapshot it sent and persist that instead. With this, a crash
+    /// mid-turn loses at most the round in flight.
+    pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
+        self.state.messages = messages;
+        self.state.todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        // `state.cwd` is only synced by the turn-end autosave; on the very
+        // first turn it is still empty, which would file the session under the
+        // wrong cwd slug.
+        self.state.cwd = self.current_cwd();
+        if let Some(o) = hrdr_app::save_session(&self.state) {
+            if o.first_save {
+                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
+            }
+            self.state.id = Some(o.id);
+        }
+    }
+
     /// Persist the conversation. Sessions auto-save continuously: any non-empty
     /// conversation is written to disk, with a stable file id assigned (from the
     /// name) on first save. Called after every completed turn, `/undo`,

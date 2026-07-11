@@ -542,6 +542,7 @@ fn event_json(ev: &AgentEvent) -> String {
         } => {
             json!({"type": "tool_end", "id": id, "name": name, "ok": ok, "result": result})
         }
+        AgentEvent::History(msgs) => json!({"type": "history", "messages": msgs.len()}),
         AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
         AgentEvent::Steered(text) => json!({"type": "steer", "text": text}),
         AgentEvent::Usage {
