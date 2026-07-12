@@ -308,6 +308,54 @@ pub fn model_choices(config: &AgentConfig, active: Option<&str>) -> Vec<ModelCho
     choices_from(&providers, catalog.as_ref(), &usage)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSource {
+    AccountCatalog,
+    ModelsDev,
+    Configured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AvailableModel {
+    pub provider: String,
+    pub model: String,
+    pub label: String,
+    pub source: ModelSource,
+}
+
+/// Discoverable configured/catalog models with provenance for agent introspection.
+pub fn available_models(config: &AgentConfig, active: Option<&str>) -> Vec<AvailableModel> {
+    let providers = configured_providers(config, active);
+    let catalog = hrdr_llm::catalog::load_cached();
+    let mut rows = Vec::new();
+    for provider in providers {
+        if let Some((_, models)) = catalog
+            .as_ref()
+            .and_then(|c| hrdr_llm::catalog::provider_models(c, &provider.catalog_key))
+        {
+            rows.extend(models.into_iter().filter(|(id, _)| id != "default").map(
+                |(model, label)| AvailableModel {
+                    provider: provider.name.clone(),
+                    model,
+                    label,
+                    source: ModelSource::ModelsDev,
+                },
+            ));
+        } else if let Some(model) = provider.configured_model.filter(|m| m != "default") {
+            rows.push(AvailableModel {
+                provider: provider.name,
+                label: model.clone(),
+                model,
+                source: ModelSource::Configured,
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+    rows.dedup_by(|a, b| a.provider == b.provider && a.model == b.model);
+    rows
+}
+
 /// Case-insensitive fuzzy filter over the choices: the query's characters must
 /// appear in order somewhere within `"model_label provider_label"`. Returns the
 /// matching indices in their original (sorted) order; an empty query matches

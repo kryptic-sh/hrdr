@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Agent model introspection.** A read-only `model_info` tool reports the live
+  provider, model, selected/effective reasoning effort, resolved default
+  sub-agent model, and optionally the discoverable configured/account-catalog
+  models without exposing endpoint credentials.
+- **Live sub-agent model inheritance.** Unpinned delegated tasks now inherit the
+  main agent's current provider, endpoint, model, and effort at launch,
+  including mid-session `/model` and `/effort` changes; explicit task, profile,
+  and global sub-agent model overrides retain precedence.
 - **ChatGPT subscription login + entitled model discovery.** A built-in
   `chatgpt` provider logs in through the browser (Codex OAuth) from the `/login`
   modal's typed authorizing state, then loads your account's entitled models

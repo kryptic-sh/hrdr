@@ -60,14 +60,15 @@ pub fn apply_provider(
     let post = host.context_window_poster();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
-        a.set_endpoint(url, key);
-        a.set_headers(headers.clone());
-        a.set_api_version(api_version);
-        a.set_provider(Some(provider));
-        a.set_provider_identity(kind, headers);
-        if let Some(m) = model {
-            a.set_model(m);
-        }
+        a.apply_provider_switch(hrdr_agent::ProviderSwitch {
+            name: provider,
+            base_url: url,
+            api_key: key,
+            api_version,
+            headers,
+            kind,
+            model,
+        });
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);
         }
@@ -119,12 +120,15 @@ pub fn apply_choice(
     let model_for_agent = model.clone();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
-        a.set_endpoint(url, key);
-        a.set_headers(headers.clone());
-        a.set_api_version(api_version);
-        a.set_provider(Some(provider));
-        a.set_provider_identity(kind, headers);
-        a.set_model(model_for_agent);
+        a.apply_provider_switch(hrdr_agent::ProviderSwitch {
+            name: provider,
+            base_url: url,
+            api_key: key,
+            api_version,
+            headers,
+            kind,
+            model: Some(model_for_agent),
+        });
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);
         }
