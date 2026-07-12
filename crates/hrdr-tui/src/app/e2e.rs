@@ -3804,10 +3804,19 @@ async fn browser_login_esc_cancels_then_late_result_is_dropped() {
         provider: "chatgpt".to_string(),
         label: "ChatGPT".to_string(),
     });
+    // A long-lived task stands in for the real callback/exchange future.
+    let handle = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    h.app.browser_login_task = Some(handle);
     h.press(KeyCode::Esc);
     assert!(
         h.app.login_modal.is_none(),
         "Esc abandons the pending login"
+    );
+    assert!(
+        h.app.browser_login_task.is_none(),
+        "Esc aborts + drops the in-flight login task (freeing the callback port)"
     );
     // The in-flight task's late result now matches nothing → no-op.
     h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {

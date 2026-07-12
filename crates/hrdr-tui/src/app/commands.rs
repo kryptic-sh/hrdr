@@ -494,11 +494,14 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
         // A built-in ChatGPT login contributes rows asynchronously (its models
         // aren't in the sync catalog), so the picker may open even when the sync
-        // list is empty — the async load fills it.
-        let chatgpt_ready = hrdr_agent::has_oauth_credentials(
-            hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
-            "chatgpt",
-        );
+        // list is empty — the async load fills it. Gated on the TRUSTED built-in
+        // (a custom `chatgpt` shadow resolves to Custom and is left untouched).
+        let chatgpt_ready = self.app.cfg.resolve_provider("chatgpt").map(|p| p.kind)
+            == Some(hrdr_agent::ResolvedProviderKind::ChatGptOAuth)
+            && hrdr_agent::has_oauth_credentials(
+                hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
+                "chatgpt",
+            );
         if choices.is_empty() && !chatgpt_ready {
             self.info(
                 "no models to choose from yet — configure a provider (or run a turn so the \
@@ -891,10 +894,10 @@ impl super::App {
         let provider = start.provider.clone();
         let tx = self.tx.clone();
         let fut = start.future;
-        tokio::spawn(async move {
+        self.browser_login_task = Some(tokio::spawn(async move {
             let outcome = fut.await;
             let _ = tx.send(super::TurnMsg::BrowserLogin(outcome));
-        });
+        }));
         self.login_modal = Some(super::LoginModal::Authorizing {
             login_id: id,
             provider,
@@ -906,6 +909,12 @@ impl super::App {
     /// [`TurnMsg::BrowserLogin`] will mismatch (no `Authorizing` modal) and be
     /// dropped.
     fn cancel_authorizing(&mut self) {
+        // Abort the in-flight task: dropping its future closes the callback
+        // listener (freeing the localhost port immediately for a retry) and
+        // stops the flow before it can save tokens for an abandoned login.
+        if let Some(task) = self.browser_login_task.take() {
+            task.abort();
+        }
         self.login_modal = None;
         self.system("login cancelled.".to_string());
     }
@@ -924,6 +933,8 @@ impl super::App {
             // result. Drop it silently.
             _ => return,
         };
+        // This login's task has resolved.
+        self.browser_login_task = None;
         if !outcome.token_saved {
             self.login_modal = None;
             self.system(format!(
@@ -974,7 +985,13 @@ impl super::App {
     /// generation still matches when it lands.
     pub(super) fn spawn_model_catalog_load(&mut self, force: bool) {
         use hrdr_agent::{CHATGPT_CODEX_BASE_URL, CatalogSource, ResolvedProviderKind};
-        if !hrdr_agent::has_oauth_credentials(ResolvedProviderKind::ChatGptOAuth, "chatgpt") {
+        // Only when the built-in ChatGPT resolves to trusted OAuth (a custom
+        // `[providers.chatgpt]` shadow resolves to Custom — leave its rows alone)
+        // AND a login is set up.
+        if self.cfg.resolve_provider("chatgpt").map(|p| p.kind)
+            != Some(ResolvedProviderKind::ChatGptOAuth)
+            || !hrdr_agent::has_oauth_credentials(ResolvedProviderKind::ChatGptOAuth, "chatgpt")
+        {
             return;
         }
         self.model_loading = true;

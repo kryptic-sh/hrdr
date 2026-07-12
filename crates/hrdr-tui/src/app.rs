@@ -247,6 +247,10 @@ pub(crate) struct App {
     /// Monotonic id for browser logins — bumped per launch so a stale/duplicate
     /// login's late result is rejected by [`LoginModal::Authorizing`].
     pub(crate) next_login_id: u64,
+    /// The in-flight browser-login task, so cancelling authorization can
+    /// `abort()` it — which drops its callback listener (freeing the localhost
+    /// port for a retry) and prevents an abandoned flow from still saving tokens.
+    pub(crate) browser_login_task: Option<tokio::task::JoinHandle<()>>,
     /// The running user `!command`, if any — Esc cancels it.
     pub(crate) user_shell: Option<UserShell>,
     /// USD already spent when the current session was adopted (a resumed
@@ -484,6 +488,7 @@ impl App {
             skill_selector: None,
             login_modal: None,
             next_login_id: 0,
+            browser_login_task: None,
             user_shell: None,
             cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),

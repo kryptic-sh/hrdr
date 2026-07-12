@@ -359,7 +359,14 @@ pub async fn chatgpt_model_catalog(access: &OAuthAccess, force: bool) -> ChatGpt
         };
     }
 
-    let etag = cache.as_ref().and_then(|c| c.etag.clone());
+    // Only send `If-None-Match` when the cached entry actually matches the
+    // current account/schema/compat. Sending another account's etag can draw a
+    // 304 that then fails the match gate (NotModified → fallback, no persist) and
+    // wedges the catalog on the built-in fallback until upstream content changes.
+    let etag = match (&cache, &digest) {
+        (Some(c), Some(d)) if cache_matches(c, d) => c.etag.clone(),
+        _ => None,
+    };
     let outcome = fetch_catalog(access, etag).await;
     let (result, persist) = resolve_catalog(outcome, cache, digest.as_deref(), now_ms());
 

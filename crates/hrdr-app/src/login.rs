@@ -355,6 +355,13 @@ pub fn browser_login_start(
         });
     }
 
+    // Only the ChatGPT aliases reach the Codex flow below; any other name is not
+    // a browser-login provider (callers route via `login_route` first, but guard
+    // so an unexpected name never silently launches a ChatGPT OAuth flow).
+    if !matches!(name, "chatgpt" | "codex" | "openai-oauth") {
+        return None;
+    }
+
     // ChatGPT (Codex) subscription login. The whole callback+exchange+save is
     // wrapped in the 60-minute backstop (not the 5-minute OpenRouter deadline).
     let state = hrdr_agent::generate_state();
