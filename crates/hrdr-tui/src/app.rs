@@ -164,6 +164,9 @@ pub(crate) struct App {
     /// sub-agent. The main agent's transcript lives in its pane — `state`'s copy
     /// is a serialization shape, refreshed from the pane at save time.
     pub(crate) panes: hrdr_app::PaneSet,
+    /// The agent's live sub-agent registry — the source the pane list is
+    /// reconciled against, and where a pane's steering queue and `Agent` come from.
+    pub(crate) live_subagents: hrdr_agent::LiveSubagents,
     /// Shared cell for the sub-agent transcript dir, handed to the agent config
     /// and refreshed whenever the session id is assigned (see
     /// [`Self::refresh_subagent_dir`]).
@@ -350,7 +353,7 @@ pub(crate) struct App {
     /// Clickable screen rect for each sub-agent panel row → the id of the `task`
     /// call that spawned it; a left click jumps to that transcript entry. `None`
     /// for a row with no call context, whose click is a no-op.
-    pub(crate) subagent_hits: Vec<(HitRect, Option<String>)>,
+    pub(crate) subagent_hits: Vec<(HitRect, hrdr_app::PaneId)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -429,6 +432,7 @@ impl App {
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
+        let live_subagents = agent.live_subagents();
         let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -472,6 +476,7 @@ impl App {
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             subagent_dir,
+            live_subagents,
             // The main agent's pane owns the live transcript from the start; the
             // opening chrome (banner + welcome) is seeded straight into it.
             panes: {
@@ -1215,18 +1220,16 @@ impl App {
                     self.scroll_offset = 0;
                     return;
                 }
-                // Click a sub-agent panel row to jump to the `task` tool call it
-                // came from — the panel lists agents; the transcript holds their
-                // output. A row without a call context has nothing to jump to.
-                if let Some(hit) = self
+                // Click a row in the agent list to *switch to that agent*: the
+                // transcript, the scroll position and the input all follow it.
+                // Main is the first row, so it is always the way back.
+                if let Some(id) = self
                     .subagent_hits
                     .iter()
                     .find(|(r, _)| r.contains(m.column, m.row))
-                    .map(|(_, id)| id.clone())
+                    .map(|(_, id)| *id)
                 {
-                    if let Some(idx) = hit.and_then(|id| self.tool_entry_index(&id)) {
-                        self.pending_focus_entry = Some(idx);
-                    }
+                    self.focus_pane(id);
                     return;
                 }
                 // Click a tool block to toggle its full output (per-entry /expand).
@@ -1250,16 +1253,6 @@ impl App {
             }
             _ => {}
         }
-    }
-
-    /// Index of the transcript entry for tool call `id`, if it is still there.
-    /// A sub-agent panel row jumps to it; the call may have been cleared by
-    /// `/clear` or scrolled out of a compacted transcript, hence the `Option`.
-    pub(crate) fn tool_entry_index(&self, id: &str) -> Option<usize> {
-        self.panes
-            .active_transcript()
-            .iter()
-            .position(|e| matches!(&e.kind, EntryKind::Tool { id: tid, .. } if tid == id))
     }
 
     /// Whether the input pane should render masked (every char hidden) —
@@ -1310,6 +1303,55 @@ impl App {
     #[cfg(test)]
     pub(crate) fn transcript_mut(&mut self) -> &mut Vec<Entry> {
         &mut self.panes.main_mut().transcript
+    }
+
+    /// Reconcile the pane list against the agent's live sub-agents, and refresh
+    /// the main pane's row. Called each frame: `sync` is also what *pins* the pane
+    /// being viewed, which is the only thing keeping the agent from releasing it.
+    pub(crate) fn sync_panes(&mut self) {
+        let title = if self.state.name.is_empty() {
+            "main".to_string()
+        } else {
+            self.state.name.clone()
+        };
+        let running = self.running;
+        let model = self.state.model.clone();
+        {
+            let main = self.panes.main_mut();
+            main.title = title;
+            main.model = model;
+            main.status = if running {
+                hrdr_app::PaneStatus::Running
+            } else {
+                hrdr_app::PaneStatus::Idle
+            };
+        }
+        self.panes.sync(&self.live_subagents);
+    }
+
+    /// Switch the view to `id`: the transcript, the scroll position and the input
+    /// all follow. Scroll resets because the new pane's offsets mean nothing in the
+    /// old one's coordinates.
+    pub(crate) fn focus_pane(&mut self, id: hrdr_app::PaneId) {
+        if self.panes.active() == id {
+            return;
+        }
+        self.panes.focus(id);
+        self.scroll_offset = 0;
+        // The pin follows the view: `sync` marks the newly active pane, so the
+        // agent keeps it alive, and releases the one we just left.
+        self.sync_panes();
+        crate::ui::clear_transcript_cache();
+    }
+
+    /// The pane a sub-agent's live output belongs to, found by the `task` call that
+    /// spawned it — which is the id its output arrives under.
+    fn pane_for_tool(&self, tool_id: &str) -> Option<hrdr_app::PaneId> {
+        self.live_subagents.with(|v| {
+            v.iter()
+                .find(|e| e.tool_id.as_deref() == Some(tool_id))
+                .map(|e| hrdr_app::PaneId::Sub(e.key))
+        })
     }
 
     fn push_entry(&mut self, e: Entry) {
@@ -1943,6 +1985,19 @@ impl App {
                 self.push_entry(Entry::tool_running(id.clone(), name.clone(), args));
             }
             AgentEvent::ToolOutput { id, chunk } => {
+                // A sub-agent's output belongs to *its* transcript, not the
+                // parent's. It reaches us as `ToolOutput` on the `task` call that
+                // spawned it — route it to that agent's pane and leave the parent's
+                // block alone, so the block records the delegation rather than
+                // replaying the work. The transcript is then self-contained: it is
+                // rendered only when that agent is the one being viewed.
+                if let Some(hrdr_app::PaneId::Sub(key)) = self.pane_for_tool(&id) {
+                    self.sync_panes();
+                    if let Some(pane) = self.panes.sub_mut(key) {
+                        hrdr_app::apply_event(&mut pane.transcript, &AgentEvent::Text(chunk));
+                    }
+                    return;
+                }
                 // Append live output to the running tool's entry.
                 for entry in self.panes.main_mut().transcript.iter_mut().rev() {
                     if let EntryKind::Tool {
@@ -1968,6 +2023,22 @@ impl App {
                 ok,
                 name: _,
             } => {
+                // A finished `task` records the delegation, not its output: what was
+                // asked, and which provider/model answered. The answer itself lives
+                // in that sub-agent's own transcript (and still reaches the model as
+                // the real tool result — this only changes what is *shown*).
+                let delegated = self.live_subagents.with(|v| {
+                    v.iter()
+                        .find(|e| e.tool_id.as_deref() == Some(id.as_str()))
+                        .map(|e| match &e.provider {
+                            Some(p) => format!("{} · {p}/{}", e.label, e.model),
+                            None => format!("{} · {}", e.label, e.model),
+                        })
+                });
+                let result = match delegated {
+                    Some(summary) => format!("↳ delegated to {summary}"),
+                    None => result,
+                };
                 for entry in self.panes.main_mut().transcript.iter_mut().rev() {
                     if let EntryKind::Tool {
                         id: tid,

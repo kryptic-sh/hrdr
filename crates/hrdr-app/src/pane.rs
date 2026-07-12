@@ -563,6 +563,7 @@ mod tests {
                 tool_id: None,
                 label: format!("task {key}"),
                 model: "m".to_string(),
+                provider: None,
                 kind: SubagentKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: hrdr_agent::steering_queue(),

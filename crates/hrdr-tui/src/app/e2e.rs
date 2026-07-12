@@ -2724,29 +2724,55 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
-/// The sub-agent panel is a list: one row per agent, no log preview and no
-/// expansion — the agent's output already streams into its `task` tool-call
-/// entry in the transcript. Clicking a row jumps the view to that entry.
+/// The agent list switches the view. It lists **main first** (so there is always a
+/// way back) and then each live sub-agent; clicking a row makes that agent the one
+/// on screen. The sub-agent's transcript is self-contained: it renders only while
+/// that agent is active, and never bleeds into the parent's `task` block, which
+/// records *what was delegated* rather than replaying the work.
 #[tokio::test]
-async fn a_sub_agent_row_lists_the_agent_and_jumps_to_its_tool_call() {
+async fn the_agent_list_switches_the_focused_agent() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     let mut h = Harness::new(vec![]).await;
-    // The `task` call the panel row points at, buried under enough filler that
-    // it is scrolled out of view while following the newest output.
+    h.app.state.name = "my session".to_string();
+
+    // With nothing delegated there is only the main agent, so no list at all.
+    assert!(
+        !h.app.panes.show_switcher(),
+        "a fresh session shows no list"
+    );
+
+    // Delegate: the parent's `task` block, and a live sub-agent behind it.
     h.app
         .push_entry(Entry::tool_running("call-1", "task", "{}"));
-    let call_idx = h.app.transcript().len() - 1;
-    for i in 0..40 {
-        h.app.push_entry(Entry::system(format!("filler {i}")));
-    }
-    // A live blocking sub-agent whose log has a header line and a body.
-    h.app.subagent_panel.on_tool_start("call-1".to_string());
-    h.app
-        .subagent_panel
-        .on_tool_output("call-1", "↳ task: explore\nrunning…\nmore output");
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: Some("claude".to_string()),
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
 
-    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    // Its output arrives as ToolOutput on the `task` call that spawned it.
+    h.app.apply_event(hrdr_agent::AgentEvent::ToolOutput {
+        id: "call-1".to_string(),
+        chunk: "reading the codebase".to_string(),
+    });
+
+    let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     let row_of = |screen: &str, needle: &str| -> Option<u16> {
@@ -2756,39 +2782,48 @@ async fn a_sub_agent_row_lists_the_agent_and_jumps_to_its_tool_call() {
             .map(|y| y as u16)
     };
 
-    // The row is the log's first line; its body never renders in the panel.
-    let row_y = row_of(&screen, "task: explore").expect("the agent lists");
-    assert!(!screen.contains("running…"), "no log preview:\n{screen}");
-    assert!(!screen.contains("more output"), "no log preview:\n{screen}");
-    assert!(!screen.contains("▸"), "no expansion arrow:\n{screen}");
-
-    // Following the newest output, so the `task` call is off-screen above.
-    assert_eq!(h.app.scroll_offset, 0);
+    // The list appeared, main first, and the sub-agent is on it.
+    assert!(h.app.panes.show_switcher(), "delegating brings the list up");
+    let main_y = row_of(&screen, "my session").expect("main is listed");
+    let sub_y = row_of(&screen, "explore").expect("the sub-agent is listed");
     assert!(
-        !screen.contains("task(") && row_of(&screen, "filler 39").is_some(),
-        "the transcript is at its newest:\n{screen}"
+        main_y < sub_y,
+        "main is first — it is the way back:\n{screen}"
     );
 
-    // Click the row: it resolves to the tool call's transcript entry…
+    // We are still on main, and the sub-agent's work is NOT in its transcript.
+    assert!(h.app.panes.active().is_main());
+    assert!(
+        !screen.contains("reading the codebase"),
+        "a sub-agent's output does not bleed into the parent's view:\n{screen}"
+    );
+
+    // Click the sub-agent's row: the view switches to it, and now its transcript
+    // is what renders.
     h.app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 3,
-        row: row_y,
+        row: sub_y,
         modifiers: crossterm::event::KeyModifiers::empty(),
     });
-    assert_eq!(
-        h.app.pending_focus_entry,
-        Some(call_idx),
-        "the click targets the task call"
+    assert_eq!(h.app.panes.active(), hrdr_app::PaneId::Sub(1));
+
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("reading the codebase"),
+        "the sub-agent's own transcript renders when it is the active agent:\n{screen}"
     );
 
-    // …and the next draw scrolls it to the top of the viewport.
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    assert!(
-        h.app.scroll_offset > 0,
-        "the view moved off the newest output"
-    );
-    assert_eq!(h.app.pending_focus_entry, None, "the focus was consumed");
+    // Click main's row to come back.
+    let main_y = row_of(&screen, "my session").expect("main is still listed");
+    h.app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row: main_y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    assert!(h.app.panes.active().is_main(), "main is always reachable");
 }
 
 /// A detached sub-agent that finishes while nothing is running wakes the model:

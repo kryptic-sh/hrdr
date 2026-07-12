@@ -51,6 +51,10 @@ pub struct LiveSubagent {
     pub tool_id: Option<String>,
     pub label: String,
     pub model: String,
+    /// Provider this sub-agent runs on, when it names one. Shown on the parent's
+    /// `task` block, which reports *what was delegated to* rather than replaying
+    /// the sub-agent's output.
+    pub provider: Option<String>,
     pub kind: SubagentKind,
     /// The sub-agent itself, retained so a frontend can drive a further turn on
     /// it once its delegated task has landed.
@@ -217,6 +221,7 @@ mod tests {
             tool_id: None,
             label: "l".to_string(),
             model: "m".to_string(),
+            provider: None,
             kind: SubagentKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),

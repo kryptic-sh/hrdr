@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::{PanelItem, panel_item_header, panel_items, relative_time};
+use hrdr_app::relative_time;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write) get a larger preview since the diff is the point.
@@ -27,7 +27,7 @@ const TODO_PANEL_MAX_ITEMS: u16 = 6;
 const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
 
 /// Outer height (with padding) of the sub-agent panel; 0 when nothing is shown.
-fn subagent_panel_height(items: &[PanelItem]) -> u16 {
+fn subagent_panel_height(items: &[hrdr_app::PaneRow]) -> u16 {
     if items.is_empty() {
         return 0;
     }
@@ -72,7 +72,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
     // Built once per frame; both the layout height and the renderer use it
     // (each sub-agent's log is cloned into the items, so don't recompute).
-    let subagent_items = panel_items(&app.subagent_panel.agents, &app.background_tasks);
+    // Reconcile the agent list against the agent's live sub-agents first: this is
+    // also what pins the pane being viewed, so the agent does not release it out
+    // from under the reader.
+    app.sync_panes();
+    // The switcher lists every agent — main first, so there is always a way back.
+    // It stays hidden while the main agent is the only one: a one-row list of the
+    // thing you are already looking at is noise.
+    let subagent_items: Vec<hrdr_app::PaneRow> = if app.panes.show_switcher() {
+        hrdr_app::pane_rows(&app.panes)
+    } else {
+        Vec::new()
+    };
     let subagent_height = subagent_panel_height(&subagent_items);
 
     // Build the row stack dynamically, remembering each section's index. Every
@@ -1083,7 +1094,7 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
 ///
 /// When the total content rows exceed `SUBAGENT_PANEL_MAX_ROWS`, the panel
 /// scrolls so the newest agents/logs stay visible at the bottom.
-fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem]) {
+fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[hrdr_app::PaneRow]) {
     let (accent, success) = (app.theme.accent, app.theme.success);
     // The input pane's chrome, with the accent rule a running agent wears — the
     // todo panel's is green.
@@ -1098,15 +1109,26 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem])
     let lines: Vec<Line<'static>> = items
         .iter()
         .map(|item| {
-            let fg = if item.done { success } else { accent };
+            let fg = match item.status {
+                hrdr_app::PaneStatus::Done => success,
+                _ => accent,
+            };
+            // The agent you are looking at is marked, so the list says where you
+            // are as well as where you can go.
+            let marker = hrdr_app::pane_row_marker(item.status, frame);
+            let here = if item.active { "▸ " } else { "  " };
+            let mut style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+            if item.active {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             Line::from(Span::styled(
-                panel_item_header(item, frame),
-                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+                format!("{here}{marker} {}", item.title.trim()),
+                style,
             ))
         })
         .collect();
 
-    // A click on a visible row jumps to the `task` call that spawned it.
+    // A click on a visible row switches the view to that agent.
     app.subagent_hits = items
         .iter()
         .enumerate()
@@ -1120,7 +1142,7 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem])
                     w: inner.width,
                     h: 1,
                 },
-                item.tool_id.clone(),
+                item.id,
             )
         })
         .collect();
@@ -2585,14 +2607,19 @@ mod clamp_tests {
 #[cfg(test)]
 mod subagent_tests {
     use super::{SUBAGENT_PANEL_MAX_ROWS, subagent_panel_height, subagent_scroll};
-    use hrdr_app::PanelItem;
+    use hrdr_app::{PaneId, PaneRow, PaneStatus};
 
-    fn items(n: usize) -> Vec<PanelItem> {
+    fn items(n: usize) -> Vec<PaneRow> {
         (0..n)
-            .map(|i| PanelItem {
+            .map(|i| PaneRow {
+                id: if i == 0 {
+                    PaneId::Main
+                } else {
+                    PaneId::Sub(i as u64)
+                },
                 title: format!("agent {i}"),
-                done: false,
-                tool_id: Some(format!("call-{i}")),
+                status: PaneStatus::Idle,
+                active: i == 0,
             })
             .collect()
     }

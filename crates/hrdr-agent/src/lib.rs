@@ -573,6 +573,7 @@ fn spawn_background(
     let tool_id_for_live = tool_id.clone();
     let label_for_live = label.clone();
     let model_for_live = cfg.model.clone();
+    let provider_for_live = cfg.provider.clone();
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -637,6 +638,7 @@ fn spawn_background(
                     tool_id: tool_id_for_live,
                     label: label_for_live,
                     model: model_for_live,
+                    provider: provider_for_live,
                     kind: SubagentKind::Background,
                     agent: Arc::clone(&sub),
                     steering: Arc::clone(&steering),
@@ -1460,6 +1462,8 @@ impl hrdr_tools::Tool for SubagentTool {
             });
         }
 
+        // Captured before `cfg` is moved into the sub-agent.
+        let provider_for_run = cfg.provider.clone();
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         sub.cost_total = Arc::clone(&self.cost_total);
@@ -1471,6 +1475,7 @@ impl hrdr_tools::Tool for SubagentTool {
         // once this call returns. It is pruned when finished, delivered, and
         // unpinned — see `LiveSubagents::prune`.
         let key = LiveSubagents::next_key();
+        let cfg_provider = provider_for_run.clone();
         let steering = steering_queue();
         let sub = Arc::new(tokio::sync::Mutex::new(sub));
         self.live.register(LiveSubagent {
@@ -1479,6 +1484,7 @@ impl hrdr_tools::Tool for SubagentTool {
             tool_id: ctx.call_id.clone(),
             label: label.clone(),
             model: model.clone(),
+            provider: cfg_provider,
             kind: SubagentKind::Blocking,
             agent: Arc::clone(&sub),
             steering: Arc::clone(&steering),
