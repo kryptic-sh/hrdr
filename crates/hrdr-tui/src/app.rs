@@ -551,20 +551,30 @@ impl App {
         self.live_subagents.register_main(
             self.agent.clone(),
             self.steering.clone(),
-            model.clone(),
-            provider.clone(),
-            base_url.clone(),
+            model,
+            provider,
+            base_url,
             usage,
         );
-        // Idempotent registration means a later call is a no-op, so push the
-        // current chrome explicitly — this doubles as "the main agent's state
-        // changed, tell the registry".
-        self.live_subagents.update(hrdr_agent::MAIN_KEY, |e| {
-            e.model = model;
-            e.provider = provider;
-            e.base_url = base_url;
-            e.usage = usage;
-        });
+        // The *counters* are the frontend's to seed (a resumed session carries them,
+        // a `/clear` resets them). What the agent is **running on** — model,
+        // provider, endpoint — is not: the agent publishes that itself, from what it
+        // is actually pointed at (`Agent::attach_live`). A copy kept here is a copy
+        // that can be wrong, and one that was: a resumed session's provider label
+        // reached the status bar while the agent kept talking to the endpoint it
+        // launched with.
+        self.live_subagents
+            .update(hrdr_agent::MAIN_KEY, |e| e.usage = usage);
+        // Adopt the entry (idempotent) so every later change republishes into it.
+        let agent = self.agent.clone();
+        let live = self.live_subagents.clone();
+        if let Ok(mut a) = agent.try_lock() {
+            a.attach_live(live, hrdr_agent::MAIN_KEY);
+        } else {
+            tokio::spawn(async move {
+                agent.lock().await.attach_live(live, hrdr_agent::MAIN_KEY);
+            });
+        }
     }
 
     /// Probe the endpoint (list its models) on a background task and post a

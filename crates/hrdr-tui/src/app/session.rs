@@ -171,17 +171,26 @@ impl super::App {
     /// runtime owners live elsewhere (chat history → the agent, TODOs → the
     /// shared list) back out to them.
     ///
-    /// Three fields are not simply overwritten:
+    /// Two fields are not simply overwritten:
     ///
-    /// * `base_url` — the endpoint belongs to this process (`--base-url`,
-    ///   the `/model` picker), not to the saved conversation. The resume notice reports
-    ///   a mismatch rather than silently switching endpoints.
     /// * `context_window` — a saved one is a stand-in until the endpoint is
     ///   re-probed, so it never clobbers a window this process already knows.
     /// * `model` / `provider` — the session supplies them only when this process
     ///   didn't pin them with a flag or an env var. Precedence, highest first:
     ///   **flag > env > session > config**. Applies to `/resume` as well as to
     ///   startup auto-resume: a pinned model never switches out from under you.
+    ///
+    /// And when the session *does* supply the provider, the agent is **repointed to
+    /// it** ([`hrdr_app::restore_session_provider`]) — endpoint, key and model
+    /// together.
+    ///
+    /// Regression: the endpoint used to be treated as the process's, and a resume
+    /// only printed "note: session endpoint was X". So a session saved on one
+    /// provider, resumed in a process configured for another, adopted the session's
+    /// model *name* and provider *label* into the status bar while the agent kept
+    /// talking to the launch endpoint — where that model does not exist and the key
+    /// is not valid. The bar said one thing; the socket did another. A conversation's
+    /// provider is part of the conversation.
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
@@ -224,9 +233,39 @@ impl super::App {
         };
         self.with_agent(|a| {
             a.set_messages(messages);
-            a.set_model(model);
+            a.set_model(model.clone());
             a.set_session_cost(spent);
         });
+
+        // The conversation's provider comes back with it: repoint the agent's
+        // endpoint and key to match the model and provider now on the status bar, so
+        // the thing doing the talking is the thing being displayed.
+        //
+        // Two things stop it. A **pinned** provider (`--provider`, `$HRDR_PROVIDER`)
+        // is this process's decision, already applied at launch — re-resolving it
+        // would throw away an endpoint the user chose (a `--base-url` override) for
+        // the provider's canonical one. And a provider the agent is **already on**
+        // needs no switch, for the same reason.
+        let (provider, window) = {
+            let s = self.state();
+            (s.provider.clone(), s.usage.context_window)
+        };
+        let current = self.live_subagents.with(|v| {
+            v.iter()
+                .find(|e| e.key == hrdr_agent::MAIN_KEY)
+                .and_then(|e| e.provider.clone())
+        });
+        let switchable = !self.cfg.provider_pinned;
+        if let Some(name) = provider.filter(|p| switchable && Some(p) != current.as_ref()) {
+            let mut host = commands::TuiHost { app: self };
+            if let Err(e) = hrdr_app::restore_session_provider(&mut host, &name, model, window) {
+                self.system(format!(
+                    "this session ran on provider '{name}', which isn't usable here ({e}) — \
+                     staying on the current endpoint; /model to switch"
+                ));
+            }
+        }
+
         if let Ok(mut t) = self.todos.lock() {
             *t = todos;
         }

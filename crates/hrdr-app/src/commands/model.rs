@@ -94,6 +94,31 @@ pub fn apply_provider(
     Ok(p)
 }
 
+/// Repoint the agent to the `(provider, model)` a **resumed session** was on.
+///
+/// A conversation's model and provider are part of it: resuming one and then
+/// talking to a different provider's endpoint is not the same conversation. The
+/// chrome already adopts them, and the agent has to be repointed with them —
+/// otherwise the two disagree, and it is the agent that is doing the talking.
+///
+/// Regression: resume adopted the session's model *name* and provider *label*
+/// into the display, told the agent only the model, and left it pointing at
+/// whatever endpoint the process launched on. A session saved on one provider,
+/// resumed in a process configured for another, showed the right thing in the
+/// status bar and sent the request somewhere else — where the model does not exist
+/// and the key is not valid.
+///
+/// Nothing is remembered as a "last used" combo (unlike [`apply_choice`]): a
+/// resume is restoring a conversation, not choosing a model.
+pub fn restore_session_provider(
+    host: &mut dyn CommandHost,
+    provider_name: &str,
+    model: String,
+    saved_window: Option<u32>,
+) -> Result<(), String> {
+    repoint(host, provider_name, model, saved_window, false)
+}
+
 /// Switch to a specific `(provider, model)` pair chosen in the `/model`
 /// selector — repoint the endpoint/key/headers to `provider` *and* set the
 /// exact `model` in one locked step (so a probe can't race a half-applied
@@ -105,6 +130,19 @@ pub fn apply_choice(
     provider_name: &str,
     model: String,
     choice_context_window: Option<u32>,
+) -> Result<(), String> {
+    repoint(host, provider_name, model, choice_context_window, true)
+}
+
+/// The one place a `(provider, model)` pair is applied to an agent *and* to the
+/// chrome that describes it — so the two cannot drift apart. `remember` records it
+/// as the last-used combo (a deliberate choice), which a resume does not.
+fn repoint(
+    host: &mut dyn CommandHost,
+    provider_name: &str,
+    model: String,
+    choice_context_window: Option<u32>,
+    remember: bool,
 ) -> Result<(), String> {
     let Some(p) = host.resolve_provider(provider_name) else {
         return Err(format!("unknown provider '{provider_name}'"));
@@ -147,8 +185,10 @@ pub fn apply_choice(
     }
     host.set_base_url(p.base_url.clone());
     host.set_provider(provider_name.to_string());
-    // Remember this combo so a later launch with nothing pinned resumes it.
-    hrdr_agent::record_last_model(provider_name, &model);
+    if remember {
+        // Remember this combo so a later launch with nothing pinned resumes it.
+        hrdr_agent::record_last_model(provider_name, &model);
+    }
     Ok(())
 }
 

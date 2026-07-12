@@ -632,6 +632,9 @@ fn spawn_background(
             let result: anyhow::Result<()> = async {
                 let mut sub = Agent::new(cfg)?;
                 sub.cost_total = cost_total;
+                // Its chrome is published by the agent itself, so what a frontend
+                // shows for it is what it is actually running on.
+                sub.attach_live(live.clone(), live_key);
                 // Share the parent's language servers (its config disabled
                 // building an own registry) — one warm set for the session.
                 sub.ctx.lsp = lsp;
@@ -1517,6 +1520,9 @@ impl hrdr_tools::Tool for SubagentTool {
         // once this call returns. It is pruned when finished, delivered, and
         // unpinned — see `LiveSubagents::prune`.
         let key = LiveSubagents::next_key();
+        // Its chrome is published by the agent itself, so what a frontend shows for
+        // it is what it is actually running on (see `Agent::attach_live`).
+        sub.attach_live(self.live.clone(), key);
         let cfg_provider = provider_for_run.clone();
         let steering = steering_queue();
         let sub = Arc::new(tokio::sync::Mutex::new(sub));
@@ -3361,6 +3367,9 @@ pub struct Agent {
     /// frontend steers, views, and drives further turns on them through this.
     /// Pruned at turn end (see [`LiveSubagents::prune`]).
     live_subagents: LiveSubagents,
+    /// This agent's own entry in the registry a frontend reads — set by
+    /// [`Agent::attach_live`]. `None` when nothing is displaying it (headless).
+    live_home: Option<(LiveSubagents, u64)>,
     /// This is a delegated sub-agent, not the session's agent. Gates every
     /// session-scoped feature — see [`AgentConfig::is_subagent`].
     is_subagent: bool,
@@ -3837,6 +3846,7 @@ impl Agent {
             configured_headers,
             delegation_runtime,
             live_subagents,
+            live_home: None,
             is_subagent: config.is_subagent,
             last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
@@ -4049,20 +4059,60 @@ impl Agent {
         self.reset_read_files();
     }
 
+    /// Adopt this agent's entry in the registry a frontend reads, and publish its
+    /// chrome into it.
+    ///
+    /// From here on, **the agent is the source of what it is running on**. Whatever
+    /// the display shows for this agent — model, provider, endpoint — is what the
+    /// agent published, so the two cannot disagree. A frontend that kept its own
+    /// copy could adopt a session's model and provider label into the status bar
+    /// while the agent went on talking to the endpoint it launched with, and the bar
+    /// would confidently name a provider the request never went to.
+    pub fn attach_live(&mut self, live: LiveSubagents, key: u64) {
+        self.live_home = Some((live, key));
+        self.publish_delegation_runtime();
+    }
+
     fn publish_delegation_runtime(&self) {
-        let mut runtime = self
-            .delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        runtime.public.provider = self.provider.clone();
-        runtime.public.model = self.client.model.clone();
-        runtime.public.effort = self.client.effort().map(str::to_string);
-        runtime.endpoint.provider = self.provider.clone();
-        runtime.endpoint.model = self.client.model.clone();
-        runtime.endpoint.effort = self.client.effort().map(str::to_string);
-        runtime.endpoint.base_url = self.client.base_url().to_string();
-        runtime.endpoint.provider_kind = self.provider_kind;
-        runtime.endpoint.configured_headers = self.configured_headers.clone();
+        {
+            let mut runtime = self
+                .delegation_runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.public.provider = self.provider.clone();
+            runtime.public.model = self.client.model.clone();
+            runtime.public.effort = self.client.effort().map(str::to_string);
+            runtime.endpoint.provider = self.provider.clone();
+            runtime.endpoint.model = self.client.model.clone();
+            runtime.endpoint.effort = self.client.effort().map(str::to_string);
+            runtime.endpoint.base_url = self.client.base_url().to_string();
+            runtime.endpoint.provider_kind = self.provider_kind;
+            runtime.endpoint.configured_headers = self.configured_headers.clone();
+        }
+        self.publish_chrome();
+    }
+
+    /// Push what this agent is running on into its registry entry — the thing a
+    /// frontend renders. Called from every path that changes the model, the
+    /// provider, or the endpoint, so a display copy can never go stale.
+    fn publish_chrome(&self) {
+        let Some((live, key)) = &self.live_home else {
+            return; // headless / not displayed: nothing to publish to
+        };
+        let model = self.client.model.clone();
+        let provider = self.provider.clone();
+        let base_url = self.client.base_url().to_string();
+        let window = self.context_window;
+        live.update(*key, |e| {
+            e.model = model;
+            e.provider = provider;
+            e.base_url = base_url;
+            // A model switch invalidates the window until it is re-learned; keep
+            // showing the last known figure rather than blanking the gauge.
+            if window.is_some() {
+                e.usage.context_window = window;
+            }
+        });
     }
 
     /// Switch the model for subsequent turns.
@@ -4092,6 +4142,16 @@ impl Agent {
     /// The configured provider's name, when one is set.
     pub fn provider_name(&self) -> Option<String> {
         self.provider.clone()
+    }
+
+    /// The model this agent will actually send to.
+    pub fn model_name(&self) -> String {
+        self.client.model.clone()
+    }
+
+    /// The endpoint this agent will actually talk to.
+    pub fn endpoint_base_url(&self) -> String {
+        self.client.base_url().to_string()
     }
 
     /// Whether this agent can authenticate to its endpoint at all: it holds a
@@ -4193,6 +4253,7 @@ impl Agent {
     pub fn set_context_window(&mut self, window: Option<u32>) {
         self.context_window = window;
         self.context_window_probed = window.is_some();
+        self.publish_chrome();
     }
 
     /// The context window in force, if known.

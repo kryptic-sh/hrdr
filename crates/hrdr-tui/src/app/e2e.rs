@@ -1837,7 +1837,7 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         assert_eq!(
             h.app.state().base_url,
             launch_endpoint,
-            "the endpoint belongs to this process, not the session"
+            "a pinned provider's endpoint belongs to this process, not the session"
         );
         // The conversation itself did come back.
         assert!(
@@ -1848,6 +1848,73 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
             "the saved transcript is restored"
         );
     }
+}
+
+/// A conversation's **provider is part of the conversation**: resuming one repoints
+/// the agent to it, so the agent is talking to the provider the status bar names.
+///
+/// Regression: resume adopted the session's model name and provider label into the
+/// display and told the agent only the model, leaving it pointed at the endpoint the
+/// process launched with. A session saved on zen, resumed in a process whose config
+/// defaults to OpenAI, showed `zen/deepseek-…` on the bar and sent the request to
+/// api.openai.com — where that model does not exist and there is no key. The bar
+/// said one thing; the socket did another.
+#[tokio::test]
+async fn resuming_a_session_repoints_the_agent_to_its_provider() {
+    let mut h = Harness::new(vec![]).await;
+    // Nothing pinned: the session gets to decide (flag > env > session > config).
+    h.app.cfg.model_pinned = false;
+    h.app.cfg.provider_pinned = false;
+
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "deepseek-v4-flash".into(),
+        provider: Some("zen".into()),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "old".to_string());
+    // The switch takes the agent lock, so it lands on its own task.
+    for _ in 0..20 {
+        if h.app
+            .agent
+            .try_lock()
+            .is_ok_and(|a| a.provider_name().is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The agent itself — not a display copy — is on the session's provider and
+    // model. It publishes its own chrome, so what the bar reads is what it is
+    // pointed at, and the two cannot disagree.
+    let (model, provider, base_url) = {
+        let a = h.app.agent.lock().await;
+        (a.model_name(), a.provider_name(), a.endpoint_base_url())
+    };
+    assert_eq!(
+        model, "deepseek-v4-flash",
+        "the agent runs the session's model"
+    );
+    assert_eq!(
+        provider.as_deref(),
+        Some("zen"),
+        "and is on the session's provider"
+    );
+    assert!(
+        base_url.contains("opencode.ai"),
+        "and is pointed at that provider's endpoint, not the one it launched on: \
+         {base_url}"
+    );
+
+    h.app.sync_panes();
+    assert_eq!(h.app.state().model, "deepseek-v4-flash");
+    assert_eq!(
+        h.app.state().provider.as_deref(),
+        Some("zen"),
+        "the bar names the provider the agent is actually talking to"
+    );
 }
 
 /// With nothing pinned, the value came from the config file (or a provider
@@ -3025,8 +3092,6 @@ async fn the_agent_list_switches_the_focused_agent() {
 #[tokio::test]
 async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     let mut h = Harness::new(vec![]).await;
-    h.app.state_mut().model = "opus".to_string();
-    h.app.state_mut().provider = Some("claude".to_string());
     h.app.state_mut().usage = hrdr_app::SessionUsage {
         tokens_in: 5_000,
         last_prompt_tokens: Some(5_000),
@@ -3035,8 +3100,16 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         ..Default::default()
     };
     // The main agent is an entry in the registry like any other, and its pane is
-    // rebuilt from that entry every frame — so its chrome is published there.
+    // rebuilt from that entry every frame. The *counters* are seeded here; what the
+    // agent is running on is published by the agent itself — so the bar cannot show
+    // a model the agent is not on.
     h.app.publish_main_agent();
+    {
+        let mut a = h.app.agent.lock().await;
+        a.set_model("opus");
+        a.set_provider(Some("claude".to_string()));
+        a.set_context_window(Some(200_000));
+    }
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
         checkpoints: Some("off".to_string()),
