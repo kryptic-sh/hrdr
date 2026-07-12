@@ -577,13 +577,10 @@ fn spawn_background(
     }
     // Shared so the inner task records events and the outer guard can still
     // write a terminal `End` if the inner task panics or is cancelled.
-    let transcript = Arc::new(Mutex::new(resolve_subagent_dir(&transcript_dir).and_then(
-        |dir| {
-            let seq = SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed);
-            let sid = subagent_transcript_id(seq, &label);
-            subagent_transcript::SubagentTranscript::open(&dir, &sid).ok()
-        },
-    )));
+    let transcript = Arc::new(Mutex::new(
+        resolve_subagent_dir(&transcript_dir)
+            .and_then(|dir| open_next_subagent_transcript(&dir, &label)),
+    ));
     if let Ok(mut g) = transcript.lock()
         && let Some(t) = g.as_mut()
     {
@@ -771,6 +768,49 @@ fn subagent_transcript_id(seq: u64, label: &str) -> String {
 /// and a session id has been assigned.
 fn resolve_subagent_dir(cell: &SubagentDirCell) -> Option<std::path::PathBuf> {
     cell.as_ref()?.lock().ok()?.clone()
+}
+
+/// How many ids to try before giving up on a transcript (best-effort — a run
+/// must never fail because we could not name its log).
+const SUBAGENT_ID_ATTEMPTS: u64 = 10_000;
+
+/// Open a transcript for one run under `dir`, claiming the next free id.
+///
+/// The id counter restarts at 0 in every process while `dir` is keyed by session
+/// id and survives a resume, so `NNN-<slug>` collides with a previous run's file
+/// on the very first task after `/resume` (the default label is `sub-task`, so
+/// this is the common case, not a corner). [`SubagentTranscript::create`] is
+/// exclusive, so a taken id fails and we advance instead of appending a new run
+/// onto an old run's log.
+///
+/// Shared by the blocking and background spawn paths so they cannot drift.
+fn open_next_subagent_transcript(
+    dir: &std::path::Path,
+    label: &str,
+) -> Option<subagent_transcript::SubagentTranscript> {
+    open_next_subagent_transcript_from(&SUBAGENT_SEQ, dir, label)
+}
+
+/// Core of [`open_next_subagent_transcript`] with the id counter injected, so a
+/// test can drive it from its own counter instead of poking the process-global
+/// one (tests share a process and run in parallel).
+fn open_next_subagent_transcript_from(
+    seq_source: &std::sync::atomic::AtomicU64,
+    dir: &std::path::Path,
+    label: &str,
+) -> Option<subagent_transcript::SubagentTranscript> {
+    for _ in 0..SUBAGENT_ID_ATTEMPTS {
+        let seq = seq_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = subagent_transcript_id(seq, label);
+        match subagent_transcript::SubagentTranscript::create(dir, &id) {
+            Ok(t) => return Some(t),
+            // Taken by a previous run (or a concurrent spawn): try the next id.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Anything else (unwritable dir, …) is not going to fix itself.
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Map a live agent event to the transcript event to record, if any.
@@ -1210,11 +1250,8 @@ impl hrdr_tools::Tool for SubagentTool {
         // Open a durable transcript for this sub-agent (best-effort — a failure
         // to persist must never block the run). The full prompt is recorded so a
         // crashed sub-agent's work is recoverable independent of the parent.
-        let mut transcript = resolve_subagent_dir(&self.transcript_dir).and_then(|dir| {
-            let seq = SUBAGENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let id = subagent_transcript_id(seq, &label);
-            subagent_transcript::SubagentTranscript::open(&dir, &id).ok()
-        });
+        let mut transcript = resolve_subagent_dir(&self.transcript_dir)
+            .and_then(|dir| open_next_subagent_transcript(&dir, &label));
         if let Some(t) = transcript.as_mut() {
             t.write(&subagent_transcript::Event::Start {
                 model: model.clone(),
@@ -8587,6 +8624,62 @@ mod tests {
             );
         }
     } // mod mock_server
+
+    /// The transcript dir is keyed by session id, so it survives a resume, while
+    /// `SUBAGENT_SEQ` restarts at 0 in each process. A resumed session's first
+    /// task therefore lands on an id a previous run already used — it must claim
+    /// the next free id rather than append onto that run's log.
+    #[test]
+    fn a_resumed_session_never_writes_into_a_previous_runs_transcript() {
+        use super::open_next_subagent_transcript_from;
+        use subagent_transcript::{EndStatus, Event, SpawnKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A previous process left an orphaned run behind (crashed: no End).
+        let mut old = subagent_transcript::SubagentTranscript::create(dir.path(), "000-sub-task")
+            .expect("seed the previous run");
+        old.write(&Event::Start {
+            model: "m".into(),
+            label: "sub-task".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "work from the previous session".into(),
+        });
+        drop(old);
+
+        // A fresh process starts its counter at 0 again and spawns a task with
+        // the default label, so it aims at exactly the id above.
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let mut fresh = open_next_subagent_transcript_from(&seq, dir.path(), "sub-task")
+            .expect("opens a transcript");
+        fresh.write(&Event::Start {
+            model: "m".into(),
+            label: "sub-task".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "work from the resumed session".into(),
+        });
+        fresh.write(&Event::End {
+            status: EndStatus::Ok,
+            bytes: 0,
+        });
+        drop(fresh);
+
+        // Two distinct files, and the old orphan is untouched — still an orphan,
+        // still carrying only its own prompt.
+        let old_body = std::fs::read_to_string(dir.path().join("000-sub-task.jsonl")).unwrap();
+        assert_eq!(old_body.lines().count(), 1, "previous run not appended to");
+        assert!(old_body.contains("previous session"));
+        assert!(
+            !subagent_transcript::is_complete(&dir.path().join("000-sub-task.jsonl")),
+            "the crashed run must still read as an orphan"
+        );
+
+        let new_body = std::fs::read_to_string(dir.path().join("001-sub-task.jsonl"))
+            .expect("the resumed run claims the next free id");
+        assert!(new_body.contains("resumed session"));
+        assert!(subagent_transcript::is_complete(
+            &dir.path().join("001-sub-task.jsonl")
+        ));
+    }
 
     #[test]
     fn subagent_transcript_id_slugifies_and_pads() {

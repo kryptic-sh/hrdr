@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Durable sub-agent transcripts.** Every delegated `task` run now streams an
+  append-only JSONL log to
+  `sessions/<cwd>/subagents/<session-id>/NNN-<label>.jsonl` — the spawn prompt,
+  each text chunk and tool call, and a terminal status (including on panic or
+  cancellation). A sub-agent that dies mid-run leaves its completed work and its
+  failure cause on disk, recoverable independently of the parent session.
+  Writing is best-effort and never fails a run; a run owns its file exclusively,
+  and the files are owner-only (`0600`, in a `0700` dir) since they carry the
+  full prompt and output. Recovery UI, pruning, and resume-into-sub-agent are
+  follow-ups.
 - **Agent model introspection.** A read-only `model_info` tool reports the live
   provider, model, selected/effective reasoning effort, resolved default
   sub-agent model, and optionally the discoverable configured/account-catalog
@@ -38,6 +48,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A resumed session no longer writes into a previous run's sub-agent
+  transcript.** The transcript directory is keyed by session id and so survives
+  a resume, while the id counter restarts at zero in each process — and the
+  default task label is `sub-task`, so the first delegation after `/resume`
+  reliably collided. In append mode that spliced a new run onto an old run's log
+  (two `Start`s, two `End`s) and made a genuinely orphaned run report as
+  complete, defeating the recovery guarantee. A run now claims its file
+  exclusively and advances to the next free id.
 - **`model_info` reports the provider name your session actually uses.** The
   live ChatGPT catalog rows are labelled with the configured spelling
   (`codex`/`openai-oauth`, not always `chatgpt`) and supersede the stale preset

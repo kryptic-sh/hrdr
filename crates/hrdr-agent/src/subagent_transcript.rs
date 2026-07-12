@@ -68,13 +68,33 @@ pub struct SubagentTranscript {
 }
 
 impl SubagentTranscript {
-    /// Open `dir/<id>.jsonl` for append, creating `dir` if needed.
-    pub fn open(dir: &Path, id: &str) -> std::io::Result<Self> {
+    /// Create `dir/<id>.jsonl` for one run, creating `dir` if needed.
+    ///
+    /// **Exclusive.** A run owns its file outright: if `id` is already taken this
+    /// returns [`std::io::ErrorKind::AlreadyExists`] so the caller can pick the
+    /// next id (see `open_next` in `lib.rs`). Opening in plain append mode would
+    /// be wrong — the transcript dir is keyed by *session id* and so survives a
+    /// resume, while the id counter restarts at 0 in each process, so a resumed
+    /// session would append a fresh run onto a previous run's file. That yields a
+    /// file with two `Start`s and two `End`s, and makes [`is_complete`] report a
+    /// genuinely orphaned run as complete — defeating the whole point of the log.
+    pub fn create(dir: &Path, id: &str) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(format!("{id}.jsonl")))?;
+        // The transcript holds the sub-agent's full prompt and output. Keep the
+        // directory owner-only; the file inherits protection from it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(dir.join(format!("{id}.jsonl")))?;
         Ok(Self { file })
     }
 
@@ -140,28 +160,22 @@ mod tests {
     }
 
     #[test]
-    fn write_appends_one_line_per_event_across_opens() {
+    fn write_appends_one_line_per_event() {
         let dir = tempfile::tempdir().unwrap();
-        {
-            let mut t = SubagentTranscript::open(dir.path(), "001-x").unwrap();
-            t.write(&Event::Start {
-                model: "m".into(),
-                label: "l".into(),
-                kind: SpawnKind::Blocking,
-                prompt: "p".into(),
-            });
-            t.write(&Event::Text {
-                chunk: "hello".into(),
-            });
-        }
-        // Re-opening appends rather than truncating.
-        {
-            let mut t = SubagentTranscript::open(dir.path(), "001-x").unwrap();
-            t.write(&Event::End {
-                status: EndStatus::Ok,
-                bytes: 5,
-            });
-        }
+        let mut t = SubagentTranscript::create(dir.path(), "001-x").unwrap();
+        t.write(&Event::Start {
+            model: "m".into(),
+            label: "l".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "p".into(),
+        });
+        t.write(&Event::Text {
+            chunk: "hello".into(),
+        });
+        t.write(&Event::End {
+            status: EndStatus::Ok,
+            bytes: 5,
+        });
         let body = std::fs::read_to_string(dir.path().join("001-x.jsonl")).unwrap();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 3, "one line per event: {body:?}");
@@ -170,23 +184,71 @@ mod tests {
         }
     }
 
+    /// A run owns its file. The dir is keyed by session id and survives a resume,
+    /// but the id counter restarts at 0 each process — so without exclusive
+    /// creation a resumed session's first task would append onto the previous
+    /// run's log, producing a file with two `Start`s and making an orphaned run
+    /// look complete.
+    #[test]
+    fn create_refuses_to_reuse_an_existing_run_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = SubagentTranscript::create(dir.path(), "000-sub-task").unwrap();
+        first.write(&Event::Start {
+            model: "m".into(),
+            label: "sub-task".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "first run".into(),
+        });
+        // No End: the first run crashed. It must stay an identifiable orphan.
+        drop(first);
+
+        let err = match SubagentTranscript::create(dir.path(), "000-sub-task") {
+            Ok(_) => panic!("an id already on disk must not be reopened"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let path = dir.path().join("000-sub-task.jsonl");
+        assert!(!is_complete(&path), "the crashed run is still an orphan");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1, "untouched by the second attempt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("subagents");
+        let _t = SubagentTranscript::create(&root, "000-x").unwrap();
+        let file_mode = std::fs::metadata(root.join("000-x.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        let dir_mode = std::fs::metadata(&root).unwrap().permissions().mode();
+        // The transcript carries the sub-agent's full prompt and output.
+        assert_eq!(file_mode & 0o777, 0o600, "transcript must be 0600");
+        assert_eq!(dir_mode & 0o777, 0o700, "transcript dir must be 0700");
+    }
+
     #[test]
     fn is_complete_flags_orphan_and_preserves_partial_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("002-x.jsonl");
-        {
-            let mut t = SubagentTranscript::open(dir.path(), "002-x").unwrap();
-            t.write(&Event::Start {
-                model: "m".into(),
-                label: "l".into(),
-                kind: SpawnKind::Blocking,
-                prompt: "p".into(),
-            });
-            t.write(&Event::Text {
-                chunk: "done work".into(),
-            });
-            // Drop without an End event: simulates a crash mid-run.
-        }
+        // One run holds one handle for its whole life — the file is never
+        // reopened, so this mirrors the real spawn paths.
+        let mut t = SubagentTranscript::create(dir.path(), "002-x").unwrap();
+        t.write(&Event::Start {
+            model: "m".into(),
+            label: "l".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "p".into(),
+        });
+        t.write(&Event::Text {
+            chunk: "done work".into(),
+        });
+
+        // Mid-run, before any End: an orphan whose completed work is on disk.
         assert!(!is_complete(&path), "no End line => orphan");
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -194,14 +256,11 @@ mod tests {
             "partial work survives the crash"
         );
 
-        // Now finish it.
-        {
-            let mut t = SubagentTranscript::open(dir.path(), "002-x").unwrap();
-            t.write(&Event::End {
-                status: EndStatus::Failed,
-                bytes: 9,
-            });
-        }
+        // The terminal event lands on the same handle the run has held all along.
+        t.write(&Event::End {
+            status: EndStatus::Failed,
+            bytes: 9,
+        });
         assert!(is_complete(&path), "End line => complete");
     }
 
@@ -217,6 +276,6 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let bad_dir = blocker.join("subdir"); // parent is a file
-        assert!(SubagentTranscript::open(&bad_dir, "id").is_err());
+        assert!(SubagentTranscript::create(&bad_dir, "id").is_err());
     }
 }
