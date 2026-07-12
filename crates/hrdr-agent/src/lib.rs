@@ -31,7 +31,7 @@ mod paths;
 pub use paths::cwd_slug;
 mod models;
 mod subagent_live;
-pub use subagent_live::{LiveSubagent, LiveSubagents, RunGuard, SubagentKind};
+pub use subagent_live::{LiveSubagent, LiveSubagents, RunGuard, SubagentKind, age_completed_todos};
 mod subagent_transcript;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
@@ -894,6 +894,9 @@ fn project_lsp_extensions(cwd: &std::path::Path) -> Vec<String> {
     exts
 }
 
+/// Turns a completed TODO stays in the agent's list before it ages out.
+pub const DEFAULT_TODO_TTL: u64 = 5;
+
 /// The context-usage token count at which proactive compaction fires:
 /// `context_window − reserved`. The reserve is clamped to a quarter of the window
 /// so a `reserved` larger than a small model's context still leaves a sane trigger
@@ -1705,6 +1708,11 @@ pub struct AgentConfig {
     /// Default `true`; `$HRDR_MEMORY`. Storage lives under the XDG data dir
     /// (project-scoped by cwd, plus a shared global scope).
     pub memory: bool,
+    /// Turns a completed TODO stays in the list before it is aged out. The list is
+    /// agent state the model re-reads every turn, so this is the agent's business:
+    /// without it a headless run (or any sub-agent) accumulates finished items
+    /// forever and pays for them in context.
+    pub todo_ttl: u64,
     /// This agent is a **delegated sub-agent**, not the session's own agent.
     ///
     /// The seam between the two. A sub-agent is transient and task-scoped: it
@@ -2115,6 +2123,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             memory: true,
+            todo_ttl: DEFAULT_TODO_TTL,
             is_subagent: false,
             memory_dir: None,
             subagent_model: None,
@@ -3303,6 +3312,11 @@ pub struct Agent {
     /// We have already tried to discover `context_window` for the current model.
     /// Stops a provider that reports nothing from being re-probed every round.
     context_window_probed: bool,
+    /// Turn counter for TODO ageing, and when each completed item was first seen
+    /// finished. See [`age_completed_todos`].
+    todo_turn: u64,
+    todo_completed_at: HashMap<String, u64>,
+    todo_ttl: u64,
     /// A self-compaction attempt failed for this history. Latched so a summariser
     /// that fails for a non-transient reason (a 401, a model that refuses the
     /// request) is not retried on every subsequent round of the turn.
@@ -3762,6 +3776,9 @@ impl Agent {
             // A config-supplied window is authoritative; otherwise we go looking.
             context_window_probed: config.context_window.is_some(),
             self_compact_failed: false,
+            todo_turn: 0,
+            todo_completed_at: HashMap::new(),
+            todo_ttl: config.todo_ttl,
             compaction_tail_turns: config.compaction_tail_turns,
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
@@ -4608,6 +4625,7 @@ impl Agent {
                 // the model already finished.
                 self.fire_turn_end_hooks(&mut on_event).await;
                 self.release_finished_subagents();
+                self.age_todos();
                 on_event(AgentEvent::TurnDone);
                 return Ok(());
             }
@@ -4673,6 +4691,7 @@ impl Agent {
         self.messages.push(acc.into_message());
         self.fire_turn_end_hooks(&mut on_event).await;
         self.release_finished_subagents();
+        self.age_todos();
         on_event(AgentEvent::TurnDone);
         Ok(())
     }
@@ -4750,6 +4769,30 @@ impl Agent {
     /// keeps a headless run (which pins nothing) from leaking agents.
     fn release_finished_subagents(&mut self) {
         self.live_subagents.prune();
+    }
+
+    /// Age out TODOs that have been finished for `todo_ttl` turns.
+    ///
+    /// The TODO list is the agent's own state — the model re-reads it every turn —
+    /// so ageing belongs here, not in a frontend. It used to run only in the TUI,
+    /// which meant a headless run and every delegated sub-agent carried their
+    /// finished items forever and paid for them in context on every request.
+    fn age_todos(&mut self) {
+        self.todo_turn += 1;
+        if let Ok(mut todos) = self.ctx.todos.lock() {
+            age_completed_todos(
+                &mut todos,
+                &mut self.todo_completed_at,
+                self.todo_turn,
+                self.todo_ttl,
+            );
+        }
+    }
+
+    /// Set how long a completed TODO lingers before ageing out (a frontend may
+    /// carry the user's preference for this).
+    pub fn set_todo_ttl(&mut self, ttl: u64) {
+        self.todo_ttl = ttl;
     }
 
     /// Learn this agent's context window if the config did not supply one, using

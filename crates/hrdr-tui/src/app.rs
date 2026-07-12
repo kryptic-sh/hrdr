@@ -28,9 +28,7 @@ mod util;
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{
-    SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
-};
+use hrdr_app::{SubAgentPanel, display_dir, git_branch, is_known_command, is_quit_command};
 pub(crate) use selector::{
     EffortSelector, LoginProviderSelector, ModelSelector, SessionSelector, SkillSelector,
     ThemeSelector, effort_selector, login_provider_selector, model_selector, session_selector,
@@ -425,6 +423,9 @@ impl App {
         // dir once an id is assigned (`refresh_subagent_dir`).
         let subagent_dir = Arc::new(std::sync::Mutex::new(None));
         config.subagent_transcript_dir = Some(subagent_dir.clone());
+        // The user's TODO-lifetime preference lives in the UI config, but the
+        // ageing itself is the agent's — hand the preference over.
+        config.todo_ttl = todo_ttl;
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
@@ -1372,19 +1373,6 @@ impl App {
         crate::ui::clear_transcript_cache();
     }
 
-    /// Age out finished TODO items. Called once per turn (on `Done`, so it also
-    /// runs when a turn errors).
-    fn prune_completed_todos(&mut self) {
-        if let Ok(mut todos) = self.todos.lock() {
-            age_completed_todos(
-                &mut todos,
-                &mut self.todo_completed_at,
-                self.todo_turn,
-                self.todo_ttl,
-            );
-        }
-    }
-
     /// The tools' current working directory (agent's, or the process cwd while
     /// a turn holds the agent lock).
     fn current_cwd(&self) -> String {
@@ -1601,18 +1589,6 @@ impl App {
         }
     }
 
-    /// Whether the context has grown enough to auto-compact (with headroom).
-    /// A configured ratio of `0` (or outside `0.0..=1.0`) disables it.
-    fn should_auto_compact(&self) -> bool {
-        !self.compacting
-            && hrdr_app::should_auto_compact(
-                self.state.usage.last().map(|(p, _)| p),
-                self.state.usage.context_window,
-                self.compaction_reserved,
-                self.auto_compact_enabled,
-            )
-    }
-
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
     fn spawn_compaction(&mut self, instructions: Option<String>) {
         self.running = true;
@@ -1706,8 +1682,11 @@ impl App {
                     self.push_entry(Entry::stats(stats));
                 }
                 // Age out completed TODOs once per turn.
-                self.todo_turn += 1;
-                self.prune_completed_todos();
+                // NOTE: TODO ageing is the agent's now (`Agent::age_todos`, at turn
+                // end). The list is agent state the model re-reads every turn, so
+                // doing it only here meant a headless run — and every delegated
+                // sub-agent — kept its finished items forever and paid for them in
+                // context on every request.
                 // Notify on completion of a non-trivial turn (if enabled).
                 self.maybe_bell();
                 // Persist the completed turn into the active session, if any.
@@ -1717,15 +1696,13 @@ impl App {
                     self.pending_init = false;
                     self.reload_project_docs();
                 }
-                // Auto-compact near the context limit before doing more work;
-                // its Compacted handler resumes the queue afterward.
-                if self.should_auto_compact() {
-                    self.push_entry(Entry::notice(
-                        "context near the limit — auto-compacting…".to_string(),
-                    ));
-                    self.spawn_compaction(None);
-                    return;
-                }
+                // NOTE: no auto-compaction here any more. The agent compacts itself
+                // when its context fills (`Agent::maybe_self_compact`), before each
+                // request rather than only between turns — so it also protects a
+                // long tool-calling turn, and it works identically with no UI
+                // attached (headless, and every delegated sub-agent). A frontend
+                // copy of the same threshold only re-compacted what the agent had
+                // just compacted. `/compact` remains, as a deliberate user action.
                 // The turn ended without draining what was queued (the model
                 // answered instead of calling a tool). Drop the agent's prepared
                 // copies — `spawn_turn` re-prepares — and send the oldest as a

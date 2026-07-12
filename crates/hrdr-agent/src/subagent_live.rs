@@ -139,6 +139,40 @@ impl LiveSubagents {
     }
 }
 
+/// Age out finished TODO items in place. Stamps each completed item with the
+/// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
+/// any completed item that has been finished for `ttl` turns. Stamps for items no
+/// longer present as completed are forgotten, so a re-completed item ages from
+/// scratch. Pending / in-progress items are kept.
+///
+/// This lives beside the agent, not in a frontend, because the TODO list is the
+/// agent's own state: the model reads it every turn. Ageing it only in the TUI
+/// meant a headless run — and every delegated sub-agent — accumulated completed
+/// items forever, growing the context they read from.
+pub fn age_completed_todos(
+    todos: &mut Vec<hrdr_tools::TodoItem>,
+    stamps: &mut std::collections::HashMap<String, u64>,
+    turn: u64,
+    ttl: u64,
+) {
+    for t in todos.iter() {
+        if t.status == "completed" {
+            stamps.entry(t.content.clone()).or_insert(turn);
+        }
+    }
+    todos.retain(|t| {
+        t.status != "completed"
+            || stamps
+                .get(&t.content)
+                .is_none_or(|&done| turn.saturating_sub(done) < ttl)
+    });
+    stamps.retain(|content, _| {
+        todos
+            .iter()
+            .any(|t| t.status == "completed" && &t.content == content)
+    });
+}
+
 /// Marks a sub-agent idle on **every** exit path — including task cancellation,
 /// where the code after `run(...).await` simply never executes.
 ///
@@ -237,6 +271,43 @@ mod tests {
         let a = LiveSubagents::next_key();
         let b = LiveSubagents::next_key();
         assert_ne!(a, b);
+    }
+
+    /// The TODO list is agent state the model re-reads every turn, so ageing it is
+    /// the agent's job. It used to happen only in the TUI — meaning a headless run
+    /// and every delegated sub-agent kept their finished items forever and paid for
+    /// them in context on every request.
+    #[test]
+    fn completed_todos_age_out_after_their_ttl() {
+        use hrdr_tools::TodoItem;
+        let todo = |content: &str, status: &str| TodoItem {
+            content: content.to_string(),
+            status: status.to_string(),
+        };
+        let mut todos = vec![
+            todo("done thing", "completed"),
+            todo("still going", "in_progress"),
+        ];
+        let mut stamps = std::collections::HashMap::new();
+
+        // First seen finished on turn 1, with a 2-turn lifetime.
+        age_completed_todos(&mut todos, &mut stamps, 1, 2);
+        assert_eq!(todos.len(), 2, "a freshly finished item still shows");
+
+        age_completed_todos(&mut todos, &mut stamps, 2, 2);
+        assert_eq!(todos.len(), 2, "and lingers for its ttl");
+
+        age_completed_todos(&mut todos, &mut stamps, 3, 2);
+        assert_eq!(todos.len(), 1, "then it is aged out");
+        assert_eq!(todos[0].content, "still going");
+        assert!(
+            stamps.is_empty(),
+            "and its stamp is forgotten, so a re-completed item ages from scratch"
+        );
+
+        // Unfinished work is never aged out, however long it takes.
+        age_completed_todos(&mut todos, &mut stamps, 99, 2);
+        assert_eq!(todos.len(), 1, "in-progress work is not swept away");
     }
 
     /// A cancelled run must not strand its sub-agent. The update after `.await`
