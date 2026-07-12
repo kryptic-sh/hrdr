@@ -22,7 +22,11 @@ pub use oauth::{
 };
 mod paths;
 pub use paths::cwd_slug;
+// The transcript writer's API is exercised only by its own tests until the
+// spawn paths consume it (Tasks 3–4); allow it to sit unused until then.
 mod models;
+#[allow(dead_code)]
+mod subagent_transcript;
 pub use models::{
     ModelChoice, builtin_catalog_key, filter_model_choices, load_last_model, load_model_usage,
     model_choices, record_last_model, record_model_use,
