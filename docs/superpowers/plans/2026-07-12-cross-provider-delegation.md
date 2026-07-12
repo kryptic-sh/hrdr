@@ -41,8 +41,8 @@ All changes live in `crates/hrdr-agent/src/lib.rs` (+ its inline
   - refactor `pub fn config_for_agent_profile` to call it (Task 1)
   - new private `fn apply_task_overrides` (Task 2)
   - `SubagentTool::parameters` — add `provider` prop, reword `model` (Task 2)
-  - `SubagentTool::call` — parse `provider`/`model`, call `apply_task_overrides`
-    (Task 2)
+  - `SubagentTool::execute` — parse `provider`/`model`, call
+    `apply_task_overrides` (Task 2)
   - tests in the same file's `mod tests` (Tasks 1 & 2)
 - `README.md` — delegation section (Task 3)
 - `CHANGELOG.md` — `[Unreleased]` (Task 3)
@@ -78,18 +78,30 @@ Behaviour-preserving for existing profiles **except** it now sets
 - [ ] **Step 1: Add the identity assertion to the existing repoint test
       (failing).**
 
-In `subagent_profile_repoints_to_a_different_provider` (`:4614`), after the
-existing `assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");` block, add:
+In `subagent_profile_repoints_to_a_different_provider` (`:4614`) add two
+assertions — each **after the variable it references is bound**. (Inserting both
+right after the `sub.base_url` assert would reference `same` before its `let` at
+`:4645`, an `E0425` compile error — not the intended assertion failure.)
+
+Add immediately after
+`assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));`
+(`:4643`):
 
 ```rust
         // Identity: the sub is now *on* openrouter, not the parent provider.
         assert_eq!(sub.provider.as_deref(), Some("openrouter"));
-        // The no-provider profile keeps the parent's provider identity.
-        assert_eq!(same.provider.as_deref(), None); // parent cfg left provider = None
 ```
 
-(`cfg` in that test is built with `..Default::default()`, so its `provider` is
-`None`; the no-provider profile must leave it `None`.)
+Add immediately after `assert_eq!(same.model, "claude-haiku");` (`:4665`):
+
+```rust
+        // The no-provider profile keeps the parent's provider identity (None here).
+        assert_eq!(same.provider.as_deref(), None);
+```
+
+(The test's `cfg` is built with `..Default::default()`, so `provider` is `None`;
+`subagent_base_config` clones without touching it, and the no-provider profile
+must leave it `None`.)
 
 - [ ] **Step 2: Run it, verify it fails.**
 
@@ -202,8 +214,7 @@ Add to `mod tests`:
     #[test]
     fn repoint_to_provider_sets_identity_and_model() {
         use super::repoint_to_provider;
-        // Start on a fake parent endpoint; repoint to the keyless `local`
-        // built-in (no ambient auth needed — deterministic in CI).
+        // Start on a fake parent endpoint; repoint to the `local` built-in.
         let mut cfg = AgentConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: Some("parent-key".to_string()),
@@ -215,12 +226,17 @@ Add to `mod tests`:
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.provider.as_deref(), Some("local"));
         assert_eq!(cfg.model, "my-local-model");
-        // Keyless local must not carry the parent's key to a different host.
-        assert_eq!(cfg.api_key, None);
         // Unknown provider errors.
         assert!(repoint_to_provider(&mut cfg, "nope", Some("m")).is_err());
     }
 ```
+
+Do **not** assert `cfg.api_key == None` here: `local`'s `key_env` is
+`HRDR_API_KEY`, which `resolve_api_key` reads from the environment
+(`lib.rs:1568`), so on a dev box with that variable exported the key would be
+`Some(...)` and the assertion would flake. Key-inheritance safety is already
+covered hermetically by
+`resolve_api_key_does_not_leak_parent_key_across_providers` (`lib.rs:4691`).
 
 - [ ] **Step 6: Run the gate.**
 
@@ -247,12 +263,12 @@ git commit -m "refactor(agent): extract repoint_to_provider + fix sub provider i
 ### Task 2: `provider` argument on the `task` tool
 
 Add the schema property and the ad-hoc resolution path (auth gate + repoint),
-wired into `SubagentTool::call`.
+wired into `SubagentTool::execute`.
 
 **Files:**
 
 - Modify: `crates/hrdr-agent/src/lib.rs` — add `fn apply_task_overrides`;
-  `SubagentTool::parameters` (`:561`); `SubagentTool::call` model-override
+  `SubagentTool::parameters` (`:561`); `SubagentTool::execute` model-override
   region (`:640-646`).
 - Test: `crates/hrdr-agent/src/lib.rs` `mod tests` — add
   `apply_task_overrides_*` tests.
@@ -334,13 +350,54 @@ Add to `mod tests`:
         apply_task_overrides(&mut cfg, None, None).unwrap();
         assert_eq!(cfg.model, "gpt-5.6-sol");
     }
+
+    // Spec Testing #4 — precedence: an ad-hoc provider/model override layered on
+    // a resolved agent profile wins on endpoint + model, while the profile's
+    // persona survives (repoint is persona-preserving).
+    #[test]
+    fn apply_task_overrides_wins_over_profile_but_keeps_persona() {
+        use super::{SubagentProfile, apply_task_overrides, config_for_agent_profile, subagent_base_config};
+        let parent = AgentConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: Some("parent-key".to_string()),
+            model: "claude-opus".to_string(),
+            provider: Some("claude".to_string()),
+            ..Default::default()
+        };
+        // Resolve a profile with a persona + its own model, no provider (stays
+        // on the parent endpoint).
+        let prof = SubagentProfile {
+            name: "reviewer".to_string(),
+            provider: None,
+            model: Some("claude-sonnet".to_string()),
+            description: None,
+            prompt: Some("Review only.".to_string()),
+            read_only: true,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+        let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
+        // Ad-hoc override to a different provider + model.
+        apply_task_overrides(&mut cfg, Some("local"), Some("adhoc-model")).unwrap();
+        // Endpoint + model come from the ad-hoc override.
+        assert_eq!(cfg.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.provider.as_deref(), Some("local"));
+        assert_eq!(cfg.model, "adhoc-model");
+        // Persona from the profile survives the override.
+        assert_eq!(cfg.agent_prompt.as_deref(), Some("Review only."));
+        assert!(cfg.read_only);
+    }
 ```
 
 - [ ] **Step 2: Run, verify failure.**
 
-Run:
-`cargo test -p hrdr-agent apply_task_overrides_provider_repoints_and_gates --locked`
-Expected: FAIL — `apply_task_overrides` does not exist.
+Run: `cargo test -p hrdr-agent apply_task_overrides --locked` Expected: FAIL
+(both tests) — `apply_task_overrides` does not exist.
 
 - [ ] **Step 3: Add `apply_task_overrides`.**
 
@@ -404,9 +461,9 @@ reads `"Optional model override (on the selected provider). …"`; change to:
             },
 ```
 
-- [ ] **Step 6: Wire `apply_task_overrides` into `call`.**
+- [ ] **Step 6: Wire `apply_task_overrides` into `execute`.**
 
-In `SubagentTool::call`, replace the model-override block (`:640-646`):
+In `SubagentTool::execute`, replace the model-override block (`:640-646`):
 
 ```rust
         if let Some(m) = args
@@ -526,20 +583,25 @@ cargo build -p hrdr
 
 Then, with the ChatGPT provider configured as the main agent (the current
 `~/.config/hrdr/config.toml`), run a headless delegation that forces a
-cross-provider sub and reports the sub's resolved model:
+cross-provider sub and reports the sub's resolved model. The `task` tool
+defaults to `background: true` (detached; result delivered after the turn may
+end), so the prompt must force `background: false` to block until the sub
+finishes — otherwise the one-shot headless run can end before the sub replies:
 
 ```bash
-./target/debug/hrdr run "Delegate a task to provider 'openrouter', model '<valid-slug>', prompt: 'Reply with only your active model id.' Then report exactly what the sub returned."
+./target/debug/hrdr run "Use the task tool with background: false (block until it finishes) to delegate to provider 'openrouter', model '<valid-slug>', prompt: 'Reply with only your active model id.' Then report exactly what the sub returned."
 ```
 
 Expected: the sub runs on openrouter (its reply is the openrouter model id, not
 a gpt-5.* id), proving the request hit openrouter with the openrouter key.
-Capture the output in the task notes.
+Capture the output in the task notes. If the run ends without the sub's reply,
+confirm `background: false` was honored (isolated-worktree subs are always
+blocking; a plain sub needs the explicit flag).
 
 - [ ] **Step 6: Negative check — unconfigured provider fails fast.**
 
 ```bash
-./target/debug/hrdr run "Delegate a task to provider 'zen', model 'x', prompt: 'hi'. Report any error verbatim."
+./target/debug/hrdr run "Use the task tool with background: false to delegate to provider 'zen', model 'x', prompt: 'hi'. Report any error verbatim."
 ```
 
 Expected (assuming no `OPENCODE_API_KEY`/saved zen login): the delegation is
@@ -556,10 +618,14 @@ whose key is unset.
 - Interface (`provider` arg) → Task 2 Steps 5-6. ✓
 - `provider` omitted = byte-identical → Task 2 test (e)/(f) + unchanged model
   block semantics. ✓
-- Repoint helper, persona-preserving → Task 1. ✓
+- Repoint helper, persona-preserving → Task 1 (helper) + verified by the
+  precedence test below. ✓
 - Provider-identity fix → Task 1 Steps 1-4. ✓
 - Auth gate, ad-hoc only → Task 2 Step 3 (`apply_task_overrides`); profiles
   untouched (Task 1 helper has no gate). ✓
+- Precedence (ad-hoc override on a resolved profile wins on endpoint/model while
+  persona survives) → Task 2 test
+  `apply_task_overrides_wins_over_profile_but_keeps_persona`. ✓
 - Ordering (gate/resolve on parent values before repoint) → helper resolves key
   before mutation; gate runs before `repoint_to_provider`. ✓
 - No-default-model error → Task 2 test (c) + impl. ✓
