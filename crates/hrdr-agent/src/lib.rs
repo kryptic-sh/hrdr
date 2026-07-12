@@ -1294,11 +1294,15 @@ impl hrdr_tools::Tool for SubagentTool {
             None => None,
         };
         // Record the terminal outcome before the `?` below can propagate it.
+        // `bytes` is the *trimmed* output length, matching the background path —
+        // the two used to disagree (this one counted the untrimmed buffer), which
+        // made the field useless for comparing runs.
+        let bytes = output.trim().len();
         if let Some(t) = transcript.as_mut() {
             match &run {
                 Ok(()) => t.write(&subagent_transcript::Event::End {
                     status: subagent_transcript::EndStatus::Ok,
-                    bytes: output.len(),
+                    bytes,
                 }),
                 Err(e) => {
                     t.write(&subagent_transcript::Event::Error {
@@ -1306,7 +1310,7 @@ impl hrdr_tools::Tool for SubagentTool {
                     });
                     t.write(&subagent_transcript::Event::End {
                         status: subagent_transcript::EndStatus::Failed,
-                        bytes: output.len(),
+                        bytes,
                     });
                 }
             }

@@ -1588,6 +1588,44 @@ async fn autosave_populates_the_subagent_transcript_dir() {
     );
 }
 
+/// The session id — and so the sub-agent transcript dir — must exist before the
+/// turn's first tool batch runs, not after it.
+///
+/// The id used to be assigned only when the agent emitted its first `History`
+/// event, which lands *after* that round's tools have already executed. A
+/// brand-new session's first delegated `task` therefore spawned with an empty dir
+/// cell and its transcript was silently dropped — exactly the crash the
+/// transcript exists to survive.
+#[tokio::test]
+async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
+    let _data_home = isolated_data_home();
+
+    let mut h = Harness::new(vec![MockReply::Text("done".into())]).await;
+    assert!(h.app.state.id.is_none(), "a fresh session has no id");
+    assert!(h.app.subagent_dir.lock().unwrap().is_none());
+
+    // Send the message but do NOT pump: the turn has been launched and nothing
+    // the agent produces has been processed yet — the same instant a first-round
+    // `task` tool call would spawn its sub-agent.
+    h.type_str("go");
+    h.press(KeyCode::Enter);
+
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("the id is reserved at turn start, before the agent runs");
+    assert_eq!(
+        *h.app.subagent_dir.lock().unwrap(),
+        Some(hrdr_app::subagent_transcript_dir(&h.app.current_cwd(), &id)),
+        "a sub-agent spawned in the first round already has somewhere to write"
+    );
+
+    h.pump().await;
+    assert_eq!(h.app.state.id.as_deref(), Some(id.as_str()), "id is stable");
+}
+
 /// A new session opens with the banner: an animated logo on the left and the
 /// session's details (model, provider, cwd) on the right, all inside one block.
 #[tokio::test]

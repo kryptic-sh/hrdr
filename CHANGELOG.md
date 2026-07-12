@@ -48,6 +48,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A new session's first delegated task is now recorded.** The session id — and
+  with it the sub-agent transcript directory — is reserved when the turn starts,
+  not when the agent emits its first history snapshot (which lands _after_ that
+  round's tools have already run). A `task` delegated in the very first round
+  used to spawn with nowhere to write, so its transcript was dropped — exactly
+  the crash the log exists to survive. Reserving the id also means a crash
+  during the first turn no longer loses the user's message. The `End` event's
+  `bytes` now measures the same thing (trimmed output length) on the blocking
+  and background paths, which previously disagreed.
 - **A resumed session no longer writes into a previous run's sub-agent
   transcript.** The transcript directory is keyed by session id and so survives
   a resume, while the id counter restarts at zero in each process — and the

@@ -62,6 +62,43 @@ impl super::App {
         }
     }
 
+    /// Claim this session's id — and with it the sub-agent transcript dir —
+    /// *before* the turn runs, when it does not have one yet.
+    ///
+    /// The id is otherwise assigned only when the agent emits its first `History`
+    /// event, and that lands **after** the round's tool batch has already
+    /// executed. So on a brand-new session the first delegated `task` spawned
+    /// while the transcript dir cell was still empty and its transcript was
+    /// silently dropped — precisely the crash the transcript exists to survive.
+    ///
+    /// The id must be *reserved*, not merely computed: [`unique_session_id`]
+    /// establishes uniqueness by looking for an existing file, so a second hrdr
+    /// started in the same cwd would mint the same id until one of them writes.
+    /// Saving here also means a crash during the very first turn no longer loses
+    /// the user's message.
+    ///
+    /// `sent` is the prepared outgoing message — the same text the agent is about
+    /// to push — so the mirror we save matches the history the agent will build.
+    ///
+    /// [`unique_session_id`]: hrdr_app::unique_session_id
+    pub(crate) fn reserve_session_id(&mut self, sent: &str) {
+        if self.state.id.is_some() {
+            return;
+        }
+        // `save_session` skips a conversation with no user message, and the agent
+        // does not push this one until the turn starts — so seed the mirror. The
+        // next autosave replaces it with the agent's own history.
+        self.state.messages.push(hrdr_agent::Message::user(sent));
+        if let Some(o) = hrdr_app::save_session(&self.state) {
+            // Stay silent here: the notice belongs *after* the turn, not ahead of
+            // the reply. Hand it to the first autosave, which would otherwise see
+            // an id already set and conclude this was not a first save.
+            self.session_notice_pending = o.first_save;
+            self.state.id = Some(o.id);
+            self.refresh_subagent_dir();
+        }
+    }
+
     /// Persist the conversation. Sessions auto-save continuously: any non-empty
     /// conversation is written to disk, with a stable file id assigned (from the
     /// name) on first save. Called after every completed turn, `/undo`,
@@ -83,8 +120,10 @@ impl super::App {
         self.state.sync_from(msgs, todos, cwd);
 
         if let Some(o) = hrdr_app::save_session(&self.state) {
-            // Notify once, when the session is first created.
-            if o.first_save {
+            // Notify once, when the session is first created — including when
+            // `reserve_session_id` created it at turn start and deferred the
+            // notice to here (it sees `first_save` as false by then).
+            if o.first_save || std::mem::take(&mut self.session_notice_pending) {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
             self.state.id = Some(o.id);

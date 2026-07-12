@@ -53,11 +53,10 @@ pub enum Event {
     },
     End {
         status: EndStatus,
-        /// Approximate size hint: the byte length of the accumulated output at
-        /// the terminal point. Trimming and availability vary by path (untrimmed
-        /// on the blocking path, trimmed on background Ok, `0` on panic/cancel),
-        /// so treat it as a rough indicator, not an exact count. Not used to gate
-        /// anything.
+        /// Byte length of the sub-agent's trimmed text output at the terminal
+        /// point — the same measure on the blocking and background paths, so runs
+        /// are comparable. `0` on `Panicked`/`Cancelled`, where the output was
+        /// never collected. A size hint only; it gates nothing.
         bytes: usize,
     },
 }

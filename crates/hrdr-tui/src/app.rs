@@ -166,6 +166,11 @@ pub(crate) struct App {
     /// and refreshed whenever the session id is assigned (see
     /// [`Self::refresh_subagent_dir`]).
     subagent_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// A session was created by [`Self::reserve_session_id`] at turn start, so
+    /// the first autosave still owes the user the "session saved" notice. The
+    /// reservation stays silent on purpose: announcing it there would print the
+    /// notice ahead of the reply rather than after the turn, where it belongs.
+    session_notice_pending: bool,
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
@@ -462,6 +467,7 @@ impl App {
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             subagent_dir,
+            session_notice_pending: false,
             editor,
             theme,
             logo,
@@ -1506,6 +1512,7 @@ impl App {
     /// Run a turn against the model with `input` as the (already-prepared) user
     /// message. The caller is responsible for any transcript display.
     fn launch_turn(&mut self, input: String) {
+        self.reserve_session_id(&input);
         self.running = true;
         self.turn_started = Some(Instant::now());
         self.turn_started_at = Some(chrono::Local::now());
