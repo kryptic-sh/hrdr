@@ -194,7 +194,11 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("callback is missing the authorization code"))?;
     let state = params.get("state").map(String::as_str).unwrap_or("");
     if state != expected_state {
-        bail!("state mismatch — possible CSRF (expected {expected_state:?}, got {state:?})");
+        // Do NOT echo `expected_state` — this message is written into the HTML
+        // page returned to whoever hit the localhost port and into the
+        // transcript, so disclosing our own CSRF token to a local prober is
+        // gratuitous. The received value is enough to diagnose.
+        bail!("state mismatch — possible CSRF (got {state:?})");
     }
     Ok(code.clone())
 }
