@@ -30,6 +30,8 @@ pub use chatgpt_models::{
 mod paths;
 pub use paths::cwd_slug;
 mod models;
+mod subagent_live;
+pub use subagent_live::{LiveSubagent, LiveSubagents, SubagentKind};
 mod subagent_transcript;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
@@ -560,10 +562,17 @@ fn spawn_background(
     cost_total: Arc<std::sync::Mutex<f64>>,
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     transcript_dir: SubagentDirCell,
+    live: LiveSubagents,
 ) -> String {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let header = format!("↳ task#{id} ({}): {label}", cfg.model);
+    // Identity for the live registry, taken before `tool_id` is moved into the
+    // background-task row below.
+    let live_key = LiveSubagents::next_key();
+    let tool_id_for_live = tool_id.clone();
+    let label_for_live = label.clone();
+    let model_for_live = cfg.model.clone();
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -595,6 +604,10 @@ fn spawn_background(
     let ts_outer = transcript;
     let reg = registry.clone();
     let reg_done = reg.clone();
+    // One handle for the inner task (which registers the sub-agent once it
+    // exists) and one for the outer guard (which marks it idle on every exit
+    // path, including panic and cancellation).
+    let live_done = live.clone();
     // The inner task does the actual work; the outer task is the panic guard:
     // it always sets `done = true` + a result, even on panic.
     let handle = tokio::spawn(async move {
@@ -612,7 +625,28 @@ fn spawn_background(
                 // Share the parent's language servers (its config disabled
                 // building an own registry) — one warm set for the session.
                 sub.ctx.lsp = lsp;
-                sub.run(prompt, steering_queue(), |ev| {
+                // Retain the sub-agent and the queue its `run` drains, so the
+                // frontend can steer it, watch it, and drive further turns on it.
+                // Registered here rather than before the spawn because `Agent::new`
+                // may fail, and a failed spawn has no sub-agent to address.
+                let steering = steering_queue();
+                let sub = Arc::new(tokio::sync::Mutex::new(sub));
+                live.register(LiveSubagent {
+                    key: live_key,
+                    bg_id: Some(id),
+                    tool_id: tool_id_for_live,
+                    label: label_for_live,
+                    model: model_for_live,
+                    kind: SubagentKind::Background,
+                    agent: Arc::clone(&sub),
+                    steering: Arc::clone(&steering),
+                    running: true,
+                    done: false,
+                    delivered: false,
+                    pinned: false,
+                });
+                let mut sub = sub.lock().await;
+                sub.run(prompt, steering, |ev| {
                     if let Ok(mut g) = ts_inner.lock()
                         && let Some(t) = g.as_mut()
                         && let Some(tev) = subagent_event_for(&ev)
@@ -711,6 +745,13 @@ fn spawn_background(
             t.done = true;
             t.result = Some(final_result);
         }
+        // The sub-agent is idle now, but its answer is still owed to the main
+        // agent, so `delivered` stays false — the entry survives the prune until
+        // the result is injected (see `deliver_background`).
+        live_done.update(live_key, |e| {
+            e.running = false;
+            e.done = true;
+        });
     });
     if let Ok(mut v) = handles.lock() {
         // Best-effort reaping: drop handles for tasks that have already
@@ -1052,9 +1093,13 @@ struct SubagentTool {
     /// The parent session's transcript dir cell (see
     /// [`AgentConfig::subagent_transcript_dir`]); read at spawn.
     transcript_dir: SubagentDirCell,
+    /// Every sub-agent spawned here is registered so the frontend can steer it,
+    /// display it, and drive further turns on it. See [`LiveSubagents`].
+    live: LiveSubagents,
 }
 
 impl SubagentTool {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         base: AgentConfig,
         runtime: SharedDelegationRuntime,
@@ -1063,6 +1108,7 @@ impl SubagentTool {
         cost_total: Arc<std::sync::Mutex<f64>>,
         lsp: Option<Arc<hrdr_tools::LspRegistry>>,
         transcript_dir: SubagentDirCell,
+        live: LiveSubagents,
     ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
@@ -1124,6 +1170,7 @@ impl SubagentTool {
             cost_total,
             lsp,
             transcript_dir,
+            live,
         }
     }
 }
@@ -1329,6 +1376,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 Arc::clone(&self.cost_total),
                 self.lsp.clone(),
                 self.transcript_dir.clone(),
+                self.live.clone(),
             ));
         }
         // Blocking: hold the slot until this call returns.
@@ -1369,9 +1417,32 @@ impl hrdr_tools::Tool for SubagentTool {
         sub.cost_total = Arc::clone(&self.cost_total);
         // Share the parent's language servers (base config has `lsp = false`).
         sub.ctx.lsp = self.lsp.clone();
-        let mut output = String::new();
+
+        // Retain the sub-agent and the very queue its `run` will drain, so the
+        // frontend can steer it mid-run, watch it, and drive further turns on it
+        // once this call returns. It is pruned when finished, delivered, and
+        // unpinned — see `LiveSubagents::prune`.
+        let key = LiveSubagents::next_key();
         let steering = steering_queue();
-        let run = sub
+        let sub = Arc::new(tokio::sync::Mutex::new(sub));
+        self.live.register(LiveSubagent {
+            key,
+            bg_id: None,
+            tool_id: ctx.call_id.clone(),
+            label: label.clone(),
+            model: model.clone(),
+            kind: SubagentKind::Blocking,
+            agent: Arc::clone(&sub),
+            steering: Arc::clone(&steering),
+            running: true,
+            done: false,
+            delivered: false,
+            pinned: false,
+        });
+
+        let mut output = String::new();
+        let mut sub_guard = sub.lock().await;
+        let run = sub_guard
             .run(prompt, steering, |ev| {
                 if let Some(t) = transcript.as_mut()
                     && let Some(tev) = subagent_event_for(&ev)
@@ -1391,6 +1462,14 @@ impl hrdr_tools::Tool for SubagentTool {
                 }
             })
             .await;
+        drop(sub_guard);
+        // The task has landed. Its answer becomes this tool call's result, so the
+        // main agent has it the moment we return: mark it delivered here.
+        self.live.update(key, |e| {
+            e.running = false;
+            e.done = true;
+            e.delivered = true;
+        });
         // Tear down / preserve the worktree before surfacing errors.
         let worktree_note = match worktree {
             Some(wt) => wt.finish().await,
@@ -3133,6 +3212,10 @@ pub struct Agent {
     configured_headers: Vec<(String, String)>,
     /// Sanitized live model state shared with introspection and delegation tools.
     delegation_runtime: SharedDelegationRuntime,
+    /// Sub-agents this agent has delegated to and is still holding — the
+    /// frontend steers, views, and drives further turns on them through this.
+    /// Pruned at turn end (see [`LiveSubagents::prune`]).
+    live_subagents: LiveSubagents,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -3355,6 +3438,7 @@ impl Agent {
             .unwrap_or(ResolvedProviderKind::BuiltIn);
         let configured_headers = config.headers.clone();
         let delegation_runtime = new_delegation_runtime(&config, provider_kind);
+        let live_subagents = LiveSubagents::new();
         tools.register(Arc::new(ModelInfoTool {
             runtime: Arc::clone(&delegation_runtime),
             available: available_models(&config, config.provider.as_deref()),
@@ -3419,6 +3503,7 @@ impl Agent {
                 Arc::clone(&cost_total),
                 lsp.clone(),
                 config.subagent_transcript_dir.clone(),
+                live_subagents.clone(),
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -3574,6 +3659,7 @@ impl Agent {
             provider_kind,
             configured_headers,
             delegation_runtime,
+            live_subagents,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -4052,6 +4138,12 @@ impl Agent {
         self.ctx.background_tasks.clone()
     }
 
+    /// The sub-agents this agent is holding — the frontend steers, displays, and
+    /// drives further turns on them through this handle. See [`LiveSubagents`].
+    pub fn live_subagents(&self) -> LiveSubagents {
+        self.live_subagents.clone()
+    }
+
     /// Number of messages currently in history (including the system prompt).
     pub fn message_count(&self) -> usize {
         self.messages.len()
@@ -4199,6 +4291,18 @@ impl Agent {
             v.retain(|t| !t.delivered);
             out
         };
+        // The main agent now has these answers, so the live entries are no longer
+        // owed. They stay only while pinned (the user is viewing one); the prune
+        // at turn end drops the rest.
+        self.live_subagents.with(|v| {
+            for e in v.iter_mut() {
+                if e.bg_id
+                    .is_some_and(|b| finished.iter().any(|(id, _, _)| *id == b))
+                {
+                    e.delivered = true;
+                }
+            }
+        });
         for (id, label, result) in finished {
             on_event(AgentEvent::Notice(format!(
                 "background task #{id} ({label}) finished"
@@ -4402,6 +4506,12 @@ impl Agent {
             // hand the frontend a history snapshot to persist. A crash from
             // here on loses at most the next round.
             on_event(AgentEvent::History(self.messages.clone()));
+
+            // Release sub-agents whose work is done, whose answers the main agent
+            // has, and that nobody is looking at. Doing it here — rather than
+            // leaving it to the frontend — means a frontend that never pins (the
+            // headless CLI, a test) cannot leak sub-agents by not participating.
+            self.live_subagents.prune();
 
             // Near the budget: tell the model so it wraps up instead of
             // getting cut off mid-plan.
@@ -6205,6 +6315,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(0.0f64)),
             None,
             None,
+            super::LiveSubagents::new(),
         );
         let ctx = hrdr_tools::ToolContext::new(cwd.path());
         // The profile repoints to `c-other`; the ad-hoc override then asks for
@@ -8953,6 +9064,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
                 None,
                 cell,
+                super::super::LiveSubagents::new(),
             )
         }
 
@@ -8971,6 +9083,72 @@ mod tests {
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
             (files[0].clone(), events)
+        }
+
+        /// A delegated sub-agent stays addressable: registered while it runs, and
+        /// once its answer has reached the main agent it survives the prune only
+        /// while a frontend is looking at it.
+        #[tokio::test]
+        async fn a_delegated_subagent_is_retained_then_pruned_unless_pinned() {
+            use super::super::{LiveSubagents, SubagentKind};
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "sub work done"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let live = LiveSubagents::new();
+            let cfg = test_cfg(server.base_url(), cwd.path());
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                super::super::ResolvedProviderKind::BuiltIn,
+            );
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                None,
+                None,
+                live.clone(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            let out = tool
+                .execute(
+                    json!({"prompt": "p", "description": "probe", "background": false}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(out.contains("sub work done"));
+
+            // Retained and idle. Its answer *is* the tool result, so the main
+            // agent already has it — the entry is no longer owed.
+            let (key, kind, running, done, delivered) = live.with(|v| {
+                assert_eq!(v.len(), 1, "the delegated sub-agent is registered");
+                let e = &v[0];
+                (e.key, e.kind, e.running, e.done, e.delivered)
+            });
+            assert_eq!(kind, SubagentKind::Blocking);
+            assert!(!running && done && delivered);
+
+            // Pinned (the user is viewing it) → kept, and still addressable.
+            live.update(key, |e| e.pinned = true);
+            live.prune();
+            assert_eq!(live.len(), 1, "a pinned sub-agent survives the prune");
+            assert!(live.handle(key).is_some(), "and is still addressable");
+
+            // Stop viewing it: finished, delivered, unwatched → released.
+            live.update(key, |e| e.pinned = false);
+            live.prune();
+            assert!(
+                live.is_empty(),
+                "an unwatched, delivered sub-agent is freed"
+            );
         }
 
         /// A blocking sub-agent records Start (full prompt) → Text → End(ok), and
