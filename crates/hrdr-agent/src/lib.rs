@@ -920,6 +920,51 @@ fn repoint_to_provider(
     Ok(())
 }
 
+/// Apply the `task` tool's ad-hoc `provider`/`model` arguments on top of an
+/// already-resolved config (post agent-profile). With `provider`: auth-gate
+/// the target (fail fast before spawning) and repoint. Without: `model`
+/// overrides on the current provider — today's behaviour.
+fn apply_task_overrides(
+    cfg: &mut AgentConfig,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    if let Some(pname) = provider {
+        // Resolve + gate against the PARENT's key/base_url, before repoint.
+        let p = cfg.resolve_provider(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
+                BUILTIN_PROVIDERS.join(", ")
+            )
+        })?;
+        if provider_auth_state(
+            pname,
+            &p,
+            cfg.api_key.as_deref(),
+            Some(cfg.base_url.as_str()),
+        ) == ProviderAuthState::Missing
+        {
+            // Only suggest an env var when the provider actually reads one;
+            // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
+            // would be sent chasing a var that resolve_api_key never consults.
+            let hint = match p.key_env.as_deref() {
+                Some(env) => format!("set ${env}, or run /login"),
+                None => format!(
+                    "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
+                ),
+            };
+            bail!("task: provider '{pname}' is not configured — {hint}");
+        }
+        if model.is_none() && p.model.is_none() {
+            bail!("task: provider '{pname}' requires an explicit model (it has no default)");
+        }
+        repoint_to_provider(cfg, pname, model)?;
+    } else if let Some(m) = model {
+        cfg.model = m.to_string();
+    }
+    Ok(())
+}
+
 /// Apply a named agent profile onto `base`: (if the profile names a provider)
 /// repoint the endpoint, auth, headers, and `api-version` to that provider and
 /// adopt its model — so the agent can run on a **different provider** — then set
@@ -1007,7 +1052,8 @@ impl SubagentTool {
              Issue several `task` calls in one turn to run sub-agents in **parallel** (e.g. \
              explore several areas at once), or set `background: true` to fire one off and keep \
              working — its result is delivered to you automatically when it finishes. Run \
-             cheaper/faster work on a different `model`",
+             cheaper/faster work on a different `model`, or delegate to a different, \
+             already-configured `provider`",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -1082,7 +1128,11 @@ impl hrdr_tools::Tool for SubagentTool {
             },
             "model": {
                 "type": "string",
-                "description": "Optional model override (on the selected provider). Defaults to the profile's / configured subagent model, else the main model."
+                "description": "Optional model override. Defaults to the profile's / configured subagent model, else the main model."
+            },
+            "provider": {
+                "type": "string",
+                "description": "Optional provider for the sub-agent — any built-in provider name or a [providers.*] entry from config that is configured and authenticated. Omit to keep the current provider; when set, pass `model` too (unless the provider has a default)."
             },
             "background": {
                 "type": "boolean",
@@ -1179,13 +1229,17 @@ impl hrdr_tools::Tool for SubagentTool {
             cfg = config_for_agent_profile(&cfg, profile)?;
         }
         cfg.cwd = ctx.cwd.clone();
-        if let Some(m) = args
+        let provider_arg = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let model_arg = args
             .get("model")
             .and_then(|v| v.as_str())
-            .filter(|m| !m.trim().is_empty())
-        {
-            cfg.model = m.trim().to_string();
-        }
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        apply_task_overrides(&mut cfg, provider_arg, model_arg)?;
         if cfg.model == "default" {
             bail!(
                 "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
@@ -5792,6 +5846,115 @@ mod tests {
         );
         // Unknown provider errors.
         assert!(repoint_to_provider(&mut cfg, "nope", Some("m")).is_err());
+    }
+
+    #[test]
+    fn apply_task_overrides_provider_repoints_and_gates() {
+        use super::{ProviderConfig, apply_task_overrides};
+        use std::collections::HashMap;
+        let mut base = AgentConfig {
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            api_key: None,
+            model: "gpt-5.6-sol".to_string(),
+            provider: Some("chatgpt".to_string()),
+            ..Default::default()
+        };
+        // A custom remote provider with NO key anywhere → Missing → gate errors.
+        base.providers.insert(
+            "ghost".to_string(),
+            ProviderConfig {
+                base_url: "https://ghost.example/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+
+        // (a) un-authenticated provider → fail fast, no repoint.
+        let mut cfg = base.clone();
+        let err = apply_task_overrides(&mut cfg, Some("ghost"), Some("m"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not configured"), "got: {err}");
+        assert_eq!(cfg.base_url, base.base_url); // unchanged on error
+
+        // (b) keyless `local` (built-in) with a model → repoints + identity.
+        let mut cfg = base.clone();
+        apply_task_overrides(&mut cfg, Some("local"), Some("deepseek-x")).unwrap();
+        assert_eq!(cfg.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.provider.as_deref(), Some("local"));
+        assert_eq!(cfg.model, "deepseek-x");
+
+        // (c) provider without a default model and no model arg → error.
+        let mut cfg = base.clone();
+        let err = apply_task_overrides(&mut cfg, Some("local"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires an explicit model"), "got: {err}");
+
+        // (d) unknown provider → error.
+        let mut cfg = base.clone();
+        assert!(apply_task_overrides(&mut cfg, Some("nope"), Some("m")).is_err());
+
+        // (e) no provider, just a model → override on the current provider.
+        let mut cfg = base.clone();
+        apply_task_overrides(&mut cfg, None, Some("gpt-5.5")).unwrap();
+        assert_eq!(cfg.base_url, base.base_url); // still chatgpt endpoint
+        assert_eq!(cfg.model, "gpt-5.5");
+        assert_eq!(cfg.provider.as_deref(), Some("chatgpt"));
+
+        // (f) neither → no-op.
+        let mut cfg = base.clone();
+        apply_task_overrides(&mut cfg, None, None).unwrap();
+        assert_eq!(cfg.model, "gpt-5.6-sol");
+    }
+
+    // Spec Testing #4 — precedence: an ad-hoc provider/model override layered on
+    // a resolved agent profile wins on endpoint + model, while the profile's
+    // persona survives (repoint is persona-preserving).
+    #[test]
+    fn apply_task_overrides_wins_over_profile_but_keeps_persona() {
+        use super::{
+            SubagentProfile, apply_task_overrides, config_for_agent_profile, subagent_base_config,
+        };
+        let parent = AgentConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: Some("parent-key".to_string()),
+            model: "claude-opus".to_string(),
+            provider: Some("claude".to_string()),
+            ..Default::default()
+        };
+        // Resolve a profile with a persona + its own model, no provider (stays
+        // on the parent endpoint).
+        let prof = SubagentProfile {
+            name: "reviewer".to_string(),
+            provider: None,
+            model: Some("claude-sonnet".to_string()),
+            description: None,
+            prompt: Some("Review only.".to_string()),
+            read_only: true,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+        let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
+        // Ad-hoc override to a different provider + model.
+        apply_task_overrides(&mut cfg, Some("local"), Some("adhoc-model")).unwrap();
+        // Endpoint + model come from the ad-hoc override.
+        assert_eq!(cfg.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.provider.as_deref(), Some("local"));
+        assert_eq!(cfg.model, "adhoc-model");
+        // Persona from the profile survives the override.
+        assert_eq!(cfg.agent_prompt.as_deref(), Some("Review only."));
+        assert!(cfg.read_only);
     }
 
     #[test]
