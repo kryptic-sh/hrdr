@@ -22,8 +22,24 @@ pub trait CommandHost {
             }
         });
     }
-    /// The shared agent handle (for async reads/mutations).
+    /// The agent a command **acts on**: the one the user is looking at.
+    ///
+    /// A command that inspects or changes *a conversation* — `/compact`, `/tools`,
+    /// `/prompt`, `/status`, `/temp`, `/doctor` — should act on the agent on
+    /// screen, exactly as the input box does. A frontend that shows only one agent
+    /// simply returns it.
     fn agent(&self) -> Arc<Mutex<Agent>>;
+
+    /// The **session's own** agent, whichever one is being viewed.
+    ///
+    /// For the few commands that are the session's rather than a conversation's:
+    /// switching the session's model/provider is tied to the saved session and the
+    /// chrome that displays it, so it must not repoint whichever sub-agent happens
+    /// to be on screen. Defaults to [`Self::agent`], which is correct for a
+    /// frontend with a single agent.
+    fn session_agent(&self) -> Arc<Mutex<Agent>> {
+        self.agent()
+    }
     /// Working directory the tools operate in.
     fn cwd(&self) -> PathBuf;
     /// Current endpoint base URL (recorded into saved sessions).

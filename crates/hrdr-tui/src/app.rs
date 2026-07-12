@@ -1386,7 +1386,7 @@ impl App {
     /// on *a conversation* uses this, so it acts on the one you are looking at —
     /// the same rule as the input box. (Session-scoped commands still use the main
     /// agent: `self.agent`.)
-    fn active_agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
+    pub(crate) fn active_agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
         match self.panes.active().key() {
             None => self.agent.clone(),
             Some(key) => self

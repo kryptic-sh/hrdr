@@ -15,7 +15,7 @@ pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
     host.set_model(name.clone());
     // Remember (current provider, new model) as the last-used combo.
     hrdr_agent::record_last_model(&host.provider().unwrap_or_default(), &name);
-    let agent = host.agent();
+    let agent = host.session_agent();
     let post = host.context_window_poster();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
@@ -45,7 +45,7 @@ pub fn apply_provider(
         return Err(busy_generic());
     }
     let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p, None, None));
-    let agent = host.agent();
+    let agent = host.session_agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
     // The catalog fallback in `probe_context_window` is keyed `provider/model`.
     let provider = name.to_string();
@@ -106,7 +106,7 @@ pub fn apply_choice(
         return Err(busy_generic());
     }
     let key = hrdr_agent::resolve_api_key(provider_name, &p, None, None);
-    let agent = host.agent();
+    let agent = host.session_agent();
     let url = p.base_url.clone();
     let provider = provider_name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();

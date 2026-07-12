@@ -313,6 +313,16 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
+        // Commands act on the agent you are looking at — the same rule as the
+        // input box. A sub-agent is an agent: `/compact`, `/tools`, `/prompt`,
+        // `/status`, `/doctor` and friends all mean *this conversation*.
+        self.app.active_agent()
+    }
+
+    fn session_agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
+        // The session's own agent. Switching the session's model/provider is tied
+        // to the saved session and the chrome that shows it, so it must not
+        // repoint whichever sub-agent happens to be on screen.
         self.app.agent.clone()
     }
     fn cwd(&self) -> std::path::PathBuf {
