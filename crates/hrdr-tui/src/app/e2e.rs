@@ -3966,12 +3966,14 @@ async fn model_selector_renders_columns_filters_and_closes() {
             model: "claude-fable-5".into(),
             provider_label: "OpenCode Zen".into(),
             model_label: "Claude Fable 5.0".into(),
+            context_window: None,
         },
         hrdr_agent::ModelChoice {
             provider: "go".into(),
             model: "deepseek-v4-pro".into(),
             provider_label: "OpenCode Go".into(),
             model_label: "DeepSeek V4 Pro".into(),
+            context_window: None,
         },
     ];
     h.app.model_selector = Some(crate::app::model_selector(choices));

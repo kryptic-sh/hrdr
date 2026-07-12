@@ -22,6 +22,10 @@ pub struct ModelChoice {
     pub provider_label: String,
     /// Friendly model name (e.g. "Claude Fable 5.0").
     pub model_label: String,
+    /// The model's advertised context window, when known (currently only
+    /// authenticated ChatGPT rows carry one). Preferred over an endpoint probe
+    /// on switch. `None` for rows whose window is unknown until probed.
+    pub context_window: Option<u32>,
 }
 
 /// The models.dev catalog key for a built-in preset (or a catalog-matching
@@ -128,6 +132,7 @@ fn choices_from(
                         model: id,
                         provider_label: provider_label.clone(),
                         model_label: name,
+                        context_window: None,
                     });
                 }
             }
@@ -144,10 +149,21 @@ fn choices_from(
                     model: m.clone(),
                     provider_label: pretty_provider(&p.name),
                     model_label: m,
+                    context_window: None,
                 });
             }
         }
     }
+    sort_choices(&mut out, usage);
+    out
+}
+
+/// The global selector ordering: most-used first, then case-insensitive
+/// `model_label` for ties. A single total order over ALL rows — the stable
+/// `sort_by` then preserves insertion (server) order for exact ties, so ChatGPT
+/// rows keep their upstream order relative to each other without a special-case
+/// comparator (which would not be a strict weak ordering).
+fn sort_choices(out: &mut [ModelChoice], usage: &HashMap<String, u64>) {
     let uses = |c: &ModelChoice| {
         usage
             .get(&usage_key(&c.provider, &c.model))
@@ -155,13 +171,45 @@ fn choices_from(
             .unwrap_or(0)
     };
     out.sort_by(|a, b| {
-        // Most-used first; ties fall back to the model name (case-insensitive).
         uses(b).cmp(&uses(a)).then_with(|| {
             a.model_label
                 .to_lowercase()
                 .cmp(&b.model_label.to_lowercase())
         })
     });
+}
+
+/// Convert entitled ChatGPT catalog rows into selector choices for the built-in
+/// `chatgpt` provider, carrying each model's context window.
+pub fn chatgpt_model_choices(models: &[crate::ChatGptModel]) -> Vec<ModelChoice> {
+    models
+        .iter()
+        .map(|m| ModelChoice {
+            provider: "chatgpt".to_string(),
+            model: m.slug.clone(),
+            provider_label: "ChatGPT".to_string(),
+            model_label: m.label.clone(),
+            context_window: m.context_window,
+        })
+        .collect()
+}
+
+/// Merge authenticated ChatGPT rows into a base selector list, then re-sort by
+/// the global ordering. Any existing `chatgpt` rows in `base` are replaced (the
+/// authenticated catalog supersedes the static one); every other provider is
+/// left untouched. ChatGPT rows retain their upstream order within equal
+/// usage/label ties via the stable sort.
+pub fn merge_chatgpt_choices(
+    base: Vec<ModelChoice>,
+    chatgpt: &[crate::ChatGptModel],
+) -> Vec<ModelChoice> {
+    let usage = load_model_usage();
+    let mut out: Vec<ModelChoice> = base
+        .into_iter()
+        .filter(|c| c.provider != "chatgpt")
+        .collect();
+    out.extend(chatgpt_model_choices(chatgpt));
+    sort_choices(&mut out, &usage);
     out
 }
 
@@ -356,6 +404,102 @@ mod tests {
         let out = choices_from(&providers(), Some(&catalog()), &tied);
         let order: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(order, vec!["claude-fable-5", "deepseek-v4-pro", "gpt-5-6"]);
+    }
+
+    #[test]
+    fn chatgpt_rows_merge_in_one_total_order_carrying_context_windows() {
+        use crate::ChatGptModel;
+        let cg = vec![
+            ChatGptModel {
+                slug: "z-model".into(),
+                label: "z".into(),
+                context_window: Some(400_000),
+            },
+            ChatGptModel {
+                slug: "a-model".into(),
+                label: "a".into(),
+                context_window: Some(272_000),
+            },
+        ];
+        let mut choices = chatgpt_model_choices(&cg);
+        // A non-ChatGPT row whose label sorts BETWEEN the two ChatGPT rows.
+        choices.push(ModelChoice {
+            provider: "zen".into(),
+            model: "m".into(),
+            provider_label: "OpenCode Zen".into(),
+            model_label: "m".into(),
+            context_window: None,
+        });
+        // All usage zero → a single label order (no ChatGPT special-casing that
+        // would let two ChatGPT rows straddle the middle row).
+        sort_choices(&mut choices, &HashMap::new());
+        let order: Vec<&str> = choices.iter().map(|c| c.model_label.as_str()).collect();
+        assert_eq!(order, vec!["a", "m", "z"]);
+
+        let a = choices.iter().find(|c| c.model == "a-model").unwrap();
+        assert_eq!(a.context_window, Some(272_000));
+        assert_eq!(a.provider, "chatgpt");
+        assert_eq!(a.provider_label, "ChatGPT");
+    }
+
+    #[test]
+    fn chatgpt_equal_label_ties_keep_upstream_server_order() {
+        use crate::ChatGptModel;
+        // Two rows sharing a label: the stable sort must preserve their inserted
+        // (server) order — first-in stays first.
+        let cg = vec![
+            ChatGptModel {
+                slug: "server-first".into(),
+                label: "dup".into(),
+                context_window: None,
+            },
+            ChatGptModel {
+                slug: "server-second".into(),
+                label: "dup".into(),
+                context_window: None,
+            },
+        ];
+        let mut choices = chatgpt_model_choices(&cg);
+        sort_choices(&mut choices, &HashMap::new());
+        let slugs: Vec<&str> = choices.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(slugs, vec!["server-first", "server-second"]);
+    }
+
+    #[test]
+    fn merge_replaces_existing_chatgpt_rows_and_leaves_others() {
+        use crate::ChatGptModel;
+        let base = vec![
+            ModelChoice {
+                provider: "chatgpt".into(),
+                model: "stale".into(),
+                provider_label: "ChatGPT".into(),
+                model_label: "stale".into(),
+                context_window: None,
+            },
+            ModelChoice {
+                provider: "zen".into(),
+                model: "keep".into(),
+                provider_label: "OpenCode Zen".into(),
+                model_label: "keep".into(),
+                context_window: None,
+            },
+        ];
+        let cg = vec![ChatGptModel {
+            slug: "fresh".into(),
+            label: "fresh".into(),
+            context_window: Some(1),
+        }];
+        let out = merge_chatgpt_choices(base, &cg);
+        let chatgpt: Vec<&str> = out
+            .iter()
+            .filter(|c| c.provider == "chatgpt")
+            .map(|c| c.model.as_str())
+            .collect();
+        assert_eq!(chatgpt, vec!["fresh"], "stale chatgpt rows replaced");
+        assert!(
+            out.iter().any(|c| c.provider == "zen" && c.model == "keep"),
+            "other providers untouched"
+        );
     }
 
     #[test]
