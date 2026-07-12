@@ -2937,7 +2937,7 @@ async fn the_agent_list_switches_the_focused_agent() {
 
     // The list appeared, main first, and the sub-agent is on it.
     assert!(h.app.panes.show_switcher(), "delegating brings the list up");
-    let main_y = row_of(&screen, "my session").expect("main is listed");
+    let main_y = row_of(&screen, "· main").expect("main is listed");
     let sub_y = row_of(&screen, "explore").expect("the sub-agent is listed");
     assert!(
         main_y < sub_y,
@@ -2969,7 +2969,7 @@ async fn the_agent_list_switches_the_focused_agent() {
     );
 
     // Click main's row to come back.
-    let main_y = row_of(&screen, "my session").expect("main is still listed");
+    let main_y = row_of(&screen, "· main").expect("main is still listed");
     h.app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 3,

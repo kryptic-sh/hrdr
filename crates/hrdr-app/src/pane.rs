@@ -101,12 +101,16 @@ impl Pane {
         &mut self.state.transcript
     }
 
-    /// Row label: the session name for main, the task description for a sub. An
-    /// unnamed main session (nothing sent yet) reads as "main".
+    /// Row label: always "main" for the main agent, the task description for a
+    /// sub-agent.
+    ///
+    /// The main row is not named after the session: the session's name is already
+    /// on the status bar, and repeating it here says nothing about *which agent*
+    /// the row is — which is the only thing the list is for.
     pub fn title(&self) -> &str {
-        match (&self.state.name, self.id) {
-            (n, PaneId::Main) if n.is_empty() => "main",
-            (n, _) => n,
+        match self.id {
+            PaneId::Main => "main",
+            PaneId::Sub(_) => &self.state.name,
         }
     }
 
@@ -539,14 +543,15 @@ mod tests {
     fn main_is_always_the_first_row_so_you_can_get_back() {
         let mut panes = PaneSet::new();
         let rows = pane_rows(&panes);
-        assert_eq!(rows[0].title, "main", "an unnamed session reads as main");
-
-        panes.main_mut().state.name = "my session".to_string();
-        let rows = pane_rows(&panes);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, PaneId::Main);
         assert!(rows[0].active, "main is active by default");
-        assert_eq!(rows[0].title, "my session");
+        assert_eq!(rows[0].title, "main");
+
+        // The row names the *agent*, not the session — naming it after the session
+        // (which the status bar already shows) says nothing about which agent it is.
+        panes.main_mut().state.name = "my session".to_string();
+        assert_eq!(pane_rows(&panes)[0].title, "main");
     }
 
     /// Each pane carries *its own* agent's model, provider, endpoint and token

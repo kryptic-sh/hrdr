@@ -1107,16 +1107,16 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[hrdr_app::P
                 hrdr_app::PaneStatus::Done => success,
                 _ => accent,
             };
-            // The agent you are looking at is marked, so the list says where you
-            // are as well as where you can go.
+            // The agent you are looking at is the highlighted row. That is the
+            // whole signal — a caret as well would be saying it twice, and it
+            // costs two columns of every other row to do it.
             let marker = hrdr_app::pane_row_marker(item.status, frame);
-            let here = if item.active { "▸ " } else { "  " };
             let mut style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
             if item.active {
                 style = style.add_modifier(Modifier::REVERSED);
             }
             Line::from(Span::styled(
-                format!("{here}{marker} {}", item.title.trim()),
+                format!(" {marker} {}", item.title.trim()),
                 style,
             ))
         })
