@@ -145,6 +145,15 @@ pub(crate) enum TurnMsg {
     /// outcome (with its originating `login_id`) so the loop can reject a stale
     /// login and, on a match, run the live provider switch.
     BrowserLogin(hrdr_app::BrowserLoginOutcome),
+    /// An async ChatGPT catalog load finished. Carries the generation it was
+    /// spawned at (a stale generation is dropped), the entitled rows, the source,
+    /// and an optional warning.
+    ModelCatalog {
+        generation: u64,
+        models: Vec<hrdr_agent::ChatGptModel>,
+        source: hrdr_agent::CatalogSource,
+        warning: Option<String>,
+    },
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
     /// The config file changed on disk (from the shared watcher).
@@ -210,6 +219,16 @@ pub(crate) struct App {
     pending_edit: Option<std::path::PathBuf>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
     pub(crate) model_selector: Option<ModelSelector>,
+    /// Authoritative monotonic generation for async model-catalog loads. Owned
+    /// by `App` (not the selector) so it survives the picker's open/close: a
+    /// catalog result is applied only when its captured snapshot still equals
+    /// this. Bumped on every selector close/cancel and provider/session change.
+    pub(crate) model_gen: u64,
+    /// Whether an async ChatGPT catalog load is in flight for the open picker.
+    pub(crate) model_loading: bool,
+    /// Provenance of the rows currently shown (fresh / stale / built-in
+    /// fallback), rendered separately from the startup guidance.
+    pub(crate) model_source: Option<hrdr_agent::CatalogSource>,
     /// The open `/resume` session picker modal; while `Some`, it captures every key.
     pub(crate) session_selector: Option<SessionSelector>,
     /// The open `/theme` picker modal; while `Some`, it captures every key and
@@ -455,6 +474,9 @@ impl App {
             pending_init: false,
             pending_edit: None,
             model_selector: None,
+            model_gen: 0,
+            model_loading: false,
+            model_source: None,
             session_selector: None,
             theme_selector: None,
             theme_original: None,
@@ -1668,6 +1690,12 @@ impl App {
                 self.state.usage.context_window = Some(tokens);
             }
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
+            TurnMsg::ModelCatalog {
+                generation,
+                models,
+                source,
+                warning,
+            } => self.apply_catalog_result(generation, models, source, warning),
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;

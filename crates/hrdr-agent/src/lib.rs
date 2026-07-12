@@ -3004,6 +3004,12 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// The current provider's trust identity — lets callers (health probe,
+    /// `/doctor`) special-case trusted ChatGPT OAuth without re-resolving.
+    pub fn provider_kind(&self) -> ResolvedProviderKind {
+        self.provider_kind
+    }
+
     /// A clone of the model client (for out-of-band calls like the startup
     /// endpoint health check's `list_models`).
     pub fn client(&self) -> Client {

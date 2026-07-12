@@ -3880,6 +3880,62 @@ async fn browser_login_failure_reports_and_closes() {
     );
 }
 
+/// A catalog load from a superseded generation (picker closed/reopened or
+/// provider changed since it began) must not touch the current picker.
+#[tokio::test]
+async fn model_catalog_stale_generation_is_dropped() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.model_gen = 5;
+    h.app.model_selector = Some(crate::app::model_selector(vec![]));
+    h.app.model_loading = true;
+    h.app.apply_catalog_result(
+        4, // an older generation
+        vec![hrdr_agent::ChatGptModel {
+            slug: "gpt-5.5".to_string(),
+            label: "GPT-5.5".to_string(),
+            context_window: Some(400_000),
+        }],
+        hrdr_agent::CatalogSource::Fresh,
+        None,
+    );
+    assert!(
+        h.app.model_loading,
+        "a stale result leaves loading untouched"
+    );
+    assert!(
+        h.app.model_source.is_none(),
+        "a stale result sets no source"
+    );
+}
+
+/// A matching-generation catalog load merges the entitled rows into the open
+/// picker and records the source.
+#[tokio::test]
+async fn model_catalog_matching_generation_merges_rows() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.model_gen = 7;
+    h.app.model_selector = Some(crate::app::model_selector(vec![]));
+    h.app.model_loading = true;
+    h.app.apply_catalog_result(
+        7,
+        vec![hrdr_agent::ChatGptModel {
+            slug: "gpt-5.5".to_string(),
+            label: "GPT-5.5".to_string(),
+            context_window: Some(400_000),
+        }],
+        hrdr_agent::CatalogSource::Fresh,
+        None,
+    );
+    assert!(!h.app.model_loading, "loading cleared on a matching result");
+    assert_eq!(h.app.model_source, Some(hrdr_agent::CatalogSource::Fresh));
+    let sel = h.app.model_selector.as_ref().unwrap();
+    assert!(
+        sel.rows()
+            .any(|c| c.provider == "chatgpt" && c.model == "gpt-5.5"),
+        "the entitled ChatGPT row is merged into the picker"
+    );
+}
+
 /// `!command` runs the shell directly: the output streams into a transcript
 /// tool block, and on ToolEnd the command + output are committed through the
 /// same plumbing as a finished turn — the user note enters the agent's

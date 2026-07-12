@@ -141,7 +141,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // open it owns the screen (and every key), so the completion popup stands
     // down.
     if let Some(sel) = &app.model_selector {
-        draw_model_selector(f, &app.theme, sel);
+        draw_model_selector(f, &app.theme, sel, app.model_loading, app.model_source);
     } else if let Some(sel) = &app.session_selector {
         draw_session_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.theme_selector {
@@ -163,7 +163,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 /// (friendly model name · friendly provider name) of every model across the
 /// configured providers, narrowed by the fuzzy filter. Same chrome as the
 /// blocks and the completion popup — solid background, 1×2 padding, no border.
-fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSelector) {
+fn draw_model_selector(
+    f: &mut Frame,
+    theme: &Theme,
+    sel: &crate::app::ModelSelector,
+    loading: bool,
+    source: Option<hrdr_agent::CatalogSource>,
+) {
     let area = f.area();
     let width = area.width.saturating_sub(4).clamp(1, 92);
     let height = area.height.saturating_sub(2).clamp(1, 32);
@@ -190,9 +196,21 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
         Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
         Span::styled("▌", Style::default().fg(theme.accent)),
     ]);
+    // ChatGPT catalog provenance / loading, rendered on the hint line — kept
+    // separate from the startup guidance so the two never share a block.
+    let status = if loading {
+        " · loading ChatGPT models…"
+    } else {
+        match source {
+            Some(hrdr_agent::CatalogSource::Fresh) => " · ChatGPT: live",
+            Some(hrdr_agent::CatalogSource::Stale) => " · ChatGPT: cached",
+            Some(hrdr_agent::CatalogSource::BuiltInFallback) => " · ChatGPT: built-in",
+            None => "",
+        }
+    };
     let hint = Line::from(Span::styled(
         format!(
-            "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel",
+            "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel{status}",
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
         ),

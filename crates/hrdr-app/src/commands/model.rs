@@ -96,6 +96,7 @@ pub fn apply_choice(
     host: &mut dyn CommandHost,
     provider_name: &str,
     model: String,
+    choice_context_window: Option<u32>,
 ) -> Result<(), String> {
     let Some(p) = host.resolve_provider(provider_name) else {
         return Err(format!("unknown provider '{provider_name}'"));
@@ -110,7 +111,10 @@ pub fn apply_choice(
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     let api_version = p.api_version.clone();
     let kind = p.kind;
-    let probe_after = p.context_window.is_none();
+    // Prefer the chosen model's own context window (e.g. an entitled ChatGPT
+    // row) over the provider's; probe the endpoint only when neither is known.
+    let effective_window = choice_context_window.or(p.context_window);
+    let probe_after = effective_window.is_none();
     let post = host.context_window_poster();
     let model_for_agent = model.clone();
     host.spawn_line(Box::pin(async move {
@@ -127,8 +131,8 @@ pub fn apply_choice(
         String::new()
     }));
     host.set_model(model.clone());
-    if p.context_window.is_some() {
-        host.set_context_window(p.context_window);
+    if effective_window.is_some() {
+        host.set_context_window(effective_window);
     }
     host.set_base_url(p.base_url.clone());
     host.set_provider(provider_name.to_string());
@@ -160,7 +164,20 @@ pub async fn endpoint_health_warning(
     model: String,
     base_url: String,
 ) -> Option<String> {
-    let client = agent.lock().await.client();
+    let (client, kind) = {
+        let a = agent.lock().await;
+        (a.client(), a.provider_kind())
+    };
+    // Trusted ChatGPT OAuth: the Codex backend does not expose the generic
+    // unauthenticated `/models` shape, so this probe only yields a false 401
+    // warning. Its authenticated catalog (Task 3) has its own health/fallback
+    // path and still surfaces a genuine 401/403 as an auth warning, so a real
+    // revoked credential is not masked. Discovered + fixed in v1
+    // (fix-chatgpt-oauth-model-discovery, endpoint_health_warning). Custom
+    // shadows keep probing.
+    if kind == hrdr_agent::ResolvedProviderKind::ChatGptOAuth {
+        return None;
+    }
     match client.list_models().await {
         Err(e) => Some(unreachable_guidance(&base_url, &e.to_string())),
         Ok(models) => {
@@ -178,5 +195,33 @@ pub async fn endpoint_health_warning(
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trusted ChatGPT OAuth skips the generic `/models` probe — the Codex
+    /// backend returns a false 401 to it (v1 provenance). The skip happens before
+    /// `list_models`, so this returns `None` without any network call.
+    #[tokio::test]
+    async fn health_probe_skipped_for_trusted_chatgpt_oauth() {
+        let config = hrdr_agent::AgentConfig {
+            provider: Some("chatgpt".to_string()),
+            base_url: hrdr_agent::CHATGPT_CODEX_BASE_URL.to_string(),
+            ..Default::default()
+        };
+        let agent = Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()));
+        let warning = endpoint_health_warning(
+            agent,
+            "gpt-5.5".to_string(),
+            hrdr_agent::CHATGPT_CODEX_BASE_URL.to_string(),
+        )
+        .await;
+        assert!(
+            warning.is_none(),
+            "trusted ChatGPT OAuth must skip the false-401 probe"
+        );
     }
 }

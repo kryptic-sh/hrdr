@@ -492,7 +492,14 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn begin_model_selector(&mut self) {
         let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
-        if choices.is_empty() {
+        // A built-in ChatGPT login contributes rows asynchronously (its models
+        // aren't in the sync catalog), so the picker may open even when the sync
+        // list is empty — the async load fills it.
+        let chatgpt_ready = hrdr_agent::has_oauth_credentials(
+            hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
+            "chatgpt",
+        );
+        if choices.is_empty() && !chatgpt_ready {
             self.info(
                 "no models to choose from yet — configure a provider (or run a turn so the \
                  models.dev catalog is cached), then try /model again"
@@ -500,7 +507,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             );
             return;
         }
+        // A fresh generation for this picker session; a prior load's late result
+        // is then rejected.
+        self.app.model_gen = self.app.model_gen.wrapping_add(1);
+        self.app.model_source = None;
         self.app.model_selector = Some(super::model_selector(choices));
+        self.app.spawn_model_catalog_load(false);
     }
     fn begin_session_selector(&mut self) {
         // Every directory's sessions, newest first — the cwd column tells them
@@ -544,8 +556,8 @@ impl super::App {
         use crossterm::event::{KeyCode, KeyModifiers};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.model_selector = None,
-            KeyCode::Char('c') if ctrl => self.model_selector = None,
+            KeyCode::Esc => self.close_model_selector(),
+            KeyCode::Char('c') if ctrl => self.close_model_selector(),
             KeyCode::Up => {
                 if let Some(s) = &mut self.model_selector {
                     s.up();
@@ -584,10 +596,10 @@ impl super::App {
             .and_then(|s| s.current())
             .cloned()
         else {
-            self.model_selector = None;
+            self.close_model_selector();
             return;
         };
-        self.model_selector = None;
+        self.close_model_selector();
         if set_default {
             self.persist_setting("provider", hrdr_agent::ConfigValue::Str(&c.provider));
             self.persist_setting("model", hrdr_agent::ConfigValue::Str(&c.model));
@@ -595,7 +607,8 @@ impl super::App {
         // Scope the host borrow so the confirmation line can be pushed after.
         let line = {
             let mut host = TuiHost { app: self };
-            match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone()) {
+            match hrdr_app::apply_choice(&mut host, &c.provider, c.model.clone(), c.context_window)
+            {
                 Ok(()) => {
                     // Bump the selection count (selector ordering).
                     hrdr_agent::record_model_use(&c.provider, &c.model);
@@ -941,10 +954,97 @@ impl super::App {
         self.login_modal = None;
     }
 
-    /// Force a catalog refresh + open/update the model picker after a login.
-    /// Task 5 fills this in (async ChatGPT catalog load); for now the user opens
-    /// `/model` manually.
-    fn refresh_models_after_login(&mut self, _provider: &str) {}
+    /// After a successful login, force-refresh the catalog and open the model
+    /// picker so the entitled models appear without a restart. Login-forced, so
+    /// it may open a closed picker (a plain `/model` load never reopens one).
+    fn refresh_models_after_login(&mut self, provider: &str) {
+        if provider != "chatgpt" {
+            return;
+        }
+        let choices = hrdr_agent::model_choices(&self.cfg, self.state.provider.as_deref());
+        self.model_gen = self.model_gen.wrapping_add(1);
+        self.model_source = None;
+        self.model_selector = Some(super::model_selector(choices));
+        self.spawn_model_catalog_load(true);
+    }
+
+    /// Spawn an authenticated ChatGPT catalog load without blocking the UI. Only
+    /// runs when a built-in ChatGPT login is set up. Captures the current
+    /// generation; the result ([`TurnMsg::ModelCatalog`]) is applied only if the
+    /// generation still matches when it lands.
+    pub(super) fn spawn_model_catalog_load(&mut self, force: bool) {
+        use hrdr_agent::{CHATGPT_CODEX_BASE_URL, CatalogSource, ResolvedProviderKind};
+        if !hrdr_agent::has_oauth_credentials(ResolvedProviderKind::ChatGptOAuth, "chatgpt") {
+            return;
+        }
+        self.model_loading = true;
+        let generation = self.model_gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let access = hrdr_agent::coordinated_oauth_access(
+                ResolvedProviderKind::ChatGptOAuth,
+                CHATGPT_CODEX_BASE_URL,
+            )
+            .await;
+            let msg = match access {
+                Ok(access) => {
+                    let r = hrdr_agent::chatgpt_model_catalog(&access, force).await;
+                    TurnMsg::ModelCatalog {
+                        generation,
+                        models: r.models,
+                        source: r.source,
+                        warning: r.warning,
+                    }
+                }
+                // Couldn't obtain a token — leave the cached rows in place; just
+                // clear the loading flag (empty models => no replace).
+                Err(_) => TurnMsg::ModelCatalog {
+                    generation,
+                    models: Vec::new(),
+                    source: CatalogSource::BuiltInFallback,
+                    warning: None,
+                },
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Apply a finished catalog load. Drops a stale generation (picker closed /
+    /// reopened / provider changed since the load began); otherwise merges the
+    /// entitled rows into the open picker, preserving the filter + selection.
+    pub(super) fn apply_catalog_result(
+        &mut self,
+        generation: u64,
+        models: Vec<hrdr_agent::ChatGptModel>,
+        source: hrdr_agent::CatalogSource,
+        warning: Option<String>,
+    ) {
+        if generation != self.model_gen {
+            return; // stale — a newer picker/provider superseded this load.
+        }
+        self.model_loading = false;
+        if models.is_empty() {
+            return; // token/refresh failed — keep the cached rows.
+        }
+        self.model_source = Some(source);
+        if let Some(w) = warning {
+            self.system(w);
+        }
+        if let Some(sel) = &mut self.model_selector {
+            let base = hrdr_agent::model_choices(&self.cfg, self.state.provider.as_deref());
+            let merged = hrdr_agent::merge_chatgpt_choices(base, &models);
+            sel.replace_model_choices(merged);
+        }
+    }
+
+    /// Close the `/model` picker and bump the generation so any in-flight catalog
+    /// load is ignored when it lands.
+    pub(super) fn close_model_selector(&mut self) {
+        self.model_selector = None;
+        self.model_loading = false;
+        self.model_source = None;
+        self.model_gen = self.model_gen.wrapping_add(1);
+    }
 
     /// Cancel the `/theme` picker, restoring the theme in force when it opened.
     fn close_theme_selector(&mut self) {

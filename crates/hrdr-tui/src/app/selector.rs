@@ -79,6 +79,26 @@ pub(crate) fn model_selector(choices: Vec<ModelChoice>) -> ModelSelector {
     Selector::new(choices, filter_model_choices)
 }
 
+impl Selector<ModelChoice> {
+    /// Replace the choice list (e.g. after an async ChatGPT catalog load),
+    /// preserving the typed filter and re-selecting the same `(provider, model)`
+    /// when it survives — else clamping the highlight to the top.
+    pub(crate) fn replace_model_choices(&mut self, choices: Vec<ModelChoice>) {
+        let current = self
+            .current()
+            .map(|c| (c.provider.clone(), c.model.clone()));
+        self.choices = choices;
+        self.filtered = (self.filter_fn)(&self.choices, &self.filter);
+        self.selected = current
+            .and_then(|(p, m)| {
+                self.filtered
+                    .iter()
+                    .position(|&i| self.choices[i].provider == p && self.choices[i].model == m)
+            })
+            .unwrap_or(0);
+    }
+}
+
 pub(crate) type SessionSelector = Selector<SessionMeta>;
 pub(crate) fn session_selector(sessions: Vec<SessionMeta>) -> SessionSelector {
     Selector::new(sessions, filter_sessions)
@@ -131,5 +151,53 @@ mod tests {
         assert!(s.current().is_none());
         s.backspace();
         assert_eq!(s.current().unwrap().label, "Medium");
+    }
+
+    fn mc(provider: &str, model: &str, label: &str) -> ModelChoice {
+        ModelChoice {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            provider_label: provider.to_string(),
+            model_label: label.to_string(),
+            context_window: None,
+        }
+    }
+
+    /// An async catalog load replaces the rows but keeps the user's filter and
+    /// re-selects the same model when it survives (the filter is a subsequence
+    /// match over "label provider", so labels are chosen to isolate matches).
+    #[test]
+    fn replace_model_choices_preserves_filter_and_selection() {
+        let mut s = model_selector(vec![
+            mc("zen", "a", "Alpha"),
+            mc("zen", "o", "Cobra"),
+            mc("zen", "c", "Cappa"),
+        ]);
+        // Filter 'c' matches Cobra + Cappa (not Alpha); select Cappa.
+        s.push_char('c');
+        assert_eq!(s.rows().count(), 2);
+        s.down();
+        assert_eq!(s.current().unwrap().model, "c");
+
+        // A new list (reordered, extra row) arrives.
+        s.replace_model_choices(vec![
+            mc("zen", "x", "Xray"),
+            mc("zen", "c", "Cappa"),
+            mc("zen", "a", "Alpha"),
+        ]);
+        // The filter is retained and Cappa stays selected.
+        assert_eq!(s.filter, "c");
+        assert_eq!(s.current().unwrap().model, "c");
+    }
+
+    /// When the selected model vanishes from the new list, the highlight clamps
+    /// to the top of the (unfiltered) list.
+    #[test]
+    fn replace_model_choices_clamps_when_selection_vanishes() {
+        let mut s = model_selector(vec![mc("zen", "a", "Alpha"), mc("zen", "o", "Cobra")]);
+        s.down(); // select Cobra
+        assert_eq!(s.current().unwrap().model, "o");
+        s.replace_model_choices(vec![mc("zen", "z", "Zeta"), mc("zen", "a", "Alpha")]);
+        assert_eq!(s.current().unwrap().model, "z", "clamps to the first row");
     }
 }
