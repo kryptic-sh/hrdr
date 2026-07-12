@@ -1116,7 +1116,7 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[hrdr_app::P
                 style = style.add_modifier(Modifier::REVERSED);
             }
             Line::from(Span::styled(
-                format!(" {marker} {}", item.title.trim()),
+                format!("{marker} {}", item.title.trim()),
                 style,
             ))
         })
