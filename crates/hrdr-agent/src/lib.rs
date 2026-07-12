@@ -337,6 +337,63 @@ fn spawn_background(
     )
 }
 
+/// The shared, lazily-resolved sub-agent transcript directory cell (see
+/// [`AgentConfig::subagent_transcript_dir`]).
+type SubagentDirCell = Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>;
+
+/// Monotonic counter for sub-agent transcript file ids, shared by the blocking
+/// and background spawn paths so ids are ordered and unique within a session
+/// dir. Separate from `BG_SEQ`, which numbers background-task registry entries.
+// Consumed by the spawn paths in Tasks 3–4; unused in non-test builds until then.
+#[allow(dead_code)]
+static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A transcript file id: `NNN-<slug>`, where `slug` is the sanitized label.
+/// `seq` is the pre-fetched counter value.
+#[allow(dead_code)]
+fn subagent_transcript_id(seq: u64, label: &str) -> String {
+    let lowered: String = label
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = lowered
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug: String = if slug.is_empty() {
+        "task".to_string()
+    } else {
+        slug.chars().take(32).collect()
+    };
+    format!("{seq:03}-{slug}")
+}
+
+/// Read the resolved transcript dir from the shared cell, if the feature is on
+/// and a session id has been assigned.
+#[allow(dead_code)]
+fn resolve_subagent_dir(cell: &SubagentDirCell) -> Option<std::path::PathBuf> {
+    cell.as_ref()?.lock().ok()?.clone()
+}
+
+/// Map a live agent event to the transcript event to record, if any.
+#[allow(dead_code)]
+fn subagent_event_for(ev: &AgentEvent) -> Option<subagent_transcript::Event> {
+    use subagent_transcript::Event;
+    match ev {
+        AgentEvent::Text(t) => Some(Event::Text { chunk: t.clone() }),
+        AgentEvent::ToolStart { name, .. } => Some(Event::Tool { name: name.clone() }),
+        _ => None,
+    }
+}
+
 /// Derive the base config for delegated sub-agents from the main agent's config:
 /// same provider/endpoint and cwd, but the sub-agent model, no nested `task` tool
 /// (recursion is bounded to one level), and no MCP servers (subs don't spawn
@@ -381,6 +438,8 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.allowed_tools = None;
     base.read_only = false;
     base.write_ext = None;
+    // Sub-agents never spawn sub-agents, so they never write transcripts.
+    base.subagent_transcript_dir = None;
     base.model = config
         .subagent_model
         .clone()
@@ -931,6 +990,14 @@ pub struct AgentConfig {
     /// these extensions (see [`ToolContext::write_allow_ext`]). Takes precedence
     /// over [`read_only`](Self::read_only); ignored when `allowed_tools` is set.
     pub write_ext: Option<Vec<String>>,
+    /// Shared cell holding the parent session's sub-agent transcript directory
+    /// (`sessions/<slug>/subagents/<id>/`), resolved lazily because the session
+    /// id is assigned on first autosave, not at construction. The `task` tool
+    /// reads it at spawn: `None` (outer) = feature off; `Some` with an inner
+    /// `None` = id not yet assigned (pre-first-save) so that spawn is not
+    /// persisted. Cleared for sub-agent base configs (subs don't spawn subs).
+    pub subagent_transcript_dir:
+        Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>,
 }
 
 /// A named sub-agent profile (`[[subagent]]`): a provider + model the `task` tool
@@ -1301,6 +1368,7 @@ impl Default for AgentConfig {
             allowed_tools: None,
             read_only: false,
             write_ext: None,
+            subagent_transcript_dir: None,
             lsp: true,
             lsp_wait_ms: None,
             lsp_servers: Vec::new(),
@@ -4163,6 +4231,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use super::SubagentDirCell;
     use super::{
         Agent, AgentConfig, AgentEvent, DEFAULT_MAX_READONLY_SUBAGENTS,
         DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
@@ -4170,9 +4239,11 @@ mod tests {
         ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
         estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
         is_transient, parse_env_bool, prune_tool_messages, repair_dangling_tool_calls,
-        retry_after_hint, steering_queue, tail_window, wants_background,
+        resolve_subagent_dir, retry_after_hint, steering_queue, subagent_base_config,
+        subagent_event_for, subagent_transcript_id, tail_window, wants_background,
     };
     use crate::cwd_slug;
+    use crate::subagent_transcript;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
@@ -7040,4 +7111,62 @@ mod tests {
             assert!(text.contains("Complete answer"));
         }
     } // mod mock_server
+
+    #[test]
+    fn subagent_transcript_id_slugifies_and_pads() {
+        assert_eq!(
+            subagent_transcript_id(0, "Explore the repo"),
+            "000-explore-the-repo"
+        );
+        assert_eq!(subagent_transcript_id(12, "  "), "012-task");
+        assert_eq!(subagent_transcript_id(7, "!!!"), "007-task");
+        let long = subagent_transcript_id(3, &"a".repeat(80));
+        assert_eq!(long, format!("003-{}", "a".repeat(32)));
+    }
+
+    #[test]
+    fn resolve_subagent_dir_reads_the_cell() {
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        assert_eq!(resolve_subagent_dir(&None), None);
+        let empty: SubagentDirCell = Some(Arc::new(Mutex::new(None)));
+        assert_eq!(resolve_subagent_dir(&empty), None);
+        let full: SubagentDirCell = Some(Arc::new(Mutex::new(Some(PathBuf::from("/x/y")))));
+        assert_eq!(resolve_subagent_dir(&full), Some(PathBuf::from("/x/y")));
+    }
+
+    #[test]
+    fn subagent_base_config_clears_the_transcript_cell() {
+        use std::sync::{Arc, Mutex};
+        let cfg = AgentConfig {
+            subagent_transcript_dir: Some(Arc::new(Mutex::new(Some("/x".into())))),
+            ..AgentConfig::default()
+        };
+        let base = subagent_base_config(&cfg);
+        assert!(base.subagent_transcript_dir.is_none());
+    }
+
+    #[test]
+    fn subagent_event_for_maps_text_and_tool_only() {
+        use subagent_transcript::Event;
+        assert_eq!(
+            subagent_event_for(&AgentEvent::Text("hi".into())),
+            Some(Event::Text { chunk: "hi".into() })
+        );
+        assert_eq!(
+            subagent_event_for(&AgentEvent::ToolStart {
+                id: "x".into(),
+                name: "bash".into(),
+                args: "{}".into(),
+            }),
+            Some(Event::Tool {
+                name: "bash".into()
+            })
+        );
+        // Reasoning / output / usage events are not recorded.
+        assert_eq!(
+            subagent_event_for(&AgentEvent::Reasoning("hmm".into())),
+            None
+        );
+    }
 }
