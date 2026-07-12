@@ -494,7 +494,15 @@ Four **built-in agents** ship out of the box, selected with the `task` tool's
 
 Each runs on the main provider (respecting `subagent_model`) with a specialized
 system prompt and a scoped tool set — `explore`/`review` are read-only, `plan`
-adds Markdown-only writes, `general` gets everything.
+adds Markdown-only writes, `general` gets everything. Without an explicit
+`subagent_model`, later delegations inherit the main agent's current provider,
+model, and effort, including changes made through `/model` or `/effort`.
+
+The read-only `model_info` tool lets an agent inspect its current provider,
+model, effort, resolved default sub-agent model, and—using
+`{"mode":"available"}`—discoverable configured/catalog models. Availability is
+best-effort and does not guarantee account authorization; hrdr does not rank
+models by price.
 
 `explore` and `review` are **proactive** — the main agent reaches for them on
 its own (explore for broad investigation, review after non-trivial changes)

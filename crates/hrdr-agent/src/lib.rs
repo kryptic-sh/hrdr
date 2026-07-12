@@ -31,8 +31,9 @@ mod paths;
 pub use paths::cwd_slug;
 mod models;
 pub use models::{
-    ModelChoice, builtin_catalog_key, chatgpt_model_choices, filter_model_choices, load_last_model,
-    load_model_usage, merge_chatgpt_choices, model_choices, record_last_model, record_model_use,
+    AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
+    chatgpt_model_choices, filter_model_choices, load_last_model, load_model_usage,
+    merge_chatgpt_choices, model_choices, record_last_model, record_model_use,
 };
 
 use std::collections::HashMap;
@@ -43,6 +44,213 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
 use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
+
+#[derive(Clone)]
+struct PublicModelRuntime {
+    provider: Option<String>,
+    model: String,
+    effort: Option<String>,
+    delegation_enabled: bool,
+}
+
+#[derive(Clone)]
+struct DelegationEndpoint {
+    provider: Option<String>,
+    model: String,
+    effort: Option<String>,
+    base_url: String,
+    api_key: Option<String>,
+    api_version: Option<String>,
+    configured_headers: Vec<(String, String)>,
+    provider_kind: ResolvedProviderKind,
+}
+
+#[derive(Clone)]
+struct DelegationRuntime {
+    public: PublicModelRuntime,
+    endpoint: DelegationEndpoint,
+    explicit_subagent_model: Option<String>,
+}
+
+type SharedDelegationRuntime = Arc<Mutex<DelegationRuntime>>;
+
+struct ModelInfoTool {
+    runtime: SharedDelegationRuntime,
+    available: Vec<AvailableModel>,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for ModelInfoTool {
+    fn name(&self) -> &'static str {
+        "model_info"
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect the active provider, model, reasoning effort, delegation default, and discoverable model choices. Read-only; use mode `available` only when model choices are needed."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["current", "available"],
+                    "default": "current"
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("current");
+        if !matches!(mode, "current" | "available") {
+            bail!("unknown model_info mode '{mode}' (supported: current, available)");
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let default_model = runtime
+            .public
+            .delegation_enabled
+            .then(|| {
+                runtime
+                    .explicit_subagent_model
+                    .clone()
+                    .unwrap_or_else(|| runtime.public.model.clone())
+            })
+            .filter(|m| m != "default");
+        let mut warnings = Vec::new();
+        if runtime.public.delegation_enabled && default_model.is_none() {
+            warnings.push(serde_json::json!({
+                "code": "no_default_subagent_model",
+                "message": "No concrete default sub-agent model is configured."
+            }));
+        }
+        let mut value = serde_json::json!({
+            "provider": runtime.public.provider,
+            "model": runtime.public.model,
+            "effort": runtime.public.effort,
+            "effective_effort": runtime.public.effort.as_deref().and_then(hrdr_llm::normalize_effort),
+            "delegation_enabled": runtime.public.delegation_enabled,
+            "default_subagent_model": default_model,
+            "warnings": warnings
+        });
+        if mode == "available" {
+            let mut available = self.available.clone();
+            if runtime.endpoint.provider_kind == ResolvedProviderKind::ChatGptOAuth
+                && runtime.endpoint.base_url == CHATGPT_CODEX_BASE_URL
+            {
+                match coordinated_oauth_access(
+                    runtime.endpoint.provider_kind,
+                    &runtime.endpoint.base_url,
+                )
+                .await
+                {
+                    Ok(access) => {
+                        let catalog = chatgpt_model_catalog(&access, false).await;
+                        available.retain(|m| m.provider != "chatgpt");
+                        available.extend(catalog.models.into_iter().map(|m| AvailableModel {
+                            provider: "chatgpt".to_string(),
+                            model: m.slug,
+                            label: m.label,
+                            source: ModelSource::AccountCatalog,
+                        }));
+                        match catalog.source {
+                            CatalogSource::Fresh => {}
+                            CatalogSource::Stale => value["warnings"]
+                                .as_array_mut()
+                                .expect("array")
+                                .push(serde_json::json!({
+                                    "code": "chatgpt_catalog_stale",
+                                    "message": catalog.warning.unwrap_or_else(|| "Using stale ChatGPT model catalog.".to_string())
+                                })),
+                            CatalogSource::BuiltInFallback => value["warnings"]
+                                .as_array_mut()
+                                .expect("array")
+                                .push(serde_json::json!({
+                                    "code": "chatgpt_catalog_fallback",
+                                    "message": catalog.warning.unwrap_or_else(|| "Using built-in ChatGPT model fallback.".to_string())
+                                })),
+                        }
+                    }
+                    Err(err) => {
+                        value["warnings"]
+                            .as_array_mut()
+                            .expect("array")
+                            .push(serde_json::json!({
+                                "code": "chatgpt_catalog_fallback",
+                                "message": format!("ChatGPT model catalog unavailable: {err}")
+                            }))
+                    }
+                }
+            }
+            if let Some(provider) = runtime.public.provider.as_ref()
+                && runtime.public.model != "default"
+                && !available
+                    .iter()
+                    .any(|m| m.provider == *provider && m.model == runtime.public.model)
+            {
+                available.push(AvailableModel {
+                    provider: provider.clone(),
+                    label: runtime.public.model.clone(),
+                    model: runtime.public.model.clone(),
+                    source: ModelSource::Configured,
+                });
+            }
+            available.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+            let rows: Vec<_> = available
+                .iter()
+                .filter(|m| m.model != "default")
+                .map(|m| {
+                    serde_json::json!({
+                        "provider": m.provider,
+                        "model": m.model,
+                        "label": m.label,
+                        "source": m.source
+                    })
+                })
+                .collect();
+            value["available_models"] = serde_json::Value::Array(rows);
+        }
+        let mut out = serde_json::to_string(&value)?;
+        if out.len() > ctx.max_output && mode == "available" {
+            value["warnings"]
+                .as_array_mut()
+                .expect("array")
+                .push(serde_json::json!({
+                    "code": "models_truncated",
+                    "message": "Available model rows were truncated to fit the tool output limit."
+                }));
+            out = serde_json::to_string(&value)?;
+            while out.len() > ctx.max_output {
+                let removed = value["available_models"]
+                    .as_array_mut()
+                    .expect("array")
+                    .pop();
+                if removed.is_none() {
+                    break;
+                }
+                out = serde_json::to_string(&value)?;
+            }
+        }
+        Ok(out)
+    }
+}
 
 pub use prompt::{gather_agent_docs, render_system};
 
@@ -456,8 +664,9 @@ pub fn config_for_agent_profile(
 /// sub-agent runs to completion and its final text becomes the tool result; its
 /// tool activity is streamed to the parent as live output.
 struct SubagentTool {
-    /// Base config for derived sub-agents (see [`subagent_base_config`]).
+    /// Base policy for derived sub-agents (endpoint/model are overlaid live).
     base: AgentConfig,
+    runtime: SharedDelegationRuntime,
     /// Named provider+model profiles selectable via the `agent` argument.
     profiles: Vec<SubagentProfile>,
     /// Description string (leaked once at startup — lists the configured
@@ -482,6 +691,7 @@ struct SubagentTool {
 impl SubagentTool {
     fn new(
         base: AgentConfig,
+        runtime: SharedDelegationRuntime,
         profiles: Vec<SubagentProfile>,
         bg_handles: BgHandles,
         cost_total: Arc<std::sync::Mutex<f64>>,
@@ -537,6 +747,7 @@ impl SubagentTool {
         }
         Self {
             base,
+            runtime,
             profiles,
             description: Box::leak(desc.into_boxed_str()),
             bg_handles,
@@ -614,28 +825,58 @@ impl hrdr_tools::Tool for SubagentTool {
             .ok_or_else(|| anyhow::anyhow!("task needs a non-empty `prompt` argument"))?
             .to_string();
 
-        // A named profile selects a provider + model (and may request isolation);
-        // else the default sub-agent (main provider, `subagent_model`).
+        let mut cfg = self.base.clone();
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        cfg.base_url = runtime.endpoint.base_url;
+        cfg.api_key = runtime.endpoint.api_key;
+        cfg.api_version = runtime.endpoint.api_version;
+        cfg.headers = runtime.endpoint.configured_headers;
+        cfg.provider = runtime.endpoint.provider;
+        cfg.model = runtime
+            .explicit_subagent_model
+            .unwrap_or(runtime.endpoint.model);
+        cfg.effort = runtime.endpoint.effort;
+
         let mut isolation: Option<String> = None;
-        let mut cfg = match args.get("agent").and_then(|v| v.as_str()) {
-            Some(name) if !name.trim().is_empty() => {
-                let profile = self
-                    .profiles
-                    .iter()
-                    .find(|p| p.name.eq_ignore_ascii_case(name.trim()))
-                    .ok_or_else(|| {
-                        let known: Vec<&str> =
-                            self.profiles.iter().map(|p| p.name.as_str()).collect();
-                        anyhow::anyhow!(
-                            "unknown subagent '{name}' (configured: {})",
-                            known.join(", ")
-                        )
-                    })?;
-                isolation = profile.isolation.clone();
-                config_for_agent_profile(&self.base, profile)?
+        if let Some(name) = args.get("agent").and_then(|v| v.as_str())
+            && !name.trim().is_empty()
+        {
+            let profile = self
+                .profiles
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or_else(|| {
+                    let known: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
+                    anyhow::anyhow!(
+                        "unknown subagent '{name}' (configured: {})",
+                        known.join(", ")
+                    )
+                })?;
+            let task_model = args
+                .get("model")
+                .and_then(|v| v.as_str())
+                .filter(|m| !m.trim().is_empty());
+            if let Some(provider) = profile.provider.as_deref()
+                && profile.model.is_none()
+                && self
+                    .base
+                    .resolve_provider(provider)
+                    .and_then(|p| p.model)
+                    .is_none()
+                && task_model.is_none()
+            {
+                bail!(
+                    "subagent '{}': provider '{provider}' has no configured model; set task.model or profile.model",
+                    profile.name
+                );
             }
-            _ => self.base.clone(),
-        };
+            isolation = profile.isolation.clone();
+            cfg = config_for_agent_profile(&cfg, profile)?;
+        }
         cfg.cwd = ctx.cwd.clone();
         if let Some(m) = args
             .get("model")
@@ -1533,6 +1774,18 @@ pub struct ResolvedProvider {
     pub kind: ResolvedProviderKind,
 }
 
+/// Complete provider transition applied before publishing live delegation state.
+#[derive(Debug, Clone)]
+pub struct ProviderSwitch {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub api_version: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub kind: ResolvedProviderKind,
+    pub model: Option<String>,
+}
+
 /// Canonical built-in provider names, in the order the `/login` wizard offers
 /// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
 pub const BUILTIN_PROVIDERS: &[&str] = &[
@@ -2391,6 +2644,8 @@ pub struct Agent {
     /// OAuth refresh can rebuild the effective header set (configured + account)
     /// and switching away restores exactly the configured headers.
     configured_headers: Vec<(String, String)>,
+    /// Sanitized live model state shared with introspection and delegation tools.
+    delegation_runtime: SharedDelegationRuntime,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -2573,6 +2828,36 @@ impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
         let mut tools = ToolRegistry::with_defaults();
+        let provider_kind = config
+            .provider
+            .as_deref()
+            .and_then(|n| config.resolve_provider(n))
+            .map(|p| p.kind)
+            .unwrap_or(ResolvedProviderKind::BuiltIn);
+        let configured_headers = config.headers.clone();
+        let delegation_runtime = Arc::new(Mutex::new(DelegationRuntime {
+            public: PublicModelRuntime {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+                delegation_enabled: config.subagents,
+            },
+            endpoint: DelegationEndpoint {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+                base_url: config.base_url.clone(),
+                api_key: config.api_key.clone(),
+                api_version: config.api_version.clone(),
+                configured_headers: configured_headers.clone(),
+                provider_kind,
+            },
+            explicit_subagent_model: config.subagent_model.clone(),
+        }));
+        tools.register(Arc::new(ModelInfoTool {
+            runtime: Arc::clone(&delegation_runtime),
+            available: available_models(&config, config.provider.as_deref()),
+        }));
         // Expose the `task` delegation tool unless disabled (or this *is* a
         // sub-agent). Registered before the system prompt is rendered so it's
         // listed for the model. The profile set (built-ins + discovered files +
@@ -2627,6 +2912,7 @@ impl Agent {
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
+                Arc::clone(&delegation_runtime),
                 profiles,
                 Arc::clone(&bg_handles),
                 Arc::clone(&cost_total),
@@ -2662,6 +2948,10 @@ impl Agent {
         } else if config.read_only {
             let ro = tools.read_only_names();
             tools.retain_only(&ro);
+        }
+        let delegation_enabled = tools.defs().iter().any(|d| d.function.name == "task");
+        if let Ok(mut runtime) = delegation_runtime.lock() {
+            runtime.public.delegation_enabled = delegation_enabled;
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.lsp = lsp;
@@ -2755,17 +3045,6 @@ impl Agent {
             .and_then(|dir| Checkpoints::open(dir).ok())
             .map(|c| Arc::new(Mutex::new(c)));
 
-        // Resolve the trust identity for the configured provider BEFORE `config`
-        // is partially moved into the client below. Falls back to `BuiltIn` when
-        // no provider is named (a raw --base-url endpoint) — never to
-        // `ChatGptOAuth`, so OAuth injection requires an explicit trusted name.
-        let provider_kind = config
-            .provider
-            .as_deref()
-            .and_then(|n| config.resolve_provider(n))
-            .map(|p| p.kind)
-            .unwrap_or(ResolvedProviderKind::BuiltIn);
-        let configured_headers = config.headers.clone();
         ctx.checkpoints = checkpoints.clone();
 
         let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
@@ -2792,6 +3071,7 @@ impl Agent {
             provider: config.provider.clone(),
             provider_kind,
             configured_headers,
+            delegation_runtime,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -2993,15 +3273,35 @@ impl Agent {
         self.reset_read_files();
     }
 
+    fn publish_delegation_runtime(&self) {
+        let mut runtime = self
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.public.provider = self.provider.clone();
+        runtime.public.model = self.client.model.clone();
+        runtime.public.effort = self.client.effort().map(str::to_string);
+        runtime.endpoint.provider = self.provider.clone();
+        runtime.endpoint.model = self.client.model.clone();
+        runtime.endpoint.effort = self.client.effort().map(str::to_string);
+        runtime.endpoint.base_url = self.client.base_url().to_string();
+        runtime.endpoint.provider_kind = self.provider_kind;
+        runtime.endpoint.configured_headers = self.configured_headers.clone();
+    }
+
     /// Switch the model for subsequent turns.
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.client.model = model.into();
+        self.cost_rates = None;
+        self.publish_delegation_runtime();
     }
 
     /// Repoint the agent at a named provider (for the catalog lookup; the
     /// endpoint itself is set by [`Self::set_endpoint`]).
     pub fn set_provider(&mut self, provider: Option<String>) {
         self.provider = provider;
+        self.cost_rates = None;
+        self.publish_delegation_runtime();
     }
 
     /// The current provider's trust identity — lets callers (health probe,
@@ -3124,6 +3424,33 @@ impl Agent {
             == hrdr_llm::CacheMode::Ephemeral
     }
 
+    /// Apply a complete provider transition, then publish one coherent runtime
+    /// projection for introspection and subsequent delegation.
+    pub fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
+        let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &switch.base_url);
+        self.client.set_base_url(switch.base_url);
+        self.client.set_api_key(switch.api_key.clone());
+        self.client.set_cache(cache);
+        self.client.set_headers(switch.headers.clone());
+        self.client.set_api_version(switch.api_version.clone());
+        self.provider = Some(switch.name);
+        self.provider_kind = switch.kind;
+        self.configured_headers = switch.headers;
+        if let Some(model) = switch.model {
+            self.client.model = model;
+        }
+        self.cost_rates = None;
+
+        let mut runtime = self
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.endpoint.api_key = switch.api_key;
+        runtime.endpoint.api_version = switch.api_version;
+        drop(runtime);
+        self.publish_delegation_runtime();
+    }
+
     /// Set (or clear) the sampling temperature.
     pub fn set_temperature(&mut self, t: Option<f32>) {
         self.client.temperature = t;
@@ -3133,6 +3460,7 @@ impl Agent {
     /// each request when it names a known level; other labels are display-only.
     pub fn set_effort(&mut self, effort: Option<String>) {
         self.client.set_effort(effort);
+        self.publish_delegation_runtime();
     }
 
     /// Replace the provider-configured extra HTTP headers (used on a provider
@@ -4400,6 +4728,187 @@ mod tests {
         assert!(small >= 4, "per-message overhead applies");
     }
 
+    #[tokio::test]
+    async fn model_info_reports_live_state_without_secrets() {
+        let mut agent = Agent::new(AgentConfig {
+            provider: Some("openai".to_string()),
+            model: "old".to_string(),
+            effort: Some("high".to_string()),
+            api_key: Some("top-secret".to_string()),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.set_model("new");
+        let out = agent
+            .tools
+            .execute("model_info", serde_json::json!({}), &agent.ctx)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["model"], "new");
+        assert_eq!(value["effort"], "high");
+        assert_eq!(value["effective_effort"], "high");
+        assert_eq!(value["default_subagent_model"], "new");
+        assert!(!out.contains("top-secret"));
+        assert!(value.get("available_models").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_info_available_filters_default_and_returns_valid_json() {
+        let agent = Agent::new(AgentConfig {
+            model: "default".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let out = agent
+            .tools
+            .execute(
+                "model_info",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            value["available_models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["model"] != "default")
+        );
+        assert!(
+            value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "no_default_subagent_model")
+        );
+    }
+
+    #[test]
+    fn delegation_runtime_initialized_from_agent_config() {
+        let cfg = AgentConfig {
+            base_url: "https://custom.example/v1".to_string(),
+            model: "primary-model".to_string(),
+            effort: Some("low".to_string()),
+            provider: None,
+            subagents: false,
+            headers: vec![("X-Test".to_string(), "value".to_string())],
+            subagent_model: Some("subagent-model".to_string()),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+
+        let agent = Agent::new(cfg.clone()).unwrap();
+        let runtime = agent
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert_eq!(runtime.public.provider, cfg.provider);
+        assert_eq!(runtime.public.model, cfg.model);
+        assert_eq!(runtime.public.effort, cfg.effort);
+        assert_eq!(runtime.public.delegation_enabled, cfg.subagents);
+        assert_eq!(runtime.explicit_subagent_model, cfg.subagent_model);
+
+        assert_eq!(runtime.endpoint.provider, None);
+        assert_eq!(runtime.endpoint.model, "primary-model");
+        assert_eq!(runtime.endpoint.effort, Some("low".to_string()));
+        assert_eq!(runtime.endpoint.base_url, "https://custom.example/v1");
+        assert_eq!(runtime.endpoint.api_key, cfg.api_key);
+        assert_eq!(
+            runtime.endpoint.provider_kind,
+            super::ResolvedProviderKind::BuiltIn
+        );
+        assert_eq!(
+            runtime.endpoint.configured_headers,
+            vec![("X-Test".to_string(), "value".to_string())]
+        );
+        assert_eq!(runtime.endpoint.api_version, cfg.api_version);
+    }
+
+    #[test]
+    fn provider_switch_publishes_one_complete_endpoint() {
+        let mut agent = Agent::new(AgentConfig {
+            model: "old".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.apply_provider_switch(super::ProviderSwitch {
+            name: "next".to_string(),
+            base_url: "https://next.example/v1".to_string(),
+            api_key: Some("secret".to_string()),
+            api_version: Some("2025-01-01".to_string()),
+            headers: vec![("X-Route".to_string(), "next".to_string())],
+            kind: super::ResolvedProviderKind::Custom,
+            model: Some("new".to_string()),
+        });
+
+        let runtime = agent
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(runtime.public.provider.as_deref(), Some("next"));
+        assert_eq!(runtime.public.model, "new");
+        assert_eq!(runtime.endpoint.base_url, "https://next.example/v1");
+        assert_eq!(runtime.endpoint.api_key.as_deref(), Some("secret"));
+        assert_eq!(runtime.endpoint.api_version.as_deref(), Some("2025-01-01"));
+        assert_eq!(
+            runtime.endpoint.provider_kind,
+            super::ResolvedProviderKind::Custom
+        );
+        assert_eq!(runtime.endpoint.configured_headers[0].0, "X-Route");
+    }
+
+    #[test]
+    fn set_model_refreshes_delegation_runtime() {
+        let mut agent = Agent::new(AgentConfig {
+            model: "old".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        agent.set_model("new-model");
+
+        let runtime = agent
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(runtime.public.model, "new-model");
+        assert_eq!(runtime.endpoint.model, "new-model");
+    }
+
+    #[test]
+    fn set_provider_and_effort_refresh_delegation_runtime() {
+        let mut agent = Agent::new(AgentConfig {
+            provider: Some("main".to_string()),
+            model: "m".to_string(),
+            effort: Some("off".to_string()),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        agent.set_provider(Some("secondary".to_string()));
+        agent.set_effort(Some("high".to_string()));
+
+        let runtime = agent
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert_eq!(runtime.public.provider, Some("secondary".to_string()));
+        assert_eq!(runtime.endpoint.provider, Some("secondary".to_string()));
+
+        assert_eq!(runtime.public.effort, Some("high".to_string()));
+        assert_eq!(runtime.endpoint.effort, Some("high".to_string()));
+    }
+
     #[test]
     fn subagent_base_bounds_recursion_and_picks_model() {
         use super::subagent_base_config;
@@ -5028,6 +5537,7 @@ mod tests {
             "git",
             "grep",
             "ls",
+            "model_info",
             "read",
             "references",
             "search",

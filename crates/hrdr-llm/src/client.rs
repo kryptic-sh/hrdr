@@ -290,6 +290,11 @@ impl Client {
         self.effort = effort;
     }
 
+    /// Current reasoning-effort label, including display-only values.
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
+
     /// Set the opt-in request parameters (`max_tokens`, `top_p`, `seed`, `stop`,
     /// `include_usage`).
     pub fn set_params(&mut self, params: crate::RequestParams) {
@@ -698,6 +703,38 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn effort_getter_preserves_display_only_values_and_clear() {
+        let mut client = Client::new("http://localhost/v1", None, "model");
+        assert_eq!(client.effort(), None);
+        client.set_effort(Some("high".to_string()));
+        assert_eq!(client.effort(), Some("high"));
+        client.set_effort(Some("custom-display-label".to_string()));
+        assert_eq!(client.effort(), Some("custom-display-label"));
+        client.set_effort(None);
+        assert_eq!(client.effort(), None);
+    }
+
+    #[test]
+    fn effort_getter_reflects_latest_value_and_request_mapping() {
+        let mut client = Client::new("http://localhost/v1", None, "model");
+
+        client.set_effort(Some("off".to_string()));
+        assert_eq!(client.effort(), Some("off"));
+        let off = client.request(&[], &[], false);
+        assert!(off.reasoning_effort.is_none());
+
+        client.set_effort(Some("high".to_string()));
+        assert_eq!(client.effort(), Some("high"));
+        let high = client.request(&[], &[], false);
+        assert_eq!(high.reasoning_effort.as_deref(), Some("high"));
+
+        client.set_effort(None);
+        assert_eq!(client.effort(), None);
+        let none = client.request(&[], &[], false);
+        assert!(none.reasoning_effort.is_none());
+    }
 
     #[test]
     fn max_tokens_routes_to_completion_field_for_reasoning_models() {
