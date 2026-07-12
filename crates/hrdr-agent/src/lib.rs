@@ -876,6 +876,50 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base
 }
 
+/// Repoint `cfg` at `pname`'s endpoint + auth (and its default or the given
+/// model). Endpoint/identity only — does NOT touch persona/tool-scope, so it is
+/// safe to layer on top of an already-resolved agent profile.
+///
+/// `model_override` wins over the provider's preset default; when neither is
+/// present `cfg.model` is left unchanged. Reads the caller's (parent's)
+/// `cfg.api_key` / `cfg.base_url` as the key-inheritance context *before*
+/// overwriting them.
+fn repoint_to_provider(
+    cfg: &mut AgentConfig,
+    pname: &str,
+    model_override: Option<&str>,
+) -> Result<()> {
+    let p = cfg.resolve_provider(pname).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
+            BUILTIN_PROVIDERS.join(", ")
+        )
+    })?;
+    // Resolve the key from the PARENT's context first, before mutating cfg.
+    let key = resolve_api_key(
+        pname,
+        &p,
+        cfg.api_key.as_deref(),
+        Some(cfg.base_url.as_str()),
+    );
+    cfg.base_url = p.base_url.clone();
+    cfg.api_key = key;
+    cfg.api_version = p.api_version.clone();
+    cfg.headers = p
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    cfg.context_window = p.context_window;
+    cfg.provider = Some(pname.to_string());
+    if let Some(m) = model_override {
+        cfg.model = m.to_string();
+    } else if let Some(m) = &p.model {
+        cfg.model = m.clone();
+    }
+    Ok(())
+}
+
 /// Apply a named agent profile onto `base`: (if the profile names a provider)
 /// repoint the endpoint, auth, headers, and `api-version` to that provider and
 /// adopt its model — so the agent can run on a **different provider** — then set
@@ -888,33 +932,8 @@ pub fn config_for_agent_profile(
 ) -> Result<AgentConfig> {
     let mut cfg = base.clone();
     if let Some(pname) = profile.provider.as_deref() {
-        let p = base.resolve_provider(pname).ok_or_else(|| {
-            anyhow::anyhow!(
-                "subagent '{}': unknown provider '{pname}' (built-ins: {}, or define \
-                 [providers.{pname}])",
-                profile.name,
-                BUILTIN_PROVIDERS.join(", ")
-            )
-        })?;
-        cfg.base_url = p.base_url.clone();
-        cfg.api_key = resolve_api_key(
-            pname,
-            &p,
-            base.api_key.as_deref(),
-            Some(base.base_url.as_str()),
-        );
-        cfg.api_version = p.api_version.clone();
-        cfg.headers = p
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        cfg.context_window = p.context_window;
-        if let Some(m) = &p.model {
-            cfg.model = m.clone();
-        }
-    }
-    if let Some(m) = &profile.model {
+        repoint_to_provider(&mut cfg, pname, profile.model.as_deref())?;
+    } else if let Some(m) = &profile.model {
         cfg.model = m.clone();
     }
     // Persona + tool scope: an explicit `tools` list wins; otherwise `read_only`
@@ -5700,6 +5719,8 @@ mod tests {
         assert_eq!(sub.model, "moonshotai/kimi-k2");
         assert!(!sub.subagents); // still can't nest
         assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));
+        // Identity: the sub is now *on* openrouter, not the parent provider.
+        assert_eq!(sub.provider.as_deref(), Some("openrouter"));
         // No provider → stays on the main endpoint, just the profile's model.
         let same = config_for_agent_profile(
             &base,
@@ -5722,6 +5743,8 @@ mod tests {
         .unwrap();
         assert_eq!(same.base_url, "https://api.anthropic.com/v1");
         assert_eq!(same.model, "claude-haiku");
+        // The no-provider profile keeps the parent's provider identity (None here).
+        assert_eq!(same.provider.as_deref(), None);
         // Unknown provider → error.
         assert!(
             config_for_agent_profile(
@@ -5744,6 +5767,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn repoint_to_provider_sets_identity_and_model() {
+        use super::repoint_to_provider;
+        // Start on a fake parent endpoint; repoint to the `local` built-in.
+        let mut cfg = AgentConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: Some("parent-key".to_string()),
+            model: "claude-opus".to_string(),
+            provider: Some("claude".to_string()),
+            ..Default::default()
+        };
+        repoint_to_provider(&mut cfg, "local", Some("my-local-model")).unwrap();
+        assert_eq!(cfg.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.provider.as_deref(), Some("local"));
+        assert_eq!(cfg.model, "my-local-model");
+        // Identity drives the derived kind that Agent::new will compute from
+        // `cfg.provider` — the whole point of setting it during repoint.
+        assert_eq!(
+            cfg.resolve_provider("local").map(|p| p.kind),
+            Some(super::ResolvedProviderKind::BuiltIn)
+        );
+        // Unknown provider errors.
+        assert!(repoint_to_provider(&mut cfg, "nope", Some("m")).is_err());
     }
 
     #[test]
