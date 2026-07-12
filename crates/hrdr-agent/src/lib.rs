@@ -3167,6 +3167,38 @@ fn build_system_prompt(
     Ok(append_persona(append_memory(system, memory), persona))
 }
 
+/// The initial delegation-runtime projection for `config`. The single place the
+/// live-state cell is built from a config, so `Agent::new` and any other
+/// constructor cannot seed it differently.
+///
+/// `api_key` here is the *resolved provider credential*. The ChatGPT OAuth bearer
+/// is injected straight into the client and deliberately never lands here, so it
+/// is never handed to a sub-agent.
+fn new_delegation_runtime(
+    config: &AgentConfig,
+    provider_kind: ResolvedProviderKind,
+) -> SharedDelegationRuntime {
+    Arc::new(Mutex::new(DelegationRuntime {
+        public: PublicModelRuntime {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+            delegation_enabled: config.subagents,
+        },
+        endpoint: DelegationEndpoint {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+            base_url: config.base_url.clone(),
+            api_key: config.api_key.clone(),
+            api_version: config.api_version.clone(),
+            configured_headers: config.headers.clone(),
+            provider_kind,
+        },
+        explicit_subagent_model: config.subagent_model.clone(),
+    }))
+}
+
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
@@ -3178,25 +3210,7 @@ impl Agent {
             .map(|p| p.kind)
             .unwrap_or(ResolvedProviderKind::BuiltIn);
         let configured_headers = config.headers.clone();
-        let delegation_runtime = Arc::new(Mutex::new(DelegationRuntime {
-            public: PublicModelRuntime {
-                provider: config.provider.clone(),
-                model: config.model.clone(),
-                effort: config.effort.clone(),
-                delegation_enabled: config.subagents,
-            },
-            endpoint: DelegationEndpoint {
-                provider: config.provider.clone(),
-                model: config.model.clone(),
-                effort: config.effort.clone(),
-                base_url: config.base_url.clone(),
-                api_key: config.api_key.clone(),
-                api_version: config.api_version.clone(),
-                configured_headers: configured_headers.clone(),
-                provider_kind,
-            },
-            explicit_subagent_model: config.subagent_model.clone(),
-        }));
+        let delegation_runtime = new_delegation_runtime(&config, provider_kind);
         tools.register(Arc::new(ModelInfoTool {
             runtime: Arc::clone(&delegation_runtime),
             available: available_models(&config, config.provider.as_deref()),
@@ -8400,8 +8414,14 @@ mod tests {
             let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.to_path_buf(),
             ))));
+            let cfg = test_cfg(base_url, cwd);
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                super::super::ResolvedProviderKind::BuiltIn,
+            );
             SubagentTool::new(
-                test_cfg(base_url, cwd),
+                cfg,
+                runtime,
                 Vec::new(),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
