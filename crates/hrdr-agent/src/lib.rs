@@ -1213,6 +1213,14 @@ impl hrdr_tools::Tool for SubagentTool {
             .explicit_subagent_model
             .unwrap_or(runtime.endpoint.model);
         cfg.effort = runtime.endpoint.effort;
+        // The parent's *live* endpoint + key, captured before an agent profile can
+        // repoint `cfg` away from it. This — not `self.base` — is the context an
+        // ad-hoc `provider` override inherits auth from. `self.base` names the
+        // endpoint the session *launched* on, and a `/model` switch since then
+        // would leave the gate judging a provider against an endpoint the session
+        // left long ago: an ad-hoc delegation back to the provider you are
+        // currently using could be rejected as "not configured".
+        let live_parent = cfg.clone();
 
         let mut isolation: Option<String> = None;
         if let Some(name) = args.get("agent").and_then(|v| v.as_str())
@@ -1261,7 +1269,7 @@ impl hrdr_tools::Tool for SubagentTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        apply_task_overrides(&mut cfg, &self.base, provider_arg, model_arg)?;
+        apply_task_overrides(&mut cfg, &live_parent, provider_arg, model_arg)?;
         if cfg.model == "default" {
             bail!(
                 "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
@@ -6053,6 +6061,174 @@ mod tests {
         assert_eq!(cfg.api_key.as_deref(), Some("parent-a-key"));
         assert_eq!(cfg.agent_prompt.as_deref(), Some("Preserve this persona."));
         assert!(cfg.read_only);
+    }
+
+    /// An ad-hoc `provider` override must not carry the parent's credential to a
+    /// different host. Key inheritance is endpoint-matched, so a target on another
+    /// base_url gets no key — and, having none of its own, is refused by the gate
+    /// rather than spawned with the wrong one.
+    #[test]
+    fn ad_hoc_provider_never_sends_the_parent_key_to_another_host() {
+        use super::{ProviderConfig, apply_task_overrides};
+        use std::collections::HashMap;
+
+        let mut parent = AgentConfig {
+            base_url: "https://parent.invalid/v1".to_string(),
+            api_key: Some("parent-secret".to_string()),
+            model: "parent-model".to_string(),
+            provider: Some("parent-p".to_string()),
+            ..Default::default()
+        };
+        // A remote provider on a DIFFERENT host that declares no credential of its
+        // own — the only way it could get one is by inheriting the parent's.
+        parent.providers.insert(
+            "elsewhere".to_string(),
+            ProviderConfig {
+                base_url: "https://elsewhere.invalid/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: Some("some-model".to_string()),
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+
+        let mut cfg = parent.clone();
+        let err = apply_task_overrides(&mut cfg, &parent, Some("elsewhere"), Some("m"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not configured"),
+            "a cross-host target with no key of its own must be refused, got: {err}"
+        );
+        // And nothing was repointed — the parent's key never travelled.
+        assert_eq!(cfg.base_url, "https://parent.invalid/v1");
+        assert_eq!(cfg.api_key.as_deref(), Some("parent-secret"));
+    }
+
+    /// The ad-hoc auth gate must judge the target against the parent's **live**
+    /// endpoint, not the one the session launched on.
+    ///
+    /// `SubagentTool.base` is the startup config; since the delegation runtime
+    /// landed, `cfg` is overlaid with the live endpoint before this runs. Passing
+    /// `self.base` as the auth context would judge a provider against an endpoint
+    /// a `/model` switch left long ago — so delegating to the provider you are
+    /// *currently on* could be rejected as "not configured".
+    #[tokio::test]
+    async fn ad_hoc_gate_judges_against_the_live_parent_endpoint() {
+        use super::{
+            ProviderConfig, ResolvedProviderKind, SubagentProfile, SubagentTool,
+            new_delegation_runtime, subagent_base_config,
+        };
+        use hrdr_tools::Tool;
+        use std::collections::HashMap;
+
+        const LIVE: &str = "https://live-b.invalid/v1";
+        let cwd = tempfile::tempdir().unwrap();
+
+        let mut parent = AgentConfig {
+            base_url: "https://startup-a.invalid/v1".to_string(),
+            api_key: Some("key-a".to_string()),
+            model: "m-a".to_string(),
+            provider: Some("startup-a".to_string()),
+            checkpoints: Some("off".to_string()),
+            cwd: cwd.path().to_path_buf(),
+            ..Default::default()
+        };
+        // Authenticated only by inheritance from a parent sitting on the same
+        // endpoint — which the LIVE parent is, and the startup parent is not.
+        parent.providers.insert(
+            "b-alias".to_string(),
+            ProviderConfig {
+                base_url: LIVE.to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        // A third provider, with a key of its own, that the agent profile repoints
+        // to. This is what makes the parent context load-bearing: once the profile
+        // has moved `cfg` to C, only the parent's endpoint can authenticate
+        // `b-alias`, and the parent must be the LIVE one.
+        parent.providers.insert(
+            "c-other".to_string(),
+            ProviderConfig {
+                base_url: "https://c-other.invalid/v1".to_string(),
+                key_env: None,
+                api_key: Some("key-c".to_string()),
+                model: Some("m-c".to_string()),
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+
+        let profile = SubagentProfile {
+            name: "reviewer".to_string(),
+            provider: Some("c-other".to_string()),
+            model: None,
+            description: None,
+            prompt: Some("Review.".to_string()),
+            read_only: false,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+
+        let base = subagent_base_config(&parent);
+        let runtime = new_delegation_runtime(&base, ResolvedProviderKind::BuiltIn);
+        // The session switched to provider B after launch (as `/model` would).
+        {
+            let mut r = runtime.lock().unwrap();
+            r.endpoint.base_url = LIVE.to_string();
+            r.endpoint.api_key = Some("key-b".to_string());
+            r.endpoint.provider = Some("live-b".to_string());
+            r.endpoint.model = "m-b".to_string();
+        }
+
+        let tool = SubagentTool::new(
+            base,
+            runtime,
+            vec![profile],
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(0.0f64)),
+            None,
+            None,
+        );
+        let ctx = hrdr_tools::ToolContext::new(cwd.path());
+        // The profile repoints to `c-other`; the ad-hoc override then asks for
+        // `b-alias`, which only the parent's live endpoint can authenticate.
+        // `background` returns as soon as the sub-agent is spawned, so this asserts
+        // the gate's verdict without waiting on the (unreachable) endpoint.
+        let res = tool
+            .execute(
+                serde_json::json!({
+                    "prompt": "p",
+                    "description": "d",
+                    "agent": "reviewer",
+                    "provider": "b-alias",
+                    "model": "m",
+                    "background": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "b-alias sits on the parent's LIVE endpoint and must pass the gate, got: {:?}",
+            res.err()
+        );
     }
 
     #[test]

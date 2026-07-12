@@ -53,6 +53,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Ad-hoc delegation is auth-gated against the provider you are actually on.**
+  The gate judged the target against the endpoint the session _launched_ on
+  rather than its live one, so after a mid-session `/model` switch a `task`
+  delegated to the provider currently in use could be refused as "not
+  configured". Key inheritance remains endpoint-matched: a cross-host target
+  still never receives the parent's key.
 - **A repointed sub-agent carries its own provider identity.** A sub-agent sent
   to another provider now sets `config.provider` to match, so its derived
   provider kind agrees with its endpoint instead of inheriting the parent's.
