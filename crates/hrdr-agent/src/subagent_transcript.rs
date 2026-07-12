@@ -86,6 +86,9 @@ impl SubagentTranscript {
 
 /// Whether a transcript file ends in an `End` event. A file with no `End` line
 /// is an orphan: the sub-agent crashed or is still running.
+// Used by tests now; the crash-recovery UI (a later WISHLIST item) is its
+// non-test consumer.
+#[allow(dead_code)]
 pub fn is_complete(path: &Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
