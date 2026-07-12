@@ -22,12 +22,17 @@ pub use oauth::{
     openrouter_authorize_url, openrouter_exchange, parse_account_id, save_oauth, save_oauth_for,
     valid_access_token,
 };
+mod chatgpt_models;
+pub use chatgpt_models::{
+    CODEX_CATALOG_COMPAT_VERSION, CatalogSource, ChatGptCatalogResult, ChatGptModel,
+    chatgpt_model_catalog, parse_catalog,
+};
 mod paths;
 pub use paths::cwd_slug;
 mod models;
 pub use models::{
-    ModelChoice, builtin_catalog_key, filter_model_choices, load_last_model, load_model_usage,
-    model_choices, record_last_model, record_model_use,
+    ModelChoice, builtin_catalog_key, chatgpt_model_choices, filter_model_choices, load_last_model,
+    load_model_usage, merge_chatgpt_choices, model_choices, record_last_model, record_model_use,
 };
 
 use std::collections::HashMap;
