@@ -38,6 +38,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`model_info` reports the provider name your session actually uses.** The
+  live ChatGPT catalog rows are labelled with the configured spelling
+  (`codex`/`openai-oauth`, not always `chatgpt`) and supersede the stale preset
+  row by alias, so the tool no longer emits a duplicate active model or a
+  provider name absent from your config.
+- **`model_info` truncation no longer deletes whole providers.** Over the output
+  limit, rows are now dropped round-robin across providers — every provider
+  keeps its first choices — and the warning says how many rows went, instead of
+  silently trimming the end of an alphabetically sorted list (which erased
+  late-alphabet providers entirely). Rows are also serialized once rather than
+  re-serializing the whole document per dropped row.
+- **The individual provider setters no longer desync delegation.**
+  `set_endpoint`, `set_provider_identity`, `set_headers`, and `set_api_version`
+  now publish the delegation runtime like `apply_provider_switch` does, so a
+  sub-agent spawned after one of them cannot be launched against the previous
+  provider's endpoint and key. (The ChatGPT OAuth bearer still never enters that
+  runtime — a ChatGPT sub-agent re-derives its own token.)
 - **ChatGPT token refresh no longer races.** A process-global, cancel-safe
   single-flight coordinator collapses concurrent refreshes into one request
   (shared across sub-agents), prefers a newer browser-installed credential over

@@ -150,8 +150,11 @@ impl hrdr_tools::Tool for ModelInfoTool {
             "default_subagent_model": default_model,
             "warnings": warnings
         });
+        // Held outside the `available` branch so the truncation pass below can
+        // re-fit the rows without rebuilding them.
+        let mut available: Vec<AvailableModel> = Vec::new();
         if mode == "available" {
-            let mut available = self.available.clone();
+            available = self.available.clone();
             if runtime.endpoint.provider_kind == ResolvedProviderKind::ChatGptOAuth
                 && runtime.endpoint.base_url == CHATGPT_CODEX_BASE_URL
             {
@@ -163,9 +166,22 @@ impl hrdr_tools::Tool for ModelInfoTool {
                 {
                     Ok(access) => {
                         let catalog = chatgpt_model_catalog(&access, false).await;
-                        available.retain(|m| m.provider != "chatgpt");
+                        // Label the live rows with the name this session actually
+                        // uses for ChatGPT (`codex`, `openai-oauth`, …), not the
+                        // canonical spelling: the rows must match the `provider`
+                        // field in this same payload, or the model reads back a
+                        // provider name that does not exist in the user's config.
+                        // Matching the superseded rows by alias likewise keeps the
+                        // stale preset row from surviving as a duplicate.
+                        let chatgpt_name = runtime
+                            .public
+                            .provider
+                            .clone()
+                            .filter(|p| is_chatgpt_provider_name(p))
+                            .unwrap_or_else(|| "chatgpt".to_string());
+                        available.retain(|m| !is_chatgpt_provider_name(&m.provider));
                         available.extend(catalog.models.into_iter().map(|m| AvailableModel {
-                            provider: "chatgpt".to_string(),
+                            provider: chatgpt_name.clone(),
                             model: m.slug,
                             label: m.label,
                             source: ModelSource::AccountCatalog,
@@ -213,9 +229,9 @@ impl hrdr_tools::Tool for ModelInfoTool {
                 });
             }
             available.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+            available.retain(|m| m.model != "default");
             let rows: Vec<_> = available
                 .iter()
-                .filter(|m| m.model != "default")
                 .map(|m| {
                     serde_json::json!({
                         "provider": m.provider,
@@ -229,27 +245,118 @@ impl hrdr_tools::Tool for ModelInfoTool {
         }
         let mut out = serde_json::to_string(&value)?;
         if out.len() > ctx.max_output && mode == "available" {
+            // Trim to fit. Popping from the tail of a (provider, model)-sorted
+            // list would delete whole providers off the end of the alphabet, so
+            // the model would conclude `zen` offers nothing. Drop round-robin
+            // across providers instead, so each keeps its first choices, and say
+            // how many rows went — a silent trim reads as a complete list.
+            let total = available.len();
             value["warnings"]
                 .as_array_mut()
                 .expect("array")
-                .push(serde_json::json!({
-                    "code": "models_truncated",
-                    "message": "Available model rows were truncated to fit the tool output limit."
-                }));
+                .push(truncation_warning(total));
+            // Size the envelope with the worst-case message (dropped == total, so
+            // its digit count is maximal); the real message can only be shorter.
+            let mut envelope = value.clone();
+            envelope["available_models"] = serde_json::Value::Array(Vec::new());
+            let base_len = serde_json::to_string(&envelope)?.len();
+            let budget = ctx.max_output.saturating_sub(base_len);
+
+            let (kept, dropped) = fit_models_to_budget(&available, budget)?;
+            let last = value["warnings"].as_array_mut().expect("array");
+            last.pop();
+            last.push(truncation_warning(dropped));
+            value["available_models"] = serde_json::Value::Array(kept);
             out = serde_json::to_string(&value)?;
-            while out.len() > ctx.max_output {
-                let removed = value["available_models"]
-                    .as_array_mut()
-                    .expect("array")
-                    .pop();
-                if removed.is_none() {
-                    break;
-                }
-                out = serde_json::to_string(&value)?;
-            }
         }
         Ok(out)
     }
+}
+
+/// The `models_truncated` warning, naming how many rows were dropped so the
+/// caller knows the list is partial rather than exhaustive.
+fn truncation_warning(dropped: usize) -> serde_json::Value {
+    serde_json::json!({
+        "code": "models_truncated",
+        "message": format!(
+            "{dropped} available model row(s) were dropped to fit the tool output limit; \
+             the list is a fair sample across providers, not the full catalog."
+        )
+    })
+}
+
+/// Select as many model rows as fit in `budget` bytes, dropping **round-robin
+/// across providers** rather than off the tail of the sorted list — otherwise the
+/// providers sorted last (`zen`, …) would vanish entirely and the model would
+/// conclude they offer no models at all. Every provider keeps its first row
+/// before any provider gets its second.
+///
+/// Returns the kept rows in `(provider, model)` order and the number dropped.
+/// `rows` must already be sorted by `(provider, model)`.
+fn fit_models_to_budget(
+    rows: &[AvailableModel],
+    budget: usize,
+) -> Result<(Vec<serde_json::Value>, usize)> {
+    // Serialize each row once: repeated whole-document re-serialization per
+    // dropped row is quadratic, and this list can be large.
+    let encoded: Vec<(usize, serde_json::Value, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let v = serde_json::json!({
+                "provider": m.provider,
+                "model": m.model,
+                "label": m.label,
+                "source": m.source
+            });
+            let len = serde_json::to_string(&v).map(|s| s.len())?;
+            Ok((i, v, len))
+        })
+        .collect::<Result<_>>()?;
+
+    // Group row indices by provider, preserving the sorted order within each.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in rows.iter().enumerate() {
+        let g = *group_of.entry(m.provider.as_str()).or_insert_with_key(|_| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+
+    // Round-robin: rank 0 of every provider, then rank 1, and so on. A row that
+    // does not fit is dropped, but a later (smaller) row may still fit.
+    let mut keep = vec![false; rows.len()];
+    let mut used = 0usize;
+    let mut kept_count = 0usize;
+    let mut rank = 0usize;
+    loop {
+        let mut any_at_rank = false;
+        for g in &groups {
+            let Some(&i) = g.get(rank) else { continue };
+            any_at_rank = true;
+            // +1 for the comma separator this row adds to the array.
+            let cost = encoded[i].2 + usize::from(kept_count > 0);
+            if used + cost <= budget {
+                used += cost;
+                keep[i] = true;
+                kept_count += 1;
+            }
+        }
+        if !any_at_rank {
+            break;
+        }
+        rank += 1;
+    }
+
+    let kept: Vec<serde_json::Value> = encoded
+        .into_iter()
+        .filter(|(i, _, _)| keep[*i])
+        .map(|(_, v, _)| v)
+        .collect();
+    let dropped = rows.len() - kept.len();
+    Ok((kept, dropped))
 }
 
 pub use prompt::{gather_agent_docs, render_system};
@@ -3513,23 +3620,50 @@ impl Agent {
 
     /// Replace the provider-configured extra HTTP headers (used on a provider
     /// switch so the new provider's headers apply).
+    ///
+    /// Prefer [`Agent::apply_provider_switch`], which applies a whole provider
+    /// transition at once. This publishes the delegation runtime on its own so a
+    /// caller that reaches for the individual setters cannot leave sub-agents
+    /// pointed at the previous provider.
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
-        self.client.set_headers(headers);
+        self.client.set_headers(headers.clone());
+        self.configured_headers = headers;
+        self.publish_delegation_runtime();
     }
 
     /// Set the Azure OpenAI API version (used on a provider switch); `None`
-    /// for a standard endpoint.
+    /// for a standard endpoint. See [`Agent::set_headers`] on preferring
+    /// [`Agent::apply_provider_switch`].
     pub fn set_api_version(&mut self, api_version: Option<String>) {
-        self.client.set_api_version(api_version);
+        self.client.set_api_version(api_version.clone());
+        self.delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .endpoint
+            .api_version = api_version;
+        self.publish_delegation_runtime();
     }
 
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
+    /// See [`Agent::set_headers`] on preferring [`Agent::apply_provider_switch`].
+    ///
+    /// The key recorded for delegation is the one passed here — a *resolved*
+    /// provider credential. The ChatGPT OAuth bearer is injected straight into
+    /// the client by [`Agent::refresh_oauth_if_needed`] and deliberately never
+    /// travels through here, so it is never handed to a sub-agent; a ChatGPT
+    /// sub-agent re-derives its own token through the shared refresh coordinator.
     pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
         let base_url = base_url.into();
         let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &base_url);
         self.client.set_base_url(base_url);
-        self.client.set_api_key(api_key);
+        self.client.set_api_key(api_key.clone());
         self.client.set_cache(cache);
+        self.delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .endpoint
+            .api_key = api_key;
+        self.publish_delegation_runtime();
     }
 
     /// Drop the last user turn (and everything after it) from history, returning
@@ -4221,6 +4355,7 @@ impl Agent {
     ) {
         self.provider_kind = kind;
         self.configured_headers = configured_headers;
+        self.publish_delegation_runtime();
     }
 
     /// Before a request, inject fresh OAuth credentials for trusted ChatGPT, or
@@ -4834,6 +4969,116 @@ mod tests {
                 .iter()
                 .any(|warning| warning["code"] == "no_default_subagent_model")
         );
+    }
+
+    /// Truncation must not delete whole providers off the end of the sorted list
+    /// — a model told `zen` has no models would stop offering it. Every provider
+    /// keeps its first row before any provider gets its second.
+    #[test]
+    fn truncation_drops_round_robin_and_keeps_every_provider() {
+        use super::{AvailableModel, ModelSource, fit_models_to_budget};
+        let row = |p: &str, m: &str| AvailableModel {
+            provider: p.to_string(),
+            model: m.to_string(),
+            label: m.to_string(),
+            source: ModelSource::Configured,
+        };
+        // Sorted by (provider, model), as the caller guarantees.
+        let rows = vec![
+            row("alpha", "a1"),
+            row("alpha", "a2"),
+            row("alpha", "a3"),
+            row("zen", "z1"),
+            row("zen", "z2"),
+        ];
+        let full = fit_models_to_budget(&rows, usize::MAX).unwrap();
+        assert_eq!(full.1, 0, "a huge budget drops nothing");
+        assert_eq!(full.0.len(), 5);
+
+        // A budget big enough for ~2 rows must spend it on one row from EACH
+        // provider, not two rows of `alpha`.
+        let one_row_len = serde_json::to_string(&full.0[0]).unwrap().len();
+        let (kept, dropped) = fit_models_to_budget(&rows, one_row_len * 2 + 1).unwrap();
+        assert_eq!(dropped, 3);
+        let providers: Vec<&str> = kept
+            .iter()
+            .map(|v| v["provider"].as_str().unwrap())
+            .collect();
+        assert!(
+            providers.contains(&"alpha") && providers.contains(&"zen"),
+            "both providers survive a tight budget, got {providers:?}"
+        );
+    }
+
+    /// The live ChatGPT rows must carry the provider name this session uses, so
+    /// they match the `provider` field in the same payload and can be fed back to
+    /// a provider switch. A config spelled `codex` must not yield rows labelled
+    /// `chatgpt` — nor leave the stale preset row behind as a duplicate.
+    #[tokio::test]
+    async fn model_info_available_has_no_duplicate_or_misnamed_chatgpt_rows() {
+        use super::CHATGPT_CODEX_BASE_URL;
+        let agent = Agent::new(AgentConfig {
+            provider: Some("codex".to_string()),
+            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+            model: "gpt-5.5".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let out = agent
+            .tools
+            .execute(
+                "model_info",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rows = value["available_models"].as_array().unwrap();
+
+        // No row may claim the canonical spelling when the session says `codex`.
+        assert!(
+            rows.iter().all(|r| r["provider"] != "chatgpt"),
+            "rows must use the session's provider spelling, got {rows:?}"
+        );
+        // And the active model must appear exactly once.
+        let active = rows
+            .iter()
+            .filter(|r| r["provider"] == "codex" && r["model"] == "gpt-5.5")
+            .count();
+        assert_eq!(active, 1, "the active model must not be duplicated");
+    }
+
+    /// The individual setters are a second switch path. They must publish the
+    /// delegation runtime too, or a sub-agent spawned after one of them would be
+    /// pointed at the previous provider's endpoint and key.
+    #[test]
+    fn individual_setters_publish_the_delegation_runtime() {
+        use super::ResolvedProviderKind;
+        let mut agent = Agent::new(AgentConfig {
+            model: "old".to_string(),
+            base_url: "https://old.example/v1".to_string(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.set_endpoint("https://new.example/v1", Some("new-key".to_string()));
+        agent.set_provider_identity(
+            ResolvedProviderKind::Custom,
+            vec![("X-New".to_string(), "1".to_string())],
+        );
+        agent.set_api_version(Some("2025-01-01".to_string()));
+
+        let runtime = agent
+            .delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(runtime.endpoint.base_url, "https://new.example/v1");
+        assert_eq!(runtime.endpoint.api_key.as_deref(), Some("new-key"));
+        assert_eq!(runtime.endpoint.provider_kind, ResolvedProviderKind::Custom);
+        assert_eq!(runtime.endpoint.api_version.as_deref(), Some("2025-01-01"));
+        assert_eq!(runtime.endpoint.configured_headers[0].0, "X-New");
     }
 
     #[test]
