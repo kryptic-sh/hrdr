@@ -259,6 +259,12 @@ fn session_dir(cwd: &str) -> PathBuf {
     sessions_dir().join(cwd_slug(cwd))
 }
 
+/// `sessions/<cwd-slug>/subagents/<session-id>/` — where a session's sub-agent
+/// transcripts live (one `.jsonl` per delegated `task`).
+pub fn subagent_transcript_dir(cwd: &str, id: &str) -> PathBuf {
+    session_dir(cwd).join("subagents").join(sanitize_name(id))
+}
+
 /// Reduce an arbitrary name to a safe, length-capped, lowercase file stem.
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name
@@ -414,6 +420,19 @@ mod tests {
     /// Global lock so env-var-dependent session tests don't race on HOME / XDG
     /// vars (std::env::set_var is not thread-safe in Rust tests).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn subagent_transcript_dir_nests_under_session() {
+        let dir = subagent_transcript_dir("/home/me/proj", "My Session");
+        // sessions/<cwd-slug>/subagents/<sanitized-id>
+        assert!(dir.ends_with("subagents/my-session"), "got {dir:?}");
+        assert!(
+            dir.to_string_lossy().contains("home-me-proj"),
+            "keyed by cwd slug: {dir:?}"
+        );
+        // Shares the session's per-cwd directory.
+        assert!(dir.starts_with(session_dir("/home/me/proj")));
+    }
 
     /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
     pub(super) fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
