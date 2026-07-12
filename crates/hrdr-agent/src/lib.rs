@@ -1678,6 +1678,38 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
     })
 }
 
+/// List the model ids available for `config`'s provider.
+///
+/// The trusted ChatGPT OAuth provider does not expose the OpenAI-compatible
+/// `/v1/models` endpoint (a plain `GET` there returns `401 Unauthorized`), so it
+/// is discovered through the account model catalog behind a coordinated —
+/// refreshing — OAuth access token, the same source the agent's `model_info`
+/// tool uses. Every other provider falls back to the OpenAI-compatible
+/// `/v1/models` listing.
+pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
+    let provider_kind = config
+        .provider
+        .as_deref()
+        .and_then(|n| config.resolve_provider(n))
+        .map(|p| p.kind)
+        .unwrap_or(ResolvedProviderKind::BuiltIn);
+    if provider_kind == ResolvedProviderKind::ChatGptOAuth
+        && config.base_url == CHATGPT_CODEX_BASE_URL
+    {
+        let access = coordinated_oauth_access(provider_kind, &config.base_url).await?;
+        let catalog = chatgpt_model_catalog(&access, false).await;
+        let mut ids: Vec<String> = catalog.models.into_iter().map(|m| m.slug).collect();
+        ids.sort();
+        return Ok(ids);
+    }
+    let client = Client::new(
+        config.base_url.clone(),
+        config.api_key.clone(),
+        config.model.clone(),
+    );
+    client.list_models().await
+}
+
 /// `[tool_output]` config table: per-tool truncation thresholds. Mirrors
 /// opencode's `tool_output`. Output over either limit is truncated and (for
 /// `bash`/`grep`) the full text is saved to disk.

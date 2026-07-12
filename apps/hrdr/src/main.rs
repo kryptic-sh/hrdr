@@ -14,7 +14,6 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
-use hrdr_llm::Client;
 
 /// The `hrdr` wordmark: printed above `--help`, and animated in the TUI's
 /// session header (passed to [`hrdr_tui::run`], which embeds no art of its own).
@@ -269,7 +268,14 @@ async fn main() -> Result<()> {
         }
         // Provider's default model, unless the user set one explicitly.
         let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
-        if !model_overridden && let Some(m) = p.model.clone() {
+        // Precedence: flag/env > config.toml > preset default. Only fall back to
+        // the preset's default model when neither a flag/env nor the config file
+        // pinned one — otherwise a preset (e.g. ChatGPT's `gpt-5.5`) would
+        // silently clobber a `model = …` set in config.toml.
+        if !model_overridden
+            && !config_had_model
+            && let Some(m) = p.model.clone()
+        {
             config.model = m;
         }
         if config.context_window.is_none() {
@@ -592,8 +598,7 @@ fn event_json(ev: &AgentEvent) -> String {
 
 /// Print available model ids, one per line.
 async fn list_models(config: AgentConfig) -> Result<()> {
-    let client = Client::new(config.base_url, config.api_key, config.model);
-    let models = client.list_models().await?;
+    let models = hrdr_agent::list_provider_models(&config).await?;
     for m in models {
         println!("{m}");
     }
