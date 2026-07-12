@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `task` tool: an optional `provider` argument for ad-hoc cross-provider
+  delegation — delegate to any configured + authenticated provider/model at
+  delegation time, not only via a predefined `[[subagent]]` profile. The target
+  provider is auth-gated before the sub-agent spawns.
 - **ChatGPT subscription login + entitled model discovery.** A built-in
   `chatgpt` provider logs in through the browser (Codex OAuth) from the `/login`
   modal's typed authorizing state, then loads your account's entitled models
@@ -30,6 +34,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Sub-agents repointed to another provider now carry that provider's identity
+  (`config.provider`), so their derived provider kind matches their endpoint
+  instead of inheriting the parent's. This also fixes cost attribution for such
+  sub-agents (the models.dev price card is keyed by `(provider, model)`; a
+  repointed sub was previously priced under the parent's provider, often
+  unpriced).
 - **ChatGPT token refresh no longer races.** A process-global, cancel-safe
   single-flight coordinator collapses concurrent refreshes into one request
   (shared across sub-agents), prefers a newer browser-installed credential over

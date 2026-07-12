@@ -535,6 +535,16 @@ and Azure/Anthropic quirks). The model can also override the model per call
 (`model` argument); also `$HRDR_SUBAGENT_MODEL` / `--subagent-model` for the
 default.
 
+The `task` tool also accepts an optional `provider` argument to delegate to a
+different, already-configured provider without defining a `[[subagent]]` profile
+— e.g. a ChatGPT-hosted main agent delegating to
+`provider = "openrouter", model = "deepseek/deepseek-chat"`. The target provider
+must be configured and authenticated (a built-in with its key/OAuth set, or a
+`[providers.*]` entry); an unconfigured provider is rejected before the
+sub-agent starts. When `provider` is set, pass `model` too — the provider's
+default model is used only if it has one, otherwise the call errors. An explicit
+`model` always wins, including over a named profile's model.
+
 A profile can also carry a **custom system prompt** and a **scoped tool set** —
 this is how the built-in `explore`/`review` agents are defined, and a user
 profile of the same name overrides the built-in:
