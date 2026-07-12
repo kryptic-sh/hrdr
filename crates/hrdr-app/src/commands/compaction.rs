@@ -6,11 +6,29 @@ use tokio::sync::Mutex;
 /// The shared compaction core (`/compact` and threshold auto-compaction):
 /// lock the agent and summarize. `Ok((before, after))` with `before == after`
 /// means there was nothing to compact.
+///
+/// **Session-scoped.** Compaction manages the conversation the *user* owns and
+/// returns to. It is refused for a delegated sub-agent: that history is
+/// short-lived, nobody resumes it, and summarising it mid-task only costs a model
+/// call and loses fidelity the parent is waiting on. This is the structural guard
+/// — a frontend that lets you drive a sub-agent pane goes through here too, so it
+/// cannot compact one by accident.
+///
+/// Overflow recovery is a different thing and still applies to sub-agents: the
+/// agent compacts itself inside `connect_and_drain` when a request would
+/// otherwise fail outright, rescuing the task rather than losing it.
 pub async fn run_compaction(
     agent: Arc<Mutex<Agent>>,
     instructions: Option<String>,
 ) -> Result<(usize, usize), String> {
     let mut a = agent.lock().await;
+    if a.is_subagent() {
+        return Err(
+            "a sub-agent's conversation is not compacted — it is transient, \
+                    and its context is the parent's to manage"
+                .to_string(),
+        );
+    }
     a.compact(instructions.as_deref())
         .await
         .map_err(|e| e.to_string())
@@ -55,4 +73,28 @@ pub fn should_auto_compact(
         return false;
     };
     window > 0 && prompt >= compaction_trigger(window, reserved)
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    /// Compaction is the session's. A frontend that lets you drive a sub-agent
+    /// pane routes through `run_compaction` too, so the refusal lives here rather
+    /// than in each frontend — it cannot be forgotten at a call site.
+    #[tokio::test]
+    async fn compaction_is_refused_for_a_delegated_sub_agent() {
+        let sub = Arc::new(Mutex::new(
+            Agent::new(hrdr_agent::AgentConfig {
+                is_subagent: true,
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        ));
+        let err = run_compaction(sub, None)
+            .await
+            .expect_err("a sub-agent's history is not the session's to compact");
+        assert!(err.contains("transient"), "got: {err}");
+    }
 }

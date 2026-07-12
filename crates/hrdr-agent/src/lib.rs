@@ -910,6 +910,21 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.write_ext = None;
     // Sub-agents never spawn sub-agents, so they never write transcripts.
     base.subagent_transcript_dir = None;
+    // ── The session/sub-agent seam ──────────────────────────────────────────
+    // This agent answers one delegated question and is then released. Session-
+    // scoped features must not follow it in.
+    base.is_subagent = true;
+    // NOTE: `memory` stays on, so a sub-agent still *reads* the project's memory
+    // as prompt context — that is just useful background. What it must not do is
+    // *write*: the store is durable and outlives the session, and a transient
+    // agent working from a fragment of the context has no business editing it.
+    // The write path is the `memory` tool, gated on `is_subagent` in `Agent::new`.
+    // Proactive compaction is the session's business: it manages a conversation
+    // the user owns and returns to. A sub-agent's history is short-lived and
+    // nobody resumes it, so summarising it away only loses fidelity mid-task.
+    // (Overflow recovery inside `connect_and_drain` is a different thing and
+    // still applies — that rescues a task that would otherwise fail outright.)
+    base.auto_compact = false;
     base.model = config
         .subagent_model
         .clone()
@@ -1657,6 +1672,18 @@ pub struct AgentConfig {
     /// Default `true`; `$HRDR_MEMORY`. Storage lives under the XDG data dir
     /// (project-scoped by cwd, plus a shared global scope).
     pub memory: bool,
+    /// This agent is a **delegated sub-agent**, not the session's own agent.
+    ///
+    /// The seam between the two. A sub-agent is transient and task-scoped: it
+    /// exists to answer one question and be released. Anything that belongs to
+    /// the *session* — durable memory that outlives it, lifecycle hooks that mark
+    /// the user's turn, proactive compaction of a conversation it does not own —
+    /// is gated on this and must not fire for it. Safety-scoped machinery
+    /// (guardrails, pre/post-tool hooks, the cost ceiling) deliberately still
+    /// applies: those constrain *tool calls*, and a sub-agent makes those too.
+    ///
+    /// Set only by [`subagent_base_config`]; never configurable.
+    pub is_subagent: bool,
     /// Override the base memory directory (default `<XDG data>/memory`) — point
     /// hrdr at another tool's memory store. The `projects/<cwd-slug>/` and
     /// `global/` scope subdirectories still apply beneath it. Config
@@ -2055,6 +2082,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             memory: true,
+            is_subagent: false,
             memory_dir: None,
             subagent_model: None,
             subagent_profiles: Vec::new(),
@@ -3216,6 +3244,9 @@ pub struct Agent {
     /// frontend steers, views, and drives further turns on them through this.
     /// Pruned at turn end (see [`LiveSubagents::prune`]).
     live_subagents: LiveSubagents,
+    /// This is a delegated sub-agent, not the session's agent. Gates every
+    /// session-scoped feature — see [`AgentConfig::is_subagent`].
+    is_subagent: bool,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -3513,7 +3544,9 @@ impl Agent {
             .memory
             .then(|| memory_dirs(&config.cwd, config.memory_dir.as_deref()))
             .flatten();
-        if config.memory {
+        // Read yes, write no: a sub-agent gets the memory *context* in its prompt
+        // but not the tool that edits the durable, cross-session store.
+        if config.memory && !config.is_subagent {
             tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
@@ -3660,6 +3693,7 @@ impl Agent {
             configured_headers,
             delegation_runtime,
             live_subagents,
+            is_subagent: config.is_subagent,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -4144,6 +4178,15 @@ impl Agent {
         self.live_subagents.clone()
     }
 
+    /// Whether this is a delegated sub-agent rather than the session's own agent.
+    ///
+    /// A frontend showing sub-agent panes asks this before offering anything
+    /// session-scoped — compaction, `/undo`, saving, session lifecycle hooks.
+    /// Those act on the conversation the *user* owns, and a sub-agent is not it.
+    pub fn is_subagent(&self) -> bool {
+        self.is_subagent
+    }
+
     /// Number of messages currently in history (including the system prompt).
     pub fn message_count(&self) -> usize {
         self.messages.len()
@@ -4556,7 +4599,12 @@ impl Agent {
     /// Run the `turn_end` hooks (both turn exits call this just before
     /// `TurnDone`). Failures surface as notices; nothing here can block.
     async fn fire_turn_end_hooks<F: FnMut(AgentEvent)>(&self, on_event: &mut F) {
-        if !self.has_event_hooks(hrdr_tools::HookEvent::TurnEnd) {
+        // `turn_end` marks the end of *the user's* turn. A delegated sub-agent
+        // runs inside that turn — firing the hook per sub-agent would run it N+1
+        // times for one turn, each with a context the user never asked about.
+        // Pre/post-tool hooks still fire for sub-agents: those constrain tool
+        // calls, and a sub-agent makes those too.
+        if self.is_subagent || !self.has_event_hooks(hrdr_tools::HookEvent::TurnEnd) {
             return;
         }
         let payload = serde_json::json!({
@@ -5660,6 +5708,85 @@ mod tests {
 
         assert_eq!(runtime.public.effort, Some("high".to_string()));
         assert_eq!(runtime.endpoint.effort, Some("high".to_string()));
+    }
+
+    /// The session/sub-agent seam. A sub-agent answers one delegated question and
+    /// is released, so anything scoped to the *session* must not follow it in.
+    /// The converse matters just as much: machinery that constrains **tool calls**
+    /// must still apply, because a sub-agent makes tool calls too — dropping that
+    /// would be the more dangerous leak.
+    #[test]
+    fn session_scoped_features_do_not_leak_into_a_sub_agent() {
+        use super::subagent_base_config;
+        let parent = AgentConfig {
+            memory: true,
+            auto_compact: true,
+            auto_prune: true,
+            max_cost: Some(5.0),
+            allow_outside_cwd: false,
+            ..Default::default()
+        };
+        let sub = subagent_base_config(&parent);
+
+        // Session-scoped: stays behind.
+        assert!(sub.is_subagent, "the sub-agent knows what it is");
+        assert!(
+            !sub.auto_compact,
+            "proactive compaction manages the user's conversation, not a sub-agent's"
+        );
+        assert!(!sub.subagents, "no nesting");
+        assert!(
+            sub.subagent_transcript_dir.is_none(),
+            "a sub-agent writes no sub-agent transcripts"
+        );
+
+        // Safety-scoped: comes along.
+        assert_eq!(sub.max_cost, Some(5.0), "the cost ceiling still applies");
+        assert!(!sub.allow_outside_cwd, "the cwd sandbox still applies");
+        assert!(
+            sub.auto_prune,
+            "cheap tool-output pruning is not compaction"
+        );
+    }
+
+    /// Memory is durable and outlives the session. A sub-agent may *read* it as
+    /// prompt context, but must not be handed the tool that edits it.
+    #[test]
+    fn a_sub_agent_can_read_memory_but_not_write_it() {
+        use super::subagent_base_config;
+        let main = Agent::new(AgentConfig {
+            memory: true,
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            main.tools
+                .defs()
+                .iter()
+                .any(|d| d.function.name == "memory"),
+            "the session's agent can write memories"
+        );
+        assert!(
+            !main.is_subagent(),
+            "the session's agent is not a sub-agent"
+        );
+
+        let sub_cfg = subagent_base_config(&AgentConfig {
+            memory: true,
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            sub_cfg.memory,
+            "memory context still loads into a sub-agent's prompt"
+        );
+        let sub = Agent::new(sub_cfg).unwrap();
+        assert!(sub.is_subagent());
+        assert!(
+            !sub.tools.defs().iter().any(|d| d.function.name == "memory"),
+            "but a transient sub-agent must not edit the durable store"
+        );
     }
 
     #[test]
