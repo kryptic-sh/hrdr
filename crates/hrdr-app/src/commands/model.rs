@@ -152,6 +152,23 @@ pub fn apply_choice(
     Ok(())
 }
 
+/// Guidance for a remote endpoint we hold no credential for. This is a *config*
+/// problem, not a reachability one — so it must not be reported as one.
+///
+/// Regression: the health probe called `/models` unauthenticated, got the 401 it
+/// was always going to get, and rendered it through [`unreachable_guidance`] —
+/// telling a user whose only mistake was not running `/login` that api.openai.com
+/// "looks unreachable" and suggesting they start a local llama-server on it.
+pub(crate) fn missing_credential_guidance(provider: Option<&str>, base_url: &str) -> String {
+    let who = provider.unwrap_or(base_url);
+    format!(
+        "⚠ no API key configured for {who} — hrdr won't call it until there is one.\n\
+         Run `/login` to set one up, or set the provider's key env var. To use a local \
+         model instead, point hrdr at a server that needs no key (e.g. `infr serve <model> \
+         --addr 127.0.0.1:8080`)."
+    )
+}
+
 /// First-run guidance for an unreachable endpoint: what `base_url` failed and
 /// how to get hrdr talking to a model. Pure (no I/O) so it's unit-testable and
 /// identical across frontends. Now that hrdr never spawns a server, this is the
@@ -175,10 +192,22 @@ pub async fn endpoint_health_warning(
     model: String,
     base_url: String,
 ) -> Option<String> {
-    let (client, kind) = {
+    let (client, kind, has_credential, provider) = {
         let a = agent.lock().await;
-        (a.client(), a.provider_kind())
+        (
+            a.client(),
+            a.provider_kind(),
+            a.has_credential(),
+            a.provider_name(),
+        )
     };
+    // Never call a provider that requires auth with no auth. The 401 that comes
+    // back is a fact about the missing key, not about the endpoint — reporting it
+    // as "unreachable" sends the user off to debug a server that is fine. A local
+    // endpoint legitimately needs no key, so it is still probed.
+    if !has_credential && !hrdr_agent::is_local_endpoint(&base_url) {
+        return Some(missing_credential_guidance(provider.as_deref(), &base_url));
+    }
     // Trusted ChatGPT OAuth: the Codex backend does not expose the generic
     // unauthenticated `/models` shape, so this probe only yields a false 401
     // warning. Its authenticated catalog (Task 3) has its own health/fallback
@@ -212,6 +241,66 @@ pub async fn endpoint_health_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote provider with no credential is not probed at all: the request
+    /// would 401 by construction, and a 401 is a fact about the missing key, not
+    /// about the endpoint.
+    ///
+    /// Regression: hrdr called `https://api.openai.com/v1/models` with no bearer,
+    /// got "Missing bearer authentication in header", and reported the endpoint as
+    /// "unreachable" — advising the user to start a local llama-server on
+    /// api.openai.com. The only thing actually wrong was that they hadn't run
+    /// `/login`.
+    ///
+    /// The endpoint here is real, but no call is made — the guard returns before
+    /// `list_models`.
+    #[tokio::test]
+    async fn a_remote_provider_with_no_key_is_told_to_log_in_not_that_it_is_down() {
+        let config = hrdr_agent::AgentConfig {
+            provider: Some("openai".to_string()),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            ..Default::default()
+        };
+        let agent = Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()));
+        let warning = endpoint_health_warning(
+            agent,
+            "gpt-5".to_string(),
+            "https://api.openai.com/v1".to_string(),
+        )
+        .await
+        .expect("an unconfigured provider is still worth a word");
+
+        assert!(
+            warning.contains("no API key configured for openai") && warning.contains("/login"),
+            "it names the real problem and the fix: {warning}"
+        );
+        assert!(
+            !warning.contains("unreachable") && !warning.contains("llama-server"),
+            "and does not blame the endpoint: {warning}"
+        );
+    }
+
+    /// A *local* endpoint with no key is the normal case — llama-server, vLLM and
+    /// `infr serve` need none — so it is still probed, and a genuinely dead one
+    /// still gets the "start a server" guidance.
+    #[tokio::test]
+    async fn a_local_endpoint_with_no_key_is_still_probed() {
+        let base_url = "http://127.0.0.1:1/v1".to_string(); // nothing listens on port 1
+        let config = hrdr_agent::AgentConfig {
+            base_url: base_url.clone(),
+            api_key: None,
+            ..Default::default()
+        };
+        let agent = Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()));
+        let warning = endpoint_health_warning(agent, "qwen3".to_string(), base_url)
+            .await
+            .expect("a dead local endpoint is reported");
+        assert!(
+            warning.contains("looks unreachable"),
+            "the no-key guard must not swallow a real local failure: {warning}"
+        );
+    }
 
     /// Trusted ChatGPT OAuth skips the generic `/models` probe — the Codex
     /// backend returns a false 401 to it (v1 provenance). The skip happens before

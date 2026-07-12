@@ -3028,6 +3028,21 @@ fn is_anthropic_native(base_url: &str) -> bool {
     host == "api.anthropic.com" || host.ends_with(".anthropic.com")
 }
 
+/// Whether `base_url` points at a server on this machine (or an explicitly
+/// keyless one): a local `llama-server` / `infr serve` / vLLM needs no
+/// credential, so having none there is normal and a probe is worth making.
+///
+/// A *remote* endpoint with no credential is the opposite: the request is
+/// guaranteed to 401, and the 401 says nothing about whether the endpoint is up.
+pub fn is_local_endpoint(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
+    ) || host.ends_with(".local")
+        || host.is_empty()
+}
+
 /// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
 fn url_host(base_url: &str) -> &str {
     let host = base_url
@@ -4044,6 +4059,31 @@ impl Agent {
     /// `/doctor`) special-case trusted ChatGPT OAuth without re-resolving.
     pub fn provider_kind(&self) -> ResolvedProviderKind {
         self.provider_kind
+    }
+
+    /// The configured provider's name, when one is set.
+    pub fn provider_name(&self) -> Option<String> {
+        self.provider.clone()
+    }
+
+    /// Whether this agent can authenticate to its endpoint at all: it holds a
+    /// resolved API key, or it is on trusted ChatGPT OAuth (whose bearer is
+    /// injected into the client at request time rather than stored here).
+    ///
+    /// Callers use this to avoid *making a call they know will fail* — an
+    /// unauthenticated request to a provider that requires auth returns 401,
+    /// which says nothing about the endpoint and everything about the missing
+    /// credential.
+    pub fn has_credential(&self) -> bool {
+        if self.provider_kind == ResolvedProviderKind::ChatGptOAuth {
+            return true;
+        }
+        self.delegation_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .endpoint
+            .api_key
+            .is_some()
     }
 
     /// A clone of the model client (for out-of-band calls like the startup
