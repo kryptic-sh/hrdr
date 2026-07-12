@@ -969,13 +969,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
         (app.scroll_offset > 0).then(|| clamp_u16(cum[(*start).min(lines.len())]))
     });
-    // A click on a sub-agent row focuses that `task` call: unlike the collapse
-    // case above, it moves the view even while following the newest output.
-    let focus_top: Option<u16> = app.pending_focus_entry.take().and_then(|idx| {
-        let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
-        Some(clamp_u16(cum[(*start).min(lines.len())]))
-    });
-    let goto_top = goto_top.or(focus_top).or(entry_top);
+    let goto_top = goto_top.or(entry_top);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Total wrapped rows at this width — from cum, not para.line_count().
     // Clamped (not truncated) to u16::MAX: ratatui's `Paragraph::scroll` only

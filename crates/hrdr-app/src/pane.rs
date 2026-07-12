@@ -13,7 +13,7 @@
 //! so a sub-agent's view is assembled by exactly the same rules as the main one:
 //! assistant text coalesces, reasoning coalesces, tool calls open and close.
 
-use hrdr_agent::{AgentEvent, LiveSubagents, SubagentKind};
+use hrdr_agent::{AgentEvent, LiveSubagents};
 
 use crate::{Entry, EntryKind};
 
@@ -66,6 +66,23 @@ pub struct Pane {
     /// *from* the main pane at save time (the same way `SessionState` refreshes
     /// its message mirror from the agent), so there is exactly one live copy.
     pub transcript: Vec<Entry>,
+    /// Where the reader is in this conversation, and what they had half-typed to
+    /// it.
+    ///
+    /// These belong to the *conversation*, not to the terminal: glancing at the
+    /// main agent and coming back should leave you where you were, with your
+    /// half-written message still in the box. Kept per pane so switching agents is
+    /// a change of view, not a loss of place.
+    pub view: PaneView,
+}
+
+/// Per-conversation view state: the reader's position and their unsent message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneView {
+    /// Scroll offset from the newest entry (0 = following the live output).
+    pub scroll: usize,
+    /// An unsent message typed into this conversation.
+    pub draft: String,
 }
 
 impl Pane {
@@ -196,6 +213,7 @@ impl Default for PaneSet {
                 model: String::new(),
                 status: PaneStatus::Idle,
                 transcript: Vec::new(),
+                view: PaneView::default(),
             },
             subs: Vec::new(),
             active: PaneId::Main,
@@ -273,6 +291,33 @@ impl PaneSet {
         self.subs.iter_mut().find(|p| p.id == PaneId::Sub(key))
     }
 
+    /// The pane on screen.
+    pub fn active_pane(&self) -> &Pane {
+        match self.active {
+            PaneId::Main => &self.main,
+            PaneId::Sub(k) => self
+                .subs
+                .iter()
+                .find(|p| p.id == PaneId::Sub(k))
+                .unwrap_or(&self.main),
+        }
+    }
+
+    /// The pane on screen, mutably — where a frontend stows the reader's place and
+    /// their unsent draft before switching away.
+    pub fn active_pane_mut(&mut self) -> &mut Pane {
+        match self.active {
+            PaneId::Main => &mut self.main,
+            PaneId::Sub(k) => {
+                if let Some(i) = self.subs.iter().position(|p| p.id == PaneId::Sub(k)) {
+                    &mut self.subs[i]
+                } else {
+                    &mut self.main
+                }
+            }
+        }
+    }
+
     /// The active sub-agent pane, if a sub-agent is what's active.
     pub fn active_sub(&self) -> Option<&Pane> {
         let key = self.active.key()?;
@@ -314,6 +359,7 @@ impl PaneSet {
                     model: model.clone(),
                     status,
                     transcript: Vec::new(),
+                    view: PaneView::default(),
                 }),
             }
         }
@@ -370,16 +416,10 @@ pub fn pane_row_marker(status: PaneStatus, running_marker: &str) -> String {
     }
 }
 
-/// Whether a sub-agent kind may be steered mid-turn. Both can — the queue is the
-/// one its `run` drains — but a blocking sub-agent is holding the main agent's
-/// turn open while it works, which is worth surfacing.
-pub fn holds_main_turn(kind: SubagentKind) -> bool {
-    matches!(kind, SubagentKind::Blocking)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hrdr_agent::SubagentKind;
 
     fn tool_start(id: &str, name: &str) -> AgentEvent {
         AgentEvent::ToolStart {

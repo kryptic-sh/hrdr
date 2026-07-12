@@ -28,7 +28,7 @@ mod util;
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{SubAgentPanel, display_dir, git_branch, is_known_command, is_quit_command};
+use hrdr_app::{display_dir, git_branch, is_known_command, is_quit_command};
 pub(crate) use selector::{
     EffortSelector, LoginProviderSelector, ModelSelector, SessionSelector, SkillSelector,
     ThemeSelector, effort_selector, login_provider_selector, model_selector, session_selector,
@@ -288,7 +288,6 @@ pub(crate) struct App {
     /// scrolling there if the reader is following the newest output. Set by a
     /// click on a sub-agent panel row: unlike `pending_scroll_entry`, which only
     /// holds a block still while its height changes, this one *moves* the view.
-    pub(crate) pending_focus_entry: Option<usize>,
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
@@ -349,7 +348,6 @@ pub(crate) struct App {
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
-    pub(crate) subagent_panel: SubAgentPanel,
     /// Shared registry of *detached background* sub-agents (a clone of the
     /// agent's `ctx.background_tasks`), read live for the panel.
     pub(crate) background_tasks: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
@@ -530,7 +528,6 @@ impl App {
             skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
             pending_scroll_entry: None,
-            pending_focus_entry: None,
             find: hrdr_app::FindState::default(),
             auto_compact_enabled: auto_compact,
             compaction_reserved,
@@ -553,7 +550,6 @@ impl App {
             infer_started: None,
             follow_button: None,
             tool_hits: Vec::new(),
-            subagent_panel: SubAgentPanel::default(),
             background_tasks,
             subagent_hits: Vec::new(),
             quit_armed: false,
@@ -1364,19 +1360,51 @@ impl App {
         }
     }
 
-    /// Switch the view to `id`: the transcript, the scroll position and the input
-    /// all follow. Scroll resets because the new pane's offsets mean nothing in the
-    /// old one's coordinates.
+    /// Switch the view to `id`: the transcript, the reader's place in it, and the
+    /// half-written message all follow.
+    ///
+    /// The place and the draft belong to the *conversation*, so they are stowed on
+    /// the pane being left and restored from the one being entered — glance at the
+    /// main agent and come back, and you are where you were with what you were
+    /// typing still in the box.
     pub(crate) fn focus_pane(&mut self, id: hrdr_app::PaneId) {
         if self.panes.active() == id {
             return;
         }
+        self.stow_view();
         self.panes.focus(id);
-        self.scroll_offset = 0;
+        let view = self.panes.active_pane().view.clone();
+        self.scroll_offset = view.scroll;
+        self.editor.set_content(&view.draft);
         // The pin follows the view: `sync` marks the newly active pane, so the
         // agent keeps it alive, and releases the one we just left.
         self.sync_panes();
         crate::ui::clear_transcript_cache();
+    }
+
+    /// The agent behind the pane on screen. `/compact` and anything else that acts
+    /// on *a conversation* uses this, so it acts on the one you are looking at —
+    /// the same rule as the input box. (Session-scoped commands still use the main
+    /// agent: `self.agent`.)
+    fn active_agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
+        match self.panes.active().key() {
+            None => self.agent.clone(),
+            Some(key) => self
+                .live_subagents
+                .handle(key)
+                .map(|(a, _)| a)
+                // Released while being viewed — fall back rather than do nothing.
+                .unwrap_or_else(|| self.agent.clone()),
+        }
+    }
+
+    /// Stow the reader's place and their unsent draft on the pane they are leaving.
+    fn stow_view(&mut self) {
+        let scroll = self.scroll_offset;
+        let draft = self.editor.content();
+        let view = &mut self.panes.active_pane_mut().view;
+        view.scroll = scroll;
+        view.draft = draft;
     }
 
     /// The pane a sub-agent's live output belongs to, found by the `task` call that
@@ -1680,7 +1708,10 @@ impl App {
         self.infer_banked = Duration::ZERO;
         self.infer_started = None;
         self.resume_inference();
-        let agent = self.agent.clone();
+        // Compaction acts on the conversation you are looking at. `run_compaction`
+        // takes any agent — a sub-agent's history fills a context window like any
+        // other, and it is the agent's own to manage.
+        let agent = self.active_agent();
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             let res = hrdr_app::run_compaction(agent, instructions).await;
@@ -1749,7 +1780,6 @@ impl App {
                 self.tools_running = 0;
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
-                self.subagent_panel.clear();
                 if let Some(e) = err {
                     self.push_entry(Entry::system(format!("[error] {e}")));
                 }
@@ -2021,10 +2051,6 @@ impl App {
                 if self.tools_running == 1 {
                     self.pause_inference();
                 }
-                // A `task` call opens a live entry in the sub-agent panel.
-                if name == "task" {
-                    self.subagent_panel.on_tool_start(id.clone());
-                }
                 self.push_entry(Entry::tool_running(id.clone(), name.clone(), args));
             }
             AgentEvent::ToolOutput { id, chunk } => {
@@ -2056,9 +2082,6 @@ impl App {
                         break;
                     }
                 }
-                // Mirror into the sub-agent panel's live log (the full stream,
-                // which the transcript discards at ToolEnd).
-                self.subagent_panel.on_tool_output(&id, &chunk);
             }
             AgentEvent::ToolEnd {
                 id,
@@ -2101,7 +2124,6 @@ impl App {
                 }
                 // The sub-agent finished — its result is now in the transcript;
                 // drop it from the live panel.
-                self.subagent_panel.on_tool_end(&id);
                 // The last tool of the round returned: the agent is about to ask
                 // the model again, so it is working from here.
                 self.tools_running = self.tools_running.saturating_sub(1);

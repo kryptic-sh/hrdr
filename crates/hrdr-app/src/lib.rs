@@ -34,8 +34,7 @@ pub use history::*;
 pub use login::*;
 pub use palette::*;
 pub use pane::{
-    Pane, PaneId, PaneRow, PaneSet, PaneStatus, apply_event, holds_main_turn, pane_row_marker,
-    pane_rows,
+    Pane, PaneId, PaneRow, PaneSet, PaneStatus, PaneView, apply_event, pane_row_marker, pane_rows,
 };
 pub use session::*;
 pub use sessions::*;

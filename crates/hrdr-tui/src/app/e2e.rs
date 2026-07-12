@@ -2724,6 +2724,67 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
+/// Your place in a conversation, and the message you were half-way through typing
+/// to it, belong to *that* conversation. Glancing at the main agent and coming
+/// back must leave both exactly as they were.
+#[tokio::test]
+async fn switching_agents_keeps_each_ones_place_and_draft() {
+    let mut h = Harness::new(vec![]).await;
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
+    h.app.sync_panes();
+
+    // Half-write a message to main, and scroll back through its transcript.
+    h.type_str("a thought for main");
+    h.app.scroll_offset = 12;
+
+    // Go to the sub-agent: a different conversation, so a clean box and its own
+    // place — not main's leftovers.
+    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    assert_eq!(
+        h.app.editor.content(),
+        "",
+        "the sub-agent's box starts empty"
+    );
+    assert_eq!(h.app.scroll_offset, 0);
+
+    // Half-write something to the sub-agent, and scroll its transcript.
+    h.type_str("wait, check auth");
+    h.app.scroll_offset = 5;
+
+    // Back to main: its draft and its place are exactly where we left them.
+    h.app.focus_pane(hrdr_app::PaneId::Main);
+    assert_eq!(h.app.editor.content(), "a thought for main");
+    assert_eq!(h.app.scroll_offset, 12, "main's place is kept");
+
+    // And back to the sub-agent: so are its.
+    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    assert_eq!(
+        h.app.editor.content(),
+        "wait, check auth",
+        "what you were typing to a sub-agent survives a glance at main"
+    );
+    assert_eq!(h.app.scroll_offset, 5, "and so does your place in it");
+}
+
 /// The input box talks to whichever agent is on screen. On a sub-agent's pane a
 /// message steers *that* sub-agent — it goes into the very queue its `run` is
 /// draining — and is shown in its transcript. The main agent's conversation is not
