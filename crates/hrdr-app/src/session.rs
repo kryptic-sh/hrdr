@@ -423,6 +423,12 @@ mod tests {
 
     #[test]
     fn subagent_transcript_dir_nests_under_session() {
+        // Both paths below are derived from $XDG_DATA_HOME, and `with_test_env`
+        // swaps that process-global for other tests. Take the same lock: without
+        // it a concurrent swap lands between the two calls and they disagree —
+        // a latent race that only showed up once the suite grew enough to
+        // reschedule around it.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = subagent_transcript_dir("/home/me/proj", "My Session");
         // sessions/<cwd-slug>/subagents/<sanitized-id>
         assert!(dir.ends_with("subagents/my-session"), "got {dir:?}");

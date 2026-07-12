@@ -46,55 +46,7 @@ pub fn compaction_message(res: &Result<(usize, usize), String>) -> String {
     }
 }
 
-/// The context-usage token count at which auto-compaction fires:
-/// `context_window − reserved` (opencode's reserved model). The reserve is
-/// clamped to a quarter of the window so a `reserved` larger than a small
-/// model's context still leaves a sane trigger — opencode clamps by the model's
-/// max-output tokens; lacking that figure, a quarter-window proxy keeps the
-/// trigger from collapsing to 0 (which would compact every turn).
-pub fn compaction_trigger(window: u32, reserved: u32) -> u32 {
-    window.saturating_sub(reserved.min(window / 4))
-}
-
-/// Whether the context usage warrants a proactive compaction before more work.
-/// Fires once usage reaches [`compaction_trigger`], shared by both frontends.
-/// `enabled` gates it (the `auto_compact` toggle); `last_prompt_tokens` is the
-/// latest model call's prompt size.
-pub fn should_auto_compact(
-    last_prompt_tokens: Option<u32>,
-    context_window: Option<u32>,
-    reserved: u32,
-    enabled: bool,
-) -> bool {
-    if !enabled {
-        return false;
-    }
-    let (Some(prompt), Some(window)) = (last_prompt_tokens, context_window) else {
-        return false;
-    };
-    window > 0 && prompt >= compaction_trigger(window, reserved)
-}
-
-#[cfg(test)]
-mod seam_tests {
-    use super::*;
-
-    /// Compaction is the session's. A frontend that lets you drive a sub-agent
-    /// pane routes through `run_compaction` too, so the refusal lives here rather
-    /// than in each frontend — it cannot be forgotten at a call site.
-    #[tokio::test]
-    async fn compaction_is_refused_for_a_delegated_sub_agent() {
-        let sub = Arc::new(Mutex::new(
-            Agent::new(hrdr_agent::AgentConfig {
-                is_subagent: true,
-                checkpoints: Some("off".to_string()),
-                ..Default::default()
-            })
-            .unwrap(),
-        ));
-        let err = run_compaction(sub, None)
-            .await
-            .expect_err("a sub-agent's history is not the session's to compact");
-        assert!(err.contains("transient"), "got: {err}");
-    }
-}
+/// The context-usage token count at which auto-compaction fires. Re-exported from
+/// `hrdr-agent`, which owns the math — the agent compacts itself on the same
+/// threshold, and two copies would drift.
+pub use hrdr_agent::{compaction_trigger, should_auto_compact};

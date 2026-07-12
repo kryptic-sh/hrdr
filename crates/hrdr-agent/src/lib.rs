@@ -893,6 +893,35 @@ fn project_lsp_extensions(cwd: &std::path::Path) -> Vec<String> {
     exts
 }
 
+/// The context-usage token count at which proactive compaction fires:
+/// `context_window − reserved`. The reserve is clamped to a quarter of the window
+/// so a `reserved` larger than a small model's context still leaves a sane trigger
+/// (a trigger of 0 would compact every turn).
+///
+/// One owner, used by the agent's own [`Agent::maybe_self_compact`] and by a
+/// frontend's threshold check, so the two cannot drift apart.
+pub fn compaction_trigger(window: u32, reserved: u32) -> u32 {
+    window.saturating_sub(reserved.min(window / 4))
+}
+
+/// Whether context usage warrants compacting before the next request.
+/// `enabled` is the `auto_compact` toggle; `last_prompt_tokens` is the latest
+/// model call's prompt size.
+pub fn should_auto_compact(
+    last_prompt_tokens: Option<u32>,
+    context_window: Option<u32>,
+    reserved: u32,
+    enabled: bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    let (Some(prompt), Some(window)) = (last_prompt_tokens, context_window) else {
+        return false;
+    };
+    window > 0 && prompt >= compaction_trigger(window, reserved)
+}
+
 fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     let mut base = config.clone();
     base.subagents = false;
@@ -911,20 +940,15 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     // Sub-agents never spawn sub-agents, so they never write transcripts.
     base.subagent_transcript_dir = None;
     // ── The session/sub-agent seam ──────────────────────────────────────────
-    // This agent answers one delegated question and is then released. Session-
-    // scoped features must not follow it in.
+    // A sub-agent is an agent. It keeps every capability the main agent has;
+    // what it may *do* is bounded by its type and permissions (`read_only`,
+    // `allowed_tools`, `write_ext`), never by the mere fact that it was
+    // delegated. Only genuinely structural limits live here:
+    //   - it cannot delegate (recursion is bounded to one level), and so
+    //   - it writes no sub-agent transcripts of its own.
+    // Everything else — memory, compaction, guardrails, hooks, the cost ceiling
+    // — is inherited, and the agent works with no UI attached.
     base.is_subagent = true;
-    // NOTE: `memory` stays on, so a sub-agent still *reads* the project's memory
-    // as prompt context — that is just useful background. What it must not do is
-    // *write*: the store is durable and outlives the session, and a transient
-    // agent working from a fragment of the context has no business editing it.
-    // The write path is the `memory` tool, gated on `is_subagent` in `Agent::new`.
-    // Proactive compaction is the session's business: it manages a conversation
-    // the user owns and returns to. A sub-agent's history is short-lived and
-    // nobody resumes it, so summarising it away only loses fidelity mid-task.
-    // (Overflow recovery inside `connect_and_drain` is a different thing and
-    // still applies — that rescues a task that would otherwise fail outright.)
-    base.auto_compact = false;
     base.model = config
         .subagent_model
         .clone()
@@ -3247,6 +3271,10 @@ pub struct Agent {
     /// This is a delegated sub-agent, not the session's agent. Gates every
     /// session-scoped feature — see [`AgentConfig::is_subagent`].
     is_subagent: bool,
+    /// Prompt tokens the last model call actually used — the agent's own view of
+    /// how full its context is, so it can compact before the next request rather
+    /// than after one has already failed. See [`Agent::maybe_self_compact`].
+    last_prompt_tokens: Option<u32>,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -3254,6 +3282,14 @@ pub struct Agent {
     /// Prune old tool output from the history before each request (see
     /// [`AgentConfig::auto_prune`]).
     auto_prune: bool,
+    /// Compact proactively when the context fills ([`AgentConfig::auto_compact`]).
+    auto_compact: bool,
+    /// Headroom left below the window when deciding to compact
+    /// ([`AgentConfig::compaction_reserved`]).
+    compaction_reserved: u32,
+    /// The model's context window, when known — the denominator for the
+    /// compaction trigger.
+    context_window: Option<u32>,
     /// Recent turns kept verbatim through compaction ([`AgentConfig::compaction_tail_turns`]).
     compaction_tail_turns: usize,
     /// Token budget for the kept-verbatim compaction tail
@@ -3544,9 +3580,11 @@ impl Agent {
             .memory
             .then(|| memory_dirs(&config.cwd, config.memory_dir.as_deref()))
             .flatten();
-        // Read yes, write no: a sub-agent gets the memory *context* in its prompt
-        // but not the tool that edits the durable, cross-session store.
-        if config.memory && !config.is_subagent {
+        // Any agent may keep memories — a sub-agent is still an agent. What it may
+        // *do* is bounded by its type and permissions, not by whether it was
+        // delegated: `memory` is a write tool, so the read-only scoping below
+        // already withholds it from a read-only agent.
+        if config.memory {
             tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
@@ -3694,12 +3732,16 @@ impl Agent {
             delegation_runtime,
             live_subagents,
             is_subagent: config.is_subagent,
+            last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
             auto_prune: config.auto_prune,
+            auto_compact: config.auto_compact,
+            compaction_reserved: config.compaction_reserved,
+            context_window: config.context_window,
             compaction_tail_turns: config.compaction_tail_turns,
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
@@ -4424,6 +4466,12 @@ impl Agent {
             self.drain_steering(&steering, &mut on_event);
             // Fold in any detached background sub-agent results that have landed.
             self.drain_background(&mut on_event);
+            // Compact before the next request if this agent manages its own
+            // context and is close to filling it (a small local model reading a
+            // lot of files gets there fast). Cheap pruning below runs first on
+            // the next pass; this is the expensive fallback, so it only fires
+            // once usage actually reaches the trigger.
+            self.maybe_self_compact(&mut on_event).await;
             // Reclaim stale tool output before building the request — the cheap,
             // no-model-call first line of defence against context ballooning
             // (compaction is the expensive fallback). No-op until there's enough
@@ -4485,6 +4533,7 @@ impl Agent {
                 *t += cost_usd.unwrap_or(0.0);
                 (*t > 0.0).then_some(*t)
             };
+            self.last_prompt_tokens = Some(prompt_tokens);
             on_event(AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -4598,13 +4647,50 @@ impl Agent {
 
     /// Run the `turn_end` hooks (both turn exits call this just before
     /// `TurnDone`). Failures surface as notices; nothing here can block.
+    /// Compact this agent's own history when it is close to filling its context
+    /// window — *before* the next request, rather than after one has failed.
+    ///
+    /// Every agent does this for itself — main, sub-agent, headless. Context
+    /// management is the agent's own business, not a feature of whatever is
+    /// watching it: an agent driven by no UI at all (the CLI, a delegated task)
+    /// fills its window exactly like one with a frontend, and a 64k local model
+    /// reading its way through a codebase gets there fast. Without this, such an
+    /// agent's only safety net is overflow recovery, which fires *after* a request
+    /// has already been rejected — paying for the round trip and risking the task.
+    ///
+    /// Failure is non-fatal: if the summarising call fails, the turn proceeds and
+    /// overflow recovery is still there to catch it.
+    async fn maybe_self_compact<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
+        if !should_auto_compact(
+            self.last_prompt_tokens,
+            self.context_window,
+            self.compaction_reserved,
+            self.auto_compact,
+        ) {
+            return;
+        }
+        match self.compact(None).await {
+            Ok((before, after)) if before != after => {
+                // The old reading described the pre-compaction history; keep it
+                // from re-triggering on the next round before fresh usage lands.
+                self.last_prompt_tokens = None;
+                on_event(AgentEvent::Notice(format!(
+                    "context was filling up — compacted {before} → {after} messages"
+                )));
+            }
+            Ok(_) => {
+                // Nothing to compact (the history is already minimal) — clear the
+                // reading anyway so we don't retry this every round.
+                self.last_prompt_tokens = None;
+            }
+            Err(e) => on_event(AgentEvent::Notice(format!(
+                "could not compact a filling context: {e}"
+            ))),
+        }
+    }
+
     async fn fire_turn_end_hooks<F: FnMut(AgentEvent)>(&self, on_event: &mut F) {
-        // `turn_end` marks the end of *the user's* turn. A delegated sub-agent
-        // runs inside that turn — firing the hook per sub-agent would run it N+1
-        // times for one turn, each with a context the user never asked about.
-        // Pre/post-tool hooks still fire for sub-agents: those constrain tool
-        // calls, and a sub-agent makes those too.
-        if self.is_subagent || !self.has_event_hooks(hrdr_tools::HookEvent::TurnEnd) {
+        if !self.has_event_hooks(hrdr_tools::HookEvent::TurnEnd) {
             return;
         }
         let payload = serde_json::json!({
@@ -5730,10 +5816,6 @@ mod tests {
 
         // Session-scoped: stays behind.
         assert!(sub.is_subagent, "the sub-agent knows what it is");
-        assert!(
-            !sub.auto_compact,
-            "proactive compaction manages the user's conversation, not a sub-agent's"
-        );
         assert!(!sub.subagents, "no nesting");
         assert!(
             sub.subagent_transcript_dir.is_none(),
@@ -5749,10 +5831,11 @@ mod tests {
         );
     }
 
-    /// Memory is durable and outlives the session. A sub-agent may *read* it as
-    /// prompt context, but must not be handed the tool that edits it.
+    /// A sub-agent is an agent: it keeps the main agent's capabilities. What it
+    /// may *do* is bounded by its type and permissions — a read-only agent has no
+    /// write tools, memory included — never by the bare fact that it was delegated.
     #[test]
-    fn a_sub_agent_can_read_memory_but_not_write_it() {
+    fn a_sub_agents_capabilities_are_bounded_by_permissions_not_by_being_a_sub_agent() {
         use super::subagent_base_config;
         let main = Agent::new(AgentConfig {
             memory: true,
@@ -5772,20 +5855,31 @@ mod tests {
             "the session's agent is not a sub-agent"
         );
 
-        let sub_cfg = subagent_base_config(&AgentConfig {
+        // A delegated sub-agent keeps it — being delegated is not a permission.
+        let sub = Agent::new(subagent_base_config(&AgentConfig {
+            memory: true,
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(sub.is_subagent());
+        assert!(
+            sub.tools.defs().iter().any(|d| d.function.name == "memory"),
+            "a sub-agent is still an agent"
+        );
+
+        // A *read-only* sub-agent does not — because `memory` is a write tool, and
+        // its permissions say no. That is the axis features are gated on.
+        let mut ro_cfg = subagent_base_config(&AgentConfig {
             memory: true,
             checkpoints: Some("off".to_string()),
             ..Default::default()
         });
+        ro_cfg.read_only = true;
+        let ro = Agent::new(ro_cfg).unwrap();
         assert!(
-            sub_cfg.memory,
-            "memory context still loads into a sub-agent's prompt"
-        );
-        let sub = Agent::new(sub_cfg).unwrap();
-        assert!(sub.is_subagent());
-        assert!(
-            !sub.tools.defs().iter().any(|d| d.function.name == "memory"),
-            "but a transient sub-agent must not edit the durable store"
+            !ro.tools.defs().iter().any(|d| d.function.name == "memory"),
+            "a read-only agent has no write tools, memory included"
         );
     }
 
