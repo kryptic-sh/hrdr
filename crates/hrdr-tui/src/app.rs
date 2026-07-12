@@ -200,8 +200,6 @@ pub(crate) struct App {
     pub(crate) dir: String,
     /// Current git branch, if the cwd is in a repo.
     pub(crate) branch: Option<String>,
-    /// Reasoning-effort label to display.
-    pub(crate) effort: Option<String>,
     /// Icon set for the TUI chrome (status bar glyphs).
     pub(crate) icon_mode: hjkl_icons::IconMode,
     /// Config kept for mid-session provider resolution (the `/model` picker).
@@ -285,11 +283,6 @@ pub(crate) struct App {
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
-    /// Whether auto-compaction is enabled (the `auto_compact` toggle).
-    pub(crate) auto_compact_enabled: bool,
-    /// Tokens reserved below the context window — auto-compaction fires at
-    /// `context_window − compaction_reserved` (opencode's model).
-    pub(crate) compaction_reserved: u32,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
     bell: bool,
     /// Handle to the in-flight turn task; `abort()` cancels it.
@@ -373,8 +366,6 @@ impl App {
         let branch = git_branch(&config.cwd);
         let cwd_for_skills = config.cwd.clone();
         let context_window = config.context_window;
-        let auto_compact = config.auto_compact;
-        let compaction_reserved = config.compaction_reserved;
         let auto_resume = ui.auto_resume;
         let bell = ui.bell;
         let todo_ttl = ui.todo_ttl;
@@ -389,7 +380,6 @@ impl App {
             .as_deref()
             .and_then(hjkl_icons::IconMode::from_config)
             .unwrap_or(hjkl_icons::IconMode::Nerd);
-        let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let provider = config.provider.clone();
         // Shared transcript-dir cell: handed to the agent (so the `task` tool
@@ -466,7 +456,6 @@ impl App {
             running: false,
             dir,
             branch,
-            effort,
             icon_mode,
             cfg,
             config_mtime: current_config_mtime(),
@@ -498,8 +487,6 @@ impl App {
             pending_goto: None,
             pending_scroll_entry: None,
             find: hrdr_app::FindState::default(),
-            auto_compact_enabled: auto_compact,
-            compaction_reserved,
             bell,
             turn_handle: None,
             quit_reap: None,
@@ -1579,9 +1566,21 @@ impl App {
     /// NOT touch the model/provider/endpoint (those are session-scoped).
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
         self.theme = Theme::load(ui.theme.as_deref());
-        self.effort = cfg.effort.clone();
-        self.auto_compact_enabled = cfg.auto_compact;
-        self.compaction_reserved = cfg.compaction_reserved;
+        // Effort and the compaction thresholds are the *agent's* — it publishes them
+        // back into the chrome. Updating a frontend copy instead was how a reload
+        // could move the context gauge while the agent kept its old behaviour.
+        let (effort, auto_compact, reserved) = (
+            cfg.effort.clone(),
+            cfg.auto_compact,
+            cfg.compaction_reserved,
+        );
+        let agent = self.agent.clone();
+        tokio::spawn(async move {
+            let mut a = agent.lock().await;
+            a.set_effort(effort);
+            a.set_auto_compact(auto_compact);
+            a.set_compaction_reserved(reserved);
+        });
         self.bell = ui.bell;
         self.todo_ttl = ui.todo_ttl;
         self.timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());

@@ -81,6 +81,15 @@ pub struct Pane {
     /// *main* agent's spinner and throughput, and a sub-agent grinding away under an
     /// idle main agent showed no loader at all.
     pub turn: hrdr_agent::TurnStats,
+    /// Reasoning effort this agent is running at.
+    pub effort: Option<String>,
+    /// Whether this agent auto-compacts, and the buffer it keeps below its window —
+    /// which is where its context gauge turns red. Per agent: a sub-agent on a
+    /// 64k local model has a different threshold from a main agent on 200k.
+    pub auto_compact: bool,
+    pub compaction_reserved: u32,
+    /// This agent's live TODO list — the one its own `todo` tool writes.
+    pub todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     /// Where the reader is in this conversation, and what they had half-typed to
     /// it.
     ///
@@ -260,6 +269,10 @@ impl Default for PaneSet {
                 status: PaneStatus::Idle,
                 state: SessionState::default(),
                 turn: hrdr_agent::TurnStats::default(),
+                effort: None,
+                auto_compact: true,
+                compaction_reserved: 0,
+                todos: Default::default(),
                 consumed: 0,
                 view: PaneView::default(),
             },
@@ -393,6 +406,10 @@ impl PaneSet {
                     model: e.model.clone(),
                     provider: e.provider.clone(),
                     base_url: e.base_url.clone(),
+                    effort: e.effort.clone(),
+                    auto_compact: e.auto_compact,
+                    compaction_reserved: e.compaction_reserved,
+                    todos: std::sync::Arc::clone(&e.todos),
                     usage: e.usage,
                     turn: e.turn,
                     running: e.running,
@@ -428,6 +445,10 @@ impl PaneSet {
                         status,
                         state: SessionState::default(),
                         turn: hrdr_agent::TurnStats::default(),
+                        effort: None,
+                        auto_compact: true,
+                        compaction_reserved: 0,
+                        todos: Default::default(),
                         consumed: 0,
                         view: PaneView::default(),
                     });
@@ -436,6 +457,10 @@ impl PaneSet {
             };
             pane.status = status;
             pane.turn = s.turn;
+            pane.effort = s.effort.clone();
+            pane.auto_compact = s.auto_compact;
+            pane.compaction_reserved = s.compaction_reserved;
+            pane.todos = std::sync::Arc::clone(&s.todos);
             pane.state.model = s.model.clone();
             pane.state.provider = s.provider.clone();
             pane.state.base_url = s.base_url.clone();
@@ -484,6 +509,10 @@ struct LiveSnapshot {
     model: String,
     provider: Option<String>,
     base_url: String,
+    effort: Option<String>,
+    auto_compact: bool,
+    compaction_reserved: u32,
+    todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     usage: crate::SessionUsage,
     turn: hrdr_agent::TurnStats,
     running: bool,
@@ -881,6 +910,43 @@ mod tests {
         );
     }
 
+    /// Everything that describes an agent comes off *that agent's* entry: its
+    /// effort, its compaction thresholds (which set where its context gauge turns
+    /// red), and its own TODO list. None of it is the frontend's to keep.
+    #[test]
+    fn a_pane_carries_its_own_agents_effort_thresholds_and_todos() {
+        let live = live_with(&[1]);
+        let todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_tools::TodoItem {
+            content: "the sub-agent's own task".to_string(),
+            status: "in_progress".to_string(),
+        }]));
+        live.update(1, |e| {
+            e.effort = Some("high".into());
+            e.auto_compact = false;
+            e.compaction_reserved = 4_000;
+            e.todos = std::sync::Arc::clone(&todos);
+        });
+
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        panes.focus(PaneId::Sub(1));
+
+        let p = panes.active_pane();
+        assert_eq!(p.effort.as_deref(), Some("high"));
+        assert!(!p.auto_compact, "its own auto-compact setting");
+        assert_eq!(p.compaction_reserved, 4_000, "its own red-line");
+        assert_eq!(
+            p.todos.lock().unwrap()[0].content,
+            "the sub-agent's own task",
+            "the TODO panel shows the list of the agent on screen"
+        );
+
+        // And the main agent's are untouched by any of it.
+        let m = panes.main();
+        assert_eq!(m.effort, None);
+        assert!(m.todos.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn focusing_a_sub_agent_that_is_gone_falls_back_to_main() {
         let mut panes = PaneSet::new();
@@ -910,6 +976,10 @@ mod tests {
                 model: "m".to_string(),
                 provider: None,
                 base_url: String::new(),
+                effort: None,
+                auto_compact: true,
+                compaction_reserved: 0,
+                todos: Default::default(),
                 usage: hrdr_agent::AgentUsage::default(),
                 events: hrdr_agent::event_log(),
                 turn: hrdr_agent::TurnStats::default(),

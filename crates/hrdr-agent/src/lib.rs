@@ -652,6 +652,10 @@ fn spawn_background(
                     model: model_for_live,
                     provider: provider_for_live,
                     base_url: base_url_for_live,
+                    effort: None,
+                    auto_compact: true,
+                    compaction_reserved: 0,
+                    todos: Default::default(),
                     usage: usage_for_live,
                     events: subagent_live::event_log(),
                     turn: TurnStats::default(),
@@ -1534,6 +1538,10 @@ impl hrdr_tools::Tool for SubagentTool {
             model: model.clone(),
             provider: cfg_provider,
             base_url: base_url_for_live,
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            todos: Default::default(),
             usage: usage_for_live,
             events: subagent_live::event_log(),
             turn: TurnStats::default(),
@@ -4069,6 +4077,10 @@ impl Agent {
     /// while the agent went on talking to the endpoint it launched with, and the bar
     /// would confidently name a provider the request never went to.
     pub fn attach_live(&mut self, live: LiveSubagents, key: u64) {
+        // The agent's own TODO list, so a frontend showing this agent shows *its*
+        // list rather than the main agent's.
+        let todos = Arc::clone(&self.ctx.todos);
+        live.update(key, |e| e.todos = todos);
         self.live_home = Some((live, key));
         self.publish_delegation_runtime();
     }
@@ -4102,11 +4114,16 @@ impl Agent {
         let model = self.client.model.clone();
         let provider = self.provider.clone();
         let base_url = self.client.base_url().to_string();
+        let effort = self.client.effort().map(str::to_string);
         let window = self.context_window;
+        let (auto_compact, reserved) = (self.auto_compact, self.compaction_reserved);
         live.update(*key, |e| {
             e.model = model;
             e.provider = provider;
             e.base_url = base_url;
+            e.effort = effort;
+            e.auto_compact = auto_compact;
+            e.compaction_reserved = reserved;
             // A model switch invalidates the window until it is re-learned; keep
             // showing the last known figure rather than blanking the gauge.
             if window.is_some() {
@@ -4259,6 +4276,23 @@ impl Agent {
     /// The context window in force, if known.
     pub fn context_window(&self) -> Option<u32> {
         self.context_window
+    }
+
+    /// Whether this agent compacts itself when its context fills, and the buffer it
+    /// keeps below its window — which is also the threshold its context gauge turns
+    /// red at.
+    ///
+    /// Live-changeable (`/reload`). Before this the frontend kept its own copies and
+    /// a reload updated only those: the gauge moved, while the agent went on
+    /// compacting (or not) exactly as it had at launch.
+    pub fn set_auto_compact(&mut self, on: bool) {
+        self.auto_compact = on;
+        self.publish_chrome();
+    }
+
+    pub fn set_compaction_reserved(&mut self, tokens: u32) {
+        self.compaction_reserved = tokens;
+        self.publish_chrome();
     }
 
     /// Working directory the tools operate in.

@@ -2827,6 +2827,10 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         model: "haiku".to_string(),
         provider: None,
         base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
@@ -2895,6 +2899,10 @@ async fn the_input_box_routes_to_the_focused_agent() {
         model: "haiku".to_string(),
         provider: None,
         base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
@@ -2988,6 +2996,10 @@ async fn the_agent_list_switches_the_focused_agent() {
         model: "haiku".to_string(),
         provider: Some("claude".to_string()),
         base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
@@ -3124,6 +3136,10 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         model: "qwen3".to_string(),
         provider: Some("local".to_string()),
         base_url: "http://127.0.0.1:8080/v1".to_string(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
         // A small local window, most of it already used — nothing like the
         // parent's.
         usage: hrdr_agent::AgentUsage {
@@ -3675,6 +3691,10 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         model: "haiku".to_string(),
         provider: None,
         base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
@@ -4907,7 +4927,16 @@ async fn effort_picker_lists_levels_default_first_and_applies() {
     h.type_str("medium");
     h.press(KeyCode::Enter);
     assert!(h.app.effort_selector.is_none(), "Enter closes the picker");
-    assert_eq!(h.app.effort.as_deref(), Some("medium"));
+    // Effort is the agent's; it publishes it into the pane the frontend renders.
+    let effort_of = |h: &Harness| h.app.panes.active_pane().effort.clone();
+    for _ in 0..20 {
+        if effort_of(&h).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        h.app.sync_panes();
+    }
+    assert_eq!(effort_of(&h).as_deref(), Some("medium"));
     let screen = h.render();
     assert!(
         screen.contains("effort → Medium (medium)"),
@@ -4917,7 +4946,14 @@ async fn effort_picker_lists_levels_default_first_and_applies() {
     // Reopen and pick Default: the override clears.
     h.submit("/effort").await;
     h.press(KeyCode::Enter); // Default is the first row
-    assert_eq!(h.app.effort, None, "Default clears the override");
+    for _ in 0..20 {
+        if effort_of(&h).is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        h.app.sync_panes();
+    }
+    assert_eq!(effort_of(&h), None, "Default clears the override");
 }
 
 /// Argument completion: after a command name + space, the popup offers the

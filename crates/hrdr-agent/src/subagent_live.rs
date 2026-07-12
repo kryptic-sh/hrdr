@@ -127,6 +127,16 @@ pub struct LiveSubagent {
     /// Endpoint it is talking to — it need not be the parent's (a sub-agent can
     /// be delegated to a different provider entirely).
     pub base_url: String,
+    /// Reasoning effort in force for *this* agent.
+    pub effort: Option<String>,
+    /// Whether this agent compacts itself when its context fills, and the buffer it
+    /// keeps below the window. Both are per-agent — a sub-agent on a small local
+    /// model has its own — and they set where its context gauge turns red.
+    pub auto_compact: bool,
+    pub compaction_reserved: u32,
+    /// This agent's TODO list — the live one its `todo` tool writes. Every agent has
+    /// its own; a frontend showing this agent shows *its* list.
+    pub todos: Arc<Mutex<Vec<hrdr_tools::TodoItem>>>,
     /// Its own token/cost counters, folded from every call it makes — by
     /// [`LiveSubagents::send_prompt`] for a turn the user drove, and by the `task`
     /// tool for the delegated run. A frontend showing this agent reads its usage
@@ -232,6 +242,12 @@ impl LiveSubagents {
                 model,
                 provider,
                 base_url,
+                // Republished by the agent itself the moment it attaches
+                // (`Agent::attach_live`) — it is the source of these, not us.
+                effort: None,
+                auto_compact: true,
+                compaction_reserved: 0,
+                todos: Default::default(),
                 usage,
                 events: event_log(),
                 turn: crate::TurnStats::default(),
@@ -496,6 +512,10 @@ mod tests {
             model: "m".to_string(),
             provider: None,
             base_url: String::new(),
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            todos: Default::default(),
             usage: crate::AgentUsage::default(),
             events: event_log(),
             turn: crate::TurnStats::default(),

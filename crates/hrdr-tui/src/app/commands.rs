@@ -433,7 +433,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.persist_setting(key, value);
     }
     fn effort(&self) -> Option<String> {
-        self.app.effort.clone()
+        self.app.panes.active_pane().effort.clone()
     }
     fn session_label(&self) -> Option<String> {
         Some(self.app.state().name.clone()).filter(|n| !n.is_empty())
@@ -454,7 +454,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.panes.active_pane().state.usage.cost_usd
     }
     fn set_effort(&mut self, label: String) {
-        self.app.effort = Some(label);
+        // Effort is the agent's; it publishes the change back into the chrome.
+        let agent = self.app.active_agent();
+        tokio::spawn(async move {
+            agent.lock().await.set_effort(Some(label));
+        });
     }
     fn cwd_changed(&mut self, new: &std::path::Path) {
         self.app.dir = hrdr_app::display_dir(new);
@@ -1197,12 +1201,13 @@ impl super::App {
             return;
         };
         self.effort_selector = None;
-        self.effort = c.value.clone();
         match &c.value {
             Some(v) => self.persist_setting("effort", hrdr_agent::ConfigValue::Str(v)),
             None => self.unpersist_setting("effort"),
         }
-        let agent = self.agent.clone();
+        // The agent you are looking at, like every other command — and the agent
+        // publishes the new effort itself, so the chrome follows without a copy.
+        let agent = self.active_agent();
         let value = c.value.clone();
         tokio::spawn(async move {
             agent.lock().await.set_effort(value);

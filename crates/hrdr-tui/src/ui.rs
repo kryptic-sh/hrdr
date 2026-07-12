@@ -51,7 +51,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
     // Snapshot the TODO list while briefly holding the lock; the height and
     // the renderer both use the same snapshot.
-    let todos = app.todos.lock().map(|t| t.clone()).unwrap_or_default();
+    // The TODO list belongs to the agent on screen — every agent has its own, and
+    // the `todo` tool a sub-agent calls writes to *its* list, not the main one's.
+    let todos = app
+        .panes
+        .active_pane()
+        .todos
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
     let todo_height = if todos.is_empty() {
         0
     } else {
@@ -1335,12 +1343,14 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
         tokens_out: pane.state.usage.tokens_out,
         ctx_used: pane.state.usage.ctx_used(),
         context_window: pane.state.usage.context_window,
-        auto_compact_enabled: app.auto_compact_enabled,
-        compaction_reserved: app.compaction_reserved,
+        // Both belong to the agent being shown: they set where *its* gauge turns
+        // red, and a sub-agent on a 64k local model has its own threshold.
+        auto_compact_enabled: pane.auto_compact,
+        compaction_reserved: pane.compaction_reserved,
         provider: pane.state.provider.as_deref(),
         model: pane.model(),
         session: Some(session.as_str()),
-        effort: app.effort.as_deref(),
+        effort: pane.effort.as_deref(),
         ttft,
         nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,
     };
@@ -1728,7 +1738,7 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
         pane.state.provider.clone().unwrap_or_else(|| "—".into()),
         val,
     );
-    if let Some(e) = &app.effort {
+    if let Some(e) = &pane.effort {
         field("effort", e.clone(), val);
     }
     field("cwd", app.dir.clone(), val);
