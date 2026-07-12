@@ -154,6 +154,13 @@ pub fn time_from_unix(secs: i64, fallback: DateTime<Local>) -> DateTime<Local> {
         .unwrap_or(fallback)
 }
 
+/// A `SystemTime` as a local timestamp. The agent domain has no chrono, so a
+/// turn's wall-clock start ([`hrdr_agent::TurnStats::started_at`]) crosses over as
+/// a `SystemTime` and is rendered here.
+pub fn time_from_system(t: std::time::SystemTime) -> DateTime<Local> {
+    DateTime::<Local>::from(t)
+}
+
 /// `DateTime<Local>` as unix seconds, for [`Entry`]'s `time` field.
 mod unix_time {
     use chrono::{DateTime, Local, TimeZone};

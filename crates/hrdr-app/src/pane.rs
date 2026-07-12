@@ -73,6 +73,14 @@ pub struct Pane {
     /// transcript is rebuilt from the agent's own record rather than assembled from
     /// whatever the frontend happened to be listening for at the time.
     consumed: usize,
+    /// The clock on this agent's current turn — what its loader shows: whether it
+    /// is inferring, how long it has worked, its throughput, its time-to-first-token.
+    ///
+    /// Per agent, because a turn is per agent. The loader used to be the main
+    /// agent's no matter who was on screen: watching a sub-agent work showed the
+    /// *main* agent's spinner and throughput, and a sub-agent grinding away under an
+    /// idle main agent showed no loader at all.
+    pub turn: hrdr_agent::TurnStats,
     /// Where the reader is in this conversation, and what they had half-typed to
     /// it.
     ///
@@ -251,6 +259,7 @@ impl Default for PaneSet {
                 id: PaneId::Main,
                 status: PaneStatus::Idle,
                 state: SessionState::default(),
+                turn: hrdr_agent::TurnStats::default(),
                 consumed: 0,
                 view: PaneView::default(),
             },
@@ -385,6 +394,7 @@ impl PaneSet {
                     provider: e.provider.clone(),
                     base_url: e.base_url.clone(),
                     usage: e.usage,
+                    turn: e.turn,
                     running: e.running,
                     done: e.done,
                     // A finished `task` block shows *what was delegated to*, not the
@@ -417,6 +427,7 @@ impl PaneSet {
                         id: PaneId::Sub(s.key),
                         status,
                         state: SessionState::default(),
+                        turn: hrdr_agent::TurnStats::default(),
                         consumed: 0,
                         view: PaneView::default(),
                     });
@@ -424,6 +435,7 @@ impl PaneSet {
                 }
             };
             pane.status = status;
+            pane.turn = s.turn;
             pane.state.model = s.model.clone();
             pane.state.provider = s.provider.clone();
             pane.state.base_url = s.base_url.clone();
@@ -473,6 +485,7 @@ struct LiveSnapshot {
     provider: Option<String>,
     base_url: String,
     usage: crate::SessionUsage,
+    turn: hrdr_agent::TurnStats,
     running: bool,
     done: bool,
     /// The `task` call that spawned this agent, if it was delegated.
@@ -899,6 +912,7 @@ mod tests {
                 base_url: String::new(),
                 usage: hrdr_agent::AgentUsage::default(),
                 events: hrdr_agent::event_log(),
+                turn: hrdr_agent::TurnStats::default(),
                 kind: SubagentKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: hrdr_agent::steering_queue(),

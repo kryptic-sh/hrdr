@@ -43,6 +43,12 @@ fn subagent_scroll(items: usize, height: u16) -> u16 {
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    // Bring every pane up to date with its agent *before* anything reads one: the
+    // loader's height, the status bar and the transcript must all describe the same
+    // frame. (This is also what pins the pane being viewed, so the agent does not
+    // release it out from under the reader.)
+    app.sync_panes();
+
     // Snapshot the TODO list while briefly holding the lock; the height and
     // the renderer both use the same snapshot.
     let todos = app.todos.lock().map(|t| t.clone()).unwrap_or_default();
@@ -52,14 +58,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
-    // The loader heads the input section while the *model* works. It hides while
-    // its tool calls run: the model is idle then, and a spinner would claim
-    // otherwise. The running tool's own block carries the `…` mark.
-    let loader_height: u16 = if app.inferring || app.compacting {
-        1
-    } else {
-        0
-    };
+    // The loader heads the input section while **the agent on screen** works. It
+    // hides while that agent's tool calls run: the model is idle then, and a spinner
+    // would claim otherwise (the running tool's own block carries the `…` mark), and
+    // it hides entirely when the agent you are looking at is not working — even if
+    // another one is.
+    let working = app.panes.active_pane().turn.inferring()
+        || (app.compacting && app.panes.active().is_main());
+    let loader_height: u16 = if working { 1 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus the horizontal padding on both sides; the
@@ -70,12 +76,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
         + 2;
 
-    // Built once per frame; both the layout height and the renderer use it
-    // (each sub-agent's log is cloned into the items, so don't recompute).
-    // Reconcile the agent list against the agent's live sub-agents first: this is
-    // also what pins the pane being viewed, so the agent does not release it out
-    // from under the reader.
-    app.sync_panes();
+    // Built once per frame; both the layout height and the renderer use it.
     // The switcher lists every agent — main first, so there is always a way back.
     // It stays hidden while the main agent is the only one: a one-row list of the
     // thing you are already looking at is noise.
@@ -1149,22 +1150,19 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// The inference loader: spinner + live stats (context size, in/out ratio,
 /// token throughput) shown above the input while a turn runs.
 fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
+    // The loader describes **the agent you are looking at**, and the clock it reads
+    // is that agent's own. Watching a sub-agent work used to show the *main* agent's
+    // spinner, throughput and elapsed time — and a sub-agent grinding away under an
+    // idle main agent showed no loader at all.
+    let pane = app.panes.active_pane();
+    let turn = &pane.turn;
     // The model's own working time: the tool calls it waited on don't count, so
     // the clock freezes while they run rather than inflating the turn.
-    let elapsed = app.infer_elapsed();
+    let elapsed = turn.infer_elapsed();
     let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+    let speed = turn.tok_per_sec();
 
-    // Live throughput over that same working time — tokens per second of
-    // inference, not per second of wall clock.
-    let speed = match app.out_tokens {
-        0 => 0.0,
-        n => {
-            let secs = elapsed.as_secs_f64();
-            if secs > 0.0 { n as f64 / secs } else { 0.0 }
-        }
-    };
-
-    let ctx = match app.panes.active_pane().state.usage.last() {
+    let ctx = match pane.state.usage.last() {
         Some((prompt, completion)) => {
             let ratio = if completion > 0 {
                 prompt as f64 / completion as f64
@@ -1177,35 +1175,33 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // "started …" segment, respecting the timestamp style (omitted when off).
-    let started = match (app.timestamp_style, app.turn_started_at) {
+    let started_at = turn.started_at.map(hrdr_app::time_from_system);
+    let started = match (app.timestamp_style, started_at) {
         (TimestampStyle::None, _) | (_, None) => String::new(),
         (TimestampStyle::Relative, Some(t)) => format!("  ·  started {}", relative_time(t)),
         (TimestampStyle::Exact, Some(t)) => format!("  ·  started {}", t.format("%H:%M")),
     };
-    let text = if app.compacting {
+    // Compaction is the session's agent summarizing itself — not something a
+    // sub-agent's pane should claim to be doing.
+    let text = if app.compacting && pane.id.is_main() {
         format!(
             " {frame} compacting context — summarizing the conversation…  ·  {:.1}s{started}",
             elapsed.as_secs_f64(),
         )
     } else {
         // Time to first token: how long the provider took to start streaming.
-        let ttft = match (app.turn_started, app.first_token_at) {
-            (Some(start), Some(first)) => {
-                format!(
-                    "  ·  ttft {:.2}s",
-                    first.duration_since(start).as_secs_f64()
-                )
-            }
-            _ => String::new(),
+        let ttft = match turn.ttft() {
+            Some(secs) => format!("  ·  ttft {secs:.2}s"),
+            None => String::new(),
         };
-        let phase = if app.first_token_at.is_some() {
+        let phase = if turn.first_token_at.is_some() {
             "generating"
         } else {
             "inferring"
         };
         format!(
             " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out){ttft}  ·  {:.1}s{started}",
-            app.out_tokens,
+            turn.out_tokens,
             elapsed.as_secs_f64(),
         )
     };
@@ -1326,13 +1322,9 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
     // that always reported the main agent's figures was describing a conversation
     // that wasn't on screen.
     let pane = app.panes.active_pane();
-    // Timing is the *turn's*, and only the main agent's turn is clocked here — so
-    // it is shown only while its own pane is up, rather than mislabelled as a
-    // sub-agent's.
-    let ttft = match (pane.id.is_main(), app.turn_started, app.first_token_at) {
-        (true, Some(start), Some(first)) => Some(first.duration_since(start).as_secs_f64()),
-        _ => None,
-    };
+    // Its turn's time-to-first-token — every agent is clocked, so this is the one
+    // on screen rather than the main agent's borrowed for it.
+    let ttft = pane.turn.ttft();
     // The session name is the session's, whichever agent is being viewed — it is
     // what the file on disk is called.
     let session = truncate_chars(&app.state().name, 28);

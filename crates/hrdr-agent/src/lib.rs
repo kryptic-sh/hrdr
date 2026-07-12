@@ -36,6 +36,8 @@ pub use subagent_live::{
     age_completed_todos, event_log,
 };
 mod subagent_transcript;
+mod turn;
+pub use turn::TurnStats;
 mod usage;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
@@ -649,6 +651,7 @@ fn spawn_background(
                     base_url: base_url_for_live,
                     usage: usage_for_live,
                     events: subagent_live::event_log(),
+                    turn: TurnStats::default(),
                     kind: SubagentKind::Background,
                     agent: Arc::clone(&sub),
                     steering: Arc::clone(&steering),
@@ -659,6 +662,7 @@ fn spawn_background(
                 });
                 // Open its record with the task it was given, so its transcript shows
                 // the question and not just the answer.
+                live.begin_turn(live_key);
                 live.record(live_key, &AgentEvent::Steered(prompt.clone()));
                 let _run_guard = RunGuard::new(live.clone(), live_key);
                 let usage_live = live.clone();
@@ -1526,6 +1530,7 @@ impl hrdr_tools::Tool for SubagentTool {
             base_url: base_url_for_live,
             usage: usage_for_live,
             events: subagent_live::event_log(),
+            turn: TurnStats::default(),
             kind: SubagentKind::Blocking,
             agent: Arc::clone(&sub),
             steering: Arc::clone(&steering),
@@ -1536,6 +1541,7 @@ impl hrdr_tools::Tool for SubagentTool {
         });
         // Open its record with the task it was given, so its transcript shows the
         // question and not just the answer.
+        self.live.begin_turn(key);
         self.live.record(key, &AgentEvent::Steered(prompt.clone()));
 
         // Cancelling the parent turn drops this future mid-`await`; the guard is

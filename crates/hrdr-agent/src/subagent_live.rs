@@ -144,6 +144,11 @@ pub struct LiveSubagent {
     /// prose. Recording the events themselves fixes both, and means a frontend
     /// that attaches late still sees the whole run.
     pub events: EventLog,
+    /// The clock on its current turn: how long the model has worked, its
+    /// throughput, whether it is inferring or waiting on a tool. Every agent has
+    /// turns, so every agent has one — a frontend showing this agent shows *its*
+    /// loader, not the main agent's.
+    pub turn: crate::TurnStats,
     pub kind: SubagentKind,
     /// The sub-agent itself, retained so a frontend can drive a further turn on
     /// it once its delegated task has landed.
@@ -229,6 +234,7 @@ impl LiveSubagents {
                 base_url,
                 usage,
                 events: event_log(),
+                turn: crate::TurnStats::default(),
                 kind: SubagentKind::Blocking,
                 agent,
                 steering,
@@ -260,10 +266,29 @@ impl LiveSubagents {
     pub fn record(&self, key: u64, ev: &crate::AgentEvent) {
         self.update(key, |e| {
             e.usage.record_event(ev);
+            e.turn.record(ev);
             if let Ok(mut log) = e.events.lock() {
                 log.push(ev.clone());
             }
         });
+    }
+
+    /// A turn is starting on agent `key`: start its clock.
+    pub fn begin_turn(&self, key: u64) {
+        self.update(key, |e| {
+            e.running = true;
+            e.turn.begin();
+        });
+    }
+
+    /// Agent `key`'s turn is over: stop its clock.
+    pub fn end_turn(&self, key: u64) {
+        self.update(key, |e| e.turn.end());
+    }
+
+    /// A snapshot of `key`'s turn clock, for the frontend showing that agent.
+    pub fn turn(&self, key: u64) -> Option<crate::TurnStats> {
+        self.with(|v| v.iter().find(|e| e.key == key).map(|e| e.turn))
     }
 
     /// Agent `key`'s events from `from` onwards, and the new cursor.
@@ -348,7 +373,7 @@ impl LiveSubagents {
         // record shows the reply and not the question, and a pane rebuilt from that
         // record would too.
         self.record(key, &crate::AgentEvent::Steered(input.clone()));
-        self.update(key, |e| e.running = true);
+        self.begin_turn(key);
         let live = self.clone();
         tokio::spawn(async move {
             // The guard marks it idle again on every exit — including cancellation,
@@ -446,6 +471,8 @@ impl Drop for RunGuard {
         self.live.update(self.key, |e| {
             e.running = false;
             e.done = true;
+            // Stop its clock too, or a cancelled agent's loader spins forever.
+            e.turn.end();
         });
     }
 }
@@ -471,6 +498,7 @@ mod tests {
             base_url: String::new(),
             usage: crate::AgentUsage::default(),
             events: event_log(),
+            turn: crate::TurnStats::default(),
             kind: SubagentKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),

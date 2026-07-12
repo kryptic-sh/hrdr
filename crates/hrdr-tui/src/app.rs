@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -353,32 +353,8 @@ pub(crate) struct App {
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
     // ---- live inference stats (for the loader above the input) ----
-    /// When the current turn started (for elapsed time + spinner).
-    pub(crate) turn_started: Option<Instant>,
-    /// Whether the *model* is working right now: streaming, or awaited before it
-    /// starts. `false` while its tool calls run — the model is idle then, so the
-    /// loader hides and its clock stops. Distinct from [`Self::running`], which
-    /// stays `true` for the whole turn.
-    pub(crate) inferring: bool,
-    /// Tool calls in flight this round. Inference resumes when it returns to 0:
-    /// a turn can issue several tools at once, and only the last one finishing
-    /// hands control back to the model.
-    tools_running: usize,
-    /// Inference time banked from earlier rounds of this turn.
-    infer_banked: Duration,
-    /// When the current inference stretch began; `None` while paused.
-    infer_started: Option<Instant>,
-    /// Wall-clock start of the current turn (for the loader's "started …").
-    pub(crate) turn_started_at: Option<chrono::DateTime<chrono::Local>>,
-    /// When the first output token of the turn arrived (for tok/s).
-    pub(crate) first_token_at: Option<Instant>,
     /// When the current thinking block started (for the "Thought:" footer).
     pub(crate) reasoning_start: Option<Instant>,
-    /// Streamed output deltas this turn (≈ tokens).
-    pub(crate) out_tokens: usize,
-    /// Prompt-cache hits + reasoning tokens from the latest call, if reported.
-    pub(crate) last_cached_tokens: Option<u32>,
-    pub(crate) last_reasoning_tokens: Option<u32>,
     tx: mpsc::UnboundedSender<TurnMsg>,
     pub(crate) rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     pub(crate) should_quit: bool,
@@ -537,22 +513,12 @@ impl App {
             todo_ttl,
             queue: VecDeque::new(),
             steering: hrdr_agent::steering_queue(),
-            inferring: false,
-            tools_running: 0,
-            infer_banked: Duration::ZERO,
-            infer_started: None,
             follow_button: None,
             tool_hits: Vec::new(),
             background_tasks,
             subagent_hits: Vec::new(),
             quit_armed: false,
-            turn_started: None,
-            turn_started_at: None,
-            first_token_at: None,
             reasoning_start: None,
-            out_tokens: 0,
-            last_cached_tokens: None,
-            last_reasoning_tokens: None,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -1691,8 +1657,7 @@ impl App {
         self.running = false;
         self.pending_init = false;
         self.compacting = false;
-        self.pause_inference();
-        self.tools_running = 0;
+        self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
         let dropped = self.queue.len();
         self.queue.clear();
         // Undelivered steering would otherwise leak into the next turn.
@@ -1744,15 +1709,10 @@ impl App {
     fn launch_turn(&mut self, input: String) {
         self.reserve_session_id(&input);
         self.running = true;
-        self.turn_started = Some(Instant::now());
-        self.turn_started_at = Some(chrono::Local::now());
-        self.first_token_at = None;
         self.reasoning_start = None;
-        self.out_tokens = 0;
-        self.tools_running = 0;
-        self.infer_banked = Duration::ZERO;
-        self.infer_started = None;
-        self.resume_inference();
+        // The turn clock belongs to the agent whose turn it is — the registry keeps
+        // it, so a frontend showing that agent shows its loader.
+        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
@@ -1786,7 +1746,11 @@ impl App {
     /// Ring the terminal bell when a turn finishes (shared gate: enabled +
     /// ran at least [`hrdr_app::BELL_MIN_SECS`], so quick replies stay silent).
     fn maybe_bell(&self) {
-        let elapsed = self.turn_started.map(|t| t.elapsed().as_secs_f64());
+        let elapsed = self
+            .live_subagents
+            .turn(hrdr_agent::MAIN_KEY)
+            .and_then(|t| t.started)
+            .map(|t| t.elapsed().as_secs_f64());
         if hrdr_app::should_bell(self.bell, elapsed) {
             use std::io::Write;
             let mut out = std::io::stdout();
@@ -1799,16 +1763,9 @@ impl App {
     fn spawn_compaction(&mut self, instructions: Option<String>) {
         self.running = true;
         self.compacting = true;
-        self.turn_started = Some(Instant::now());
-        self.turn_started_at = Some(chrono::Local::now());
-        self.first_token_at = None;
         self.reasoning_start = None;
-        self.out_tokens = 0;
         // Summarizing is the model working: its own clock, no tools.
-        self.tools_running = 0;
-        self.infer_banked = Duration::ZERO;
-        self.infer_started = None;
-        self.resume_inference();
+        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
         // Compaction acts on the conversation you are looking at. `run_compaction`
         // takes any agent — a sub-agent's history fills a context window like any
         // other, and it is the agent's own to manage.
@@ -1877,8 +1834,7 @@ impl App {
                 }
                 self.turn_handle = None;
                 self.running = false;
-                self.pause_inference();
-                self.tools_running = 0;
+                self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
                 if let Some(e) = err {
@@ -1958,12 +1914,10 @@ impl App {
                 self.turn_handle = None;
                 self.running = false;
                 self.compacting = false;
-                self.pause_inference();
+                self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
                 self.state_mut().usage.set_last(None);
-                self.last_cached_tokens = None;
-                self.last_reasoning_tokens = None;
                 self.push_entry(Entry::system(hrdr_app::compaction_message(&res)));
                 if res.is_ok() {
                     self.autosave();
@@ -1980,43 +1934,17 @@ impl App {
     /// Format the final stats line for the just-finished turn, if it produced
     /// any output.
     fn turn_stats(&self) -> Option<String> {
-        let started = self.turn_started?;
+        let turn = self.live_subagents.turn(hrdr_agent::MAIN_KEY)?;
+        turn.started?;
         hrdr_app::turn_stats_line(
             // The model's working time, excluding the tool calls it waited on.
-            self.infer_elapsed().as_secs_f64(),
-            self.first_token_at
-                .map(|t0| t0.duration_since(started).as_secs_f64()),
-            self.out_tokens,
+            turn.infer_elapsed().as_secs_f64(),
+            turn.ttft(),
+            turn.out_tokens,
             self.state().usage.last(),
-            self.last_cached_tokens,
-            self.last_reasoning_tokens,
+            turn.last_cached_tokens,
+            turn.last_reasoning_tokens,
         )
-    }
-
-    /// The model went idle: bank the inference time and hide the loader. Called
-    /// when the first tool of a round starts, and when a turn ends.
-    fn pause_inference(&mut self) {
-        if let Some(t) = self.infer_started.take() {
-            self.infer_banked += t.elapsed();
-        }
-        self.inferring = false;
-    }
-
-    /// The model is working again: the turn just began, or its last tool call
-    /// returned and the agent is about to request the next response.
-    fn resume_inference(&mut self) {
-        self.infer_started.get_or_insert_with(Instant::now);
-        self.inferring = true;
-    }
-
-    /// How long the model has actually worked this turn: banked stretches plus
-    /// the one in progress. Excludes time spent waiting on tool calls.
-    pub(crate) fn infer_elapsed(&self) -> Duration {
-        self.infer_banked
-            + self
-                .infer_started
-                .map(|t| t.elapsed())
-                .unwrap_or(Duration::ZERO)
     }
 
     /// A detached sub-agent finished while nothing was running: wake the model so
@@ -2050,7 +1978,7 @@ impl App {
     /// Start the inference clock from a test, without spawning a real turn.
     #[cfg(test)]
     pub(crate) fn resume_inference_for_test(&mut self) {
-        self.resume_inference();
+        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     }
 
     /// Apply a `/model` pick without driving the picker's UI — the same
@@ -2065,14 +1993,6 @@ impl App {
         let mut host = commands::TuiHost { app: self };
         hrdr_app::apply_choice(&mut host, provider, model.to_string(), window)
             .expect("the model switch is applied");
-    }
-
-    /// Count a streamed delta toward the live tok/s stats.
-    fn count_token(&mut self) {
-        if self.first_token_at.is_none() {
-            self.first_token_at = Some(Instant::now());
-        }
-        self.out_tokens += 1;
     }
 
     /// Record how long the last reasoning block took, when thinking ends. The
@@ -2102,8 +2022,8 @@ impl App {
     /// "what does this event do to a conversation", and it does not live in a
     /// frontend.
     ///
-    /// What is left here is what is genuinely the terminal's: the turn clock, the
-    /// loader, the stats line, and writing the session file.
+    /// What is left here is what is genuinely the terminal's: writing the session
+    /// file, and the wall-clock it holds for a reasoning block's duration.
     fn apply_event(&mut self, ev: AgentEvent) {
         // A steered message is displayed as the user typed it, not in its
         // `@file`-expanded form — the expansion is for the model, not the reader.
@@ -2114,35 +2034,9 @@ impl App {
             other => other,
         };
 
-        // ── the terminal's own bookkeeping ────────────────────────────────────
-        match &ev {
-            AgentEvent::Text(_) | AgentEvent::Reasoning(_) => self.count_token(),
-            AgentEvent::Usage {
-                cached_prompt_tokens,
-                reasoning_tokens,
-                ..
-            } => {
-                self.last_cached_tokens = *cached_prompt_tokens;
-                self.last_reasoning_tokens = *reasoning_tokens;
-            }
-            AgentEvent::ToolStart { .. } => {
-                // The model has handed off: it is idle until every tool of this
-                // round returns. Stop its clock and hide the loader.
-                self.tools_running += 1;
-                if self.tools_running == 1 {
-                    self.pause_inference();
-                }
-            }
-            AgentEvent::ToolEnd { .. } => {
-                // The last tool of the round returned: the agent is about to ask
-                // the model again, so it is working from here.
-                self.tools_running = self.tools_running.saturating_sub(1);
-                if self.tools_running == 0 && self.running {
-                    self.resume_inference();
-                }
-            }
-            AgentEvent::History(messages) => self.persist_mid_turn(messages.clone()),
-            _ => {}
+        // Mid-turn durability: the agent committed a round and sent its history.
+        if let AgentEvent::History(messages) = &ev {
+            self.persist_mid_turn(messages.clone());
         }
         // Thinking time is wall-clock, which only the frontend is holding. Stamp it
         // on the open block *before* the event is folded: the reducer closes an
@@ -2153,7 +2047,11 @@ impl App {
             self.finish_reasoning();
         }
 
-        // ── the agent's own record, which its pane is built from ──────────────
+        // ── the agent's own record: its transcript, its counters, its turn clock ──
+        // `record` folds the event into all three, for any agent. The loader, the
+        // throughput and the time-to-first-token shown for this agent come from
+        // there, so they are *this* agent's — not the main agent's borrowed by
+        // whatever pane happens to be on screen.
         self.live_subagents.record(hrdr_agent::MAIN_KEY, &ev);
         self.sync_panes();
     }

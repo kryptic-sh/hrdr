@@ -2762,6 +2762,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -2829,6 +2830,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: steering.clone(),
@@ -2921,6 +2923,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -3059,6 +3062,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
             cost_usd: 0.0,
         },
         events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -3513,9 +3517,16 @@ async fn the_loader_stops_while_the_models_tools_run() {
 
     let mut h = Harness::new(vec![]).await;
     h.app.running = true;
-    h.app.turn_started = Some(std::time::Instant::now());
     h.app.resume_inference_for_test();
-    assert!(h.app.inferring, "the model works as the turn opens");
+    // The clock is the *agent's*, kept on its registry entry — the main agent's is
+    // read exactly the way a sub-agent's is.
+    let turn = |h: &Harness| {
+        h.app
+            .live_subagents
+            .turn(hrdr_agent::MAIN_KEY)
+            .expect("the session's agent is in the registry")
+    };
+    assert!(turn(&h).inferring(), "the model works as the turn opens");
 
     // A tool round opens: the model handed off and is now idle.
     h.app.on_turn_msg(TurnMsg::Event(AgentEvent::ToolStart {
@@ -3528,8 +3539,8 @@ async fn the_loader_stops_while_the_models_tools_run() {
         name: "bash".into(),
         args: "{}".into(),
     }));
-    assert!(!h.app.inferring, "idle while its tools run");
-    let frozen = h.app.infer_elapsed();
+    assert!(!turn(&h).inferring(), "idle while its tools run");
+    let frozen = turn(&h).infer_elapsed();
 
     let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3540,7 +3551,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
     );
     // The clock is frozen: the banked time doesn't advance across a pause.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    assert_eq!(h.app.infer_elapsed(), frozen, "the clock stopped");
+    assert_eq!(turn(&h).infer_elapsed(), frozen, "the clock stopped");
 
     // One of two tools returning is not enough — the model is still waiting.
     let end = |id: &str| {
@@ -3552,17 +3563,97 @@ async fn the_loader_stops_while_the_models_tools_run() {
         })
     };
     h.app.on_turn_msg(end("a"));
-    assert!(!h.app.inferring, "one tool of two is still outstanding");
+    assert!(
+        !turn(&h).inferring(),
+        "one tool of two is still outstanding"
+    );
 
     // The last one hands control back: the model works again, and the clock runs.
     h.app.on_turn_msg(end("b"));
-    assert!(h.app.inferring, "the model resumed");
+    assert!(turn(&h).inferring(), "the model resumed");
     std::thread::sleep(std::time::Duration::from_millis(20));
-    assert!(h.app.infer_elapsed() > frozen, "the clock restarted");
+    assert!(turn(&h).infer_elapsed() > frozen, "the clock restarted");
 
     // The turn ends: the model stops, whatever was in flight.
     h.app.on_turn_msg(TurnMsg::Done(None));
-    assert!(!h.app.inferring, "the turn is over");
+    assert!(!turn(&h).inferring(), "the turn is over");
+}
+
+/// The loader belongs to **the agent on screen**. A turn is per agent, so its
+/// clock is per agent: a sub-agent working shows *its* loader, and the main agent
+/// working while you read a sub-agent shows none.
+///
+/// Regression: the loader was driven by the main agent's clock whichever agent was
+/// being viewed — so a sub-agent's pane claimed to be "generating" the main agent's
+/// tokens, and a sub-agent grinding away under an idle main agent showed nothing.
+#[tokio::test]
+async fn the_loader_belongs_to_the_agent_on_screen() {
+    let mut h = Harness::new(vec![]).await;
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
+        kind: hrdr_agent::SubagentKind::Background,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // The sub-agent is working; the main agent is idle. On main: no loader — it is
+    // not the main agent that is busy.
+    h.app.live_subagents.begin_turn(1);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("inferring") && !screen.contains("generating"),
+        "the main agent is idle, so its view shows no loader:\n{screen}"
+    );
+
+    // Switch to the sub-agent: the loader is there, running *its* clock.
+    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app
+        .live_subagents
+        .record(1, &hrdr_agent::AgentEvent::Text("looking".into()));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("generating"),
+        "the agent on screen is working, so its loader shows:\n{screen}"
+    );
+
+    // Its tool runs: the model is idle, so the loader hides — its own pane, its own
+    // clock.
+    h.app.live_subagents.record(
+        1,
+        &hrdr_agent::AgentEvent::ToolStart {
+            id: "t1".into(),
+            name: "grep".into(),
+            args: "{}".into(),
+        },
+    );
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("inferring") && !screen.contains("generating"),
+        "no loader while the agent's own tool runs:\n{screen}"
+    );
 }
 
 /// The loader heads the input area while a turn runs: above every panel, with a
@@ -3579,8 +3670,7 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
     }];
     h.app.running = true;
     // The loader tracks the *model* working, not merely a turn being in flight.
-    h.app.inferring = true;
-    h.app.turn_started = Some(std::time::Instant::now());
+    h.app.resume_inference_for_test();
 
     let mut term = Terminal::new(TestBackend::new(56, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();

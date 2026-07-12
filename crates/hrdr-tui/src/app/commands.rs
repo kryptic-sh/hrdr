@@ -81,8 +81,6 @@ impl super::App {
         // The registry is what the main pane is rebuilt from, so the reset has to
         // land there too (`Agent::clear` zeroes the agent's own cost counter).
         self.publish_main_agent();
-        self.last_cached_tokens = None;
-        self.last_reasoning_tokens = None;
         self.state_mut().id = None; // detach; next message starts a new session
         // Detach the sub-agent transcript dir with it — otherwise a `task`
         // spawned early in the next session (before its first autosave assigns
