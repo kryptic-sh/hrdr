@@ -344,13 +344,10 @@ type SubagentDirCell = Option<std::sync::Arc<std::sync::Mutex<Option<std::path::
 /// Monotonic counter for sub-agent transcript file ids, shared by the blocking
 /// and background spawn paths so ids are ordered and unique within a session
 /// dir. Separate from `BG_SEQ`, which numbers background-task registry entries.
-// Consumed by the spawn paths in Tasks 3–4; unused in non-test builds until then.
-#[allow(dead_code)]
 static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A transcript file id: `NNN-<slug>`, where `slug` is the sanitized label.
 /// `seq` is the pre-fetched counter value.
-#[allow(dead_code)]
 fn subagent_transcript_id(seq: u64, label: &str) -> String {
     let lowered: String = label
         .trim()
@@ -378,13 +375,11 @@ fn subagent_transcript_id(seq: u64, label: &str) -> String {
 
 /// Read the resolved transcript dir from the shared cell, if the feature is on
 /// and a session id has been assigned.
-#[allow(dead_code)]
 fn resolve_subagent_dir(cell: &SubagentDirCell) -> Option<std::path::PathBuf> {
     cell.as_ref()?.lock().ok()?.clone()
 }
 
 /// Map a live agent event to the transcript event to record, if any.
-#[allow(dead_code)]
 fn subagent_event_for(ev: &AgentEvent) -> Option<subagent_transcript::Event> {
     use subagent_transcript::Event;
     match ev {
@@ -533,6 +528,9 @@ struct SubagentTool {
     /// The owning agent's language servers, shared with every sub-agent (the
     /// base config has `lsp = false`, so none builds a registry of its own).
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
+    /// The parent session's transcript dir cell (see
+    /// [`AgentConfig::subagent_transcript_dir`]); read at spawn.
+    transcript_dir: SubagentDirCell,
 }
 
 impl SubagentTool {
@@ -542,6 +540,7 @@ impl SubagentTool {
         bg_handles: BgHandles,
         cost_total: Arc<std::sync::Mutex<f64>>,
         lsp: Option<Arc<hrdr_tools::LspRegistry>>,
+        transcript_dir: SubagentDirCell,
     ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
@@ -600,6 +599,7 @@ impl SubagentTool {
             slots: Arc::new(SubagentSlots::default()),
             cost_total,
             lsp,
+            transcript_dir,
         }
     }
 }
@@ -779,6 +779,23 @@ impl hrdr_tools::Tool for SubagentTool {
         let model = cfg.model.clone();
         ctx.emit(format!("↳ task ({model}): {label}\n"));
 
+        // Open a durable transcript for this sub-agent (best-effort — a failure
+        // to persist must never block the run). The full prompt is recorded so a
+        // crashed sub-agent's work is recoverable independent of the parent.
+        let mut transcript = resolve_subagent_dir(&self.transcript_dir).and_then(|dir| {
+            let seq = SUBAGENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = subagent_transcript_id(seq, &label);
+            subagent_transcript::SubagentTranscript::open(&dir, &id).ok()
+        });
+        if let Some(t) = transcript.as_mut() {
+            t.write(&subagent_transcript::Event::Start {
+                model: model.clone(),
+                label: label.clone(),
+                kind: subagent_transcript::SpawnKind::Blocking,
+                prompt: prompt.clone(),
+            });
+        }
+
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         sub.cost_total = Arc::clone(&self.cost_total);
@@ -787,15 +804,23 @@ impl hrdr_tools::Tool for SubagentTool {
         let mut output = String::new();
         let steering = steering_queue();
         let run = sub
-            .run(prompt, steering, |ev| match ev {
-                // Stream the sub-agent's answer text to the parent's live output
-                // (the frontend's sub-agent panel) as well as accumulating it.
-                AgentEvent::Text(t) => {
-                    output.push_str(&t);
-                    ctx.emit(t);
+            .run(prompt, steering, |ev| {
+                if let Some(t) = transcript.as_mut()
+                    && let Some(tev) = subagent_event_for(&ev)
+                {
+                    t.write(&tev);
                 }
-                AgentEvent::ToolStart { name, .. } => ctx.emit(format!("\n· {name}")),
-                _ => {}
+                match ev {
+                    // Stream the sub-agent's answer text to the parent's live
+                    // output (the frontend's sub-agent panel) as well as
+                    // accumulating it.
+                    AgentEvent::Text(t) => {
+                        output.push_str(&t);
+                        ctx.emit(t);
+                    }
+                    AgentEvent::ToolStart { name, .. } => ctx.emit(format!("\n· {name}")),
+                    _ => {}
+                }
             })
             .await;
         // Tear down / preserve the worktree before surfacing errors.
@@ -803,6 +828,24 @@ impl hrdr_tools::Tool for SubagentTool {
             Some(wt) => wt.finish().await,
             None => None,
         };
+        // Record the terminal outcome before the `?` below can propagate it.
+        if let Some(t) = transcript.as_mut() {
+            match &run {
+                Ok(()) => t.write(&subagent_transcript::Event::End {
+                    status: subagent_transcript::EndStatus::Ok,
+                    bytes: output.len(),
+                }),
+                Err(e) => {
+                    t.write(&subagent_transcript::Event::Error {
+                        msg: format!("{e:#}"),
+                    });
+                    t.write(&subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Failed,
+                        bytes: output.len(),
+                    });
+                }
+            }
+        }
         run.with_context(|| format!("sub-agent (model={model}) failed"))?;
 
         let mut output = output.trim().to_string();
@@ -2596,6 +2639,7 @@ impl Agent {
                 Arc::clone(&bg_handles),
                 Arc::clone(&cost_total),
                 lsp.clone(),
+                config.subagent_transcript_dir.clone(),
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -7109,6 +7153,129 @@ mod tests {
                 })
                 .collect();
             assert!(text.contains("Complete answer"));
+        }
+
+        // ── (e) sub-agent transcript persistence ──────────────────────────────
+
+        use super::super::{SubagentDirCell, SubagentTool, subagent_transcript};
+
+        /// Build a `task` tool whose spawned sub-agents talk to `base_url` and
+        /// whose transcripts land in `ts_dir`.
+        fn transcript_tool(
+            base_url: String,
+            cwd: &std::path::Path,
+            ts_dir: &std::path::Path,
+        ) -> SubagentTool {
+            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                ts_dir.to_path_buf(),
+            ))));
+            SubagentTool::new(
+                test_cfg(base_url, cwd),
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                None,
+                cell,
+            )
+        }
+
+        fn read_events(
+            ts_dir: &std::path::Path,
+        ) -> (std::path::PathBuf, Vec<subagent_transcript::Event>) {
+            let files: Vec<std::path::PathBuf> = std::fs::read_dir(ts_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            assert_eq!(files.len(), 1, "exactly one transcript file: {files:?}");
+            let body = std::fs::read_to_string(&files[0]).unwrap();
+            let events = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            (files[0].clone(), events)
+        }
+
+        /// A blocking sub-agent records Start (full prompt) → Text → End(ok), and
+        /// the file reads back as complete.
+        #[tokio::test]
+        async fn blocking_subagent_records_start_text_end_ok() {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "sub work done"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            let args =
+                json!({"prompt": "do the sub task", "description": "probe", "background": false});
+
+            let out = tool.execute(args, &ctx).await.unwrap();
+            assert!(out.contains("sub work done"), "returns sub output: {out}");
+
+            let (path, events) = read_events(ts_dir.path());
+            assert!(
+                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Blocking, prompt, .. } if prompt == "do the sub task"),
+                "first event is a blocking Start with the full prompt: {:?}",
+                events[0]
+            );
+            assert!(
+                events.iter().any(|e| matches!(e, subagent_transcript::Event::Text { chunk } if chunk.contains("sub work done"))),
+                "text chunk recorded: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events.last().unwrap(),
+                    subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Ok,
+                        ..
+                    }
+                ),
+                "ends ok: {events:?}"
+            );
+            assert!(subagent_transcript::is_complete(&path));
+        }
+
+        /// A blocking sub-agent whose model call fails records Error then
+        /// End(failed) — the failure cause is durable even though `execute`
+        /// returns the error.
+        #[tokio::test]
+        async fn blocking_subagent_failure_records_error_end_failed() {
+            use hrdr_tools::Tool;
+            // 400 is non-transient, so the run errors on the first attempt.
+            let server = MockServer::start(vec![MockResp::HttpError(400)]).await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            let args = json!({"prompt": "will fail", "description": "probe", "background": false});
+
+            let result = tool.execute(args, &ctx).await;
+            assert!(result.is_err(), "execute surfaces the sub-agent error");
+
+            let (path, events) = read_events(ts_dir.path());
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, subagent_transcript::Event::Error { .. })),
+                "error recorded: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events.last().unwrap(),
+                    subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Failed,
+                        ..
+                    }
+                ),
+                "ends failed: {events:?}"
+            );
+            // A written End line means the reader sees it as complete (failed, not orphaned).
+            assert!(subagent_transcript::is_complete(&path));
         }
     } // mod mock_server
 
