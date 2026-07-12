@@ -43,8 +43,14 @@ pub const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const PKCE_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 /// Verifier length. 64 sits comfortably inside the spec's 43–128 range.
 const PKCE_VERIFIER_LEN: usize = 64;
-/// The callback server gives up after this long (matches codex.ts).
+/// The OpenRouter callback server gives up after this long (matches codex.ts).
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Generous outer backstop for the whole ChatGPT browser login (callback +
+/// token exchange + save): the subscription flow can involve MFA and account
+/// pickers, so it is not held to the 5-minute callback deadline. Bounded so a
+/// user who abandons the browser doesn't leave a listener + task alive forever.
+pub const CHATGPT_LOGIN_BACKSTOP: Duration = Duration::from_secs(60 * 60);
 
 // ── PKCE ────────────────────────────────────────────────────────────────────
 
@@ -87,12 +93,26 @@ pub fn generate_state() -> String {
 /// anything without a `code`/`error` query (favicon probes and the like), and
 /// on the real callback returns a small success (or error) page to the browser.
 pub async fn await_oauth_code(port: u16, expected_state: &str) -> Result<String> {
+    await_oauth_code_within(port, expected_state, CALLBACK_TIMEOUT).await
+}
+
+/// Like [`await_oauth_code`] but with a caller-chosen deadline. OpenRouter keeps
+/// the 5-minute [`CALLBACK_TIMEOUT`]; ChatGPT passes a larger bound because its
+/// whole flow is wrapped in the [`CHATGPT_LOGIN_BACKSTOP`] by the caller.
+pub async fn await_oauth_code_within(
+    port: u16,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .with_context(|| format!("binding 127.0.0.1:{port} for the OAuth callback"))?;
-    match tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, expected_state)).await {
+    match tokio::time::timeout(timeout, accept_callback(&listener, expected_state)).await {
         Ok(res) => res,
-        Err(_) => bail!("timed out waiting for the OAuth callback (5 minutes)"),
+        Err(_) => bail!(
+            "timed out waiting for the OAuth callback ({}s)",
+            timeout.as_secs()
+        ),
     }
 }
 
@@ -1247,6 +1267,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn await_oauth_code_within_honours_its_deadline() {
+        // Bind a real port; no callback ever arrives, so only the caller-chosen
+        // deadline ends the wait — proving the timeout is parameterized (ChatGPT
+        // passes the 60-minute backstop, OpenRouter the 5-minute default).
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let res = await_oauth_code_within(port, "state", Duration::from_millis(120)).await;
+        assert!(res.is_err(), "expired deadline yields a timeout error");
+        assert!(res.unwrap_err().to_string().contains("timed out"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::theme::Theme;
-use hrdr_app::{last_fenced_block, resolve_alias, resolve_under};
+use hrdr_app::{CommandHost, last_fenced_block, resolve_alias, resolve_under};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -783,6 +783,18 @@ impl super::App {
                         self.login_modal = None;
                         return;
                     };
+                    // Route by resolved trust kind (not spelling): a browser
+                    // login enters the TUI's typed pending state; keyless/key go
+                    // through the shared pick.
+                    let route = {
+                        let host = TuiHost { app: self };
+                        host.resolve_provider(&c.name)
+                            .map(|p| hrdr_app::login_route(&c.name, &p))
+                    };
+                    if route == Some(hrdr_app::LoginRoute::Browser) {
+                        self.start_browser_login(&c.name, c.label.clone());
+                        return;
+                    }
                     let pick = {
                         let mut host = TuiHost { app: self };
                         hrdr_app::login_pick_provider(&c.name, &mut host)
@@ -803,6 +815,15 @@ impl super::App {
                 KeyCode::Char(ch) if !ctrl => sel.push_char(ch),
                 _ => {}
             },
+            // Browser login in flight: Esc / Ctrl+C abandons it (the in-flight
+            // task's late result is rejected by login-id mismatch).
+            Some(super::LoginModal::Authorizing { .. }) => match key.code {
+                KeyCode::Esc => self.cancel_authorizing(),
+                KeyCode::Char('c') if ctrl => self.cancel_authorizing(),
+                _ => {}
+            },
+            // The final provider-switch transaction — not interruptible.
+            Some(super::LoginModal::Switching { .. }) => {}
             Some(super::LoginModal::Key { name, input, .. }) => match key.code {
                 KeyCode::Esc => {
                     self.login_modal = None;
@@ -830,6 +851,100 @@ impl super::App {
             None => {}
         }
     }
+
+    /// Launch a browser OAuth login into the typed `Authorizing` pending state.
+    /// Bumps `login_id` so any prior in-flight login's late result is ignored,
+    /// opens the browser via the shared worker, and spawns the exchange/save
+    /// future — its outcome arrives as [`TurnMsg::BrowserLogin`].
+    fn start_browser_login(&mut self, name: &str, label: String) {
+        // One browser login at a time — reject a duplicate defensively (the
+        // login-id mechanism is the real guard for a late result).
+        if matches!(
+            self.login_modal,
+            Some(super::LoginModal::Authorizing { .. }) | Some(super::LoginModal::Switching { .. })
+        ) {
+            self.system("a login is already in progress.".to_string());
+            return;
+        }
+        self.next_login_id += 1;
+        let id = self.next_login_id;
+        let start = {
+            let mut host = TuiHost { app: self };
+            hrdr_app::browser_login_start(name, id, &mut host)
+        };
+        let Some(start) = start else {
+            return;
+        };
+        let provider = start.provider.clone();
+        let tx = self.tx.clone();
+        let fut = start.future;
+        tokio::spawn(async move {
+            let outcome = fut.await;
+            let _ = tx.send(super::TurnMsg::BrowserLogin(outcome));
+        });
+        self.login_modal = Some(super::LoginModal::Authorizing {
+            login_id: id,
+            provider,
+            label,
+        });
+    }
+
+    /// Abandon an in-flight browser login. The spawned task keeps running but its
+    /// [`TurnMsg::BrowserLogin`] will mismatch (no `Authorizing` modal) and be
+    /// dropped.
+    fn cancel_authorizing(&mut self) {
+        self.login_modal = None;
+        self.system("login cancelled.".to_string());
+    }
+
+    /// Handle a finished browser login. Ignores a stale/duplicate result (no
+    /// matching `Authorizing` login_id). On success, runs the non-cancellable
+    /// switch transaction: persist the default provider, live-switch, report.
+    pub(super) fn on_browser_login(&mut self, outcome: hrdr_app::BrowserLoginOutcome) {
+        let label = match &self.login_modal {
+            Some(super::LoginModal::Authorizing {
+                login_id,
+                provider,
+                label,
+            }) if *login_id == outcome.login_id && *provider == outcome.provider => label.clone(),
+            // No matching pending login — a stale or cancelled login's late
+            // result. Drop it silently.
+            _ => return,
+        };
+        if !outcome.token_saved {
+            self.login_modal = None;
+            self.system(format!(
+                "{} login failed: {}",
+                outcome.provider,
+                outcome.error.as_deref().unwrap_or("unknown error")
+            ));
+            return;
+        }
+        // Enter the non-interruptible switch transaction.
+        self.login_modal = Some(super::LoginModal::Switching { label });
+        {
+            let mut host = TuiHost { app: self };
+            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&outcome.provider));
+            match hrdr_app::apply_provider(&mut host, &outcome.provider, None) {
+                Ok(p) => host.info(format!(
+                    "✓ signed in to {} ({}). Switched — loading models…",
+                    outcome.provider, p.base_url
+                )),
+                Err(e) => host.info(format!(
+                    "signed in to {}, but the switch failed: {e}",
+                    outcome.provider
+                )),
+            }
+        }
+        // Trigger a forced ChatGPT catalog refresh + open the picker (Task 5).
+        self.refresh_models_after_login(&outcome.provider);
+        self.login_modal = None;
+    }
+
+    /// Force a catalog refresh + open/update the model picker after a login.
+    /// Task 5 fills this in (async ChatGPT catalog load); for now the user opens
+    /// `/model` manually.
+    fn refresh_models_after_login(&mut self, _provider: &str) {}
 
     /// Cancel the `/theme` picker, restoring the theme in force when it opened.
     fn close_theme_selector(&mut self) {

@@ -472,6 +472,43 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
             ];
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
+        crate::app::LoginModal::Authorizing { label, .. }
+        | crate::app::LoginModal::Switching { label, .. } => {
+            let switching = matches!(modal, crate::app::LoginModal::Switching { .. });
+            let height = 5u16.min(area.height.saturating_sub(2).max(1));
+            let rect = Rect {
+                x: (area.width.saturating_sub(width)) / 2,
+                y: (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
+            };
+            f.render_widget(Clear, rect);
+            let block = Block::default()
+                .style(Style::default().bg(theme.user_bg))
+                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            if inner.height < 2 || inner.width < 6 {
+                return;
+            }
+            let (title, hint) = if switching {
+                (
+                    format!("🔑 {label} — switching…"),
+                    "finalizing — please wait".to_string(),
+                )
+            } else {
+                (
+                    format!("🔑 {label} — waiting for your browser…"),
+                    "finish in the browser · Esc cancel".to_string(),
+                )
+            };
+            let lines = vec![
+                Line::from(Span::styled(title, Style::default().fg(theme.warn))),
+                Line::from(""),
+                Line::from(Span::styled(hint, Style::default().fg(theme.dim))),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        }
     }
 }
 

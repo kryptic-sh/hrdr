@@ -3768,6 +3768,118 @@ async fn login_modal_flow_masks_the_key_entry() {
     assert!(h.app.login_modal.is_none(), "Esc closes the modal");
 }
 
+/// A browser login's late result is applied only when its `login_id` matches the
+/// current `Authorizing` pending state — a stale/duplicate login is ignored.
+#[tokio::test]
+async fn browser_login_ignores_a_stale_login_id() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
+        login_id: 2,
+        provider: "chatgpt".to_string(),
+        label: "ChatGPT".to_string(),
+    });
+    // A late result from an older login (id 1) must not disturb id 2.
+    h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
+        login_id: 1,
+        provider: "chatgpt".to_string(),
+        token_saved: true,
+        error: None,
+    });
+    assert!(
+        matches!(
+            h.app.login_modal,
+            Some(crate::app::LoginModal::Authorizing { login_id: 2, .. })
+        ),
+        "a stale login result must leave the current pending login intact"
+    );
+}
+
+/// Esc abandons an in-flight browser login; a later result for it is then
+/// dropped (no matching `Authorizing`).
+#[tokio::test]
+async fn browser_login_esc_cancels_then_late_result_is_dropped() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
+        login_id: 1,
+        provider: "chatgpt".to_string(),
+        label: "ChatGPT".to_string(),
+    });
+    h.press(KeyCode::Esc);
+    assert!(
+        h.app.login_modal.is_none(),
+        "Esc abandons the pending login"
+    );
+    // The in-flight task's late result now matches nothing → no-op.
+    h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
+        login_id: 1,
+        provider: "chatgpt".to_string(),
+        token_saved: true,
+        error: None,
+    });
+    assert!(
+        h.app.login_modal.is_none(),
+        "a cancelled login's late result does nothing"
+    );
+}
+
+/// A matching, successful browser login runs the switch transaction: the modal
+/// closes and the live provider is switched.
+#[tokio::test]
+async fn browser_login_success_switches_provider() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
+        login_id: 7,
+        provider: "chatgpt".to_string(),
+        label: "ChatGPT".to_string(),
+    });
+    h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
+        login_id: 7,
+        provider: "chatgpt".to_string(),
+        token_saved: true,
+        error: None,
+    });
+    assert!(
+        h.app.login_modal.is_none(),
+        "the switch transaction closed the modal"
+    );
+    assert_eq!(
+        h.app.state.provider.as_deref(),
+        Some("chatgpt"),
+        "the live provider switched to ChatGPT"
+    );
+}
+
+/// A failed (matching) browser login reports the error and closes the modal
+/// without switching.
+#[tokio::test]
+async fn browser_login_failure_reports_and_closes() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
+        login_id: 3,
+        provider: "chatgpt".to_string(),
+        label: "ChatGPT".to_string(),
+    });
+    h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
+        login_id: 3,
+        provider: "chatgpt".to_string(),
+        token_saved: false,
+        error: Some("authorization was rejected".to_string()),
+    });
+    assert!(
+        h.app.login_modal.is_none(),
+        "a failed login closes the modal"
+    );
+    assert!(
+        h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Notice(t) if t.contains("login failed"))),
+        "the failure is reported to the user"
+    );
+}
+
 /// `!command` runs the shell directly: the output streams into a transcript
 /// tool block, and on ToolEnd the command + output are committed through the
 /// same plumbing as a finished turn — the user note enters the agent's

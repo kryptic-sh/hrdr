@@ -68,6 +68,22 @@ pub(crate) enum LoginModal {
         /// The key as typed/pasted (rendered masked).
         input: String,
     },
+    /// A browser OAuth login is in flight. Esc / `/cancel` abandons it (a late
+    /// result is ignored by `login_id` mismatch); `Switching` cannot be
+    /// interrupted.
+    Authorizing {
+        /// Rejects a stale/duplicate login's late [`TurnMsg::BrowserLogin`].
+        login_id: u64,
+        /// The provider being authorized (`chatgpt` / `openrouter`).
+        provider: String,
+        /// Friendly label for the modal title.
+        label: String,
+    },
+    /// The credential is saved and the live provider switch is running — the
+    /// final transaction, deliberately NOT cancellable.
+    Switching {
+        label: String,
+    },
 }
 
 // The display-mode enums live in the shared `hrdr-app` core so every frontend
@@ -125,6 +141,10 @@ pub(crate) enum TurnMsg {
     Compacted(Result<(usize, usize), String>),
     /// A model/provider switch re-probed the endpoint's advertised context window.
     ContextWindow(u32),
+    /// A browser OAuth login's exchange/save step finished. Carries the typed
+    /// outcome (with its originating `login_id`) so the loop can reject a stale
+    /// login and, on a match, run the live provider switch.
+    BrowserLogin(hrdr_app::BrowserLoginOutcome),
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
     /// The config file changed on disk (from the shared watcher).
@@ -205,6 +225,9 @@ pub(crate) struct App {
     /// The open `/login` modal (provider list, then masked key entry); while
     /// `Some`, it captures every key (and pasted text, for the key field).
     pub(crate) login_modal: Option<LoginModal>,
+    /// Monotonic id for browser logins — bumped per launch so a stale/duplicate
+    /// login's late result is rejected by [`LoginModal::Authorizing`].
+    pub(crate) next_login_id: u64,
     /// The running user `!command`, if any — Esc cancels it.
     pub(crate) user_shell: Option<UserShell>,
     /// USD already spent when the current session was adopted (a resumed
@@ -438,6 +461,7 @@ impl App {
             effort_selector: None,
             skill_selector: None,
             login_modal: None,
+            next_login_id: 0,
             user_shell: None,
             cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),
@@ -1643,6 +1667,7 @@ impl App {
                 // advertised max (drives "X of Y" + the auto-compaction trigger).
                 self.state.usage.context_window = Some(tokens);
             }
+            TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;

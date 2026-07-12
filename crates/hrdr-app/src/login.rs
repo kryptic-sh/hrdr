@@ -4,7 +4,7 @@
 //! modal slot and, while it's `Some`, routes every submitted line to
 //! [`LoginWizard::step`] instead of the model or the slash dispatcher.
 
-use crate::commands::{CommandHost, apply_provider};
+use crate::commands::{BrowserLoginOutcome, BrowserLoginStart, CommandHost, apply_provider};
 
 /// A running `/login` conversation. Cloneable so a frontend can hold it in
 /// whatever state cell it uses.
@@ -118,6 +118,37 @@ pub enum LoginPick {
     NeedsKey { name: String },
 }
 
+/// How a picked provider authenticates — decided by the RESOLVED trust kind, not
+/// the provider spelling, so a `Custom` shadow named `openrouter`/`chatgpt` is
+/// routed to key entry, never a browser flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRoute {
+    /// Trusted ChatGPT OAuth, or the built-in OpenRouter: a browser login.
+    Browser,
+    /// A keyless self-hosted endpoint: apply directly, no key.
+    Keyless,
+    /// A remote key-based provider (including any custom shadow): needs a key.
+    Key,
+}
+
+/// Route a resolved provider to its login flow by trust kind.
+///
+/// - `ChatGptOAuth` (built-in ChatGPT only) → browser.
+/// - `BuiltIn` + an OAuth name (`openrouter`) → browser. `is_oauth_login` is
+///   name-based and true for a custom `openrouter` shadow too, so the `BuiltIn`
+///   kind is what distinguishes the built-in from a shadow.
+/// - keyless (`remote == false`) → keyless.
+/// - everything else (remote key providers, all `Custom` shadows) → key.
+pub fn login_route(name: &str, resolved: &hrdr_agent::ResolvedProvider) -> LoginRoute {
+    use hrdr_agent::ResolvedProviderKind as K;
+    match resolved.kind {
+        K::ChatGptOAuth => LoginRoute::Browser,
+        K::BuiltIn if is_oauth_login(name) => LoginRoute::Browser,
+        _ if !resolved.remote => LoginRoute::Keyless,
+        _ => LoginRoute::Key,
+    }
+}
+
 /// Act on a provider pick: launch the OAuth flow, apply a keyless endpoint,
 /// or report that an API key is needed next. Shared by the wizard (text
 /// frontends) and the TUI's login modal.
@@ -129,26 +160,29 @@ pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick 
         ));
         return LoginPick::Done;
     };
-    // OAuth providers log in through the browser, not a pasted key.
-    if is_oauth_login(&name) {
-        start_oauth_login(&name, host);
-        return LoginPick::Done;
-    }
-    // A keyless (self-hosted) endpoint needs no API key — apply and finish.
-    if !p.remote {
-        match apply_provider(host, &name, None) {
-            Ok(p) => {
-                host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
-                host.info(format!(
-                    "✓ using {name} ({}). No API key needed; set as your default provider.",
-                    p.base_url
-                ));
-            }
-            Err(e) => host.info(e),
+    match login_route(&name, &p) {
+        // Browser login: launch it (the wizard/non-TUI path persists + reports on
+        // completion; the TUI manages its own typed pending state).
+        LoginRoute::Browser => {
+            start_oauth_login(&name, host);
+            LoginPick::Done
         }
-        return LoginPick::Done;
+        // A keyless (self-hosted) endpoint needs no API key — apply and finish.
+        LoginRoute::Keyless => {
+            match apply_provider(host, &name, None) {
+                Ok(p) => {
+                    host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
+                    host.info(format!(
+                        "✓ using {name} ({}). No API key needed; set as your default provider.",
+                        p.base_url
+                    ));
+                }
+                Err(e) => host.info(e),
+            }
+            LoginPick::Done
+        }
+        LoginRoute::Key => LoginPick::NeedsKey { name },
     }
-    LoginPick::NeedsKey { name }
 }
 
 /// The plaintext-storage warning shown before the key is entered.
@@ -280,11 +314,19 @@ impl LoginWizard {
     }
 }
 
-/// Kick off an OAuth browser login for `name`: print the authorize URL, open the
-/// browser, and spawn the flow (callback server → token exchange → save the
-/// credential and persist the provider as default). The wizard finishes
-/// immediately; the spawned task posts the outcome as a system line.
-fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
+/// Launch a browser OAuth login for `name`, returning a [`BrowserLoginStart`]
+/// whose `future` performs ONLY the callback + token exchange + credential save
+/// (no provider switch, no default persistence, no UI). The URL is printed +
+/// opened here (via `open_browser`) and deliberately not carried in the returned
+/// value. `login_id` lets the caller reject a stale/duplicate login's result.
+///
+/// `None` only when `name` is not a browser-login provider (caller should have
+/// routed via [`login_route`] first).
+pub fn browser_login_start(
+    name: &str,
+    login_id: u64,
+    host: &mut dyn CommandHost,
+) -> Option<BrowserLoginStart> {
     let (verifier, challenge) = hrdr_agent::generate_pkce();
     let label = provider_label(name);
 
@@ -294,18 +336,27 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
         let callback = format!("http://localhost:{PORT}/auth/callback");
         let url = hrdr_agent::openrouter_authorize_url(&callback, &challenge);
         open_browser(&url, label, host);
-        host.spawn_line(Box::pin(async move {
-            match openrouter_oauth_flow(PORT, &verifier).await {
-                Ok(()) => "✓ logged in to OpenRouter. Key saved and set as your default \
-                           — pick a model with /model to use it now."
-                    .to_string(),
-                Err(e) => format!("OpenRouter login failed: {e}"),
+        let future = Box::pin(async move {
+            let (token_saved, error) = match openrouter_exchange_and_save(PORT, &verifier).await {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(e.to_string())),
+            };
+            BrowserLoginOutcome {
+                login_id,
+                provider: "openrouter".to_string(),
+                token_saved,
+                error,
             }
-        }));
-        return true;
+        });
+        return Some(BrowserLoginStart {
+            login_id,
+            provider: "openrouter".to_string(),
+            future,
+        });
     }
 
-    // ChatGPT (Codex) subscription login.
+    // ChatGPT (Codex) subscription login. The whole callback+exchange+save is
+    // wrapped in the 60-minute backstop (not the 5-minute OpenRouter deadline).
     let state = hrdr_agent::generate_state();
     let redirect = hrdr_agent::OPENAI_REDIRECT_URI.to_string();
     let url = hrdr_agent::openai_authorize_url(&redirect, &challenge, &state);
@@ -313,13 +364,64 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
         "⚠ This signs in with your ChatGPT subscription for use in a third-party tool.".to_string(),
     );
     open_browser(&url, label, host);
-    host.spawn_line(Box::pin(async move {
-        match chatgpt_oauth_flow(&verifier, &state, &redirect).await {
-            Ok(()) => "✓ signed in with ChatGPT. Tokens saved and set as your default \
-                       — pick a model with /model to use it now."
-                .to_string(),
-            Err(e) => format!("ChatGPT login failed: {e}"),
+    let future = Box::pin(async move {
+        let flow = chatgpt_exchange_and_save(&verifier, &state, &redirect);
+        let (token_saved, error) =
+            match tokio::time::timeout(hrdr_agent::CHATGPT_LOGIN_BACKSTOP, flow).await {
+                Ok(Ok(())) => (true, None),
+                Ok(Err(e)) => (false, Some(e.to_string())),
+                Err(_) => (false, Some("ChatGPT login timed out".to_string())),
+            };
+        BrowserLoginOutcome {
+            login_id,
+            provider: "chatgpt".to_string(),
+            token_saved,
+            error,
         }
+    });
+    Some(BrowserLoginStart {
+        login_id,
+        provider: "chatgpt".to_string(),
+        future,
+    })
+}
+
+/// A sanitized completion line for a finished browser login, and (on success)
+/// persist the provider as the default. Shared by the non-TUI wizard path; the
+/// TUI additionally performs a live switch + model refresh.
+pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
+    if outcome.token_saved {
+        let _ = hrdr_agent::persist_setting(
+            "provider",
+            hrdr_agent::ConfigValue::Str(&outcome.provider),
+        );
+        match outcome.provider.as_str() {
+            "openrouter" => "✓ logged in to OpenRouter. Key saved and set as your default \
+                             — pick a model with /model to use it now."
+                .to_string(),
+            _ => "✓ signed in with ChatGPT. Tokens saved and set as your default \
+                  — pick a model with /model to use it now."
+                .to_string(),
+        }
+    } else {
+        format!(
+            "{} login failed: {}",
+            outcome.provider,
+            outcome.error.as_deref().unwrap_or("unknown error")
+        )
+    }
+}
+
+/// Non-TUI browser login: launch it and post the sanitized completion line when
+/// the exchange/save future resolves. The TUI does not use this — it owns the
+/// typed pending state and the live switch.
+fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
+    let Some(start) = browser_login_start(name, 0, host) else {
+        return true;
+    };
+    host.spawn_line(Box::pin(async move {
+        let outcome = start.future.await;
+        browser_login_completion_line(&outcome)
     }));
     true
 }
@@ -334,20 +436,31 @@ fn open_browser(url: &str, label: &str, host: &mut dyn CommandHost) {
     let _ = crate::open_system_handler(std::path::Path::new(url));
 }
 
-/// OpenRouter: wait for the callback code, exchange it for a normal API key, and
-/// save it to the credential store like any other key.
-async fn openrouter_oauth_flow(port: u16, verifier: &str) -> anyhow::Result<()> {
+/// OpenRouter (5-minute callback deadline): wait for the callback code, exchange
+/// it for a normal API key, and save it to the credential store. Exchange/save
+/// only — the caller persists the default provider.
+async fn openrouter_exchange_and_save(port: u16, verifier: &str) -> anyhow::Result<()> {
     let code = hrdr_agent::await_oauth_code(port, "").await?;
     let key = hrdr_agent::openrouter_exchange(&code, verifier).await?;
     hrdr_agent::save_auth_token("openrouter", &key)?;
-    let _ = hrdr_agent::persist_setting("provider", hrdr_agent::ConfigValue::Str("openrouter"));
     Ok(())
 }
 
-/// ChatGPT: wait for the callback code, exchange it for the access/refresh token
-/// set, and store it in the OAuth credential store.
-async fn chatgpt_oauth_flow(verifier: &str, state: &str, redirect: &str) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code(hrdr_agent::OPENAI_OAUTH_PORT, state).await?;
+/// ChatGPT: wait for the callback code (no 5-minute inner deadline — the caller
+/// wraps the whole flow in the 60-minute backstop), exchange it for the
+/// access/refresh token set, and store it in the OAuth credential store.
+/// Exchange/save only — the caller persists the default + performs the switch.
+async fn chatgpt_exchange_and_save(
+    verifier: &str,
+    state: &str,
+    redirect: &str,
+) -> anyhow::Result<()> {
+    let code = hrdr_agent::await_oauth_code_within(
+        hrdr_agent::OPENAI_OAUTH_PORT,
+        state,
+        hrdr_agent::CHATGPT_LOGIN_BACKSTOP,
+    )
+    .await?;
     let tokens = hrdr_agent::openai_exchange(&code, redirect, verifier).await?;
     let account_id = tokens
         .id_token
@@ -361,13 +474,87 @@ async fn chatgpt_oauth_flow(verifier: &str, state: &str, redirect: &str) -> anyh
         account_id,
     };
     hrdr_agent::save_oauth("chatgpt", &creds)?;
-    let _ = hrdr_agent::persist_setting("provider", hrdr_agent::ConfigValue::Str("chatgpt"));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route by resolved trust kind, not spelling: this is the isolation the
+    /// whole login flow rests on.
+    #[test]
+    fn login_route_keys_on_trust_kind_not_spelling() {
+        use hrdr_agent::AgentConfig;
+
+        let cfg = AgentConfig::default();
+        // Built-in ChatGPT → browser.
+        assert_eq!(
+            login_route("chatgpt", &cfg.resolve_provider("chatgpt").unwrap()),
+            LoginRoute::Browser
+        );
+        // Built-in OpenRouter → browser.
+        assert_eq!(
+            login_route("openrouter", &cfg.resolve_provider("openrouter").unwrap()),
+            LoginRoute::Browser
+        );
+        // Built-in OpenAI (key provider) → key.
+        assert_eq!(
+            login_route("openai", &cfg.resolve_provider("openai").unwrap()),
+            LoginRoute::Key
+        );
+        // Keyless local → keyless.
+        assert_eq!(
+            login_route("local", &cfg.resolve_provider("local").unwrap()),
+            LoginRoute::Keyless
+        );
+
+        // Custom shadows spelled like OAuth providers must NOT get a browser
+        // flow — they resolve to Custom and route to key entry.
+        let mut providers = std::collections::HashMap::new();
+        for shadow in ["chatgpt", "openrouter", "codex"] {
+            providers.insert(
+                shadow.to_string(),
+                hrdr_agent::ProviderConfig {
+                    base_url: "https://evil.example/v1".to_string(),
+                    key_env: None,
+                    api_key: Some("k".to_string()),
+                    model: None,
+                    remote: None,
+                    context_window: None,
+                    headers: std::collections::HashMap::new(),
+                    api_version: None,
+                },
+            );
+        }
+        let shadowed = AgentConfig {
+            providers,
+            ..Default::default()
+        };
+        for shadow in ["chatgpt", "openrouter", "codex"] {
+            assert_eq!(
+                login_route(shadow, &shadowed.resolve_provider(shadow).unwrap()),
+                LoginRoute::Key,
+                "custom shadow {shadow} must route to key entry"
+            );
+        }
+    }
+
+    /// The shared (non-TUI) completion line reports a failed browser login for
+    /// either provider, without leaking the sanitized error's boundaries.
+    #[test]
+    fn browser_login_completion_reports_failure_for_both_providers() {
+        for provider in ["chatgpt", "openrouter"] {
+            let line = browser_login_completion_line(&BrowserLoginOutcome {
+                login_id: 0,
+                provider: provider.to_string(),
+                token_saved: false,
+                error: Some("authorization was rejected".to_string()),
+            });
+            assert!(line.contains(&format!("{provider} login failed")));
+            assert!(line.contains("authorization was rejected"));
+        }
+    }
 
     #[test]
     fn provider_pick_parses_number_or_name() {
