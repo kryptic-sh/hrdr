@@ -122,26 +122,33 @@ provider identity (e.g. the chatgpt-as-target OAuth path keys off it).
 
 ### Auth gate (the "configured/authenticated" requirement)
 
-Inside `repoint_to_provider`, after `resolve_provider` and before returning:
+The gate lives in the **ad-hoc `task` path only**, not inside the shared
+`repoint_to_provider` helper — so existing `[[subagent]]` profiles keep their
+current behaviour unchanged. (Folding the gate into the shared helper would also
+gate every named profile, changing shipped #7 behaviour and breaking
+`subagent_profile_repoints_to_a_different_provider` (`lib.rs:4614`), which
+repoints to openrouter with no configured auth and expects success. Out of scope
+here; a follow-up could unify.)
 
-- **Unknown provider** → hard error listing built-ins + `[providers.*]` (the
-  error already emitted at `lib.rs:406-413`).
+Before the ad-hoc path calls `repoint_to_provider`, resolve the target provider
+and gate:
+
+- **Unknown provider** → hard error listing built-ins + `[providers.*]`. (The
+  same `resolve_provider(...).ok_or_else(...)` inside the helper also rejects an
+  unknown provider at `lib.rs:406-413`; the ad-hoc gate reuses that path.)
 - **Un-authenticated remote provider** → compute
   `provider_auth_state(pname, &p, cfg.api_key.as_deref(), Some(&cfg.base_url))`
-  (`lib.rs:1593`). If `Missing` → hard error **before spawn**:
+  (`lib.rs:1593`), where `cfg` still holds the **parent's** key/base_url at this
+  point. If `Missing` → hard error **before spawn**:
   `task: provider 'X' is not configured — set $<KEY_ENV>, or run /login`.
   `OAuth` (chatgpt), `Keyless` (local), and `Key` all pass.
 
-**Ordering (required):** the parent's `cfg.api_key` / `cfg.base_url` are the
-inheritance context for both `resolve_api_key` and the auth-state check. Compute
-the resolved key and auth state from those parent values **before** overwriting
-any `cfg` field. Overwriting first and then gating would test the target
-provider's key against its own freshly-set endpoint — wrong result.
-
-Folding the auth gate into the shared helper means named profiles that repoint
-to an un-auth'd provider now also fail fast instead of 401-ing mid-run. This is
-a deliberate, desirable behaviour change; call it out in the PR body and
-CHANGELOG.
+**Ordering (required):** run the auth gate on the parent's `cfg.api_key` /
+`cfg.base_url` (the inheritance context) **before** calling
+`repoint_to_provider`, which overwrites those fields. Gating after the repoint
+would test the target provider's key against its own freshly-set endpoint —
+wrong result. `resolve_api_key` inside the helper reads the same parent values
+via its own arguments, so pass them from the pre-repoint `cfg`.
 
 ### Model-argument reconciliation
 
@@ -201,8 +208,9 @@ runs on openrouter (the sub reports its resolved model). Find a valid slug with
   reword the `model` description.
 - The `task` tool top-level description (mentions provider selection).
 - `README.md` delegation section.
-- `CHANGELOG.md` under `[Unreleased]` — feature entry + the auth-gate behaviour
-  change note.
+- `CHANGELOG.md` under `[Unreleased]` — feature entry (ad-hoc cross-provider
+  delegation) + the provider-identity correctness fix. No existing-profile
+  behaviour change (the auth gate is ad-hoc-only).
 
 ## Integration
 
