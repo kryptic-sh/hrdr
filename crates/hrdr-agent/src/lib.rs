@@ -29,10 +29,7 @@ pub use chatgpt_models::{
 };
 mod paths;
 pub use paths::cwd_slug;
-// The transcript writer's API is exercised only by its own tests until the
-// spawn paths consume it (Tasks 3–4); allow it to sit unused until then.
 mod models;
-#[allow(dead_code)]
 mod subagent_transcript;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
@@ -562,6 +559,7 @@ fn spawn_background(
     handles: &BgHandles,
     cost_total: Arc<std::sync::Mutex<f64>>,
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
+    transcript_dir: SubagentDirCell,
 ) -> String {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -577,6 +575,27 @@ fn spawn_background(
             delivered: false,
         });
     }
+    // Shared so the inner task records events and the outer guard can still
+    // write a terminal `End` if the inner task panics or is cancelled.
+    let transcript = Arc::new(Mutex::new(resolve_subagent_dir(&transcript_dir).and_then(
+        |dir| {
+            let seq = SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let sid = subagent_transcript_id(seq, &label);
+            subagent_transcript::SubagentTranscript::open(&dir, &sid).ok()
+        },
+    )));
+    if let Ok(mut g) = transcript.lock()
+        && let Some(t) = g.as_mut()
+    {
+        t.write(&subagent_transcript::Event::Start {
+            model: cfg.model.clone(),
+            label: label.clone(),
+            kind: subagent_transcript::SpawnKind::Background,
+            prompt: prompt.clone(),
+        });
+    }
+    let ts_inner = transcript.clone();
+    let ts_outer = transcript;
     let reg = registry.clone();
     let reg_done = reg.clone();
     // The inner task does the actual work; the outer task is the panic guard:
@@ -597,6 +616,12 @@ fn spawn_background(
                 // building an own registry) — one warm set for the session.
                 sub.ctx.lsp = lsp;
                 sub.run(prompt, steering_queue(), |ev| {
+                    if let Ok(mut g) = ts_inner.lock()
+                        && let Some(t) = g.as_mut()
+                        && let Some(tev) = subagent_event_for(&ev)
+                    {
+                        t.write(&tev);
+                    }
                     let chunk = match ev {
                         AgentEvent::Text(t) => {
                             out.push_str(&t);
@@ -619,22 +644,63 @@ fn spawn_background(
             match result {
                 Ok(()) => {
                     let o = out.trim().to_string();
+                    if let Ok(mut g) = ts_inner.lock()
+                        && let Some(t) = g.as_mut()
+                    {
+                        t.write(&subagent_transcript::Event::End {
+                            status: subagent_transcript::EndStatus::Ok,
+                            bytes: o.len(),
+                        });
+                    }
                     if o.is_empty() {
                         "(no text output)".to_string()
                     } else {
                         o
                     }
                 }
-                Err(e) => format!("(background task failed: {e})"),
+                Err(e) => {
+                    if let Ok(mut g) = ts_inner.lock()
+                        && let Some(t) = g.as_mut()
+                    {
+                        t.write(&subagent_transcript::Event::Error {
+                            msg: format!("{e:#}"),
+                        });
+                        t.write(&subagent_transcript::Event::End {
+                            status: subagent_transcript::EndStatus::Failed,
+                            bytes: out.len(),
+                        });
+                    }
+                    format!("(background task failed: {e})")
+                }
             }
         });
-        // Always set done = true, even if the inner task panicked.
+        // Always set done = true, even if the inner task panicked. The inner
+        // task writes its own terminal `End` on Ok/Err; only panic and cancel
+        // reach the outer guard without one, so those are recorded here.
         let final_result = match inner.await {
             Ok(s) => s,
             Err(join_err) if join_err.is_panic() => {
+                if let Ok(mut g) = ts_outer.lock()
+                    && let Some(t) = g.as_mut()
+                {
+                    t.write(&subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Panicked,
+                        bytes: 0,
+                    });
+                }
                 format!("(background task panicked: {join_err})")
             }
-            Err(_) => "(background task was cancelled)".to_string(),
+            Err(_) => {
+                if let Ok(mut g) = ts_outer.lock()
+                    && let Some(t) = g.as_mut()
+                {
+                    t.write(&subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Cancelled,
+                        bytes: 0,
+                    });
+                }
+                "(background task was cancelled)".to_string()
+            }
         };
         if let Ok(mut v) = reg_done.lock()
             && let Some(t) = v.iter_mut().find(|t| t.id == id)
@@ -1113,6 +1179,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 &self.bg_handles,
                 Arc::clone(&self.cost_total),
                 self.lsp.clone(),
+                self.transcript_dir.clone(),
             ));
         }
         // Blocking: hold the slot until this call returns.
@@ -8434,6 +8501,64 @@ mod tests {
             );
             // A written End line means the reader sees it as complete (failed, not orphaned).
             assert!(subagent_transcript::is_complete(&path));
+        }
+
+        /// A background (`background: true`) sub-agent records its own transcript
+        /// from the detached task: Start(background) → Text → End(ok).
+        #[tokio::test]
+        async fn background_subagent_records_its_own_transcript() {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "bg work done"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            let args = json!({"prompt": "bg task", "description": "probe", "background": true});
+
+            let out = tool.execute(args, &ctx).await.unwrap();
+            assert!(
+                out.contains("Started background task"),
+                "returns immediately: {out}"
+            );
+
+            // Drive the detached task to completion via the shared registry.
+            let mut done = false;
+            for _ in 0..300 {
+                if let Ok(v) = ctx.background_tasks.lock()
+                    && v.iter().any(|t| t.done)
+                {
+                    done = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(done, "background task finished within the timeout");
+
+            let (_path, events) = read_events(ts_dir.path());
+            assert!(
+                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
+                "first event is a background Start with the full prompt: {:?}",
+                events[0]
+            );
+            assert!(
+                events.iter().any(|e| matches!(e, subagent_transcript::Event::Text { chunk } if chunk.contains("bg work done"))),
+                "text chunk recorded: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events.last().unwrap(),
+                    subagent_transcript::Event::End {
+                        status: subagent_transcript::EndStatus::Ok,
+                        ..
+                    }
+                ),
+                "ends ok: {events:?}"
+            );
         }
     } // mod mock_server
 
