@@ -441,6 +441,7 @@ fn repoint_to_provider(
 /// overrides on the current provider — today's behaviour.
 fn apply_task_overrides(
     cfg: &mut AgentConfig,
+    parent: &AgentConfig,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
@@ -452,13 +453,19 @@ fn apply_task_overrides(
                 BUILTIN_PROVIDERS.join(", ")
             )
         })?;
-        if provider_auth_state(
+        let current_auth = provider_auth_state(
             pname,
             &p,
             cfg.api_key.as_deref(),
             Some(cfg.base_url.as_str()),
-        ) == ProviderAuthState::Missing
-        {
+        );
+        let parent_auth = provider_auth_state(
+            pname,
+            &p,
+            parent.api_key.as_deref(),
+            Some(parent.base_url.as_str()),
+        );
+        if current_auth == ProviderAuthState::Missing && parent_auth == ProviderAuthState::Missing {
             // Only suggest an env var when the provider actually reads one;
             // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
             // would be sent chasing a var that resolve_api_key never consults.
@@ -473,7 +480,22 @@ fn apply_task_overrides(
         if model.is_none() && p.model.is_none() {
             bail!("task: provider '{pname}' requires an explicit model (it has no default)");
         }
+        let key = resolve_api_key(
+            pname,
+            &p,
+            cfg.api_key.as_deref(),
+            Some(cfg.base_url.as_str()),
+        )
+        .or_else(|| {
+            resolve_api_key(
+                pname,
+                &p,
+                parent.api_key.as_deref(),
+                Some(parent.base_url.as_str()),
+            )
+        });
         repoint_to_provider(cfg, pname, model)?;
+        cfg.api_key = key;
     } else if let Some(m) = model {
         cfg.model = m.to_string();
     }
@@ -716,7 +738,7 @@ impl hrdr_tools::Tool for SubagentTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        apply_task_overrides(&mut cfg, provider_arg, model_arg)?;
+        apply_task_overrides(&mut cfg, &self.base, provider_arg, model_arg)?;
         if cfg.model == "default" {
             bail!(
                 "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
@@ -4817,7 +4839,7 @@ mod tests {
 
         // (a) un-authenticated provider → fail fast, no repoint.
         let mut cfg = base.clone();
-        let err = apply_task_overrides(&mut cfg, Some("ghost"), Some("m"))
+        let err = apply_task_overrides(&mut cfg, &base, Some("ghost"), Some("m"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not configured"), "got: {err}");
@@ -4825,32 +4847,32 @@ mod tests {
 
         // (b) keyless `local` (built-in) with a model → repoints + identity.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, Some("local"), Some("deepseek-x")).unwrap();
+        apply_task_overrides(&mut cfg, &base, Some("local"), Some("deepseek-x")).unwrap();
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.provider.as_deref(), Some("local"));
         assert_eq!(cfg.model, "deepseek-x");
 
         // (c) provider without a default model and no model arg → error.
         let mut cfg = base.clone();
-        let err = apply_task_overrides(&mut cfg, Some("local"), None)
+        let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires an explicit model"), "got: {err}");
 
         // (d) unknown provider → error.
         let mut cfg = base.clone();
-        assert!(apply_task_overrides(&mut cfg, Some("nope"), Some("m")).is_err());
+        assert!(apply_task_overrides(&mut cfg, &base, Some("nope"), Some("m")).is_err());
 
         // (e) no provider, just a model → override on the current provider.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, None, Some("gpt-5.5")).unwrap();
+        apply_task_overrides(&mut cfg, &base, None, Some("gpt-5.5")).unwrap();
         assert_eq!(cfg.base_url, base.base_url); // still chatgpt endpoint
         assert_eq!(cfg.model, "gpt-5.5");
         assert_eq!(cfg.provider.as_deref(), Some("chatgpt"));
 
         // (f) neither → no-op.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, None, None).unwrap();
+        apply_task_overrides(&mut cfg, &base, None, None).unwrap();
         assert_eq!(cfg.model, "gpt-5.6-sol");
     }
 
@@ -4888,13 +4910,89 @@ mod tests {
         };
         let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
         // Ad-hoc override to a different provider + model.
-        apply_task_overrides(&mut cfg, Some("local"), Some("adhoc-model")).unwrap();
+        apply_task_overrides(&mut cfg, &parent, Some("local"), Some("adhoc-model")).unwrap();
         // Endpoint + model come from the ad-hoc override.
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.provider.as_deref(), Some("local"));
         assert_eq!(cfg.model, "adhoc-model");
         // Persona from the profile survives the override.
         assert_eq!(cfg.agent_prompt.as_deref(), Some("Review only."));
+        assert!(cfg.read_only);
+    }
+
+    #[test]
+    fn apply_task_overrides_can_return_to_original_parent_provider_auth() {
+        use super::{
+            ProviderConfig, SubagentProfile, apply_task_overrides, config_for_agent_profile,
+            subagent_base_config,
+        };
+
+        let parent_endpoint = "https://parent-a.invalid/v1";
+        let profile_endpoint = "https://profile-b.invalid/v1";
+        let mut parent = AgentConfig {
+            base_url: parent_endpoint.to_string(),
+            api_key: Some("parent-a-key".to_string()),
+            model: "parent-a-model".to_string(),
+            provider: Some("test-parent-a".to_string()),
+            ..Default::default()
+        };
+        parent.providers.insert(
+            "test-parent-a".to_string(),
+            ProviderConfig {
+                base_url: parent_endpoint.to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        parent.providers.insert(
+            "test-profile-b".to_string(),
+            ProviderConfig {
+                base_url: profile_endpoint.to_string(),
+                key_env: None,
+                api_key: Some("profile-b-key".to_string()),
+                model: Some("profile-b-model".to_string()),
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        let profile = SubagentProfile {
+            name: "reviewer".to_string(),
+            provider: Some("test-profile-b".to_string()),
+            model: None,
+            description: None,
+            prompt: Some("Preserve this persona.".to_string()),
+            read_only: true,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+
+        let base = subagent_base_config(&parent);
+        let mut cfg = config_for_agent_profile(&base, &profile).unwrap();
+        apply_task_overrides(
+            &mut cfg,
+            &base,
+            Some("test-parent-a"),
+            Some("adhoc-a-model"),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.base_url, parent_endpoint);
+        assert_eq!(cfg.provider.as_deref(), Some("test-parent-a"));
+        assert_eq!(cfg.model, "adhoc-a-model");
+        assert_eq!(cfg.api_key.as_deref(), Some("parent-a-key"));
+        assert_eq!(cfg.agent_prompt.as_deref(), Some("Preserve this persona."));
         assert!(cfg.read_only);
     }
 
