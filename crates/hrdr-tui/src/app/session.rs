@@ -144,7 +144,7 @@ impl super::App {
         // silently no-op while the transcript + session id still switched, and
         // the in-flight turn's autosave would then overwrite the resumed
         // session's file with the old conversation.
-        if self.running {
+        if self.running() {
             // Defense in depth: the shared dispatcher already guards /resume,
             // but auto-resume/other callers reach this directly.
             self.system(hrdr_app::RESUME_BUSY_MSG);

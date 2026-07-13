@@ -71,8 +71,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // would claim otherwise (the running tool's own block carries the `…` mark), and
     // it hides entirely when the agent you are looking at is not working — even if
     // another one is.
-    let working = app.panes.active_pane().turn.inferring()
-        || (app.compacting && app.panes.active().is_main());
+    // Compaction is the agent's, like the turn clock: a sub-agent summarizing itself
+    // says so on its own pane rather than looking hung.
+    let working = app.panes.active_pane().turn.inferring() || app.panes.active_pane().compacting;
     let loader_height: u16 = if working { 1 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
@@ -1191,7 +1192,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
     };
     // Compaction is the session's agent summarizing itself — not something a
     // sub-agent's pane should claim to be doing.
-    let text = if app.compacting && pane.id.is_main() {
+    let text = if pane.compacting {
         format!(
             " {frame} compacting context — summarizing the conversation…  ·  {:.1}s{started}",
             elapsed.as_secs_f64(),
@@ -2337,7 +2338,9 @@ fn transcript_lines(
     }
     // Queued prompts follow the transcript, so the last block is separated from
     // them exactly as it would be from any other tinted block.
-    let queued_bg = (!app.queue.is_empty()).then(|| BlockKind::Queued.bg(theme));
+    // Each agent's own queue: what is waiting to reach *this* agent.
+    let queued = app.panes.active_pane().pending.clone();
+    let queued_bg = (!queued.is_empty()).then(|| BlockKind::Queued.bg(theme));
     flush(
         &mut out,
         &mut msg_starts,
@@ -2368,10 +2371,10 @@ fn transcript_lines(
     // Pending queued messages render like user prompts, with a "Queued" badge
     // as the block's last row — through the same block path as everything else,
     // so they pick up the same padding and background.
-    if !app.queue.is_empty() {
+    if !queued.is_empty() {
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
-        for msg in &app.queue {
+        for msg in &queued {
             let mut body = markdown_lines(msg, &md_theme, bg, inner);
             // A blank row inside the block, so the badge doesn't sit flush
             // against the message text above it.

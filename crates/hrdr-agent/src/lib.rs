@@ -439,7 +439,43 @@ pub enum AgentEvent {
 /// A message still pending when the model answers without calling a tool is
 /// *not* delivered: that turn is over, and the frontend re-sends it as a turn of
 /// its own. Whatever it leaves behind is the frontend's to clear.
-pub type SteeringQueue = Arc<Mutex<std::collections::VecDeque<String>>>;
+pub type SteeringQueue = Arc<Mutex<std::collections::VecDeque<Steer>>>;
+
+/// One message waiting to reach an agent: what the model will read, and what the
+/// user actually typed.
+///
+/// They differ — `@file` mentions are expanded for the model, and the expansion can
+/// be an entire file. The reader must see what they wrote, not the blob.
+///
+/// Both live on the *queue*, because the queue is the agent's: a frontend used to
+/// keep a second, parallel queue of the display strings and pop the two in lockstep
+/// by hand, which is a drift waiting to happen (and left the displayed text
+/// depending on which side consumed first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Steer {
+    /// What is pushed into the conversation — `@file`-expanded.
+    pub sent: String,
+    /// What the user typed, for display.
+    pub display: String,
+}
+
+impl Steer {
+    /// A message whose sent and displayed forms are the same.
+    pub fn plain(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            display: text.clone(),
+            sent: text,
+        }
+    }
+
+    pub fn new(sent: impl Into<String>, display: impl Into<String>) -> Self {
+        Self {
+            sent: sent.into(),
+            display: display.into(),
+        }
+    }
+}
 
 /// Create an empty [`SteeringQueue`].
 pub fn steering_queue() -> SteeringQueue {
@@ -663,6 +699,7 @@ fn spawn_background(
                     agent: Arc::clone(&sub),
                     steering: Arc::clone(&steering),
                     running: true,
+                    compacting: false,
                     done: false,
                     delivered: false,
                     pinned: false,
@@ -956,6 +993,28 @@ pub fn should_auto_compact(
         return false;
     };
     window > 0 && prompt >= compaction_trigger(window, reserved)
+}
+
+/// Marks an agent as compacting for as long as it is, and clears the flag on every
+/// exit — a summarization that fails or is cancelled must not leave its pane
+/// spinning "compacting…" forever.
+struct CompactingGuard(Option<(LiveSubagents, u64)>);
+
+impl CompactingGuard {
+    fn new(home: Option<(LiveSubagents, u64)>) -> Self {
+        if let Some((live, key)) = &home {
+            live.update(*key, |e| e.compacting = true);
+        }
+        Self(home)
+    }
+}
+
+impl Drop for CompactingGuard {
+    fn drop(&mut self) {
+        if let Some((live, key)) = &self.0 {
+            live.update(*key, |e| e.compacting = false);
+        }
+    }
 }
 
 /// The opening usage counters for a delegated sub-agent — zeroed, but knowing
@@ -1549,6 +1608,7 @@ impl hrdr_tools::Tool for SubagentTool {
             agent: Arc::clone(&sub),
             steering: Arc::clone(&steering),
             running: true,
+            compacting: false,
             done: false,
             delivered: false,
             pinned: false,
@@ -4510,6 +4570,10 @@ impl Agent {
         if before <= 2 {
             return Ok((before, before));
         }
+        // The agent is the one that knows it is summarizing — including when it
+        // decided to on its own, which no frontend is told about. The guard clears
+        // the flag on every exit, error and cancellation included.
+        let _compacting = CompactingGuard::new(self.live_home.clone());
         // Keep the most recent messages verbatim — compaction usually fires
         // mid-task, and the summary alone loses exactly the detail the model
         // is working with. Only the head (everything older) is summarized.
@@ -4606,13 +4670,14 @@ impl Agent {
     /// conversation as user messages, emitting [`AgentEvent::Steered`] for each
     /// so the frontend can display it at delivery time.
     fn drain_steering<F: FnMut(AgentEvent)>(&mut self, steering: &SteeringQueue, on_event: &mut F) {
-        let pending: Vec<String> = steering
+        let pending: Vec<Steer> = steering
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
         for msg in pending {
-            on_event(AgentEvent::Steered(msg.clone()));
-            self.messages.push(ChatMessage::user(msg));
+            // The model reads the expanded form; the transcript shows what was typed.
+            on_event(AgentEvent::Steered(msg.display));
+            self.messages.push(ChatMessage::user(msg.sent));
         }
     }
 
@@ -7696,8 +7761,8 @@ mod tests {
         let steering = steering_queue();
         {
             let mut q = steering.lock().unwrap();
-            q.push_back("use ripgrep instead".to_string());
-            q.push_back("and skip the tests".to_string());
+            q.push_back(crate::Steer::plain("use ripgrep instead"));
+            q.push_back(crate::Steer::plain("and skip the tests"));
         }
         assert!(Agent::has_steering(&steering));
 
@@ -9454,7 +9519,9 @@ mod tests {
                 agent
                     .run("read the file", steering.clone(), |ev| {
                         if matches!(&ev, AgentEvent::ToolStart { .. }) {
-                            q.lock().unwrap().push_back("use ripgrep".to_string());
+                            q.lock()
+                                .unwrap()
+                                .push_back(crate::Steer::plain("use ripgrep"));
                         }
                         events.push(ev);
                     })
@@ -9522,7 +9589,9 @@ mod tests {
                         // arrive as several.
                         if matches!(&ev, AgentEvent::Text(_)) && !submitted {
                             submitted = true;
-                            q.lock().unwrap().push_back("and also this".to_string());
+                            q.lock()
+                                .unwrap()
+                                .push_back(crate::Steer::plain("and also this"));
                         }
                         events.push(ev);
                     })

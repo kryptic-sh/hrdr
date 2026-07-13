@@ -44,7 +44,7 @@ impl super::App {
         // then write the old history into a brand-new session. Cancel the turn
         // first, then clear through an awaited lock (the abort releases it at
         // the task's next yield).
-        if self.running {
+        if self.running() {
             self.cancel_turn();
         }
         if let Ok(mut a) = self.agent.try_lock() {
@@ -60,7 +60,7 @@ impl super::App {
         self.clear_transcript();
         // `/clear` starts a new session, so it opens with the banner again.
         self.push_entry(Entry::header());
-        self.queue.clear();
+        self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
         if let Ok(mut q) = self.steering.lock() {
             q.clear();
         }
@@ -270,7 +270,7 @@ impl super::App {
             self.system("usage: /edit <file>");
             return;
         }
-        if self.running {
+        if self.running() {
             self.system(hrdr_app::busy_guard("/edit"));
             return;
         }
@@ -393,7 +393,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         true // the TUI implements the full registry
     }
     fn is_busy(&self) -> bool {
-        self.app.running
+        self.app.running() || self.app.compacting()
     }
     fn send_prompt(&mut self, prompt: String, show_as_user: bool) {
         if show_as_user {

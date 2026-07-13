@@ -321,7 +321,7 @@ impl Harness {
 
     /// Drain the turn channel until the agent is no longer running.
     async fn pump(&mut self) {
-        while self.app.running {
+        while self.app.running() {
             match self.rx.recv().await {
                 Some(msg) => self.app.on_turn_msg(msg),
                 None => break,
@@ -398,7 +398,7 @@ async fn plain_message_gets_a_streamed_reply() {
         "assistant reply missing:\n{screen}"
     );
     // The turn finished — not stuck "running".
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -426,7 +426,7 @@ async fn tool_call_runs_the_tool_then_finishes() {
         screen.contains("Added the todo."),
         "final reply missing:\n{screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -462,7 +462,7 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
         screen.contains("Both ran."),
         "final reply missing:\n{screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -497,7 +497,7 @@ async fn read_only_tool_calls_run_concurrently_in_order() {
         "final reply missing:
 {screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -525,7 +525,7 @@ async fn step_budget_exhaustion_wraps_up_instead_of_failing() {
         "notice missing:
 {screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -562,7 +562,7 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
         "final text missing:
 {screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -588,7 +588,7 @@ async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
         screen.contains("Recovered fine."),
         "did not recover after tool error:\n{screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -608,7 +608,7 @@ async fn clear_wipes_the_transcript() {
         !screen.contains("first answer") && !screen.contains("remember this"),
         "old transcript survived /clear:\n{screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -623,7 +623,7 @@ async fn slash_help_renders_locally_without_a_turn() {
         screen.contains("/exit") && screen.contains("reload AGENTS.md"),
         "help output missing:\n{screen}"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -635,7 +635,7 @@ async fn usage_captured_after_turn() {
         "last_usage must be None before any turn"
     );
     h.submit("ping").await;
-    assert!(!h.app.running);
+    assert!(!h.app.running());
     assert_eq!(
         h.app.state().usage.last(),
         Some((10, 5)),
@@ -653,7 +653,7 @@ async fn multi_chunk_text_assembles_correctly() {
     ])])
     .await;
     h.submit("say hello").await;
-    assert!(!h.app.running);
+    assert!(!h.app.running());
     // The accumulator must stitch the deltas into a single entry.
     let assembled = h.app.transcript().iter().find_map(|e| match &e.kind {
         EntryKind::Assistant(s) => Some(s.clone()),
@@ -677,7 +677,7 @@ async fn reasoning_entry_appended_to_transcript() {
     .await;
     assert!(h.app.show_reasoning, "show_reasoning must default to true");
     h.submit("think").await;
-    assert!(!h.app.running);
+    assert!(!h.app.running());
     let has_reasoning = h.app.transcript().iter().any(
         |e| matches!(&e.kind, EntryKind::Reasoning { text, .. } if text.contains("I am thinking.")),
     );
@@ -708,7 +708,7 @@ async fn reasoning_hidden_in_render_after_toggle() {
         "show_reasoning should be false after first /reasoning"
     );
     h.submit("think aloud").await;
-    assert!(!h.app.running);
+    assert!(!h.app.running());
     let screen = h.render();
     assert!(
         !screen.contains("secret thought"),
@@ -749,7 +749,7 @@ async fn statusbar_slash_command_updates_state() {
         h.app.statusbar_mode == StatusBarMode::Truncate,
         "/statusbar truncate did not set Truncate mode"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 #[tokio::test]
@@ -775,7 +775,7 @@ async fn timestamps_slash_command_updates_state() {
         h.app.timestamp_style == TimestampStyle::Relative,
         "/timestamps relative did not set Relative style"
     );
-    assert!(!h.app.running);
+    assert!(!h.app.running());
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,12 +1160,12 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     let mut h = Harness::new(vec![MockReply::Text("first reply".into())]).await;
 
     // A turn is in flight.
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("second question");
     h.press(KeyCode::Enter);
 
     assert_eq!(
-        h.app.queue.iter().collect::<Vec<_>>(),
+        h.app.pending(),
         ["second question"],
         "the message is queued"
     );
@@ -1176,12 +1176,12 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
         "and not yet in the conversation"
     );
-    assert!(h.app.running, "the running turn was not disturbed");
+    assert!(h.app.running(), "the running turn was not disturbed");
     assert_eq!(h.app.editor.content(), "", "the draft was taken");
 
     // The turn ends: the queued message becomes its own turn.
     h.app.on_turn_msg(TurnMsg::Done(None));
-    assert!(h.app.queue.is_empty(), "the queue drained");
+    assert!(h.app.pending().is_empty(), "the queue drained");
     assert!(
         h.app
             .transcript()
@@ -1189,7 +1189,7 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
         "the queued message was sent after the turn"
     );
-    assert!(h.app.running, "as a turn of its own");
+    assert!(h.app.running(), "as a turn of its own");
 }
 
 /// The steering path: a message queued while the model is working rides in with
@@ -1201,7 +1201,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     use hrdr_agent::AgentEvent;
 
     let mut h = Harness::new(vec![]).await;
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
 
     // Submitted while the model works.
     h.type_str("actually, use ripgrep");
@@ -1222,23 +1222,29 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     );
     // It is handed to the running turn, which drains it before its next request.
     assert_eq!(h.app.steering_len_for_test(), 1);
-    assert_eq!(h.app.queue.len(), 1, "and shown as pending meanwhile");
+    assert_eq!(h.app.pending().len(), 1, "and shown as pending meanwhile");
 
-    // `Agent::run` drains it after the round's tool results and says so.
-    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Steered(
-        "actually, use ripgrep".into(),
-    )));
+    // `Agent::run` drains it after the round's tool results and says so — the queue
+    // is the agent's, so taking it off is part of what the agent does, not something
+    // the frontend does in parallel.
+    let taken = h
+        .app
+        .live_subagents
+        .take_pending(hrdr_agent::MAIN_KEY)
+        .expect("the agent takes it off its own queue");
+    h.app
+        .on_turn_msg(TurnMsg::Event(AgentEvent::Steered(taken.display)));
     assert_eq!(
         user_entries(&h),
         ["actually, use ripgrep"],
         "displayed at delivery"
     );
-    assert!(h.app.queue.is_empty(), "no longer pending");
+    assert!(h.app.pending().is_empty(), "no longer pending");
 
     // The turn continues; nothing is re-sent when it ends.
     h.app.on_turn_msg(TurnMsg::Done(None));
     assert_eq!(user_entries(&h), ["actually, use ripgrep"], "sent once");
-    assert!(!h.app.running, "no follow-up turn was spawned");
+    assert!(!h.app.running(), "no follow-up turn was spawned");
 }
 
 /// A cancelled turn drops the message it was carrying rather than leaking it
@@ -1246,13 +1252,13 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
 #[tokio::test]
 async fn cancelling_drops_an_undelivered_steer() {
     let mut h = Harness::new(vec![]).await;
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("never mind");
     h.press(KeyCode::Enter);
     assert_eq!(h.app.steering_len_for_test(), 1);
 
     h.app.cancel_turn();
-    assert!(h.app.queue.is_empty());
+    assert!(h.app.pending().is_empty());
     assert_eq!(h.app.steering_len_for_test(), 0, "the agent's copy too");
 }
 
@@ -1261,23 +1267,23 @@ async fn cancelling_drops_an_undelivered_steer() {
 #[tokio::test]
 async fn queued_messages_are_sent_fifo_one_turn_at_a_time() {
     let mut h = Harness::new(vec![]).await;
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     for msg in ["one", "two"] {
         h.type_str(msg);
         h.press(KeyCode::Enter);
     }
-    assert_eq!(h.app.queue.iter().collect::<Vec<_>>(), ["one", "two"]);
+    assert_eq!(h.app.pending(), ["one", "two"]);
 
     h.app.on_turn_msg(TurnMsg::Done(None));
     assert_eq!(
-        h.app.queue.iter().collect::<Vec<_>>(),
+        h.app.pending(),
         ["two"],
         "one turn spawns per completion, oldest first"
     );
 
     // Cancelling drops what is still waiting rather than sending it later.
     h.app.cancel_turn();
-    assert!(h.app.queue.is_empty(), "a cancel discards the queue");
+    assert!(h.app.pending().is_empty(), "a cancel discards the queue");
 }
 
 /// Regression: meta lines, the thinking spinner, stats lines, and queued-message
@@ -1294,7 +1300,9 @@ async fn every_transcript_row_is_rendered_through_the_block_path() {
     .await;
     h.submit("run it").await;
     h.app.transcript_mut().push(Entry::diff("+added"));
-    h.app.queue.push_back("queued msg".into());
+    h.app
+        .live_subagents
+        .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::plain("queued msg"));
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -1449,7 +1457,7 @@ async fn history_snapshot_persists_the_session_mid_turn() {
 
     // Simulate a running turn: the turn task would hold the agent lock; here
     // the flag alone shows the regular autosave path is not what saves us.
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.push_entry(Entry::user("do the thing"));
     let snapshot = vec![
         hrdr_agent::Message::user("do the thing"),
@@ -2116,7 +2124,7 @@ async fn a_thinking_block_renders_no_label() {
     h2.app
         .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
-    h2.app.running = true;
+    h2.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h2.app.reasoning_start = Some(std::time::Instant::now());
     let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h2.app)).unwrap();
@@ -2838,6 +2846,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
+        compacting: false,
         done: false,
         delivered: false,
         pinned: false,
@@ -2911,6 +2920,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         steering: steering.clone(),
         // Mid-turn: a message must be delivered as steering, not a new turn.
         running: true,
+        compacting: false,
         done: false,
         delivered: false,
         pinned: false,
@@ -2922,7 +2932,12 @@ async fn the_input_box_routes_to_the_focused_agent() {
     h.submit("check the auth module too").await;
 
     // It reached the sub-agent's steering queue — the one its `run` drains.
-    let steered: Vec<String> = steering.lock().unwrap().iter().cloned().collect();
+    let steered: Vec<String> = steering
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.display.clone())
+        .collect();
     assert_eq!(
         steered,
         vec!["check the auth module too".to_string()],
@@ -2959,7 +2974,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         main_before,
         "a side-conversation does not enter the main agent's transcript"
     );
-    assert!(!h.app.running, "and it did not start a main-agent turn");
+    assert!(!h.app.running(), "and it did not start a main-agent turn");
 }
 
 /// The agent list switches the view. It lists **main first** (so there is always a
@@ -3007,6 +3022,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
+        compacting: false,
         done: false,
         delivered: false,
         pinned: false,
@@ -3156,6 +3172,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: false,
+        compacting: false,
         done: true,
         delivered: false,
         pinned: false,
@@ -3248,26 +3265,26 @@ async fn a_finished_background_task_wakes_an_idle_model() {
     // Still running: nothing to deliver.
     *h.app.background_tasks.lock().unwrap() = vec![task(false, false)];
     h.app.maybe_deliver_background();
-    assert!(!h.app.running, "an unfinished task doesn't wake anything");
+    assert!(!h.app.running(), "an unfinished task doesn't wake anything");
 
     // Finished, but a turn is already in flight — it will drain at its next
     // request, so don't spawn a second turn on top of it.
     *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.maybe_deliver_background();
-    h.app.running = false;
+    h.app.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
 
     // Already delivered: nothing to do (and no wake-up loop).
     *h.app.background_tasks.lock().unwrap() = vec![task(true, true)];
     h.app.maybe_deliver_background();
-    assert!(!h.app.running, "a delivered result doesn't wake anything");
+    assert!(!h.app.running(), "a delivered result doesn't wake anything");
 
     // Finished, undelivered, idle: the model is woken with an empty turn — no
     // user message of its own is added to the transcript.
     *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
     let before = h.app.transcript().len();
     h.app.maybe_deliver_background();
-    assert!(h.app.running, "the model was woken");
+    assert!(h.app.running(), "the model was woken");
     assert_eq!(
         h.app.transcript().len(),
         before,
@@ -3280,10 +3297,10 @@ async fn a_finished_background_task_wakes_an_idle_model() {
 #[tokio::test]
 async fn the_queued_badge_sits_below_a_blank_row() {
     let mut h = Harness::new(vec![]).await;
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("hold this thought");
     h.press(KeyCode::Enter);
-    assert_eq!(h.app.queue.len(), 1, "the message is pending");
+    assert_eq!(h.app.pending().len(), 1, "the message is pending");
 
     let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3605,7 +3622,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
     use hrdr_agent::AgentEvent;
 
     let mut h = Harness::new(vec![]).await;
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.resume_inference_for_test();
     // The clock is the *agent's*, kept on its registry entry — the main agent's is
     // read exactly the way a sub-agent's is.
@@ -3702,6 +3719,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
+        compacting: false,
         done: false,
         delivered: false,
         pinned: false,
@@ -3761,7 +3779,7 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
         content: "ship it".to_string(),
         status: "in_progress".to_string(),
     }];
-    h.app.running = true;
+    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
     // The loader tracks the *model* working, not merely a turn being in flight.
     h.app.resume_inference_for_test();
 
@@ -4068,11 +4086,11 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
 
     h.type_str("investigate the bug");
     h.press(KeyCode::Enter);
-    assert!(h.app.running, "the turn is in flight");
+    assert!(h.app.running(), "the turn is in flight");
     pump_until_partial_reply(&mut h).await;
 
     h.app.cancel_turn();
-    assert!(!h.app.running, "cancelled");
+    assert!(!h.app.running(), "cancelled");
 
     let id = h
         .app
@@ -4124,7 +4142,7 @@ async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
     h.app
         .on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     assert!(h.app.should_quit, "Ctrl+Q arms the quit");
-    assert!(!h.app.running, "the in-flight turn was cancelled first");
+    assert!(!h.app.running(), "the in-flight turn was cancelled first");
 
     let id = h
         .app
@@ -4253,7 +4271,7 @@ async fn an_unrecognized_slash_command_is_reported_not_sent_to_the_model() {
     h.type_str("/exprot");
     h.press(KeyCode::Enter);
 
-    assert!(!h.app.running, "no turn should have been spawned");
+    assert!(!h.app.running(), "no turn should have been spawned");
     assert!(
         !h.app
             .transcript()
@@ -4530,7 +4548,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("!echo hello-from-shell");
     h.press(KeyCode::Enter);
-    assert!(!h.app.running, "no model turn spawns for a !command");
+    assert!(!h.app.running(), "no model turn spawns for a !command");
     assert!(
         h.app
             .transcript()

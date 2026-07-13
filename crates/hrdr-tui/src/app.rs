@@ -1,6 +1,6 @@
 //! App state, the async event loop, and agent orchestration.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -194,7 +194,6 @@ pub(crate) struct App {
     pub(crate) timestamp_style: TimestampStyle,
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
     pub(crate) statusbar_mode: StatusBarMode,
-    pub(crate) running: bool,
     // ---- status bar info ----
     /// Working directory, home-shortened for display.
     pub(crate) dir: String,
@@ -223,8 +222,6 @@ pub(crate) struct App {
     /// Show every tool result in full (`/expand all`); per-entry `expanded`
     /// overrides this for individual results.
     pub(crate) expand_tools: bool,
-    /// True while a compaction (summarization) pass is running.
-    pub(crate) compacting: bool,
     /// True while an `/init` turn runs, so its result reloads `AGENTS.md`.
     pending_init: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
@@ -317,11 +314,6 @@ pub(crate) struct App {
     todo_completed_at: HashMap<String, u64>,
     /// Turns a completed TODO stays visible before pruning (config `todo_ttl`).
     todo_ttl: u64,
-    /// Messages submitted while a turn is running, still waiting to reach the
-    /// model. Shown as pending blocks below the transcript. Each also sits in
-    /// [`Self::steering`] as its prepared (`@file`-expanded) text; whichever
-    /// side consumes it first pops from both.
-    pub(crate) queue: VecDeque<String>,
     /// The running turn's steering queue. `Agent::run` drains it before each
     /// request — i.e. right after a round's tool results — so a queued message
     /// rides in with them. Empty when no turn is running.
@@ -453,7 +445,6 @@ impl App {
             header_anchor: Instant::now(),
             timestamp_style,
             statusbar_mode,
-            running: false,
             dir,
             branch,
             icon_mode,
@@ -467,7 +458,6 @@ impl App {
             file_index_building: false,
             show_reasoning: show_thinking,
             expand_tools: false,
-            compacting: false,
             pending_init: false,
             pending_edit: None,
             model_selector: None,
@@ -498,7 +488,6 @@ impl App {
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
             todo_ttl,
-            queue: VecDeque::new(),
             steering: hrdr_agent::steering_queue(),
             follow_button: None,
             tool_hits: Vec::new(),
@@ -718,7 +707,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 // Ctrl+C interrupts a running turn (doesn't arm quit).
-                KeyCode::Char('c') if self.running => {
+                KeyCode::Char('c') if self.running() => {
                     self.cancel_turn();
                     self.quit_armed = false;
                     return Action::None;
@@ -740,7 +729,7 @@ impl App {
                 // Ctrl+L clears + repaints the screen (fix terminal corruption).
                 KeyCode::Char('l') => return Action::Redraw,
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
-                KeyCode::Char('g') if !self.running => return Action::OpenEditor,
+                KeyCode::Char('g') if !self.running() => return Action::OpenEditor,
                 // Ctrl+D on an empty input quits (shell-style EOF) — checked
                 // before the vim Normal-mode scroll arm below so it fires even
                 // in Normal mode, matching the welcome banner's advertised
@@ -770,7 +759,7 @@ impl App {
 
         // Esc while running cancels the in-flight turn (vim: only in Normal, so
         // Esc still exits Insert; plain: always, since Esc is otherwise unused).
-        if self.running
+        if self.running()
             && key.code == KeyCode::Esc
             && key.modifiers.is_empty()
             && self.editor.mode_label() != "INSERT"
@@ -897,21 +886,16 @@ impl App {
                 self.send_to_subagent(key, input);
                 return Action::None;
             }
-            if self.running {
-                // A turn is in flight. The message is never injected mid-stream:
-                // it waits as a pending block, and `Agent::run` picks it up
-                // before its next request — which only happens after a round's
-                // tool results, so the model reads them together. If the model
-                // instead ends the turn, nothing drains it and `Done` re-sends it
-                // as a turn of its own.
-                self.queue.push_back(input.clone());
+            if self.running() || self.compacting() {
+                // Busy. The message is never injected mid-stream: it waits on the
+                // agent's own queue, and `Agent::run` picks it up before its next
+                // request — which only happens after a round's tool results, so the
+                // model reads them together. If the model ends the turn instead,
+                // nothing drains it and `Done` re-sends it as a turn of its own.
+                // (While compacting, nothing is in `run()` to drain it at all.)
                 let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
-                if let Ok(mut q) = self.steering.lock() {
-                    q.push_back(sent);
-                }
-            } else if self.compacting {
-                // Summarizing, not in `run()` — nothing is draining steering.
-                self.queue.push_back(input);
+                self.live_subagents
+                    .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
             } else {
                 self.spawn_turn(input);
             }
@@ -931,7 +915,7 @@ impl App {
     /// user's own shell. Rejected while a turn is running: its tool blocks
     /// would interleave with the model's.
     pub(crate) fn user_shell_command(&mut self, command: String) {
-        if self.running {
+        if self.running() {
             self.system(
                 "a turn is running — wait for it (or interrupt with Esc) before running                  !commands"
                     .to_string(),
@@ -1305,6 +1289,27 @@ impl App {
         self.panes.main_mut().transcript_mut()
     }
 
+    /// Whether the session's agent has a turn in flight.
+    ///
+    /// Read from the agent, not remembered here: the agent is the one that knows,
+    /// and every other agent's `running` already came from the registry. A copy in
+    /// the frontend is a copy that can be wrong.
+    pub(crate) fn running(&self) -> bool {
+        self.live_subagents.is_running(hrdr_agent::MAIN_KEY)
+    }
+
+    /// Whether the session's agent is summarizing its own context.
+    pub(crate) fn compacting(&self) -> bool {
+        self.live_subagents.is_compacting(hrdr_agent::MAIN_KEY)
+    }
+
+    /// What the user has said to the session's agent that has not reached it yet.
+    /// (The renderer reads the *active* pane's queue; this is main's, for tests.)
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> Vec<String> {
+        self.live_subagents.pending(hrdr_agent::MAIN_KEY)
+    }
+
     /// The main agent's state: its name, model, endpoint, history, transcript and
     /// token counters — and the payload the session file stores.
     ///
@@ -1325,7 +1330,7 @@ impl App {
     pub(crate) fn sync_panes(&mut self) {
         // The registry drives every pane's status, main included — so tell it
         // whether the session's agent is working.
-        let running = self.running;
+        let running = self.running();
         self.live_subagents
             .update(hrdr_agent::MAIN_KEY, |e| e.running = running);
         self.panes.sync(&self.live_subagents);
@@ -1338,6 +1343,8 @@ impl App {
     /// so it lives in `LiveSubagents::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
+        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
+        let input = hrdr_agent::Steer::new(sent, input);
         // What was said and everything that comes back is recorded on the agent's
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
         // is folded into the transcript here — doing it in both places would show
@@ -1663,16 +1670,10 @@ impl App {
             // next turn — harmless either way.
             self.quit_reap = Some(handle);
         }
-        self.running = false;
         self.pending_init = false;
-        self.compacting = false;
         self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
-        let dropped = self.queue.len();
-        self.queue.clear();
-        // Undelivered steering would otherwise leak into the next turn.
-        if let Ok(mut q) = self.steering.lock() {
-            q.clear();
-        }
+        // Undelivered messages would otherwise leak into the next turn.
+        let dropped = self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
         // The turn never reached `Done`, so nothing has autosaved the visible
         // user message + whatever partial reply streamed in before the
@@ -1687,7 +1688,7 @@ impl App {
     /// double Ctrl+C, Ctrl+D on empty input, `/exit`) never drops the visible
     /// user message or a partial reply.
     fn request_quit(&mut self) {
-        if self.running {
+        if self.running() {
             self.cancel_turn();
         }
         self.should_quit = true;
@@ -1704,20 +1705,28 @@ impl App {
     }
 
     fn spawn_turn(&mut self, input: String) {
-        // Commit the message into history at send time (a queued message lives
-        // as a pending bottom item until this point).
-        self.push_entry(Entry::user(input.clone()));
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
         let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
-        self.launch_turn(sent);
+        self.launch_turn_shown(hrdr_agent::Steer::new(sent, input));
+    }
+
+    /// Start a turn and show what was said. The message carries both forms — what
+    /// the model reads and what the user typed — so the transcript never shows an
+    /// `@file` expansion back to the person who wrote the `@file`.
+    fn launch_turn_shown(&mut self, msg: hrdr_agent::Steer) {
+        // Commit the message into the transcript at send time (a queued message
+        // lives as a pending bottom item until this point).
+        self.push_entry(Entry::user(msg.display));
+        self.launch_turn(msg.sent);
     }
 
     /// Run a turn against the model with `input` as the (already-prepared) user
     /// message. The caller is responsible for any transcript display.
     fn launch_turn(&mut self, input: String) {
         self.reserve_session_id(&input);
-        self.running = true;
+        // The agent is what is running; the registry is where that is recorded.
+        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
         self.reasoning_start = None;
         // The turn clock belongs to the agent whose turn it is — the registry keeps
         // it, so a frontend showing that agent shows its loader.
@@ -1770,8 +1779,6 @@ impl App {
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
     fn spawn_compaction(&mut self, instructions: Option<String>) {
-        self.running = true;
-        self.compacting = true;
         self.reasoning_start = None;
         // Summarizing is the model working: its own clock, no tools.
         self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
@@ -1811,7 +1818,7 @@ impl App {
         match msg {
             TurnMsg::Event(ev) => {
                 // Ignore buffered events after cancellation.
-                if self.running {
+                if self.running() {
                     self.apply_event(ev);
                 }
             }
@@ -1837,12 +1844,11 @@ impl App {
                 // Same rationale as TurnMsg::System above: passive async output.
             }
             TurnMsg::Done(err) => {
-                if !self.running {
+                if !self.running() {
                     // Stale Done from an aborted task; discard.
                     return;
                 }
                 self.turn_handle = None;
-                self.running = false;
                 self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
@@ -1880,11 +1886,8 @@ impl App {
                 // answered instead of calling a tool). Drop the agent's prepared
                 // copies — `spawn_turn` re-prepares — and send the oldest as a
                 // turn of its own. The rest wait for that turn to finish.
-                if let Ok(mut q) = self.steering.lock() {
-                    q.clear();
-                }
-                if let Some(next) = self.queue.pop_front() {
-                    self.spawn_turn(next);
+                if let Some(next) = self.live_subagents.take_pending(hrdr_agent::MAIN_KEY) {
+                    self.launch_turn_shown(next);
                 }
             }
             TurnMsg::FileIndex(cwd, files) => {
@@ -1921,8 +1924,6 @@ impl App {
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;
-                self.running = false;
-                self.compacting = false;
                 self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
@@ -1933,8 +1934,8 @@ impl App {
                 }
                 self.scroll_offset = 0;
                 // Resume any queued work now that the context is compact.
-                if let Some(next) = self.queue.pop_front() {
-                    self.spawn_turn(next);
+                if let Some(next) = self.live_subagents.take_pending(hrdr_agent::MAIN_KEY) {
+                    self.launch_turn_shown(next);
                 }
             }
         }
@@ -1965,7 +1966,7 @@ impl App {
     /// user message of its own. Only fires when idle: a running turn already
     /// drains them at its next request, and a compaction is about to.
     pub(crate) fn maybe_deliver_background(&mut self) {
-        if self.running || self.compacting {
+        if self.running() || self.compacting() {
             return;
         }
         let ready = self
@@ -2034,15 +2035,8 @@ impl App {
     /// What is left here is what is genuinely the terminal's: writing the session
     /// file, and the wall-clock it holds for a reasoning block's duration.
     fn apply_event(&mut self, ev: AgentEvent) {
-        // A steered message is displayed as the user typed it, not in its
-        // `@file`-expanded form — the expansion is for the model, not the reader.
-        let ev = match ev {
-            AgentEvent::Steered(sent) => {
-                AgentEvent::Steered(self.queue.pop_front().unwrap_or(sent))
-            }
-            other => other,
-        };
-
+        // The agent already emits a steered message in the form the user typed it:
+        // the queue carries both, so nothing here has to pair them up.
         // Mid-turn durability: the agent committed a round and sent its history.
         if let AgentEvent::History(messages) = &ev {
             self.persist_mid_turn(messages.clone());

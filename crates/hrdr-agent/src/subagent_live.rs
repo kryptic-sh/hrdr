@@ -166,9 +166,14 @@ pub struct LiveSubagent {
     /// The steering queue its `run` is draining. Push here to inject a message
     /// into the turn already in flight.
     pub steering: SteeringQueue,
-    /// A turn is in flight on this sub-agent (its delegated task, or one the user
-    /// drove from its view).
+    /// A turn is in flight on this agent (a delegated task, or one the user drove
+    /// from its view).
     pub running: bool,
+    /// It is summarizing its own context — a `/compact`, or a self-compaction it
+    /// decided on when its window filled. The agent sets this: it is the one that
+    /// knows, and a sub-agent compacting itself on a small local model is exactly as
+    /// worth showing as the main agent doing it.
+    pub compacting: bool,
     /// Its delegated task has finished.
     pub done: bool,
     /// Its result has reached the main agent (a blocking tool result, or a
@@ -255,6 +260,7 @@ impl LiveSubagents {
                 agent,
                 steering,
                 running: false,
+                compacting: false,
                 // The session's agent is never finished, never owed, never pruned.
                 done: false,
                 delivered: false,
@@ -297,9 +303,78 @@ impl LiveSubagents {
         });
     }
 
-    /// Agent `key`'s turn is over: stop its clock.
+    /// Agent `key`'s turn is over: stop its clock and mark it idle.
     pub fn end_turn(&self, key: u64) {
-        self.update(key, |e| e.turn.end());
+        self.update(key, |e| {
+            e.running = false;
+            e.turn.end();
+        });
+    }
+
+    /// Whether agent `key` has a turn in flight.
+    pub fn is_running(&self, key: u64) -> bool {
+        self.with(|v| v.iter().any(|e| e.key == key && e.running))
+    }
+
+    /// Whether agent `key` is summarizing its own context.
+    pub fn is_compacting(&self, key: u64) -> bool {
+        self.with(|v| v.iter().any(|e| e.key == key && e.compacting))
+    }
+
+    /// Queue a message for agent `key`, to reach it before its next request.
+    ///
+    /// The queue is the agent's, not a frontend's: what is waiting to be said to an
+    /// agent is a fact about that agent. A frontend reads it back with
+    /// [`Self::pending`] to show it, and does not keep a copy.
+    pub fn enqueue(&self, key: u64, msg: crate::Steer) {
+        self.with(|v| {
+            if let Some(e) = v.iter().find(|e| e.key == key)
+                && let Ok(mut q) = e.steering.lock()
+            {
+                q.push_back(msg);
+            }
+        });
+    }
+
+    /// What is still waiting to reach agent `key`, as the user typed it.
+    pub fn pending(&self, key: u64) -> Vec<String> {
+        self.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| {
+                    e.steering
+                        .lock()
+                        .ok()
+                        .map(|q| q.iter().map(|s| s.display.clone()).collect())
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Take the message at the head of agent `key`'s queue.
+    pub fn take_pending(&self, key: u64) -> Option<crate::Steer> {
+        self.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.steering.lock().ok().and_then(|mut q| q.pop_front()))
+        })
+    }
+
+    /// Drop everything queued for agent `key`, returning how many were discarded
+    /// (a cancelled turn must not leak them into the next one).
+    pub fn clear_pending(&self, key: u64) -> usize {
+        self.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| {
+                    e.steering.lock().ok().map(|mut q| {
+                        let n = q.len();
+                        q.clear();
+                        n
+                    })
+                })
+                .unwrap_or(0)
+        })
     }
 
     /// A snapshot of `key`'s turn clock, for the frontend showing that agent.
@@ -365,7 +440,12 @@ impl LiveSubagents {
     ///
     /// `None` when the sub-agent has already been released (finished, delivered and
     /// pruned), so a caller can say so rather than swallow the prompt.
-    pub fn send_prompt<F>(&self, key: u64, input: String, on_event: F) -> Option<PromptDelivery>
+    pub fn send_prompt<F>(
+        &self,
+        key: u64,
+        input: crate::Steer,
+        on_event: F,
+    ) -> Option<PromptDelivery>
     where
         F: FnMut(crate::AgentEvent) + Send + 'static,
     {
@@ -388,8 +468,9 @@ impl LiveSubagents {
         // the input that opens a turn — so record it here. Without it the agent's
         // record shows the reply and not the question, and a pane rebuilt from that
         // record would too.
-        self.record(key, &crate::AgentEvent::Steered(input.clone()));
+        self.record(key, &crate::AgentEvent::Steered(input.display.clone()));
         self.begin_turn(key);
+        let input = input.sent;
         let live = self.clone();
         tokio::spawn(async move {
             // The guard marks it idle again on every exit — including cancellation,
@@ -523,6 +604,7 @@ mod tests {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
             running: true,
+            compacting: false,
             done: false,
             delivered: false,
             pinned: false,
@@ -621,10 +703,15 @@ mod tests {
         live.register(entry(1)); // `entry` is running
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
-        let delivery = live.send_prompt(1, "look at auth too".to_string(), |_| {});
+        let delivery = live.send_prompt(1, crate::Steer::plain("look at auth too"), |_| {});
         assert_eq!(delivery, Some(PromptDelivery::Steered));
         assert_eq!(
-            steering.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            steering
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.sent.clone())
+                .collect::<Vec<_>>(),
             vec!["look at auth too".to_string()],
             "it reaches the queue the agent's run() drains"
         );
@@ -647,7 +734,7 @@ mod tests {
             e.done = true;
         });
 
-        let delivery = live.send_prompt(1, "now summarise".to_string(), |_| {});
+        let delivery = live.send_prompt(1, crate::Steer::plain("now summarise"), |_| {});
         assert_eq!(
             delivery,
             Some(PromptDelivery::StartedTurn),
@@ -666,7 +753,10 @@ mod tests {
     #[test]
     fn a_prompt_to_a_released_agent_is_reported_not_swallowed() {
         let live = LiveSubagents::new();
-        assert!(live.send_prompt(99, "hello?".to_string(), |_| {}).is_none());
+        assert!(
+            live.send_prompt(99, crate::Steer::plain("hello?"), |_| {})
+                .is_none()
+        );
     }
 
     /// A cancelled run must not strand its sub-agent. The update after `.await`
@@ -807,7 +897,10 @@ mod tests {
         live.register(entry(7));
         let (agent, steering) = live.handle(7).expect("a live sub-agent is addressable");
         // The queue is the one `run` drains, so a push is a mid-turn injection.
-        steering.lock().unwrap().push_back("steer me".to_string());
+        steering
+            .lock()
+            .unwrap()
+            .push_back(crate::Steer::plain("steer me"));
         assert_eq!(steering.lock().unwrap().len(), 1);
         // And the agent itself is reachable for a further turn.
         assert!(agent.try_lock().is_ok());

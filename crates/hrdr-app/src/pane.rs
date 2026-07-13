@@ -81,6 +81,13 @@ pub struct Pane {
     /// *main* agent's spinner and throughput, and a sub-agent grinding away under an
     /// idle main agent showed no loader at all.
     pub turn: hrdr_agent::TurnStats,
+    /// This agent is summarizing its own context. Per agent, because compaction is:
+    /// a sub-agent on a small local model compacts itself, and its pane should say
+    /// so rather than looking hung.
+    pub compacting: bool,
+    /// What the user has said to this agent that has not reached it yet — the
+    /// agent's own queue, shown as pending blocks under its transcript.
+    pub pending: Vec<String>,
     /// Reasoning effort this agent is running at.
     pub effort: Option<String>,
     /// Whether this agent auto-compacts, and the buffer it keeps below its window —
@@ -269,6 +276,8 @@ impl Default for PaneSet {
                 status: PaneStatus::Idle,
                 state: SessionState::default(),
                 turn: hrdr_agent::TurnStats::default(),
+                compacting: false,
+                pending: Vec::new(),
                 effort: None,
                 auto_compact: true,
                 compaction_reserved: 0,
@@ -414,6 +423,12 @@ impl PaneSet {
                     turn: e.turn,
                     running: e.running,
                     done: e.done,
+                    compacting: e.compacting,
+                    pending: e
+                        .steering
+                        .lock()
+                        .map(|q| q.iter().map(|s| s.display.clone()).collect())
+                        .unwrap_or_default(),
                     // A finished `task` block shows *what was delegated to*, not the
                     // work — the work is in that agent's own transcript.
                     tool_id: e.tool_id.clone(),
@@ -445,6 +460,8 @@ impl PaneSet {
                         status,
                         state: SessionState::default(),
                         turn: hrdr_agent::TurnStats::default(),
+                        compacting: false,
+                        pending: Vec::new(),
                         effort: None,
                         auto_compact: true,
                         compaction_reserved: 0,
@@ -457,6 +474,8 @@ impl PaneSet {
             };
             pane.status = status;
             pane.turn = s.turn;
+            pane.compacting = s.compacting;
+            pane.pending = s.pending.clone();
             pane.effort = s.effort.clone();
             pane.auto_compact = s.auto_compact;
             pane.compaction_reserved = s.compaction_reserved;
@@ -517,6 +536,8 @@ struct LiveSnapshot {
     turn: hrdr_agent::TurnStats,
     running: bool,
     done: bool,
+    compacting: bool,
+    pending: Vec<String>,
     /// The `task` call that spawned this agent, if it was delegated.
     tool_id: Option<String>,
     /// How that `task` block should read once it finishes: what was delegated, and
@@ -947,6 +968,50 @@ mod tests {
         assert!(m.todos.lock().unwrap().is_empty());
     }
 
+    /// Running, compacting, and what is queued are facts about an agent, so they come
+    /// off the agent's entry — for every agent.
+    ///
+    /// This is what a frontend copy cost: only the main agent had them. A sub-agent
+    /// compacting itself — which it decides on its own, and which no frontend is told
+    /// about — just looked hung; and a message queued for one agent showed under
+    /// whichever agent happened to be on screen.
+    #[test]
+    fn running_compacting_and_the_queue_are_the_agents() {
+        let live = live_with(&[1]);
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        assert!(!panes.subs()[0].compacting);
+        assert!(panes.subs()[0].pending.is_empty());
+
+        // It decides to summarize itself — nothing asked it to.
+        live.update(1, |e| e.compacting = true);
+        // And the user says something to it while it is busy.
+        live.enqueue(
+            1,
+            hrdr_agent::Steer::new("<expanded @file blob>", "check auth"),
+        );
+
+        panes.sync(&live);
+        let p = &panes.subs()[0];
+        assert!(p.compacting, "its own pane says it is compacting");
+        assert_eq!(
+            p.pending,
+            vec!["check auth".to_string()],
+            "the pending block shows what was typed, not the @file expansion the \
+             model will read"
+        );
+
+        // The main agent's view is untouched by either.
+        assert!(!panes.main().compacting);
+        assert!(panes.main().pending.is_empty());
+
+        // The agent takes it off its own queue; nothing else has to be told.
+        let taken = live.take_pending(1).expect("it was queued on the agent");
+        assert_eq!(taken.sent, "<expanded @file blob>");
+        panes.sync(&live);
+        assert!(panes.subs()[0].pending.is_empty());
+    }
+
     #[test]
     fn focusing_a_sub_agent_that_is_gone_falls_back_to_main() {
         let mut panes = PaneSet::new();
@@ -987,6 +1052,7 @@ mod tests {
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: hrdr_agent::steering_queue(),
                 running: false,
+                compacting: false,
                 done: true,
                 delivered: true,
                 pinned: false,
