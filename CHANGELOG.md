@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-13
+
 ### Added
+
+- **Sub-agents are agents you can look at, talk to, and steer.** Every delegated
+  sub-agent is retained as an addressable conversation with its own pane. The
+  agent list switches the view to it (the main agent is the first row, so there
+  is always a way back), the input box talks to whichever agent is on screen —
+  steering a running one, driving a further turn on a finished one — and each
+  pane keeps its own scroll position and unsent draft across switches. A
+  sub-agent is released once it is finished, delivered, and nobody is looking at
+  it. The list stays hidden while the main agent is the only one.
+- **An agent records what it does.** Each agent keeps its own event log, and a
+  frontend replays it to build that agent's transcript through the one shared
+  reducer — so a pane opened ten minutes into a run still shows the whole run,
+  and a sub-agent's tool calls render as real tool blocks. This is what makes a
+  _background_ sub-agent visible at all: its `task` call returns the instant it
+  is spawned, so it previously emitted nothing to a frontend and its pane stayed
+  empty however long it worked.
+- **Commands act on the agent you are looking at.** `/model`, `/compact`,
+  `/effort`, `/tools`, `/prompt`, `/status`, `/cost`, `/doctor` and `/copy` all
+  mean _this conversation_ — the same rule as the input box. `/model` on a
+  sub-agent's view switches that sub-agent, and the status bar follows it.
 
 - **Ad-hoc cross-provider delegation.** The `task` tool takes an optional
   `provider` argument, so a sub-agent can run on any configured and
@@ -43,6 +65,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The status bar describes the agent on screen.** Model, provider, endpoint,
+  context gauge, token counters, cost, reasoning effort, time-to-first-token and
+  the loader all come from the active pane. A sub-agent runs on its own model
+  against its own window and bills its own tokens; the bar used to report the
+  main agent's figures whichever agent you were watching.
+- **The agent owns what describes it.** Model/provider/endpoint, token and cost
+  counters, the turn clock, reasoning effort, auto-compaction thresholds, the
+  TODO list, whether it is running or compacting, and the queue of messages
+  waiting for it all live on the agent and are published to the frontend, which
+  keeps no copy. The main agent is registered like any other, so one code path
+  renders both.
+- **`AGENTS.md` is never re-seeded into a running conversation.** An `/init`
+  turn no longer re-reads the file it just wrote back into the live system
+  prompt, and neither does `/reload` — the agent that edited it has the content
+  in its context already. `/new` re-reads it and reports when it differs from
+  what was in the prompt.
+- **`read` numbers lines with `N: ` instead of `N\t`.** The separator is no
+  longer a tab, so a tab-indented line's own indentation is unambiguous in the
+  output.
+- **`!command` output goes to the model immediately** rather than waiting to
+  ride along with your next message.
+
 - **Trusted provider identity isolates ChatGPT OAuth.** Provider resolution now
   stamps a trust kind (`Custom`/`BuiltIn`/`ChatGptOAuth`); a custom provider
   named `chatgpt`/`codex`/`openai-oauth` resolves to `Custom` and can never read
@@ -52,6 +96,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint.
 
 ### Fixed
+
+- **A resumed session talks to the provider it was saved on.** Resume adopted
+  the session's model name and provider label into the display but told the
+  agent only the model, leaving it pointed at whatever endpoint the process
+  launched with — so a session saved on one provider, resumed in a process
+  configured for another, showed the right thing on the status bar and sent the
+  request somewhere else, where the model does not exist and the key is not
+  valid. A pinned `--provider` still wins, and an explicit `--base-url` is never
+  re-resolved away.
+- **No unauthenticated probe of a provider that requires auth.** The startup
+  health check called `/models` with no credential, got the 401 it was always
+  going to get, and reported the endpoint as _unreachable_ — advising the user
+  to start a local server on `api.openai.com` when all they had to do was
+  `/login`. A local endpoint legitimately needs no key and is still probed.
+- **A sub-agent's context gauge has a scale.** Its window is resolved at spawn
+  the way an agent resolves its own, so its pane draws a gauge instead of a bare
+  token count.
+- **`/reload` changes what the agent actually does.** `auto_compact` and
+  `compaction_reserved` updated only the frontend's copies, so a reload moved
+  the context gauge while the agent went on compacting exactly as it had at
+  launch.
+- **`/expand` (toggle-last) and per-message timestamps** read a stale transcript
+  mirror and, respectively, toggled nothing and looked up the wrong entry.
+- **Restored transcripts rebuild their render hashes.** `Entry::content_hash` is
+  derived and not persisted, so restored entries arrived zeroed — leaving the
+  renderer's cache key discriminating by index alone across a whole restored
+  transcript.
+- **An empty turn mints no session.** The turn that carries a `!command`'s
+  output or a finished background task reserved a session id, seeding the saved
+  conversation with a blank user message — so `!ls` as the first thing in a
+  fresh project left a `session.json` whose opening turn is empty.
+- **The agent list names the agent**, not the session, and drops the redundant
+  caret on the selected row.
 
 - **Ad-hoc delegation is auth-gated against the provider you are actually on.**
   The gate judged the target against the endpoint the session _launched_ on
@@ -136,6 +213,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hiding an entitled model. The browser-login copy no longer advertises a
   5-minute deadline (ChatGPT's is 60 minutes) or a `/cancel` that the modal
   cannot receive.
+
+### Performance
+
+- **The transcript renderer stops re-doing work every frame.** Entry content
+  hashes are precomputed rather than recomputed per entry per frame, and the
+  per-entry theme/markdown/string clones that fed the layout cache now happen
+  only on a cache miss instead of on every frame including hits.
 
 ## [0.2.11] - 2026-07-12
 
@@ -2169,7 +2253,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.11...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/kryptic-sh/hrdr/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/kryptic-sh/hrdr/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/kryptic-sh/hrdr/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/kryptic-sh/hrdr/compare/v0.2.8...v0.2.9
