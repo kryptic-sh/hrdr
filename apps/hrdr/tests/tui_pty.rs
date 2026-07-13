@@ -61,6 +61,13 @@ fn visible(raw: &str) -> String {
     out
 }
 
+/// The pty's write end, shared by the handshake responder and the keystrokes.
+type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
+fn grab_writer(w: &Writer) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+    w.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Lock the screen, ignoring poisoning. A test that panics mid-assertion should
 /// report *its* failure, not have the reader thread die of a poisoned mutex and
 /// report that instead.
@@ -124,7 +131,11 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
 
     let screen = Arc::new(Mutex::new(String::new()));
     let mut reader = pty.master.try_clone_reader().expect("pty reader");
+    // Shared: the reader thread answers the terminal handshake below, and the test
+    // types into the same pty afterwards.
+    let writer = Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
     let sink = Arc::clone(&screen);
+    let responder = Arc::clone(&writer);
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -132,6 +143,18 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
                 // EOF: the child closed the pty. Nothing more is coming.
                 Ok(0) => break,
                 Ok(n) => {
+                    // **Answer the cursor-position query, or nothing else ever
+                    // arrives.** A ConPTY opens by asking the terminal where the
+                    // cursor is (`ESC[6n`) and *waits for the reply* before it
+                    // flushes anything the child wrote. A real terminal answers; a
+                    // test harness has to as well. Without this, Windows produced
+                    // exactly four bytes — the query itself — and hung: even
+                    // `cmd.exe /c echo` never completed. With it, hrdr paints.
+                    if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                        let mut w = grab_writer(&responder);
+                        let _ = w.write_all(b"\x1b[1;1R");
+                        let _ = w.flush();
+                    }
                     let mut s = grab(&sink);
                     s.push_str(&String::from_utf8_lossy(&buf[..n]));
                 }
@@ -177,9 +200,11 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let mut writer = pty.master.take_writer().expect("pty writer");
-    writer.write_all(keys.as_bytes()).expect("write keys");
-    writer.flush().expect("flush keys");
+    {
+        let mut w = grab_writer(&writer);
+        w.write_all(keys.as_bytes()).expect("write keys");
+        w.flush().expect("flush keys");
+    }
 
     let start = Instant::now();
     let status = loop {
