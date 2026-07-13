@@ -1091,7 +1091,7 @@ impl App {
             "I ran `{}` in the shell but cancelled it before it finished.",
             shell.command
         );
-        self.finish_user_shell(Some(note));
+        self.finish_user_shell(Some(note), false);
     }
 
     /// End-of-`!command` plumbing, mirroring what [`TurnMsg::Done`] does for a
@@ -1099,7 +1099,7 @@ impl App {
     /// autosaves, so the shell block + note survive a quit or crash like any
     /// other transcript entry — instead of riding whenever the next turn's
     /// autosave happens to run.
-    fn finish_user_shell(&mut self, note: Option<String>) {
+    fn finish_user_shell(&mut self, note: Option<String>, launch_turn: bool) {
         if let Some(note) = note {
             match self.agent.try_lock() {
                 Ok(mut a) => a.push_user_note(note),
@@ -1116,6 +1116,13 @@ impl App {
             }
         }
         self.autosave();
+        // The note is now in the agent's history but hasn't been shown to the
+        // model yet. Kick off a turn with empty input — `agent.run("")` skips
+        // pushing another user message (the note is already there) and sends
+        // the request with the shell output as context.
+        if launch_turn && !self.running() {
+            self.launch_turn(String::new());
+        }
     }
 
     /// Route pasted text: the `/login` key field takes it whole (an API key
@@ -1813,7 +1820,7 @@ impl App {
                 }
                 self.apply_event(ev);
                 if ended {
-                    self.finish_user_shell(note);
+                    self.finish_user_shell(note, true);
                 }
             }
             TurnMsg::System(text) => {
