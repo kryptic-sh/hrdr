@@ -143,20 +143,24 @@ impl Tool for MoveTool {
 }
 
 /// `fs::rename` fails across filesystems (`EXDEV`), which a project spanning a
-/// mount point can hit. Fall back to copy-then-remove.
+/// mount point can hit. Fall back to copy-then-remove **only** for that case —
+/// a permission error, `ENOSPC`, or a missing source is a real failure that must
+/// surface, not be escalated into an expensive recursive copy that then fails
+/// (or worse, half-succeeds) for the same reason.
 async fn rename_or_copy(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     match tokio::fs::rename(from, to).await {
         Ok(()) => Ok(()),
-        Err(_) if from.is_dir() => {
-            staged_copy_dir(from, to).await?;
-            tokio::fs::remove_dir_all(from).await?;
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            if from.is_dir() {
+                staged_copy_dir(from, to).await?;
+                tokio::fs::remove_dir_all(from).await?;
+            } else {
+                tokio::fs::copy(from, to).await?;
+                tokio::fs::remove_file(from).await?;
+            }
             Ok(())
         }
-        Err(_) => {
-            tokio::fs::copy(from, to).await?;
-            tokio::fs::remove_file(from).await?;
-            Ok(())
-        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -185,24 +189,72 @@ fn staging_path(to: &std::path::Path) -> std::path::PathBuf {
     to.with_file_name(format!(".{name}.hrdr-stage-{}", std::process::id()))
 }
 
+/// A second sibling staging name, for holding the *existing* destination aside
+/// while the replacement is swapped in — so `to` is never a missing path.
+fn aside_path(to: &std::path::Path) -> std::path::PathBuf {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    to.with_file_name(format!(".{name}.hrdr-aside-{}", std::process::id()))
+}
+
+/// Remove a path whether it is a file or a directory.
+async fn remove_path(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    }
+}
+
 async fn staged_copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     validate_copy_tree(from).await?;
     let stage = staging_path(to);
     if tokio::fs::try_exists(&stage).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(&stage).await?;
+        remove_path(&stage).await?;
     }
     if let Err(error) = copy_dir(from, &stage).await {
         let _ = tokio::fs::remove_dir_all(&stage).await;
         return Err(error);
     }
+
+    // Swap the freshly-built copy into place without ever leaving `to` missing.
+    // The old code did `remove(to)` then `rename(stage → to)`: if the rename
+    // failed, `to` was already gone. Instead, move the existing destination
+    // *aside* first, swap the stage in, then delete the aside copy — and on a
+    // failed swap, put the original straight back.
     if tokio::fs::try_exists(to).await.unwrap_or(false) {
-        if to.is_dir() {
-            tokio::fs::remove_dir_all(to).await?;
-        } else {
-            tokio::fs::remove_file(to).await?;
+        let aside = aside_path(to);
+        if tokio::fs::try_exists(&aside).await.unwrap_or(false) {
+            remove_path(&aside).await?;
         }
+        tokio::fs::rename(to, &aside).await.with_context(|| {
+            format!(
+                "staging replacement of {} (new copy left at {})",
+                to.display(),
+                stage.display()
+            )
+        })?;
+        if let Err(error) = tokio::fs::rename(&stage, to).await {
+            // Restore the original destination; leave the stage copy as
+            // recoverable litter and name it so it can be reclaimed.
+            let _ = tokio::fs::rename(&aside, to).await;
+            return Err(anyhow::Error::new(error).context(format!(
+                "replacing {} (original left intact; new copy still at {})",
+                to.display(),
+                stage.display()
+            )));
+        }
+        // Swap done: the destination is correct. A failure to delete the old
+        // copy now is non-fatal litter, not a correctness problem.
+        let _ = remove_path(&aside).await;
+    } else {
+        tokio::fs::rename(&stage, to).await.with_context(|| {
+            format!(
+                "moving new copy into place at {} (new copy left at {})",
+                to.display(),
+                stage.display()
+            )
+        })?;
     }
-    tokio::fs::rename(&stage, to).await?;
     Ok(())
 }
 
@@ -693,6 +745,44 @@ mod tests {
             !dir.path().join("tree").exists(),
             "source moved, not copied"
         );
+    }
+
+    /// Overwriting an existing directory with `copy --overwrite` lands the new
+    /// contents, replaces the old ones, and leaves no `.hrdr-stage`/`.hrdr-aside`
+    /// litter in the parent — the destination is swapped in via a rename, never
+    /// deleted before the replacement is in place.
+    #[tokio::test]
+    async fn copy_overwrite_of_a_dir_replaces_contents_and_leaves_no_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        write(&dir.path().join("src/new.txt"), "fresh").await;
+        write(&dir.path().join("dst/old.txt"), "stale").await;
+
+        CopyTool
+            .execute(json!({"from": "src", "to": "dst", "overwrite": true}), &c)
+            .await
+            .unwrap();
+
+        // The destination now mirrors the source, and the old file is gone.
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("dst/new.txt"))
+                .await
+                .unwrap(),
+            "fresh"
+        );
+        assert!(
+            !dir.path().join("dst/old.txt").exists(),
+            "the stale file must be replaced, not merged"
+        );
+        // No staging litter survives in the parent directory.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains("hrdr-stage") && !name.contains("hrdr-aside"),
+                "staging litter left behind: {name}"
+            );
+        }
     }
 
     #[tokio::test]

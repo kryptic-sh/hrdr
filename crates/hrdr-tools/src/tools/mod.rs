@@ -7,7 +7,7 @@ pub(crate) mod git;
 pub(crate) mod grep;
 pub(crate) mod ls;
 pub(crate) mod lsp_nav;
-mod mutation;
+pub(crate) mod mutation;
 pub(crate) mod read;
 pub(crate) mod replace;
 pub(crate) mod shell;

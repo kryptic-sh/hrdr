@@ -117,7 +117,7 @@ impl Tool for PatchTool {
                     if let Some(parent) = path.parent() {
                         tokio::fs::create_dir_all(parent).await.ok();
                     }
-                    tokio::fs::write(path, content)
+                    crate::tools::mutation::atomic_write(path, content)
                         .await
                         .with_context(|| format!("writing {}", path.display()))
                 }

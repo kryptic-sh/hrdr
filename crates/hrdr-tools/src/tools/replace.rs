@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::{Tool, ToolContext, truncate};
 
+use super::edit::MAX_EDIT_OUTPUT_BYTES;
 use super::mutation::apply_file_change;
 use super::write::unified_diff;
 
@@ -129,6 +130,24 @@ impl Tool for ReplaceTool {
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
             ctx.ensure_within_cwd(&path)?;
+            // A literal substitution's output size is exactly computable from the
+            // hit count, so bound it before allocating: `find="e"`, `replace=50KB`
+            // could expand even a single sub-2 MB file into gigabytes. (A regex
+            // replacement's size depends on per-match captures, so it isn't
+            // guarded here — its input is already capped at `MAX_FILE_BYTES`.)
+            if !a.regex && a.replace.len() > a.find.len() {
+                let projected = before
+                    .len()
+                    .saturating_add(hits.saturating_mul(a.replace.len() - a.find.len()));
+                if projected > MAX_EDIT_OUTPUT_BYTES {
+                    bail!(
+                        "replacing {:?} in {} would produce ~{projected} bytes; narrow `find` or \
+                         the sweep",
+                        a.find,
+                        path.strip_prefix(&ctx.cwd).unwrap_or(&path).display()
+                    );
+                }
+            }
             let after = if a.regex {
                 re.replace_all(&before, a.replace.as_str()).into_owned()
             } else {
