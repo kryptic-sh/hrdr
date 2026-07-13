@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Run a command straight from the shell: `hrdr <command>`.** Anything the
+  input box takes, the command line now takes too — `hrdr /new` opens a fresh
+  session instead of auto-resuming, `hrdr /model` comes up with the picker open,
+  `hrdr /resume` with the session list, `hrdr ':review src/lib.rs'` invokes a
+  skill, `hrdr '!git status'` runs the shell escape, and
+  `hrdr "why is this slow"` opens the session with a first message to the model.
+  It runs after any auto-resume and before the first frame, down the same code
+  path `Enter` takes (`App::submit_input`), so the two cannot drift apart: a
+  command the TUI learns, the CLI gets for free. Flags go before the command;
+  `hrdr run …` and `hrdr models` are unaffected.
+
 ### Performance
 
 - **A frame no longer costs the whole session.** The transcript is laid out once

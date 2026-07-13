@@ -42,7 +42,11 @@ fn sync_cursor<W: std::io::Write>(
 
 /// Drive `app` against the terminal until it quits: draw, then await terminal
 /// input, agent messages, config-file changes, or a spinner tick.
-pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
+pub(crate) async fn run_loop(
+    app: &mut App,
+    terminal: &mut Tui,
+    command: Option<String>,
+) -> Result<()> {
     // Probe the endpoint in the background and warn if it's unreachable or
     // doesn't have the configured model — surfaced before the first turn.
     app.spawn_health_check();
@@ -61,6 +65,24 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     // The editor's insert state drives the cursor shape (see `sync_cursor`).
     // `None` forces the first frame to emit it.
     let mut cursor_insert: Option<bool> = None;
+
+    // A command handed to hrdr on the command line (`hrdr /new`, `hrdr /model`,
+    // `hrdr '!git status'`) runs here — after the session is up and any auto-resume
+    // has happened, so `/new` starts from a real session and `/resume` has one to
+    // pick from, and *before* the first frame, so the picker a command opens is
+    // already on screen when the terminal first paints.
+    //
+    // It goes through `submit_input`, the same path `Enter` takes: the command line
+    // gets whatever the input box gets, and neither has to know what the other
+    // supports.
+    if let Some(input) = command {
+        match app.submit_input(input) {
+            Action::OpenEditor => open_in_editor(app, terminal)?,
+            Action::OpenFile(path) => open_file_in_editor(app, terminal, &path)?,
+            Action::Redraw => terminal.clear()?,
+            Action::None => {}
+        }
+    }
 
     loop {
         // A detached sub-agent that finished while the agent was idle wakes it,

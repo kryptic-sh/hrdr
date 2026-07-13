@@ -100,7 +100,18 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
 ///
 /// `logo` is the ASCII art the session header animates — the caller owns it (the
 /// binary also prints it above `--help`), so the TUI never embeds one.
-pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig, logo: &'static str) -> Result<()> {
+///
+/// `command` is a line of input to run as soon as the session is up, exactly as if
+/// it had been typed into the input box and submitted: `hrdr /new` starts fresh,
+/// `hrdr /model` opens the picker, `hrdr '!git status'` runs the shell escape,
+/// `hrdr ':review src/lib.rs'` invokes a skill, and anything else is a first
+/// message to the model.
+pub async fn run(
+    config: AgentConfig,
+    ui: hrdr_app::UiConfig,
+    logo: &'static str,
+    command: Option<String>,
+) -> Result<()> {
     // Install a panic hook that restores the terminal to its normal state
     // *before* the panic message and backtrace are printed.  Without this the
     // message lands inside the alt screen and is immediately cleared on exit —
@@ -131,6 +142,6 @@ pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig, logo: &'static str
 
     let mut app = App::new(config, ui, logo)?;
     app.connect_mcp().await;
-    tui::run_loop(&mut app, &mut terminal).await?;
+    tui::run_loop(&mut app, &mut terminal, command).await?;
     Ok(())
 }

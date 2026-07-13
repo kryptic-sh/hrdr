@@ -820,6 +820,23 @@ impl App {
         // plain: Enter without a newline modifier / trailing backslash).
         if self.editor.wants_submit(&ekey) {
             let input = self.editor.content();
+            return self.submit_input(input);
+        }
+
+        self.editor.feed_key(ekey);
+        Action::None
+    }
+
+    /// Act on one line of input — the single path everything the user can *say* to
+    /// hrdr goes down, whichever way they said it.
+    ///
+    /// A `/command`, a `:skill`, a `!shell` escape, a quit word, or a message for
+    /// the model: the rules for telling them apart, and the routing that follows,
+    /// live here and nowhere else. `Enter` in the input box is one caller; a
+    /// command handed to hrdr on the command line (`hrdr /new`) is another, and it
+    /// gets exactly the behaviour typing it would.
+    pub(crate) fn submit_input(&mut self, input: String) -> Action {
+        {
             if input.trim().is_empty() {
                 return Action::None;
             }
@@ -896,11 +913,8 @@ impl App {
             } else {
                 self.spawn_turn(input);
             }
-            return Action::None;
+            Action::None
         }
-
-        self.editor.feed_key(ekey);
-        Action::None
     }
 
     /// Run a user-typed `!command`: spawn the shell in the agent's cwd,

@@ -25,6 +25,10 @@ const LOGO_ART: &str = include_str!("../art.txt");
     version,
     about = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models.",
     before_help = LOGO_ART,
+    // `hrdr run …` / `hrdr models` are subcommands; anything else trailing is a
+    // command for the TUI to run at startup. They are mutually exclusive, so
+    // `hrdr /model` can't be mistaken for a malformed subcommand invocation.
+    args_conflicts_with_subcommands = true,
 )]
 struct Cli {
     /// OpenAI-compatible base URL (default: $HRDR_BASE_URL or http://localhost:8080/v1).
@@ -140,6 +144,14 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// A command to run in the TUI as soon as it starts, exactly as if you had
+    /// typed it into the input box: a slash command (`hrdr /new`, `hrdr /model`),
+    /// a skill (`hrdr :review src/lib.rs`), a shell escape (`hrdr '!git status'`),
+    /// or a plain message to open the session with. Put flags *before* it — every
+    /// word after it is part of the command.
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    input: Vec<String>,
 }
 
 /// Shells `--completions` can generate for: clap_complete's five core shells
@@ -457,7 +469,13 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
-        None => hrdr_tui::run(config, ui, LOGO_ART).await,
+        // Trailing words are a command for the TUI to run at startup — the same
+        // line the input box would take. Joined, so `hrdr /model gpt-5` and
+        // `hrdr "/model gpt-5"` mean the same thing.
+        None => {
+            let command = (!cli.input.is_empty()).then(|| cli.input.join(" "));
+            hrdr_tui::run(config, ui, LOGO_ART, command).await
+        }
     }
 }
 
@@ -617,4 +635,66 @@ async fn list_models(config: AgentConfig) -> Result<()> {
         println!("{m}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A trailing command reaches the TUI as one line, whatever its syntax.
+    ///
+    /// `hrdr /new`, `hrdr /model`, `hrdr :review …`, `hrdr '!git status'` — none of
+    /// these are subcommands, and none of them should be *mistaken* for one. They
+    /// are the line the input box would have taken, handed over before the first
+    /// frame.
+    #[test]
+    fn a_trailing_command_is_collected_for_the_tui() {
+        for (argv, want) in [
+            (vec!["hrdr", "/new"], "/new"),
+            (vec!["hrdr", "/model"], "/model"),
+            // Unquoted words after the command are part of it: `hrdr /model gpt-5`
+            // must mean what `hrdr "/model gpt-5"` means.
+            (vec!["hrdr", "/model", "gpt-5"], "/model gpt-5"),
+            (vec!["hrdr", ":review", "src/lib.rs"], ":review src/lib.rs"),
+            (vec!["hrdr", "!git status"], "!git status"),
+            (vec!["hrdr", "fix the failing test"], "fix the failing test"),
+        ] {
+            let cli = Cli::parse_from(&argv);
+            assert!(cli.command.is_none(), "{argv:?} is not a subcommand");
+            assert_eq!(cli.input.join(" "), want, "{argv:?}");
+        }
+    }
+
+    /// Flags still bind to hrdr, not to the command — as long as they come first.
+    #[test]
+    fn flags_before_the_command_still_reach_hrdr() {
+        let cli = Cli::parse_from(["hrdr", "--provider", "zen", "--vim", "/model"]);
+        assert_eq!(cli.provider.as_deref(), Some("zen"));
+        assert!(cli.vim);
+        assert_eq!(cli.input.join(" "), "/model");
+    }
+
+    /// The subcommands still win: adding a trailing command must not have turned
+    /// `hrdr run …` or `hrdr models` into TUI input.
+    #[test]
+    fn subcommands_are_not_swallowed_by_the_trailing_command() {
+        let cli = Cli::parse_from(["hrdr", "run", "fix", "the", "bug"]);
+        match cli.command {
+            Some(Command::Run { prompt, .. }) => assert_eq!(prompt.join(" "), "fix the bug"),
+            _ => panic!("`hrdr run` must still be the run subcommand"),
+        }
+        assert!(cli.input.is_empty());
+
+        let cli = Cli::parse_from(["hrdr", "models"]);
+        assert!(matches!(cli.command, Some(Command::Models)));
+    }
+
+    /// No command → nothing to run at startup (the plain TUI).
+    #[test]
+    fn no_command_is_no_startup_input() {
+        let cli = Cli::parse_from(["hrdr"]);
+        assert!(cli.command.is_none());
+        assert!(cli.input.is_empty());
+    }
 }

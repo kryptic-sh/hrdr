@@ -4814,6 +4814,49 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
     }
 }
 
+/// A command handed to hrdr on the command line does exactly what typing it does.
+///
+/// `hrdr /new`, `hrdr /model`, `hrdr '!git status'`, `hrdr ':skill …'` — all of it
+/// goes through `submit_input`, the same function `Enter` calls, so the two can't
+/// drift: a command the input box learns, the command line gets for free. What is
+/// checked here is that each *kind* of input is still told apart when it arrives
+/// this way — a slash command runs locally instead of being sent to the model, a
+/// plain message starts a turn.
+#[tokio::test]
+async fn a_command_line_command_runs_the_same_path_as_typing_it() {
+    // A slash command runs locally: it does its work in the session, and nothing
+    // is sent to the model.
+    let mut h = Harness::new(vec![]).await;
+    h.app.submit_input("/help".to_string());
+    let printed: String = h
+        .app
+        .transcript()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::System(t) | EntryKind::Notice(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        printed.contains("/model"),
+        "`hrdr /help` should print the command list, as typing it does: {printed}"
+    );
+    assert!(!h.app.running(), "a slash command must not start a turn");
+
+    // A plain message opens the session with a turn to the model.
+    let mut h = Harness::new(vec![MockReply::Text("on it".to_string())]).await;
+    h.app.submit_input("fix the failing test".to_string());
+    h.pump().await;
+    let out = h.render();
+    assert!(out.contains("fix the failing test"), "the message is shown");
+    assert!(out.contains("on it"), "and the model answered it: {out}");
+
+    // The input box is left empty either way — the command was consumed, not
+    // dropped into the draft for the user to press Enter on themselves.
+    assert_eq!(h.app.editor.content(), "");
+}
+
 /// The `/model` selector renders both columns (friendly model · provider),
 /// narrows as you type into its fuzzy filter, and closes on Esc.
 #[tokio::test]

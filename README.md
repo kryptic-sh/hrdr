@@ -97,6 +97,14 @@ hrdr
 # vim keybindings in the input pane instead
 hrdr --vim
 
+# start the TUI with a command already run — anything the input box takes:
+hrdr /new                     # a fresh session, not the auto-resumed one
+hrdr /model                   # open the model picker on the way in
+hrdr /resume                  # pick a session to come back to
+hrdr ':review src/lib.rs'     # invoke a skill
+hrdr '!git status'            # run a shell escape, output into the transcript
+hrdr "why is the build slow"  # open the session with a message to the model
+
 # one-shot headless run, streamed to stdout
 hrdr run "add a --json flag to the status command"
 
