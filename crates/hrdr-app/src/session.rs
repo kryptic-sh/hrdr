@@ -166,6 +166,19 @@ impl SessionState {
     /// spinner forever).
     pub fn restored(mut self) -> Self {
         crate::settle_restored_tools(&mut self.transcript);
+        // `Entry::content_hash` is not persisted (it is derived), so every restored
+        // entry arrives with a zeroed one. Rebuild them.
+        //
+        // The renderer caches a laid-out entry under `(index, content_hash, …)`. Left
+        // at zero, the content half of that key is a constant across the whole restored
+        // transcript, and entries are told apart only by their index — so the cache is
+        // correct exactly as long as nothing ever shifts an index without clearing it.
+        // That invariant holds today (every prune/truncate/clear does), but it is not
+        // one worth resting on: the failure it buys is one restored message rendering
+        // as another.
+        for e in &mut self.transcript {
+            e.refresh_hash();
+        }
         self
     }
 }
@@ -545,6 +558,48 @@ mod tests {
                 "id from the filename"
             );
         });
+    }
+
+    /// A restored entry gets its render hash rebuilt. It is derived state, so it is
+    /// not persisted — and a zeroed one makes the renderer's cache key
+    /// `(index, content_hash, …)` degenerate: the content half becomes a constant
+    /// across the whole restored transcript, leaving only the index to tell two
+    /// entries apart. Any future path that shifts an index without clearing the cache
+    /// would then render one restored message as another.
+    #[test]
+    fn restoring_rebuilds_the_render_hashes() {
+        let t = crate::time_from_unix(1_700_000_000, chrono::Local::now());
+        let raw = SessionState {
+            transcript: vec![
+                // As they arrive from serde: content present, hash zeroed.
+                Entry {
+                    kind: EntryKind::User("first".into()),
+                    time: t,
+                    content_hash: 0,
+                },
+                Entry {
+                    kind: EntryKind::User("second".into()),
+                    time: t,
+                    content_hash: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let st = raw.restored();
+        assert!(
+            st.transcript.iter().all(|e| e.content_hash != 0),
+            "every restored entry carries its own hash again"
+        );
+        assert_ne!(
+            st.transcript[0].content_hash, st.transcript[1].content_hash,
+            "and different content still hashes differently — which is the whole \
+             point of the cache key"
+        );
+        assert_eq!(
+            st.transcript[0].content_hash,
+            Entry::at(EntryKind::User("first".into()), t).content_hash,
+            "a restored entry hashes exactly like a freshly built one"
+        );
     }
 
     /// A tool call left running at save time is settled on restore — nothing can

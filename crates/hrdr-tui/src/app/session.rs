@@ -88,6 +88,15 @@ impl super::App {
         if self.state().id.is_some() {
             return;
         }
+        // An *empty* turn carries no message of its own: it exists to hand the agent
+        // something already in its history — a `!command`'s output, or a finished
+        // background task. Seeding the mirror with an empty user message would create
+        // a session whose first turn is blank, named after nothing (`session.json`).
+        // The turn still runs; its autosave names the session from the agent's real
+        // history once the note is in it.
+        if sent.trim().is_empty() {
+            return;
+        }
         // `save_session` skips a conversation with no user message, and the agent
         // does not push this one until the turn starts — so seed the mirror. The
         // next autosave replaces it with the agent's own history.

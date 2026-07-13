@@ -3246,6 +3246,36 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     );
 }
 
+/// An **empty** turn — the kind a `!command`'s output or a finished background task
+/// rides in on — carries no message of its own, so it must not mint a session named
+/// after one.
+///
+/// Regression: `launch_turn("")` reserved a session id, which seeds the saved mirror
+/// with `Message::user("")`. `is_saveable()` sees a user message and writes the file;
+/// the name derives from that first message, which is blank — so running `!ls` as the
+/// first thing in a fresh project left a `session.json` whose opening turn is empty.
+#[tokio::test]
+async fn an_empty_turn_does_not_mint_a_blank_session() {
+    let mut h = Harness::new(vec![]).await;
+    assert!(h.app.state().id.is_none(), "nothing saved yet");
+
+    // What `finish_user_shell` does once a `!command` ends: the note is already in the
+    // agent's history, and an empty turn hands it to the model.
+    h.app.reserve_session_id("");
+    assert!(
+        h.app.state().id.is_none(),
+        "an empty turn reserves no session"
+    );
+    assert!(
+        h.app.state().messages.is_empty(),
+        "and seeds no blank user message into the saved conversation"
+    );
+
+    // A real message still does, exactly as before.
+    h.app.reserve_session_id("read the config");
+    assert!(h.app.state().id.is_some(), "a real turn reserves one");
+}
+
 /// A detached sub-agent that finishes while nothing is running wakes the model:
 /// an empty turn spawns, and `Agent::run` folds the result into the conversation
 /// before its first request. The user never has to type to collect it.
