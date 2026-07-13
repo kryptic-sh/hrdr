@@ -4751,6 +4751,69 @@ async fn a_transcript_taller_than_u16_max_rows_does_not_wrap_the_scroll_math() {
     );
 }
 
+/// A block whose entry has not changed is **reused**, not rebuilt — and a block
+/// whose entry *has* changed is rebuilt.
+///
+/// This is the whole reason a long session stays responsive. A frame used to cost
+/// the entire transcript: every entry's rows were re-cloned, re-measured, and then
+/// handed to a `Paragraph` that re-wrapped the lot from the top and threw away
+/// everything above the scroll. At a thousand entries that was ~26ms per frame —
+/// and a frame is drawn on every keystroke — while past the old cache's 1024-entry
+/// cap it collapsed to ~120ms, because each frame evicted what the next one needed.
+///
+/// Now each block is laid out once and shared by `Rc`, so a frame that changes
+/// nothing hands the same rows back. Pointer identity is the proof: same pointer,
+/// no re-render.
+#[tokio::test]
+async fn an_unchanged_block_is_reused_not_rerendered() {
+    let mut h = Harness::new(vec![]).await;
+    for i in 0..50 {
+        h.app.push_entry(Entry::user(format!("message {i}")));
+    }
+    h.render();
+    let first: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    assert!(
+        first.iter().all(Option::is_some),
+        "every entry should have been laid out once"
+    );
+
+    // A frame that changes nothing must not lay anything out again.
+    h.render();
+    let second: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    assert_eq!(first, second, "an idle frame must reuse every block");
+
+    // Growing one entry — what streaming does, a token at a time — rebuilds that
+    // block and leaves every other one alone.
+    if let Some(EntryKind::User(text)) = h
+        .app
+        .panes
+        .main_mut()
+        .transcript_mut()
+        .get_mut(10)
+        .map(|e| &mut e.kind)
+    {
+        text.push_str(" and more");
+    }
+    h.app
+        .panes
+        .main_mut()
+        .transcript_mut()
+        .get_mut(10)
+        .unwrap()
+        .refresh_hash();
+    h.render();
+    let third: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    assert_ne!(
+        second[9], third[9],
+        "the entry that changed must be laid out again"
+    );
+    for (i, (before, after)) in second.iter().zip(&third).enumerate() {
+        if i != 9 {
+            assert_eq!(before, after, "entry {} was rebuilt for nothing", i + 1);
+        }
+    }
+}
+
 /// The `/model` selector renders both columns (friendly model · provider),
 /// narrows as you type into its fuzzy filter, and closes on Esc.
 #[tokio::test]

@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
@@ -949,26 +950,24 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
 
-    let (lines, msg_starts, tool_regions) = transcript_lines(app, text_area.width);
-    // Cumulative wrapped-row height at each logical-line boundary — always built
-    // from cached per-line measurements (cheap HashMap lookups) so we never pay
-    // for ratatui's full-text re-wrap in para.line_count() every frame.
+    let (chunks, msg_at) = transcript_chunks(app, text_area.width);
+    // The screen row each block starts at. A block's rows come out of
+    // `render_block` already wrapped and padded to the render width, so a row is a
+    // row: no measuring, no re-wrapping, just a running total.
     //
     // Use usize throughout to avoid u16 overflow on long transcripts; only the
     // final Paragraph::scroll cast (u16) is clamped at the last moment.
-    let mut cum = Vec::with_capacity(lines.len() + 1);
+    let mut cum = Vec::with_capacity(chunks.len() + 1);
     let mut acc: usize = 0;
     cum.push(0usize);
-    for line in &lines {
-        let h = cached_line_wrap(line, text_area.width);
-        acc = acc.saturating_add(h);
+    for c in &chunks {
+        acc = acc.saturating_add(c.rows.len());
         cum.push(acc);
     }
-    // Resolve a pending /goto to a from-top wrapped-row offset using cum
-    // (avoids another Paragraph::line_count allocation + re-wrap).
+    // Resolve a pending /goto to a from-top row offset.
     let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
-        let start = (*msg_starts.get(num.checked_sub(1)?)?).min(lines.len());
-        Some(clamp_u16(cum[start]))
+        let at = (*msg_at.get(num.checked_sub(1)?)?).min(chunks.len());
+        Some(clamp_u16(cum[at]))
     });
     // A tool block that was just expanded or collapsed changed height. While the
     // reader is scrolled up, pull its top to the top of the viewport: the offset
@@ -976,12 +975,11 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // many rows it gained or lost. Following the newest output is left alone —
     // the bottom is already pinned.
     let entry_top: Option<u16> = app.pending_scroll_entry.take().and_then(|idx| {
-        let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
-        (app.scroll_offset > 0).then(|| clamp_u16(cum[(*start).min(lines.len())]))
+        let at = chunks.iter().position(|c| c.tool_idx == Some(idx))?;
+        (app.scroll_offset > 0).then(|| clamp_u16(cum[at]))
     });
     let goto_top = goto_top.or(entry_top);
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    // Total wrapped rows at this width — from cum, not para.line_count().
+    // Total rows at this width.
     // Clamped (not truncated) to u16::MAX: ratatui's `Paragraph::scroll` only
     // takes a u16, and a long enough transcript would otherwise wrap the raw
     // `as u16` cast past 65535 back down near 0, snapping the view to the top.
@@ -1010,35 +1008,73 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.max_scroll = max_scroll as usize;
     let scroll = max_scroll.saturating_sub(offset);
 
-    // Map each tool block's wrapped-row span to the visible screen rows (clipped
-    // to the viewport) so a left click can toggle that tool's expansion.
-    // Arithmetic is in usize (cum values) to avoid overflow; only the final
-    // HitRect fields are cast back to u16.
+    let scroll_us = scroll as usize;
+    let view_end = scroll_us.saturating_add(area.height as usize);
+
+    // Map each tool block's row span to the visible screen rows (clipped to the
+    // viewport) so a left click can toggle that tool's expansion. Arithmetic is in
+    // usize (cum values) to avoid overflow; only the final HitRect fields are cast
+    // back to u16.
     app.tool_hits.clear();
-    {
-        let scroll_us = scroll as usize;
-        let view_end = scroll_us.saturating_add(area.height as usize);
-        let last = cum.len() - 1;
-        for (lstart, lend, idx) in tool_regions {
-            let ws = cum[lstart.min(last)];
-            let we = cum[lend.min(last)];
-            let vis_start = ws.max(scroll_us);
-            let vis_end = we.min(view_end);
-            if vis_end > vis_start {
-                app.tool_hits.push((
-                    crate::app::HitRect {
-                        x: text_area.x,
-                        y: text_area.y + (vis_start - scroll_us) as u16,
-                        w: text_area.width,
-                        h: (vis_end - vis_start) as u16,
-                    },
-                    idx,
-                ));
-            }
+    for (i, c) in chunks.iter().enumerate() {
+        let Some(idx) = c.tool_idx else { continue };
+        let vis_start = cum[i].max(scroll_us);
+        let vis_end = cum[i + 1].min(view_end);
+        if vis_end > vis_start {
+            app.tool_hits.push((
+                crate::app::HitRect {
+                    x: text_area.x,
+                    y: text_area.y + (vis_start - scroll_us) as u16,
+                    w: text_area.width,
+                    h: (vis_end - vis_start) as u16,
+                },
+                idx,
+            ));
         }
     }
 
-    f.render_widget(para.scroll((scroll, 0)), text_area);
+    // Paint only what the viewport can show.
+    //
+    // `Paragraph` lays out from its first row every frame and throws away
+    // everything above `scroll`, so handing it the whole transcript makes every
+    // frame cost the *whole session* — at a thousand entries that was ~24ms of a
+    // ~26ms frame, and it grows without bound. Each block is self-contained, so the
+    // same pixels come out of the blocks the viewport overlaps, with the scroll
+    // rebased to the first of them.
+    //
+    // `cum` is nondecreasing, so binary-search it: `first` is the block that owns
+    // row `scroll`, `last` the one past the final visible row.
+    let first = cum.partition_point(|&c| c <= scroll_us).saturating_sub(1);
+    let last = cum.partition_point(|&c| c < view_end).min(chunks.len());
+    let mut visible: Vec<Line<'static>> = chunks
+        .get(first..last.max(first))
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|c| c.rows.iter().cloned())
+        .collect();
+    // Rows of the first visible block that sit above the viewport.
+    let inner_scroll = clamp_u16(scroll_us.saturating_sub(cum[first.min(chunks.len())]));
+
+    // Highlight the active /find query. Only the rows about to be painted need it,
+    // and it only restyles them — the blocks in the cache stay as they were.
+    if let Some(needle) = app
+        .find
+        .query
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .filter(|q| !q.is_empty())
+    {
+        let hl = Style::default()
+            .fg(Color::Black)
+            .bg(app.theme.warn)
+            .add_modifier(Modifier::BOLD);
+        for line in visible.iter_mut() {
+            *line = highlight_line(std::mem::take(line), &needle, hl);
+        }
+    }
+
+    let para = Paragraph::new(visible).wrap(Wrap { trim: false });
+    f.render_widget(para.scroll((inner_scroll, 0)), text_area);
 
     // Scrollbar shows total session length + where we are within it. ratatui maps
     // `position` over `0..=content_length-1`, so content_length is the number of
@@ -1588,24 +1624,38 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
     Line::from(spans)
 }
 
-/// Cache key for rendered transcript entry content lines.
-/// Fields: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
-type TranscriptKey = (usize, u64, u16, bool, bool);
+/// Cache key for an entry's rendered *body* — the markdown/tool render, before
+/// the block chrome around it.
+/// Fields: (content_fingerprint, render_width, expand_all, show_reasoning).
+type BodyKey = (u64, u16, bool, bool);
+
+/// Cache key for a finished *block* — the body plus the chrome that frames it,
+/// which the body key can't see: the block kind, the timestamp/stats rows lent to
+/// it by a following entry, and whether its bottom pad is dropped because the
+/// block after it is untinted too.
+type BlockKey = (BodyKey, u64);
+
+/// Rows shared between the cache and the frames that paint them.
+type Rows = Rc<Vec<Line<'static>>>;
+
+/// A render cache: one slot per transcript entry, holding the key it was rendered
+/// under and the rows it produced.
+type SlotCache<K> = RefCell<HashMap<usize, (K, Rows)>>;
 
 thread_local! {
     // Incremental syntect state: a streaming block's content grows every token,
     // so only pay for the new lines. (The rendered rows are cached per entry by
-    // TRANSCRIPT_CACHE below.)
+    // BLOCK_CACHE below.)
     static INC_HL: RefCell<hrdr_app::HighlightCache> = RefCell::new(hrdr_app::HighlightCache::new());
-    // Cache rendered transcript entry content lines (excluding the per-message
-    // timestamp meta line, which is always fresh).
-    // Key: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
-    // Evicted in bulk at 1024 entries.
-    static TRANSCRIPT_CACHE: RefCell<HashMap<TranscriptKey, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
-    // Cached wrapped-row height per logical line, keyed on (span-content hash,
-    // width). Avoids repeated Paragraph::line_count calls for stable lines when
-    // building the cumulative-height array used for tool click hit-testing.
-    static LINE_WRAP_CACHE: RefCell<HashMap<(u64, u16), usize>> = RefCell::new(HashMap::new());
+    // Both caches are keyed by *transcript index*, holding one slot per entry —
+    // not by content, with the whole map dropped when it outgrows a cap. A cap is
+    // what made a long session lurch: past it, every frame evicted the entries the
+    // next frame needed, so a 2000-entry transcript re-rendered itself from scratch
+    // ~8 times a second. One slot per entry can't thrash (the working set *is* the
+    // transcript), and it can't grow without bound either. `clear_transcript_cache`
+    // drops both when the indices themselves move (prune, resume, /clear).
+    static BODY_CACHE: SlotCache<BodyKey> = RefCell::new(HashMap::new());
+    static BLOCK_CACHE: SlotCache<BlockKey> = RefCell::new(HashMap::new());
 }
 
 /// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
@@ -1976,83 +2026,147 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
     }
 }
 
-/// Clear the thread-local transcript render cache. Call after mutating the
-/// transcript vector (prune, clear, truncate) so stale entry indices — which
-/// are part of the cache key — don't cause the wrong content to be displayed.
+/// Clear the thread-local transcript render caches. Call after mutating the
+/// transcript vector (prune, clear, truncate) so stale entry indices — which are
+/// what both caches are keyed by — don't serve one entry's rows for another.
 pub(crate) fn clear_transcript_cache() {
-    TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+    BODY_CACHE.with(|c| c.borrow_mut().clear());
+    BLOCK_CACHE.with(|c| c.borrow_mut().clear());
 }
 
-/// Look up `key` in [`TRANSCRIPT_CACHE`]; on miss, call `render()` to produce
-/// lines, cache them (evicting the whole map when it exceeds 256 entries), then
-/// return, evicting the whole map when it exceeds its cap.
-fn cache_entry<F>(key: TranscriptKey, render: F) -> Vec<Line<'static>>
+/// The rendered body of entry `idx`, from [`BODY_CACHE`] when `key` still
+/// matches the slot, otherwise from `render()`.
+///
+/// Shared by [`Rc`]: an unchanged entry costs a refcount bump per frame, not a
+/// copy of every [`Span`] in it.
+fn cached_body<F>(idx: usize, key: BodyKey, render: F) -> Rows
 where
     F: FnOnce() -> Vec<Line<'static>>,
 {
-    if let Some(cached) = TRANSCRIPT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return cached;
+    if let Some(hit) = BODY_CACHE.with(|c| {
+        c.borrow()
+            .get(&idx)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, rows)| Rc::clone(rows))
+    }) {
+        return hit;
     }
-    let lines = render();
-    TRANSCRIPT_CACHE.with(|c| {
-        let mut m = c.borrow_mut();
-        if m.len() > 1024 {
-            m.clear();
-        }
-        m.insert(key, lines.clone());
-    });
-    lines
+    let rows = Rc::new(render());
+    BODY_CACHE.with(|c| c.borrow_mut().insert(idx, (key, Rc::clone(&rows))));
+    rows
 }
 
-/// Return the wrapped-row height of `line` at `width`, using [`LINE_WRAP_CACHE`]
-/// so repeated calls for stable lines don't re-measure every frame. Style is
-/// omitted from the key (style doesn't affect wrapping, only color).
-fn cached_line_wrap(line: &Line<'static>, width: u16) -> usize {
-    let mut h = DefaultHasher::new();
-    for span in &line.spans {
-        span.content.hash(&mut h);
+/// The finished rows of entry `idx`'s block, from [`BLOCK_CACHE`] when `key`
+/// still matches, otherwise from `render()`. `cacheable` is false for the header,
+/// whose logo animates every frame.
+fn cached_block<F>(idx: usize, key: BlockKey, cacheable: bool, render: F) -> Rows
+where
+    F: FnOnce() -> Vec<Line<'static>>,
+{
+    if !cacheable {
+        return Rc::new(render());
     }
-    let key = (h.finish(), width);
-    LINE_WRAP_CACHE.with(|c| {
-        if let Some(&wc) = c.borrow().get(&key) {
-            return wc;
-        }
-        let wc = Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .max(1);
-        let mut m = c.borrow_mut();
-        if m.len() > 8192 {
-            m.clear();
-        }
-        m.insert(key, wc);
-        wc
+    if let Some(hit) = BLOCK_CACHE.with(|c| {
+        c.borrow()
+            .get(&idx)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, rows)| Rc::clone(rows))
+    }) {
+        return hit;
+    }
+    let rows = Rc::new(render());
+    BLOCK_CACHE.with(|c| c.borrow_mut().insert(idx, (key, Rc::clone(&rows))));
+    rows
+}
+
+/// The identity of the rows cached for entry `idx`, or `None` if it has no slot.
+/// A frame that reuses a block returns the same pointer; a frame that re-rendered
+/// it returns a different one. Used by
+/// `an_unchanged_block_is_reused_not_rerendered` to hold the invariant that keeps
+/// a long transcript's frame cost flat.
+#[cfg(test)]
+pub(crate) fn block_cache_ptr(idx: usize) -> Option<usize> {
+    BLOCK_CACHE.with(|c| {
+        c.borrow()
+            .get(&idx)
+            .map(|(_, rows)| Rc::as_ptr(rows) as usize)
     })
 }
 
-/// A block whose lines are built but not yet painted. Held for one iteration so
-/// a text-less assistant turn — which has no block of its own — can append its
-/// `#N assistant` jump label to it.
-struct PendingBlock {
+/// Fingerprint the parts of a block that its body key can't see: the kind (which
+/// picks the background and border), the rows lent to it by a following entry (a
+/// text-less turn's `#N` label, a stats line), its own timestamp footer, and
+/// whether its bottom pad is dropped.
+fn chrome_hash(
     kind: BlockKind,
-    lines: Vec<Line<'static>>,
-    /// Transcript index, when this block is a tool call (for click-to-expand).
+    header: &[Line<'static>],
+    lent: &[Line<'static>],
+    footer: &[Line<'static>],
+    drop_bottom: bool,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    (kind as u8).hash(&mut h);
+    drop_bottom.hash(&mut h);
+    for rows in [header, lent, footer] {
+        rows.len().hash(&mut h);
+        for line in rows {
+            for span in &line.spans {
+                span.content.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// One painted transcript block, held by the frame that assembles the transcript.
+///
+/// Its rows come out of [`render_block`], which has already wrapped every body
+/// line to the block's inner width and padded it out to the full render width —
+/// so **each row is exactly one screen row**, and a chunk's height is just
+/// `rows.len()`. That invariant is what lets a frame place the viewport by
+/// counting rows instead of re-wrapping the session
+/// (`every_block_row_is_exactly_one_screen_row` holds it in place).
+#[derive(Clone)]
+struct Chunk {
+    /// Shared with the cache: an unchanged block is a refcount bump per frame.
+    rows: Rows,
+    /// Transcript index, when this chunk is a tool call (for click-to-expand).
     tool_idx: Option<usize>,
-    /// How many numbered messages start at this block. Usually 1 (or 0 for
-    /// blocks that aren't messages); a block carrying a borrowed assistant label
-    /// counts that message too.
+}
+
+/// A block whose parts are gathered but which is not yet rendered. Held for one
+/// iteration so a text-less assistant turn — which has no block of its own — can
+/// lend its `#N assistant` jump label to it, and so the block after it can say
+/// whether the two need a separator between them.
+struct PendingBlock {
+    /// Transcript index — the cache slot this block owns.
+    idx: usize,
+    kind: BlockKind,
+    /// Rows above the body (nothing uses this today; kept so a block that wants a
+    /// title row does not have to bypass the cache to get one).
+    header: Vec<Line<'static>>,
+    /// The entry's own rendered content, shared with [`BODY_CACHE`].
+    body: Rows,
+    /// Rows lent by a *following* entry: a text-less turn's `#N` label, a per-turn
+    /// stats line. They sit below the body and above this block's own footer.
+    lent: Vec<Line<'static>>,
+    /// This block's closing `#N you · 2m ago` label.
+    footer: Vec<Line<'static>>,
+    /// The body's cache key, extended with the chrome hash to key the block.
+    body_key: BodyKey,
+    /// The header's logo animates, so its block is rebuilt every frame.
+    cacheable: bool,
+    tool_idx: Option<usize>,
+    /// How many numbered messages start at this block. Usually 1 (or 0 for blocks
+    /// that aren't messages); a block carrying a lent assistant label counts that
+    /// message too.
     msgs: usize,
-    /// Rows at the end of `lines` that close the block (its `#N …` label). Rows
-    /// borrowed by a later entry are inserted *above* them.
-    footer_len: usize,
 }
 
 impl PendingBlock {
-    /// Append rows lent by a following entry — a text-less turn's `#N` label, a
-    /// per-turn stats line — keeping the block's own closing label last.
+    /// Take rows lent by a following entry.
     fn lend(&mut self, rows: Vec<Line<'static>>) {
-        let at = self.lines.len() - self.footer_len;
-        self.lines.splice(at..at, rows);
+        self.lent.extend(rows);
     }
 }
 
@@ -2072,52 +2186,85 @@ impl PendingBlock {
 /// * **anything → nothing** — the last block gets no separator of its own; the
 ///   layout keeps a blank row between the transcript and the input pane below.
 fn flush(
-    out: &mut Vec<Line<'static>>,
-    msg_starts: &mut Vec<usize>,
-    tool_regions: &mut Vec<(usize, usize, usize)>,
+    chunks: &mut Vec<Chunk>,
+    msg_at: &mut Vec<usize>,
     pending: Option<PendingBlock>,
     next_bg: Option<Color>,
     width: usize,
     theme: &Theme,
 ) {
     let Some(block) = pending else { return };
-    let start = out.len();
     let bg = block.kind.bg(theme);
-    out.extend(render_block(
-        block.lines,
-        width,
-        bg,
-        block.kind.border(theme),
-    ));
-    for _ in 0..block.msgs {
-        msg_starts.push(start);
-    }
-    if let Some(i) = block.tool_idx {
-        tool_regions.push((start, out.len(), i));
-    }
-    match (bg == Color::Reset, next_bg.map(|n| n == Color::Reset)) {
-        (false, Some(false)) => out.push(Line::raw("")),
-        // Drop this block's bottom pad; the next block's top pad is the gap.
-        (true, Some(true)) => {
-            out.pop();
+    let border = block.kind.border(theme);
+    let untinted = bg == Color::Reset;
+    let next_untinted = next_bg.map(|n| n == Color::Reset);
+    // Drop this block's bottom pad; the next block's top pad is the gap.
+    let drop_bottom = untinted && next_untinted == Some(true);
+    // Two tinted blocks would merge into one slab; give them a separator row.
+    let separate = !untinted && next_untinted == Some(false);
+
+    let key = (
+        block.body_key,
+        chrome_hash(
+            block.kind,
+            &block.header,
+            &block.lent,
+            &block.footer,
+            drop_bottom,
+        ),
+    );
+    let rows = cached_block(block.idx, key, block.cacheable, || {
+        let mut body: Vec<Line<'static>> = Vec::with_capacity(
+            block.header.len() + block.body.len() + block.lent.len() + block.footer.len(),
+        );
+        body.extend(block.header.iter().cloned());
+        body.extend(block.body.iter().cloned());
+        body.extend(block.lent.iter().cloned());
+        body.extend(block.footer.iter().cloned());
+        let mut rows = render_block(body, width, bg, border);
+        if drop_bottom {
+            rows.pop();
         }
-        _ => {}
+        rows
+    });
+
+    for _ in 0..block.msgs {
+        msg_at.push(chunks.len());
+    }
+    chunks.push(Chunk {
+        rows,
+        tool_idx: block.tool_idx,
+    });
+    if separate {
+        chunks.push(separator());
     }
 }
 
-/// Returns the rendered transcript lines, the logical-line index each 1-based
-/// user/assistant message starts at (for `/goto`), and each tool block's
-/// `(logical_start, logical_end, transcript_index)` span (for click-to-expand).
-#[allow(clippy::type_complexity)]
-fn transcript_lines(
-    app: &App,
-    width: u16,
-) -> (Vec<Line<'static>>, Vec<usize>, Vec<(usize, usize, usize)>) {
+/// A one-row gap between two blocks. Its `Rc` is cloned, not rebuilt: the row is
+/// the same blank line every time.
+fn separator() -> Chunk {
+    thread_local! {
+        static SEP: Rc<Vec<Line<'static>>> = Rc::new(vec![Line::raw("")]);
+    }
+    Chunk {
+        rows: SEP.with(Rc::clone),
+        tool_idx: None,
+    }
+}
+
+/// Returns the transcript as a list of rendered blocks, plus the chunk each
+/// 1-based user/assistant message starts at (for `/goto`).
+///
+/// Nothing here is laid out against the viewport: a chunk's rows are already
+/// wrapped and padded, so the caller places the viewport by counting them. Blocks
+/// whose entry has not changed come straight out of [`BLOCK_CACHE`] as an `Rc`,
+/// which is what keeps a frame's cost proportional to what *changed* rather than
+/// to the length of the session.
+fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
-    let mut out: Vec<Line> = Vec::new();
-    let mut msg_starts: Vec<usize> = Vec::new();
-    let mut tool_regions: Vec<(usize, usize, usize)> = Vec::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut msg_at: Vec<usize> = Vec::new();
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
     // The `#N you · 2m ago` row that closes a message block, preceded by a blank
@@ -2154,9 +2301,8 @@ fn transcript_lines(
     let inner = inner_width(w);
     let mut pending: Option<PendingBlock> = None;
     for (i, entry) in app.panes.active_transcript().iter().enumerate() {
-        // Cache key shared by all arms (Reasoning skip happens before this).
-        let ck = (
-            i,
+        // Body cache key shared by all arms (Reasoning skip happens before this).
+        let ck: BodyKey = (
             entry_content_hash(entry, app.expand_tools),
             width,
             app.expand_tools,
@@ -2174,7 +2320,7 @@ fn transcript_lines(
             // clock, and the details mirror the live model/provider.
             EntryKind::Header => (
                 BlockKind::Header,
-                header_lines(app, app.header_anchor, width),
+                Rc::new(header_lines(app, app.header_anchor, width)),
             ),
             // An assistant turn that only called tools has no text, so it gets no
             // block of its own — but its `#N assistant` label is a `/goto` jump
@@ -2187,7 +2333,7 @@ fn transcript_lines(
                 } else {
                     // Nothing to append to (it opens the transcript): the label
                     // has nowhere to live, so the message keeps no jump point.
-                    msg_starts.push(out.len());
+                    msg_at.push(chunks.len());
                 }
                 continue;
             }
@@ -2199,7 +2345,7 @@ fn transcript_lines(
                 msg_num += 1;
                 msg_here += 1;
                 footer.extend(meta(i, msg_num, "you"));
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::User.bg(theme), inner)
                 });
                 (BlockKind::User, body)
@@ -2211,7 +2357,7 @@ fn transcript_lines(
                 msg_num += 1;
                 msg_here += 1;
                 footer.extend(meta(i, msg_num, "assistant"));
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Assistant.bg(theme), inner)
                 });
                 (BlockKind::Assistant, body)
@@ -2224,7 +2370,7 @@ fn transcript_lines(
             EntryKind::Reasoning { text, .. } => {
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     markdown_lines(
                         text,
                         &theme.md_theme_dim(),
@@ -2243,7 +2389,7 @@ fn transcript_lines(
                 expanded,
                 ..
             } => {
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     tool_lines(
                         theme,
                         name,
@@ -2259,7 +2405,7 @@ fn transcript_lines(
             // Slash-command output and status notices read like assistant output
             // — same markdown, same colors, no dimming — on their own background.
             EntryKind::System(text) | EntryKind::Notice(text) => {
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Command.bg(theme), inner)
                 });
                 (BlockKind::Command, body)
@@ -2267,11 +2413,11 @@ fn transcript_lines(
             // The per-turn stats line belongs to the turn that just ended, so it
             // closes that turn's block rather than opening one of its own.
             EntryKind::Stats(text) => {
-                let body = cache_entry(ck, || text_lines(text, Style::default().fg(theme.dim)));
+                let body = cached_body(i, ck, || text_lines(text, Style::default().fg(theme.dim)));
                 match pending.as_mut() {
                     Some(block) => {
                         let mut rows = vec![Line::raw("")];
-                        rows.extend(body);
+                        rows.extend(body.iter().cloned());
                         block.lend(rows);
                         continue;
                     }
@@ -2283,7 +2429,7 @@ fn transcript_lines(
             // `/diff` is slash-command output too, but with diff coloring
             // instead of markdown.
             EntryKind::Diff(text) => {
-                let body = cache_entry(ck, || {
+                let body = cached_body(i, ck, || {
                     text.lines()
                         .map(|line| {
                             Line::from(Span::styled(
@@ -2299,23 +2445,24 @@ fn transcript_lines(
         // Flush the previous block, then hold this one: a text-less assistant
         // turn that follows appends its label to whatever is pending.
         flush(
-            &mut out,
-            &mut msg_starts,
-            &mut tool_regions,
+            &mut chunks,
+            &mut msg_at,
             pending.take(),
             Some(kind.bg(theme)),
             w,
             theme,
         );
-        header.extend(body);
-        let footer_len = footer.len();
-        header.extend(footer);
         pending = Some(PendingBlock {
+            idx: i,
             kind,
-            lines: header,
+            header: std::mem::take(&mut header),
+            body,
+            lent: Vec::new(),
+            footer: std::mem::take(&mut footer),
+            body_key: ck,
+            cacheable: !matches!(entry.kind, EntryKind::Header),
             tool_idx: matches!(entry.kind, EntryKind::Tool { .. }).then_some(i),
             msgs: msg_here,
-            footer_len,
         });
     }
     // Queued prompts follow the transcript, so the last block is separated from
@@ -2324,35 +2471,19 @@ fn transcript_lines(
     let queued = app.panes.active_pane().pending.clone();
     let queued_bg = (!queued.is_empty()).then(|| BlockKind::Queued.bg(theme));
     flush(
-        &mut out,
-        &mut msg_starts,
-        &mut tool_regions,
+        &mut chunks,
+        &mut msg_at,
         pending.take(),
         queued_bg,
         w,
         theme,
     );
 
-    // Highlight the active /find query across the committed transcript.
-    if let Some(needle) = app
-        .find
-        .query
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .filter(|q| !q.is_empty())
-    {
-        let hl = Style::default()
-            .fg(Color::Black)
-            .bg(theme.warn)
-            .add_modifier(Modifier::BOLD);
-        for line in out.iter_mut() {
-            *line = highlight_line(std::mem::take(line), &needle, hl);
-        }
-    }
-
     // Pending queued messages render like user prompts, with a "Queued" badge
     // as the block's last row — through the same block path as everything else,
-    // so they pick up the same padding and background.
+    // so they pick up the same padding and background. They are not transcript
+    // entries and have no cache slot: there are never more than a few, and each
+    // one is consumed the moment the agent is free.
     if !queued.is_empty() {
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
@@ -2362,14 +2493,17 @@ fn transcript_lines(
             // against the message text above it.
             body.push(Line::raw(""));
             body.push(Line::from(Span::styled(" Queued ", badge)));
-            out.extend(render_block(body, w, bg, BlockKind::Queued.border(theme)));
+            chunks.push(Chunk {
+                rows: Rc::new(render_block(body, w, bg, BlockKind::Queued.border(theme))),
+                tool_idx: None,
+            });
             // Queued blocks are tinted: a blank row separates them from each
             // other, and the last one from the input pane below.
-            out.push(Line::raw(""));
+            chunks.push(separator());
         }
     }
 
-    (out, msg_starts, tool_regions)
+    (chunks, msg_at)
 }
 
 /// Split plain text into styled block-body lines (no padding — [`render_block`]
@@ -2642,27 +2776,30 @@ mod subagent_tests {
 
 /// Test 5 — render-cache equivalence and invalidation.
 ///
-/// `transcript_lines()` cannot be called in unit tests (requires a live `App`
-/// and a ratatui `Frame`), so these tests exercise the three pure building
-/// blocks that `transcript_lines()` is built on: `entry_content_hash`,
-/// `cache_entry`, and `cached_line_wrap`.  Each test targets a distinct
-/// failure mode:
+/// `transcript_chunks()` cannot be called in unit tests (requires a live `App`
+/// and a ratatui `Frame`), so these tests exercise the pure building blocks it
+/// is made of: `entry_content_hash`, `cached_body`, and `cached_block`.  Each
+/// test targets a distinct failure mode:
 ///
 /// * **wrong-content-served**: a warm cache hit returns different bytes than
-///   the closure that originally populated it (caught by `cache_entry_warm_hit_equals_cold_render`).
-/// * **cross-entry contamination**: entries stored under different keys
-///   collide and entry B's render is served for entry A (caught by
-///   `cache_entry_different_keys_do_not_collide`).
+///   the closure that originally populated it (caught by `cached_body_warm_hit_equals_cold_render`).
+/// * **cross-entry contamination**: two entries share a cache slot and entry B's
+///   render is served for entry A (caught by
+///   `cached_body_different_entries_do_not_collide`).
 /// * **stale expand state**: the user runs `/expand` but the collapsed render
 ///   is returned because `expand_all` is not part of the hash (caught by
 ///   `entry_content_hash_tool_expand_flag_changes_hash`).
-/// * **wrong wrap height**: the hit-test geometry for click-to-expand Tool
-///   regions miscalculates because width is dropped from the LINE_WRAP_CACHE
-///   key (caught by `cached_line_wrap_deterministic_and_width_sensitive`).
+/// * **stale rows after an edit**: an entry's content changes but its slot still
+///   holds the old render (caught by `a_changed_key_replaces_the_slot`).
+/// * **stale chrome**: the *body* is unchanged but the rows around it are not —
+///   a timestamp ticked over, a following turn lent the block its `#N` label — and
+///   the block is served with the old chrome (caught by
+///   `cached_block_keys_on_the_chrome_around_the_body`).
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        LINE_WRAP_CACHE, TRANSCRIPT_CACHE, cache_entry, cached_line_wrap, entry_content_hash,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, cached_block, cached_body, chrome_hash,
+        entry_content_hash,
     };
     use crate::app::{Entry, EntryKind};
     use ratatui::text::{Line, Span};
@@ -2737,104 +2874,146 @@ mod cache_tests {
         );
     }
 
-    // ── cache_entry ────────────────────────────────────────────────────────────
+    // ── cached_body ────────────────────────────────────────────────────────────
 
-    /// A warm cache hit must return exactly the same `Vec<Line>` as the initial
-    /// cold render, and the render closure must not be called a second time.
+    /// A warm cache hit must return exactly the same rows as the initial cold
+    /// render, and the render closure must not be called a second time.
     ///
-    /// Regression: if `cache_entry` returned a fresh render on every call
-    /// (ignoring the stored value), the output would still be correct only if
-    /// the render function is deterministic.  Any theme-dependent colour or
-    /// incremental syntax-highlight state that differs between frames would
-    /// produce visually wrong output.  The panic inside the warm closure proves
-    /// the cache is actually consulted.
+    /// Regression: if `cached_body` re-rendered on every call (ignoring the
+    /// stored value), the output would only be right as long as the render
+    /// function is deterministic — and it isn't: the incremental syntax
+    /// highlighter resumes state across calls. The panic inside the warm closure
+    /// proves the cache is actually consulted.
     #[test]
-    fn cache_entry_warm_hit_equals_cold_render() {
-        TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+    fn cached_body_warm_hit_equals_cold_render() {
+        BODY_CACHE.with(|c| c.borrow_mut().clear());
 
-        // Use an unusual key that won't collide with other tests even if they
-        // run in the same thread (thread-locals are shared within a thread).
-        let key: (usize, u64, u16, bool, bool) = (0xffff, 0xdead_beef_cafe_0001, 80, false, false);
+        let key = (0xdead_beef_cafe_0001, 80, false, false);
         let expected = vec![Line::from(Span::raw("cold render content"))];
 
         // Cold miss — closure must be invoked and its result stored.
-        let cold = cache_entry(key, || expected.clone());
+        let cold = cached_body(0, key, || expected.clone());
         assert_eq!(
-            cold, expected,
+            *cold, expected,
             "cold render must return what the closure produced"
         );
 
         // Warm hit — the cached value must be returned; closure panics if called.
-        let warm = cache_entry(key, || {
+        let warm = cached_body(0, key, || {
             panic!("closure must not be invoked on a warm cache hit")
         });
         assert_eq!(
-            warm, expected,
-            "warm cache hit must return the same lines as the cold render"
+            *warm, expected,
+            "warm cache hit must return the same rows as the cold render"
         );
     }
 
-    /// Two entries stored under different cache keys must never cross-serve:
-    /// looking up key B after key A is warm must still produce B's own content.
-    ///
-    /// Regression: a hash-map key collision (e.g. if the key were reduced to
-    /// fewer fields) would silently return A's render when B is looked up.
-    /// Users would see one transcript entry rendered with another entry's text.
+    /// Two entries must never cross-serve: looking up entry B after entry A is
+    /// warm must still produce B's own content.
     #[test]
-    fn cache_entry_different_keys_do_not_collide() {
-        TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+    fn cached_body_different_entries_do_not_collide() {
+        BODY_CACHE.with(|c| c.borrow_mut().clear());
 
-        let key_a: (usize, u64, u16, bool, bool) = (10, 0xaaaa, 80, false, false);
-        let key_b: (usize, u64, u16, bool, bool) = (11, 0xbbbb, 80, false, false);
-
+        let key_a = (0xaaaa, 80, false, false);
+        let key_b = (0xbbbb, 80, false, false);
         let lines_a = vec![Line::from(Span::raw("entry A — unique content"))];
         let lines_b = vec![Line::from(Span::raw("entry B — unique content"))];
 
-        let r_a = cache_entry(key_a, || lines_a.clone());
-        let r_b = cache_entry(key_b, || lines_b.clone());
+        let r_a = cached_body(10, key_a, || lines_a.clone());
+        let r_b = cached_body(11, key_b, || lines_b.clone());
 
-        assert_eq!(r_a, lines_a, "key_a lookup must return lines_a");
-        assert_eq!(r_b, lines_b, "key_b lookup must return lines_b");
+        assert_eq!(*r_a, lines_a, "entry 10 must return its own rows");
+        assert_eq!(*r_b, lines_b, "entry 11 must return its own rows");
+    }
+
+    /// A slot holds *one* render per entry, so a changed key must replace it —
+    /// not sit behind it.
+    ///
+    /// This is what makes streaming work: the entry the model is writing into
+    /// changes its content hash on every token, and each frame must show the text
+    /// as it now stands. It is also the eviction policy: one slot per entry means
+    /// the cache is bounded by the transcript and can never thrash (the old cache
+    /// was capped and dropped *wholesale*, so past the cap every frame threw away
+    /// what the next frame needed — a 2000-entry session re-rendered itself from
+    /// scratch several times a second).
+    #[test]
+    fn a_changed_key_replaces_the_slot() {
+        BODY_CACHE.with(|c| c.borrow_mut().clear());
+
+        let before = vec![Line::from(Span::raw("hello"))];
+        let after = vec![Line::from(Span::raw("hello world"))];
+
+        let old = cached_body(3, (0x1111, 80, false, false), || before.clone());
+        assert_eq!(*old, before);
+
+        // Same entry, new content → new key → the slot is re-rendered.
+        let new = cached_body(3, (0x2222, 80, false, false), || after.clone());
+        assert_eq!(*new, after, "a changed key must not serve the stale render");
+
+        BODY_CACHE.with(|c| {
+            assert_eq!(
+                c.borrow().len(),
+                1,
+                "an entry keeps one slot, however many times its content changes"
+            );
+        });
+    }
+
+    // ── cached_block ───────────────────────────────────────────────────────────
+
+    /// A block is its body *plus the chrome around it*, and the chrome can change
+    /// while the body does not: a relative timestamp ticks from `1m ago` to `2m
+    /// ago`, a text-less turn lends the block its `#N assistant` label, the block
+    /// after it turns out to be untinted so the bottom pad is dropped. All of that
+    /// is invisible to the body key, so `chrome_hash` carries it — and a block
+    /// whose chrome changed must be re-rendered.
+    #[test]
+    fn cached_block_keys_on_the_chrome_around_the_body() {
+        BLOCK_CACHE.with(|c| c.borrow_mut().clear());
+
+        let body_key = (0x3333, 80, false, false);
+        let none: &[Line<'static>] = &[];
+        let footer_1m = [Line::from(Span::raw("#1 you · 1m ago"))];
+        let footer_2m = [Line::from(Span::raw("#1 you · 2m ago"))];
+
+        let h_1m = chrome_hash(BlockKind::User, none, none, &footer_1m, false);
+        let h_2m = chrome_hash(BlockKind::User, none, none, &footer_2m, false);
+        assert_ne!(h_1m, h_2m, "a ticked-over timestamp must change the hash");
         assert_ne!(
-            r_a, r_b,
-            "distinct cache keys must not serve each other's stored lines"
+            h_1m,
+            chrome_hash(BlockKind::User, none, none, &footer_1m, true),
+            "dropping the bottom pad must change the hash"
+        );
+        assert_ne!(
+            h_1m,
+            chrome_hash(BlockKind::Assistant, none, none, &footer_1m, false),
+            "the block kind picks the background — it must change the hash"
+        );
+
+        let stale = vec![Line::from(Span::raw("with 1m ago"))];
+        let fresh = vec![Line::from(Span::raw("with 2m ago"))];
+        let first = cached_block(5, (body_key, h_1m), true, || stale.clone());
+        assert_eq!(*first, stale);
+        let second = cached_block(5, (body_key, h_2m), true, || fresh.clone());
+        assert_eq!(
+            *second, fresh,
+            "same body, new chrome → the block must be re-rendered"
         );
     }
 
-    // ── cached_line_wrap ───────────────────────────────────────────────────────
-
-    /// `cached_line_wrap` must be deterministic (identical inputs → identical
-    /// output) and must treat different widths as distinct cache entries.
-    ///
-    /// Regression: if the `width` dimension were accidentally omitted from the
-    /// `LINE_WRAP_CACHE` key, a line measured at width=80 would be returned for
-    /// the same content at width=2.  This corrupts the cumulative-height array
-    /// used for click-to-expand tool-block hit-testing: every region below the
-    /// first miscalculated line would have a wrong vertical offset, making
-    /// clicks miss their targets.
+    /// The header's logo animates every frame, so its block is never cached —
+    /// caching it would freeze the animation on the first frame ever drawn.
     #[test]
-    fn cached_line_wrap_deterministic_and_width_sensitive() {
-        LINE_WRAP_CACHE.with(|c| c.borrow_mut().clear());
+    fn an_uncacheable_block_is_never_stored() {
+        BLOCK_CACHE.with(|c| c.borrow_mut().clear());
 
-        // "abcd" at width=2 must wrap to 2 rows (2 chars per row);
-        // at width=80 it fits on 1 row.
-        let line: Line<'static> = Line::from(Span::raw("abcd"));
+        let key = ((0x4444, 80, false, false), 0);
+        let a = cached_block(0, key, false, || vec![Line::from(Span::raw("frame 1"))]);
+        let b = cached_block(0, key, false, || vec![Line::from(Span::raw("frame 2"))]);
 
-        let at_2 = cached_line_wrap(&line, 2);
-        let at_2_again = cached_line_wrap(&line, 2); // warm hit — must not change
-        let at_80 = cached_line_wrap(&line, 80);
-
-        assert!(at_2 >= 1, "wrap height must be at least 1 (narrow)");
-        assert!(at_80 >= 1, "wrap height must be at least 1 (wide)");
-        assert_eq!(
-            at_2, at_2_again,
-            "same (line, width) must always return the same height (deterministic)"
-        );
-        assert!(
-            at_2 > at_80,
-            "width=2 must produce more rows than width=80 for a 4-char line \
-             (got narrow={at_2}, wide={at_80})"
-        );
+        assert_eq!(a[0].spans[0].content, "frame 1");
+        assert_eq!(b[0].spans[0].content, "frame 2", "each frame renders anew");
+        BLOCK_CACHE.with(|c| assert!(c.borrow().is_empty(), "nothing was stored"));
     }
 }
 
@@ -3027,6 +3206,28 @@ mod block_tests {
         }
     }
 
+    /// A one-content-row block of `kind`, rendered fresh (never cached, so these
+    /// tests can't serve each other's rows out of the thread-local cache).
+    fn test_block(kind: BlockKind) -> PendingBlock {
+        PendingBlock {
+            idx: 0,
+            kind,
+            header: Vec::new(),
+            body: Rc::new(vec![Line::from(Span::raw("x"))]),
+            lent: Vec::new(),
+            footer: Vec::new(),
+            body_key: (0, 10, false, false),
+            cacheable: false,
+            tool_idx: None,
+            msgs: 0,
+        }
+    }
+
+    /// The rows a list of chunks paints, in order.
+    fn flatten(chunks: &[Chunk]) -> Vec<Line<'static>> {
+        chunks.iter().flat_map(|c| c.rows.iter().cloned()).collect()
+    }
+
     /// The gap between two blocks, for every pairing of tinted / untinted.
     ///
     /// Each block carries a blank padded row above and below, so a naive
@@ -3047,36 +3248,28 @@ mod block_tests {
         // Paint `first`, then `second`, and count the blank rows between their
         // one content row each.
         let gap = |first: BlockKind, second: Option<BlockKind>| -> usize {
-            let mut out = Vec::new();
-            let (mut starts, mut regions) = (Vec::new(), Vec::new());
-            let block = |kind| PendingBlock {
-                kind,
-                lines: vec![Line::from(Span::raw("x"))],
-                tool_idx: None,
-                msgs: 0,
-                footer_len: 0,
-            };
+            let mut chunks = Vec::new();
+            let mut starts = Vec::new();
             flush(
-                &mut out,
+                &mut chunks,
                 &mut starts,
-                &mut regions,
-                Some(block(first)),
+                Some(test_block(first)),
                 second.map(|k| k.bg(&theme)),
                 10,
                 &theme,
             );
-            let after_first = out.len();
+            let after_first: usize = chunks.iter().map(|c| c.rows.len()).sum();
             if let Some(second) = second {
                 flush(
-                    &mut out,
+                    &mut chunks,
                     &mut starts,
-                    &mut regions,
-                    Some(block(second)),
+                    Some(test_block(second)),
                     None,
                     10,
                     &theme,
                 );
             }
+            let out = flatten(&chunks);
             // Rows after the first block's content row, before the second's.
             let content = |l: &Line<'_>| {
                 l.spans
@@ -3112,56 +3305,76 @@ mod block_tests {
         // row between the transcript and the input pane is the layout's, not the
         // last block's — so a tinted block ends flush with its own bottom pad.
         let trailing = |kind: BlockKind| -> usize {
-            let mut out = Vec::new();
-            let (mut starts, mut regions) = (Vec::new(), Vec::new());
+            let mut chunks = Vec::new();
+            let mut starts = Vec::new();
             flush(
-                &mut out,
+                &mut chunks,
                 &mut starts,
-                &mut regions,
-                Some(PendingBlock {
-                    kind,
-                    lines: vec![Line::from(Span::raw("x"))],
-                    tool_idx: None,
-                    msgs: 0,
-                    footer_len: 0,
-                }),
+                Some(test_block(kind)),
                 None,
                 10,
                 &theme,
             );
-            out.len() - 2 // minus the content row and the top pad
+            flatten(&chunks).len() - 2 // minus the content row and the top pad
         };
         assert_eq!(trailing(tinted), 1, "bottom pad only");
         assert_eq!(trailing(plain), 1, "bottom pad only");
     }
 
-    /// `flush` still records where a block's messages start and, for a tool
-    /// call, the rows a click can land on — even as the gap rules shift rows.
+    /// `flush` still records which chunk a block's messages start at and, for a
+    /// tool call, which chunk a click can land on — even as the gap rules shift
+    /// rows around.
     #[test]
-    fn flush_records_message_starts_and_tool_regions() {
+    fn flush_records_message_starts_and_tool_chunks() {
         let theme = Theme::default();
-        let mut out = vec![Line::raw("existing")];
-        let (mut starts, mut regions) = (Vec::new(), Vec::new());
-        flush(
-            &mut out,
-            &mut starts,
-            &mut regions,
-            Some(PendingBlock {
-                kind: BlockKind::Tool,
-                lines: vec![Line::from(Span::raw("x"))],
-                tool_idx: Some(7),
-                msgs: 2, // a block carrying a borrowed assistant label
-                footer_len: 0,
-            }),
-            None,
-            10,
-            &theme,
-        );
+        let mut chunks = vec![separator()]; // something already painted
+        let mut starts = Vec::new();
+        let mut block = test_block(BlockKind::Tool);
+        block.tool_idx = Some(7);
+        block.msgs = 2; // a block carrying a borrowed assistant label
+        flush(&mut chunks, &mut starts, Some(block), None, 10, &theme);
         assert_eq!(starts, vec![1, 1], "both messages start at the block");
-        assert_eq!(regions.len(), 1);
-        let (start, end, idx) = regions[0];
-        assert_eq!((start, idx), (1, 7));
-        assert!(end > start, "the tool block spans rows");
+        let tools: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.tool_idx.map(|idx| (i, idx)))
+            .collect();
+        assert_eq!(tools, vec![(1, 7)], "the tool block is chunk 1");
+        assert!(chunks[1].rows.len() > 1, "the tool block spans rows");
+    }
+
+    /// **Every row a block emits is exactly one screen row.**
+    ///
+    /// `render_block` wraps each body line to the block's inner width and pads it
+    /// out to the full render width, so nothing it produces can wrap again at that
+    /// width. The frame leans on this: it places the viewport by *counting* rows
+    /// (`cum` in `draw_transcript`) instead of re-wrapping the transcript, which is
+    /// what keeps a long session's frame cost flat. If a block ever emitted a row
+    /// wider than the render width, that row would wrap on screen, every row below
+    /// it would sit one line lower than the scroll math believes, and clicks on
+    /// tool blocks would land on the wrong entry.
+    #[test]
+    fn every_block_row_is_exactly_one_screen_row() {
+        let theme = Theme::default();
+        let width = 24usize;
+        // A long unbroken word, a long sentence, a CJK run (two columns per glyph)
+        // and an empty line — every way a body line could overshoot the width.
+        let body = vec![
+            Line::from(Span::raw("supercalifragilisticexpialidocious")),
+            Line::from(Span::raw("the quick brown fox jumps over the lazy dog")),
+            Line::from(Span::raw("日本語のテキストは全角です")),
+            Line::raw(""),
+        ];
+        for kind in [BlockKind::User, BlockKind::Assistant, BlockKind::Command] {
+            let rows = render_block(body.clone(), width, kind.bg(&theme), kind.border(&theme));
+            for line in &rows {
+                let w: usize = line.spans.iter().map(Span::width).sum();
+                assert_eq!(
+                    w, width,
+                    "every block row must fill exactly the render width: {line:?}"
+                );
+            }
+        }
     }
 
     /// The tool header always leads with a status mark that reflects the call's

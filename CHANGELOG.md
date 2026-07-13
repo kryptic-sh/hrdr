@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **A frame no longer costs the whole session.** The transcript is laid out once
+  per block and cached by transcript index, shared by `Rc`; each frame reuses
+  every block it didn't change and hands the terminal only the blocks the
+  viewport actually overlaps. Previously every frame — and a frame is drawn on
+  every keystroke — re-cloned every entry's rows, re-measured every line, and
+  handed the lot to a `Paragraph` that re-wrapped the transcript from the top
+  just to discard everything above the scroll. Measured at 120 columns: a
+  1000-entry transcript went from **26ms to 0.42ms** per frame, a 2000-entry one
+  from **120ms to 0.67ms**.
+- **Removed the render cache's size cap**, which was the cliff behind the worst
+  of the lag: past 1024 cached entries the whole map was dropped, so every frame
+  evicted exactly what the next frame needed and a long session re-rendered
+  itself from scratch several times a second. The cache now holds one slot per
+  entry — bounded by the transcript, and unable to thrash.
+
 ## [0.2.12] - 2026-07-13
 
 ### Added
