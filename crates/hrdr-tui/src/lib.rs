@@ -42,8 +42,20 @@ impl TerminalGuard {
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         )?;
+        // Keyboard enhancement is a *nicety*: with it, `Shift+Enter` and friends
+        // arrive unambiguously; without it, they don't, and everything else works
+        // exactly as before. So it must never be the reason hrdr fails to start —
+        // and it was. crossterm has no implementation of it for the legacy Windows
+        // console API and returns an error there, which this propagated with `?`:
+        // on a Windows terminal without VT support, hrdr printed
+        // "Keyboard progressive enhancement not implemented for the legacy Windows
+        // API" and exited 1, before painting a single frame. Ask for it; carry on
+        // without it.
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        );
         Ok(Self)
     }
 }
