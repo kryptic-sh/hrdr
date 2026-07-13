@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.12"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/hrdr"
@@ -19,12 +19,12 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 
 [workspace.dependencies]
 # internal
-hrdr-llm = { path = "crates/hrdr-llm", version = "0.2.1" }
-hrdr-tools = { path = "crates/hrdr-tools", version = "0.2.1" }
-hrdr-agent = { path = "crates/hrdr-agent", version = "0.2.1" }
-hrdr-editor = { path = "crates/hrdr-editor", version = "0.2.1" }
-hrdr-app = { path = "crates/hrdr-app", version = "0.2.1" }
-hrdr-tui = { path = "crates/hrdr-tui", version = "0.2.1" }
+hrdr-llm = { path = "crates/hrdr-llm", version = "0.3.0" }
+hrdr-tools = { path = "crates/hrdr-tools", version = "0.3.0" }
+hrdr-agent = { path = "crates/hrdr-agent", version = "0.3.0" }
+hrdr-editor = { path = "crates/hrdr-editor", version = "0.3.0" }
+hrdr-app = { path = "crates/hrdr-app", version = "0.3.0" }
+hrdr-tui = { path = "crates/hrdr-tui", version = "0.3.0" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
 hjkl-engine = "0.33"
