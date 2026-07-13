@@ -35,10 +35,11 @@ enum FileOp {
     Write {
         path: PathBuf,
         content: String,
-        existed: bool,
+        original: Option<String>,
     },
     Delete {
         path: PathBuf,
+        original: String,
     },
 }
 
@@ -51,9 +52,10 @@ impl Tool for PatchTool {
         "Apply a unified diff (git/patch format) across one or more files in a single call — \
          the efficient way to make multi-file or multi-hunk changes. Each file section has \
          `--- a/<path>` and `+++ b/<path>` headers followed by `@@` hunks (a `diff --git` line \
-         is optional; use `/dev/null` as the path to create or delete a file). Read each file \
-         first. Atomic: if any hunk fails to apply, nothing is written. For a single small \
-         change, prefer `edit`."
+         is optional; use `/dev/null` as the path to create or delete a file). Hunk line counts \
+         are derived from the body, so inaccurate counts are repaired and a bare `@@` header is \
+         accepted when its context identifies one unique location. Read each file first. Atomic: \
+         if any hunk fails to apply, nothing is written. For a single small change, prefer `edit`."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -75,6 +77,18 @@ impl Tool for PatchTool {
             bail!("no file sections in the patch — need `--- `/`+++ ` headers per file");
         }
 
+        // Repeated sections would each plan against the same on-disk base, so a
+        // later section could silently overwrite an earlier section's result.
+        let mut targets = std::collections::HashSet::new();
+        for fd in &files {
+            let target = fd.new_path.as_ref().or(fd.old_path.as_ref());
+            if let Some(path) = target
+                && !targets.insert(path)
+            {
+                bail!("patch not applied (no files changed): duplicate file section for {path}");
+            }
+        }
+
         // Phase 1 — validate + compute each file's result in memory (atomic).
         let mut ops = Vec::new();
         let mut errors = Vec::new();
@@ -91,51 +105,68 @@ impl Tool for PatchTool {
             );
         }
 
-        // Phase 2 — write.
+        // Phase 2 — commit. Roll back every attempted path if any filesystem
+        // operation fails, so validation atomicity extends through writes.
+        for i in 0..ops.len() {
+            let result = match &ops[i] {
+                FileOp::Write { path, content, .. } => {
+                    ctx.checkpoint(path);
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    tokio::fs::write(path, content)
+                        .await
+                        .with_context(|| format!("writing {}", path.display()))
+                }
+                FileOp::Delete { path, .. } => {
+                    ctx.checkpoint(path);
+                    tokio::fs::remove_file(path)
+                        .await
+                        .with_context(|| format!("deleting {}", path.display()))
+                }
+            };
+            if let Err(error) = result {
+                let rollback_errors = rollback_ops(&ops[..=i]).await;
+                let suffix = if rollback_errors.is_empty() {
+                    "earlier filesystem changes rolled back".to_string()
+                } else {
+                    format!("rollback incomplete: {}", rollback_errors.join("; "))
+                };
+                return Err(error.context(format!("patch not applied; {suffix}")));
+            }
+        }
+
         let mut summary = Vec::new();
-        for op in ops {
+        for op in &ops {
             match op {
                 FileOp::Write {
                     path,
                     content,
-                    existed,
+                    original,
                 } => {
-                    ctx.checkpoint(&path);
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
-                    }
-                    let bytes = content.len();
-                    tokio::fs::write(&path, &content)
-                        .await
-                        .with_context(|| format!("writing {}", path.display()))?;
                     let mut notes =
-                        crate::run_file_hooks(&ctx.hooks, "patch", &path, &ctx.cwd).await;
-                    ctx.mark_read(&path);
-                    // Diagnostics on what's on disk (hooks may have reformatted).
+                        crate::run_file_hooks(&ctx.hooks, "patch", path, &ctx.cwd).await;
+                    ctx.mark_read(path);
                     if let Some(lsp) = &ctx.lsp {
-                        let on_disk = tokio::fs::read_to_string(&path)
+                        let on_disk = tokio::fs::read_to_string(path)
                             .await
                             .unwrap_or_else(|_| content.clone());
-                        if let Some(note) = lsp.diagnostics_note(&path, &on_disk).await {
+                        if let Some(note) = lsp.diagnostics_note(path, &on_disk).await {
                             notes.push(note);
                         }
                     }
-                    let verb = if existed { "patched" } else { "created" };
-                    let mut line = format!("{verb} {} ({bytes} bytes)", rel(&path, ctx));
+                    let verb = if original.is_some() {
+                        "patched"
+                    } else {
+                        "created"
+                    };
+                    let mut line = format!("{verb} {} ({} bytes)", rel(path, ctx), content.len());
                     if !notes.is_empty() {
                         line.push_str(&format!("  [{}]", notes.join("; ")));
                     }
                     summary.push(line);
                 }
-                FileOp::Delete { path } => {
-                    ctx.checkpoint(&path);
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => summary.push(format!("deleted {}", rel(&path, ctx))),
-                        Err(e) => {
-                            summary.push(format!("FAILED to delete {}: {e}", rel(&path, ctx)))
-                        }
-                    }
-                }
+                FileOp::Delete { path, .. } => summary.push(format!("deleted {}", rel(path, ctx))),
             }
         }
         Ok(truncate(
@@ -150,10 +181,45 @@ impl Tool for PatchTool {
     }
 }
 
+async fn rollback_ops(ops: &[FileOp]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for op in ops.iter().rev() {
+        let result = match op {
+            FileOp::Write {
+                path,
+                original: Some(content),
+                ..
+            }
+            | FileOp::Delete {
+                path,
+                original: content,
+            } => tokio::fs::write(path, content).await,
+            FileOp::Write {
+                path,
+                original: None,
+                ..
+            } => tokio::fs::remove_file(path).await,
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", op.path().display()));
+        }
+    }
+    errors
+}
+
+impl FileOp {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Write { path, .. } | Self::Delete { path, .. } => path,
+        }
+    }
+}
+
 /// Read the target, apply the file's hunks with [`diffy`], and return the
 /// pending [`FileOp`] — enforcing confinement and the read-before-edit gate.
 async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
-    // Deletion: `+++ /dev/null`.
+    // Deletion: `+++ /dev/null`. Validate that the hunk applies and removes
+    // the complete file before scheduling the filesystem operation.
     if fd.new_path.is_none() {
         let old = fd
             .old_path
@@ -164,7 +230,31 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
         if !ctx.was_read(&path) {
             bail!("{}: read it before deleting it via patch", path.display());
         }
-        return Ok(FileOp::Delete { path });
+        let original = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        let normalized = normalize_diff(&fd.diff, &original, false)
+            .map_err(|e| anyhow!("{}: invalid diff — {e}", path.display()))?;
+        let patch = diffy::Patch::from_str(&normalized).map_err(|e| {
+            anyhow!(
+                "{}: invalid diff after repairing hunk headers — {e}",
+                path.display()
+            )
+        })?;
+        let remaining = diffy::apply(&original, &patch)
+            .map_err(|e| anyhow!("{}: hunks don't apply — {e}", path.display()))?;
+        if !remaining.is_empty() {
+            bail!(
+                "{}: deletion patch leaves {} bytes; a /dev/null patch must remove the complete file",
+                path.display(),
+                remaining.len()
+            );
+        }
+        return Ok(FileOp::Delete { path, original });
+    }
+
+    if fd.old_path.is_some() && fd.old_path != fd.new_path {
+        bail!("patch renames are not supported; old and new paths must match");
     }
 
     let path = ctx.resolve(fd.new_path.as_ref().unwrap());
@@ -180,15 +270,182 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
     } else {
         String::new() // creating a new file
     };
-    let patch = diffy::Patch::from_str(&fd.diff)
+    let original = exists.then(|| base.clone());
+    let normalized = normalize_diff(&fd.diff, &base, !exists)
         .map_err(|e| anyhow!("{}: invalid diff — {e}", path.display()))?;
+    let patch = diffy::Patch::from_str(&normalized).map_err(|e| {
+        anyhow!(
+            "{}: invalid diff after repairing hunk headers — {e}",
+            path.display()
+        )
+    })?;
     let content = diffy::apply(&base, &patch)
         .map_err(|e| anyhow!("{}: hunks don't apply — {e}", path.display()))?;
     Ok(FileOp::Write {
         path,
         content,
-        existed: exists,
+        original,
     })
+}
+
+/// Repair hunk metadata before handing a patch to `diffy`. Models reliably
+/// produce body prefixes and context but often miscount header rows. Counts are
+/// therefore derived from the body. A bare `@@` gets its old-file start from a
+/// unique exact match of the hunk's context/removal sequence.
+fn normalize_diff(diff: &str, base: &str, creating: bool) -> Result<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() && !lines[i].starts_with("@@") {
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    let base_lines: Vec<&str> = base.lines().collect();
+    let mut line_delta = 0isize;
+    let mut hunk_number = 0usize;
+    while i < lines.len() {
+        if !lines[i].starts_with("@@") {
+            bail!("expected a hunk header, found {:?}", lines[i]);
+        }
+        hunk_number += 1;
+        let header = lines[i];
+        let bare = header == "@@";
+        if !bare && !valid_standard_header(header) {
+            bail!(
+                "hunk {hunk_number} has a malformed header {header:?}; use `@@`, or `@@ -OLD[,COUNT] +NEW[,COUNT] @@`"
+            );
+        }
+        i += 1;
+        let body_start = i;
+        while i < lines.len() && !lines[i].starts_with("@@") {
+            i += 1;
+        }
+        let body = &lines[body_start..i];
+        if body.is_empty() {
+            bail!("hunk {hunk_number} has no body");
+        }
+        for line in body {
+            if !matches!(line.as_bytes().first(), Some(b' ' | b'+' | b'-' | b'\\')) {
+                bail!(
+                    "hunk {hunk_number} has a line without a diff prefix: {line:?}; prefix it with space, `+`, or `-`"
+                );
+            }
+        }
+        let old_count = body
+            .iter()
+            .filter(|line| line.starts_with(' ') || line.starts_with('-'))
+            .count();
+        let new_count = body
+            .iter()
+            .filter(|line| line.starts_with(' ') || line.starts_with('+'))
+            .count();
+        let old_sequence: Vec<&str> = body
+            .iter()
+            .filter(|line| line.starts_with(' ') || line.starts_with('-'))
+            .map(|line| &line[1..])
+            .collect();
+        let old_start = locate_old_sequence(
+            &base_lines,
+            &old_sequence,
+            parse_old_start(header),
+            hunk_number,
+            bare,
+            creating,
+        )?;
+        let new_start = if old_start == 0 {
+            usize::from(new_count > 0)
+        } else {
+            (old_start as isize + line_delta).max(1) as usize
+        };
+        out.push(format!(
+            "@@ -{},{} +{},{} @@",
+            old_start, old_count, new_start, new_count
+        ));
+        out.extend(body.iter().map(|line| (*line).to_string()));
+        line_delta += new_count as isize - old_count as isize;
+    }
+    Ok(format!("{}\n", out.join("\n")))
+}
+
+fn parse_old_start(header: &str) -> Option<usize> {
+    header
+        .strip_prefix("@@ -")?
+        .split_once(' ')?
+        .0
+        .split(',')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn valid_standard_header(header: &str) -> bool {
+    let Some(rest) = header.strip_prefix("@@ -") else {
+        return false;
+    };
+    let Some((old, rest)) = rest.split_once(" +") else {
+        return false;
+    };
+    let Some((new, suffix)) = rest.split_once(" @@") else {
+        return false;
+    };
+    valid_range(old) && valid_range(new) && (suffix.is_empty() || suffix.starts_with(' '))
+}
+
+fn valid_range(range: &str) -> bool {
+    let mut parts = range.split(',');
+    parts.next().is_some_and(|v| v.parse::<usize>().is_ok())
+        && parts.next().is_none_or(|v| v.parse::<usize>().is_ok())
+        && parts.next().is_none()
+}
+
+fn locate_old_sequence(
+    base: &[&str],
+    old_sequence: &[&str],
+    declared_start: Option<usize>,
+    hunk_number: usize,
+    bare: bool,
+    creating: bool,
+) -> Result<usize> {
+    if old_sequence.is_empty() {
+        if bare && !creating {
+            bail!(
+                "hunk {hunk_number} is a location-free addition to an existing file; add an explicit hunk range or unchanged context"
+            );
+        }
+        return Ok(declared_start.unwrap_or(0));
+    }
+    if let Some(start) = declared_start {
+        let index = start.saturating_sub(1);
+        if index
+            .checked_add(old_sequence.len())
+            .and_then(|end| base.get(index..end))
+            == Some(old_sequence)
+        {
+            return Ok(start);
+        }
+    }
+    let starts = sequence_starts(base, old_sequence);
+    match starts.as_slice() {
+        [start] => Ok(*start + 1),
+        [] => bail!(
+            "hunk {hunk_number} old/context lines do not match the file; re-read it and copy exact current text"
+        ),
+        _ => bail!(
+            "hunk {hunk_number} old/context lines match {} locations; add more context to identify one location",
+            starts.len()
+        ),
+    }
+}
+
+fn sequence_starts(haystack: &[&str], needle: &[&str]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(i, window)| (window == needle).then_some(i))
+        .collect()
 }
 
 /// Split a (possibly multi-file) unified diff into per-file slices. Splits on
@@ -300,6 +557,167 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(files[1].old_path.as_deref(), Some("gone.txt"));
     }
 
+    #[test]
+    fn repairs_inaccurate_hunk_counts() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1,99 +1,42 @@\n one\n-two\n+TWO\n three\n";
+        let normalized = normalize_diff(diff, "one\ntwo\nthree\n", false).unwrap();
+        assert!(normalized.contains("@@ -1,3 +1,3 @@"), "{normalized}");
+        let patch = diffy::Patch::from_str(&normalized).unwrap();
+        assert_eq!(
+            diffy::apply("one\ntwo\nthree\n", &patch).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn repairs_wrong_hunk_positions_when_context_is_unique() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -99,1 +88,1 @@\n-old\n+new\n";
+        let normalized = normalize_diff(diff, "head\nold\ntail\n", false).unwrap();
+        assert!(normalized.contains("@@ -2,1 +2,1 @@"), "{normalized}");
+    }
+
+    #[test]
+    fn wrong_hunk_position_with_ambiguous_context_errors() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -99 +99 @@\n-same\n+new\n";
+        let err = normalize_diff(diff, "same\nother\nsame\n", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("match 2 locations"), "{err}");
+    }
+
+    #[test]
+    fn huge_declared_position_does_not_panic() {
+        let diff = format!(
+            "--- a/a.txt\n+++ b/a.txt\n@@ -{} +1 @@\n-old\n+new\n",
+            usize::MAX
+        );
+        let normalized = normalize_diff(&diff, "old\n", false).unwrap();
+        assert!(normalized.contains("@@ -1,1 +1,1 @@"), "{normalized}");
+    }
+
+    #[test]
+    fn standard_hunk_header_remains_equivalent() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -2,2 +2,2 @@ label\n-old\n+new\n tail\n";
+        let normalized = normalize_diff(diff, "head\nold\ntail\n", false).unwrap();
+        assert!(normalized.contains("@@ -2,2 +2,2 @@"), "{normalized}");
+    }
+
+    #[test]
+    fn omitted_counts_are_derived() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -2 +2 @@\n-old\n+new\n";
+        let normalized = normalize_diff(diff, "head\nold\n", false).unwrap();
+        assert!(normalized.contains("@@ -2,1 +2,1 @@"), "{normalized}");
+    }
+
+    #[test]
+    fn bare_hunk_header_finds_unique_context() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n beta\n-old\n+new\n gamma\n";
+        let normalized = normalize_diff(diff, "alpha\nbeta\nold\ngamma\nomega\n", false).unwrap();
+        assert!(normalized.contains("@@ -2,3 +2,3 @@"), "{normalized}");
+        let patch = diffy::Patch::from_str(&normalized).unwrap();
+        assert_eq!(
+            diffy::apply("alpha\nbeta\nold\ngamma\nomega\n", &patch).unwrap(),
+            "alpha\nbeta\nnew\ngamma\nomega\n"
+        );
+    }
+
+    #[test]
+    fn bare_hunk_header_rejects_ambiguous_context() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n-same\n+changed\n";
+        let err = normalize_diff(diff, "same\nother\nsame\n", false).unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.contains("match 2 locations"), "{shown}");
+        assert!(shown.contains("more context"), "{shown}");
+    }
+
+    #[test]
+    fn bare_hunk_header_rejects_missing_context() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n-missing\n+changed\n";
+        let err = normalize_diff(diff, "present\n", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not match the file"), "{err}");
+    }
+
+    #[test]
+    fn bare_addition_creates_a_new_file() {
+        let diff = "--- /dev/null\n+++ b/a.txt\n@@\n+first\n+second\n";
+        let normalized = normalize_diff(diff, "", true).unwrap();
+        assert!(normalized.contains("@@ -0,0 +1,2 @@"), "{normalized}");
+        let patch = diffy::Patch::from_str(&normalized).unwrap();
+        assert_eq!(diffy::apply("", &patch).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn bare_addition_to_existing_file_requires_location() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n+first\n";
+        let err = normalize_diff(diff, "existing\n", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("location-free addition"), "{err}");
+    }
+
+    #[test]
+    fn malformed_hunk_headers_are_rejected() {
+        for header in [
+            "@@ nonsense",
+            "@@ -x +1 @@",
+            "@@ -1 +x @@",
+            "@@ -1,2,3 +1 @@",
+            "@@ -1 +1",
+        ] {
+            let diff = format!("--- a/a.txt\n+++ b/a.txt\n{header}\n-old\n+new\n");
+            let err = normalize_diff(&diff, "old\n", false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed header"), "{header}: {err}");
+        }
+    }
+
+    #[test]
+    fn bare_deletion_removes_unique_lines() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n-two\n-three\n";
+        let normalized = normalize_diff(diff, "one\ntwo\nthree\nfour\n", false).unwrap();
+        assert!(normalized.contains("@@ -2,2 +2,0 @@"), "{normalized}");
+        let patch = diffy::Patch::from_str(&normalized).unwrap();
+        assert_eq!(
+            diffy::apply("one\ntwo\nthree\nfour\n", &patch).unwrap(),
+            "one\nfour\n"
+        );
+    }
+
+    #[test]
+    fn multiple_bare_hunks_derive_shifted_new_positions() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n-one\n+ONE\n+extra\n@@\n-three\n+THREE\n";
+        let normalized = normalize_diff(diff, "one\ntwo\nthree\n", false).unwrap();
+        assert!(normalized.contains("@@ -1,1 +1,2 @@"), "{normalized}");
+        assert!(normalized.contains("@@ -3,1 +4,1 @@"), "{normalized}");
+        let patch = diffy::Patch::from_str(&normalized).unwrap();
+        assert_eq!(
+            diffy::apply("one\ntwo\nthree\n", &patch).unwrap(),
+            "ONE\nextra\ntwo\nTHREE\n"
+        );
+    }
+
+    #[test]
+    fn rejects_unprefixed_hunk_body_lines_with_guidance() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\nold\n+new\n";
+        let err = normalize_diff(diff, "old\n", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without a diff prefix"), "{err}");
+        assert!(err.contains("prefix it with space"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_empty_hunk() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@\n";
+        let err = normalize_diff(diff, "old\n", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no body"), "{err}");
+    }
+
     #[tokio::test]
     async fn applies_a_multi_hunk_patch_atomically() {
         let dir = tempfile::tempdir().unwrap();
@@ -376,11 +794,93 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "keep\n");
     }
 
-    /// A deletion that fails at the filesystem level (here: the "file" is
-    /// actually a directory, so `remove_file` errors) must be reported as a
-    /// failure, not silently claimed as "deleted".
     #[tokio::test]
-    async fn a_failed_deletion_is_reported_not_claimed_success() {
+    async fn duplicate_file_sections_are_rejected_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&path);
+
+        let patch = "--- a/same.txt\n+++ b/same.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- a/same.txt\n+++ b/same.txt\n@@ -2 +2 @@\n-two\n+TWO\n";
+        let err = PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate file section"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_deletion_hunk_does_not_delete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.txt");
+        tokio::fs::write(&path, "keep\n").await.unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&path);
+
+        let patch = "--- a/keep.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n";
+        PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "keep\n");
+    }
+
+    #[tokio::test]
+    async fn partial_deletion_hunk_does_not_delete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.txt");
+        tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&path);
+
+        let patch = "--- a/keep.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-one\n";
+        let err = PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must remove the complete file"),
+            "{err}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn differing_paths_are_rejected_as_unsupported_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.txt");
+        tokio::fs::write(&old, "old\n").await.unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&old);
+
+        let patch = "--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let err = PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("renames are not supported"),
+            "{err}"
+        );
+        assert!(!dir.path().join("new.txt").exists());
+    }
+
+    /// A deletion target that cannot be read as a file fails during validation,
+    /// before any filesystem changes are attempted.
+    #[tokio::test]
+    async fn an_invalid_deletion_target_errors_without_removal() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("adir");
         tokio::fs::create_dir(&sub).await.unwrap();
@@ -389,17 +889,12 @@ diff --git a/bar.txt b/bar.txt
         ctx.restrict_to_cwd = false;
         ctx.mark_read(&sub);
 
-        let patch = "\
---- a/adir
-+++ /dev/null
-@@ -1 +0,0 @@
--x
-";
-        let out = PatchTool
+        let patch = "--- a/adir\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let err = PatchTool
             .execute(json!({ "patch": patch }), &ctx)
             .await
-            .expect("plan succeeds; the failure is reported in the summary");
-        assert!(out.contains("FAILED to delete"), "{out}");
+            .unwrap_err();
+        assert!(err.to_string().contains("reading"), "{err}");
         assert!(sub.exists(), "the directory must still be there");
     }
 }

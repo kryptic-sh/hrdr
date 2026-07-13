@@ -2240,7 +2240,7 @@ impl Default for AgentConfig {
             provider_pinned: false,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
-            max_steps: 50,
+            max_steps: 300,
             max_cost: None,
             provider: None,
             context_window: None,
@@ -6568,6 +6568,11 @@ mod tests {
     }
 
     // ── Trusted provider identity (Task 1) ───────────────────────────────────
+
+    #[test]
+    fn default_tool_round_limit_is_300() {
+        assert_eq!(AgentConfig::default().max_steps, 300);
+    }
 
     #[test]
     fn builtin_chatgpt_aliases_resolve_to_chatgpt_oauth() {

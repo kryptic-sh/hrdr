@@ -145,6 +145,7 @@ mod tests {
                 path: None,
                 glob: None,
                 context: None,
+                multiline: false,
             },
             &c,
         )
@@ -172,6 +173,7 @@ mod tests {
                 path: None,
                 glob: None,
                 context: None,
+                multiline: false,
             },
             &c,
         )
@@ -186,6 +188,7 @@ mod tests {
                 path: None,
                 glob: Some("*.rs".into()),
                 context: None,
+                multiline: false,
             },
             &c,
         )
@@ -200,6 +203,7 @@ mod tests {
                 path: None,
                 glob: None,
                 context: None,
+                multiline: false,
             },
             &c,
         )
@@ -222,6 +226,7 @@ mod tests {
                 path: None,
                 glob: None,
                 context: Some(1),
+                multiline: false,
             },
             &c,
         )
@@ -243,6 +248,7 @@ mod tests {
                 path: None,
                 glob: None,
                 context: Some(3),
+                multiline: false,
             },
             &c,
         )

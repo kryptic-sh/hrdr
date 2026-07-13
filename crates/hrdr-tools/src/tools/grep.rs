@@ -45,6 +45,8 @@ pub(crate) struct GrepArgs {
     pub(crate) glob: Option<String>,
     #[serde(default)]
     pub(crate) context: Option<usize>,
+    #[serde(default)]
+    pub(crate) multiline: bool,
 }
 
 impl GrepArgs {
@@ -84,7 +86,8 @@ impl Tool for GrepTool {
         "Search file contents (via ripgrep, grep, or a built-in walker — whichever is available). \
          Returns `path:line:match`. Optionally scope to a `path` and/or filter files with a \
          `glob` (e.g. '*.rs'). Set `context` to 2–3 to see the lines around each match \
-         instead of making a follow-up read call."
+         instead of making a follow-up read call. Set `multiline` to true for patterns that \
+         span line boundaries."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -93,7 +96,8 @@ impl Tool for GrepTool {
                 "pattern": {"type": "string", "description": "Regex pattern to search for."},
                 "path": {"type": "string", "description": "File or directory to search (default cwd)."},
                 "glob": {"type": "string", "description": "Glob to filter files, e.g. '*.rs'."},
-                "context": {"type": "integer", "description": "Lines of context around each match (0-10, default 0)."}
+                "context": {"type": "integer", "description": "Lines of context around each match (0-10, default 0)."},
+                "multiline": {"type": "boolean", "description": "Allow regex matches to span line boundaries (default false)."}
             },
             "required": ["pattern"]
         })
@@ -120,9 +124,13 @@ impl Tool for GrepTool {
 async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let mut cmd = tokio::process::Command::new("rg");
     cmd.arg("--line-number")
+        .arg("--with-filename")
         .arg("--no-heading")
         .arg("--color=never")
         .current_dir(&ctx.cwd);
+    if a.multiline {
+        cmd.arg("--multiline");
+    }
     if a.context() > 0 {
         cmd.arg("-C").arg(a.context().to_string());
     }
@@ -137,6 +145,11 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 }
 
 async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    // POSIX grep cannot match across records. Use the same portable in-process
+    // implementation as the no-binary fallback for multiline requests.
+    if a.multiline {
+        return grep_builtin(a, ctx);
+    }
     let mut cmd = tokio::process::Command::new("grep");
     cmd.arg("-rnE").arg("--color=never").current_dir(&ctx.cwd);
     if a.context() > 0 {
@@ -196,6 +209,9 @@ async fn run_search_cmd(
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
 /// each line with a regex. Used when neither ripgrep nor grep is installed.
 pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    if a.multiline {
+        return grep_builtin_multiline(a, ctx);
+    }
     let re =
         regex::Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
     let root = a
@@ -294,6 +310,114 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     }
 }
 
+/// Cross-line variant of the built-in walker. Every line touched by a match is
+/// emitted as a match line. POSIX grep uses this path too because its executable
+/// has no portable cross-record matching mode.
+fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    let re =
+        regex::Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
+    let root = a
+        .path
+        .as_ref()
+        .map(|p| ctx.resolve(p))
+        .unwrap_or_else(|| ctx.cwd.clone());
+    let glob_pat = a
+        .glob
+        .as_ref()
+        .map(|g| glob::Pattern::new(g))
+        .transpose()
+        .context("invalid glob")?;
+    let mut out = String::new();
+    let mut matches = 0usize;
+
+    'walk: for entry in ignore::WalkBuilder::new(&root)
+        .max_depth(Some(20))
+        .hidden(true)
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
+            continue;
+        }
+        if let Some(gp) = &glob_pat {
+            let name = path.file_name().map(|n| n.to_string_lossy());
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            if !name.as_deref().is_some_and(|n| gp.matches(n)) && !gp.matches_path(rel) {
+                continue;
+            }
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let mut matched_lines = HashSet::new();
+        let mut capped = false;
+        for hit in re.find_iter(&text) {
+            if matches >= a.max_matches() {
+                capped = true;
+                break;
+            }
+            matches += 1;
+            let start = text[..hit.start()].bytes().filter(|b| *b == b'\n').count();
+            let last_byte = hit.end().saturating_sub(1).max(hit.start());
+            let end = text[..last_byte].bytes().filter(|b| *b == b'\n').count();
+            for line in start..=end.min(lines.len().saturating_sub(1)) {
+                matched_lines.insert(line);
+                if matched_lines.len() >= ctx.max_output_lines {
+                    capped = true;
+                    break;
+                }
+            }
+            if capped {
+                break;
+            }
+        }
+        if !matched_lines.is_empty() {
+            let mut hits: Vec<usize> = matched_lines.into_iter().collect();
+            hits.sort_unstable();
+            let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
+            if a.context() == 0 {
+                for i in hits {
+                    out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, lines[i]));
+                }
+            } else {
+                emit_context_windows(
+                    &mut out,
+                    &disp.display().to_string(),
+                    &lines,
+                    &hits,
+                    a.context(),
+                );
+            }
+        }
+        if capped {
+            out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
+            break 'walk;
+        }
+        if out.len() > ctx.max_output {
+            break 'walk;
+        }
+    }
+    if out.is_empty() {
+        Ok("(no matches)".to_string())
+    } else {
+        Ok(truncate_saved(
+            out.trim_end(),
+            ctx.max_output,
+            ctx.max_output_lines,
+            TruncateSide::Head,
+            "grep",
+        ))
+    }
+}
+
 /// Append merged ±`n_ctx` windows around `hits` (0-based line indexes) in
 /// grep `-C` format: `path:NN:line` for matches, `path-NN-line` for context,
 /// `--` between disjoint groups (including the boundary to earlier output).
@@ -332,6 +456,112 @@ fn emit_context_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multiline_args(pattern: &str) -> GrepArgs {
+        GrepArgs {
+            pattern: pattern.to_string(),
+            path: Some("sample.txt".to_string()),
+            glob: None,
+            context: None,
+            multiline: true,
+        }
+    }
+
+    #[test]
+    fn multiline_defaults_to_false_and_is_in_schema() {
+        let args: GrepArgs = serde_json::from_value(json!({ "pattern": "x" })).unwrap();
+        assert!(!args.multiline);
+        let schema = GrepTool::detect().parameters();
+        assert_eq!(
+            schema["properties"]["multiline"]["type"],
+            serde_json::Value::String("boolean".into())
+        );
+    }
+
+    #[test]
+    fn builtin_multiline_matches_across_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = grep_builtin(&multiline_args("foo\\nbar"), &ctx).unwrap();
+        assert!(out.contains("sample.txt:2:foo"), "{out}");
+        assert!(out.contains("sample.txt:3:bar"), "{out}");
+    }
+
+    #[test]
+    fn builtin_without_multiline_does_not_cross_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "foo\nbar\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let mut args = multiline_args("foo\\nbar");
+        args.multiline = false;
+        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+    }
+
+    #[test]
+    fn builtin_multiline_zero_width_match_on_empty_file_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        assert_eq!(
+            grep_builtin(&multiline_args("^"), &ctx).unwrap(),
+            "(no matches)"
+        );
+    }
+
+    #[test]
+    fn builtin_multiline_spanning_match_respects_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = (0..100).map(|i| format!("line{i}\n")).collect::<String>();
+        std::fs::write(dir.path().join("sample.txt"), text).unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.max_output_lines = 5;
+        let out = grep_builtin(&multiline_args("(?s).*"), &ctx).unwrap();
+        assert!(out.lines().count() <= 7, "{out}");
+        assert!(out.contains("full output"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn ripgrep_multiline_matches_across_line_boundary() {
+        if which::which("rg").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = grep_ripgrep(&multiline_args("foo\\nbar"), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("sample.txt:2:foo"), "{out}");
+        assert!(out.contains("sample.txt:3:bar"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn posix_backend_multiline_matches_across_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = grep_posix(&multiline_args("foo\\nbar"), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("sample.txt:2:foo"), "{out}");
+        assert!(out.contains("sample.txt:3:bar"), "{out}");
+    }
+
+    #[test]
+    fn builtin_multiline_preserves_context_and_glob_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
+        std::fs::write(dir.path().join("sample.rs"), "foo\nbar\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let mut args = multiline_args("foo\\nbar");
+        args.glob = Some("*.txt".into());
+        args.context = Some(1);
+        let out = grep_builtin(&args, &ctx).unwrap();
+        assert!(out.contains("sample.txt-1-before"), "{out}");
+        assert!(out.contains("sample.txt-4-after"), "{out}");
+        assert!(!out.contains("sample.rs"), "{out}");
+    }
 
     /// A search scoped at an explicit path outside the project is refused
     /// before any backend runs — grep reads file contents, so an out-of-cwd
@@ -382,6 +612,7 @@ mod tests {
             path: None,
             glob: None,
             context: Some(2),
+            multiline: false,
         };
         let out = grep_posix(&a, &ctx).await.unwrap();
         assert!(!out.contains("supersecret"), "{out}");
@@ -405,6 +636,7 @@ mod tests {
             path: None,
             glob: None,
             context: Some(2),
+            multiline: false,
         };
         let out = grep_builtin(&a, &ctx).unwrap();
         assert!(!out.contains("supersecret"), "{out}");
