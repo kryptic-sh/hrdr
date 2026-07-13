@@ -187,6 +187,9 @@ mod tests {
         assert!(!p.contains("git add -A"), "{p}");
         assert!(!p.contains("force-push"), "{p}");
         assert!(!p.contains("Read a file before editing it"), "{p}");
+        // Nothing it can reach can destroy anything, so the deletion rules would
+        // be advice about tools it does not have.
+        assert!(!p.contains("Deleting:"), "{p}");
         // The read/search workflow and the confinement safety line remain.
         assert!(p.contains("grep/find/ls/tree/read"), "{p}");
         assert!(p.contains("confined to the working directory"), "{p}");
@@ -218,6 +221,54 @@ mod tests {
         assert!(
             p.contains("git status --short"),
             "and how to find the names when it doesn't know them"
+        );
+    }
+
+    /// Deletion is by explicit name, never by expansion — and the prompt says why.
+    ///
+    /// `rm -rf "$DIR"/*` with `DIR` unset is `rm -rf /*`. A glob deletes whatever
+    /// it matches *at the moment it runs*, which is not the list the model
+    /// reasoned about. Command substitution (`rm -rf $(find …)`) lets one command
+    /// both pick the victims and kill them, with nobody reading the list in
+    /// between. Each of those has eaten someone's home directory, so each is named
+    /// here rather than left to inference from a general principle.
+    #[test]
+    fn the_prompt_forbids_deleting_by_expansion_and_says_why() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+
+        for forbidden in [
+            r#"rm -rf "$DIR""#,
+            r#"rm -rf "$DIR"/*"#,
+            "rm -rf $(...)",
+            "find … -delete",
+            "| xargs rm",
+        ] {
+            assert!(
+                p.contains(forbidden),
+                "the prompt must name `{forbidden}` as forbidden, or the model \
+                 will reach for the spelling that was left out"
+            );
+        }
+        // The failure mode, stated — not just the ban.
+        assert!(
+            p.contains("becomes `rm -rf /*`"),
+            "it must say what an unset variable expands to"
+        );
+        // What to do instead.
+        assert!(p.contains("rm file-a.txt file-b.txt"), "name the files");
+        assert!(
+            p.contains("read the list, then delete the entries by name"),
+            "find out the names first, in a separate command"
+        );
+        // Irreversible actions in general, not just rm.
+        for risky in ["TRUNCATE", "terraform destroy", "kubectl delete", "sed -i"] {
+            assert!(p.contains(risky), "`{risky}` is irreversible too");
+        }
+        // And the reason models actually reach for `rm`: to make an error go away.
+        assert!(
+            p.contains("Deleting is not a way around a problem"),
+            "clearing state to silence a failure is the habit to break"
         );
     }
 
