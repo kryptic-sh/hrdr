@@ -180,9 +180,14 @@ impl ToolContext {
     /// Snapshot a file's current content into the checkpoint store (if any)
     /// before a tool modifies it, so the change can be reverted.
     pub fn checkpoint(&self, path: &std::path::Path) {
-        if let Some(cp) = &self.checkpoints
-            && let Ok(mut cp) = cp.lock()
-        {
+        if let Some(cp) = &self.checkpoints {
+            // Recover a poisoned lock rather than skip: a panic elsewhere doesn't
+            // logically corrupt the checkpoint store, and `.lock().ok()` here would
+            // silently disable checkpointing (no more `/undo`) for the rest of the
+            // session. This call is fire-and-forget, so recover-and-continue is the
+            // right move — unlike `checkpoint_tree`/`checkpoint_missing`, which must
+            // report failure to their caller.
+            let mut cp = cp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             cp.record_pre(path);
         }
     }
@@ -365,10 +370,14 @@ impl ToolContext {
     /// Whether the model has seen `path`'s current content this session.
     pub fn was_read(&self, path: &std::path::Path) -> bool {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Recover a poisoned lock and answer from the real set. Failing open
+        // (`unwrap_or(true)`) would report *every* file as read for the rest of
+        // the session, silently disabling the read-before-mutate guardrail; the
+        // set itself isn't corrupted by an unrelated panic, so honor it.
         self.read_files
             .lock()
             .map(|set| set.contains(&canon))
-            .unwrap_or(true) // poisoned lock: don't wedge edits
+            .unwrap_or_else(|e| e.into_inner().contains(&canon))
     }
 }
 
@@ -1312,6 +1321,72 @@ mod tests {
         let names: Vec<String> = r.defs().into_iter().map(|d| d.function.name).collect();
         assert_eq!(names, vec!["read".to_string(), "grep".to_string()]);
         assert!(!r.is_read_only("write")); // gone → unknown → not read-only
+    }
+
+    // ---- poisoned-lock recovery ----
+
+    #[test]
+    fn checkpoint_recovers_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let f = work.join("a.txt");
+        std::fs::write(&f, "orig").unwrap();
+
+        let cps = Arc::new(Mutex::new(
+            Checkpoints::open(dir.path().join("cp")).unwrap(),
+        ));
+        cps.lock().unwrap().begin_turn();
+
+        // Poison the mutex with a panic while it's held.
+        let poisoner = cps.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the checkpoint lock");
+        }));
+        assert!(cps.is_poisoned(), "precondition: lock is poisoned");
+
+        let mut ctx = ToolContext::new(&work);
+        ctx.checkpoints = Some(cps.clone());
+        ctx.checkpoint(&f); // must recover the guard and still record
+
+        let guard = cps.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !guard.list().is_empty(),
+            "checkpointing must survive a poisoned lock, not silently skip"
+        );
+    }
+
+    #[test]
+    fn was_read_recovers_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen.txt");
+        std::fs::write(&seen, "x").unwrap();
+        let unseen = dir.path().join("unseen.txt");
+        std::fs::write(&unseen, "y").unwrap();
+
+        let ctx = ToolContext::new(dir.path());
+        ctx.mark_read(&seen);
+
+        // Poison the read_files lock.
+        let rf = ctx.read_files.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = rf.lock().unwrap();
+            panic!("poison the read_files lock");
+        }));
+        assert!(
+            ctx.read_files.is_poisoned(),
+            "precondition: lock is poisoned"
+        );
+
+        // The recovered guard answers from the real set: the read file is still
+        // reported read, and — crucially, unlike the old fail-open — a file that
+        // was never read is still reported unread.
+        assert!(ctx.was_read(&seen), "a genuinely-read file stays read");
+        assert!(
+            !ctx.was_read(&unseen),
+            "poison must not make every file look read (that disables the guardrail)"
+        );
     }
 
     // ---- floor_char_boundary ----

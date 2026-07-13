@@ -37,6 +37,14 @@ struct ChangeRecord {
     /// means file, `pre: None` means the path did not exist.
     #[serde(default)]
     kind: Option<NodeKind>,
+    /// Unix permission bits captured at snapshot time (regular files only), so a
+    /// revert can restore an executable/script's mode instead of resurrecting it
+    /// at the default umask. `#[serde(default)]` (→ `None`) so journals written
+    /// before this field existed still deserialize; a `None` mode means "don't
+    /// touch permissions on revert" — today's behavior — and is what non-unix
+    /// records always carry.
+    #[serde(default)]
+    mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -54,6 +62,16 @@ pub struct CheckpointInfo {
     pub turn: u64,
     pub ts: u64,
     pub files: Vec<String>,
+}
+
+/// The pre-`turn` state of one path, reconstructed by [`Checkpoints::revert_to`]
+/// from the earliest record that touched it: the turn it was first touched, its
+/// pre-image blob hash, its node kind, and its permission mode.
+struct RestoreState {
+    turn: u64,
+    pre: Option<String>,
+    kind: Option<NodeKind>,
+    mode: Option<u32>,
 }
 
 /// A disk-backed store of per-turn file pre-images.
@@ -208,14 +226,29 @@ impl Checkpoints {
                 return;
             }
         };
-        let pre = match std::fs::read(path) {
+        let (pre, mode) = match std::fs::read(path) {
             Ok(bytes) => match self.store_blob(&bytes) {
-                Ok(hash) => Some(hash),
-                Err(_) => return, // couldn't store — don't record a bad checkpoint
+                // Capture the file's permission mode alongside its content so a
+                // revert restores it in place (see `revert_to`'s `File` arm)
+                // rather than recreating it at the default umask.
+                Ok(hash) => (Some(hash), file_mode(path)),
+                // Couldn't store the blob (e.g. disk full). Mirror the sibling
+                // read-failure arm below: drop the key from `touched` so a later
+                // write this turn can retry, and say why — don't silently return
+                // and leave the change looking checkpointed when it isn't.
+                Err(e) => {
+                    self.touched.remove(&key);
+                    eprintln!(
+                        "hrdr: checkpoint: couldn't store a pre-image blob for {} ({e}) — \
+                         this file won't be revertible for this turn",
+                        path.display()
+                    );
+                    return;
+                }
             },
             // The file genuinely didn't exist before this turn's write — a
             // revert should delete it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
             // Some other read failure (permissions, I/O error, …): the file
             // may well exist. Recording `pre = None` here would make a later
             // revert *delete* a file that was never actually new — worse than
@@ -238,6 +271,7 @@ impl Checkpoints {
             path: key,
             pre,
             kind: None,
+            mode,
         };
         if let Ok(line) = serde_json::to_string(&rec) {
             use std::io::Write;
@@ -267,6 +301,7 @@ impl Checkpoints {
             path: key,
             pre: None,
             kind: Some(NodeKind::Missing),
+            mode: None,
         })
     }
 
@@ -307,16 +342,16 @@ impl Checkpoints {
         }
         let metadata = std::fs::symlink_metadata(path)
             .with_context(|| format!("reading checkpoint metadata for {}", path.display()))?;
-        let (kind, pre) = if metadata.file_type().is_dir() {
-            (NodeKind::Directory, None)
+        let (kind, pre, mode) = if metadata.file_type().is_dir() {
+            (NodeKind::Directory, None, None)
         } else if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(path)
                 .with_context(|| format!("reading symlink {}", path.display()))?;
             let hash = self.store_blob(target.to_string_lossy().as_bytes())?;
-            (NodeKind::Symlink, Some(hash))
+            (NodeKind::Symlink, Some(hash), None)
         } else if metadata.file_type().is_file() {
             let hash = self.store_blob(&std::fs::read(path)?)?;
-            (NodeKind::File, Some(hash))
+            (NodeKind::File, Some(hash), file_mode(path))
         } else {
             self.touched.remove(&key);
             anyhow::bail!(
@@ -330,6 +365,7 @@ impl Checkpoints {
             path: key,
             pre,
             kind: Some(kind),
+            mode,
         })
     }
 
@@ -387,20 +423,33 @@ impl Checkpoints {
         self.reload_records();
         // For each file touched in turns >= `turn`, the pre-`turn` state is the
         // pre-image recorded at the SMALLEST such turn.
-        let mut earliest: BTreeMap<String, (u64, Option<String>, Option<NodeKind>)> =
-            BTreeMap::new();
+        let mut earliest: BTreeMap<String, RestoreState> = BTreeMap::new();
         for r in self.records.iter().filter(|r| r.turn >= turn) {
-            let e = earliest
-                .entry(r.path.clone())
-                .or_insert((r.turn, r.pre.clone(), r.kind));
-            if r.turn < e.0 {
-                *e = (r.turn, r.pre.clone(), r.kind);
+            let e = earliest.entry(r.path.clone()).or_insert(RestoreState {
+                turn: r.turn,
+                pre: r.pre.clone(),
+                kind: r.kind,
+                mode: r.mode,
+            });
+            if r.turn < e.turn {
+                *e = RestoreState {
+                    turn: r.turn,
+                    pre: r.pre.clone(),
+                    kind: r.kind,
+                    mode: r.mode,
+                };
             }
         }
         let mut restore_entries: Vec<_> = earliest.into_iter().collect();
         restore_entries.sort_by_key(|(path, _)| Path::new(path).components().count());
         let mut restored = Vec::new();
-        for (path, (_t, pre, kind)) in &restore_entries {
+        for (
+            path,
+            RestoreState {
+                pre, kind, mode, ..
+            },
+        ) in &restore_entries
+        {
             let p = PathBuf::from(path);
             let effective = kind.unwrap_or(if pre.is_some() {
                 NodeKind::File
@@ -416,9 +465,23 @@ impl Checkpoints {
                     if let Some(parent) = p.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    remove_existing_node(&p)?;
+                    // Write in place when the existing path is already a regular
+                    // file: truncate-and-write keeps the inode, so any hardlinks
+                    // survive and the file's own permission bits aren't reset by
+                    // an unlink+recreate at the default umask. Only when the node
+                    // type changed (was a dir/symlink) or it's gone do we
+                    // unlink+recreate.
+                    let existing_is_regular_file = std::fs::symlink_metadata(&p)
+                        .map(|m| m.file_type().is_file())
+                        .unwrap_or(false);
+                    if !existing_is_regular_file {
+                        remove_existing_node(&p)?;
+                    }
                     std::fs::write(&p, bytes)
                         .with_context(|| format!("restoring {}", p.display()))?;
+                    // Restore the recorded permission mode. Absent (legacy record,
+                    // or non-unix) → leave permissions as-is, today's behavior.
+                    restore_mode(&p, *mode)?;
                 }
                 NodeKind::Symlink => {
                     let bytes =
@@ -445,11 +508,23 @@ impl Checkpoints {
     }
 
     fn store_blob(&self, bytes: &[u8]) -> Result<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let hash = sha256_hex(bytes);
         let path = self.blobs_dir.join(&hash);
         if !path.exists() {
             let compressed = miniz_oxide::deflate::compress_to_vec(bytes, 6);
-            std::fs::write(&path, compressed).with_context(|| format!("writing blob {hash}"))?;
+            // Write to a temp sibling then rename into place: a crash mid-write
+            // leaves only the throwaway temp (GC'd as an orphan), never a
+            // truncated blob under its content hash that would silently decompress
+            // wrong on a later revert. Rename is atomic on the same filesystem.
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp = self
+                .blobs_dir
+                .join(format!(".tmp-{}-{seq}", std::process::id()));
+            std::fs::write(&tmp, compressed).with_context(|| format!("writing blob {hash}"))?;
+            std::fs::rename(&tmp, &path).with_context(|| format!("finalizing blob {hash}"))?;
         }
         Ok(hash)
     }
@@ -469,9 +544,48 @@ impl Checkpoints {
                 out.push('\n');
             }
         }
-        std::fs::write(&self.journal_path, out).context("rewriting checkpoint journal")?;
+        // Write to `<journal>.tmp` then rename over the target so a crash mid-write
+        // can't truncate the journal and lose every checkpoint — the rename either
+        // fully lands the new journal or leaves the old one intact.
+        let mut tmp = self.journal_path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, out).context("writing checkpoint journal")?;
+        std::fs::rename(&tmp, &self.journal_path).context("rewriting checkpoint journal")?;
         Ok(())
     }
+}
+
+/// The Unix permission mode of the regular file at `path` (`None` off unix, or
+/// if it can't be stat'd — a missing mode just means "don't touch permissions
+/// on revert"). Captured at snapshot time and replayed by [`restore_mode`].
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Reapply a recorded permission mode to a just-restored regular file. `None`
+/// (legacy record with no mode, or non-unix) is a no-op — preserving the prior
+/// behavior where revert never adjusted permissions.
+#[cfg(unix)]
+fn restore_mode(path: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("restoring permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
 }
 
 fn remove_existing_node(path: &Path) -> Result<()> {
@@ -900,5 +1014,122 @@ mod tests {
         let remaining = cp.list();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].turn, 1);
+    }
+
+    /// Revert restores the file's permission mode captured at snapshot time — an
+    /// 0755 script must not come back 0644 after `/undo`.
+    #[cfg(unix)]
+    #[test]
+    fn revert_restores_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("script.sh");
+        std::fs::write(&f, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        cp.begin_turn();
+        cp.record_pre(&f);
+        // The edit both rewrites content and (as an unlink+recreate would) drops
+        // the exec bit.
+        std::fs::write(&f, "changed").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        cp.revert_last().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "#!/bin/sh\necho hi\n");
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "revert must restore the recorded 0755 mode");
+    }
+
+    /// Reverting an existing regular file writes in place (no unlink), so a
+    /// hardlink to it survives the revert instead of being severed.
+    #[cfg(unix)]
+    #[test]
+    fn revert_preserves_hardlinks() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        let link = dir.path().join("b.txt");
+        std::fs::write(&f, "original").unwrap();
+        std::fs::hard_link(&f, &link).unwrap();
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().ino(),
+            std::fs::metadata(&link).unwrap().ino()
+        );
+
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        cp.begin_turn();
+        cp.record_pre(&f);
+        std::fs::write(&f, "changed").unwrap();
+
+        cp.revert_last().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        // Same inode → the hardlink was never broken, and the sibling name sees
+        // the reverted content too.
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().ino(),
+            std::fs::metadata(&link).unwrap().ino(),
+            "revert must not sever the hardlink"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "original");
+    }
+
+    /// A legacy journal record (no `mode`/`kind`/`ts` fields) still deserializes
+    /// via `#[serde(default)]` and reverts, falling back to today's behavior of
+    /// not adjusting permissions.
+    #[test]
+    fn legacy_record_without_mode_field_deserializes_and_reverts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpdir = dir.path().join("cp");
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "v0").unwrap();
+
+        // Snapshot once to produce a blob for "v0", then hand-rewrite the journal
+        // as a legacy line carrying only turn/path/pre (the pre-mode schema).
+        {
+            let mut cp = Checkpoints::open(cpdir.clone()).unwrap();
+            cp.begin_turn();
+            cp.record_pre(&f);
+            std::fs::write(&f, "v1").unwrap();
+        }
+        let journal = cpdir.join("journal.jsonl");
+        let text = std::fs::read_to_string(&journal).unwrap();
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let hash = first["pre"].as_str().unwrap().to_string();
+        let legacy = serde_json::json!({
+            "turn": 1,
+            "path": f.to_string_lossy(),
+            "pre": hash,
+        });
+        std::fs::write(&journal, serde_json::to_string(&legacy).unwrap() + "\n").unwrap();
+
+        // Reopen (must not drop the record) and revert (must restore v0 without
+        // touching permissions).
+        let mut cp = Checkpoints::open(cpdir.clone()).unwrap();
+        assert_eq!(cp.list().len(), 1, "legacy record must survive deserialize");
+        cp.revert_last().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v0");
+    }
+
+    /// The happy path leaves no partial/temp file behind: `store_blob` renames
+    /// its temp sibling into place, so only the final content-addressed blob
+    /// remains.
+    #[test]
+    fn store_blob_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        let hash = cp.store_blob(b"durable payload").unwrap();
+
+        let entries: Vec<String> = std::fs::read_dir(&cp.blobs_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![hash],
+            "only the finalized blob remains — no `.tmp-*` sibling"
+        );
     }
 }
