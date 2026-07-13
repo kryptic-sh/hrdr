@@ -117,6 +117,13 @@ jobs:
       - run: cargo build --locked -p hrdr
       - run: cargo run --locked -p hrdr -- --version
       - run: cargo run --locked -p hrdr -- --help
+      # `--version`/`--help` return before a terminal is ever constructed, so they
+      # prove the binary links — not that the *TUI* comes up. This starts it for
+      # real in a pty (a ConPTY on Windows), waits for a frame to reach the screen,
+      # and requires a clean exit. Run against the release profile: it is the build
+      # that ships, and the debug one is already covered by the `test` matrix.
+      - name: TUI starts in a real terminal
+        run: cargo test --locked --release -p hrdr --test tui_pty
       - name: Completions + man page generate cleanly
         shell: bash
         run: |

@@ -54,3 +54,12 @@ clap_complete = "4"
 clap_complete_nushell = "4"
 clap_mangen = "0.3"
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# A real terminal for the TUI to run in — a pty on Unix, a ConPTY on Windows.
+# Test-only: it never reaches the shipped binary. Without one, hrdr's own tests
+# can only ever drive the `App` behind a `TestBackend`, which proves the widgets
+# lay out but not that the *program* starts: raw mode, the alternate screen, the
+# panic hook, the terminal restore. Those are exactly the parts that break per-OS.
+portable-pty = "0.9"
+tempfile.workspace = true
