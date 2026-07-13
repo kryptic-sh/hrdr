@@ -166,20 +166,35 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         finish_reasoning(transcript);
     }
     match ev {
-        AgentEvent::Text(t) => match transcript.last_mut().map(|e| &mut e.kind) {
-            Some(EntryKind::Assistant(s)) => s.push_str(t),
-            // An empty delta must not open an entry: a turn that only calls tools
-            // would otherwise leave a blank assistant block behind.
-            _ if t.is_empty() => {}
-            _ => transcript.push(Entry::assistant(t.clone())),
-        },
-        AgentEvent::Reasoning(t) => match transcript.last_mut().map(|e| &mut e.kind) {
-            Some(EntryKind::Reasoning {
-                text,
-                took_ms: None,
-            }) => text.push_str(t),
-            _ => transcript.push(Entry::reasoning(t.clone())),
-        },
+        AgentEvent::Text(t) => {
+            let mut mutated = false;
+            if let Some(last) = transcript.last_mut()
+                && let EntryKind::Assistant(s) = &mut last.kind
+            {
+                s.push_str(t);
+                last.refresh_hash();
+                mutated = true;
+            }
+            if !mutated && !t.is_empty() {
+                transcript.push(Entry::assistant(t.clone()));
+            }
+        }
+        AgentEvent::Reasoning(t) => {
+            let mut mutated = false;
+            if let Some(last) = transcript.last_mut()
+                && let EntryKind::Reasoning {
+                    text,
+                    took_ms: None,
+                } = &mut last.kind
+            {
+                text.push_str(t);
+                last.refresh_hash();
+                mutated = true;
+            }
+            if !mutated {
+                transcript.push(Entry::reasoning(t.clone()));
+            }
+        }
         AgentEvent::ToolStart { id, name, args } => {
             transcript.push(Entry::at(
                 EntryKind::Tool {
@@ -195,8 +210,11 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
             ));
         }
         AgentEvent::ToolOutput { id, chunk } => {
-            if let Some(EntryKind::Tool { result, .. }) = open_tool(transcript, id) {
+            if let Some(entry) = open_tool(transcript, id)
+                && let EntryKind::Tool { result, .. } = &mut entry.kind
+            {
                 result.push_str(chunk);
+                entry.refresh_hash();
             }
         }
         AgentEvent::ToolEnd {
@@ -205,16 +223,18 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
             ok,
             name: _,
         } => {
-            if let Some(EntryKind::Tool {
-                result: r,
-                ok: o,
-                done,
-                ..
-            }) = open_tool(transcript, id)
+            if let Some(entry) = open_tool(transcript, id)
+                && let EntryKind::Tool {
+                    result: r,
+                    ok: o,
+                    done,
+                    ..
+                } = &mut entry.kind
             {
                 *r = result.clone();
                 *o = *ok;
                 *done = true;
+                entry.refresh_hash();
             }
         }
         // An agent's notice (an error, an MCP warning, an exhausted step budget) is
@@ -230,14 +250,13 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
 
 /// The still-open tool entry with `id`, searched from the end (a tool id is
 /// unique within a turn, and the newest match is the live one).
-fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut EntryKind> {
-    transcript.iter_mut().rev().find_map(|e| match &e.kind {
-        EntryKind::Tool {
-            id: tid,
-            done: false,
-            ..
-        } if tid == id => Some(&mut e.kind),
-        _ => None,
+fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
+    transcript.iter_mut().rev().find(|e| {
+        matches!(&e.kind, EntryKind::Tool {
+        id: tid,
+        done: false,
+        ..
+    } if tid == id)
     })
 }
 

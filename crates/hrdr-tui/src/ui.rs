@@ -1960,37 +1960,20 @@ fn pad_line(
 /// entry. Only the parts that affect the visual output are hashed; the
 /// timestamp meta line (which changes on /timestamps) is rendered separately and
 /// is intentionally excluded so timestamp-only frames still get cache hits.
+///
+/// Uses the precomputed [`Entry::content_hash`] for most entry types; only Tool
+/// entries need the per-frame `expanded` flag mixed in at lookup time.
 fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
-    let mut h = DefaultHasher::new();
     match &entry.kind {
         // The header animates and reads live session state; it is never cached.
-        EntryKind::Header => {}
-        // `took_ms` doesn't affect the rendered rows.
-        EntryKind::Reasoning { text, .. } => text.hash(&mut h),
-        EntryKind::User(t)
-        | EntryKind::Assistant(t)
-        | EntryKind::System(t)
-        | EntryKind::Notice(t)
-        | EntryKind::Stats(t)
-        | EntryKind::Diff(t) => t.hash(&mut h),
-        EntryKind::Tool {
-            name,
-            args,
-            result,
-            ok,
-            done,
-            expanded,
-            ..
-        } => {
-            name.hash(&mut h);
-            args.hash(&mut h);
-            result.hash(&mut h);
-            ok.hash(&mut h);
-            done.hash(&mut h);
-            (*expanded || expand_all).hash(&mut h);
+        EntryKind::Header => 0,
+        EntryKind::Tool { expanded, .. } => {
+            // Mix the effective expand state into the cached content hash.
+            let expand = *expanded || expand_all;
+            entry.content_hash ^ (expand as u64)
         }
+        _ => entry.content_hash,
     }
-    h.finish()
 }
 
 /// Clear the thread-local transcript render cache. Call after mutating the

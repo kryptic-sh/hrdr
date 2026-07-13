@@ -11,17 +11,29 @@
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 
 /// One rendered item in the transcript, stamped with the local time it was
 /// added. Serializes as a flat object: `{"kind": "user", "data": "hi",
 /// "time": 1700000000}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     #[serde(flatten)]
     pub kind: EntryKind,
     /// When this entry was added, stored as unix seconds.
     #[serde(with = "unix_time")]
     pub time: DateTime<Local>,
+    /// Precomputed hash of the content fields that affect rendering (excludes
+    /// timestamps, `took_ms`, and the Tool `expanded` flag / `expand_all`).
+    /// Computed on construction and refreshed on mutation. Never serialized.
+    #[serde(skip, default)]
+    pub content_hash: u64,
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.time == other.time
+    }
 }
 
 /// What an [`Entry`] holds. Everything here round-trips through the session
@@ -72,20 +84,66 @@ pub enum EntryKind {
 impl Entry {
     /// An entry stamped with the current local time.
     pub fn now(kind: EntryKind) -> Self {
+        let content_hash = Self::kind_hash(&kind);
         Self {
             kind,
             time: Local::now(),
+            content_hash,
         }
     }
 
     /// An entry stamped with an explicit time (restoring, or in tests).
     pub fn at(kind: EntryKind, time: DateTime<Local>) -> Self {
-        Self { kind, time }
+        let content_hash = Self::kind_hash(&kind);
+        Self {
+            kind,
+            time,
+            content_hash,
+        }
     }
 
     /// The banner that opens a new session.
     pub fn header() -> Self {
         Self::now(EntryKind::Header)
+    }
+
+    /// Hash of the content fields that affect rendering. Excludes timestamps,
+    /// `took_ms`, and the Tool `expanded` flag / `expand_all` — the latter two
+    /// are combined at lookup time in the frontend.
+    fn kind_hash(kind: &EntryKind) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match kind {
+            EntryKind::Header => {}
+            EntryKind::Reasoning { text, .. } => text.hash(&mut h),
+            EntryKind::User(t)
+            | EntryKind::Assistant(t)
+            | EntryKind::System(t)
+            | EntryKind::Notice(t)
+            | EntryKind::Stats(t)
+            | EntryKind::Diff(t) => t.hash(&mut h),
+            EntryKind::Tool {
+                name,
+                args,
+                result,
+                ok,
+                done,
+                ..
+            } => {
+                name.hash(&mut h);
+                args.hash(&mut h);
+                result.hash(&mut h);
+                ok.hash(&mut h);
+                done.hash(&mut h);
+                // expanded and expand_all are handled at cache-key lookup time
+            }
+        }
+        h.finish()
+    }
+
+    /// Recompute `content_hash` after an in-place mutation (text push, tool
+    /// result/ok/done change). Called by the event-applier in `pane.rs`.
+    pub fn refresh_hash(&mut self) {
+        self.content_hash = Self::kind_hash(&self.kind);
     }
 
     pub fn user(text: impl Into<String>) -> Self {
