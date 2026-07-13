@@ -3480,6 +3480,9 @@ pub struct Agent {
     preserve_recent_tokens: u32,
     /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
     project_docs: Option<String>,
+    /// The last `refresh_system` found different project docs on disk than were in
+    /// the prompt. Read by a frontend after `/new` to say so.
+    project_docs_changed: bool,
     /// File checkpoint store (per-turn pre-images), if a store dir is available.
     checkpoints: Option<Arc<Mutex<Checkpoints>>>,
     /// MCP servers to connect (consumed by [`Self::connect_mcp`]).
@@ -3855,6 +3858,7 @@ impl Agent {
             ctx.guardrails = Arc::new(rails);
         }
         let project_docs = gather_agent_docs(&config.cwd);
+        let project_docs_changed = false;
         let memory = mem_dirs.as_ref().and_then(|(p, g)| gather_memory(p, g));
         let system = build_system_prompt(
             &tools,
@@ -3935,6 +3939,7 @@ impl Agent {
             compaction_tail_turns: config.compaction_tail_turns,
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
+            project_docs_changed,
             checkpoints,
             mcp_configs: config.mcp,
             mcp_clients: Vec::new(),
@@ -4024,6 +4029,18 @@ impl Agent {
     }
 
     /// The gathered `AGENTS.md` project instructions for the current cwd, if any.
+    /// Whether the project docs re-read by the last [`Self::clear`] / [`Self::set_cwd`]
+    /// differ from the ones that were in the prompt.
+    ///
+    /// A *running* conversation is never re-seeded with a changed `AGENTS.md`: the
+    /// agent that edited the file already has the change in its context, and
+    /// re-injecting it would say the same thing twice. A new conversation
+    /// (`/new`) starts from whatever is on disk now, and this is how a frontend
+    /// knows to mention it.
+    pub fn project_docs_changed(&self) -> bool {
+        self.project_docs_changed
+    }
+
     pub fn project_docs(&self) -> Option<&str> {
         self.project_docs.as_deref()
     }
@@ -4084,7 +4101,12 @@ impl Agent {
     /// in `messages[0]` (seeding it if the history is empty). Shared by
     /// [`Self::clear`] and [`Self::set_cwd`].
     fn refresh_system(&mut self) {
-        self.project_docs = gather_agent_docs(&self.ctx.cwd);
+        // Whether the project docs on disk differ from the ones already in the
+        // prompt. Content, not just mtime: a `touch` moves the timestamp without
+        // changing a word, and re-announcing a reload that changed nothing is a lie.
+        let docs = gather_agent_docs(&self.ctx.cwd);
+        self.project_docs_changed = docs != self.project_docs;
+        self.project_docs = docs;
         // Re-resolve memory roots for the (possibly changed) cwd and reload the
         // index, so `/clear` and `set_cwd` reflect saved notes for this project.
         let memory = if self.memory_enabled {
@@ -5822,6 +5844,58 @@ mod tests {
     use std::collections::HashMap;
 
     use std::sync::Arc;
+
+    /// A new conversation starts from the `AGENTS.md` that is on disk *now*, and
+    /// says so when that differs from what was in the prompt.
+    ///
+    /// A running conversation is never re-seeded with it. The agent that edited the
+    /// file has the change in its context already — telling it again would state the
+    /// project's rules twice in one context, from two different versions of the file.
+    /// Another session that wants the change starts a new conversation.
+    #[test]
+    fn a_new_conversation_picks_up_a_changed_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("AGENTS.md");
+        std::fs::write(&docs, "always use ripgrep").unwrap();
+
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            agent.project_docs().unwrap().contains("ripgrep"),
+            "the launch prompt carries the file as it was"
+        );
+        assert!(
+            !agent.project_docs_changed(),
+            "nothing has changed at launch"
+        );
+
+        // The file changes on disk (an /init turn wrote it, or another process did).
+        // The *running* conversation is untouched — nothing re-reads it.
+        std::fs::write(&docs, "always use ripgrep\nand never touch vendor/").unwrap();
+        assert!(
+            !agent.project_docs().unwrap().contains("vendor"),
+            "a running conversation is not re-seeded underneath itself"
+        );
+
+        // A new conversation reads what the project says now, and reports it.
+        agent.clear();
+        assert!(agent.project_docs().unwrap().contains("vendor"));
+        assert!(
+            agent.project_docs_changed(),
+            "and the change is worth telling the user about"
+        );
+
+        // Clearing again with nothing changed says nothing.
+        agent.clear();
+        assert!(
+            !agent.project_docs_changed(),
+            "an unchanged file is not announced as reloaded"
+        );
+    }
 
     use super::SubagentDirCell;
     use super::{

@@ -47,19 +47,35 @@ impl super::App {
         if self.running() {
             self.cancel_turn();
         }
-        if let Ok(mut a) = self.agent.try_lock() {
+        // `Agent::clear` re-reads `AGENTS.md` from disk: a *new* conversation starts
+        // from what the project says now. (A *running* one is never re-seeded — the
+        // agent that edited the file already has the change in its context.) Say so
+        // when it actually changed.
+        let reloaded = if let Ok(mut a) = self.agent.try_lock() {
             a.clear();
+            a.project_docs_changed()
         } else {
             // The just-aborted turn still holds the lock until its task drops;
             // clear through an awaited lock.
             let agent = self.agent.clone();
+            let tx = self.tx.clone();
             tokio::spawn(async move {
-                agent.lock().await.clear();
+                let mut a = agent.lock().await;
+                a.clear();
+                if a.project_docs_changed() {
+                    let _ = tx.send(TurnMsg::System(
+                        hrdr_app::PROJECT_DOCS_RELOADED_MSG.to_string(),
+                    ));
+                }
             });
-        }
+            false
+        };
         self.clear_transcript();
         // `/clear` starts a new session, so it opens with the banner again.
         self.push_entry(Entry::header());
+        if reloaded {
+            self.push_entry(Entry::notice(hrdr_app::PROJECT_DOCS_RELOADED_MSG));
+        }
         self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
         if let Ok(mut q) = self.steering.lock() {
             q.clear();
@@ -148,11 +164,16 @@ impl super::App {
             }
         }
     }
-    /// `/reload` — re-read config + `AGENTS.md`, applying the runtime bits that
-    /// can change live; keeps the current settings if the config is invalid.
+    /// `/reload` — re-read config (and rediscover skills), applying the runtime bits
+    /// that can change live; keeps the current settings if the config is invalid.
+    ///
+    /// It does **not** re-seed `AGENTS.md` into a running conversation. Project docs
+    /// are part of the system prompt this conversation was started with; replacing
+    /// them underneath it means the model has been told two different things about
+    /// the project in one context. A changed `AGENTS.md` is picked up by the next
+    /// conversation (`/new`).
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
-        self.reload_project_docs();
         self.skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.current_cwd()));
     }
     /// Rewind the last user turn out of the agent history + transcript,
@@ -424,9 +445,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn start_compaction(&mut self, instructions: Option<String>) {
         self.app.spawn_compaction(instructions);
-    }
-    fn mark_init_turn(&mut self) {
-        self.app.pending_init = true;
     }
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
         // The TUI version also suppresses the config hot-reload it would cause.

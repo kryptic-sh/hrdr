@@ -222,8 +222,6 @@ pub(crate) struct App {
     /// Show every tool result in full (`/expand all`); per-entry `expanded`
     /// overrides this for individual results.
     pub(crate) expand_tools: bool,
-    /// True while an `/init` turn runs, so its result reloads `AGENTS.md`.
-    pending_init: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
@@ -458,7 +456,6 @@ impl App {
             file_index_building: false,
             show_reasoning: show_thinking,
             expand_tools: false,
-            pending_init: false,
             pending_edit: None,
             model_selector: None,
             model_gen: 0,
@@ -1648,18 +1645,6 @@ impl App {
         }
     }
 
-    /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
-    /// in place (e.g. after `/init` writes one).
-    fn reload_project_docs(&mut self) {
-        let agent = self.agent.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            if let Some(line) = hrdr_app::reload_project_docs(agent).await {
-                let _ = tx.send(TurnMsg::System(line));
-            }
-        });
-    }
-
     /// Abort the in-flight agent task and discard any queued messages.
     fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn_handle.take() {
@@ -1670,7 +1655,6 @@ impl App {
             // next turn — harmless either way.
             self.quit_reap = Some(handle);
         }
-        self.pending_init = false;
         self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
         // Undelivered messages would otherwise leak into the next turn.
         let dropped = self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
@@ -1870,11 +1854,11 @@ impl App {
                 self.maybe_bell();
                 // Persist the completed turn into the active session, if any.
                 self.autosave();
-                // If this was an /init turn, reload AGENTS.md into the prompt.
-                if self.pending_init {
-                    self.pending_init = false;
-                    self.reload_project_docs();
-                }
+                // NOTE: an `/init` turn does NOT re-seed the system prompt with the
+                // `AGENTS.md` it just wrote. The agent wrote it — it has the content
+                // in its context already, and injecting it again would say the same
+                // thing twice. The next conversation (`/new`) starts from the file on
+                // disk, which is where a change belongs.
                 // NOTE: no auto-compaction here any more. The agent compacts itself
                 // when its context fills (`Agent::maybe_self_compact`), before each
                 // request rather than only between turns — so it also protects a

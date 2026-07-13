@@ -42,6 +42,15 @@ pub fn reload_invalid_message(e: &dyn std::fmt::Display) -> String {
 /// Startup notice when `AGENTS.md` was gathered into the system prompt.
 pub const PROJECT_DOCS_LOADED_MSG: &str = "loaded project instructions from AGENTS.md";
 
+/// Shown by `/new` when the `AGENTS.md` it just re-read differs from the one that
+/// was in the prompt — the only point at which project docs are re-seeded.
+///
+/// A running conversation is never re-seeded: the agent that edited the file has
+/// the change in its context already, and another session that wants it starts a
+/// new conversation.
+pub const PROJECT_DOCS_RELOADED_MSG: &str =
+    "AGENTS.md changed on disk — reloaded into the system prompt";
+
 /// Startup warning when the config file exists but is invalid (the running
 /// config already fell back to defaults + env).
 pub fn startup_config_warning() -> Option<String> {
@@ -172,18 +181,6 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
 /// fetches the sub-agent names ([`agent_names`]) and cwd ([`agent_cwd`]) itself.
 pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
     crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent))
-}
-
-/// Re-read `AGENTS.md` into the system prompt (used by `/reload` and after an
-/// `/init` turn writes the file). Returns the standard system line when
-/// project docs were loaded, `None` when there are none.
-pub async fn reload_project_docs(agent: Arc<Mutex<Agent>>) -> Option<String> {
-    let mut a = agent.lock().await;
-    let cwd = a.cwd();
-    a.set_cwd(cwd); // re-runs the AGENTS.md gather for the (unchanged) cwd
-    a.project_docs()
-        .is_some()
-        .then(|| "loaded AGENTS.md into the system prompt".to_string())
 }
 
 /// The working-tree `git diff` for `cwd` (stdout on success, stderr message on

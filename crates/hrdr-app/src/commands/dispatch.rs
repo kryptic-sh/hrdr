@@ -440,7 +440,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 return true;
             }
             host.info("/init — exploring the project to write AGENTS.md…".to_string());
-            host.mark_init_turn();
             host.send_prompt(INIT_PROMPT.to_string(), false);
         }
         "timestamps" | "ts" => {

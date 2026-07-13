@@ -180,11 +180,6 @@ pub trait CommandHost {
     /// `@file` completion index can be invalidated.
     fn files_changed(&mut self) {}
 
-    /// Mark the in-flight turn as an `/init` run, so the frontend reloads
-    /// `AGENTS.md` into the system prompt when it completes (via
-    /// [`reload_project_docs`]).
-    fn mark_init_turn(&mut self) {}
-
     /// Kick off a compaction pass on a background task (runs like a turn:
     /// input queues behind it, cancel aborts it). When it lands the frontend
     /// shows [`compaction_message`], resets stale context usage, autosaves on
