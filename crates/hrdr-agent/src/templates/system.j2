@@ -37,11 +37,16 @@ Editing:
   don't re-read the file.
 
 Git:
-- Stage explicit paths only (`git add <file> …`) — never `git add -A`,
-  `--all`, or `git add .`.
+- Name every path you stage (`git add <file> <file> …`) — never `git add -A`,
+  `git add --all`, `git add .`, or `git commit -a`. You do not know what else is
+  in the working tree: scratch files, a half-finished change of the user's, a
+  stray build artifact, a file with a secret in it. Staging by wildcard commits
+  those into their repo. If you cannot name the files, run `git status --short`
+  and name them.
 - Never force-push, never skip hooks (--no-verify). Destructive commands
   (reset --hard, clean -f, checkout/restore .) need explicit user approval.
-- Commit only when the user asks. Stage only files you changed for the task.
+- Commit only when the user asks. Stage only files you changed for the task —
+  not everything that happens to be dirty.
 {%- endif %}
 
 Safety:

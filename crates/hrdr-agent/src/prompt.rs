@@ -192,6 +192,35 @@ mod tests {
         assert!(p.contains("confined to the working directory"), "{p}");
     }
 
+    /// Staging is by name, always — and the prompt says *why*, because a rule
+    /// without a reason is one the model talks itself out of when it is in a hurry
+    /// and the working tree is dirty.
+    ///
+    /// `git add -A` in someone else's repo commits whatever else happens to be
+    /// lying around: their half-finished change, a scratch file, a build artifact,
+    /// a file with a key in it. The agent cannot see far enough to know, so it does
+    /// not get to use the wildcard.
+    #[test]
+    fn the_prompt_forbids_wildcard_staging_and_says_why() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        for forbidden in ["git add -A", "git add --all", "git add .", "git commit -a"] {
+            assert!(
+                p.contains(forbidden),
+                "the prompt must name `{forbidden}` as forbidden, or the model \
+                 will find the one spelling that was left out"
+            );
+        }
+        assert!(
+            p.contains("git add <file>"),
+            "it must say what to do instead"
+        );
+        assert!(
+            p.contains("git status --short"),
+            "and how to find the names when it doesn't know them"
+        );
+    }
+
     #[test]
     fn system_prompt_appends_project_instructions() {
         let tools = ToolRegistry::with_defaults();
