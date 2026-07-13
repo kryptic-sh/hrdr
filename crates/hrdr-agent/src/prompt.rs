@@ -50,6 +50,14 @@ pub fn render_system(
             // sub-agent has no `task` tool, and telling it how to pick a model for one
             // would be instructions for a tool it cannot call.
             can_delegate => has("task") && has("models"),
+            // The shell rules are written in a shell. `bash` and `powershell` are
+            // registered only when their interpreter is actually on PATH, so this
+            // asks the same question the tool set already answered: telling an
+            // agent to redirect with `2>&1` when its only shell is PowerShell (where
+            // the idiom is `*>`) is advice that silently drops the errors it was
+            // meant to capture. A machine with both gets both.
+            has_bash => has("bash"),
+            has_powershell => has("powershell"),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -316,13 +324,16 @@ mod tests {
         assert!(p.contains("**by name**"));
     }
 
-    /// A slow command's output is captured to a file, not piped into `grep`.
+    /// A slow command's output is captured to a file, not piped into a filter.
     ///
     /// `cargo test 2>&1 | grep FAILED` answers exactly one question and destroys
     /// the evidence for every other one. The next question — what preceded the
     /// failure, what else broke, what did the warning say — costs another full
-    /// build. Redirect once, then grep the file as many times as you like: three
+    /// build. Redirect once, then search the file as many times as you like: three
     /// questions become one build instead of three.
+    ///
+    /// The *rule* is shell-agnostic; the syntax is not, so the syntax is gated on
+    /// which shell this machine actually has (below).
     #[test]
     fn the_prompt_captures_slow_output_to_a_file() {
         let tools = ToolRegistry::with_defaults();
@@ -331,19 +342,108 @@ mod tests {
             p.contains("writes its\n  output to a file, and you read the file"),
             "slow/noisy commands are captured, not piped away"
         );
-        assert!(
-            p.contains("> /tmp/<name>.log 2>&1"),
-            "the prompt shows the redirect, stderr included — the error is usually there"
-        );
         // The reason, not just the rule: re-running a build to ask a second
         // question is the cost being avoided.
-        assert!(p.contains("Piping straight into `| grep` or `| tail` throws the rest away"));
-        assert!(p.contains("is three builds; a build you run once and grep three times is\n  one"));
-        // And it must not read as licence to clobber an existing file — `>` was
+        assert!(p.contains("Piping straight into a filter throws the rest away"));
+        assert!(p.contains("is three builds; a build you run once and search three times is one"),);
+        // And it must not read as licence to clobber an existing file — `>` is
         // called out elsewhere as truncating on open.
         assert!(
-            p.contains("a fresh name you choose, so nothing is\n  overwritten"),
+            p.contains("a fresh file you name"),
             "the redirect target is a new file, not an existing one"
+        );
+    }
+
+    /// The shell rules are written in the shell the machine actually has.
+    ///
+    /// `bash` and `powershell` are registered only when their interpreter is on
+    /// PATH, so the prompt keys off the tool set. This matters more than a style
+    /// nit: `2>&1` is the bash idiom for "capture stderr too", and in PowerShell
+    /// the equivalent is `*>` — a plain `>` there redirects the success stream
+    /// alone, so an agent told the bash idiom would write a log with the errors
+    /// *missing*, which is precisely what it was trying to capture. Advice for a
+    /// shell you do not have is worse than no advice.
+    #[test]
+    fn the_shell_rules_match_the_shell_the_machine_has() {
+        // Drive the template's gates directly: which shell tools exist depends on
+        // the machine running the test (there is no PowerShell on a stock Linux CI
+        // box, and no way to register a tool whose interpreter isn't on PATH), and
+        // the point of the gates is exactly that they are *not* the same everywhere.
+        let render = |has_bash: bool, has_powershell: bool| -> String {
+            let mut env = Environment::new();
+            env.add_template("system", SYSTEM_TEMPLATE).unwrap();
+            env.get_template("system")
+                .unwrap()
+                .render(context! {
+                    cwd => "/tmp/x",
+                    os => "test",
+                    tool_names => "read, write",
+                    can_write => true,
+                    can_delegate => false,
+                    has_bash => has_bash,
+                    has_powershell => has_powershell,
+                    instructions => None::<&str>,
+                })
+                .unwrap()
+        };
+
+        // bash only: the bash idiom, and not a word about PowerShell.
+        let p = render(true, false);
+        assert!(p.contains("`bash` — `<cmd> > /tmp/<name>.log 2>&1`"));
+        assert!(
+            p.contains("Keep the `2>&1`"),
+            "the bash idiom, with the reason stderr matters"
+        );
+        assert!(!p.contains("PowerShell is not bash"), "{p}");
+        assert!(!p.contains("`*>`"), "{p}");
+
+        // PowerShell only: `*>`, and not a word of bash.
+        let p = render(false, true);
+        assert!(p.contains(r#"`powershell` — `<cmd> *> "$env:TEMP\<name>.log"`"#));
+        assert!(
+            p.contains("Use `*>`, not\n    `>`"),
+            "`>` in PowerShell drops the errors — the whole point of capturing"
+        );
+        assert!(p.contains("PowerShell is not bash"));
+        assert!(!p.contains("/tmp/<name>.log"), "no bash syntax: {p}");
+        assert!(!p.contains("2>&1"), "no bash syntax: {p}");
+
+        // Both (a machine with `pwsh` on PATH beside bash): both idioms, and the
+        // shared rule stated once.
+        let p = render(true, true);
+        assert!(p.contains("`bash` — "));
+        assert!(p.contains("`powershell` — "));
+        assert_eq!(
+            p.matches("writes its\n  output to a file").count(),
+            1,
+            "the rule is stated once; only its syntax is per-shell"
+        );
+
+        // Neither: no shell, no shell rules.
+        let p = render(false, false);
+        assert!(!p.contains("Shell:"), "{p}");
+    }
+
+    /// The gates are wired to the tool set, not to a guess about the platform.
+    ///
+    /// `bash` and `powershell` are registered only when their interpreter is on
+    /// PATH, so "does this agent have a shell" is a question the registry has
+    /// already answered. Whatever this machine has, the prompt must agree with it.
+    #[test]
+    fn the_shell_gates_follow_the_registered_tools() {
+        let tools = ToolRegistry::with_defaults();
+        let names: Vec<String> = tools.defs().into_iter().map(|d| d.function.name).collect();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+
+        assert_eq!(
+            names.iter().any(|n| n == "bash"),
+            p.contains("`bash` — "),
+            "bash advice appears exactly when the bash tool does"
+        );
+        assert_eq!(
+            names.iter().any(|n| n == "powershell"),
+            p.contains("`powershell` — "),
+            "PowerShell advice appears exactly when the powershell tool does"
         );
     }
 

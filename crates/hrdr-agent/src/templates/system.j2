@@ -76,24 +76,44 @@ Tests:
   written. A test that passes whatever the code does is worse than no test: it
   reports safety that isn't there.
 
+{%- if has_bash or has_powershell %}
+
 Shell:
-- Every command must finish on its own. Nothing interactive (`vim`, `git rebase
-  -i`, `git add -p`, a REPL), nothing that waits (`watch`, `tail -f`), nothing
+- Every command must finish on its own. Nothing interactive (an editor, a REPL,
+  `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`), nothing
   that opens a pager — pass `--no-pager`, `-y`, `--yes`, `--non-interactive`,
   `CI=1` as the tool wants. A command that blocks for input nobody can give takes
   the whole turn down with it.
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
-- **Anything slow or noisy — a build, a test suite, a long search — writes its
-  output to a file, and you read the file.** Run it once as
-  `<cmd> > /tmp/<name>.log 2>&1` (a fresh name you choose, so nothing is
-  overwritten), then `grep`/`tail`/`read` that file as many times as you like.
-  Piping straight into `| grep` or `| tail` throws the rest away, so the next
-  question — what came *before* the error, what else failed, what did the warning
-  say — means running the whole thing again. A build you re-run three times to ask
-  three questions is three builds; a build you run once and grep three times is
-  one. Keep `2>&1`: the error you want is usually on stderr.
 - Quote every path you interpolate; assume names contain spaces.
+- **Anything slow or noisy — a build, a test suite, a long search — writes its
+  output to a file, and you read the file.** Run it once, redirecting *every*
+  stream to a fresh file you name; then search that file as many times as you like.
+  Piping straight into a filter throws the rest away, so the next question — what
+  came *before* the error, what else failed, what did the warning say — means
+  running the whole thing again. A build you re-run three times to ask three
+  questions is three builds; a build you run once and search three times is one.
+{%- if has_bash %}
+  - `bash` — `<cmd> > /tmp/<name>.log 2>&1`, then `grep`/`tail`/`read` the file.
+    Keep the `2>&1`: a bare `>` captures stdout only, and the compiler error or
+    panic you are looking for is on stderr.
+{%- endif %}
+{%- if has_powershell %}
+  - `powershell` — `<cmd> *> "$env:TEMP\<name>.log"`, then `Select-String`,
+    `Get-Content -Tail`, or hrdr's own `grep`/`read` on the file. Use `*>`, not
+    `>`: PowerShell's `>` redirects the success stream alone, so errors, warnings
+    and verbose output vanish — exactly what you were trying to capture.
+{%- endif %}
+{%- if has_powershell %}
+- PowerShell is not bash. Its pipeline carries objects, not lines: filter with
+  `Select-String` / `Where-Object`, not `grep`; `Get-Content -Tail n`, not `tail
+  -n`. Native-command stderr becomes error records, so check `$LASTEXITCODE` for a
+  native tool's success rather than trusting a quiet pipeline. Set
+  `$ProgressPreference = 'SilentlyContinue'` when a command draws a progress bar —
+  it lands in the captured output otherwise.
+{%- endif %}
+{%- endif %}
 
 Git:
 - Name every path you stage (`git add <file> <file> …`) — never `git add -A`,
