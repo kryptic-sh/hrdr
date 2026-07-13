@@ -198,6 +198,9 @@ mod tests {
         assert!(!p.contains("Deleting:"), "{p}");
         assert!(!p.contains("Tests:"), "{p}");
         assert!(!p.contains("Shell:"), "{p}");
+        // It cannot edit a manifest, commit, or tag — a release workflow is a
+        // workflow it has no way to carry out.
+        assert!(!p.contains("Releasing"), "{p}");
         // The read/search workflow and the confinement safety line remain.
         assert!(p.contains("grep/find/ls/tree/read"), "{p}");
         assert!(p.contains("confined to the working directory"), "{p}");
@@ -206,6 +209,69 @@ mod tests {
         // them), and still reads web pages and files that may try to instruct it.
         assert!(p.contains("Reporting:"), "{p}");
         assert!(p.contains("Untrusted content:"), "{p}");
+    }
+
+    /// "cut a release" is a whole workflow, and the prompt spells it out.
+    ///
+    /// Left to itself a model does part of it — bumps the manifest and stops, or
+    /// tags without touching the changelog, or invents a version out of the air.
+    /// The steps are ordered (version → changelog → manifest → commit → tag → push),
+    /// the version comes from semver applied to what actually changed, and the
+    /// manifest is wherever *this* ecosystem keeps it — a Rust project and a PHP one
+    /// do not agree on what "bump the version" means.
+    ///
+    /// The tag is the part that cannot be taken back: pushing it is usually what
+    /// makes CI publish. So the prompt says to be green first, and never to move a
+    /// tag that already exists.
+    #[test]
+    fn the_prompt_spells_out_how_to_cut_a_release() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        assert!(p.contains(r#"Releasing — "cut a release""#));
+        assert!(
+            p.contains(
+                "pick the version, update the changelog, bump the\n  manifest, commit, tag, push"
+            ),
+            "the steps, in order — a half-cut release is a broken one"
+        );
+
+        // Semver, including the 0.x rule that a released-software habit gets wrong.
+        assert!(p.contains("a breaking change\n  is MAJOR"));
+        assert!(
+            p.contains("Below 1.0 (`0.y.z`), a breaking change bumps the MINOR"),
+            "pre-1.0 has its own rule and this project is 0.2.x"
+        );
+
+        // Each ecosystem keeps the version somewhere different — and the lockfile
+        // that records it has to move with it.
+        for manifest in [
+            "`Cargo.toml`",
+            "`package.json`",
+            "`pyproject.toml`",
+            "`composer.json`",
+            "`mix.exs`",
+            "`pubspec.yaml`",
+        ] {
+            assert!(
+                p.contains(manifest),
+                "the prompt must know about {manifest}"
+            );
+        }
+        assert!(p.contains("cargo generate-lockfile"), "lockfiles follow");
+        assert!(
+            p.contains("the tag *is* the version"),
+            "Go has no manifest to bump"
+        );
+
+        // The changelog is updated, not invented; and it says something.
+        assert!(p.contains("**only if one already exists**"));
+        assert!(p.contains("Name the APIs, files and\n  behaviours that changed"));
+
+        // The irreversible step, guarded.
+        assert!(p.contains("Make sure the tree is green"));
+        assert!(p.contains("Never move or reuse a tag"));
+        // Staging stays explicit here too — a release commit is still a commit.
+        assert!(p.contains("**by name**"));
     }
 
     /// The prompt forbids the cheapest way to make a red test green: changing the
