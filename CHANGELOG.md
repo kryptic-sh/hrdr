@@ -22,6 +22,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evicted exactly what the next frame needed and a long session re-rendered
   itself from scratch several times a second. The cache now holds one slot per
   entry — bounded by the transcript, and unable to thrash.
+- **The session header is built only when it is on screen.** Its logo animates,
+  so it can never be cached, and it paints a span per glyph — the single most
+  expensive block in the transcript, and in any session long enough to scroll it
+  off the top, one nobody is looking at. Its height is remembered so the
+  viewport can still be placed without it. Worth ~130µs of every frame.
+- **Message timestamps are no longer formatted every frame.** Each
+  `#N you · 2m ago` label was a clock read and an allocation, per message, per
+  frame — for a label that changes at most once a minute. The renderer now keys
+  its cache on a time _bucket_ (`relative_time_bucket`) and builds the string
+  only when the block is laid out again.
+
+Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
+(from 120ms), and one that is streaming a reply costs **0.39ms per token** (from
+~120ms).
 
 ## [0.2.12] - 2026-07-13
 

@@ -175,7 +175,7 @@ const UI_ENV_SETTERS: &[(&str, UiEnvSetter)] = &[
 ];
 
 /// Per-message timestamp display style.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TimestampStyle {
     /// No timestamps/numbers.
     None,

@@ -26,7 +26,18 @@ pub fn fmt_cost(usd: f64) -> String {
 /// Human-friendly elapsed time since `then`, with compound units for the larger
 /// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 pub fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
-    let secs = (chrono::Local::now() - then).num_seconds().max(0);
+    relative_time_since(then, chrono::Local::now())
+}
+
+/// [`relative_time`] against a caller-supplied `now`.
+///
+/// A frame renders many of these, and reading the clock (with its timezone
+/// lookup) per entry is pure waste: take the reading once and pass it in.
+pub fn relative_time_since(
+    then: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    let secs = (now - then).num_seconds().max(0);
     if secs < 5 {
         "now".to_string()
     } else if secs < 60 {
@@ -47,6 +58,30 @@ pub fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
         } else {
             format!("{d}d ago")
         }
+    }
+}
+
+/// The value [`relative_time_since`]'s output is a function of: two instants that
+/// share a bucket render the same string, and a changed bucket means the string
+/// changed.
+///
+/// It exists so a renderer can *key a cache* on a relative time without building
+/// the string — a formatted timestamp per entry per frame is an allocation (and a
+/// clock read) for a label that changes at most once a minute.
+/// `bucket_agrees_with_the_string_it_stands_for` holds the two in step.
+pub fn relative_time_bucket(
+    then: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Local>,
+) -> u64 {
+    let secs = (now - then).num_seconds().max(0) as u64;
+    // Each arm mirrors a range of `relative_time_since`, reduced to the coarsest
+    // value the string is sensitive to, and offset so ranges cannot collide.
+    match secs {
+        0..=4 => 0,                          // "now"
+        5..=59 => 100 + secs,                // seconds
+        60..=3599 => 1_000 + secs / 60,      // minutes
+        3600..=86_399 => 10_000 + secs / 60, // hours + minutes
+        _ => 100_000 + secs / 3600,          // days + hours
     }
 }
 
@@ -91,6 +126,45 @@ mod tests {
         );
         // Future times clamp to "now" (negative elapsed).
         assert_eq!(relative_time(now + Duration::hours(1)), "now");
+    }
+
+    /// The bucket must be a faithful stand-in for the string: same bucket → same
+    /// string, different bucket → different string.
+    ///
+    /// The renderer keys its per-block cache on the bucket precisely so it never
+    /// has to build the string. If the bucket were coarser than the string, a
+    /// timestamp would freeze on screen ("5m ago" long after it became "7m ago");
+    /// if it were finer, every block would be re-laid-out on a clock tick and the
+    /// cache would be worthless. Sweep the ranges and the boundaries between them.
+    #[test]
+    fn bucket_agrees_with_the_string_it_stands_for() {
+        use chrono::Duration;
+        let now = chrono::Local::now();
+        let secs: Vec<i64> = (0..130)
+            .chain([300, 359, 360, 3599, 3600, 3601, 3660, 7199, 7200])
+            .chain([86_399, 86_400, 86_401, 90_000, 172_800, 176_400])
+            .collect();
+
+        let sample: Vec<(u64, String)> = secs
+            .iter()
+            .map(|s| {
+                let then = now - Duration::seconds(*s);
+                (
+                    relative_time_bucket(then, now),
+                    relative_time_since(then, now),
+                )
+            })
+            .collect();
+
+        for (i, (bucket_a, string_a)) in sample.iter().enumerate() {
+            for (bucket_b, string_b) in &sample[i + 1..] {
+                assert_eq!(
+                    bucket_a == bucket_b,
+                    string_a == string_b,
+                    "bucket and string disagree: ({bucket_a}, {string_a}) vs ({bucket_b}, {string_b})"
+                );
+            }
+        }
     }
 }
 

@@ -950,6 +950,35 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
 
+    // A block is laid out against `app` (the header reads live session state), so
+    // the frame *reads* everything it needs here and hands the writes back below —
+    // the chunks borrow the app until they are painted.
+    let pending_goto = app.pending_goto.take();
+    let pending_entry = app.pending_scroll_entry.take();
+    let (scroll_offset, max_scroll, tool_hits) =
+        draw_chunks(f, app, area, text_area, pending_goto, pending_entry);
+
+    // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest. Write
+    // it back so "scrolled up" state (and the follow button) is accurate even after
+    // the content shrinks.
+    app.scroll_offset = scroll_offset;
+    app.max_scroll = max_scroll;
+    app.tool_hits = tool_hits;
+
+    draw_scrollbar(f, app, area, max_scroll, scroll_offset);
+}
+
+/// Lay the transcript out, place the viewport in it, and paint the rows it lands
+/// on. Returns what the frame learned: where the reader ended up, how far there is
+/// to scroll, and which screen rows a click would land on a tool block in.
+fn draw_chunks(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    text_area: Rect,
+    pending_goto: Option<usize>,
+    pending_entry: Option<usize>,
+) -> (usize, usize, Vec<(crate::app::HitRect, usize)>) {
     let (chunks, msg_at) = transcript_chunks(app, text_area.width);
     // The screen row each block starts at. A block's rows come out of
     // `render_block` already wrapped and padded to the render width, so a row is a
@@ -961,11 +990,11 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let mut acc: usize = 0;
     cum.push(0usize);
     for c in &chunks {
-        acc = acc.saturating_add(c.rows.len());
+        acc = acc.saturating_add(c.rows.height());
         cum.push(acc);
     }
     // Resolve a pending /goto to a from-top row offset.
-    let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
+    let goto_top: Option<u16> = pending_goto.and_then(|num| {
         let at = (*msg_at.get(num.checked_sub(1)?)?).min(chunks.len());
         Some(clamp_u16(cum[at]))
     });
@@ -974,7 +1003,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // is measured from the bottom, so the block would otherwise slide by however
     // many rows it gained or lost. Following the newest output is left alone —
     // the bottom is already pinned.
-    let entry_top: Option<u16> = app.pending_scroll_entry.take().and_then(|idx| {
+    let entry_top: Option<u16> = pending_entry.and_then(|idx| {
         let at = chunks.iter().position(|c| c.tool_idx == Some(idx))?;
         (app.scroll_offset > 0).then(|| clamp_u16(cum[at]))
     });
@@ -992,20 +1021,16 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // `app.max_scroll`) so the from-top position stays put. `offset == 0`
     // (following the newest output) is left untouched — it stays pinned to the
     // bottom by design.
-    if app.scroll_offset > 0 {
+    let mut scroll_offset = app.scroll_offset;
+    if scroll_offset > 0 {
         let grown = max_scroll.saturating_sub(clamp_u16(app.max_scroll));
-        app.scroll_offset = app.scroll_offset.saturating_add(grown as usize);
+        scroll_offset = scroll_offset.saturating_add(grown as usize);
     }
     // A /goto puts the target message at the top of the viewport.
     if let Some(wrapped_start) = goto_top {
-        app.scroll_offset = max_scroll.saturating_sub(wrapped_start) as usize;
+        scroll_offset = max_scroll.saturating_sub(wrapped_start) as usize;
     }
-    // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
-    // Clamp and write back so "scrolled up" state (and the follow button) is
-    // accurate even after the content shrinks.
-    let offset = clamp_u16(app.scroll_offset).min(max_scroll);
-    app.scroll_offset = offset as usize;
-    app.max_scroll = max_scroll as usize;
+    let offset = clamp_u16(scroll_offset).min(max_scroll);
     let scroll = max_scroll.saturating_sub(offset);
 
     let scroll_us = scroll as usize;
@@ -1015,13 +1040,13 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // viewport) so a left click can toggle that tool's expansion. Arithmetic is in
     // usize (cum values) to avoid overflow; only the final HitRect fields are cast
     // back to u16.
-    app.tool_hits.clear();
+    let mut tool_hits = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         let Some(idx) = c.tool_idx else { continue };
         let vis_start = cum[i].max(scroll_us);
         let vis_end = cum[i + 1].min(view_end);
         if vis_end > vis_start {
-            app.tool_hits.push((
+            tool_hits.push((
                 crate::app::HitRect {
                     x: text_area.x,
                     y: text_area.y + (vis_start - scroll_us) as u16,
@@ -1050,7 +1075,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         .get(first..last.max(first))
         .unwrap_or_default()
         .iter()
-        .flat_map(|c| c.rows.iter().cloned())
+        .flat_map(|c| c.rows.rows().iter().cloned().collect::<Vec<_>>())
         .collect();
     // Rows of the first visible block that sit above the viewport.
     let inner_scroll = clamp_u16(scroll_us.saturating_sub(cum[first.min(chunks.len())]));
@@ -1076,13 +1101,18 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let para = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(para.scroll((inner_scroll, 0)), text_area);
 
-    // Scrollbar shows total session length + where we are within it. ratatui maps
-    // `position` over `0..=content_length-1`, so content_length is the number of
-    // scroll positions (max_scroll + 1) — not the raw line total, or the thumb
-    // never reaches the bottom when following.
-    let mut sb_state = ScrollbarState::new(max_scroll as usize + 1)
+    (offset as usize, max_scroll as usize, tool_hits)
+}
+
+/// The scrollbar: total session length, and where the reader is within it.
+fn draw_scrollbar(f: &mut Frame, app: &App, area: Rect, max_scroll: usize, offset: usize) {
+    // ratatui maps `position` over `0..=content_length-1`, so content_length is the
+    // number of scroll positions (max_scroll + 1) — not the raw row total, or the
+    // thumb never reaches the bottom when following.
+    let scroll = max_scroll.saturating_sub(offset);
+    let mut sb_state = ScrollbarState::new(max_scroll + 1)
         .viewport_content_length(area.height as usize)
-        .position(scroll as usize);
+        .position(scroll);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
         .end_symbol(Some("↓"))
@@ -1656,6 +1686,10 @@ thread_local! {
     // drops both when the indices themselves move (prune, resume, /clear).
     static BODY_CACHE: SlotCache<BodyKey> = RefCell::new(HashMap::new());
     static BLOCK_CACHE: SlotCache<BlockKey> = RefCell::new(HashMap::new());
+    // Heights of the blocks that are rebuilt rather than cached (the header). Keyed
+    // by the same block key, so a header whose *shape* changed — a model with a
+    // longer name, an effort row appearing — is measured again rather than trusted.
+    static LAZY_HEIGHTS: RefCell<HashMap<BlockKey, usize>> = RefCell::new(HashMap::new());
 }
 
 /// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
@@ -2032,6 +2066,20 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
 pub(crate) fn clear_transcript_cache() {
     BODY_CACHE.with(|c| c.borrow_mut().clear());
     BLOCK_CACHE.with(|c| c.borrow_mut().clear());
+    LAZY_HEIGHTS.with(|c| c.borrow_mut().clear());
+}
+
+/// What the session header *shows* — everything but the animation, which changes
+/// every frame and changes nothing about the header's shape.
+fn header_hash(app: &App) -> u64 {
+    let mut h = DefaultHasher::new();
+    let pane = app.panes.active_pane();
+    pane.model().hash(&mut h);
+    pane.state.provider.hash(&mut h);
+    pane.effort.hash(&mut h);
+    app.dir.hash(&mut h);
+    app.logo.hash(&mut h);
+    h.finish()
 }
 
 /// The rendered body of entry `idx`, from [`BODY_CACHE`] when `key` still
@@ -2057,15 +2105,11 @@ where
 }
 
 /// The finished rows of entry `idx`'s block, from [`BLOCK_CACHE`] when `key`
-/// still matches, otherwise from `render()`. `cacheable` is false for the header,
-/// whose logo animates every frame.
-fn cached_block<F>(idx: usize, key: BlockKey, cacheable: bool, render: F) -> Rows
+/// still matches, otherwise from `render()`.
+fn cached_block<F>(idx: usize, key: BlockKey, render: F) -> Rows
 where
-    F: FnOnce() -> Vec<Line<'static>>,
+    F: FnOnce() -> Rows,
 {
-    if !cacheable {
-        return Rc::new(render());
-    }
     if let Some(hit) = BLOCK_CACHE.with(|c| {
         c.borrow()
             .get(&idx)
@@ -2074,9 +2118,21 @@ where
     }) {
         return hit;
     }
-    let rows = Rc::new(render());
+    let rows = render();
     BLOCK_CACHE.with(|c| c.borrow_mut().insert(idx, (key, Rc::clone(&rows))));
     rows
+}
+
+/// How tall the block under `key` came out the last time it was built, for the
+/// blocks whose *rows* can't be cached but whose height doesn't change: the
+/// animated header. Knowing the height is enough to place the viewport, and a
+/// viewport that doesn't reach the block never builds it.
+fn lazy_height(key: BlockKey) -> Option<usize> {
+    LAZY_HEIGHTS.with(|c| c.borrow().get(&key).copied())
+}
+
+fn remember_lazy_height(key: BlockKey, height: usize) {
+    LAZY_HEIGHTS.with(|c| c.borrow_mut().insert(key, height));
 }
 
 /// The identity of the rows cached for entry `idx`, or `None` if it has no slot.
@@ -2099,20 +2155,22 @@ pub(crate) fn block_cache_ptr(idx: usize) -> Option<usize> {
 /// whether its bottom pad is dropped.
 fn chrome_hash(
     kind: BlockKind,
-    header: &[Line<'static>],
-    lent: &[Line<'static>],
-    footer: &[Line<'static>],
+    lent: &[Lent],
+    footer: &Option<MetaSpec>,
     drop_bottom: bool,
 ) -> u64 {
     let mut h = DefaultHasher::new();
     (kind as u8).hash(&mut h);
     drop_bottom.hash(&mut h);
-    for rows in [header, lent, footer] {
-        rows.len().hash(&mut h);
-        for line in rows {
-            for span in &line.spans {
-                span.content.hash(&mut h);
-            }
+    footer.hash(&mut h);
+    lent.len().hash(&mut h);
+    for l in lent {
+        // Scalars only — never the rendered text. This runs for every entry on
+        // every frame, and hashing the rows would put the transcript's *bytes* back
+        // in the frame's path, which is the cost this design exists to avoid.
+        match l {
+            Lent::Meta(meta) => (0u8, meta).hash(&mut h),
+            Lent::Stats(key, _) => (1u8, key).hash(&mut h),
         }
     }
     h.finish()
@@ -2126,36 +2184,117 @@ fn chrome_hash(
 /// `rows.len()`. That invariant is what lets a frame place the viewport by
 /// counting rows instead of re-wrapping the session
 /// (`every_block_row_is_exactly_one_screen_row` holds it in place).
-#[derive(Clone)]
-struct Chunk {
-    /// Shared with the cache: an unchanged block is a refcount bump per frame.
-    rows: Rows,
+struct Chunk<'a> {
+    rows: ChunkRows<'a>,
     /// Transcript index, when this chunk is a tool call (for click-to-expand).
     tool_idx: Option<usize>,
+}
+
+/// A chunk's rows — laid out already, or laid out only if they are looked at.
+enum ChunkRows<'a> {
+    /// Shared with the cache: an unchanged block is a refcount bump per frame.
+    Ready(Rows),
+    /// The session header, whose logo animates: it cannot be cached (the frame it
+    /// would serve is the one before), and it paints a span per glyph, which is the
+    /// single most expensive block in the transcript. In any session long enough to
+    /// scroll it off the top, that is a hundred-odd microseconds a frame spent on
+    /// rows nobody is looking at. Its *height* doesn't animate, so it is cached the
+    /// first time the block is built and the rows come back only when the viewport
+    /// reaches them.
+    Lazy {
+        height: usize,
+        build: Box<dyn Fn() -> Rows + 'a>,
+    },
+}
+
+impl ChunkRows<'_> {
+    /// Screen rows this chunk occupies — never builds anything.
+    fn height(&self) -> usize {
+        match self {
+            ChunkRows::Ready(rows) => rows.len(),
+            ChunkRows::Lazy { height, .. } => *height,
+        }
+    }
+
+    /// The rows themselves, laying them out if that was deferred.
+    fn rows(&self) -> Rows {
+        match self {
+            ChunkRows::Ready(rows) => Rc::clone(rows),
+            ChunkRows::Lazy { build, .. } => build(),
+        }
+    }
+}
+
+/// A message's closing `#N you · 2m ago` label — as a *recipe*, not as rows.
+///
+/// The label is the one part of a block that changes on its own, without the entry
+/// changing: a relative timestamp ticks over. Formatting it costs a clock read and
+/// an allocation, and a frame has one per message — so the frame keys the block
+/// cache on this (all scalars: `bucket` stands in for the rendered time, see
+/// [`hrdr_app::relative_time_bucket`]) and only builds the rows when the block
+/// itself has to be laid out again.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct MetaSpec {
+    /// The message's `#N`.
+    num: usize,
+    role: &'static str,
+    style: TimestampStyle,
+    /// What the time reads as now, without saying it in words.
+    bucket: u64,
+    /// When the entry landed — read only when the rows are actually built.
+    time: chrono::DateTime<chrono::Local>,
+}
+
+impl MetaSpec {
+    /// The blank row and the label itself, on the block's own background.
+    fn rows(&self, now: chrono::DateTime<chrono::Local>, theme: &Theme) -> Vec<Line<'static>> {
+        if self.style == TimestampStyle::None {
+            return Vec::new();
+        }
+        let time = if self.style == TimestampStyle::Relative {
+            hrdr_app::relative_time_since(self.time, now)
+        } else {
+            self.time.format("%H:%M").to_string()
+        };
+        let (num, role) = (self.num, self.role);
+        vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                format!("#{num} {role} · {time}"),
+                Style::default().fg(theme.dim),
+            )),
+        ]
+    }
+}
+
+/// Rows a *following* entry lends to the block above it, because it has no block
+/// of its own: a text-less turn's `#N assistant` jump label, or the stats line
+/// that closes the turn.
+#[derive(Clone)]
+enum Lent {
+    Meta(MetaSpec),
+    /// Already rendered and cached under its own entry's body key — which is what
+    /// the block hashes, rather than walking the rows.
+    Stats(BodyKey, Rows),
 }
 
 /// A block whose parts are gathered but which is not yet rendered. Held for one
 /// iteration so a text-less assistant turn — which has no block of its own — can
 /// lend its `#N assistant` jump label to it, and so the block after it can say
 /// whether the two need a separator between them.
-struct PendingBlock {
+struct PendingBlock<'a> {
     /// Transcript index — the cache slot this block owns.
     idx: usize,
     kind: BlockKind,
-    /// Rows above the body (nothing uses this today; kept so a block that wants a
-    /// title row does not have to bypass the cache to get one).
-    header: Vec<Line<'static>>,
-    /// The entry's own rendered content, shared with [`BODY_CACHE`].
-    body: Rows,
-    /// Rows lent by a *following* entry: a text-less turn's `#N` label, a per-turn
-    /// stats line. They sit below the body and above this block's own footer.
-    lent: Vec<Line<'static>>,
+    /// The entry's own content.
+    body: BodySource<'a>,
+    /// What a following entry lent this block. Sits below the body, above the
+    /// block's own footer.
+    lent: Vec<Lent>,
     /// This block's closing `#N you · 2m ago` label.
-    footer: Vec<Line<'static>>,
+    footer: Option<MetaSpec>,
     /// The body's cache key, extended with the chrome hash to key the block.
     body_key: BodyKey,
-    /// The header's logo animates, so its block is rebuilt every frame.
-    cacheable: bool,
     tool_idx: Option<usize>,
     /// How many numbered messages start at this block. Usually 1 (or 0 for blocks
     /// that aren't messages); a block carrying a lent assistant label counts that
@@ -2163,10 +2302,19 @@ struct PendingBlock {
     msgs: usize,
 }
 
-impl PendingBlock {
-    /// Take rows lent by a following entry.
-    fn lend(&mut self, rows: Vec<Line<'static>>) {
-        self.lent.extend(rows);
+/// Where a block's body comes from.
+enum BodySource<'a> {
+    /// Rendered and shared with [`BODY_CACHE`] — every entry but the header.
+    Cached(Rows),
+    /// Rebuilt on demand: the header, whose logo animates. Nothing about it can be
+    /// cached, so it is only ever built when it is going to be seen.
+    Animated(Box<dyn Fn() -> Vec<Line<'static>> + 'a>),
+}
+
+impl PendingBlock<'_> {
+    /// Take what a following entry lends.
+    fn lend(&mut self, rows: Lent) {
+        self.lent.push(rows);
     }
 }
 
@@ -2185,15 +2333,18 @@ impl PendingBlock {
 /// * **mixed** — the two pads already read as a single gap. Left alone.
 /// * **anything → nothing** — the last block gets no separator of its own; the
 ///   layout keeps a blank row between the transcript and the input pane below.
-fn flush(
-    chunks: &mut Vec<Chunk>,
+fn flush<'a>(
+    chunks: &mut Vec<Chunk<'a>>,
     msg_at: &mut Vec<usize>,
-    pending: Option<PendingBlock>,
+    pending: Option<PendingBlock<'a>>,
     next_bg: Option<Color>,
     width: usize,
+    now: chrono::DateTime<chrono::Local>,
     theme: &Theme,
 ) {
     let Some(block) = pending else { return };
+    let (idx, msgs, tool_idx) = (block.idx, block.msgs, block.tool_idx);
+    let animated = matches!(block.body, BodySource::Animated(_));
     let bg = block.kind.bg(theme);
     let border = block.kind.border(theme);
     let untinted = bg == Color::Reset;
@@ -2205,36 +2356,60 @@ fn flush(
 
     let key = (
         block.body_key,
-        chrome_hash(
-            block.kind,
-            &block.header,
-            &block.lent,
-            &block.footer,
-            drop_bottom,
-        ),
+        chrome_hash(block.kind, &block.lent, &block.footer, drop_bottom),
     );
-    let rows = cached_block(block.idx, key, block.cacheable, || {
-        let mut body: Vec<Line<'static>> = Vec::with_capacity(
-            block.header.len() + block.body.len() + block.lent.len() + block.footer.len(),
-        );
-        body.extend(block.header.iter().cloned());
-        body.extend(block.body.iter().cloned());
-        body.extend(block.lent.iter().cloned());
-        body.extend(block.footer.iter().cloned());
+    let theme = theme.clone();
+    // Lay the block out: the body, then whatever a following entry lent it, then
+    // its own label — all through the one `render_block` call, so no entry paints
+    // its own chrome.
+    let render = move || -> Rows {
+        let mut body: Vec<Line<'static>> = Vec::with_capacity(8);
+        match &block.body {
+            BodySource::Cached(rows) => body.extend(rows.iter().cloned()),
+            BodySource::Animated(build) => body.extend(build()),
+        }
+        for lent in &block.lent {
+            match lent {
+                Lent::Meta(meta) => body.extend(meta.rows(now, &theme)),
+                // The stats line sits a blank row below the turn it closes.
+                Lent::Stats(_, rows) => {
+                    body.push(Line::raw(""));
+                    body.extend(rows.iter().cloned());
+                }
+            }
+        }
+        if let Some(footer) = &block.footer {
+            body.extend(footer.rows(now, &theme));
+        }
         let mut rows = render_block(body, width, bg, border);
         if drop_bottom {
             rows.pop();
         }
-        rows
-    });
+        Rc::new(rows)
+    };
 
-    for _ in 0..block.msgs {
+    let rows = match animated {
+        // Every other block is laid out once and cached.
+        false => ChunkRows::Ready(cached_block(idx, key, render)),
+        // The header: its rows animate, its height does not. Once we know how tall
+        // it is, a frame that doesn't show it doesn't build it.
+        true => match lazy_height(key) {
+            Some(height) => ChunkRows::Lazy {
+                height,
+                build: Box::new(render),
+            },
+            None => {
+                let rows = render();
+                remember_lazy_height(key, rows.len());
+                ChunkRows::Ready(rows)
+            }
+        },
+    };
+
+    for _ in 0..msgs {
         msg_at.push(chunks.len());
     }
-    chunks.push(Chunk {
-        rows,
-        tool_idx: block.tool_idx,
-    });
+    chunks.push(Chunk { rows, tool_idx });
     if separate {
         chunks.push(separator());
     }
@@ -2242,12 +2417,12 @@ fn flush(
 
 /// A one-row gap between two blocks. Its `Rc` is cloned, not rebuilt: the row is
 /// the same blank line every time.
-fn separator() -> Chunk {
+fn separator<'a>() -> Chunk<'a> {
     thread_local! {
         static SEP: Rc<Vec<Line<'static>>> = Rc::new(vec![Line::raw("")]);
     }
     Chunk {
-        rows: SEP.with(Rc::clone),
+        rows: ChunkRows::Ready(SEP.with(Rc::clone)),
         tool_idx: None,
     }
 }
@@ -2260,41 +2435,27 @@ fn separator() -> Chunk {
 /// whose entry has not changed come straight out of [`BLOCK_CACHE`] as an `Rc`,
 /// which is what keeps a frame's cost proportional to what *changed* rather than
 /// to the length of the session.
-fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
+fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>) {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut msg_at: Vec<usize> = Vec::new();
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
-    // The `#N you · 2m ago` row that closes a message block, preceded by a blank
-    // row separating it from the message. Both are block *body* lines (not
-    // chrome outside the block), so they sit on the block's background like
-    // everything else. Kept out of the render cache: the relative time changes
-    // every frame.
-    let meta = |i: usize, num: usize, role: &str| -> Vec<Line<'static>> {
-        if app.timestamp_style == TimestampStyle::None {
-            return Vec::new();
+    // One clock read for the whole frame. Reading it per message — which is what
+    // formatting a relative time does — is a timezone lookup and an allocation per
+    // entry, every frame, for a label that changes at most once a minute.
+    let now = chrono::Local::now();
+    // The `#N you · 2m ago` row that closes a message block, as a recipe: the rows
+    // are built only if the block has to be laid out again ([`MetaSpec`]).
+    let meta = |e: &Entry, num: usize, role: &'static str| -> MetaSpec {
+        MetaSpec {
+            num,
+            role,
+            style: app.timestamp_style,
+            bucket: hrdr_app::relative_time_bucket(e.time, now),
+            time: e.time,
         }
-        let time = app
-            .panes
-            .active_transcript()
-            .get(i)
-            .map(|e| {
-                if app.timestamp_style == TimestampStyle::Relative {
-                    relative_time(e.time)
-                } else {
-                    e.time.format("%H:%M").to_string()
-                }
-            })
-            .unwrap_or_default();
-        vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                format!("#{num} {role} · {time}"),
-                Style::default().fg(theme.dim),
-            )),
-        ]
     };
     // Block width and the width its content is laid out at (minus padding).
     let w = width as usize;
@@ -2302,8 +2463,15 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
     let mut pending: Option<PendingBlock> = None;
     for (i, entry) in app.panes.active_transcript().iter().enumerate() {
         // Body cache key shared by all arms (Reasoning skip happens before this).
+        // The header has no content of its own to hash — it reads live session
+        // state — so it hashes what it *displays*. Its rows are never cached, but
+        // its height is, and a header that grew a row (an effort field appearing, a
+        // longer model name wrapping) has to be measured again.
         let ck: BodyKey = (
-            entry_content_hash(entry, app.expand_tools),
+            match entry.kind {
+                EntryKind::Header => header_hash(app),
+                _ => entry_content_hash(entry, app.expand_tools),
+            },
             width,
             app.expand_tools,
             app.show_reasoning,
@@ -2311,16 +2479,18 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
         // Every arm produces (kind, header rows, cached body rows, footer rows)
         // and is then funneled through the one `render_block` call below — no
         // entry paints its own chrome.
-        let mut header: Vec<Line<'static>> = Vec::new();
-        let mut footer: Vec<Line<'static>> = Vec::new();
+        let mut footer: Option<MetaSpec> = None;
         // Numbered messages starting at the block this entry produces.
         let mut msg_here = 0usize;
         let (kind, body) = match &entry.kind {
-            // Rebuilt every frame: the logo animation advances with the wall
-            // clock, and the details mirror the live model/provider.
+            // Rebuilt every frame it is *seen*: the logo animation advances with
+            // the wall clock, and the details mirror the live model/provider. A
+            // frame that has scrolled past it doesn't build it at all.
             EntryKind::Header => (
                 BlockKind::Header,
-                Rc::new(header_lines(app, app.header_anchor, width)),
+                BodySource::Animated(Box::new(move || {
+                    header_lines(app, app.header_anchor, width)
+                })),
             ),
             // An assistant turn that only called tools has no text, so it gets no
             // block of its own — but its `#N assistant` label is a `/goto` jump
@@ -2328,7 +2498,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
             EntryKind::Assistant(text) if text.trim().is_empty() => {
                 msg_num += 1;
                 if let Some(block) = pending.as_mut() {
-                    block.lend(meta(i, msg_num, "assistant"));
+                    block.lend(Lent::Meta(meta(entry, msg_num, "assistant")));
                     block.msgs += 1;
                 } else {
                     // Nothing to append to (it opens the transcript): the label
@@ -2344,11 +2514,11 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
             EntryKind::User(text) => {
                 msg_num += 1;
                 msg_here += 1;
-                footer.extend(meta(i, msg_num, "you"));
+                footer = Some(meta(entry, msg_num, "you"));
                 let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::User.bg(theme), inner)
                 });
-                (BlockKind::User, body)
+                (BlockKind::User, BodySource::Cached(body))
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
             // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
@@ -2356,11 +2526,11 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
             EntryKind::Assistant(text) => {
                 msg_num += 1;
                 msg_here += 1;
-                footer.extend(meta(i, msg_num, "assistant"));
+                footer = Some(meta(entry, msg_num, "assistant"));
                 let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Assistant.bg(theme), inner)
                 });
-                (BlockKind::Assistant, body)
+                (BlockKind::Assistant, BodySource::Cached(body))
             }
             EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
             // No `⠋ Thinking` / `Thought: 1.2s` label: the dimmer text already
@@ -2378,7 +2548,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
                         inner,
                     )
                 });
-                (BlockKind::Reasoning, body)
+                (BlockKind::Reasoning, BodySource::Cached(body))
             }
             EntryKind::Tool {
                 name,
@@ -2400,7 +2570,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
                         *expanded || app.expand_tools,
                     )
                 });
-                (BlockKind::Tool, body)
+                (BlockKind::Tool, BodySource::Cached(body))
             }
             // Slash-command output and status notices read like assistant output
             // — same markdown, same colors, no dimming — on their own background.
@@ -2408,7 +2578,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
                 let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Command.bg(theme), inner)
                 });
-                (BlockKind::Command, body)
+                (BlockKind::Command, BodySource::Cached(body))
             }
             // The per-turn stats line belongs to the turn that just ended, so it
             // closes that turn's block rather than opening one of its own.
@@ -2416,14 +2586,12 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
                 let body = cached_body(i, ck, || text_lines(text, Style::default().fg(theme.dim)));
                 match pending.as_mut() {
                     Some(block) => {
-                        let mut rows = vec![Line::raw("")];
-                        rows.extend(body.iter().cloned());
-                        block.lend(rows);
+                        block.lend(Lent::Stats(ck, body));
                         continue;
                     }
                     // Nothing to attach to (it opens the transcript): fall back
                     // to a block of its own.
-                    None => (BlockKind::Stats, body),
+                    None => (BlockKind::Stats, BodySource::Cached(body)),
                 }
             }
             // `/diff` is slash-command output too, but with diff coloring
@@ -2439,7 +2607,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
                         })
                         .collect()
                 });
-                (BlockKind::Command, body)
+                (BlockKind::Command, BodySource::Cached(body))
             }
         };
         // Flush the previous block, then hold this one: a text-less assistant
@@ -2450,17 +2618,16 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
             pending.take(),
             Some(kind.bg(theme)),
             w,
+            now,
             theme,
         );
         pending = Some(PendingBlock {
             idx: i,
             kind,
-            header: std::mem::take(&mut header),
             body,
             lent: Vec::new(),
-            footer: std::mem::take(&mut footer),
+            footer,
             body_key: ck,
-            cacheable: !matches!(entry.kind, EntryKind::Header),
             tool_idx: matches!(entry.kind, EntryKind::Tool { .. }).then_some(i),
             msgs: msg_here,
         });
@@ -2476,6 +2643,7 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
         pending.take(),
         queued_bg,
         w,
+        now,
         theme,
     );
 
@@ -2494,7 +2662,12 @@ fn transcript_chunks(app: &App, width: u16) -> (Vec<Chunk>, Vec<usize>) {
             body.push(Line::raw(""));
             body.push(Line::from(Span::styled(" Queued ", badge)));
             chunks.push(Chunk {
-                rows: Rc::new(render_block(body, w, bg, BlockKind::Queued.border(theme))),
+                rows: ChunkRows::Ready(Rc::new(render_block(
+                    body,
+                    w,
+                    bg,
+                    BlockKind::Queued.border(theme),
+                ))),
                 tool_idx: None,
             });
             // Queued blocks are tinted: a blank row separates them from each
@@ -2798,8 +2971,8 @@ mod subagent_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        BLOCK_CACHE, BODY_CACHE, BlockKind, cached_block, cached_body, chrome_hash,
-        entry_content_hash,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, MetaSpec, Rc, TimestampStyle,
+        cached_block, cached_body, chrome_hash, entry_content_hash,
     };
     use crate::app::{Entry, EntryKind};
     use ratatui::text::{Line, Span};
@@ -2972,48 +3145,124 @@ mod cache_tests {
         BLOCK_CACHE.with(|c| c.borrow_mut().clear());
 
         let body_key = (0x3333, 80, false, false);
-        let none: &[Line<'static>] = &[];
-        let footer_1m = [Line::from(Span::raw("#1 you · 1m ago"))];
-        let footer_2m = [Line::from(Span::raw("#1 you · 2m ago"))];
+        let now = chrono::Local::now();
+        let at = |mins: i64| MetaSpec {
+            num: 1,
+            role: "you",
+            style: TimestampStyle::Relative,
+            bucket: hrdr_app::relative_time_bucket(now - chrono::Duration::minutes(mins), now),
+            time: now - chrono::Duration::minutes(mins),
+        };
+        let none: &[Lent] = &[];
+        let (footer_1m, footer_2m) = (Some(at(1)), Some(at(2)));
 
-        let h_1m = chrome_hash(BlockKind::User, none, none, &footer_1m, false);
-        let h_2m = chrome_hash(BlockKind::User, none, none, &footer_2m, false);
+        let h_1m = chrome_hash(BlockKind::User, none, &footer_1m, false);
+        let h_2m = chrome_hash(BlockKind::User, none, &footer_2m, false);
         assert_ne!(h_1m, h_2m, "a ticked-over timestamp must change the hash");
         assert_ne!(
             h_1m,
-            chrome_hash(BlockKind::User, none, none, &footer_1m, true),
+            chrome_hash(BlockKind::User, none, &footer_1m, true),
             "dropping the bottom pad must change the hash"
         );
         assert_ne!(
             h_1m,
-            chrome_hash(BlockKind::Assistant, none, none, &footer_1m, false),
+            chrome_hash(BlockKind::Assistant, none, &footer_1m, false),
             "the block kind picks the background — it must change the hash"
+        );
+        assert_ne!(
+            h_1m,
+            chrome_hash(
+                BlockKind::User,
+                &[Lent::Meta(at(1))], // a text-less turn lent it its `#N` label
+                &footer_1m,
+                false
+            ),
+            "rows lent by a following entry must change the hash"
         );
 
         let stale = vec![Line::from(Span::raw("with 1m ago"))];
         let fresh = vec![Line::from(Span::raw("with 2m ago"))];
-        let first = cached_block(5, (body_key, h_1m), true, || stale.clone());
+        let first = cached_block(5, (body_key, h_1m), || Rc::new(stale.clone()));
         assert_eq!(*first, stale);
-        let second = cached_block(5, (body_key, h_2m), true, || fresh.clone());
+        let second = cached_block(5, (body_key, h_2m), || Rc::new(fresh.clone()));
         assert_eq!(
             *second, fresh,
             "same body, new chrome → the block must be re-rendered"
         );
     }
 
-    /// The header's logo animates every frame, so its block is never cached —
-    /// caching it would freeze the animation on the first frame ever drawn.
+    /// A timestamp that has not visibly changed must not re-lay-out its block.
+    ///
+    /// The block key carries a *bucket* rather than the rendered time, so two
+    /// frames a second apart — where the label still reads `5m ago` — hash the
+    /// same. If the key carried the raw instant instead, every message in the
+    /// transcript would be laid out again on every frame and the cache would buy
+    /// nothing.
     #[test]
-    fn an_uncacheable_block_is_never_stored() {
-        BLOCK_CACHE.with(|c| c.borrow_mut().clear());
+    fn a_timestamp_that_reads_the_same_does_not_rebuild_the_block() {
+        let now = chrono::Local::now();
+        let then = now - chrono::Duration::minutes(5);
+        let spec = |now: chrono::DateTime<chrono::Local>| MetaSpec {
+            num: 1,
+            role: "you",
+            style: TimestampStyle::Relative,
+            bucket: hrdr_app::relative_time_bucket(then, now),
+            time: then,
+        };
 
-        let key = ((0x4444, 80, false, false), 0);
-        let a = cached_block(0, key, false, || vec![Line::from(Span::raw("frame 1"))]);
-        let b = cached_block(0, key, false, || vec![Line::from(Span::raw("frame 2"))]);
+        let a = Some(spec(now));
+        let b = Some(spec(now + chrono::Duration::seconds(1))); // still "5m ago"
+        let c = Some(spec(now + chrono::Duration::minutes(1))); // now "6m ago"
+        let none: &[Lent] = &[];
 
-        assert_eq!(a[0].spans[0].content, "frame 1");
-        assert_eq!(b[0].spans[0].content, "frame 2", "each frame renders anew");
-        BLOCK_CACHE.with(|c| assert!(c.borrow().is_empty(), "nothing was stored"));
+        assert_eq!(
+            chrome_hash(BlockKind::User, none, &a, false),
+            chrome_hash(BlockKind::User, none, &b, false),
+            "a frame a second later reads the same — reuse the block"
+        );
+        assert_ne!(
+            chrome_hash(BlockKind::User, none, &a, false),
+            chrome_hash(BlockKind::User, none, &c, false),
+            "the label ticked over — lay the block out again"
+        );
+    }
+
+    /// The header's logo animates every frame, so its block is never cached — the
+    /// frame it would serve is the one before. Instead its *height* is remembered,
+    /// and the rows are built only when the viewport actually reaches them.
+    ///
+    /// It is the most expensive block in the transcript (a span per glyph of the
+    /// logo), and in any session long enough to scroll it off the top, it is rows
+    /// nobody is looking at. Measuring must not build it; painting must.
+    #[test]
+    fn a_lazy_block_is_measured_without_being_built() {
+        use std::cell::Cell;
+
+        let builds = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&builds);
+        let chunk = ChunkRows::Lazy {
+            height: 7,
+            build: Box::new(move || {
+                counter.set(counter.get() + 1);
+                Rc::new(vec![Line::from(Span::raw("logo"))])
+            }),
+        };
+
+        // Placing the viewport asks every block how tall it is. That must be free.
+        assert_eq!(chunk.height(), 7);
+        assert_eq!(chunk.height(), 7);
+        assert_eq!(builds.get(), 0, "measuring must not lay the block out");
+
+        // Painting it does build it — and rebuilds it each frame, which is what
+        // keeps the animation moving.
+        let rows = chunk.rows();
+        assert_eq!(rows.len(), 1);
+        chunk.rows();
+        assert_eq!(
+            builds.get(),
+            2,
+            "a painted block is laid out afresh each frame"
+        );
     }
 }
 
@@ -3208,24 +3457,31 @@ mod block_tests {
 
     /// A one-content-row block of `kind`, rendered fresh (never cached, so these
     /// tests can't serve each other's rows out of the thread-local cache).
-    fn test_block(kind: BlockKind) -> PendingBlock {
+    fn test_block<'a>(kind: BlockKind) -> PendingBlock<'a> {
         PendingBlock {
             idx: 0,
             kind,
-            header: Vec::new(),
-            body: Rc::new(vec![Line::from(Span::raw("x"))]),
+            body: BodySource::Cached(Rc::new(vec![Line::from(Span::raw("x"))])),
             lent: Vec::new(),
-            footer: Vec::new(),
+            footer: None,
             body_key: (0, 10, false, false),
-            cacheable: false,
             tool_idx: None,
             msgs: 0,
         }
     }
 
+    /// The clock a test frame is drawn at (no block under test carries a
+    /// timestamp, so its value never reaches the rows).
+    fn test_now() -> chrono::DateTime<chrono::Local> {
+        chrono::Local::now()
+    }
+
     /// The rows a list of chunks paints, in order.
     fn flatten(chunks: &[Chunk]) -> Vec<Line<'static>> {
-        chunks.iter().flat_map(|c| c.rows.iter().cloned()).collect()
+        chunks
+            .iter()
+            .flat_map(|c| c.rows.rows().iter().cloned().collect::<Vec<_>>())
+            .collect()
     }
 
     /// The gap between two blocks, for every pairing of tinted / untinted.
@@ -3256,9 +3512,10 @@ mod block_tests {
                 Some(test_block(first)),
                 second.map(|k| k.bg(&theme)),
                 10,
+                test_now(),
                 &theme,
             );
-            let after_first: usize = chunks.iter().map(|c| c.rows.len()).sum();
+            let after_first: usize = chunks.iter().map(|c| c.rows.height()).sum();
             if let Some(second) = second {
                 flush(
                     &mut chunks,
@@ -3266,6 +3523,7 @@ mod block_tests {
                     Some(test_block(second)),
                     None,
                     10,
+                    test_now(),
                     &theme,
                 );
             }
@@ -3313,6 +3571,7 @@ mod block_tests {
                 Some(test_block(kind)),
                 None,
                 10,
+                test_now(),
                 &theme,
             );
             flatten(&chunks).len() - 2 // minus the content row and the top pad
@@ -3332,7 +3591,15 @@ mod block_tests {
         let mut block = test_block(BlockKind::Tool);
         block.tool_idx = Some(7);
         block.msgs = 2; // a block carrying a borrowed assistant label
-        flush(&mut chunks, &mut starts, Some(block), None, 10, &theme);
+        flush(
+            &mut chunks,
+            &mut starts,
+            Some(block),
+            None,
+            10,
+            test_now(),
+            &theme,
+        );
         assert_eq!(starts, vec![1, 1], "both messages start at the block");
         let tools: Vec<_> = chunks
             .iter()
@@ -3340,7 +3607,7 @@ mod block_tests {
             .filter_map(|(i, c)| c.tool_idx.map(|idx| (i, idx)))
             .collect();
         assert_eq!(tools, vec![(1, 7)], "the tool block is chunk 1");
-        assert!(chunks[1].rows.len() > 1, "the tool block spans rows");
+        assert!(chunks[1].rows.height() > 1, "the tool block spans rows");
     }
 
     /// **Every row a block emits is exactly one screen row.**
