@@ -655,6 +655,32 @@ mod tests {
         );
     }
 
+    /// Reverting a wholly agent-owned file diff should use Git's exact tracked
+    /// version instead of reconstructing the old text by hand. The prompt must
+    /// also protect unrelated work by requiring both tracking and diff checks.
+    #[test]
+    fn the_prompt_prefers_git_for_clean_file_reverts() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+
+        for required in [
+            "git ls-files\n  --error-unmatch <file>",
+            "git diff -- <file>",
+            "git restore -- <file>",
+            "git checkout -- <file>",
+        ] {
+            assert!(p.contains(required), "missing revert guidance: {required}");
+        }
+        assert!(
+            p.contains("every change in that file is yours"),
+            "whole-file restore must require a clean, agent-owned diff"
+        );
+        assert!(
+            p.contains("remove only your own hunks with an edit or patch"),
+            "mixed files must preserve pre-existing and user changes"
+        );
+    }
+
     /// Deletion is by explicit name, never by expansion — and the prompt says why.
     ///
     /// `rm -rf "$DIR"/*` with `DIR` unset is `rm -rf /*`. A glob deletes whatever
