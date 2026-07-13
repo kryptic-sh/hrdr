@@ -28,7 +28,7 @@ use crate::{CHATGPT_CODEX_BASE_URL, OAuthAccess, builtin_provider, write_atomic}
 /// compatibility pin (protocol declaration), not a model allowlist — compatible
 /// new models arrive dynamically. Bump only after validating the client
 /// protocol at the new version. Tracker: `kryptic-sh/hrdr#2`.
-pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.144.1";
+pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.144.3";
 
 /// On-disk cache schema. Bump on any incompatible layout change (invalidates
 /// older entries, which are then treated as absent).
