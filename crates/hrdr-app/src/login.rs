@@ -4,7 +4,9 @@
 //! modal slot and, while it's `Some`, routes every submitted line to
 //! [`LoginWizard::step`] instead of the model or the slash dispatcher.
 
-use crate::commands::{BrowserLoginOutcome, BrowserLoginStart, CommandHost, apply_provider};
+use crate::commands::{
+    BrowserLoginOutcome, BrowserLoginStart, CommandHost, apply_provider_or_pick,
+};
 
 /// A running `/login` conversation. Cloneable so a frontend can hold it in
 /// whatever state cell it uses.
@@ -169,7 +171,7 @@ pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick 
         }
         // A keyless (self-hosted) endpoint needs no API key — apply and finish.
         LoginRoute::Keyless => {
-            match apply_provider(host, &name, None) {
+            match apply_provider_or_pick(host, &name) {
                 Ok(p) => {
                     host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
                     host.info(format!(
@@ -177,7 +179,9 @@ pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick 
                         p.base_url
                     ));
                 }
-                Err(e) => host.info(e),
+                // A provider that can't name a model has already opened the picker
+                // (`apply_provider_or_pick`); anything else is a real failure.
+                Err(e) => host.info(e.to_string()),
             }
             LoginPick::Done
         }
@@ -207,7 +211,7 @@ pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
             return;
         }
     };
-    match apply_provider(host, name, Some(key.to_string())) {
+    match apply_provider_or_pick(host, name) {
         Ok(p) => {
             host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
             host.info(format!(
@@ -215,6 +219,12 @@ pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
                  provider.",
                 p.base_url
             ));
+        }
+        // `NeedsModel` is not a failure — the picker is already open on this
+        // provider's models, and the key is saved either way.
+        Err(crate::ProviderSwitchError::NeedsModel { .. }) => {
+            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
+            host.info(format!("✓ logged in to {name}. Key saved to {saved}."));
         }
         Err(e) => host.info(format!("key saved to {saved}, but the switch failed: {e}")),
     }

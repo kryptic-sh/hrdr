@@ -359,17 +359,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn base_url(&self) -> String {
         self.app.panes.active_pane().state.base_url.clone()
     }
-    fn model(&self) -> String {
-        self.app.active_model()
+    fn model_ref(&self) -> hrdr_agent::ModelRef {
+        self.app.active_model_ref()
     }
-    fn set_model(&mut self, model: String) {
-        self.app.set_active_model(model);
-    }
-    fn provider(&self) -> Option<String> {
-        self.app.panes.active_pane().state.provider.clone()
-    }
-    fn set_provider(&mut self, name: String) {
-        self.app.set_active_provider(name);
+    fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
+        self.app.set_active_model_ref(reference);
     }
     fn show_thinking(&self) -> bool {
         self.app.show_reasoning
@@ -568,6 +562,25 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.model_source = None;
         self.app.model_selector = Some(super::model_selector(choices));
         self.app.spawn_model_catalog_load(false);
+    }
+    /// The picker, restricted to one provider's models — what `/login <provider>`
+    /// opens when the provider declares no model and none was ever used on it.
+    /// Naming a provider is a question ("which of its models?"), and this is the
+    /// UI asking it, rather than reporting an error the user can't act on.
+    fn begin_model_selector_for(&mut self, provider: &str) {
+        let name = hrdr_agent::ProviderName::new(provider);
+        let mut choices = hrdr_agent::model_choices(&self.app.cfg, Some(name.as_str()));
+        choices.retain(|c| hrdr_agent::ProviderName::new(&c.provider) == name);
+        // No rows for it (a provider the catalog doesn't cover, before its first
+        // turn caches one) → the unfiltered picker is still better than nothing.
+        if choices.is_empty() {
+            self.begin_model_selector();
+            return;
+        }
+        self.app.model_gen = self.app.model_gen.wrapping_add(1);
+        self.app.model_source = None;
+        self.app.model_selector = Some(super::model_selector(choices));
+        self.app.spawn_model_catalog_load(true);
     }
     fn begin_session_selector(&mut self) {
         // Every directory's sessions, newest first — the cwd column tells them
@@ -1003,10 +1016,16 @@ impl super::App {
         {
             let mut host = TuiHost { app: self };
             host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&outcome.provider));
-            match hrdr_app::apply_provider(&mut host, &outcome.provider, None) {
+            match hrdr_app::apply_provider_or_pick(&mut host, &outcome.provider) {
                 Ok(p) => host.info(format!(
                     "✓ signed in to {} ({}). Switched — loading models…",
                     outcome.provider, p.base_url
+                )),
+                // `NeedsModel` opened the picker on this provider's models: the sign-in
+                // worked, and picking a model is the next step, not an error.
+                Err(hrdr_app::ProviderSwitchError::NeedsModel { .. }) => host.info(format!(
+                    "✓ signed in to {} — pick a model to use it.",
+                    outcome.provider
                 )),
                 Err(e) => host.info(format!(
                     "signed in to {}, but the switch failed: {e}",

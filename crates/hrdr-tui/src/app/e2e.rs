@@ -281,7 +281,7 @@ impl Harness {
         let tmp = tempfile::tempdir().unwrap();
         let config = AgentConfig {
             base_url: mock.base_url.clone(),
-            model: "test-model".to_string(),
+            model: "local://test-model".parse().unwrap(),
             cwd: tmp.path().to_path_buf(),
             checkpoints: Some("off".to_string()),
             context_window: Some(1000),
@@ -1810,8 +1810,8 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
         // As if `--model flash --provider go` (or $HRDR_MODEL / $HRDR_PROVIDER).
+        // ONE pin now: the flags name one identity, so pinning is all-or-nothing.
         h.app.cfg.model_pinned = true;
-        h.app.cfg.provider_pinned = true;
         h.app.state_mut().model = "flash".into();
         h.app.state_mut().provider = Some("go".into());
         let launch_endpoint = h.app.state().base_url.clone();
@@ -1872,7 +1872,6 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     let mut h = Harness::new(vec![]).await;
     // Nothing pinned: the session gets to decide (flag > env > session > config).
     h.app.cfg.model_pinned = false;
-    h.app.cfg.provider_pinned = false;
 
     let saved = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
@@ -1887,7 +1886,7 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
         if h.app
             .agent
             .try_lock()
-            .is_ok_and(|a| a.provider_name().is_some())
+            .is_ok_and(|a| a.provider_name() == "zen")
         {
             break;
         }
@@ -1899,17 +1898,17 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     // pointed at, and the two cannot disagree.
     let (model, provider, base_url) = {
         let a = h.app.agent.lock().await;
-        (a.model_name(), a.provider_name(), a.endpoint_base_url())
+        (
+            a.model_name(),
+            a.provider_name().to_string(),
+            a.endpoint_base_url(),
+        )
     };
     assert_eq!(
         model, "deepseek-v4-flash",
         "the agent runs the session's model"
     );
-    assert_eq!(
-        provider.as_deref(),
-        Some("zen"),
-        "and is on the session's provider"
-    );
+    assert_eq!(provider, "zen", "and is on the session's provider");
     assert!(
         base_url.contains("opencode.ai"),
         "and is pointed at that provider's endpoint, not the one it launched on: \
@@ -3134,8 +3133,8 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     h.app.publish_main_agent();
     {
         let mut a = h.app.agent.lock().await;
-        a.set_model("opus");
-        a.set_provider(Some("claude".to_string()));
+        // One call: the model and the provider it is served by arrive together.
+        a.set_model_ref("claude://opus".parse().unwrap()).unwrap();
         a.set_context_window(Some(200_000));
     }
 
@@ -3208,9 +3207,9 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     h.app
         .apply_model_choice_for_test("openai", "gpt-5", Some(400_000));
     assert_eq!(
-        h.app.active_model(),
-        "gpt-5",
-        "/model switched the agent on screen"
+        h.app.active_model_ref(),
+        "openai://gpt-5".parse().unwrap(),
+        "/model switched the agent on screen — provider and model together"
     );
     assert_eq!(
         h.app.live_subagents.with(|v| v

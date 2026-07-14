@@ -6,10 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use crate::{
-    AgentConfig, BUILTIN_PROVIDERS, ProviderName, builtin_provider, resolve_api_key, write_atomic,
+    AgentConfig, BUILTIN_PROVIDERS, ModelRef, ProviderName, builtin_provider, resolve_api_key,
+    write_atomic,
 };
 
 /// One pickable model in the selector: the ids to switch to plus the friendly
@@ -253,44 +255,182 @@ pub fn record_model_use(provider: &str, model: &str) {
     let _ = write_atomic(&path, json.as_bytes());
 }
 
-/// The last-used `(provider, model)` store's path,
-/// `<XDG data>/hrdr/last_model.json`.
+/// The last-used-model store's path, `<XDG data>/hrdr/last_model.json`.
 fn last_model_path() -> Option<PathBuf> {
     Some(hjkl_xdg::data_dir("hrdr").ok()?.join("last_model.json"))
 }
 
-/// The most recently switched-to `(provider, model)`, if any has been recorded.
-/// The startup resolver falls back to this when neither a flag, env var, session,
-/// nor config pins a provider/model — so a fresh launch resumes where you left
-/// off. An empty provider (a keyless local endpoint) yields `None`, since it
-/// can't be resolved back to a provider preset.
-pub fn load_last_model() -> Option<(String, String)> {
-    let v: Value = last_model_path()
+/// What `last_model.json` remembers: the last identity used *overall*, and the
+/// last model used **on each provider**.
+///
+/// The per-provider map is what makes a provider-only switch (`/login zen`,
+/// `--provider zen`) expressible at all: a provider names no model, and the model
+/// you were using on some *other* provider is exactly the one that must not follow
+/// you there. "The model you last used on THIS provider" is the answer that both
+/// exists and is right — see [`model_for_provider`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LastModels {
+    /// The identity most recently switched to, whatever the provider.
+    pub last: Option<ModelRef>,
+    /// provider (canonical) → the model id last used on it.
+    pub by_provider: HashMap<String, String>,
+}
+
+impl LastModels {
+    /// The model last used on `provider`, as a complete identity.
+    pub fn on(&self, provider: &ProviderName) -> Option<ModelRef> {
+        let model = self.by_provider.get(provider.as_str())?;
+        ModelRef::new(provider.clone(), model).ok()
+    }
+
+    /// Fold `r` in: it becomes the last identity, and the last model on ITS
+    /// provider. Other providers' entries are untouched — that is the point.
+    fn record(&mut self, r: &ModelRef) {
+        self.by_provider
+            .insert(r.provider().as_str().to_string(), r.model().to_string());
+        self.last = Some(r.clone());
+    }
+
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "last": self.last.as_ref().map(ToString::to_string),
+            "by_provider": self.by_provider,
+        })
+    }
+}
+
+/// Everything the store remembers (empty when there is no file, or it is corrupt
+/// — a last-used memory is a nicety, never fatal).
+pub fn load_last_models() -> LastModels {
+    last_model_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())?;
-    parse_last_model(&v)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map(|v| parse_last_model(&v))
+        .unwrap_or_default()
 }
 
-/// Pull a valid `(provider, model)` out of the stored JSON. Both must be present
-/// and non-empty (an empty provider can't be resolved to a preset). Pure, so the
-/// parse rules are testable without a file.
-fn parse_last_model(v: &Value) -> Option<(String, String)> {
-    let provider = v.get("provider")?.as_str()?.to_string();
-    let model = v.get("model")?.as_str()?.to_string();
-    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+/// The most recently switched-to identity, if one has been recorded. The startup
+/// resolver falls back to this when neither a flag, env var, session, nor config
+/// names an identity — so a fresh launch resumes where you left off.
+pub fn load_last_model() -> Option<ModelRef> {
+    load_last_models().last
 }
 
-/// Record `(provider, model)` as the most recently used combo. Best-effort: any
-/// I/O error is swallowed.
-pub fn record_last_model(provider: &str, model: &str) {
+/// The model last used on `provider`, if any — step (1) of [`model_for_provider`].
+pub fn last_model_on(provider: &ProviderName) -> Option<ModelRef> {
+    load_last_models().on(provider)
+}
+
+/// Parse the stored JSON, in either shape. Pure, so the rules are testable
+/// without a file.
+///
+/// BACK-COMPAT: the old file was a single pair, `{"provider":…,"model":…}`. It
+/// still reads — as the last identity AND as that provider's one `by_provider`
+/// entry, so an existing user's next `/login <same provider>` already knows their
+/// model. A malformed half (either side empty, or a `last` that doesn't parse) is
+/// dropped rather than fabricated into a half-identity.
+fn parse_last_model(v: &Value) -> LastModels {
+    // The current shape.
+    let mut out = LastModels {
+        last: v
+            .get("last")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<ModelRef>().ok()),
+        by_provider: HashMap::new(),
+    };
+    if let Some(map) = v.get("by_provider").and_then(Value::as_object) {
+        for (provider, model) in map {
+            let Some(model) = model.as_str() else {
+                continue;
+            };
+            // Route both halves through `ModelRef` so the stored key is canonical
+            // (an old `anthropic` entry answers a lookup for `claude`) and an empty
+            // half is rejected rather than stored.
+            if let Ok(r) = ModelRef::new(ProviderName::new(provider), model) {
+                out.by_provider
+                    .insert(r.provider().as_str().to_string(), r.model().to_string());
+            }
+        }
+    }
+    // The old single-pair shape.
+    if let (Some(provider), Some(model)) = (
+        v.get("provider").and_then(Value::as_str),
+        v.get("model").and_then(Value::as_str),
+    ) && let Ok(r) = ModelRef::new(ProviderName::new(provider), model)
+    {
+        out.by_provider
+            .entry(r.provider().as_str().to_string())
+            .or_insert_with(|| r.model().to_string());
+        out.last.get_or_insert(r);
+    }
+    out
+}
+
+/// Record `r` as the most recently used identity — and as the last model used on
+/// its provider. Best-effort: any I/O error is swallowed.
+///
+/// Read-modify-write: the other providers' entries are the whole value of the
+/// store, so a write must never drop them.
+pub fn record_last_model(r: &ModelRef) {
     let Some(path) = last_model_path() else {
         return;
     };
-    let json = serde_json::json!({ "provider": provider, "model": model }).to_string();
+    let mut store = load_last_models();
+    store.record(r);
+    let Ok(json) = serde_json::to_string(&store.to_json()) else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = write_atomic(&path, json.as_bytes());
+}
+
+/// The identity to use when a provider is named but **no model is** — `/login
+/// <provider>`, `--provider <name>`, a `[[subagent]]` profile that names only a
+/// provider.
+///
+/// A provider-only switch is not expressible as a [`ModelRef`], and that is the
+/// point: the bug this refactor exists to kill was `repoint_to_provider` leaving
+/// `cfg.model` alone when the new provider declared no default (6 of the 7
+/// built-ins), so the model you were running on **silently followed you onto a
+/// provider that has never heard of it**. The old model is never an answer here.
+/// The answers, in order:
+///
+/// 1. the model you last used ON THAT PROVIDER ([`last_model_on`]);
+/// 2. a model the provider itself declares — `[providers.<name>].model`, or a
+///    built-in preset's default (only `chatgpt` has one);
+/// 3. nothing: an error naming the flag that would settle it.
+///
+/// A caller with a UI may catch (3) and open a model picker filtered to that
+/// provider instead of surfacing it.
+pub fn model_for_provider(provider: &ProviderName, config: &AgentConfig) -> Result<ModelRef> {
+    let resolved = config.resolve_provider(provider.as_str()).ok_or_else(|| {
+        anyhow!(
+            "unknown provider '{provider}' (built-ins: {}, or define [providers.{provider}])",
+            BUILTIN_PROVIDERS.join(", ")
+        )
+    })?;
+    model_for_resolved_provider(provider, &resolved)
+}
+
+/// [`model_for_provider`] for a provider that is already resolved (a caller
+/// holding a [`ResolvedProvider`] rather than the config it came from). One
+/// implementation of the chain; this is it.
+pub fn model_for_resolved_provider(
+    provider: &ProviderName,
+    resolved: &crate::ResolvedProvider,
+) -> Result<ModelRef> {
+    if let Some(r) = last_model_on(provider) {
+        return Ok(r);
+    }
+    if let Some(model) = resolved.model.as_deref() {
+        return ModelRef::new(provider.clone(), model).map_err(Into::into);
+    }
+    Err(anyhow!(
+        "provider '{provider}' needs a model — pass --model '{provider}://<model>' \
+         (or pick one with /model)"
+    ))
 }
 
 /// Every model the user can pick, across their configured providers, with
@@ -381,6 +521,11 @@ fn is_subsequence(needle: &[char], haystack: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A `provider://model` identity, for the tests that speak in them.
+    fn r(s: &str) -> ModelRef {
+        s.parse().unwrap()
+    }
 
     fn catalog() -> Value {
         json!({
@@ -637,16 +782,121 @@ mod tests {
         assert!(filter_model_choices(&out, "zzzzz").is_empty());
     }
 
+    /// The store keeps a model PER PROVIDER, because that is the only honest answer
+    /// to "you named a provider but no model". A half-written pair is not an
+    /// identity and is dropped rather than fabricated.
     #[test]
-    fn last_model_parses_a_valid_pair_only() {
+    fn last_model_parses_the_per_provider_map() {
+        let store = parse_last_model(&json!({
+            "last": "openai://gpt-5.5",
+            "by_provider": {
+                "openai": "gpt-5.5",
+                // Folded onto the canonical name on the way in, so a lookup for
+                // `claude` finds a file written as `anthropic`.
+                "anthropic": "sonnet",
+                // Not identities: dropped, never half-stored.
+                "zen": "",
+                "": "grok-code",
+            },
+        }));
+        assert_eq!(store.last, Some(r("openai://gpt-5.5")));
         assert_eq!(
-            parse_last_model(&json!({"provider": "zen", "model": "grok-code"})),
-            Some(("zen".to_string(), "grok-code".to_string()))
+            store.on(&ProviderName::new("openai")),
+            Some(r("openai://gpt-5.5"))
         );
-        // An empty provider (keyless local) can't resolve to a preset → None.
-        assert!(parse_last_model(&json!({"provider": "", "model": "m"})).is_none());
-        assert!(parse_last_model(&json!({"provider": "zen"})).is_none());
-        assert!(parse_last_model(&json!({})).is_none());
+        assert_eq!(
+            store.on(&ProviderName::new("claude")),
+            Some(r("claude://sonnet"))
+        );
+        assert_eq!(store.on(&ProviderName::new("zen")), None);
+        assert_eq!(store.by_provider.len(), 2);
+
+        // A `last` that isn't a complete identity is not one.
+        assert_eq!(parse_last_model(&json!({"last": "gpt-5.5"})).last, None);
+        assert_eq!(parse_last_model(&json!({})), LastModels::default());
+    }
+
+    /// BACK-COMPAT: yesterday's single-pair file still reads — as the last identity
+    /// AND as that provider's entry, so an existing user's first `/login zen` in the
+    /// new world already knows which model they were on.
+    #[test]
+    fn last_model_still_reads_the_old_single_pair_file() {
+        let store = parse_last_model(&json!({"provider": "zen", "model": "grok-code"}));
+        assert_eq!(store.last, Some(r("zen://grok-code")));
+        assert_eq!(
+            store.on(&ProviderName::new("zen")),
+            Some(r("zen://grok-code"))
+        );
+        // …and nothing is invented for any other provider — the whole point.
+        assert_eq!(store.on(&ProviderName::new("openai")), None);
+
+        // A half pair is not an identity.
+        for v in [
+            json!({"provider": "", "model": "m"}),
+            json!({"provider": "zen"}),
+            json!({"provider": "zen", "model": ""}),
+        ] {
+            assert_eq!(parse_last_model(&v), LastModels::default(), "{v}");
+        }
+    }
+
+    /// Recording an identity touches ITS provider's entry and no other — a store
+    /// that dropped the rest would make the per-provider fallback useless after one
+    /// switch.
+    #[test]
+    fn recording_a_model_leaves_the_other_providers_alone() {
+        let mut store = parse_last_model(&json!({
+            "last": "zen://grok-code",
+            "by_provider": {"zen": "grok-code", "openai": "gpt-5.5"},
+        }));
+        store.record(&r("claude://opus-4-8"));
+        assert_eq!(store.last, Some(r("claude://opus-4-8")));
+        assert_eq!(
+            store.on(&ProviderName::new("claude")),
+            Some(r("claude://opus-4-8"))
+        );
+        assert_eq!(
+            store.on(&ProviderName::new("zen")),
+            Some(r("zen://grok-code"))
+        );
+        assert_eq!(
+            store.on(&ProviderName::new("openai")),
+            Some(r("openai://gpt-5.5"))
+        );
+        // Round-trips through the file shape.
+        assert_eq!(parse_last_model(&store.to_json()), store);
+    }
+
+    /// The fallback chain for a provider-only switch: the model last used THERE,
+    /// else one the provider declares, else an actionable error — and never the
+    /// model you were running on somewhere else.
+    #[test]
+    fn model_for_a_provider_falls_back_and_never_carries_the_old_model_over() {
+        // (1) is I/O-backed (`last_model_on`), so the pure chain is exercised from
+        // (2): a provider that declares a model yields it…
+        let chatgpt = builtin_provider("chatgpt").unwrap();
+        assert_eq!(
+            chatgpt.model.as_deref(),
+            Some("gpt-5.5"),
+            "the only built-in with one"
+        );
+        assert_eq!(
+            model_for_resolved_provider(&ProviderName::new("codex"), &chatgpt).unwrap(),
+            r("chatgpt://gpt-5.5"),
+        );
+        // …and one that declares none is an ERROR naming the flag that settles it —
+        // *not* whatever model the caller happened to be using.
+        let zen = builtin_provider("zen").unwrap();
+        assert!(zen.model.is_none());
+        // (Only meaningful when the store has no `zen` entry — which is the case in
+        // a test process with no XDG data dir written for it.)
+        if last_model_on(&ProviderName::new("zen")).is_none() {
+            let err = model_for_resolved_provider(&ProviderName::new("zen"), &zen)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("provider 'zen' needs a model"), "{err}");
+            assert!(err.contains("--model 'zen://<model>'"), "{err}");
+        }
     }
 
     #[test]

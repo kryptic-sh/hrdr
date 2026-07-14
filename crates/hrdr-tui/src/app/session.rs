@@ -203,11 +203,16 @@ impl super::App {
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
-        let pinned_model = self.cfg.model_pinned.then(|| self.state().model.clone());
-        let pinned_provider = self
-            .cfg
-            .provider_pinned
-            .then(|| self.state().provider.clone());
+        // ONE pin, for one identity. A flag/env (`--model` / `--provider` /
+        // `$HRDR_MODEL` / `$HRDR_PROVIDER`) pins what this process runs on, and a
+        // resumed session does not unpin it — but it pins the identity WHOLE. Pinning
+        // one half and adopting the other is how a session's model used to arrive on
+        // the launch provider (or the launch model on the session's provider), which
+        // is precisely the pair that has never agreed.
+        let pinned = self.cfg.model_pinned.then(|| {
+            let s = self.state();
+            (s.model.clone(), s.provider.clone())
+        });
 
         // The state *is* the main pane's — transcript, counters and all — so
         // adopting a session is one assignment. There is nothing left to hand back.
@@ -216,10 +221,8 @@ impl super::App {
         state.id = id;
         state.base_url = base_url;
         state.usage.context_window = probed_window.or(state.usage.context_window);
-        if let Some(model) = pinned_model {
+        if let Some((model, provider)) = pinned {
             state.model = model;
-        }
-        if let Some(provider) = pinned_provider {
             state.provider = provider;
         }
         self.refresh_subagent_dir();
@@ -231,41 +234,46 @@ impl super::App {
         // The resumed session's spend is seeded into the agent's own counter, so it
         // counts on from there — rather than the frontend keeping a second tally and
         // adding it to the agent's on the way to the screen.
-        let (messages, model, todos, spent) = {
+        let (messages, todos, spent) = {
             let s = self.state();
-            (
-                s.messages.clone(),
-                s.model.clone(),
-                s.todos.clone(),
-                s.usage.cost_usd,
-            )
+            (s.messages.clone(), s.todos.clone(), s.usage.cost_usd)
         };
         self.with_agent(|a| {
             a.set_messages(messages);
-            a.set_model(model.clone());
             a.set_session_cost(spent);
         });
 
-        // The conversation's provider comes back with it: repoint the agent's
-        // endpoint and key to match the model and provider now on the status bar, so
-        // the thing doing the talking is the thing being displayed.
+        // The conversation's IDENTITY comes back with it — provider and model
+        // together, which is the only way either of them means anything: resuming a
+        // conversation and then talking to a different provider's endpoint is not the
+        // same conversation. The agent is switched with it, so the thing doing the
+        // talking is the thing being displayed. (The model alone used to be handed
+        // over here, leaving the agent on the launch endpoint.)
         //
-        // Two things stop it. A **pinned** provider (`--provider`, `$HRDR_PROVIDER`)
-        // is this process's decision, already applied at launch — re-resolving it
+        // Two things stop it. A **pinned** identity (`--model`/`--provider`, or the
+        // env) is this process's decision, already applied at launch — re-resolving it
         // would throw away an endpoint the user chose (a `--base-url` override) for
-        // the provider's canonical one. And a provider the agent is **already on**
+        // the provider's canonical one. And an identity the agent is **already on**
         // needs no switch, for the same reason.
-        let (provider, window) = {
+        let (session_provider, model, window) = {
             let s = self.state();
-            (s.provider.clone(), s.usage.context_window)
+            (s.provider.clone(), s.model.clone(), s.usage.context_window)
         };
         let current = self.live_subagents.with(|v| {
             v.iter()
                 .find(|e| e.key == hrdr_agent::MAIN_KEY)
-                .and_then(|e| e.provider.clone())
+                .map(|e| (e.provider.clone().unwrap_or_default(), e.model.clone()))
         });
-        let switchable = !self.cfg.provider_pinned;
-        if let Some(name) = provider.filter(|p| switchable && Some(p) != current.as_ref()) {
+        // The session file still spells the identity as two keys, and an older one
+        // may carry only the model. Collapsed here, at the edge: a session that names
+        // no provider means "this model, on the provider I am on" — never a model
+        // with no provider at all, which is the state this refactor abolished.
+        let provider = session_provider
+            .or_else(|| current.as_ref().map(|(p, _)| p.clone()))
+            .filter(|p| !p.is_empty());
+        let switchable = !self.cfg.model_pinned;
+        let unchanged = current.as_ref() == provider.clone().map(|p| (p, model.clone())).as_ref();
+        if let Some(name) = provider.filter(|_| switchable && !unchanged && !model.is_empty()) {
             let mut host = commands::TuiHost { app: self };
             if let Err(e) = hrdr_app::restore_session_provider(&mut host, &name, model, window) {
                 self.system(format!(

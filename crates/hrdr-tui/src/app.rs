@@ -349,7 +349,7 @@ impl App {
         ui: hrdr_app::UiConfig,
         logo: &'static str,
     ) -> Result<Self> {
-        let model = config.model.clone();
+        let model = config.model.model().to_string();
         let vim_mode = ui.vim_mode;
         let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
@@ -371,7 +371,9 @@ impl App {
             .and_then(hjkl_icons::IconMode::from_config)
             .unwrap_or(hjkl_icons::IconMode::Nerd);
         let base_url = config.base_url.clone();
-        let provider = config.provider.clone();
+        // The session's on-disk shape still spells the identity as two keys, so it
+        // is taken apart here — at the edge — and nowhere else.
+        let provider = Some(config.model.provider().to_string());
         // Shared transcript-dir cell: handed to the agent (so the `task` tool
         // can persist sub-agent runs) and kept here to repoint at the session's
         // dir once an id is assigned (`refresh_subagent_dir`).
@@ -1465,19 +1467,28 @@ impl App {
         self.update_chrome(id, |s| s.usage.context_window = tokens);
     }
 
-    /// The model shown for the agent on screen.
-    pub(crate) fn active_model(&self) -> String {
-        self.panes.active_pane().model().to_string()
+    /// What the agent being viewed is running on, as ONE value — read back out of
+    /// the two keys the pane's display state still holds it in.
+    pub(crate) fn active_model_ref(&self) -> hrdr_agent::ModelRef {
+        let pane = self.panes.active_pane();
+        let provider = pane.state.provider.as_deref().unwrap_or("local");
+        hrdr_agent::ModelRef::new(hrdr_agent::ProviderName::new(provider), pane.model())
+            .unwrap_or_else(|_| {
+                hrdr_agent::DEFAULT_MODEL_REF
+                    .parse()
+                    .expect("a valid default identity")
+            })
     }
 
-    /// `/model` (and `/login`'s provider switch) set the model of the agent being
-    /// viewed — the same agent the input box talks to and `/compact` compacts.
-    pub(crate) fn set_active_model(&mut self, model: String) {
-        self.update_active_chrome(|s| s.model = model);
-    }
-
-    pub(crate) fn set_active_provider(&mut self, name: String) {
-        self.update_active_chrome(|s| s.provider = Some(name));
+    /// `/model` (and `/login`'s provider switch) set the identity of the agent
+    /// being viewed — the same agent the input box talks to and `/compact`
+    /// compacts. Provider and model land together: the display can no more show a
+    /// mismatched pair than the agent can run one.
+    pub(crate) fn set_active_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
+        self.update_active_chrome(|s| {
+            s.model = reference.model().to_string();
+            s.provider = Some(reference.provider().to_string());
+        });
     }
 
     pub(crate) fn set_active_base_url(&mut self, url: String) {

@@ -727,7 +727,7 @@ mod tests {
         agent: Arc<Mutex<Agent>>,
         info_log: Vec<String>,
         busy: bool,
-        model: String,
+        model: hrdr_agent::ModelRef,
         input: String,
     }
 
@@ -735,7 +735,7 @@ mod tests {
         fn new(cwd: std::path::PathBuf) -> Self {
             let agent = Agent::new(AgentConfig {
                 cwd: cwd.clone(),
-                model: "test-model".to_string(),
+                model: "local://test-model".parse().unwrap(),
                 ..Default::default()
             })
             .unwrap();
@@ -744,7 +744,7 @@ mod tests {
                 agent: Arc::new(Mutex::new(agent)),
                 info_log: Vec::new(),
                 busy: false,
-                model: "test-model".to_string(),
+                model: "local://test-model".parse().unwrap(),
                 input: String::new(),
             }
         }
@@ -763,11 +763,11 @@ mod tests {
         fn base_url(&self) -> String {
             "http://test.invalid".to_string()
         }
-        fn model(&self) -> String {
+        fn model_ref(&self) -> hrdr_agent::ModelRef {
             self.model.clone()
         }
-        fn set_model(&mut self, model: String) {
-            self.model = model;
+        fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
+            self.model = reference;
         }
         fn show_thinking(&self) -> bool {
             false
@@ -861,7 +861,8 @@ mod tests {
 
         assert!(dispatch(&mut host, "/model other-model"));
         assert_eq!(
-            host.model, "test-model",
+            host.model,
+            "local://test-model".parse().unwrap(),
             "/model must not switch the model directly"
         );
         assert!(

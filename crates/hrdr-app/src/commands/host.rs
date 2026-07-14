@@ -36,23 +36,29 @@ pub trait CommandHost {
     fn base_url(&self) -> String;
 
     // The chrome below describes **the agent `agent()` returns** — the one on
-    // screen. `set_model` and friends must therefore write to *that* agent's
-    // state, not to a display copy of the session's: `/model` in a sub-agent's
-    // view switches that sub-agent, and the status bar shows it because it is
-    // reading the very same state.
+    // screen. `set_model_ref` must therefore write to *that* agent's state, not to
+    // a display copy of the session's: `/model` in a sub-agent's view switches that
+    // sub-agent, and the status bar shows it because it is reading the very same
+    // state.
 
-    /// The displayed model name.
-    fn model(&self) -> String;
-    /// Update the displayed model (the agent is switched separately by dispatch).
-    fn set_model(&mut self, model: String);
+    /// What the agent on screen is running on: provider AND model, as one value.
+    ///
+    /// One accessor, because it is one thing. The old `model()`/`provider()` pair
+    /// let a caller read half of it, act on that half, and leave the other half
+    /// describing a provider the model has never been served by.
+    fn model_ref(&self) -> hrdr_agent::ModelRef;
 
-    /// Current provider name (e.g. "zen", "openai"), when one is active.
-    fn provider(&self) -> Option<String> {
-        None
+    /// Update the displayed identity (the agent itself is switched in the same step
+    /// by [`apply_reference`](crate::commands::model), under its lock).
+    fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef);
+
+    /// The model id alone — for the places that only render it.
+    fn model(&self) -> String {
+        self.model_ref().model().to_string()
     }
-    /// Update the active provider name (used by a `/model` provider switch / auto-save).
-    fn set_provider(&mut self, name: String) {
-        let _ = name;
+    /// The provider name alone — for the places that only render it.
+    fn provider(&self) -> String {
+        self.model_ref().provider().to_string()
     }
 
     /// Whether `<think>` reasoning is shown.
@@ -286,6 +292,18 @@ pub trait CommandHost {
         self.info("model selector isn't available in this frontend".to_string());
     }
 
+    /// Open the `/model` selector restricted to `provider`'s models.
+    ///
+    /// The UI's answer to "you named a provider, but a provider is not a model"
+    /// (see [`apply_provider_or_pick`](crate::apply_provider_or_pick)): after a
+    /// `/login` to a provider that declares no default and that you have never used,
+    /// the useful thing is a list of its models, not an error. The default falls
+    /// back to the unfiltered picker.
+    fn begin_model_selector_for(&mut self, provider: &str) {
+        let _ = provider;
+        self.begin_model_selector();
+    }
+
     /// Open the interactive `/resume` session picker — a filterable list of
     /// saved sessions, newest first. A frontend that supports it stashes the
     /// selector in a modal slot; the default falls back to the text listing.
@@ -323,7 +341,8 @@ pub trait CommandHost {
     /// on top. A frontend that supports it stashes the selector in a modal
     /// slot; the default lists the levels as text.
     fn begin_effort_selector(&mut self) {
-        let choices = crate::effort_choices(self.provider().as_deref(), &self.model());
+        let reference = self.model_ref();
+        let choices = crate::effort_choices(Some(reference.provider().as_str()), reference.model());
         let mut s = format!(
             "effort: {} — levels for this model:",
             self.effort().unwrap_or_else(|| "default".into())

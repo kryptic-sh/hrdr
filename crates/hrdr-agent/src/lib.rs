@@ -32,7 +32,7 @@ pub use paths::cwd_slug;
 mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod resolve;
-pub use resolve::{AuthContext, ResolvedModel, resolve};
+pub use resolve::{AuthContext, ResolvedModel, resolve, resolve_in};
 mod models;
 mod subagent_live;
 pub use subagent_live::{
@@ -44,9 +44,10 @@ mod turn;
 pub use turn::TurnStats;
 mod usage;
 pub use models::{
-    AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
-    chatgpt_model_choices, filter_model_choices, load_last_model, load_model_usage,
-    merge_chatgpt_choices, model_choices, record_last_model, record_model_use,
+    AvailableModel, LastModels, ModelChoice, ModelSource, available_models, builtin_catalog_key,
+    chatgpt_model_choices, filter_model_choices, last_model_on, load_last_model, load_last_models,
+    load_model_usage, merge_chatgpt_choices, model_choices, model_for_provider,
+    model_for_resolved_provider, record_last_model, record_model_use,
 };
 pub use usage::AgentUsage;
 
@@ -61,22 +62,23 @@ use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
 
 #[derive(Clone)]
 struct PublicModelRuntime {
-    provider: Option<String>,
-    model: String,
+    /// What the agent is running on, as one value.
+    reference: ModelRef,
     effort: Option<String>,
     delegation_enabled: bool,
 }
 
+/// The endpoint a delegated sub-agent inherits: the parent's resolved identity
+/// (endpoint, key, headers, api-version, trust kind — all of it, together) plus
+/// its reasoning effort.
+///
+/// `resolved.api_key()` is the *resolved provider credential*. The ChatGPT OAuth
+/// bearer is injected straight into the client and deliberately never lands here,
+/// so it is never handed to a sub-agent.
 #[derive(Clone)]
 struct DelegationEndpoint {
-    provider: Option<String>,
-    model: String,
+    resolved: ResolvedModel,
     effort: Option<String>,
-    base_url: String,
-    api_key: Option<String>,
-    api_version: Option<String>,
-    configured_headers: Vec<(String, String)>,
-    provider_kind: ResolvedProviderKind,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,10 @@ impl hrdr_tools::Tool for ModelsTool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let (active_provider, active_model) = (
+            runtime.public.reference.provider().as_str().to_string(),
+            runtime.public.reference.model().to_string(),
+        );
         let default_model = runtime
             .public
             .delegation_enabled
@@ -152,9 +158,9 @@ impl hrdr_tools::Tool for ModelsTool {
                 runtime
                     .explicit_subagent_model
                     .clone()
-                    .unwrap_or_else(|| runtime.public.model.clone())
+                    .unwrap_or_else(|| active_model.clone())
             })
-            .filter(|m| m != "default");
+            .filter(|m| m != DEFAULT_MODEL);
         let mut warnings = Vec::new();
         if runtime.public.delegation_enabled && default_model.is_none() {
             warnings.push(serde_json::json!({
@@ -163,8 +169,8 @@ impl hrdr_tools::Tool for ModelsTool {
             }));
         }
         let mut value = serde_json::json!({
-            "provider": runtime.public.provider,
-            "model": runtime.public.model,
+            "provider": active_provider,
+            "model": active_model,
             "effort": runtime.public.effort,
             "effective_effort": runtime.public.effort.as_deref().and_then(hrdr_llm::normalize_effort),
             "delegation_enabled": runtime.public.delegation_enabled,
@@ -176,12 +182,10 @@ impl hrdr_tools::Tool for ModelsTool {
         let mut available: Vec<AvailableModel> = Vec::new();
         if mode == "available" {
             available = self.available.clone();
-            if runtime.endpoint.provider_kind == ResolvedProviderKind::ChatGptOAuth
-                && runtime.endpoint.base_url == CHATGPT_CODEX_BASE_URL
-            {
+            if runtime.endpoint.resolved.is_codex_oauth() {
                 match coordinated_oauth_access(
-                    runtime.endpoint.provider_kind,
-                    &runtime.endpoint.base_url,
+                    runtime.endpoint.resolved.kind(),
+                    runtime.endpoint.resolved.base_url(),
                 )
                 .await
                 {
@@ -194,10 +198,7 @@ impl hrdr_tools::Tool for ModelsTool {
                         // provider name that does not exist in the user's config.
                         // Matching the superseded rows by alias likewise keeps the
                         // stale preset row from surviving as a duplicate.
-                        let chatgpt_name = runtime
-                            .public
-                            .provider
-                            .clone()
+                        let chatgpt_name = Some(active_provider.clone())
                             .filter(|p| is_chatgpt_provider_name(p))
                             .unwrap_or_else(|| "chatgpt".to_string());
                         available.retain(|m| !is_chatgpt_provider_name(&m.provider));
@@ -236,21 +237,20 @@ impl hrdr_tools::Tool for ModelsTool {
                     }
                 }
             }
-            if let Some(provider) = runtime.public.provider.as_ref()
-                && runtime.public.model != "default"
+            if active_model != DEFAULT_MODEL
                 && !available
                     .iter()
-                    .any(|m| m.provider == *provider && m.model == runtime.public.model)
+                    .any(|m| m.provider == active_provider && m.model == active_model)
             {
                 available.push(AvailableModel {
-                    provider: provider.clone(),
-                    label: runtime.public.model.clone(),
-                    model: runtime.public.model.clone(),
+                    provider: active_provider.clone(),
+                    label: active_model.clone(),
+                    model: active_model.clone(),
                     source: ModelSource::Configured,
                 });
             }
             available.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
-            available.retain(|m| m.model != "default");
+            available.retain(|m| m.model != DEFAULT_MODEL);
             let rows: Vec<_> = available
                 .iter()
                 .map(|m| {
@@ -259,8 +259,7 @@ impl hrdr_tools::Tool for ModelsTool {
                     // scanning a long list to pick a model for delegation reads the
                     // rows, not the envelope — and the answer to "which provider
                     // should I keep the sub-agent on" is right there in the row.
-                    let current = runtime.public.provider.as_deref() == Some(m.provider.as_str())
-                        && runtime.public.model == m.model;
+                    let current = active_provider == m.provider && active_model == m.model;
                     serde_json::json!({
                         "provider": m.provider,
                         "model": m.model,
@@ -628,14 +627,14 @@ fn spawn_background(
 ) -> String {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let header = format!("↳ task#{id} ({}): {label}", cfg.model);
+    let header = format!("↳ task#{id} ({}): {label}", cfg.model.model());
     // Identity for the live registry, taken before `tool_id` is moved into the
     // background-task row below.
     let live_key = LiveSubagents::next_key();
     let tool_id_for_live = tool_id.clone();
     let label_for_live = label.clone();
-    let model_for_live = cfg.model.clone();
-    let provider_for_live = cfg.provider.clone();
+    let model_for_live = cfg.model.model().to_string();
+    let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
     let usage_for_live = subagent_usage(&cfg);
     if let Ok(mut v) = registry.lock() {
@@ -659,7 +658,7 @@ fn spawn_background(
         && let Some(t) = g.as_mut()
     {
         t.write(&subagent_transcript::Event::Start {
-            model: cfg.model.clone(),
+            model: cfg.model.model().to_string(),
             label: label.clone(),
             kind: subagent_transcript::SpawnKind::Background,
             prompt: prompt.clone(),
@@ -1098,9 +1097,13 @@ fn subagent_context_window(
 /// agent shows a bar.
 fn subagent_usage(cfg: &AgentConfig) -> AgentUsage {
     AgentUsage {
-        context_window: cfg
-            .context_window
-            .or_else(|| context_window_for(cfg.provider.as_deref(), &cfg.base_url, &cfg.model)),
+        context_window: cfg.context_window.or_else(|| {
+            context_window_for(
+                Some(cfg.model.provider().as_str()),
+                &cfg.base_url,
+                cfg.model.model(),
+            )
+        }),
         ..Default::default()
     }
 }
@@ -1132,66 +1135,91 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     // Everything else — memory, compaction, guardrails, hooks, the cost ceiling
     // — is inherited, and the agent works with no UI attached.
     base.is_subagent = true;
-    base.model = config
-        .subagent_model
-        .clone()
-        .unwrap_or_else(|| config.model.clone());
+    // The sub-agent model, on the SAME provider — that is what
+    // `[subagent_model]` / `--subagent-model` mean (a bare model id: "Opus
+    // drives, Sonnet implements", same endpoint, same key, same bill).
+    if let Some(m) = &config.subagent_model {
+        base.model = ModelSpec::ModelOnly(m.clone()).apply(&config.model);
+    }
     base
 }
 
-/// Repoint `cfg` at `pname`'s endpoint + auth (and its default or the given
-/// model). Endpoint/identity only — does NOT touch persona/tool-scope, so it is
-/// safe to layer on top of an already-resolved agent profile.
+/// Move `cfg` onto the identity `reference`: re-derive its endpoint, key,
+/// api-version and headers from the provider that identity names, atomically with
+/// the identity itself. Endpoint/identity only — does NOT touch persona or tool
+/// scope, so it is safe to layer on top of an already-resolved agent profile.
 ///
-/// `model_override` wins over the provider's preset default; when neither is
-/// present `cfg.model` is left unchanged. Reads the caller's (parent's)
-/// `cfg.api_key` / `cfg.base_url` as the key-inheritance context *before*
-/// overwriting them.
-fn repoint_to_provider(
+/// `parent` is the key-inheritance context (see [`AuthContext`]); passing the
+/// caller's own endpoint + key lets a same-endpoint child inherit the credential,
+/// and the `same_endpoint` guard inside [`resolve_api_key`] is what stops that key
+/// from leaking to a different provider's host.
+///
+/// The endpoint is re-derived ONLY when the provider changes. A same-provider
+/// model change must not undo a *relocation*: a config (or a `--base-url`) that
+/// points a provider at another address is still that provider, and switching the
+/// model on it is not a request to move back to the preset's URL.
+fn apply_model_ref(
     cfg: &mut AgentConfig,
-    pname: &str,
-    model_override: Option<&str>,
+    reference: ModelRef,
+    parent: Option<&AuthContext<'_>>,
 ) -> Result<()> {
-    let p = cfg.resolve_provider(pname).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
-            BUILTIN_PROVIDERS.join(", ")
-        )
-    })?;
-    // Resolve the key from the PARENT's context first, before mutating cfg.
-    let key = resolve_api_key(
-        pname,
-        &p,
-        cfg.api_key.as_deref(),
-        Some(cfg.base_url.as_str()),
-    );
-    cfg.base_url = p.base_url.clone();
-    cfg.api_key = key;
-    cfg.api_version = p.api_version.clone();
-    cfg.headers = p
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    // Only when the preset actually declares one: most built-ins carry `None`, and
-    // overwriting an inherited (probed) window with `None` would blind the agent to
-    // how full it is — silently disabling its own compaction.
-    if p.context_window.is_some() {
-        cfg.context_window = p.context_window;
+    if reference.provider() == cfg.model.provider() {
+        cfg.model = reference;
+        return Ok(());
     }
-    cfg.provider = Some(pname.to_string());
-    if let Some(m) = model_override {
-        cfg.model = m.to_string();
-    } else if let Some(m) = &p.model {
-        cfg.model = m.clone();
+    let name = reference.provider().as_str();
+    let resolved = resolve(&reference, cfg, parent)?;
+    // The provider's CONFIGURED window (a `[providers.*].context_window`, or the
+    // ChatGPT preset floor) — a user override, so it outranks the derived one, and
+    // it is applied only when the preset actually declares one: most built-ins
+    // carry `None`, and overwriting an inherited (probed) window with `None` would
+    // blind the agent to how full it is, silently disabling its own compaction.
+    if let Some(w) = cfg.resolve_provider(name).and_then(|p| p.context_window) {
+        cfg.context_window = Some(w);
     }
+    cfg.base_url = resolved.base_url().to_string();
+    cfg.api_key = resolved.api_key().map(str::to_string);
+    cfg.api_version = resolved.api_version().map(str::to_string);
+    cfg.headers = resolved.headers().to_vec();
+    cfg.model = reference;
     Ok(())
 }
 
+/// The identity a *named* provider means for `cfg` when no model is named with
+/// it: the fallback chain ([`model_for_provider`]) — the model last used on that
+/// provider, else one the provider declares, else an error.
+///
+/// Never `cfg.model`'s model id. That is the bug: a model that belongs to the
+/// provider you are LEAVING has no meaning on the one you are arriving at.
+fn provider_switch_ref(cfg: &AgentConfig, provider: &str) -> Result<ModelRef> {
+    model_for_provider(&ProviderName::new(provider), cfg)
+}
+
+/// The identity a `(provider, model)` argument pair names, against the identity
+/// `cfg` is already on.
+///
+/// The three shapes a source can spell, and only these:
+/// - both → that exact identity;
+/// - a model alone → [`ModelSpec::ModelOnly`]: same provider, new model;
+/// - a provider alone → the fallback chain ([`provider_switch_ref`]) — NEVER
+///   `cfg`'s current model id, which belongs to the provider being left.
+fn named_pair_ref(
+    cfg: &AgentConfig,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<Option<ModelRef>> {
+    Ok(match (provider, model) {
+        (Some(p), Some(m)) => Some(ModelRef::new(ProviderName::new(p), m)?),
+        (Some(p), None) => Some(provider_switch_ref(cfg, p)?),
+        (None, Some(m)) => Some(ModelSpec::ModelOnly(m.to_string()).apply(&cfg.model)),
+        (None, None) => None,
+    })
+}
+
 /// Apply the `task` tool's ad-hoc `provider`/`model` arguments on top of an
-/// already-resolved config (post agent-profile). With `provider`: auth-gate
-/// the target (fail fast before spawning) and repoint. Without: `model`
-/// overrides on the current provider — today's behaviour.
+/// already-resolved config (post agent-profile). With `provider`: auth-gate the
+/// target (fail fast before spawning) and switch. Without: `model` overrides on
+/// the current provider.
 fn apply_task_overrides(
     cfg: &mut AgentConfig,
     parent: &AgentConfig,
@@ -1199,7 +1227,7 @@ fn apply_task_overrides(
     model: Option<&str>,
 ) -> Result<()> {
     if let Some(pname) = provider {
-        // Resolve + gate against the PARENT's key/base_url, before repoint.
+        // Resolve + gate against the PARENT's key/base_url, before switching.
         let p = cfg.resolve_provider(pname).ok_or_else(|| {
             anyhow::anyhow!(
                 "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
@@ -1230,46 +1258,69 @@ fn apply_task_overrides(
             };
             bail!("task: provider '{pname}' is not configured — {hint}");
         }
-        if model.is_none() && p.model.is_none() {
+        if model.is_none()
+            && p.model.is_none()
+            && last_model_on(&ProviderName::new(pname)).is_none()
+        {
             bail!("task: provider '{pname}' requires an explicit model (it has no default)");
         }
-        let key = resolve_api_key(
-            pname,
-            &p,
-            cfg.api_key.as_deref(),
-            Some(cfg.base_url.as_str()),
-        )
+    }
+    let Some(reference) = named_pair_ref(cfg, provider, model)? else {
+        return Ok(());
+    };
+    // Key inheritance: the CHILD's own context first (it may already sit on this
+    // endpoint), then the parent's. `AuthContext` carries the endpoint each key
+    // belongs to, so `resolve_api_key`'s `same_endpoint` guard can refuse to hand
+    // a credential to a different provider's host. Snapshotted (owned) because
+    // `apply_model_ref` mutates the very config they borrow from.
+    let (child_key, child_url) = (cfg.api_key.clone(), cfg.base_url.clone());
+    let child_ctx = AuthContext {
+        api_key: child_key.as_deref(),
+        base_url: &child_url,
+    };
+    let parent_ctx = AuthContext {
+        api_key: parent.api_key.as_deref(),
+        base_url: parent.base_url.as_str(),
+    };
+    let inherited = resolve(&reference, cfg, Some(&child_ctx))
+        .ok()
+        .and_then(|r| r.api_key().map(str::to_string))
         .or_else(|| {
-            resolve_api_key(
-                pname,
-                &p,
-                parent.api_key.as_deref(),
-                Some(parent.base_url.as_str()),
-            )
+            resolve(&reference, cfg, Some(&parent_ctx))
+                .ok()
+                .and_then(|r| r.api_key().map(str::to_string))
         });
-        repoint_to_provider(cfg, pname, model)?;
-        cfg.api_key = key;
-    } else if let Some(m) = model {
-        cfg.model = m.to_string();
+    apply_model_ref(cfg, reference, Some(&child_ctx))?;
+    if provider.is_some() {
+        cfg.api_key = inherited;
     }
     Ok(())
 }
 
 /// Apply a named agent profile onto `base`: (if the profile names a provider)
-/// repoint the endpoint, auth, headers, and `api-version` to that provider and
-/// adopt its model — so the agent can run on a **different provider** — then set
-/// the persona, tool scope, and runtime knobs. Used both for delegated
-/// sub-agents (with a [`subagent_base_config`] base) and for `--agent` primary
-/// mode (applied directly onto the main config, keeping delegation + MCP).
+/// switch the identity — endpoint, auth, headers, and `api-version` follow it — so
+/// the agent can run on a **different provider**, then set the persona, tool
+/// scope, and runtime knobs. Used both for delegated sub-agents (with a
+/// [`subagent_base_config`] base) and for `--agent` primary mode (applied directly
+/// onto the main config, keeping delegation + MCP).
 pub fn config_for_agent_profile(
     base: &AgentConfig,
     profile: &SubagentProfile,
 ) -> Result<AgentConfig> {
     let mut cfg = base.clone();
-    if let Some(pname) = profile.provider.as_deref() {
-        repoint_to_provider(&mut cfg, pname, profile.model.as_deref())?;
-    } else if let Some(m) = &profile.model {
-        cfg.model = m.clone();
+    if let Some(reference) =
+        named_pair_ref(&cfg, profile.provider.as_deref(), profile.model.as_deref())?
+    {
+        // The profile's own endpoint inherits the parent's key only across the
+        // SAME endpoint (`resolve_api_key`'s guard) — a profile naming another
+        // provider must not be handed this one's credential. Snapshotted: the
+        // apply below mutates the config these borrow from.
+        let (key, url) = (cfg.api_key.clone(), cfg.base_url.clone());
+        let parent_ctx = AuthContext {
+            api_key: key.as_deref(),
+            base_url: &url,
+        };
+        apply_model_ref(&mut cfg, reference, Some(&parent_ctx))?;
     }
     // Persona + tool scope: an explicit `tools` list wins; otherwise `read_only`
     // (resolved to the read-only tool set in `Agent::new`, which has the registry).
@@ -1478,14 +1529,21 @@ impl hrdr_tools::Tool for SubagentTool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        cfg.base_url = runtime.endpoint.base_url;
-        cfg.api_key = runtime.endpoint.api_key;
-        cfg.api_version = runtime.endpoint.api_version;
-        cfg.headers = runtime.endpoint.configured_headers;
-        cfg.provider = runtime.endpoint.provider;
-        cfg.model = runtime
-            .explicit_subagent_model
-            .unwrap_or(runtime.endpoint.model);
+        // The parent's LIVE resolved endpoint, whole — identity, endpoint, key,
+        // api-version and headers together, exactly as the parent resolved them (a
+        // relocation included). Overlaying them one at a time is what let a
+        // sub-agent end up on one provider's endpoint with another's model.
+        let live = runtime.endpoint.resolved;
+        cfg.base_url = live.base_url().to_string();
+        cfg.api_key = live.api_key().map(str::to_string);
+        cfg.api_version = live.api_version().map(str::to_string);
+        cfg.headers = live.headers().to_vec();
+        // The sub-agent model rides on the parent's PROVIDER — a bare model id
+        // never changes which endpoint it is sent to.
+        cfg.model = match &runtime.explicit_subagent_model {
+            Some(m) => ModelSpec::ModelOnly(m.clone()).apply(live.reference()),
+            None => live.reference().clone(),
+        };
         cfg.effort = runtime.endpoint.effort;
         // The parent's *live* endpoint + key, captured before an agent profile can
         // repoint `cfg` away from it. This — not `self.base` — is the context an
@@ -1522,6 +1580,7 @@ impl hrdr_tools::Tool for SubagentTool {
                     .resolve_provider(provider)
                     .and_then(|p| p.model)
                     .is_none()
+                && last_model_on(&ProviderName::new(provider)).is_none()
                 && task_model.is_none()
             {
                 bail!(
@@ -1544,7 +1603,7 @@ impl hrdr_tools::Tool for SubagentTool {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         apply_task_overrides(&mut cfg, &live_parent, provider_arg, model_arg)?;
-        if cfg.model == "default" {
+        if cfg.has_default_model() {
             bail!(
                 "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
                  `--model` / `--subagent-model` on the CLI"
@@ -1558,9 +1617,9 @@ impl hrdr_tools::Tool for SubagentTool {
         // before both the background and blocking spawns below.
         cfg.context_window = subagent_context_window(
             cfg.context_window,
-            cfg.provider.as_deref(),
+            Some(cfg.model.provider().as_str()),
             &cfg.base_url,
-            &cfg.model,
+            cfg.model.model(),
         );
         let label = args
             .get("description")
@@ -1634,7 +1693,7 @@ impl hrdr_tools::Tool for SubagentTool {
             None => None,
         };
 
-        let model = cfg.model.clone();
+        let model = cfg.model.model().to_string();
         ctx.emit(format!("↳ task ({model}): {label}\n"));
 
         // Open a durable transcript for this sub-agent (best-effort — a failure
@@ -1652,7 +1711,7 @@ impl hrdr_tools::Tool for SubagentTool {
         }
 
         // Captured before `cfg` is moved into the sub-agent.
-        let provider_for_run = cfg.provider.clone();
+        let provider_for_run = Some(cfg.model.provider().to_string());
         let base_url_for_live = cfg.base_url.clone();
         let usage_for_live = subagent_usage(&cfg);
         let mut sub =
@@ -1788,11 +1847,28 @@ impl hrdr_tools::Tool for SubagentTool {
 }
 
 /// Agent configuration.
+///
+/// The model identity — WHICH model at WHICH provider — is the single
+/// [`model`](Self::model) field. `base_url` / `api_key` / `api_version` /
+/// `headers` are **derived** from it: they are the cached output of
+/// [`resolve`] for that identity (possibly relocated onto a `--base-url`
+/// override), not four independently-authoritative settings. Writing one of them
+/// by hand does not change which model is in force; changing the identity
+/// re-derives all of them together.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// DERIVED from [`model`](Self::model) (see the struct docs): the endpoint
+    /// [`resolve`] produced for it, unless a `--base-url` / `$HRDR_BASE_URL`
+    /// override relocated the provider elsewhere.
     pub base_url: String,
+    /// DERIVED from [`model`](Self::model): the credential [`resolve_api_key`]
+    /// found for its provider (inline → `key_env` → the `/login` store).
     pub api_key: Option<String>,
-    pub model: String,
+    /// The model identity: the provider AND the model id, as ONE value. A
+    /// mismatched pair (an OpenRouter model id against the Anthropic endpoint) is
+    /// not representable. Defaults to `local://default` — "the OpenAI-compatible
+    /// server I run, and whatever model it serves".
+    pub model: ModelRef,
     pub cwd: PathBuf,
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
@@ -1802,20 +1878,23 @@ pub struct AgentConfig {
     /// unlimited. Estimates come from the models.dev catalog; calls on an
     /// unpriced model count as $0.
     pub max_cost: Option<f64>,
-    /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
-    /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
-    pub provider: Option<String>,
-    /// `model` was set by a CLI flag or `$HRDR_MODEL`, which outrank a resumed
-    /// session's model. A value from the config file (or a provider preset's
-    /// default) leaves this false, so a session may override it.
+    /// The model identity was set by a CLI flag (`--model` / `--provider`) or by
+    /// `$HRDR_MODEL` / `$HRDR_PROVIDER`, which outrank a resumed session's. A value
+    /// from the config file (or a provider preset's default) leaves this false, so
+    /// a session may override it.
+    ///
+    /// There is ONE pin, because there is one identity: pinning half of it was how
+    /// a provider and a model that never agreed got to travel together.
     ///
     /// Precedence: flag > env > session > config.
     pub model_pinned: bool,
-    /// `provider` was set by a CLI flag or `$HRDR_PROVIDER`. See
-    /// [`AgentConfig::model_pinned`].
-    pub provider_pinned: bool,
-    /// Model context window in tokens, for the status bar's "X of Y" display.
-    /// Probed from the endpoint when unset; set in config to override.
+    /// The USER-CONFIGURED context window (`context_window` in config.toml, or a
+    /// `[providers.<name>].context_window`), in tokens — for the status bar's
+    /// "X of Y" and the auto-compaction trigger.
+    ///
+    /// An override, and the top of the precedence: it wins over the window derived
+    /// from `(endpoint, model)` (see [`ResolvedModel::context_window`]) and over an
+    /// endpoint probe. `None` = nothing configured; the agent derives or probes one.
     pub context_window: Option<u32>,
     /// Output-token cap (`max_tokens`). Required by the native Anthropic backend
     /// (`None` uses its 8192 default); on the OpenAI path it's sent only when set.
@@ -1911,11 +1990,11 @@ pub struct AgentConfig {
     /// them for a local server (which may reject the content-parts form). `None`
     /// means `auto`. See [`resolve_cache_mode`].
     pub prompt_cache: Option<String>,
-    /// Extra HTTP headers for the active provider (from its `[providers.<name>]`
-    /// `headers`), sent with every request. Populated when a provider is resolved.
+    /// DERIVED from [`model`](Self::model): the extra HTTP headers of its provider
+    /// (from `[providers.<name>].headers`), sent with every request.
     pub headers: Vec<(String, String)>,
-    /// Azure OpenAI API version for the active provider (see
-    /// [`ProviderConfig::api_version`]); enables the Azure URL + auth quirks.
+    /// DERIVED from [`model`](Self::model): its provider's Azure OpenAI API version
+    /// (see [`ProviderConfig::api_version`]); enables the Azure URL + auth quirks.
     pub api_version: Option<String>,
     /// Expose the `task` tool so the model can delegate self-contained sub-tasks
     /// to a fresh sub-agent. Default `true`; forced `false` inside a sub-agent so
@@ -2303,14 +2382,15 @@ impl Default for AgentConfig {
         Self {
             base_url: "http://localhost:8080/v1".to_string(),
             api_key: None,
-            model: "default".to_string(),
+            // `local` IS the default endpoint (`http://localhost:8080/v1`) and
+            // `default` IS the default model id — the pair the two old fields
+            // carried, now spelled as the one identity they always were.
+            model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
             model_pinned: false,
-            provider_pinned: false,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 300,
             max_cost: None,
-            provider: None,
             context_window: None,
             max_tokens: None,
             top_p: None,
@@ -2358,33 +2438,72 @@ impl Default for AgentConfig {
     }
 }
 
+/// The identity a config with nothing set runs on: an OpenAI-compatible server
+/// the user runs themselves (`http://localhost:8080/v1`), serving whatever model
+/// it was started with (`default` — let the endpoint pick).
+pub const DEFAULT_MODEL_REF: &str = "local://default";
+
+/// The model id meaning "whatever this endpoint serves" — not a model name.
+/// A remote provider needs a real id; this sentinel is only ever right for a
+/// local server that serves one model.
+pub const DEFAULT_MODEL: &str = "default";
+
 impl AgentConfig {
     /// Resolve a provider name to a preset: a `[providers.<name>]` entry from
     /// config takes precedence over the built-ins (`zen`/`openai`/`local`).
     pub fn resolve_provider(&self, name: &str) -> Option<ResolvedProvider> {
-        let lname = name.trim().to_ascii_lowercase();
-        if let Some((_, c)) = self
-            .providers
-            .iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == lname)
-        {
-            return Some(ResolvedProvider {
-                base_url: c.base_url.clone(),
-                key_env: c.key_env.clone(),
-                api_key: c.api_key.clone(),
-                model: c.model.clone(),
-                remote: c.remote.unwrap_or(true),
-                context_window: c.context_window,
-                headers: c.headers.clone(),
-                api_version: c.api_version.clone(),
-                // A user-defined entry is Custom — never OAuth-trusted, even when
-                // spelled `chatgpt`/`codex`/`openai-oauth`. This branch runs
-                // BEFORE `builtin_provider`, so it shadows the built-in name.
-                kind: ResolvedProviderKind::Custom,
-            });
-        }
-        builtin_provider(name)
+        resolve_provider_in(&self.providers, name)
     }
+
+    /// Whether the identity in force is the `default` model sentinel — i.e. no
+    /// real model id was ever named (see [`DEFAULT_MODEL`]).
+    pub fn has_default_model(&self) -> bool {
+        self.model.model() == DEFAULT_MODEL
+    }
+}
+
+/// [`AgentConfig::resolve_provider`] against a bare provider table — the form
+/// [`resolve_in`] and a live [`Agent`] need (neither holds a whole config).
+pub fn resolve_provider_in(
+    providers: &HashMap<String, ProviderConfig>,
+    name: &str,
+) -> Option<ResolvedProvider> {
+    let lname = name.trim().to_ascii_lowercase();
+    if let Some((_, c)) = providers
+        .iter()
+        .find(|(k, _)| k.to_ascii_lowercase() == lname)
+    {
+        return Some(ResolvedProvider {
+            base_url: c.base_url.clone(),
+            key_env: c.key_env.clone(),
+            api_key: c.api_key.clone(),
+            model: c.model.clone(),
+            remote: c.remote.unwrap_or(true),
+            context_window: c.context_window,
+            headers: c.headers.clone(),
+            api_version: c.api_version.clone(),
+            // A user-defined entry is Custom — never OAuth-trusted, even when
+            // spelled `chatgpt`/`codex`/`openai-oauth`. This branch runs
+            // BEFORE `builtin_provider`, so it shadows the built-in name.
+            kind: ResolvedProviderKind::Custom,
+        });
+    }
+    builtin_provider(name)
+}
+
+/// **The** Codex OAuth gate: the trusted [`ResolvedProviderKind::ChatGptOAuth`]
+/// kind AND the canonical [`CHATGPT_CODEX_BASE_URL`] endpoint.
+///
+/// Both halves are required, and this is the only place the conjunction is
+/// written. The kind alone is not enough — a built-in `chatgpt` provider
+/// relocated onto another URL by `--base-url` must not have the OAuth bearer or
+/// the `ChatGPT-Account-Id` header injected into it. The URL alone is not enough
+/// — a `[providers.*]` entry aimed at the Codex URL resolves `Custom` and never
+/// earns the account's credentials.
+///
+/// [`ResolvedModel::is_codex_oauth`] is the same test, asked of a resolved model.
+pub fn is_codex_oauth(kind: ResolvedProviderKind, base_url: &str) -> bool {
+    kind == ResolvedProviderKind::ChatGptOAuth && base_url == CHATGPT_CODEX_BASE_URL
 }
 
 /// One MCP server from a `[[mcp]]` config entry, registered with its tools
@@ -2579,18 +2698,6 @@ pub struct ResolvedProvider {
     pub kind: ResolvedProviderKind,
 }
 
-/// Complete provider transition applied before publishing live delegation state.
-#[derive(Debug, Clone)]
-pub struct ProviderSwitch {
-    pub name: String,
-    pub base_url: String,
-    pub api_key: Option<String>,
-    pub api_version: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub kind: ResolvedProviderKind,
-    pub model: Option<String>,
-}
-
 /// Canonical built-in provider names, in the order the `/login` wizard offers
 /// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
 pub const BUILTIN_PROVIDERS: &[&str] = &[
@@ -2767,16 +2874,11 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
 /// tool uses. Every other provider falls back to the OpenAI-compatible
 /// `/v1/models` listing.
 pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
-    let provider_kind = config
-        .provider
-        .as_deref()
-        .and_then(|n| config.resolve_provider(n))
-        .map(|p| p.kind)
-        .unwrap_or(ResolvedProviderKind::BuiltIn);
-    if provider_kind == ResolvedProviderKind::ChatGptOAuth
-        && config.base_url == CHATGPT_CODEX_BASE_URL
-    {
-        let access = coordinated_oauth_access(provider_kind, &config.base_url).await?;
+    // The identity resolved against this config — including the double gate,
+    // asked once (`is_codex_oauth`) rather than re-written here.
+    let resolved = ResolvedModel::from_config(config);
+    if resolved.is_codex_oauth() {
+        let access = coordinated_oauth_access(resolved.kind(), resolved.base_url()).await?;
         let catalog = chatgpt_model_catalog(&access, false).await;
         let mut ids: Vec<String> = catalog.models.into_iter().map(|m| m.slug).collect();
         ids.sort();
@@ -2785,7 +2887,7 @@ pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
     let client = Client::new(
         config.base_url.clone(),
         config.api_key.clone(),
-        config.model.clone(),
+        config.model.model().to_string(),
     );
     client.list_models().await
 }
@@ -2851,6 +2953,89 @@ struct FileConfig {
     lsp: Option<LspFileConfig>,
 }
 
+/// What a config SOURCE named about the model identity, in the two keys it
+/// spells it in (`provider = …` / `model = …`, `$HRDR_PROVIDER` / `$HRDR_MODEL`,
+/// `--provider` / `--model`).
+///
+/// The identity itself is one value ([`ModelRef`]) and the core only ever sees
+/// that. But the *sources* are two-key, and a source may name one half — so the
+/// halves exist for exactly as long as it takes to settle the precedence between
+/// sources, and then [`collapse`](Self::collapse) them. This is the edge, and the
+/// only place halves are allowed to be.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedModel {
+    /// The provider this source named, if any.
+    pub provider: Option<String>,
+    /// The model id this source named, if any.
+    pub model: Option<String>,
+}
+
+impl NamedModel {
+    /// What `$HRDR_PROVIDER` / `$HRDR_MODEL` name (empty when neither is set).
+    pub fn from_env() -> Self {
+        Self {
+            provider: std::env::var("HRDR_PROVIDER").ok(),
+            model: std::env::var("HRDR_MODEL").ok(),
+        }
+    }
+
+    /// Overlay a **higher-precedence** source: each half it names wins, each half
+    /// it is silent about leaves this one's alone.
+    pub fn layer(&mut self, higher: &Self) {
+        if let Some(p) = &higher.provider {
+            self.provider = Some(p.clone());
+        }
+        if let Some(m) = &higher.model {
+            self.model = Some(m.clone());
+        }
+    }
+
+    /// Collapse the halves onto `base` — the identity in force — into ONE
+    /// [`ModelRef`]. An unnamed half keeps `base`'s; an empty/whitespace one is
+    /// not a name and is ignored (`ModelRef` rejects it anyway).
+    ///
+    /// This is the *last* moment halves exist. Note what it does NOT do: it never
+    /// carries a model onto a provider that a different source named — that
+    /// judgement (`config_model_applies`, and the fallback chain in
+    /// [`model_for_provider`]) belongs to the caller layering the sources, which
+    /// is why this takes an explicit `base`.
+    pub fn collapse(&self, base: &ModelRef) -> ModelRef {
+        let provider = self
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map_or_else(|| base.provider().clone(), ProviderName::new);
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| base.model());
+        ModelRef::new(provider, model).unwrap_or_else(|_| base.clone())
+    }
+}
+
+/// What config.toml and the environment NAMED for the model identity — the raw
+/// halves, for the ONE caller that needs them: the CLI startup edge, which layers
+/// its own `--provider` / `--model` on top and settles the precedence between all
+/// three before collapsing them (see [`NamedModel::collapse`]).
+///
+/// [`AgentConfig::load`] has already collapsed these into
+/// [`AgentConfig::model`]; this says which halves were actually *named*, which is
+/// what the precedence rules turn on (a config `model` belongs to the config's
+/// `provider` and must not follow the user onto a `--provider` they passed).
+pub fn named_model() -> NamedModel {
+    let mut named = read_config_file::<FileConfig>()
+        .map(|fc| NamedModel {
+            provider: fc.provider,
+            model: fc.model,
+        })
+        .unwrap_or_default();
+    named.layer(&NamedModel::from_env());
+    named
+}
+
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
 /// `~/.config/hrdr` (cross-platform via home-dir detection). Shared by
 /// `config.toml` loading and the global `AGENTS.md` lookup so the two can't
@@ -2890,19 +3075,26 @@ impl AgentConfig {
     /// and fails to parse (for surfacing a warning + falling back to defaults).
     pub fn load_checked() -> Result<Self> {
         let mut cfg = Self::default();
+        let mut named = NamedModel::default();
         if let Some(fc) = read_config_file::<FileConfig>() {
+            named.provider = fc.provider.clone();
+            named.model = fc.model.clone();
             cfg.apply_file(fc);
         }
         cfg.apply_env();
-        // Env-supplied model/provider outrank a resumed session's; config-file
-        // ones don't (flag > env > session > config). The binary ORs in its
-        // `--model` / `--provider` flags on top of these.
-        cfg.model_pinned = std::env::var_os("HRDR_MODEL").is_some();
-        cfg.provider_pinned = std::env::var_os("HRDR_PROVIDER").is_some();
+        named.layer(&NamedModel::from_env());
+        cfg.model = named.collapse(&cfg.model);
+        // Env-supplied identity outranks a resumed session's; a config-file one
+        // doesn't (flag > env > session > config). The binary ORs in its `--model` /
+        // `--provider` flags on top of this. ONE pin, because there is one identity.
+        cfg.model_pinned = NamedModel::from_env() != NamedModel::default();
         Ok(cfg)
     }
 
-    /// Layer file values over the current config.
+    /// Layer file values over the current config. The identity's two keys
+    /// (`provider = …`, `model = …`) are picked up by [`load_checked`](Self::load_checked)
+    /// and collapsed there — a source may name one half, and a half is not an
+    /// identity.
     fn apply_file(&mut self, fc: FileConfig) {
         if let Some(v) = fc.base_url {
             self.base_url = v;
@@ -2910,14 +3102,8 @@ impl AgentConfig {
         if let Some(v) = fc.api_key {
             self.api_key = Some(v);
         }
-        if let Some(v) = fc.model {
-            self.model = v;
-        }
         if let Some(v) = fc.temperature {
             self.temperature = Some(v);
-        }
-        if let Some(v) = fc.provider {
-            self.provider = Some(v);
         }
         if let Some(v) = fc.context_window {
             self.context_window = Some(v);
@@ -3096,10 +3282,12 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// Env var → setter table used by [`AgentConfig::apply_env`]. Adding a knob is a
 /// single row here (non-capturing closures coerce to `fn` pointers). Values that
 /// need parsing (numbers, bools) silently keep the current value on a bad parse.
+///
+/// `$HRDR_PROVIDER` / `$HRDR_MODEL` are deliberately NOT here: they name halves
+/// of the one identity, and are collapsed into it by [`NamedModel`] rather than
+/// assigned one at a time.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
-    ("HRDR_PROVIDER", |c, v| c.provider = Some(v)),
     ("HRDR_BASE_URL", |c, v| c.base_url = v),
-    ("HRDR_MODEL", |c, v| c.model = v),
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
     ("HRDR_ALLOW_OUTSIDE_CWD", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
@@ -3506,18 +3694,27 @@ summary.";
 /// A running agent: model client + tools + conversation state.
 pub struct Agent {
     client: Client,
-    /// Configured provider name, when there is one. The models.dev catalog is
-    /// keyed `provider/model`, so the fallback probe needs it to disambiguate a
-    /// model several providers serve with different context windows.
-    provider: Option<String>,
-    /// Trust identity of the current provider — gates OAuth bearer/account
-    /// injection together with the canonical endpoint. Updated atomically with
-    /// the endpoint on every provider switch via [`Agent::set_provider_identity`].
-    provider_kind: ResolvedProviderKind,
-    /// The provider's configured (non-OAuth) headers. Held separately so an
-    /// OAuth refresh can rebuild the effective header set (configured + account)
-    /// and switching away restores exactly the configured headers.
-    configured_headers: Vec<(String, String)>,
+    /// **What this agent is running on**: the identity (provider AND model) and
+    /// everything derived from it — endpoint, key, api-version, headers, trust
+    /// kind, window. One value, moved as one by [`Agent::set_model_ref`], so the
+    /// client can never be talking to one provider with another's model, key or
+    /// trust.
+    ///
+    /// `client.model` / `client.base_url()` are this, applied — the wire copy.
+    resolved: ResolvedModel,
+    /// The `[providers.*]` table, kept so [`Agent::set_model_ref`] can re-resolve a
+    /// new identity against the user's config. The only part of [`AgentConfig`] the
+    /// agent must be able to re-read; everything else it has already unpacked.
+    providers: HashMap<String, ProviderConfig>,
+    /// A `--base-url` / `$HRDR_BASE_URL` / free-floating `base_url =` override in
+    /// force: the endpoint the resolved provider's is REPLACED by.
+    ///
+    /// It is a *relocation*, not a provider: this is still that provider, at an
+    /// address the user chose, so it survives a model change on the same provider
+    /// (`/model` on a local server on a nonstandard port must not snap back to
+    /// `:8080`). A switch to a DIFFERENT provider drops it — the new provider's
+    /// endpoint is its own. See [`Agent::relocate_endpoint`].
+    relocation: Option<Relocation>,
     /// Sanitized live model state shared with introspection and delegation tools.
     delegation_runtime: SharedDelegationRuntime,
     /// Sub-agents this agent has delegated to and is still holding — the
@@ -3602,10 +3799,10 @@ pub struct Agent {
     /// every delegated sub-agent's (the `task` tool hands each sub-agent this
     /// same counter). Std mutex — held only long enough to add.
     cost_total: Arc<std::sync::Mutex<f64>>,
-    /// Price-card memo for the current `(provider, model)`, so the catalog
-    /// isn't re-read on every usage event. The inner `None` remembers an
-    /// unpriced model (e.g. a local server).
-    cost_rates: Option<(String, Option<hrdr_llm::catalog::ModelCost>)>,
+    /// Price-card memo for the current identity, so the catalog isn't re-read on
+    /// every usage event. The inner `None` remembers an unpriced model (e.g. a
+    /// local server).
+    cost_rates: Option<(ModelRef, Option<hrdr_llm::catalog::ModelCost>)>,
     /// Abort the turn before the next model call once `cost_total` reaches
     /// this many USD ([`AgentConfig::max_cost`]).
     max_cost: Option<f64>,
@@ -3736,33 +3933,29 @@ fn build_system_prompt(
     Ok(append_persona(append_memory(system, memory), persona))
 }
 
+/// An endpoint override in force — see [`Agent::relocation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Relocation {
+    base_url: String,
+    api_key: Option<String>,
+}
+
 /// The initial delegation-runtime projection for `config`. The single place the
 /// live-state cell is built from a config, so `Agent::new` and any other
 /// constructor cannot seed it differently.
-///
-/// `api_key` here is the *resolved provider credential*. The ChatGPT OAuth bearer
-/// is injected straight into the client and deliberately never lands here, so it
-/// is never handed to a sub-agent.
 fn new_delegation_runtime(
     config: &AgentConfig,
-    provider_kind: ResolvedProviderKind,
+    resolved: &ResolvedModel,
 ) -> SharedDelegationRuntime {
     Arc::new(Mutex::new(DelegationRuntime {
         public: PublicModelRuntime {
-            provider: config.provider.clone(),
-            model: config.model.clone(),
+            reference: config.model.clone(),
             effort: config.effort.clone(),
             delegation_enabled: config.subagents,
         },
         endpoint: DelegationEndpoint {
-            provider: config.provider.clone(),
-            model: config.model.clone(),
+            resolved: resolved.clone(),
             effort: config.effort.clone(),
-            base_url: config.base_url.clone(),
-            api_key: config.api_key.clone(),
-            api_version: config.api_version.clone(),
-            configured_headers: config.headers.clone(),
-            provider_kind,
         },
         explicit_subagent_model: config.subagent_model.clone(),
     }))
@@ -3772,18 +3965,26 @@ impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
         let mut tools = ToolRegistry::with_defaults();
-        let provider_kind = config
-            .provider
-            .as_deref()
-            .and_then(|n| config.resolve_provider(n))
-            .map(|p| p.kind)
-            .unwrap_or(ResolvedProviderKind::BuiltIn);
-        let configured_headers = config.headers.clone();
-        let delegation_runtime = new_delegation_runtime(&config, provider_kind);
+        // The identity's endpoint is ADOPTED from the config, not re-derived: those
+        // fields are what an earlier `resolve()` produced, and a `--base-url` may
+        // have relocated them since. Re-resolving here would silently undo that.
+        let resolved = ResolvedModel::from_config(&config);
+        // …and whether it *is* a relocation is exactly "the provider would have
+        // resolved somewhere else". Remembered, so a later model switch on the same
+        // provider keeps the endpoint the user chose (see `Agent::relocation`).
+        let relocation = resolve(&config.model, &config, None)
+            .ok()
+            .filter(|p| p.base_url() == config.base_url && p.api_key() == config.api_key.as_deref())
+            .is_none()
+            .then(|| Relocation {
+                base_url: config.base_url.clone(),
+                api_key: config.api_key.clone(),
+            });
+        let delegation_runtime = new_delegation_runtime(&config, &resolved);
         let live_subagents = LiveSubagents::new();
         tools.register(Arc::new(ModelsTool {
             runtime: Arc::clone(&delegation_runtime),
-            available: available_models(&config, config.provider.as_deref()),
+            available: available_models(&config, Some(config.model.provider().as_str())),
         }));
         // Expose the `task` delegation tool unless disabled (or this *is* a
         // sub-agent). Registered before the system prompt is rendered so it's
@@ -3993,8 +4194,12 @@ impl Agent {
         ctx.checkpoints = checkpoints.clone();
 
         let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
-        let mut client =
-            Client::new(config.base_url, config.api_key, config.model).with_cache(cache_mode);
+        let mut client = Client::new(
+            config.base_url,
+            config.api_key,
+            config.model.model().to_string(),
+        )
+        .with_cache(cache_mode);
         if let Some(t) = config.temperature {
             client = client.with_temperature(t);
         }
@@ -4013,9 +4218,9 @@ impl Agent {
 
         Ok(Self {
             client,
-            provider: config.provider.clone(),
-            provider_kind,
-            configured_headers,
+            resolved,
+            providers: config.providers,
+            relocation,
             delegation_runtime,
             live_subagents,
             live_home: None,
@@ -4273,15 +4478,12 @@ impl Agent {
                 .delegation_runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            runtime.public.provider = self.provider.clone();
-            runtime.public.model = self.client.model.clone();
+            // The whole resolved identity, in one assignment — a sub-agent spawned
+            // after any switch inherits an endpoint that agrees with itself.
+            runtime.public.reference = self.resolved.reference().clone();
             runtime.public.effort = self.client.effort().map(str::to_string);
-            runtime.endpoint.provider = self.provider.clone();
-            runtime.endpoint.model = self.client.model.clone();
+            runtime.endpoint.resolved = self.resolved.clone();
             runtime.endpoint.effort = self.client.effort().map(str::to_string);
-            runtime.endpoint.base_url = self.client.base_url().to_string();
-            runtime.endpoint.provider_kind = self.provider_kind;
-            runtime.endpoint.configured_headers = self.configured_headers.clone();
         }
         self.publish_chrome();
     }
@@ -4294,7 +4496,7 @@ impl Agent {
             return; // headless / not displayed: nothing to publish to
         };
         let model = self.client.model.clone();
-        let provider = self.provider.clone();
+        let provider = Some(self.provider_name().to_string());
         let base_url = self.client.base_url().to_string();
         let effort = self.client.effort().map(str::to_string);
         let window = self.context_window;
@@ -4314,33 +4516,100 @@ impl Agent {
         });
     }
 
-    /// Switch the model for subsequent turns.
-    pub fn set_model(&mut self, model: impl Into<String>) {
-        self.client.model = model.into();
+    /// **Switch what this agent is running on.** The one mutator.
+    ///
+    /// A [`ModelRef`] is a complete identity, and everything downstream of it moves
+    /// with it, in one step: the endpoint, the API key, the api-version, the
+    /// headers, the client's model, the prompt-cache mode (an endpoint fact), the
+    /// trust kind (which gates OAuth injection), the price card, the context window
+    /// (invalidated — the old figure described a different model), and the runtime
+    /// projection sub-agents inherit.
+    ///
+    /// There is deliberately no way to move one of those without the others. The
+    /// five setters this replaces (`set_model`, `set_provider`, `set_endpoint`,
+    /// `apply_provider_switch`, `set_provider_identity`) each moved a subset, and
+    /// every caller had to remember the rest — which is how a model got to outlive
+    /// the provider it belongs to.
+    ///
+    /// Errors (leaving the agent untouched) when the identity names a provider that
+    /// is neither a built-in nor a `[providers.<name>]`.
+    pub fn set_model_ref(&mut self, reference: ModelRef) -> Result<()> {
+        // A relocation belongs to the provider it relocated — keep it across a model
+        // change on that same provider, drop it when the provider itself changes.
+        let same_provider = reference.provider() == self.resolved.reference().provider();
+        if !same_provider {
+            self.relocation = None;
+        }
+        let mut resolved = resolve_in(&self.providers, &reference, None)?;
+        if let Some(r) = &self.relocation {
+            resolved.relocate(r.base_url.clone(), r.api_key.clone());
+        }
+        self.adopt_resolved(resolved);
+        Ok(())
+    }
+
+    /// Move the resolved endpoint elsewhere (`--base-url`) — a **relocation**, not
+    /// a provider switch: the identity, its trust kind and its catalog keep
+    /// pointing at the same provider, which is now simply reachable at another
+    /// address. There is no provider-less state to fall into.
+    ///
+    /// The trust gate re-evaluates honestly against the new URL: a built-in ChatGPT
+    /// relocated off the Codex endpoint stops passing [`ResolvedModel::is_codex_oauth`]
+    /// and is never handed the account's bearer. The key recorded for delegation is
+    /// the one passed here — a *resolved* credential; the ChatGPT OAuth bearer is
+    /// injected straight into the client by [`Agent::refresh_oauth_if_needed`] and
+    /// never travels through here, so it is never handed to a sub-agent.
+    pub fn relocate_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
+        let base_url = base_url.into();
+        self.relocation = Some(Relocation {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+        });
+        let mut resolved = self.resolved.clone();
+        resolved.relocate(base_url, api_key);
+        self.adopt_resolved(resolved);
+    }
+
+    /// Apply a resolved identity to the client and the runtime, atomically. The
+    /// single writer of `self.resolved`.
+    fn adopt_resolved(&mut self, resolved: ResolvedModel) {
+        let cache = resolve_cache_mode(self.prompt_cache.as_deref(), resolved.base_url());
+        self.client.set_base_url(resolved.base_url().to_string());
+        self.client
+            .set_api_key(resolved.api_key().map(str::to_string));
+        self.client.set_cache(cache);
+        self.client.set_headers(resolved.headers().to_vec());
+        self.client
+            .set_api_version(resolved.api_version().map(str::to_string));
+        self.client.model = resolved.reference().model().to_string();
+        self.resolved = resolved;
         self.cost_rates = None;
         // A different model has a different window; the old figure is not ours.
         self.invalidate_context_window();
         self.publish_delegation_runtime();
     }
 
-    /// Repoint the agent at a named provider (for the catalog lookup; the
-    /// endpoint itself is set by [`Self::set_endpoint`]).
-    pub fn set_provider(&mut self, provider: Option<String>) {
-        self.provider = provider;
-        self.cost_rates = None;
-        self.invalidate_context_window();
-        self.publish_delegation_runtime();
+    /// What this agent is running on: provider AND model, as one value.
+    pub fn model_ref(&self) -> &ModelRef {
+        self.resolved.reference()
+    }
+
+    /// The identity resolved against the config — endpoint, key, headers, trust
+    /// kind, window. Derived state; the [`ModelRef`] is what is authoritative.
+    pub fn resolved(&self) -> &ResolvedModel {
+        &self.resolved
     }
 
     /// The current provider's trust identity — lets callers (health probe,
     /// `/doctor`) special-case trusted ChatGPT OAuth without re-resolving.
     pub fn provider_kind(&self) -> ResolvedProviderKind {
-        self.provider_kind
+        self.resolved.kind()
     }
 
-    /// The configured provider's name, when one is set.
-    pub fn provider_name(&self) -> Option<String> {
-        self.provider.clone()
+    /// The provider this agent is on. Always a name: an agent without a provider
+    /// is not a thing that can exist any more.
+    pub fn provider_name(&self) -> &str {
+        self.resolved.reference().provider().as_str()
     }
 
     /// The model this agent will actually send to.
@@ -4362,15 +4631,10 @@ impl Agent {
     /// which says nothing about the endpoint and everything about the missing
     /// credential.
     pub fn has_credential(&self) -> bool {
-        if self.provider_kind == ResolvedProviderKind::ChatGptOAuth {
+        if self.resolved.kind() == ResolvedProviderKind::ChatGptOAuth {
             return true;
         }
-        self.delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .endpoint
-            .api_key
-            .is_some()
+        self.resolved.api_key().is_some()
     }
 
     /// A clone of the model client (for out-of-band calls like the startup
@@ -4389,16 +4653,12 @@ impl Agent {
     /// catalog, memoized per pair — the inner `None` remembers an unpriced
     /// model (a local server) so the catalog isn't re-read every call.
     async fn current_cost_rates(&mut self) -> Option<hrdr_llm::catalog::ModelCost> {
-        let key = format!(
-            "{}/{}",
-            self.provider.as_deref().unwrap_or(""),
-            self.client.model
-        );
-        if self.cost_rates.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+        let key = self.resolved.reference().clone();
+        if self.cost_rates.as_ref().map(|(k, _)| k) != Some(&key) {
             // The catalog's namespace, not the app's — see `catalog_provider_key`.
             let rates = hrdr_llm::catalog::model_cost(
-                catalog_provider_key(self.provider.as_deref()).as_deref(),
-                &self.client.model,
+                catalog_provider_key(Some(key.provider().as_str())).as_deref(),
+                key.model(),
             )
             .await;
             self.cost_rates = Some((key, rates));
@@ -4452,14 +4712,10 @@ impl Agent {
         // cross-provider fallback would return the same-id API model's (different)
         // window. Mirrors `context_window_for`; keeps every probe path consistent.
         if self.client.base_url() == CHATGPT_CODEX_BASE_URL {
-            return context_window_for(
-                self.provider.as_deref(),
-                self.client.base_url(),
-                &self.client.model,
-            );
+            return self.resolved.context_window();
         }
         hrdr_llm::catalog::context_window(
-            catalog_provider_key(self.provider.as_deref()).as_deref(),
+            catalog_provider_key(Some(self.provider_name())).as_deref(),
             &self.client.model,
         )
         .await
@@ -4547,34 +4803,6 @@ impl Agent {
             == hrdr_llm::CacheMode::Ephemeral
     }
 
-    /// Apply a complete provider transition, then publish one coherent runtime
-    /// projection for introspection and subsequent delegation.
-    pub fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
-        let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &switch.base_url);
-        self.client.set_base_url(switch.base_url);
-        self.client.set_api_key(switch.api_key.clone());
-        self.client.set_cache(cache);
-        self.client.set_headers(switch.headers.clone());
-        self.client.set_api_version(switch.api_version.clone());
-        self.provider = Some(switch.name);
-        self.provider_kind = switch.kind;
-        self.configured_headers = switch.headers;
-        if let Some(model) = switch.model {
-            self.client.model = model;
-        }
-        self.cost_rates = None;
-        self.invalidate_context_window();
-
-        let mut runtime = self
-            .delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        runtime.endpoint.api_key = switch.api_key;
-        runtime.endpoint.api_version = switch.api_version;
-        drop(runtime);
-        self.publish_delegation_runtime();
-    }
-
     /// Set (or clear) the sampling temperature.
     pub fn set_temperature(&mut self, t: Option<f32>) {
         self.client.temperature = t;
@@ -4584,54 +4812,6 @@ impl Agent {
     /// each request when it names a known level; other labels are display-only.
     pub fn set_effort(&mut self, effort: Option<String>) {
         self.client.set_effort(effort);
-        self.publish_delegation_runtime();
-    }
-
-    /// Replace the provider-configured extra HTTP headers (used on a provider
-    /// switch so the new provider's headers apply).
-    ///
-    /// Prefer [`Agent::apply_provider_switch`], which applies a whole provider
-    /// transition at once. This publishes the delegation runtime on its own so a
-    /// caller that reaches for the individual setters cannot leave sub-agents
-    /// pointed at the previous provider.
-    pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
-        self.client.set_headers(headers.clone());
-        self.configured_headers = headers;
-        self.publish_delegation_runtime();
-    }
-
-    /// Set the Azure OpenAI API version (used on a provider switch); `None`
-    /// for a standard endpoint. See [`Agent::set_headers`] on preferring
-    /// [`Agent::apply_provider_switch`].
-    pub fn set_api_version(&mut self, api_version: Option<String>) {
-        self.client.set_api_version(api_version.clone());
-        self.delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .endpoint
-            .api_version = api_version;
-        self.publish_delegation_runtime();
-    }
-
-    /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
-    /// See [`Agent::set_headers`] on preferring [`Agent::apply_provider_switch`].
-    ///
-    /// The key recorded for delegation is the one passed here — a *resolved*
-    /// provider credential. The ChatGPT OAuth bearer is injected straight into
-    /// the client by [`Agent::refresh_oauth_if_needed`] and deliberately never
-    /// travels through here, so it is never handed to a sub-agent; a ChatGPT
-    /// sub-agent re-derives its own token through the shared refresh coordinator.
-    pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
-        let base_url = base_url.into();
-        let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &base_url);
-        self.client.set_base_url(base_url);
-        self.client.set_api_key(api_key.clone());
-        self.client.set_cache(cache);
-        self.delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .endpoint
-            .api_key = api_key;
         self.publish_delegation_runtime();
     }
 
@@ -5226,11 +5406,8 @@ impl Agent {
             return;
         }
         self.context_window_probed = true;
-        self.context_window = context_window_for(
-            self.provider.as_deref(),
-            self.client.base_url(),
-            &self.client.model,
-        );
+        // The window the identity resolved to — `(endpoint, model)`, network-free.
+        self.context_window = self.resolved.context_window();
     }
 
     /// Forget what we knew about the window — the model or endpoint changed, so
@@ -5488,45 +5665,31 @@ impl Agent {
         }
     }
 
-    /// Update the trust identity when the endpoint changes. Called by every
-    /// provider switch so `provider_kind`/`configured_headers` stay in lockstep
-    /// with the client's `base_url` — a stale kind would misgate OAuth injection.
-    pub fn set_provider_identity(
-        &mut self,
-        kind: ResolvedProviderKind,
-        configured_headers: Vec<(String, String)>,
-    ) {
-        self.provider_kind = kind;
-        self.configured_headers = configured_headers;
-        self.publish_delegation_runtime();
-    }
-
     /// Before a request, inject fresh OAuth credentials for trusted ChatGPT, or
     /// strip any stale OAuth state when this is not ChatGPT.
     ///
-    /// Injection is gated on BOTH the trusted [`ResolvedProviderKind::ChatGptOAuth`]
-    /// kind AND the canonical [`CHATGPT_CODEX_BASE_URL`] endpoint — a custom
-    /// shadow or a `--base-url` override never receives the bearer/account
-    /// header. On the non-ChatGPT path the configured headers are restored
-    /// (dropping any `ChatGPT-Account-Id` left over from a prior ChatGPT turn);
-    /// the API key is left untouched (it is the key provider's real credential).
+    /// The gate is [`ResolvedModel::is_codex_oauth`] — the trusted kind AND the
+    /// canonical endpoint, one definition — so a custom shadow or a relocated
+    /// endpoint never receives the bearer/account header. On the non-ChatGPT path
+    /// the resolved provider's own headers are restored (dropping any
+    /// `ChatGPT-Account-Id` left over from a prior ChatGPT turn); the API key is
+    /// left untouched (it is the key provider's real credential).
     async fn refresh_oauth_if_needed(&mut self) {
-        let base_url = self.client.base_url().to_string();
-        let is_chatgpt = self.provider_kind == ResolvedProviderKind::ChatGptOAuth
-            && base_url == CHATGPT_CODEX_BASE_URL;
-        if !is_chatgpt {
+        if !self.resolved.is_codex_oauth() {
             // Defensive: ensure no stale bearer/account header survives a switch
             // away from ChatGPT. Idempotent for a steady-state key provider.
             if self.client.extra_headers_contains("ChatGPT-Account-Id") {
-                self.client.set_headers(self.configured_headers.clone());
+                self.client.set_headers(self.resolved.headers().to_vec());
             }
             return;
         }
         // A failed refresh leaves the previous state untouched; the authenticated
-        // catalog/health path (Task 3/5) surfaces a genuine auth warning.
-        if let Ok(access) = oauth::coordinated_oauth_access(self.provider_kind, &base_url).await {
+        // catalog/health path surfaces a genuine auth warning.
+        if let Ok(access) =
+            oauth::coordinated_oauth_access(self.resolved.kind(), self.resolved.base_url()).await
+        {
             self.client.set_api_key(Some(access.access));
-            let mut headers = self.configured_headers.clone();
+            let mut headers = self.resolved.headers().to_vec();
             if let Some(id) = access.account_id {
                 headers.push(("ChatGPT-Account-Id".to_string(), id));
             }
@@ -5967,6 +6130,11 @@ mod tests {
 
     use std::sync::Arc;
 
+    /// A complete identity from its wire form — what a config carries now.
+    fn r(s: &str) -> super::ModelRef {
+        s.parse().expect("a valid provider://model")
+    }
+
     /// A new conversation starts from the `AGENTS.md` that is on disk *now*, and
     /// says so when that differs from what was in the prompt.
     ///
@@ -6112,15 +6280,14 @@ mod tests {
     #[tokio::test]
     async fn models_reports_live_state_without_secrets() {
         let mut agent = Agent::new(AgentConfig {
-            provider: Some("openai".to_string()),
-            model: "old".to_string(),
+            model: r("openai://old"),
             effort: Some("high".to_string()),
             api_key: Some("top-secret".to_string()),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
-        agent.set_model("new");
+        agent.set_model_ref(r("openai://new")).unwrap();
         let out = agent
             .tools
             .execute("models", serde_json::json!({}), &agent.ctx)
@@ -6147,8 +6314,7 @@ mod tests {
     #[tokio::test]
     async fn models_flags_the_row_the_agent_is_running_on() {
         let agent = Agent::new(AgentConfig {
-            provider: Some("openai".to_string()),
-            model: "gpt-5".to_string(),
+            model: r("openai://gpt-5"),
             api_key: Some("k".to_string()),
             checkpoints: Some("off".to_string()),
             ..Default::default()
@@ -6218,7 +6384,7 @@ mod tests {
     #[tokio::test]
     async fn models_available_filters_default_and_returns_valid_json() {
         let agent = Agent::new(AgentConfig {
-            model: "default".to_string(),
+            model: r("local://default"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
@@ -6290,15 +6456,21 @@ mod tests {
 
     /// The live ChatGPT rows must carry the provider name this session uses, so
     /// they match the `provider` field in the same payload and can be fed back to
-    /// a provider switch. A config spelled `codex` must not yield rows labelled
-    /// `chatgpt` — nor leave the stale preset row behind as a duplicate.
+    /// a provider switch — and the stale preset row must not survive as a duplicate.
+    ///
+    /// ASSERTION CHANGED (provider/model coupling): a config spelled `codex` used to
+    /// yield rows spelled `codex`, and the test asserted no row said `chatgpt`.
+    /// `ProviderName` now folds every alias onto the canonical name *on the way in*,
+    /// so the session's own name IS `chatgpt` — and the rows say `chatgpt` with it.
+    /// The invariant this protects is unchanged and asserted directly: **the rows
+    /// name the same provider as the envelope**, so what the model reads back is a
+    /// provider that exists.
     #[tokio::test]
     async fn models_available_has_no_duplicate_or_misnamed_chatgpt_rows() {
         use super::CHATGPT_CODEX_BASE_URL;
         let agent = Agent::new(AgentConfig {
-            provider: Some("codex".to_string()),
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
-            model: "gpt-5.5".to_string(),
+            model: r("codex://gpt-5.5"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
@@ -6313,59 +6485,67 @@ mod tests {
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let session_provider = value["provider"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_provider, "chatgpt",
+            "the alias folded on the way in"
+        );
         let rows = value["available_models"].as_array().unwrap();
 
-        // No row may claim the canonical spelling when the session says `codex`.
+        // Every ChatGPT row names the provider the envelope names — a row the model
+        // could not feed back to a switch is worse than no row.
         assert!(
-            rows.iter().all(|r| r["provider"] != "chatgpt"),
-            "rows must use the session's provider spelling, got {rows:?}"
+            rows.iter()
+                .filter(|r| super::is_chatgpt_provider_name(r["provider"].as_str().unwrap()))
+                .all(|r| r["provider"] == session_provider.as_str()),
+            "rows must name the session's provider, got {rows:?}"
         );
         // And the active model must appear exactly once.
         let active = rows
             .iter()
-            .filter(|r| r["provider"] == "codex" && r["model"] == "gpt-5.5")
+            .filter(|r| r["provider"] == session_provider.as_str() && r["model"] == "gpt-5.5")
             .count();
         assert_eq!(active, 1, "the active model must not be duplicated");
     }
 
-    /// The individual setters are a second switch path. They must publish the
-    /// delegation runtime too, or a sub-agent spawned after one of them would be
-    /// pointed at the previous provider's endpoint and key.
+    /// A relocation (`--base-url`) publishes the whole endpoint too — a sub-agent
+    /// spawned after one must not be pointed at the endpoint the session left.
+    ///
+    /// ASSERTION CHANGED (provider/model coupling): this was
+    /// `individual_setters_publish_the_delegation_runtime`, and it drove the three
+    /// setters (`set_endpoint` + `set_provider_identity` + `set_api_version`) that
+    /// could each move a piece of the endpoint on their own. Those are gone: the
+    /// pieces move together or not at all. What survives of it is the *relocation*
+    /// — the one legitimate reason to move an endpoint without changing provider —
+    /// and the same guarantee is asserted of it.
     #[test]
-    fn individual_setters_publish_the_delegation_runtime() {
-        use super::ResolvedProviderKind;
+    fn a_relocation_publishes_the_whole_endpoint() {
         let mut agent = Agent::new(AgentConfig {
-            model: "old".to_string(),
-            base_url: "https://old.example/v1".to_string(),
+            model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
-        agent.set_endpoint("https://new.example/v1", Some("new-key".to_string()));
-        agent.set_provider_identity(
-            ResolvedProviderKind::Custom,
-            vec![("X-New".to_string(), "1".to_string())],
-        );
-        agent.set_api_version(Some("2025-01-01".to_string()));
+        agent.relocate_endpoint("https://new.example/v1", Some("new-key".to_string()));
 
         let runtime = agent
             .delegation_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(runtime.endpoint.base_url, "https://new.example/v1");
-        assert_eq!(runtime.endpoint.api_key.as_deref(), Some("new-key"));
-        assert_eq!(runtime.endpoint.provider_kind, ResolvedProviderKind::Custom);
-        assert_eq!(runtime.endpoint.api_version.as_deref(), Some("2025-01-01"));
-        assert_eq!(runtime.endpoint.configured_headers[0].0, "X-New");
+        let e = &runtime.endpoint.resolved;
+        assert_eq!(e.base_url(), "https://new.example/v1");
+        assert_eq!(e.api_key(), Some("new-key"));
+        // The identity rode along unchanged: this is still `local`, elsewhere.
+        assert_eq!(e.reference(), &r("local://old"));
+        assert_eq!(e.kind(), super::ResolvedProviderKind::BuiltIn);
     }
 
     #[test]
     fn delegation_runtime_initialized_from_agent_config() {
         let cfg = AgentConfig {
             base_url: "https://custom.example/v1".to_string(),
-            model: "primary-model".to_string(),
+            model: r("local://primary-model"),
             effort: Some("low".to_string()),
-            provider: None,
             subagents: false,
             headers: vec![("X-Test".to_string(), "value".to_string())],
             subagent_model: Some("subagent-model".to_string()),
@@ -6379,93 +6559,119 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        assert_eq!(runtime.public.provider, cfg.provider);
-        assert_eq!(runtime.public.model, cfg.model);
+        assert_eq!(runtime.public.reference, cfg.model);
         assert_eq!(runtime.public.effort, cfg.effort);
         assert_eq!(runtime.public.delegation_enabled, cfg.subagents);
         assert_eq!(runtime.explicit_subagent_model, cfg.subagent_model);
 
-        assert_eq!(runtime.endpoint.provider, None);
-        assert_eq!(runtime.endpoint.model, "primary-model");
+        // The endpoint is the config's — ADOPTED, not re-resolved: `local` would
+        // have resolved to :8080, and re-deriving it here would have silently
+        // undone the relocation this config carries.
+        let e = &runtime.endpoint.resolved;
+        assert_eq!(e.reference(), &cfg.model);
+        assert_eq!(e.base_url(), "https://custom.example/v1");
+        assert_eq!(e.api_key(), cfg.api_key.as_deref());
+        assert_eq!(e.api_version(), cfg.api_version.as_deref());
+        assert_eq!(e.headers(), cfg.headers.as_slice());
+        assert_eq!(e.kind(), super::ResolvedProviderKind::BuiltIn);
         assert_eq!(runtime.endpoint.effort, Some("low".to_string()));
-        assert_eq!(runtime.endpoint.base_url, "https://custom.example/v1");
-        assert_eq!(runtime.endpoint.api_key, cfg.api_key);
-        assert_eq!(
-            runtime.endpoint.provider_kind,
-            super::ResolvedProviderKind::BuiltIn
-        );
-        assert_eq!(
-            runtime.endpoint.configured_headers,
-            vec![("X-Test".to_string(), "value".to_string())]
-        );
-        assert_eq!(runtime.endpoint.api_version, cfg.api_version);
     }
 
+    /// THE ONE MUTATOR: a switch moves the identity AND everything derived from it
+    /// — endpoint, key, api-version, headers, trust kind, the client's model — in
+    /// one step. There is no way to move one without the others, which is what the
+    /// five setters this replaces made possible.
     #[test]
-    fn provider_switch_publishes_one_complete_endpoint() {
-        let mut agent = Agent::new(AgentConfig {
-            model: "old".to_string(),
+    fn set_model_ref_moves_the_whole_identity_at_once() {
+        use super::{ProviderConfig, ResolvedProviderKind};
+        let mut cfg = AgentConfig {
+            model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
-        })
-        .unwrap();
-        agent.apply_provider_switch(super::ProviderSwitch {
-            name: "next".to_string(),
-            base_url: "https://next.example/v1".to_string(),
-            api_key: Some("secret".to_string()),
-            api_version: Some("2025-01-01".to_string()),
-            headers: vec![("X-Route".to_string(), "next".to_string())],
-            kind: super::ResolvedProviderKind::Custom,
-            model: Some("new".to_string()),
-        });
+        };
+        cfg.providers.insert(
+            "next".to_string(),
+            ProviderConfig {
+                base_url: "https://next.example/v1".to_string(),
+                key_env: None,
+                api_key: Some("secret".to_string()),
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::from([("X-Route".to_string(), "next".to_string())]),
+                api_version: Some("2025-01-01".to_string()),
+            },
+        );
+        let mut agent = Agent::new(cfg).unwrap();
+        agent.set_model_ref(r("next://new")).unwrap();
+
+        // The client — what actually talks — moved with it.
+        assert_eq!(agent.client.model, "new");
+        assert_eq!(agent.client.base_url(), "https://next.example/v1");
+        assert!(agent.client.has_api_key());
 
         let runtime = agent
             .delegation_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(runtime.public.provider.as_deref(), Some("next"));
-        assert_eq!(runtime.public.model, "new");
-        assert_eq!(runtime.endpoint.base_url, "https://next.example/v1");
-        assert_eq!(runtime.endpoint.api_key.as_deref(), Some("secret"));
-        assert_eq!(runtime.endpoint.api_version.as_deref(), Some("2025-01-01"));
-        assert_eq!(
-            runtime.endpoint.provider_kind,
-            super::ResolvedProviderKind::Custom
-        );
-        assert_eq!(runtime.endpoint.configured_headers[0].0, "X-Route");
+        assert_eq!(runtime.public.reference, r("next://new"));
+        let e = &runtime.endpoint.resolved;
+        assert_eq!(e.base_url(), "https://next.example/v1");
+        assert_eq!(e.api_key(), Some("secret"));
+        assert_eq!(e.api_version(), Some("2025-01-01"));
+        assert_eq!(e.kind(), ResolvedProviderKind::Custom);
+        assert_eq!(e.headers()[0].0, "X-Route");
+        drop(runtime);
+
+        // An unknown provider is refused, and the agent is left exactly as it was —
+        // a failed switch must not strand it half-moved.
+        assert!(agent.set_model_ref(r("nosuchprovider://m")).is_err());
+        assert_eq!(agent.model_ref(), &r("next://new"));
+        assert_eq!(agent.client.base_url(), "https://next.example/v1");
     }
 
+    /// A model change on the SAME provider keeps a relocation; a change of provider
+    /// drops it. A relocated endpoint is where *this provider* lives for this
+    /// session (`--base-url http://localhost:9000/v1`), so `/model` on it must not
+    /// snap back to the preset's `:8080` — and a switch to another provider must
+    /// not carry that address across to it.
     #[test]
-    fn set_model_refreshes_delegation_runtime() {
+    fn a_relocation_survives_a_model_change_but_not_a_provider_change() {
         let mut agent = Agent::new(AgentConfig {
-            model: "old".to_string(),
+            // `--base-url`, applied by the CLI edge before construction.
+            base_url: "http://localhost:9000/v1".to_string(),
+            model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
+        agent.set_model_ref(r("local://new")).unwrap();
+        assert_eq!(agent.client.model, "new");
+        assert_eq!(
+            agent.client.base_url(),
+            "http://localhost:9000/v1",
+            "the endpoint the user chose for this provider survives a model switch"
+        );
 
-        agent.set_model("new-model");
-
-        let runtime = agent
-            .delegation_runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(runtime.public.model, "new-model");
-        assert_eq!(runtime.endpoint.model, "new-model");
+        agent.set_model_ref(r("openai://gpt-5")).unwrap();
+        assert_eq!(
+            agent.client.base_url(),
+            "https://api.openai.com/v1",
+            "…and never follows them onto a different provider"
+        );
     }
 
     #[test]
-    fn set_provider_and_effort_refresh_delegation_runtime() {
+    fn set_model_ref_and_effort_refresh_delegation_runtime() {
         let mut agent = Agent::new(AgentConfig {
-            provider: Some("main".to_string()),
-            model: "m".to_string(),
+            model: r("openai://m"),
             effort: Some("off".to_string()),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
 
-        agent.set_provider(Some("secondary".to_string()));
+        agent.set_model_ref(r("openrouter://new-model")).unwrap();
         agent.set_effort(Some("high".to_string()));
 
         let runtime = agent
@@ -6473,9 +6679,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        assert_eq!(runtime.public.provider, Some("secondary".to_string()));
-        assert_eq!(runtime.endpoint.provider, Some("secondary".to_string()));
-
+        assert_eq!(runtime.public.reference, r("openrouter://new-model"));
+        assert_eq!(
+            runtime.endpoint.resolved.reference(),
+            &r("openrouter://new-model")
+        );
         assert_eq!(runtime.public.effort, Some("high".to_string()));
         assert_eq!(runtime.endpoint.effort, Some("high".to_string()));
     }
@@ -6525,18 +6733,18 @@ mod tests {
     /// A provider preset that declares no window must not erase one the agent
     /// already knows.
     ///
-    /// Most built-ins carry `context_window: None`, and `repoint_to_provider`
-    /// assigned it unconditionally — so a sub-agent repointed to one had its
-    /// inherited (probed) window clobbered to `None`. `should_auto_compact` is
-    /// `false` whenever the window is unknown, so self-compaction became dead code
-    /// precisely where it was needed: a small local model.
+    /// Most built-ins carry `context_window: None`, and the old
+    /// `repoint_to_provider` assigned it unconditionally — so a sub-agent repointed
+    /// to one had its inherited (probed) window clobbered to `None`.
+    /// `should_auto_compact` is `false` whenever the window is unknown, so
+    /// self-compaction became dead code precisely where it was needed: a small local
+    /// model. Now guarded by `apply_model_ref`, which this exercises.
     #[test]
-    fn repointing_to_a_provider_does_not_erase_a_known_context_window() {
-        use super::{builtin_provider, repoint_to_provider, should_auto_compact};
+    fn switching_identity_does_not_erase_a_known_context_window() {
+        use super::{apply_model_ref, builtin_provider, should_auto_compact};
         let mut cfg = AgentConfig {
             base_url: "http://localhost:8080/v1".to_string(),
-            model: "local-64k".to_string(),
-            provider: Some("local".to_string()),
+            model: r("local://local-64k"),
             // Probed at startup: this agent knows it has a small window.
             context_window: Some(64_000),
             ..Default::default()
@@ -6544,7 +6752,7 @@ mod tests {
         // `local`, like most built-ins, declares no window of its own.
         assert!(builtin_provider("local").unwrap().context_window.is_none());
 
-        repoint_to_provider(&mut cfg, "local", Some("other-local")).unwrap();
+        apply_model_ref(&mut cfg, r("local://other-local"), None).unwrap();
         assert_eq!(
             cfg.context_window,
             Some(64_000),
@@ -6559,8 +6767,9 @@ mod tests {
         // is the account catalog's figure for its default model (gpt-5.5 = 272k),
         // NOT the old hardcoded 400k — the per-model window for other entitled
         // models is resolved from the account catalog cache, not this constant.
-        repoint_to_provider(&mut cfg, "chatgpt", Some("gpt-5.5")).unwrap();
+        apply_model_ref(&mut cfg, r("chatgpt://gpt-5.5"), None).unwrap();
         assert_eq!(cfg.context_window, Some(272_000));
+        assert_eq!(cfg.base_url, super::CHATGPT_CODEX_BASE_URL);
     }
 
     #[test]
@@ -6605,9 +6814,8 @@ mod tests {
     fn subagent_usage_resolves_chatgpt_window_from_the_account_catalog() {
         use super::subagent_usage;
         let cfg = AgentConfig {
-            provider: Some("chatgpt".into()),
             base_url: super::CHATGPT_CODEX_BASE_URL.into(),
-            model: "totally-fake-model-xyz".into(),
+            model: r("chatgpt://totally-fake-model-xyz"),
             // No inherited window → force resolution. A delegated ChatGPT
             // sub-agent's gauge must read the account-catalog window (preset floor
             // for an uncached slug), not the models.dev `None` this used to give.
@@ -6790,20 +6998,25 @@ mod tests {
     fn subagent_base_bounds_recursion_and_picks_model() {
         use super::subagent_base_config;
         let cfg = AgentConfig {
-            model: "opus".to_string(),
+            model: r("claude://opus"),
             subagent_model: Some("sonnet".to_string()),
             ..Default::default()
         };
         let base = subagent_base_config(&cfg);
         assert!(!base.subagents, "sub-agents can't spawn sub-agents");
         assert!(base.mcp.is_empty());
-        assert_eq!(base.model, "sonnet", "uses the configured subagent model");
-        // No subagent model → reuse the main model.
+        assert_eq!(
+            base.model,
+            r("claude://sonnet"),
+            "the configured sub-agent model, on the parent's PROVIDER — a bare model \
+             id never moves the endpoint"
+        );
+        // No subagent model → reuse the main identity, whole.
         let cfg = AgentConfig {
-            model: "opus".to_string(),
+            model: r("claude://opus"),
             ..Default::default()
         };
-        assert_eq!(subagent_base_config(&cfg).model, "opus");
+        assert_eq!(subagent_base_config(&cfg).model, r("claude://opus"));
     }
 
     // ── Trusted provider identity (Task 1) ───────────────────────────────────
@@ -6901,26 +7114,29 @@ mod tests {
     async fn switching_away_from_chatgpt_leaves_no_bearer_or_account_header() {
         use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
         let config = AgentConfig {
-            provider: Some("chatgpt".to_string()),
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+            model: r("chatgpt://gpt-5.5"),
             ..Default::default()
         };
         let mut agent = Agent::new(config).unwrap();
         assert_eq!(agent.provider_kind(), ResolvedProviderKind::ChatGptOAuth);
+        assert!(agent.resolved().is_codex_oauth(), "the double gate passes");
 
-        // Stand in for a completed OAuth injection: bearer + account header.
-        agent.set_endpoint(CHATGPT_CODEX_BASE_URL, Some("oauth-bearer".to_string()));
-        agent.set_headers(vec![(
+        // Stand in for a completed OAuth injection: bearer + account header, exactly
+        // as `refresh_oauth_if_needed` writes them — straight onto the client, never
+        // into the resolved identity (which is why they can't outlive it).
+        agent.client.set_api_key(Some("oauth-bearer".to_string()));
+        agent.client.set_headers(vec![(
             "ChatGPT-Account-Id".to_string(),
             "acct-123".to_string(),
         )]);
         assert!(agent.client().has_api_key());
 
-        // Now switch to a keyless local provider, exactly as `apply_provider` /
-        // `apply_choice` do: endpoint + key, then the trust identity.
-        agent.set_endpoint("http://127.0.0.1:1234/v1", None);
-        agent.set_provider(Some("local".to_string()));
-        agent.set_provider_identity(ResolvedProviderKind::BuiltIn, Vec::new());
+        // Now switch to the keyless `local` provider — ONE call, because there is
+        // one identity: the endpoint, the key, the headers and the trust kind move
+        // with it or not at all.
+        agent.set_model_ref(r("local://small")).unwrap();
+        assert!(!agent.resolved().is_codex_oauth());
         agent.refresh_oauth_if_needed().await;
 
         assert!(
@@ -6931,6 +7147,36 @@ mod tests {
             !agent.client().extra_headers_contains("ChatGPT-Account-Id"),
             "the account header must not survive a switch away from ChatGPT"
         );
+    }
+
+    /// The OAuth double gate, once: a built-in ChatGPT **relocated** off the Codex
+    /// endpoint is no longer the Codex endpoint, and is never handed the account's
+    /// bearer — the trust kind alone does not buy it.
+    #[tokio::test]
+    async fn a_relocated_chatgpt_is_not_the_codex_endpoint() {
+        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
+        let mut agent = Agent::new(AgentConfig {
+            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+            model: r("chatgpt://gpt-5.5"),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(agent.resolved().is_codex_oauth());
+
+        agent.relocate_endpoint("http://localhost:9099/v1", None);
+        assert_eq!(
+            agent.provider_kind(),
+            ResolvedProviderKind::ChatGptOAuth,
+            "it is still the built-in provider — relocation is not a shadow",
+        );
+        assert!(
+            !agent.resolved().is_codex_oauth(),
+            "…but it is not at the endpoint the account's credentials belong to",
+        );
+        // So the refresh path does not inject anything.
+        agent.refresh_oauth_if_needed().await;
+        assert!(!agent.client().extra_headers_contains("ChatGPT-Account-Id"));
     }
 
     #[test]
@@ -7017,7 +7263,7 @@ mod tests {
         let cfg = AgentConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: Some("main-key".to_string()),
-            model: "claude-opus".to_string(),
+            model: r("claude://claude-opus"),
             ..Default::default()
         };
         let base = subagent_base_config(&cfg);
@@ -7039,11 +7285,14 @@ mod tests {
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(sub.model, "moonshotai/kimi-k2");
+        // Identity: the sub is now *on* openrouter, with openrouter's model — one
+        // value, so the endpoint below cannot disagree with it.
+        assert_eq!(sub.model, r("openrouter://moonshotai/kimi-k2"));
         assert!(!sub.subagents); // still can't nest
         assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));
-        // Identity: the sub is now *on* openrouter, not the parent provider.
-        assert_eq!(sub.provider.as_deref(), Some("openrouter"));
+        // THE LEAK GUARD: the parent's Anthropic key does not follow the profile to
+        // another provider's host (`resolve_api_key`'s `same_endpoint` check).
+        assert_eq!(sub.api_key, None);
         // No provider → stays on the main endpoint, just the profile's model.
         let same = config_for_agent_profile(
             &base,
@@ -7065,9 +7314,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(same.base_url, "https://api.anthropic.com/v1");
-        assert_eq!(same.model, "claude-haiku");
-        // The no-provider profile keeps the parent's provider identity (None here).
-        assert_eq!(same.provider.as_deref(), None);
+        // A bare model id on the profile is a `ModelSpec::ModelOnly`: same provider,
+        // new model — it never moves the endpoint or the key.
+        assert_eq!(same.model, r("claude://claude-haiku"));
+        assert_eq!(same.api_key.as_deref(), Some("main-key"));
         // Unknown provider → error.
         assert!(
             config_for_agent_profile(
@@ -7092,29 +7342,75 @@ mod tests {
         );
     }
 
+    /// Moving a config onto a new identity re-derives its endpoint and key WITH it.
+    /// (Was `repoint_to_provider_sets_identity_and_model`.)
     #[test]
-    fn repoint_to_provider_sets_identity_and_model() {
-        use super::repoint_to_provider;
-        // Start on a fake parent endpoint; repoint to the `local` built-in.
+    fn applying_an_identity_rederives_the_endpoint_with_it() {
+        use super::apply_model_ref;
+        // Start on the Anthropic endpoint; switch to the `local` built-in.
         let mut cfg = AgentConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: Some("parent-key".to_string()),
-            model: "claude-opus".to_string(),
-            provider: Some("claude".to_string()),
+            model: r("claude://claude-opus"),
             ..Default::default()
         };
-        repoint_to_provider(&mut cfg, "local", Some("my-local-model")).unwrap();
+        apply_model_ref(&mut cfg, r("local://my-local-model"), None).unwrap();
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
-        assert_eq!(cfg.provider.as_deref(), Some("local"));
-        assert_eq!(cfg.model, "my-local-model");
-        // Identity drives the derived kind that Agent::new will compute from
-        // `cfg.provider` — the whole point of setting it during repoint.
+        assert_eq!(cfg.model, r("local://my-local-model"));
+        // The identity IS the provider — the kind `Agent::new` will derive follows
+        // from it, and cannot name a provider the endpoint doesn't belong to.
         assert_eq!(
-            cfg.resolve_provider("local").map(|p| p.kind),
+            cfg.resolve_provider(cfg.model.provider().as_str())
+                .map(|p| p.kind),
             Some(super::ResolvedProviderKind::BuiltIn)
         );
-        // Unknown provider errors.
-        assert!(repoint_to_provider(&mut cfg, "nope", Some("m")).is_err());
+        // Unknown provider errors, leaving the config where it was.
+        assert!(apply_model_ref(&mut cfg, r("nope://m"), None).is_err());
+        assert_eq!(cfg.model, r("local://my-local-model"));
+    }
+
+    /// THE BUG THIS EXISTS TO KILL: a provider named with no model must never keep
+    /// the model you were running on somewhere else.
+    ///
+    /// Six of the seven built-ins declare no default model. `repoint_to_provider`
+    /// left `cfg.model` untouched for every one of them — so `--provider openai`
+    /// while on `zen://kimi-k2` sent `kimi-k2` to api.openai.com, which has never
+    /// heard of it. There is no longer a way to even express that: naming a provider
+    /// without a model goes through the fallback chain, and when the chain has no
+    /// answer it is an ERROR, not a silent carry-over.
+    #[test]
+    fn a_provider_with_no_model_never_inherits_the_previous_providers_model() {
+        use super::{named_pair_ref, provider_switch_ref};
+        let cfg = AgentConfig {
+            model: r("zen://kimi-k2"),
+            ..Default::default()
+        };
+        // `openai` declares no default model, and (in a test process) nothing was
+        // ever used on it — so this cannot be answered, and says so.
+        if super::last_model_on(&super::ProviderName::new("openai")).is_none() {
+            let err = provider_switch_ref(&cfg, "openai").unwrap_err().to_string();
+            assert!(err.contains("provider 'openai' needs a model"), "{err}");
+            assert!(err.contains("--model 'openai://<model>'"), "{err}");
+            assert!(!err.contains("kimi-k2"), "the old model is not an answer");
+            // Same through the pair-shaped entry point the `task` tool and the
+            // profiles use.
+            assert!(named_pair_ref(&cfg, Some("openai"), None).is_err());
+        }
+        // A provider that DOES declare one answers with it — never with kimi-k2.
+        assert_eq!(
+            named_pair_ref(&cfg, Some("chatgpt"), None).unwrap(),
+            Some(r("chatgpt://gpt-5.5"))
+        );
+        // And an explicit model is always taken as given.
+        assert_eq!(
+            named_pair_ref(&cfg, Some("openai"), Some("gpt-5.5")).unwrap(),
+            Some(r("openai://gpt-5.5"))
+        );
+        // A bare model stays on the provider in force (`ModelSpec::ModelOnly`).
+        assert_eq!(
+            named_pair_ref(&cfg, None, Some("grok-code")).unwrap(),
+            Some(r("zen://grok-code"))
+        );
     }
 
     #[test]
@@ -7124,8 +7420,7 @@ mod tests {
         let mut base = AgentConfig {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             api_key: None,
-            model: "gpt-5.6-sol".to_string(),
-            provider: Some("chatgpt".to_string()),
+            model: r("chatgpt://gpt-5.6-sol"),
             ..Default::default()
         };
         // A custom remote provider with NO key anywhere → Missing → gate errors.
@@ -7151,19 +7446,22 @@ mod tests {
         assert!(err.contains("not configured"), "got: {err}");
         assert_eq!(cfg.base_url, base.base_url); // unchanged on error
 
-        // (b) keyless `local` (built-in) with a model → repoints + identity.
+        // (b) keyless `local` (built-in) with a model → switches the whole identity.
         let mut cfg = base.clone();
         apply_task_overrides(&mut cfg, &base, Some("local"), Some("deepseek-x")).unwrap();
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
-        assert_eq!(cfg.provider.as_deref(), Some("local"));
-        assert_eq!(cfg.model, "deepseek-x");
+        assert_eq!(cfg.model, r("local://deepseek-x"));
 
-        // (c) provider without a default model and no model arg → error.
-        let mut cfg = base.clone();
-        let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("requires an explicit model"), "got: {err}");
+        // (c) provider without a default model and no model arg → error (nothing in
+        //     the last-used store for it in a test process).
+        if super::last_model_on(&super::ProviderName::new("local")).is_none() {
+            let mut cfg = base.clone();
+            let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires an explicit model"), "got: {err}");
+            assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"), "unchanged on error");
+        }
 
         // (d) unknown provider → error.
         let mut cfg = base.clone();
@@ -7173,13 +7471,12 @@ mod tests {
         let mut cfg = base.clone();
         apply_task_overrides(&mut cfg, &base, None, Some("gpt-5.5")).unwrap();
         assert_eq!(cfg.base_url, base.base_url); // still chatgpt endpoint
-        assert_eq!(cfg.model, "gpt-5.5");
-        assert_eq!(cfg.provider.as_deref(), Some("chatgpt"));
+        assert_eq!(cfg.model, r("chatgpt://gpt-5.5"));
 
         // (f) neither → no-op.
         let mut cfg = base.clone();
         apply_task_overrides(&mut cfg, &base, None, None).unwrap();
-        assert_eq!(cfg.model, "gpt-5.6-sol");
+        assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"));
     }
 
     // Spec Testing #4 — precedence: an ad-hoc provider/model override layered on
@@ -7193,8 +7490,7 @@ mod tests {
         let parent = AgentConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: Some("parent-key".to_string()),
-            model: "claude-opus".to_string(),
-            provider: Some("claude".to_string()),
+            model: r("claude://claude-opus"),
             ..Default::default()
         };
         // Resolve a profile with a persona + its own model, no provider (stays
@@ -7217,10 +7513,9 @@ mod tests {
         let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
         // Ad-hoc override to a different provider + model.
         apply_task_overrides(&mut cfg, &parent, Some("local"), Some("adhoc-model")).unwrap();
-        // Endpoint + model come from the ad-hoc override.
+        // Endpoint + model come from the ad-hoc override, together.
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
-        assert_eq!(cfg.provider.as_deref(), Some("local"));
-        assert_eq!(cfg.model, "adhoc-model");
+        assert_eq!(cfg.model, r("local://adhoc-model"));
         // Persona from the profile survives the override.
         assert_eq!(cfg.agent_prompt.as_deref(), Some("Review only."));
         assert!(cfg.read_only);
@@ -7238,8 +7533,7 @@ mod tests {
         let mut parent = AgentConfig {
             base_url: parent_endpoint.to_string(),
             api_key: Some("parent-a-key".to_string()),
-            model: "parent-a-model".to_string(),
-            provider: Some("test-parent-a".to_string()),
+            model: r("test-parent-a://parent-a-model"),
             ..Default::default()
         };
         parent.providers.insert(
@@ -7295,8 +7589,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.base_url, parent_endpoint);
-        assert_eq!(cfg.provider.as_deref(), Some("test-parent-a"));
-        assert_eq!(cfg.model, "adhoc-a-model");
+        assert_eq!(cfg.model, r("test-parent-a://adhoc-a-model"));
         assert_eq!(cfg.api_key.as_deref(), Some("parent-a-key"));
         assert_eq!(cfg.agent_prompt.as_deref(), Some("Preserve this persona."));
         assert!(cfg.read_only);
@@ -7314,8 +7607,7 @@ mod tests {
         let mut parent = AgentConfig {
             base_url: "https://parent.invalid/v1".to_string(),
             api_key: Some("parent-secret".to_string()),
-            model: "parent-model".to_string(),
-            provider: Some("parent-p".to_string()),
+            model: r("parent-p://parent-model"),
             ..Default::default()
         };
         // A remote provider on a DIFFERENT host that declares no credential of its
@@ -7342,9 +7634,10 @@ mod tests {
             err.contains("not configured"),
             "a cross-host target with no key of its own must be refused, got: {err}"
         );
-        // And nothing was repointed — the parent's key never travelled.
+        // And nothing moved — the parent's key never travelled.
         assert_eq!(cfg.base_url, "https://parent.invalid/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("parent-secret"));
+        assert_eq!(cfg.model, r("parent-p://parent-model"));
     }
 
     /// The ad-hoc auth gate must judge the target against the parent's **live**
@@ -7358,8 +7651,8 @@ mod tests {
     #[tokio::test]
     async fn ad_hoc_gate_judges_against_the_live_parent_endpoint() {
         use super::{
-            ProviderConfig, ResolvedProviderKind, SubagentProfile, SubagentTool,
-            new_delegation_runtime, subagent_base_config,
+            ProviderConfig, SubagentProfile, SubagentTool, new_delegation_runtime,
+            subagent_base_config,
         };
         use hrdr_tools::Tool;
         use std::collections::HashMap;
@@ -7370,8 +7663,7 @@ mod tests {
         let mut parent = AgentConfig {
             base_url: "https://startup-a.invalid/v1".to_string(),
             api_key: Some("key-a".to_string()),
-            model: "m-a".to_string(),
-            provider: Some("startup-a".to_string()),
+            model: r("startup-a://m-a"),
             checkpoints: Some("off".to_string()),
             cwd: cwd.path().to_path_buf(),
             ..Default::default()
@@ -7426,14 +7718,18 @@ mod tests {
         };
 
         let base = subagent_base_config(&parent);
-        let runtime = new_delegation_runtime(&base, ResolvedProviderKind::BuiltIn);
-        // The session switched to provider B after launch (as `/model` would).
+        let runtime = new_delegation_runtime(&base, &super::ResolvedModel::from_config(&base));
+        // The session switched to provider B after launch (as `/model` would): the
+        // live endpoint is published as ONE resolved identity, so what a sub-agent
+        // inherits is a provider and a model that agree with each other.
         {
-            let mut r = runtime.lock().unwrap();
-            r.endpoint.base_url = LIVE.to_string();
-            r.endpoint.api_key = Some("key-b".to_string());
-            r.endpoint.provider = Some("live-b".to_string());
-            r.endpoint.model = "m-b".to_string();
+            let mut rt = runtime.lock().unwrap();
+            // `b-alias` IS the live endpoint; the key is the one the session holds
+            // for it after the switch.
+            let mut live = super::resolve(&r("b-alias://m-b"), &parent, None).unwrap();
+            assert_eq!(live.base_url(), LIVE);
+            live.relocate(LIVE.to_string(), Some("key-b".to_string()));
+            rt.endpoint.resolved = live;
         }
 
         let tool = SubagentTool::new(
@@ -7815,7 +8111,7 @@ mod tests {
     #[test]
     fn each_builtin_subagent_gets_exactly_the_tools_it_should() {
         let base = AgentConfig {
-            model: "m".to_string(),
+            model: r("local://m"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         };
@@ -7905,7 +8201,7 @@ mod tests {
     #[test]
     fn profiles_land_in_the_pool_their_capability_implies() {
         let base = AgentConfig {
-            model: "m".to_string(),
+            model: r("local://m"),
             ..Default::default()
         };
         let base = super::subagent_base_config(&base);
@@ -8520,10 +8816,10 @@ mod tests {
     fn env_setters_string_fields_directly() {
         // Exercise each string-typed setter in ENV_SETTERS by calling the fn
         // pointer directly, without touching process environment.
+        // `HRDR_PROVIDER` / `HRDR_MODEL` are deliberately absent: they name halves
+        // of one identity and are collapsed by `NamedModel`, never assigned singly.
         let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[
-            ("HRDR_PROVIDER", |c| c.provider.as_deref().unwrap_or("")),
             ("HRDR_BASE_URL", |c| &c.base_url),
-            ("HRDR_MODEL", |c| &c.model),
             ("HRDR_CHECKPOINTS", |c| {
                 c.checkpoints.as_deref().unwrap_or("")
             }),
@@ -8628,9 +8924,7 @@ mod tests {
         assert_eq!(cfg.preserve_recent_tokens, 12_000);
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
-        assert_eq!(cfg.model, "gpt-4");
         assert_eq!(cfg.temperature, Some(0.5));
-        assert_eq!(cfg.provider.as_deref(), Some("zen"));
         assert_eq!(cfg.context_window, Some(8192));
         assert_eq!(cfg.max_tokens, Some(16_000));
         assert_eq!(cfg.top_p, Some(0.9));
@@ -9538,7 +9832,7 @@ mod tests {
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
             AgentConfig {
                 base_url,
-                model: "test-model".to_string(),
+                model: "local://test-model".parse().unwrap(),
                 cwd: cwd.to_path_buf(),
                 checkpoints: Some("off".to_string()),
                 subagents: false,
@@ -10187,7 +10481,7 @@ mod tests {
             let cfg = test_cfg(base_url, cwd);
             let runtime = super::super::new_delegation_runtime(
                 &cfg,
-                super::super::ResolvedProviderKind::BuiltIn,
+                &super::super::ResolvedModel::from_config(&cfg),
             );
             SubagentTool::new(
                 cfg,
@@ -10236,7 +10530,7 @@ mod tests {
             let cfg = test_cfg(server.base_url(), cwd.path());
             let runtime = super::super::new_delegation_runtime(
                 &cfg,
-                super::super::ResolvedProviderKind::BuiltIn,
+                &super::super::ResolvedModel::from_config(&cfg),
             );
             let tool = SubagentTool::new(
                 cfg,

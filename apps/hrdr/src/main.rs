@@ -240,21 +240,27 @@ async fn main() -> Result<()> {
     let mut config = AgentConfig::load();
     let mut ui = hrdr_app::UiConfig::load();
 
-    // Apply a provider preset (CLI > config/env) before explicit CLI overrides.
-    // Custom `[providers.<name>]` from config shadow the built-ins.
+    // ── The identity edge ───────────────────────────────────────────────────
+    // config.toml, the environment and the CLI each spell the model identity as
+    // TWO keys (`provider = …`, `model = …`). This is the only place that is true:
+    // the halves are layered by precedence here, collapsed into one `ModelRef`, and
+    // the core never sees a half again.
     let mut remote_provider = false;
-    // Last-used fallback: when nothing pins a provider/model, resume the last
-    // combo the user switched to (recorded by the `/model` selector, `/provider`,
-    // and `/model`). Captured before the resolution below sets `config.provider`.
+    // Last-used fallback: when nothing names a provider/model, resume the identity
+    // the user last switched to (recorded by the `/model` selector and `/login`).
     let last_used = hrdr_agent::load_last_model();
-    let config_provider = config.provider.clone();
-    let config_had_provider = config.provider.is_some();
-    let config_had_model = config.model != "default";
+    // What config.toml + $HRDR_PROVIDER/$HRDR_MODEL named (`AgentConfig::load` has
+    // already collapsed these into `config.model`; the startup precedence below
+    // needs to know which halves were actually NAMED, and by whom).
+    let named = hrdr_agent::named_model();
+    let config_provider = named.provider.clone();
+    let config_had_provider = named.provider.is_some();
+    let config_had_model = named.model.is_some();
     let provider_name = cli
         .provider
         .clone()
-        .or_else(|| config.provider.clone())
-        .or_else(|| last_used.as_ref().map(|(p, _)| p.clone()));
+        .or_else(|| named.provider.clone())
+        .or_else(|| last_used.as_ref().map(|r| r.provider().to_string()));
     // A `model` in config.toml belongs to the provider config.toml names. It must
     // NOT follow the user onto a provider they switched to — `model = "sonnet"`
     // plus `hrdr --provider chatgpt` would otherwise suppress the ChatGPT preset's
@@ -267,13 +273,32 @@ async fn main() -> Result<()> {
             (Some(_), None) => true,
             (None, _) => cli.provider.is_none(),
         };
+    let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
+    // The model half, settled: a flag/env or an applicable config model, else the
+    // model the provider ITSELF answers with (the last one used on it, else one it
+    // declares — `model_for_provider`), else the `default` sentinel.
+    let mut identity = config.model.clone();
     if let Some(name) = &provider_name {
+        let provider = hrdr_agent::ProviderName::new(name);
         let p = config.resolve_provider(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown provider '{name}' (built-ins: zen, openai, openrouter, claude, local; \
                  or define [providers.{name}] in config)"
             )
         })?;
+        let model = if model_overridden || config_model_applies {
+            // Whatever the flag/env/config named, on this provider.
+            config.model.model().to_string()
+        } else {
+            // The provider is named but no model is: never carry the old one over.
+            // The fallback chain answers, or nothing does — in which case we launch
+            // on the `default` sentinel and say so below, exactly as before.
+            hrdr_agent::model_for_resolved_provider(&provider, &p)
+                .map(|r| r.model().to_string())
+                .unwrap_or_else(|_| hrdr_agent::DEFAULT_MODEL.to_string())
+        };
+        identity = hrdr_agent::ModelRef::new(provider, &model)?;
+
         // Provider sets the endpoint unless an explicit --base-url / $HRDR_BASE_URL wins.
         let base_overridden = cli.base_url.is_some() || std::env::var_os("HRDR_BASE_URL").is_some();
         if !base_overridden {
@@ -291,19 +316,6 @@ async fn main() -> Result<()> {
             let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
             eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
         }
-        // Provider's default model, unless the user set one explicitly.
-        let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
-        // Precedence: flag/env > config.toml (for its own provider) > preset
-        // default. Only fall back to the preset's default model when neither a
-        // flag/env nor an applicable config model pinned one — otherwise a preset
-        // (e.g. ChatGPT's `gpt-5.5`) would silently clobber a `model = …` set in
-        // config.toml for this same provider.
-        if !model_overridden && !config_model_applies {
-            // The preset's default when it has one; otherwise the `default`
-            // sentinel (let the endpoint pick). Never leave another provider's
-            // model id in place.
-            config.model = p.model.clone().unwrap_or_else(|| "default".to_string());
-        }
         // Stamp the provider's flat preset — EXCEPT for the Codex endpoint, whose
         // preset is only right for its default model (gpt-5.5 = 272k) and would
         // over-state a smaller entitled model (a 128k codex model). Codex is
@@ -314,36 +326,35 @@ async fn main() -> Result<()> {
         config.headers = p.headers.into_iter().collect();
         config.api_version = p.api_version;
         remote_provider = p.remote;
-        // Record which provider is in force (`--provider` may have overridden
-        // the config's). The status bar, the session header, and saved sessions
-        // all read it from here.
-        config.provider = Some(name.clone());
     }
 
-    // Restore the last-used model as the final fallback: only when neither a
-    // flag/env nor config pinned a provider *or* a model (the pure fresh case),
-    // so the last-used pair's model beats a preset's default.
-    let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
+    // Restore the last-used identity as the final fallback: only when neither a
+    // flag/env nor config named a provider *or* a model (the pure fresh case), so
+    // the last-used identity beats a preset's default — whole, never half.
     if !model_overridden
         && !config_had_provider
         && !config_had_model
-        && let Some((_, m)) = &last_used
+        && let Some(r) = &last_used
     {
-        config.model = m.clone();
+        identity = r.clone();
     }
 
     if let Some(u) = cli.base_url {
         config.base_url = u;
     }
     // A `--model` / `--provider` flag outranks everything, including a resumed
-    // session's (flag > env > session > config).
-    if let Some(m) = cli.model {
-        config.model = m;
+    // session's (flag > env > session > config). `--model` is a bare model id here
+    // (slice D teaches it `provider://model`), so it rides on the provider settled
+    // above.
+    // ONE pin for ONE identity: either flag names the thing this process runs on,
+    // and a resumed session does not get to replace it.
+    if cli.model.is_some() || cli.provider.is_some() {
         config.model_pinned = true;
     }
-    if cli.provider.is_some() {
-        config.provider_pinned = true;
+    if let Some(m) = cli.model {
+        identity = hrdr_agent::ModelSpec::ModelOnly(m).apply(&identity);
     }
+    config.model = identity;
     if cli.vim {
         ui.vim_mode = true;
     }
@@ -429,7 +440,7 @@ async fn main() -> Result<()> {
         ui.show_thinking = v;
     }
 
-    if remote_provider && config.model == "default" {
+    if remote_provider && config.has_default_model() {
         eprintln!(
             "hrdr: set a model with --model (run `hrdr models` to list this provider's models)"
         );
@@ -449,15 +460,15 @@ async fn main() -> Result<()> {
             // read it. Resolve per-model from the account catalog cache instead —
             // now that the final model is known — falling back to the preset floor.
             config.context_window = hrdr_agent::context_window_for(
-                config.provider.as_deref(),
+                Some(config.model.provider().as_str()),
                 &config.base_url,
-                &config.model,
+                config.model.model(),
             );
         } else {
             let probe = hrdr_llm::Client::new(
                 config.base_url.clone(),
                 config.api_key.clone(),
-                config.model.clone(),
+                config.model.model().to_string(),
             );
             config.context_window =
                 tokio::time::timeout(Duration::from_secs(3), probe.context_window())

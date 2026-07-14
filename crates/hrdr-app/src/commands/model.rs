@@ -1,97 +1,162 @@
 use std::sync::Arc;
 
-use hrdr_agent::Agent;
+use hrdr_agent::{Agent, ModelRef, ModelSpec, ProviderName};
 use tokio::sync::Mutex;
 
 use super::helpers::busy_generic;
 use super::host::CommandHost;
 
-/// Switch **the active agent's** model and, in the *same* locked step, re-probe
-/// the endpoint for the new model's advertised context window — delivering it to
-/// the UI so auto-compaction honors the model's real max. Folding the probe into
-/// the model-change future (rather than a separate task) avoids racing a probe of
-/// the old model against the switch.
+/// Switch **the active agent's** model — `/model <spec>`, where the spec is either
+/// a bare model id (same provider) or a whole `provider://model` identity — and,
+/// in the *same* locked step, re-probe the endpoint for the new model's advertised
+/// context window, delivering it to the UI so auto-compaction honors the model's
+/// real max. Folding the probe into the switch future (rather than a separate
+/// task) avoids racing a probe of the old model against the switch.
 ///
 /// `/model` means "change the model of the conversation I am looking at", exactly
-/// as `/compact` means "compact the conversation I am looking at". [`set_model`]
-/// writes to that same agent's chrome, so the status bar follows it — the two are
-/// the same piece of state, not a display copy of one.
+/// as `/compact` means "compact the conversation I am looking at".
+/// [`set_model_ref`] writes to that same agent's chrome, so the status bar follows
+/// it — the two are the same piece of state, not a display copy of one.
 ///
-/// [`set_model`]: CommandHost::set_model
+/// [`set_model_ref`]: CommandHost::set_model_ref
 pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
-    host.set_model(name.clone());
-    // Remember (current provider, new model) as the last-used combo.
-    hrdr_agent::record_last_model(&host.provider().unwrap_or_default(), &name);
-    let agent = host.agent();
-    let post = host.context_window_poster();
-    host.spawn_line(Box::pin(async move {
-        let mut a = agent.lock().await;
-        a.set_model(name);
-        if let Some(w) = a.probe_context_window().await {
-            post(w);
+    // A bare id keeps the provider in force; `provider://model` replaces it whole.
+    // Either way what reaches the agent is a COMPLETE identity.
+    let spec: ModelSpec = match name.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            host.info(format!("/model {name}: {e}"));
+            return;
         }
-        String::new()
-    }));
+    };
+    let reference = spec.apply(&host.model_ref());
+    apply_reference(host, reference, None, true);
 }
 
-/// Switch the live session to provider `name`: repoint the endpoint (with the
-/// resolved or supplied API key), model, and context window, and update the
-/// displayed chrome. `key` overrides the resolved credential — the `/login`
-/// wizard passes the freshly-entered key. Returns the resolved provider on
-/// success; `Err(message)` when the name is unknown or a turn is running.
-/// Used by the `/login` wizard.
+/// Why switching to a named provider didn't happen.
+///
+/// [`NeedsModel`](Self::NeedsModel) is the one that matters: a provider names an
+/// endpoint, not a model, and the model you were using belongs to the provider you
+/// are leaving. It is a *question for the user*, not a failure — a frontend with a
+/// picker answers it by opening one ([`CommandHost::begin_model_selector_for`]),
+/// and only a frontend without one surfaces the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderSwitchError {
+    /// No built-in and no `[providers.<name>]` by that name.
+    Unknown(String),
+    /// A turn is running.
+    Busy(String),
+    /// The provider declares no model, and none was ever used on it.
+    NeedsModel { provider: String, message: String },
+}
+
+impl std::fmt::Display for ProviderSwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(m) | Self::Busy(m) => f.write_str(m),
+            Self::NeedsModel { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+/// Switch the live session to provider `name` — the `/login` path, and the only
+/// one that names a provider WITHOUT a model.
+///
+/// Which model? **Not the one you were using**: that one belongs to the provider
+/// you are leaving, and following you onto this one is the bug this refactor
+/// exists to kill. [`hrdr_agent::model_for_provider`] answers it — the model you
+/// last used on THIS provider, else one the provider itself declares — and when it
+/// has no answer, this says so ([`ProviderSwitchError::NeedsModel`]) rather than
+/// inventing one.
 pub fn apply_provider(
     host: &mut dyn CommandHost,
     name: &str,
-    key: Option<String>,
-) -> Result<hrdr_agent::ResolvedProvider, String> {
+) -> Result<hrdr_agent::ResolvedProvider, ProviderSwitchError> {
     let Some(p) = host.resolve_provider(name) else {
-        return Err(format!("unknown provider '{name}'"));
+        return Err(ProviderSwitchError::Unknown(format!(
+            "unknown provider '{name}'"
+        )));
     };
     if host.is_busy() {
-        return Err(busy_generic());
+        return Err(ProviderSwitchError::Busy(busy_generic()));
     }
-    let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p, None, None));
+    let provider = ProviderName::new(name);
+    let reference = hrdr_agent::model_for_resolved_provider(&provider, &p).map_err(|e| {
+        ProviderSwitchError::NeedsModel {
+            provider: name.to_string(),
+            message: format!("{e:#}"),
+        }
+    })?;
+    apply_reference(host, reference, p.context_window, true);
+    Ok(p)
+}
+
+/// Switch to provider `name`, and when it cannot name a model, **ask** — open the
+/// model picker filtered to that provider instead of reporting an error the user
+/// can do nothing with. The `/login` completion path.
+///
+/// Returns the resolved provider when the switch happened.
+pub fn apply_provider_or_pick(
+    host: &mut dyn CommandHost,
+    name: &str,
+) -> Result<hrdr_agent::ResolvedProvider, ProviderSwitchError> {
+    let outcome = apply_provider(host, name);
+    if let Err(ProviderSwitchError::NeedsModel { provider, message }) = &outcome {
+        host.info(format!("{message} — pick one:"));
+        host.begin_model_selector_for(provider);
+    }
+    outcome
+}
+
+/// The ONE place an identity is applied to the agent *and* to the chrome that
+/// describes it — so the two cannot drift apart.
+///
+/// `window` is a window already known for the target (a picker row's, or the
+/// provider's configured one), which wins over a probe; `remember` records the
+/// identity as last-used (a deliberate choice — a session resume does not).
+fn apply_reference(
+    host: &mut dyn CommandHost,
+    reference: ModelRef,
+    window: Option<u32>,
+    remember: bool,
+) {
+    // A change of PROVIDER moves the endpoint; a change of model on the provider
+    // you are already on does not — that would undo a `--base-url` relocation,
+    // which is where this provider lives for this session. Same rule as the agent's.
+    let moving_provider = host.model_ref().provider() != reference.provider();
+    let endpoint = moving_provider
+        .then(|| host.resolve_provider(reference.provider().as_str()))
+        .flatten()
+        .map(|p| p.base_url);
+
+    host.set_model_ref(reference.clone());
+    if let Some(url) = endpoint {
+        host.set_base_url(url);
+    }
+    if let Some(w) = window {
+        host.set_context_window(Some(w));
+    }
+    if remember {
+        // Remembered per provider, so a later `/login <provider>` (which names no
+        // model) can come back to the model you were actually using there.
+        hrdr_agent::record_last_model(&reference);
+    }
+
     let agent = host.agent();
-    let (url, model) = (p.base_url.clone(), p.model.clone());
-    // The catalog fallback in `probe_context_window` is keyed `provider/model`.
-    let provider = name.to_string();
-    let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
-    let api_version = p.api_version.clone();
-    // Trust identity travels with the endpoint: a stale kind would misgate OAuth
-    // injection on the next request.
-    let kind = p.kind;
-    // Probe the new endpoint for its advertised context window unless the
-    // provider config already declares one (which wins).
-    let probe_after = p.context_window.is_none();
     let post = host.context_window_poster();
+    let probe_after = window.is_none();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
-        a.apply_provider_switch(hrdr_agent::ProviderSwitch {
-            name: provider,
-            base_url: url,
-            api_key: key,
-            api_version,
-            headers,
-            kind,
-            model,
-        });
+        // ONE call: endpoint, key, api-version, headers, trust kind and model move
+        // together, under the same lock, so a probe can never see a half-switch.
+        if let Err(e) = a.set_model_ref(reference) {
+            return format!("{e:#}");
+        }
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);
         }
         String::new()
     }));
-    if let Some(m) = &p.model {
-        host.set_model(m.clone());
-        // Remember (provider, its model) as the last-used combo.
-        hrdr_agent::record_last_model(name, m);
-    }
-    if p.context_window.is_some() {
-        host.set_context_window(p.context_window);
-    }
-    host.set_base_url(p.base_url.clone());
-    host.set_provider(name.to_string());
-    Ok(p)
 }
 
 /// Repoint the agent to the `(provider, model)` a **resumed session** was on.
@@ -134,9 +199,10 @@ pub fn apply_choice(
     repoint(host, provider_name, model, choice_context_window, true)
 }
 
-/// The one place a `(provider, model)` pair is applied to an agent *and* to the
-/// chrome that describes it — so the two cannot drift apart. `remember` records it
-/// as the last-used combo (a deliberate choice), which a resume does not.
+/// Apply a `(provider, model)` pair from a two-key source (a picker row, a saved
+/// session) — collapsed into one identity here, at the edge, and applied through
+/// [`apply_reference`]. `remember` records it as the last-used identity (a
+/// deliberate choice), which a resume does not.
 fn repoint(
     host: &mut dyn CommandHost,
     provider_name: &str,
@@ -150,45 +216,12 @@ fn repoint(
     if host.is_busy() {
         return Err(busy_generic());
     }
-    let key = hrdr_agent::resolve_api_key(provider_name, &p, None, None);
-    let agent = host.agent();
-    let url = p.base_url.clone();
-    let provider = provider_name.to_string();
-    let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
-    let api_version = p.api_version.clone();
-    let kind = p.kind;
+    let reference = ModelRef::new(ProviderName::new(provider_name), &model)
+        .map_err(|e| format!("{provider_name}://{model}: {e}"))?;
     // Prefer the chosen model's own context window (e.g. an entitled ChatGPT
     // row) over the provider's; probe the endpoint only when neither is known.
-    let effective_window = choice_context_window.or(p.context_window);
-    let probe_after = effective_window.is_none();
-    let post = host.context_window_poster();
-    let model_for_agent = model.clone();
-    host.spawn_line(Box::pin(async move {
-        let mut a = agent.lock().await;
-        a.apply_provider_switch(hrdr_agent::ProviderSwitch {
-            name: provider,
-            base_url: url,
-            api_key: key,
-            api_version,
-            headers,
-            kind,
-            model: Some(model_for_agent),
-        });
-        if probe_after && let Some(w) = a.probe_context_window().await {
-            post(w);
-        }
-        String::new()
-    }));
-    host.set_model(model.clone());
-    if effective_window.is_some() {
-        host.set_context_window(effective_window);
-    }
-    host.set_base_url(p.base_url.clone());
-    host.set_provider(provider_name.to_string());
-    if remember {
-        // Remember this combo so a later launch with nothing pinned resumes it.
-        hrdr_agent::record_last_model(provider_name, &model);
-    }
+    let window = choice_context_window.or(p.context_window);
+    apply_reference(host, reference, window, remember);
     Ok(())
 }
 
@@ -238,7 +271,7 @@ pub async fn endpoint_health_warning(
             a.client(),
             a.provider_kind(),
             a.has_credential(),
-            a.provider_name(),
+            a.provider_name().to_string(),
         )
     };
     // Never call a provider that requires auth with no auth. The 401 that comes
@@ -246,7 +279,7 @@ pub async fn endpoint_health_warning(
     // as "unreachable" sends the user off to debug a server that is fine. A local
     // endpoint legitimately needs no key, so it is still probed.
     if !has_credential && !hrdr_agent::is_local_endpoint(&base_url) {
-        return Some(missing_credential_guidance(provider.as_deref(), &base_url));
+        return Some(missing_credential_guidance(Some(&provider), &base_url));
     }
     // Trusted ChatGPT OAuth: the Codex backend does not expose the generic
     // unauthenticated `/models` shape, so this probe only yields a false 401
@@ -297,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn a_remote_provider_with_no_key_is_told_to_log_in_not_that_it_is_down() {
         let config = hrdr_agent::AgentConfig {
-            provider: Some("openai".to_string()),
+            model: "openai://gpt-5".parse().unwrap(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: None,
             ..Default::default()
@@ -348,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn health_probe_skipped_for_trusted_chatgpt_oauth() {
         let config = hrdr_agent::AgentConfig {
-            provider: Some("chatgpt".to_string()),
+            model: "chatgpt://gpt-5.5".parse().unwrap(),
             base_url: hrdr_agent::CHATGPT_CODEX_BASE_URL.to_string(),
             ..Default::default()
         };

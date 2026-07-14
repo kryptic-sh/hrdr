@@ -19,8 +19,8 @@ use anyhow::{Result, anyhow};
 
 use crate::model_ref::{ModelRef, catalog_provider_key};
 use crate::{
-    AgentConfig, BUILTIN_PROVIDERS, CHATGPT_CODEX_BASE_URL, ResolvedProviderKind, builtin_provider,
-    chatgpt_models, resolve_api_key,
+    AgentConfig, BUILTIN_PROVIDERS, CHATGPT_CODEX_BASE_URL, ProviderConfig, ResolvedProviderKind,
+    builtin_provider, chatgpt_models, is_codex_oauth, resolve_api_key, resolve_provider_in,
 };
 
 /// The key-inheritance context a *child* agent resolves against: the caller's
@@ -123,13 +123,58 @@ impl ResolvedModel {
     /// not enough (a `[providers.*]` entry pointed at the Codex URL is `Custom` —
     /// it never earns the account's credentials).
     ///
-    /// The same conjunction is currently hand-written at each of its call sites —
-    /// `Agent::refresh_oauth_if_needed`, `oauth::coordinated_oauth_access`,
-    /// `list_provider_models`, and the `has_oauth_credentials` gating around them.
-    /// Those are NOT changed in this slice (zero behavior change); they are what
-    /// this helper replaces once `ResolvedModel` reaches them.
+    /// The conjunction itself lives in [`is_codex_oauth`](crate::is_codex_oauth) —
+    /// the one definition every call site (`Agent::refresh_oauth_if_needed`,
+    /// `oauth::coordinated_oauth_access`, `list_provider_models`, the
+    /// `has_oauth_credentials` gating) now goes through.
     pub fn is_codex_oauth(&self) -> bool {
-        self.kind == ResolvedProviderKind::ChatGptOAuth && self.base_url == CHATGPT_CODEX_BASE_URL
+        is_codex_oauth(self.kind, &self.base_url)
+    }
+
+    /// Adopt the config's **cached derived** endpoint (`AgentConfig`'s `base_url` /
+    /// `api_key` / `api_version` / `headers`) for its identity, rather than
+    /// re-deriving it.
+    ///
+    /// Those fields are what an earlier [`resolve`] produced — but they may have
+    /// been *relocated* since (a `--base-url` / `$HRDR_BASE_URL` override, or a
+    /// free-floating `base_url =` in config.toml that names no provider). An agent
+    /// constructed from such a config must talk to the endpoint it was given, not
+    /// to the one its provider preset would resolve to, so construction adopts and
+    /// never re-resolves. The trust [`kind`](Self::kind) is still resolved from the
+    /// config (the sole trust gate), and the window is still derived from the
+    /// `(endpoint, model)` in force.
+    pub fn from_config(cfg: &AgentConfig) -> Self {
+        let name = cfg.model.provider().as_str();
+        let kind = cfg
+            .resolve_provider(name)
+            .map_or(ResolvedProviderKind::BuiltIn, |p| p.kind);
+        Self {
+            reference: cfg.model.clone(),
+            base_url: cfg.base_url.clone(),
+            api_key: cfg.api_key.clone(),
+            api_version: cfg.api_version.clone(),
+            headers: cfg.headers.clone(),
+            kind,
+            context_window: derived_context_window(Some(name), &cfg.base_url, cfg.model.model()),
+        }
+    }
+
+    /// Move this resolved model onto another endpoint — the `--base-url` override,
+    /// which *relocates* a provider rather than replacing it.
+    ///
+    /// The identity and the trust kind ride along unchanged (this is still that
+    /// provider, at a different address), so the double gate re-evaluates honestly:
+    /// a built-in ChatGPT relocated off the Codex URL stops being
+    /// [`is_codex_oauth`](Self::is_codex_oauth) and is never handed the account's
+    /// bearer. The window is re-derived, since it is a fact about the endpoint.
+    pub fn relocate(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
+        self.base_url = base_url.into();
+        self.api_key = api_key;
+        self.context_window = derived_context_window(
+            Some(self.reference.provider().as_str()),
+            &self.base_url,
+            self.reference.model(),
+        );
     }
 }
 
@@ -156,8 +201,23 @@ pub fn resolve(
     cfg: &AgentConfig,
     parent: Option<&AuthContext<'_>>,
 ) -> Result<ResolvedModel> {
+    resolve_in(&cfg.providers, reference, parent)
+}
+
+/// [`resolve`] against just the `[providers.*]` table — the only part of the
+/// config it reads.
+///
+/// A live [`Agent`](crate::Agent) keeps that table (and not a whole `AgentConfig`,
+/// which would be a second, drifting copy of settings it has already unpacked) so
+/// [`Agent::set_model_ref`](crate::Agent::set_model_ref) can re-resolve a new
+/// identity against the user's providers.
+pub fn resolve_in(
+    providers: &HashMap<String, ProviderConfig>,
+    reference: &ModelRef,
+    parent: Option<&AuthContext<'_>>,
+) -> Result<ResolvedModel> {
     let name = reference.provider().as_str();
-    let p = cfg.resolve_provider(name).ok_or_else(|| {
+    let p = resolve_provider_in(providers, name).ok_or_else(|| {
         anyhow!(
             "unknown provider '{name}' (built-ins: {}, or define [providers.{name}])",
             BUILTIN_PROVIDERS.join(", ")
