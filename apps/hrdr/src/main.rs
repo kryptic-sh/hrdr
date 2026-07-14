@@ -397,12 +397,11 @@ async fn main() -> Result<()> {
     let named_specs = hrdr_agent::named_model_specs();
     let specs: Vec<hrdr_agent::ModelSpec> =
         named_specs.iter().chain(cli_spec.iter()).cloned().collect();
+    // `--model` / `$HRDR_MODEL` / config.toml settle the identity a NEW session
+    // starts on — the default, not a pin. A session that already carries an
+    // identity (it was resumed, or `/model` picked one) keeps its own: the model
+    // and the provider are part of the conversation.
     let identity = settle_identity(&store, &specs, &config)?;
-    // ONE pin for ONE identity: `--model` (like `$HRDR_MODEL`) names the thing this
-    // process runs on, and a resumed session does not get to replace it.
-    if cli_spec.is_some() {
-        config.model_pinned = true;
-    }
 
     // The endpoint the identity's provider resolves to — its key, headers and
     // api-version with it. A `--base-url` / `$HRDR_BASE_URL` **relocates** that
@@ -430,6 +429,9 @@ async fn main() -> Result<()> {
     // value the user wrote somewhere.
     let file_url =
         (config.base_url != hrdr_agent::DEFAULT_BASE_URL).then(|| config.base_url.clone());
+    // Remembered as the relocation it is: it moved THIS provider's endpoint. A
+    // resume onto another provider leaves it behind, and says so.
+    config.base_url_override = flag_url.clone();
     config.base_url = settle_base_url(flag_url, file_url, &p.base_url, provider_named);
     // Key precedence: inline > key_env var > credential saved by `/login`.
     // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT login

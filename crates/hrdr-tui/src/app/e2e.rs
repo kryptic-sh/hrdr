@@ -1815,31 +1815,26 @@ async fn a_narrow_viewport_drops_the_header_details() {
     assert!(!screen.contains("model  "), "details dropped:\n{screen}");
 }
 
-/// Model precedence, highest first: **flag > env > session > config**.
+/// Model precedence, highest first: **the session > flag > env > config**.
 ///
-/// A flag or env var pins the identity — WHOLE, since it is one value: resuming a
-/// session — automatically at startup or explicitly via `/resume` — must not switch
-/// the model (or the provider) out from under it. The endpoint is never taken from
-/// the session either.
+/// `--model` / `$HRDR_MODEL` name the identity a **new** session starts on — the
+/// default, not a pin. A session that already carries one (it was resumed, or `/model`
+/// picked it) keeps it: the provider and the model are part of the conversation, and
+/// resuming it brings BOTH back — identity and endpoint together, not one half each.
 ///
-/// Regression: resuming replaced the configured model with whatever the session
-/// last used, so `hrdr --model go://deepseek-v4-flash` in a directory with a saved
-/// session silently ran a different model, and the header showed the wrong one.
-/// `base_url` was clobbered too, contradicting the resume notice's "session endpoint
-/// was X (current: Y)".
+/// Regression (the rule this replaces): a launch flag used to outrank the session, so
+/// resuming a `zen://kimi-k2` conversation under `hrdr --model chatgpt://gpt-5.5`
+/// carried on the old messages against a different model at a different provider.
 #[tokio::test]
-async fn a_pinned_model_and_provider_survive_a_resume() {
+async fn a_resumed_session_keeps_its_own_model_over_a_launch_flag() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
-        // As if `--model go://flash` (or $HRDR_MODEL). ONE pin, for the one identity
-        // the flag names: pinning is all-or-nothing.
-        h.app.cfg.model_pinned = true;
-        h.app.state_mut().model = "go://flash".parse().unwrap();
-        let launch_endpoint = h.app.state().base_url.clone();
+        // As if `hrdr --model chatgpt://gpt-5.5` (or `$HRDR_MODEL`).
+        h.app.state_mut().model = "chatgpt://gpt-5.5".parse().unwrap();
 
         let saved = hrdr_app::SessionState {
             cwd: h.app.current_cwd(),
-            model: "zen://pro".parse().unwrap(),
+            model: "zen://kimi-k2".parse().unwrap(),
             base_url: "https://saved.example/v1".into(),
             messages: vec![hrdr_agent::Message::system("sys")],
             transcript: vec![Entry::user("earlier")],
@@ -1851,18 +1846,31 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         } else {
             h.app.auto_resume_state(saved, "old".to_string());
         }
+        // The chrome follows the agent, never leads it: let the repoint land.
+        h.settle_switch().await;
+        h.app.sync_panes();
 
         assert_eq!(
             h.app.state().model.to_string(),
-            "go://flash",
-            "the pinned identity wins, whole (explicit_resume={explicit_resume})"
+            "zen://kimi-k2",
+            "the session's identity wins, whole (explicit_resume={explicit_resume})"
+        );
+        // …and the agent — the thing doing the talking — went with it.
+        let (provider, endpoint) = {
+            let a = h.app.agent.lock().await;
+            (a.provider_name().to_string(), a.endpoint_base_url())
+        };
+        assert_eq!(provider, "zen", "the agent is on the session's provider");
+        assert!(
+            endpoint.contains("opencode.ai"),
+            "pointed at that provider's endpoint, not the launch one: {endpoint}"
         );
         assert_eq!(
             h.app.state().base_url,
-            launch_endpoint,
-            "a pinned provider's endpoint belongs to this process, not the session"
+            endpoint,
+            "and the bar names the endpoint the agent is actually talking to"
         );
-        // The conversation itself did come back.
+        // The conversation itself came back too.
         assert!(
             h.app
                 .transcript()
@@ -1871,6 +1879,171 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
             "the saved transcript is restored"
         );
     }
+}
+
+/// The other half of the same rule: what `/model` picked is what a later resume
+/// restores — a pick is the session's identity, and a launch flag is only the default
+/// for a session that hasn't got one.
+#[tokio::test]
+async fn a_model_pick_is_what_a_later_resume_restores() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .apply_model_choice_for_test("zen", "kimi-k2", Some(200_000));
+    h.settle_switch().await;
+    h.app.sync_panes();
+    assert_eq!(
+        h.app.state().model.to_string(),
+        "zen://kimi-k2",
+        "the pick is the session's identity"
+    );
+
+    // What the autosave writes: the identity in force, as picked.
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: h.app.state().model.clone(),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+
+    // A LATER process, launched with a different `--model`, resumes it.
+    let mut h2 = Harness::new(vec![]).await;
+    h2.app.state_mut().model = "chatgpt://gpt-5.5".parse().unwrap();
+    h2.app.auto_resume_state(saved, "old".to_string());
+    h2.settle_switch().await;
+    h2.app.sync_panes();
+    assert_eq!(
+        h2.app.state().model.to_string(),
+        "zen://kimi-k2",
+        "the pick came back — the launch flag is a new session's default, not a pin"
+    );
+}
+
+/// A session whose provider isn't usable HERE (unknown, or its key is gone) is the one
+/// case a resume cannot honour: the agent stays where it is — talking to an endpoint
+/// that works — and says so. It never silently sends the conversation somewhere it
+/// cannot go.
+#[tokio::test]
+async fn a_session_on_an_unusable_provider_stays_put_and_says_so() {
+    let mut h = Harness::new(vec![]).await;
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "nowhere://ghost".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "old".to_string());
+
+    assert!(
+        h.app.transcript().iter().any(|e| matches!(
+            &e.kind,
+            EntryKind::Notice(t) | EntryKind::System(t)
+                if t.contains("this session ran on provider 'nowhere'")
+                && t.contains("staying on the current endpoint")
+        )),
+        "the failure is reported:\n{:?}",
+        h.app
+            .transcript()
+            .iter()
+            .map(|e| &e.kind)
+            .collect::<Vec<_>>()
+    );
+    let provider = h.app.agent.lock().await.provider_name().to_string();
+    assert_eq!(provider, "local", "the agent did not move");
+}
+
+/// A pre-`provider://model` session file names a model and NO provider. "This model"
+/// means: on the provider in force — which, at a resume, is still the launch identity's.
+#[tokio::test]
+async fn a_legacy_session_lands_its_model_on_the_provider_in_force() {
+    let mut h = Harness::new(vec![]).await;
+    // As if `hrdr --model zen://kimi-k2` — the provider in force at the resume.
+    h.app.state_mut().model = "zen://kimi-k2".parse().unwrap();
+
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "local://legacy-model".parse().unwrap(),
+        provider_unset: true,
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "old".to_string());
+    h.settle_switch().await;
+    h.app.sync_panes();
+
+    assert_eq!(
+        h.app.state().model.to_string(),
+        "zen://legacy-model",
+        "the session's model, on the provider in force"
+    );
+}
+
+/// A `--base-url` relocation belongs to the provider it relocated. Resuming a session
+/// that ran on ANOTHER provider moves the agent off it — the relocation is dropped,
+/// which is correct, and is SAID: an override the user typed and an endpoint they are
+/// not talking to must never disagree in silence.
+#[tokio::test]
+async fn a_relocation_that_no_longer_applies_is_announced_not_dropped() {
+    // Provider CHANGES: the relocation of `local` is left behind, and announced.
+    let mut h = Harness::new(vec![]).await;
+    h.app.cfg.base_url_override = Some("http://localhost:1234/v1".to_string());
+    h.app.state_mut().base_url = "http://localhost:1234/v1".to_string();
+    h.app.state_mut().model = "local://qwen3".parse().unwrap();
+
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "zen://kimi-k2".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "old".to_string());
+    h.settle_switch().await;
+
+    let notice = h
+        .app
+        .transcript()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::Notice(t) | EntryKind::System(t)
+                if t.starts_with("note: this session runs on") =>
+            {
+                Some(t.clone())
+            }
+            _ => None,
+        })
+        .expect("the dropped relocation is announced");
+    assert_eq!(
+        notice,
+        "note: this session runs on zen; --base-url (http://localhost:1234/v1) applied to \
+         local and no longer applies — talking to https://opencode.ai/zen/v1"
+    );
+
+    // Provider is the SAME: the relocation still applies, and nothing is said.
+    let mut h = Harness::new(vec![]).await;
+    h.app.cfg.base_url_override = Some("http://localhost:1234/v1".to_string());
+    h.app.state_mut().base_url = "http://localhost:1234/v1".to_string();
+    h.app.state_mut().model = "local://qwen3".parse().unwrap();
+
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "local://other-model".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "old".to_string());
+    h.settle_switch().await;
+
+    assert!(
+        !h.app.transcript().iter().any(|e| matches!(
+            &e.kind,
+            EntryKind::Notice(t) | EntryKind::System(t) if t.contains("--base-url")
+        )),
+        "a same-provider resume keeps the relocation — there is nothing to say"
+    );
+    assert_eq!(
+        h.app.state().base_url,
+        "http://localhost:1234/v1",
+        "and the endpoint the user chose for this provider is still the one in use"
+    );
 }
 
 /// A conversation's **provider is part of the conversation**: resuming one repoints
@@ -1885,8 +2058,6 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
 #[tokio::test]
 async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     let mut h = Harness::new(vec![]).await;
-    // Nothing pinned: the session gets to decide (flag > env > session > config).
-    h.app.cfg.model_pinned = false;
 
     let saved = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
@@ -1937,13 +2108,12 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     );
 }
 
-/// With nothing pinned, the value came from the config file (or a provider
-/// preset's default) — and a resumed session outranks config.
+/// The same rule with the launch identity coming from the config file (or a provider
+/// preset's default) instead of a flag: a resumed session outranks it too.
 #[tokio::test]
-async fn an_unpinned_model_and_provider_yield_to_the_session() {
+async fn a_config_default_yields_to_the_session_as_well() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
-        assert!(!h.app.cfg.model_pinned, "the harness config isn't pinned");
         h.app.state_mut().model = "local://from-config".parse().unwrap();
 
         let saved = hrdr_app::SessionState {

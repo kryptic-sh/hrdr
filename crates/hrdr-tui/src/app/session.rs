@@ -184,14 +184,15 @@ impl super::App {
     ///
     /// * `context_window` — a saved one is a stand-in until the endpoint is
     ///   re-probed, so it never clobbers a window this process already knows.
-    /// * `model` / `provider` — the session supplies them only when this process
-    ///   didn't pin them with a flag or an env var. Precedence, highest first:
-    ///   **flag > env > session > config**. Applies to `/resume` as well as to
-    ///   startup auto-resume: a pinned model never switches out from under you.
+    /// * `model` / `provider` — the session's identity WINS. A conversation carries
+    ///   the model and the provider it ran on, and resuming it brings both back.
+    ///   `--model` / `$HRDR_MODEL` / config.toml settle the identity a **new** session
+    ///   starts on — they are the default, not a pin, and a session that already has
+    ///   an identity (resumed, or picked with `/model`) is not overridden by them.
+    ///   Applies to `/resume` as well as to startup auto-resume.
     ///
-    /// And when the session *does* supply the provider, the agent is **repointed to
-    /// it** ([`hrdr_app::restore_session_provider`]) — endpoint, key and model
-    /// together.
+    /// And when the session supplies the provider, the agent is **repointed to it**
+    /// ([`hrdr_app::restore_session_provider`]) — endpoint, key and model together.
     ///
     /// Regression: the endpoint used to be treated as the process's, and a resume
     /// only printed "note: session endpoint was X". So a session saved on one
@@ -203,15 +204,17 @@ impl super::App {
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
-        // ONE pin, for one identity. A flag/env (`--model` / `$HRDR_MODEL`) pins what
-        // this process runs on, and a resumed session does not unpin it — but it pins
-        // the identity WHOLE. Pinning one half and adopting the other is how a
-        // session's model used to arrive on the launch provider (or the launch model
-        // on the session's provider), which is precisely the pair that never agreed.
-        let pinned = self.cfg.model_pinned.then(|| self.state().model.clone());
         // The identity in force right now — the provider an OLD session file (one
-        // that named a model but no provider) means by "this model".
+        // that named a model but no provider) means by "this model", and the provider
+        // a `--base-url` relocation (if any) was applied to.
         let in_force = self.state().model.clone();
+        // A relocation is only in effect while we are still talking to it: a `/model`
+        // switch away from the launch provider already left it behind.
+        let relocation = self
+            .cfg
+            .base_url_override
+            .clone()
+            .filter(|u| *u == base_url);
 
         // The state *is* the main pane's — transcript, counters and all — so
         // adopting a session is one assignment. There is nothing left to hand back.
@@ -226,9 +229,6 @@ impl super::App {
                 .apply(&in_force)
                 .expect("a bare model id always resolves");
             state.provider_unset = false;
-        }
-        if let Some(model) = pinned {
-            state.model = model;
         }
         self.refresh_subagent_dir();
         // The pane is rebuilt from the registry every frame, main agent included —
@@ -255,11 +255,10 @@ impl super::App {
         // talking is the thing being displayed. (The model alone used to be handed
         // over here, leaving the agent on the launch endpoint.)
         //
-        // Two things stop it. A **pinned** identity (`--model`, or `$HRDR_MODEL`) is
-        // this process's decision, already applied at launch — re-resolving it would
-        // throw away an endpoint the user chose (a `--base-url` override) for the
-        // provider's canonical one. And an identity the agent is **already on** needs
-        // no switch, for the same reason.
+        // One thing stops it: an identity the agent is **already on** needs no switch —
+        // and re-resolving it would throw away an endpoint the user chose (a
+        // `--base-url` relocation of that same provider) for the provider's canonical
+        // one.
         let (reference, window) = {
             let s = self.state();
             (s.model.clone(), s.usage.context_window)
@@ -269,21 +268,49 @@ impl super::App {
                 .find(|e| e.key == hrdr_agent::MAIN_KEY)
                 .map(|e| (e.provider.clone().unwrap_or_default(), e.model.clone()))
         });
-        let switchable = !self.cfg.model_pinned;
         let unchanged = current.as_ref()
             == Some(&(
                 reference.provider().to_string(),
                 reference.model().to_string(),
             ));
-        if switchable && !unchanged && !reference.model().is_empty() {
+        if !unchanged && !reference.model().is_empty() {
             let name = reference.provider().to_string();
             let model = reference.model().to_string();
+            // The provider the AGENT is on — the one whose endpoint (relocated or not)
+            // it is currently talking to, and the one a switch moves it off.
+            let from = current
+                .as_ref()
+                .map(|(p, _)| p.clone())
+                .unwrap_or_else(|| in_force.provider().to_string());
             let mut host = commands::TuiHost { app: self };
             if let Err(e) = hrdr_app::restore_session_provider(&mut host, &name, model, window) {
                 self.system(format!(
                     "this session ran on provider '{name}', which isn't usable here ({e}) — \
                      staying on the current endpoint; /model to switch"
                 ));
+            } else if from != name {
+                // A change of PROVIDER moves the endpoint — the agent's rule, and the
+                // chrome's, so the bar names the endpoint the agent is talking to. (The
+                // switch itself posts no endpoint here: it repoints an identity the
+                // pane already shows.)
+                let now = self
+                    .cfg
+                    .resolve_provider(&name)
+                    .map(|p| p.base_url)
+                    .unwrap_or_default();
+                if !now.is_empty() {
+                    self.set_active_base_url(now.clone());
+                }
+                // …and a `--base-url` relocation is left behind with the provider it
+                // relocated. Dropping it is right — it named THAT provider's address —
+                // but never silently: an override the user typed and an endpoint they
+                // are not talking to must not disagree in silence.
+                if let Some(url) = relocation {
+                    self.system(format!(
+                        "note: this session runs on {name}; --base-url ({url}) applied to \
+                         {from} and no longer applies — talking to {now}"
+                    ));
+                }
             }
         }
 

@@ -1941,16 +1941,18 @@ pub struct AgentConfig {
     /// unlimited. Estimates come from the models.dev catalog; calls on an
     /// unpriced model count as $0.
     pub max_cost: Option<f64>,
-    /// The model identity was set by the `--model` CLI flag or by `$HRDR_MODEL`,
-    /// which outrank a resumed session's. A value
-    /// from the config file (or a provider preset's default) leaves this false, so
-    /// a session may override it.
+    /// The `--base-url` / `$HRDR_BASE_URL` this run was launched with, if any —
+    /// the endpoint override that **relocated** the launch provider (it is still
+    /// that provider, at another address). `None` = no relocation; a
+    /// free-floating `base_url` in config.toml is not one (it names no provider,
+    /// so anything that does supersedes it).
     ///
-    /// There is ONE pin, because there is one identity: pinning half of it was how
-    /// a provider and a model that never agreed got to travel together.
-    ///
-    /// Precedence: flag > env > session > config.
-    pub model_pinned: bool,
+    /// Kept as the *source* value, not just folded into [`base_url`](Self::base_url),
+    /// because a relocation is only meaningful relative to the provider it was
+    /// applied to: resuming a session that ran on ANOTHER provider moves the agent
+    /// off that provider, and the relocation stops applying. That has to be said out
+    /// loud rather than silently dropped (see the TUI's `adopt_state`).
+    pub base_url_override: Option<String>,
     /// The USER-CONFIGURED context window (`context_window` in config.toml, or a
     /// `[providers.<name>].context_window`), in tokens — for the status bar's
     /// "X of Y" and the auto-compaction trigger.
@@ -2449,7 +2451,7 @@ impl Default for AgentConfig {
             // `default` IS the default model id — the pair the two old fields
             // carried, now spelled as the one identity they always were.
             model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
-            model_pinned: false,
+            base_url_override: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 300,
@@ -3182,10 +3184,6 @@ impl AgentConfig {
                 cfg.model = reference;
             }
         }
-        // An env-supplied identity outranks a resumed session's; a config-file one
-        // doesn't (flag > env > session > config). The binary ORs in its `--model`
-        // flag on top of this. ONE pin, because there is one identity.
-        cfg.model_pinned = env_model_spec().is_some();
         Ok(cfg)
     }
 
