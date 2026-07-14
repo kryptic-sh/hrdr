@@ -56,6 +56,8 @@ clap_mangen = "0.3"
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
+hrdr-test-support.workspace = true
 # A real terminal for the TUI to run in — a pty on Unix, a ConPTY on Windows.
 # Test-only: it never reaches the shipped binary. Without one, hrdr's own tests
 # can only ever drive the `App` behind a `TestBackend`, which proves the widgets

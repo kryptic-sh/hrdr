@@ -27,10 +27,7 @@ glob.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 
-[features]
-# Test-only isolation of the user's real files (see src/test_support.rs), turned on
-# by the other crates' test binaries. Adds nothing to a release build.
-test-support = []
-
 [dev-dependencies]
+# Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
+hrdr-test-support.workspace = true
 tempfile.workspace = true

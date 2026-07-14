@@ -4,6 +4,14 @@
 //! complete: stream a turn, execute any requested tools, feed the results back,
 //! repeat. Emits [`AgentEvent`]s for a UI (or stdout) to render live.
 
+// Every test in this crate — including one written tomorrow by someone who read none
+// of this — runs with `$HOME` and the XDG roots pointed at a throwaway directory. The
+// `extern crate` is what links `hrdr-test-support`'s life-before-main ctor into this
+// test binary; rustc drops a dependency nothing references, and a dropped ctor is a
+// test writing the developer's real sessions. Do not remove it.
+#[cfg(test)]
+extern crate hrdr_test_support;
+
 mod agents_dir;
 mod auth;
 mod prompt;
@@ -45,11 +53,6 @@ pub use subagent_live::{
     age_completed_todos, event_log,
 };
 mod subagent_transcript;
-/// Isolation for tests that touch user state — see [`test_support`]. Compiled only
-/// for hrdr's own test builds (`cfg(test)`, and the `test-support` feature the other
-/// crates' test binaries turn on); never part of a release build.
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 mod turn;
 pub use turn::TurnStats;
 mod usage;
@@ -10217,10 +10220,6 @@ mod tests {
         /// Minimal agent config pointing at `base_url`, with checkpoints and
         /// subagents disabled for test isolation.
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
-            // A real agent run refreshes the models.dev cache, writes checkpoints and
-            // reads the auth store — all under `$HOME`. Every mock-server test funnels
-            // through here, so this is where that stops being the developer's `$HOME`.
-            crate::test_support::isolate_user_state();
             AgentConfig {
                 base_url,
                 model: "local://test-model".parse().unwrap(),

@@ -7,6 +7,7 @@ members = [
     "crates/hrdr-editor",
     "crates/hrdr-app",
     "crates/hrdr-tui",
+    "crates/hrdr-test-support",
     "apps/hrdr",
 ]
 
@@ -25,6 +26,9 @@ hrdr-agent = { path = "crates/hrdr-agent", version = "0.3.0" }
 hrdr-editor = { path = "crates/hrdr-editor", version = "0.3.0" }
 hrdr-app = { path = "crates/hrdr-app", version = "0.3.0" }
 hrdr-tui = { path = "crates/hrdr-tui", version = "0.3.0" }
+# Dev-only, never published: the ctor that sandboxes $HOME/XDG before any test runs.
+# Path-only on purpose — cargo strips a versionless path dev-dependency on publish.
+hrdr-test-support = { path = "crates/hrdr-test-support" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
 hjkl-engine = "0.33"

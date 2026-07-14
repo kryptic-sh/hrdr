@@ -17,5 +17,7 @@ futures-util.workspace = true
 async-stream.workspace = true
 
 [dev-dependencies]
+# Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
+hrdr-test-support.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

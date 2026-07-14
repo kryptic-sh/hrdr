@@ -28,6 +28,6 @@ tempfile.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# A test never writes the developer's real sessions/config/history.
-hrdr-agent = { workspace = true, features = ["test-support"] }
+# Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
+hrdr-test-support.workspace = true
 

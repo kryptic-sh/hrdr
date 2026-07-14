@@ -735,8 +735,7 @@ mod tests {
         fn new(cwd: std::path::PathBuf) -> Self {
             // Dispatching a command runs the real code: `/model` reads the last-used
             // store, an agent refreshes the models.dev cache. Not from the developer's
-            // `$HOME` — every test here builds its host through this constructor.
-            hrdr_agent::test_support::isolate_user_state();
+            // `$HOME` — the sandbox ctor moved it before this binary reached `main`.
             let agent = Agent::new(AgentConfig {
                 cwd: cwd.clone(),
                 model: "local://test-model".parse().unwrap(),

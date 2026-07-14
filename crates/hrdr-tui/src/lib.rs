@@ -7,6 +7,14 @@
 //!
 //! Workflow: type in the input (Insert mode), `Esc` to Normal, `Enter` to send.
 
+// Every test in this crate — including one written tomorrow by someone who read none
+// of this — runs with `$HOME` and the XDG roots pointed at a throwaway directory. The
+// `extern crate` is what links `hrdr-test-support`'s life-before-main ctor into this
+// test binary; rustc drops a dependency nothing references, and a dropped ctor is a
+// test writing the developer's real sessions. Do not remove it.
+#[cfg(test)]
+extern crate hrdr_test_support;
+
 mod app;
 mod theme;
 mod tui;

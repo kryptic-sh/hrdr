@@ -17,3 +17,7 @@ hjkl-clipboard.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+# Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
+hrdr-test-support.workspace = true

@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **No test can touch the developer's real user state — and no test has to
+  ask.** Isolation used to be a helper
+  (`hrdr_agent::test_support::isolate_user_state`) called from three test
+  constructors, so any test that did not go through one of them wrote the real
+  `~/.local/share/hrdr` (that is how 3,179 junk `tmp-*` session directories and
+  a silently rewritten `last_model.json` happened). It is now structural: the
+  new dev-only `hrdr-test-support` crate carries a `#[ctor]` that points
+  `$HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` and
+  `XDG_CACHE_HOME` at a throwaway per-process directory **before `main`** in
+  every test binary — unit and integration alike — with nothing to opt into. Two
+  automatic checks keep it honest: `every_test_binary_is_sandboxed` fails if a
+  crate root or a `tests/*.rs` stops linking the ctor, and the `leak-guard` CI
+  job runs the whole suite against a sentinel `$HOME` and fails, naming the
+  files, if anything lands in it. `hrdr_agent::test_support` is gone; the TUI's
+  `isolated_data_home()` remains, now purely for tests that need a root private
+  from their _siblings_.
+
 ### Breaking
 
 - **The endpoint belongs to the provider.** An endpoint may now come from

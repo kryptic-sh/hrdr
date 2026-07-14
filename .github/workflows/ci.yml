@@ -93,11 +93,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run:
-          cargo nextest run --workspace --all-features
-          --locked --no-fail-fast
+          cargo nextest run --workspace --all-features --locked --no-fail-fast
+      - run: cargo test --workspace --doc --all-features --locked
+
+  # No test may touch the developer's real files. Layer 1 is a life-before-main ctor
+  # (`hrdr-test-support`) that moves $HOME and every XDG root to a throwaway dir in every
+  # test binary, with nothing to opt into. This is layer 2: run the whole suite in a
+  # subprocess whose $HOME and XDG roots are an EMPTY sentinel dir, and fail — naming the
+  # files — if anything lands in it. It is what catches the test that slipped the net
+  # (a new tests/*.rs missing the link line, a doctest) before it reaches a real machine.
+  # Gated on HRDR_LEAK_GUARD so a plain `cargo test` never invokes itself.
+  leak-guard:
+    name: no test writes real user state
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
       - run:
-          cargo test --workspace --doc --all-features
-          --locked
+          cargo test --locked -p hrdr-test-support --test leak_guard --
+          --nocapture
+        env:
+          HRDR_LEAK_GUARD: '1'
 
   smoke:
     name: build + smoke ${{ matrix.os }}
@@ -252,7 +273,8 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }} -p hrdr
           --bin hrdr
       - name: Smoke artifact
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target ==
+        if:
+          matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target ==
           'aarch64-apple-darwin'
         run: ./target/${{ matrix.target }}/release/hrdr --version
       - name: Package (Linux / macOS)
@@ -333,8 +355,8 @@ jobs:
     name: Publish GitHub Release
     needs: [build, fmt, clippy, deny, machete]
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      github.event_name == 'workflow_dispatch' || (github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write

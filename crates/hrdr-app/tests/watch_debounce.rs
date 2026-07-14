@@ -5,6 +5,12 @@
 //! whole process (`config_file_path()` reads it), which would race the unit
 //! tests running in the library's test binary.
 
+// This is its own test binary: it does NOT get the library's `#[cfg(test)]` code, so it
+// links the sandbox ctor itself. Without this line the test would run against the
+// developer's real `$HOME`. Every `tests/*.rs` in the workspace carries it, and
+// `every_test_binary_is_sandboxed` fails the build for one that does not.
+extern crate hrdr_test_support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};

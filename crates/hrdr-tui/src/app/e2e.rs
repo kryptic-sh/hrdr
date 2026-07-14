@@ -279,10 +279,9 @@ impl Harness {
     async fn with_max_steps(replies: Vec<MockReply>, max_steps: usize) -> Self {
         // A harnessed app is a REAL app: it autosaves sessions, appends to the input
         // history, persists a `/timestamps` toggle, records a `/model` pick. Every one
-        // of those lands under `$HOME` — so the floor every e2e test stands on is a
-        // throwaway home, installed once for the process, and a test that forgets to
-        // ask for isolation still cannot reach the developer's files.
-        hrdr_agent::test_support::isolate_user_state();
+        // of those lands under `$HOME` — which, in a test binary, is the throwaway
+        // sandbox `hrdr-test-support`'s ctor installed before `main` ever ran. Nothing
+        // to call here: the floor is already not the developer's home.
         let mock = MockServer::start(replies).await;
         let tmp = tempfile::tempdir().unwrap();
         let config = AgentConfig {
@@ -387,21 +386,22 @@ fn without_bar(row: &str) -> &str {
 }
 
 /// A PRIVATE, EMPTY `sessions_dir()` and user config for the duration of one test —
-/// for the tests that assert on exactly what they wrote there, and would read another
-/// test's files as their own.
+/// for the tests that assert on exactly what they wrote there, and would otherwise read
+/// a *sibling test's* files as their own.
 ///
-/// Isolation from the *developer's* files is not this guard's job and never depends on
-/// remembering to call it: [`isolate_user_state`](hrdr_agent::test_support::isolate_user_state)
-/// has already moved `$HOME` and the XDG roots to a throwaway directory for the whole
-/// process. This narrows that shared root to one nobody else can write, and hands it
-/// back on drop — `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-global, so a test
-/// holding a private root must hold the lock while it does, and must not leave the vars
-/// pointing at a temp dir that is about to be deleted.
+/// This is no longer about the developer's files, and it is not what stands between a
+/// test and `~/.local/share/hrdr`: `hrdr-test-support`'s ctor moved `$HOME` and the XDG
+/// roots to a throwaway directory before `main`, for every test in the binary, with
+/// nothing to call and nothing to remember. But that sandbox is ONE root shared by every
+/// test in the process, and cargo runs them in parallel — a test asserting "the session
+/// store holds exactly one session" needs a root no sibling can write. That is this
+/// guard's only remaining job.
+///
+/// It hands the root back on drop: `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-
+/// global, so a test holding a private root holds the lock while it does, and must not
+/// leave the vars pointing at a temp dir that is about to be deleted.
 fn isolated_data_home() -> DataHomeGuard {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // The process-wide floor first: whatever this guard does, and whenever it is
-    // dropped, the roots never fall back to the developer's home.
-    hrdr_agent::test_support::isolate_user_state();
     // A previous test's panic must not poison the lock for everyone else.
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
@@ -423,7 +423,7 @@ struct DataHomeGuard {
 
 impl Drop for DataHomeGuard {
     fn drop(&mut self) {
-        let (data, config, _cache) = hrdr_agent::test_support::user_state_dirs();
+        let (data, config, _cache) = hrdr_test_support::user_state_dirs();
         // SAFETY: the lock is still held (it is dropped after this), so no other test
         // is reading or writing these vars.
         unsafe {

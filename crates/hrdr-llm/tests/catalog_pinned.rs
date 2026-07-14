@@ -5,6 +5,12 @@
 //! would race the unit tests in the library's test binary. One test, not two,
 //! for the same reason: cargo runs a binary's tests on parallel threads.
 
+// This is its own test binary: it does NOT get the library's `#[cfg(test)]` code, so it
+// links the sandbox ctor itself. Without this line the test would run against the
+// developer's real `$HOME`. Every `tests/*.rs` in the workspace carries it, and
+// `every_test_binary_is_sandboxed` fails the build for one that does not.
+extern crate hrdr_test_support;
+
 /// A pinned catalog answers every lookup, and a missing one yields `None`
 /// rather than falling through to a fetch — the whole point of pinning.
 #[tokio::test]

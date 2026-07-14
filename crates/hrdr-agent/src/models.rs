@@ -556,6 +556,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The whole promise, tested the way it will be broken: a test that calls the real
+    /// state-writing code with **no fixture, no harness, no helper** — exactly what a
+    /// new contributor writes — and cannot reach the developer's files anyway.
+    ///
+    /// `record_last_model` rewrites `last_model.json`, the file this suite used to
+    /// silently overwrite on the owner's machine. It still writes it. It just cannot
+    /// write it anywhere but the sandbox `hrdr-test-support`'s ctor installed before
+    /// `main` — no line in this test asks for that.
+    #[test]
+    fn a_test_that_asks_for_nothing_still_cannot_write_the_real_last_model_store() {
+        record_last_model(&r("zen://a-model-nobody-uses"));
+
+        let path = last_model_path().expect("the store resolves to a path");
+        assert!(path.exists(), "the write really happened");
+        // It landed in the sandbox, and nowhere near the real home.
+        hrdr_test_support::assert_sandboxed(&path);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("a-model-nobody-uses"));
+    }
+
     /// A `provider://model` identity, for the tests that speak in them.
     fn r(s: &str) -> ModelRef {
         s.parse().unwrap()

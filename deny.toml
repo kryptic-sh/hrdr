@@ -38,6 +38,11 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# `hrdr-test-support` is a versionless path dev-dependency on purpose: cargo strips such
+# a dependency when publishing, which is how the test-only sandbox crate stays out of
+# every published manifest. A versionless path dep reads as `*`, so path wildcards are
+# allowed — registry wildcards still are not.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

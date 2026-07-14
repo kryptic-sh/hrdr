@@ -1,0 +1,14 @@
+[package]
+name = "hrdr-test-support"
+description = "Test-only: sandboxes $HOME and the XDG roots before any hrdr test runs. Never published, never linked into a release build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# Runs the sandbox at test-binary load, before `main` and before the test harness
+# spawns a thread — the only point at which `env::set_var` is sound.
+ctor = "0.6"
