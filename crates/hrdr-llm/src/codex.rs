@@ -25,7 +25,7 @@
 //!
 //! [`Accumulator`]: crate::Accumulator
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -415,16 +415,27 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
         // Hard failures — surface as terminal (non-retryable) errors carrying the
         // provider's message, mirroring the mid-stream error handling elsewhere.
         "response.failed" => {
-            let msg = ev
-                .get("response")
-                .and_then(|r| r.get("error"))
+            let err_obj = ev.get("response").and_then(|r| r.get("error"));
+            let msg = err_obj
                 .and_then(error_message)
                 .unwrap_or_else(|| "response failed".to_string());
-            bail!("responses stream failed: {msg}")
+            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
+            Err(anyhow::Error::new(crate::client::ChatError {
+                status: None,
+                retry_after: None,
+                kind: classify_codex_error(code),
+                message: format!("responses stream failed: {msg}"),
+            }))
         }
         "error" => {
+            let code = ev.get("code").and_then(Value::as_str);
             let msg = error_message(ev).unwrap_or_else(|| "unknown error".to_string());
-            bail!("responses stream error: {msg}")
+            Err(anyhow::Error::new(crate::client::ChatError {
+                status: None,
+                retry_after: None,
+                kind: classify_codex_error(code),
+                message: format!("responses stream error: {msg}"),
+            }))
         }
         _ => Ok(None), // response.created, .in_progress, output_item.added(non-fn), part events, …
     }
@@ -462,6 +473,18 @@ fn error_message(err: &Value) -> Option<String> {
         (_, Some(m)) => Some(m.to_string()),
         (Some(c), None) => Some(c.to_string()),
         (None, None) => None,
+    }
+}
+
+/// Classify a Codex error code as transient or terminal. Only clearly transient
+/// codes (rate limit, server error, timeout) are marked retryable; all others
+/// (auth, bad request, etc.) are terminal (`Other`).
+fn classify_codex_error(code: Option<&str>) -> crate::client::ChatErrorKind {
+    match code {
+        Some("rate_limit_exceeded" | "server_error" | "timeout") => {
+            crate::client::ChatErrorKind::Transient
+        }
+        _ => crate::client::ChatErrorKind::Other,
     }
 }
 
@@ -793,14 +816,59 @@ mod tests {
         let failed = json!({"type": "response.failed", "response": {
             "error": {"code": "rate_limit_exceeded", "message": "slow down"}
         }});
-        let err = map_event(&mut state, &failed).unwrap_err().to_string();
-        assert!(err.contains("rate_limit_exceeded"), "{err}");
-        assert!(err.contains("slow down"), "{err}");
+        let err = map_event(&mut state, &failed).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+        assert!(
+            chat_err.message.contains("rate_limit_exceeded"),
+            "{}",
+            chat_err.message
+        );
+        assert!(
+            chat_err.message.contains("slow down"),
+            "{}",
+            chat_err.message
+        );
 
         let top = json!({"type": "error", "code": "server_error", "message": "boom"});
-        let err = map_event(&mut state, &top).unwrap_err().to_string();
-        assert!(err.contains("server_error"), "{err}");
-        assert!(err.contains("boom"), "{err}");
+        let err = map_event(&mut state, &top).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+        assert!(
+            chat_err.message.contains("server_error"),
+            "{}",
+            chat_err.message
+        );
+        assert!(chat_err.message.contains("boom"), "{}", chat_err.message);
+    }
+
+    #[test]
+    fn codex_terminal_error_is_not_transient() {
+        // Terminal error codes (auth, bad request, etc.) must remain Other,
+        // not Transient — a 401-like error is not retryable.
+        let mut state = StreamState::default();
+        let failed = json!({"type": "response.failed", "response": {
+            "error": {"code": "invalid_api_key", "message": "bad key"}
+        }});
+        let err = map_event(&mut state, &failed).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("invalid_api_key"),
+            "{}",
+            chat_err.message
+        );
+
+        let top =
+            json!({"type": "error", "code": "invalid_request_error", "message": "bad params"});
+        let err = map_event(&mut state, &top).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("invalid_request_error"),
+            "{}",
+            chat_err.message
+        );
     }
 
     #[test]

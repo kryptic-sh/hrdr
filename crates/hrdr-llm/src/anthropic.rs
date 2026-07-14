@@ -19,7 +19,7 @@
 //!
 //! [`Accumulator`]: crate::Accumulator
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -545,12 +545,30 @@ fn map_event(
             Ok((chunk.usage.is_some() || !chunk.choices.is_empty()).then_some(chunk))
         }
         "error" => {
-            let msg = ev
-                .get("error")
+            let err_obj = ev.get("error");
+            let err_type = err_obj
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let msg = err_obj
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            bail!("anthropic stream error: {msg}")
+            let kind = match err_type {
+                "rate_limit_error" | "overloaded_error" => crate::client::ChatErrorKind::Transient,
+                _ => crate::client::ChatErrorKind::Other,
+            };
+            let err_msg = if err_type.is_empty() {
+                format!("anthropic stream error: {msg}")
+            } else {
+                format!("anthropic stream error ({err_type}): {msg}")
+            };
+            Err(anyhow::Error::new(crate::client::ChatError {
+                status: None,
+                retry_after: None,
+                kind,
+                message: err_msg,
+            }))
         }
         _ => Ok(None), // ping, content_block_stop, content_block_start(text), …
     }
@@ -1281,5 +1299,113 @@ mod tests {
             asst.get("anthropic_thinking_blocks").is_none(),
             "anthropic_thinking_blocks must not be a top-level message key"
         );
+    }
+
+    #[test]
+    fn rate_limit_error_is_transient() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        let ev =
+            json!({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::Transient,
+            "rate_limit_error must be transient"
+        );
+        assert!(chat_err.message.contains("rate_limit_error"));
+        assert!(chat_err.message.contains("Rate limited"));
+    }
+
+    #[test]
+    fn overloaded_error_is_transient() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        let ev = json!({"type":"error","error":{"type":"overloaded_error","message":"Server overloaded"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::Transient,
+            "overloaded_error must be transient"
+        );
+        assert!(chat_err.message.contains("overloaded_error"));
+        assert!(chat_err.message.contains("Server overloaded"));
+    }
+
+    #[test]
+    fn other_anthropic_error_is_terminal() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        // An `invalid_request_error` must be classified as terminal (Other).
+        let ev = json!({"type":"error","error":{"type":"invalid_request_error","message":"bad request"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::Other,
+            "invalid_request_error must be terminal"
+        );
+        assert!(chat_err.message.contains("invalid_request_error"));
+        assert!(chat_err.message.contains("bad request"));
+
+        // An error with no type field must also be terminal.
+        let ev = json!({"type":"error","error":{"message":"generic"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::Other,
+            "no-type error must be terminal"
+        );
+        assert!(chat_err.message.contains("generic"));
     }
 }
