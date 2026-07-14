@@ -410,7 +410,7 @@ pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
 /// prevents a confinement bypass where a path like
 /// `cwd/nonexistent/../../etc/passwd` would pass a `starts_with(cwd)` check
 /// despite escaping the working directory.
-pub(crate) fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
+pub fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
@@ -472,6 +472,48 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
     result
 }
 
+/// Validate that a file path is safe to attach (read and share with the model).
+///
+/// `path_str` is the user-provided path (e.g., from `@file.txt` or `/add file.txt`).
+/// It is resolved against `cwd`, canonicalized, and checked against security policies:
+///
+/// * Must be a regular, readable file (not a directory, symlink, etc.)
+/// * Must be within `cwd` (no `..` escape, no symlink escape)
+/// * Must not be a secret/credential file (see [`secret_file_reason`])
+///
+/// Returns the canonicalized [`PathBuf`] on success.
+pub fn validate_attach_path(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let resolved = resolve_under(cwd, path_str);
+    // Reject non-regular files (directories, sockets, etc.).
+    if !resolved.is_file() {
+        anyhow::bail!("not a regular file: {}", resolved.display());
+    }
+    // Canonicalize — resolves symlinks and `..` components.
+    let canon = resolved
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("can't resolve {}: {e}", resolved.display()))?;
+    // Confine to cwd (canonical form catches symlink escapes).
+    let canon_cwd = cwd
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("can't resolve cwd {}: {e}", cwd.display()))?;
+    if !canon.starts_with(&canon_cwd) {
+        anyhow::bail!(
+            "{} is outside the working directory ({}) — file attachments are confined \
+             to the project",
+            resolved.display(),
+            cwd.display(),
+        );
+    }
+    // Reject secret/credential files.
+    if let Some(reason) = secret_file_reason(&canon) {
+        anyhow::bail!(
+            "refusing to attach {}: {reason} — secret/credential files are off-limits",
+            resolved.display(),
+        );
+    }
+    Ok(canon)
+}
+
 /// Credential/secret file patterns the content-reading tools (`read`, `grep`)
 /// refuse to return. Prompt-injected content (a README, a fetched page) can
 /// instruct the agent to read the credential store and smuggle the keys out via
@@ -486,7 +528,7 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
 ///
 /// This is the single, well-documented pattern set — extend the arms here to
 /// broaden coverage; every content-reading tool routes through it.
-pub(crate) fn secret_file_reason(path: &std::path::Path) -> Option<&'static str> {
+pub fn secret_file_reason(path: &std::path::Path) -> Option<&'static str> {
     use std::path::Component;
     let comps: Vec<String> = path
         .components()
@@ -1997,6 +2039,109 @@ b:2:y"
         assert!(
             ctx.ensure_inside_cwd(&path).is_ok(),
             "existing file reached via .. staying in cwd must be allowed"
+        );
+    }
+
+    // ---- validate_attach_path ----
+
+    #[test]
+    fn validate_attach_path_rejects_dotdot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Place a decoy so the escape target exists.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "data").unwrap();
+
+        let err = validate_attach_path("../outside.txt", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_attach_path_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let err = validate_attach_path("/etc/passwd", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_attach_path_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Symlink inside the project pointing outside.
+        let outside = dir.path().join("outside_file");
+        std::fs::write(&outside, "content").unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+
+        let err = validate_attach_path("link", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error for symlink escape, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_attach_path_rejects_secret_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join(".env"), "SECRET=1").unwrap();
+
+        let err = validate_attach_path(".env", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("secret"),
+            "expected secret-file error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_attach_path_accepts_valid_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let sub = cwd.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("notes.txt"), "hello").unwrap();
+
+        let canon = validate_attach_path("sub/notes.txt", &cwd).unwrap();
+        assert!(canon.exists());
+        assert_eq!(std::fs::read_to_string(&canon).unwrap(), "hello");
+    }
+
+    #[test]
+    fn validate_attach_path_rejects_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let err = validate_attach_path("nope.txt", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "expected not-a-file error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_attach_path_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir(cwd.join("subdir")).unwrap();
+
+        let err = validate_attach_path("subdir", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "expected not-a-file error, got: {err}"
         );
     }
 }

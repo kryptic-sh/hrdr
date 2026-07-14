@@ -279,7 +279,13 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info("usage: /add <file>".to_string());
                 return true;
             }
-            let path = crate::resolve_under(&host.cwd(), &arg);
+            let path = match hrdr_tools::validate_attach_path(&arg, &host.cwd()) {
+                Ok(p) => p,
+                Err(e) => {
+                    host.info(format!("can't add {arg}: {e}"));
+                    return true;
+                }
+            };
             // `expand_mentions` (`@file`) caps attached content at
             // `MAX_ATTACH_BYTES` and truncates; `/add` names one file
             // explicitly, so silently truncating it would be more confusing
@@ -875,5 +881,81 @@ mod tests {
             "the default host reports the picker as unavailable: {:?}",
             host.info_log
         );
+    }
+
+    /// `/add` rejects paths that escape the working directory via `..`
+    #[tokio::test]
+    async fn add_rejects_dotdot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        // Place a file outside the cwd but inside the temp dir so it exists.
+        let outside = dir.path().join("leak.txt");
+        std::fs::write(&outside, "data").unwrap();
+        let mut host = TestHost::new(root);
+
+        assert!(dispatch(&mut host, "/add ../leak.txt"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("outside the working directory")),
+            "expected outside-cwd error, got: {:?}",
+            host.info_log
+        );
+        assert!(
+            host.input.is_empty(),
+            "escaped path must not attach content"
+        );
+    }
+
+    /// `/add` rejects absolute paths (outside cwd)
+    #[tokio::test]
+    async fn add_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut host = TestHost::new(root);
+
+        assert!(dispatch(&mut host, "/add /etc/passwd"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("outside the working directory")),
+            "expected outside-cwd error, got: {:?}",
+            host.info_log
+        );
+        assert!(host.input.is_empty());
+    }
+
+    /// `/add` rejects secret/credential files
+    #[tokio::test]
+    async fn add_rejects_secret_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        let mut host = TestHost::new(root);
+
+        assert!(dispatch(&mut host, "/add .env"));
+        assert!(
+            host.info_log.iter().any(|l| l.contains("secret")),
+            "expected secret-file error, got: {:?}",
+            host.info_log
+        );
+        assert!(host.input.is_empty());
+    }
+
+    /// `/add` accepts a valid nested file
+    #[tokio::test]
+    async fn add_accepts_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), "nested content").unwrap();
+        let mut host = TestHost::new(root);
+
+        assert!(dispatch(&mut host, "/add sub/nested.txt"));
+        assert!(host.input.contains("nested content"), "{:?}", host.input);
     }
 }

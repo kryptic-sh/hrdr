@@ -112,7 +112,11 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
         if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
             continue;
         }
-        let path = cwd.join(rel);
+        // Validate — skip unreadable, out-of-cwd, or secret paths gracefully
+        // (the mention stays in the display copy; only the sent copy omits it).
+        let Ok(path) = hrdr_tools::validate_attach_path(rel, cwd) else {
+            continue;
+        };
         if let Ok(text) = std::fs::read_to_string(&path) {
             let text = if text.len() > MAX_ATTACH_BYTES {
                 let end = floor_char_boundary(&text, MAX_ATTACH_BYTES);
@@ -753,6 +757,57 @@ mod tests {
             collapse_home("/home/mxaddict/proj", "/home/mx"),
             "/home/mxaddict/proj"
         );
+    }
+
+    /// `@file` mention with `..` escape is gracefully skipped (mention stays, no content).
+    #[test]
+    fn expand_mentions_skips_dotdot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("leak.txt");
+        std::fs::write(&outside, "data").unwrap();
+
+        let out = expand_mentions("check @../leak.txt", &root);
+        // Original text unchanged (mention stays in display copy).
+        assert_eq!(out, "check @../leak.txt");
+    }
+
+    /// `@file` mention with absolute path is gracefully skipped.
+    #[test]
+    fn expand_mentions_skips_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let out = expand_mentions("check @/etc/passwd", &root);
+        assert_eq!(out, "check @/etc/passwd");
+    }
+
+    /// `@file` mention of a secret file is gracefully skipped.
+    #[test]
+    fn expand_mentions_skips_secret_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+
+        let out = expand_mentions("check @.env", &root);
+        assert_eq!(out, "check @.env");
+    }
+
+    /// `@file` mention of a valid nested file works normally.
+    #[test]
+    fn expand_mentions_accepts_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("notes.txt"), "nested content").unwrap();
+
+        let out = expand_mentions("show @sub/notes.txt", &root);
+        assert!(out.starts_with("show @sub/notes.txt"));
+        assert!(out.contains("nested content"));
     }
 }
 
