@@ -887,8 +887,9 @@ fn spawn_background(
         v.push((id, handle));
     }
     format!(
-        "Started background task #{id} ({label}) — it runs concurrently. Its result will be \
-         delivered to you automatically when it finishes; continue with other work and don't wait."
+        "Started background task #{id} ({label}) — it runs concurrently in the background. \
+         You will be notified automatically, and its result will be delivered to you when it \
+         finishes; continue with your other work — do not poll or wait."
     )
 }
 
@@ -11433,9 +11434,29 @@ mod tests {
 
             let out = tool.execute(args, &ctx).await.unwrap();
             assert!(
-                out.contains("Started background task"),
+                out.starts_with("Started background task"),
                 "returns immediately: {out}"
             );
+            // The contract: the delegating agent sees (a) it started + runs
+            // concurrently, and (b) the result will be automatically
+            // notified/delivered — so it must continue working, not poll/wait.
+            assert!(
+                out.contains("runs concurrently in the background"),
+                "contract (a): concurrent background execution: {out}"
+            );
+            assert!(
+                out.contains("You will be notified automatically")
+                    && out.contains("its result will be delivered to you"),
+                "contract (b): auto-notify/deliver: {out}"
+            );
+            assert!(
+                out.contains("do not poll or wait"),
+                "contract (b): do not poll/wait: {out}"
+            );
+            // Nested/sub-agent delegation is structurally impossible: a
+            // sub-agent's config sets `subagents = false` (no task tool), so a
+            // background sub-agent cannot spawn another — the contract is
+            // trivially upheld for nested cases.
 
             // Drive the detached task to completion via the shared registry.
             let mut done = false;

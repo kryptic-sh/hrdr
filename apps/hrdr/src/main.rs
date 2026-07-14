@@ -708,6 +708,7 @@ fn event_json(ev: &AgentEvent) -> String {
         AgentEvent::History(msgs) => json!({"type": "history", "messages": msgs.len()}),
         AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
         AgentEvent::Steered(text) => json!({"type": "steer", "text": text}),
+        AgentEvent::TodoUpdated(todos) => json!({"type": "todo", "todos": todos}),
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
