@@ -6207,17 +6207,20 @@ fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
 /// in lockstep.
 static JITTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Map a sequence number to one of 1,000 evenly spaced jitter slots.
+fn retry_jitter(seq: u64) -> f64 {
+    0.75 + f64::from((seq % 1_000) as u32) / 2_000.0
+}
+
 /// Exponential backoff for retry `attempt` (1-based), capped at 8s, with
 /// ±25% jitter so parallel agents (sub-agents especially) tripping the same
 /// rate limit don't retry in lockstep and re-trip it together.
 fn retry_backoff(attempt: usize) -> std::time::Duration {
     let secs = (0.5 * 2f64.powi((attempt as i32 - 1).max(0))).min(8.0);
-    // Every call increments the atomic counter, so concurrent agents never
-    // receive the same jitter value.  The counter cycles evenly through the
-    // 1000 slots.
+    // Every call increments the atomic counter, so concurrent agents receive
+    // adjacent jitter slots. The counter cycles evenly through all 1,000.
     let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let jitter = 0.75 + f64::from((seq % 1_000) as u32) / 2_000.0; // 0.75..1.25
-    std::time::Duration::from_secs_f64(secs * jitter)
+    std::time::Duration::from_secs_f64(secs * retry_jitter(seq))
 }
 
 /// The server-requested wait from a `Retry-After` header, if the client embedded
@@ -9918,20 +9921,14 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_jitter_varies_across_rapid_calls() {
-        // The atomic counter guarantees distinct jitter even when called as fast
-        // as possible — something subsec-nanos alone cannot do for concurrent
-        // agents.  1000 calls at the same attempt should produce 1000 unique
-        // durations because seq % 1000 cycles through every residue.
-        use super::retry_backoff;
-        let mut seen: Vec<f64> = (0..1000).map(|_| retry_backoff(3).as_secs_f64()).collect();
+    fn retry_jitter_uses_every_slot() {
+        use super::retry_jitter;
+        let mut seen: Vec<f64> = (0..1000).map(retry_jitter).collect();
         seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
         seen.dedup();
-        assert!(
-            seen.len() > 900,
-            "expected >900 distinct jitter values from 1000 calls, got {}",
-            seen.len()
-        );
+        assert_eq!(seen.len(), 1000);
+        assert!((seen[0] - 0.75).abs() < 1e-9);
+        assert!(seen[999] < 1.25);
     }
 
     #[test]
