@@ -222,23 +222,41 @@ enum Command {
 /// settled — so a bare model id always means "that model, on the provider already in
 /// effect", whichever layer wrote it.
 ///
-/// The provider in effect *before any of them* is `last_used`: the identity the user
-/// last switched to interactively (the `/model` picker, `/login`). That is the launch
-/// fallback, and the only place startup reads that store — a delegation never does,
-/// because a `task` must resolve identically on every machine and in CI.
+/// The provider in effect *before any of them* is the store's last-used identity: what
+/// the user last switched to interactively (the `/model` picker, `/login`). That is the
+/// launch fallback.
+///
+/// **THE INTERACTIVE POLICY** for a `provider://` spec (`hrdr --model 'openai://'`,
+/// `model = "openai://"`) lives here too: [`hrdr_agent::model_for_provider_in`] — the
+/// model you last used on THAT provider, else the one it declares, else an error naming
+/// the fix. This is the launch edge, where "carry on with what I was using" is precisely
+/// what the user means.
+///
+/// A delegation never gets this policy (see `strict_spec_ref` in `hrdr-agent`): a `task`
+/// must resolve identically on every machine and in CI, so it reads no store — which is
+/// why `ModelSpec::apply` refuses to answer for `ProviderOnly` at all, and each caller
+/// has to say which policy it wants.
 fn settle_identity(
-    last_used: Option<hrdr_agent::ModelRef>,
+    store: &hrdr_agent::LastModels,
     specs: &[hrdr_agent::ModelSpec],
-) -> hrdr_agent::ModelRef {
-    let mut identity = last_used.unwrap_or_else(|| {
+    config: &AgentConfig,
+) -> Result<hrdr_agent::ModelRef> {
+    let mut identity = store.last.clone().unwrap_or_else(|| {
         hrdr_agent::DEFAULT_MODEL_REF
             .parse()
             .expect("a valid default identity")
     });
     for spec in specs {
-        identity = spec.apply(&identity);
+        identity = match spec.apply(&identity) {
+            Some(r) => r,
+            // `provider://` — the interactive chain answers, or nobody does.
+            None => {
+                let provider = spec.provider().expect("ProviderOnly names a provider");
+                hrdr_agent::model_for_provider_in(store, provider, config)?
+            }
+        };
     }
-    identity
+    Ok(identity)
 }
 
 /// The endpoint to talk to: the provider's `preset` URL, unless something
@@ -308,7 +326,8 @@ async fn main() -> Result<()> {
     // the last-used identity (recorded by the `/model` picker and `/login`) — the
     // launch fallback, and the ONLY place startup consults that interactive store.
     // A delegation never does: it must resolve the same on every machine and in CI.
-    let last_used = hrdr_agent::load_last_model();
+    let store = hrdr_agent::load_last_models();
+    let last_used = store.last.clone();
     let cli_spec = cli
         .model
         .as_deref()
@@ -318,7 +337,7 @@ async fn main() -> Result<()> {
     let named_specs = hrdr_agent::named_model_specs();
     let specs: Vec<hrdr_agent::ModelSpec> =
         named_specs.iter().chain(cli_spec.iter()).cloned().collect();
-    let identity = settle_identity(last_used.clone(), &specs);
+    let identity = settle_identity(&store, &specs, &config)?;
     // ONE pin for ONE identity: `--model` (like `$HRDR_MODEL`) names the thing this
     // process runs on, and a resumed session does not get to replace it.
     if cli_spec.is_some() {
@@ -341,10 +360,7 @@ async fn main() -> Result<()> {
     // the user wrote it for; a provider named ANYWHERE (a `provider://model` spec,
     // or the last-used identity) supersedes it, as it always has. A flag/env one
     // relocates unconditionally.
-    let provider_named = last_used.is_some()
-        || specs
-            .iter()
-            .any(|s| matches!(s, hrdr_agent::ModelSpec::Full(_)));
+    let provider_named = last_used.is_some() || specs.iter().any(|s| s.provider().is_some());
     let flag_url = cli
         .base_url
         .clone()
@@ -756,7 +772,10 @@ mod cli_tests {
         // A URI sets the whole identity.
         let full = spec(["hrdr", "--model", "chatgpt://gpt-5.5"]);
         assert_eq!(full, ModelSpec::Full("chatgpt://gpt-5.5".parse().unwrap()));
-        assert_eq!(full.apply(&base), "chatgpt://gpt-5.5".parse().unwrap());
+        assert_eq!(
+            full.apply(&base),
+            Some("chatgpt://gpt-5.5".parse().unwrap())
+        );
 
         // A bare id keeps the provider in effect — slashes and colons included.
         for (arg, want) in [
@@ -766,7 +785,7 @@ mod cli_tests {
         ] {
             let s = spec(["hrdr", "--model", arg]);
             assert!(matches!(s, ModelSpec::ModelOnly(_)), "{arg}");
-            assert_eq!(s.apply(&base), want.parse().unwrap(), "{arg}");
+            assert_eq!(s.apply(&base), Some(want.parse().unwrap()), "{arg}");
         }
     }
 
@@ -789,31 +808,41 @@ mod cli_tests {
     /// the provider already in effect, and nothing at all resumes the last-used one.
     #[test]
     fn the_model_spec_layers_settle_the_launch_identity() {
-        use hrdr_agent::{ModelRef, ModelSpec};
+        use hrdr_agent::{LastModels, ModelRef, ModelSpec};
         let spec = |s: &str| s.parse::<ModelSpec>().unwrap();
-        let last = |s: &str| Some(s.parse::<ModelRef>().unwrap());
-        let got = |last_used, specs: &[ModelSpec]| settle_identity(last_used, specs).to_string();
+        // The store, explicit — never the developer's real `last_model.json`.
+        let store = |last: Option<&str>| LastModels {
+            last: last.map(|s| s.parse::<ModelRef>().unwrap()),
+            ..Default::default()
+        };
+        let cfg = AgentConfig::default();
+        let got = |last: Option<&str>, specs: &[ModelSpec]| {
+            settle_identity(&store(last), specs, &cfg)
+                .expect("resolves")
+                .to_string()
+        };
 
         // `--model chatgpt://gpt-5.5` sets the WHOLE identity — it does not matter
         // what was in effect before.
         assert_eq!(
-            got(last("zen://kimi-k2"), &[spec("chatgpt://gpt-5.5")]),
+            got(Some("zen://kimi-k2"), &[spec("chatgpt://gpt-5.5")]),
             "chatgpt://gpt-5.5"
         );
         // `--model gpt-5.5` (bare) keeps the provider in effect.
         assert_eq!(
-            got(last("zen://kimi-k2"), &[spec("gpt-5.5")]),
+            got(Some("zen://kimi-k2"), &[spec("gpt-5.5")]),
             "zen://gpt-5.5"
         );
         // Nothing named: the last-used identity is resumed, whole.
-        assert_eq!(got(last("zen://kimi-k2"), &[]), "zen://kimi-k2");
+        assert_eq!(got(Some("zen://kimi-k2"), &[]), "zen://kimi-k2");
         // Nothing named and nothing used: `local://default` — the server you run,
-        // serving whatever it was started with.
+        // serving whatever it was started with. A bare `--base-url` run is this run.
         assert_eq!(got(None, &[]), hrdr_agent::DEFAULT_MODEL_REF);
-        // A bare `--base-url` names no provider, so the identity stays `local` — and
-        // `local` IS "the OpenAI-compatible server I run".
         assert_eq!(
-            settle_identity(None, &[]).provider().as_str(),
+            settle_identity(&store(None), &[], &cfg)
+                .unwrap()
+                .provider()
+                .as_str(),
             "local",
             "a bare --base-url run is a `local` run"
         );
@@ -828,10 +857,62 @@ mod cli_tests {
         // …and a URI at a higher layer replaces the lot.
         assert_eq!(
             got(
-                last("zen://kimi-k2"),
+                Some("zen://kimi-k2"),
                 &[spec("openrouter://deepseek-chat"), spec("local://qwen3")]
             ),
             "local://qwen3"
+        );
+    }
+
+    /// `hrdr --model 'openai://'` — a provider named with NO model. This is the
+    /// interactive edge, so it gets the interactive policy: the model you last used on
+    /// THAT provider, else the one it declares, else an error naming the fix.
+    ///
+    /// Never the model you were using somewhere else: that one belongs to the provider
+    /// you are leaving, and following you onto this one is the whole bug.
+    #[test]
+    fn a_provider_only_model_flag_resolves_through_the_interactive_chain() {
+        use hrdr_agent::{LastModels, ModelRef, ModelSpec};
+        let spec: ModelSpec = "openai://".parse().unwrap();
+        let cfg = AgentConfig::default();
+
+        // 1. The model last used ON OPENAI wins.
+        let store = LastModels {
+            last: Some("zen://kimi-k2".parse::<ModelRef>().unwrap()),
+            by_provider: [("openai".to_string(), "gpt-5.1-codex".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(
+            settle_identity(&store, std::slice::from_ref(&spec), &cfg)
+                .unwrap()
+                .to_string(),
+            "openai://gpt-5.1-codex"
+        );
+
+        // 2. Nothing remembered on openai, and the preset declares no model → an
+        //    error that names the fix. `kimi-k2` (the provider being LEFT) is never it.
+        let store = LastModels {
+            last: Some("zen://kimi-k2".parse::<ModelRef>().unwrap()),
+            ..Default::default()
+        };
+        let err = settle_identity(&store, std::slice::from_ref(&spec), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'openai' needs a model"), "{err}");
+        assert!(err.contains("openai://<model>"), "{err}");
+        assert!(
+            !err.contains("kimi-k2"),
+            "never the old provider's model: {err}"
+        );
+
+        // 3. A provider that DECLARES a model answers with it, store or no store.
+        let chatgpt: ModelSpec = "chatgpt://".parse().unwrap();
+        assert_eq!(
+            settle_identity(&LastModels::default(), &[chatgpt], &cfg)
+                .unwrap()
+                .to_string(),
+            "chatgpt://gpt-5.5"
         );
     }
 

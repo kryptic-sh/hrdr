@@ -405,13 +405,25 @@ pub fn record_last_model(r: &ModelRef) {
 /// A caller with a UI may catch (3) and open a model picker filtered to that
 /// provider instead of surfacing it.
 pub fn model_for_provider(provider: &ProviderName, config: &AgentConfig) -> Result<ModelRef> {
+    model_for_provider_in(&load_last_models(), provider, config)
+}
+
+/// [`model_for_provider`] against an explicit store — the pure core, so the
+/// interactive chain is testable without the real `last_model.json` (and so a test
+/// cannot silently stop testing anything the moment the developer uses that
+/// provider for real).
+pub fn model_for_provider_in(
+    store: &LastModels,
+    provider: &ProviderName,
+    config: &AgentConfig,
+) -> Result<ModelRef> {
     let resolved = config.resolve_provider(provider.as_str()).ok_or_else(|| {
         anyhow!(
             "unknown provider '{provider}' (built-ins: {}, or define [providers.{provider}])",
             BUILTIN_PROVIDERS.join(", ")
         )
     })?;
-    model_for_resolved_provider(provider, &resolved)
+    model_for_resolved_provider_in(store, provider, &resolved)
 }
 
 /// [`model_for_provider`] for a provider that is already resolved (a caller

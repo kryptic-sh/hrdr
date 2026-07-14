@@ -166,12 +166,22 @@ impl<'de> Deserialize<'de> for SessionState {
         let (model, provider_unset) = match (spec, provider) {
             // v2, or a v1 file whose provider half we already have.
             (Some(ModelSpec::Full(r)), _) => (r, false),
+            // A session file never names a provider with no model: it records what an
+            // agent RAN on, which is always complete. Treat it as naming nothing.
+            (Some(ModelSpec::ProviderOnly(p)), _) => (
+                ModelRef::new(p, hrdr_agent::DEFAULT_MODEL).unwrap_or(default),
+                false,
+            ),
             (Some(ModelSpec::ModelOnly(m)), Some(p)) => (
                 ModelRef::new(hrdr_agent::ProviderName::new(p), &m).unwrap_or(default),
                 false,
             ),
             // v1, model only: the provider is whatever this process is on.
-            (Some(spec @ ModelSpec::ModelOnly(_)), None) => (spec.apply(&default), true),
+            (Some(spec @ ModelSpec::ModelOnly(_)), None) => (
+                spec.apply(&default)
+                    .expect("a bare model id always resolves"),
+                true,
+            ),
             (None, Some(p)) => (
                 ModelRef::new(hrdr_agent::ProviderName::new(p), hrdr_agent::DEFAULT_MODEL)
                     .unwrap_or(default),
@@ -1132,7 +1142,9 @@ mod migration_tests {
         // on the identity in force.
         let in_force: ModelRef = "zen://grok-code".parse().unwrap();
         assert_eq!(
-            ModelSpec::ModelOnly(back.state.model.model().to_string()).apply(&in_force),
+            ModelSpec::ModelOnly(back.state.model.model().to_string())
+                .apply(&in_force)
+                .unwrap(),
             "zen://kimi-k2".parse().unwrap()
         );
     }

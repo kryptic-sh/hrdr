@@ -47,7 +47,8 @@ pub use models::{
     AvailableModel, LastModels, ModelChoice, ModelSource, available_models, builtin_catalog_key,
     chatgpt_model_choices, filter_model_choices, last_model_on, load_last_model, load_last_models,
     load_model_usage, merge_chatgpt_choices, model_choices, model_for_provider,
-    model_for_resolved_provider, record_last_model, record_model_use,
+    model_for_provider_in, model_for_resolved_provider, model_for_resolved_provider_in,
+    record_last_model, record_model_use,
 };
 pub use usage::AgentUsage;
 
@@ -159,10 +160,16 @@ impl hrdr_tools::Tool for ModelsTool {
             .delegation_enabled
             .then(|| match &runtime.explicit_subagent_model {
                 // The spec resolved against the identity in force: a bare id names a
-                // model on this provider, a `provider://model` one names its own.
-                Some(spec) => spec.apply(&runtime.public.reference).model().to_string(),
-                None => active_model.clone(),
+                // model on this provider, a `provider://model` one names its own. A
+                // `provider://` that the provider itself cannot answer (it declares no
+                // model) resolves to nothing — and is reported as no default, below,
+                // rather than silently becoming the model this agent happens to run.
+                Some(spec) => spec
+                    .apply(&runtime.public.reference)
+                    .map(|r| r.model().to_string()),
+                None => Some(active_model.clone()),
             })
+            .flatten()
             .filter(|m| m != DEFAULT_MODEL);
         let mut warnings = Vec::new();
         if runtime.public.delegation_enabled && default_model.is_none() {
@@ -1143,8 +1150,11 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     // `provider://model` moves the sub-agents to another provider, and the endpoint
     // (key, headers, api-version) has to follow it, or they would be sent to the
     // parent's endpoint under another provider's model id.
-    if let Some(spec) = &config.subagent_model {
-        let reference = spec.apply(&config.model);
+    // A bare `provider://` takes that provider's DECLARED model — the strict,
+    // store-free policy, because a sub-agent's model is not an interactive choice.
+    if let Some(spec) = &config.subagent_model
+        && let Ok(reference) = strict_spec_ref(config, spec, &config.model)
+    {
         let (key, url) = (base.api_key.clone(), base.base_url.clone());
         let parent = AuthContext {
             api_key: key.as_deref(),
@@ -1223,36 +1233,42 @@ fn named_spec_ref(cfg: &AgentConfig, spec: Option<&str>) -> Result<Option<ModelR
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    // `provider://` — a provider with no model. The provider's DECLARED model, or
-    // nothing: never the model of the provider being left.
-    if let Some(p) = provider_only_spec(spec) {
-        let declared = cfg
-            .resolve_provider(&p)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown provider '{p}' (built-ins: {}, or define [providers.{p}])",
-                    BUILTIN_PROVIDERS.join(", ")
-                )
-            })?
-            .model;
-        let Some(m) = declared else {
-            bail!(
-                "provider '{p}' needs a model — name one as '{p}://<model>' \
-                 (it declares no default)"
-            );
-        };
-        return Ok(Some(ModelRef::new(ProviderName::new(&p), &m)?));
-    }
     let spec: ModelSpec = spec.parse()?;
-    Ok(Some(spec.apply(&cfg.model)))
+    strict_spec_ref(cfg, &spec, &cfg.model).map(Some)
 }
 
-/// The provider named by a `provider://` spec — a provider with no model, the one
-/// shape [`ModelSpec`] does not carry (it is by definition incomplete). `None` for
-/// every complete spec.
-fn provider_only_spec(spec: &str) -> Option<String> {
-    let p = spec.trim().strip_suffix("://")?.trim();
-    (!p.is_empty()).then(|| p.to_string())
+/// **THE PROGRAMMATIC POLICY** for a [`ModelSpec::ProviderOnly`]: the model that
+/// provider itself DECLARES (`[providers.<name>].model`, or a built-in preset's),
+/// else an error.
+///
+/// [`ModelSpec::apply`] answers `None` for that shape precisely so this choice has
+/// to be made explicitly, here, by the paths that need a *reproducible* answer.
+/// `base` supplies the provider for a bare model id, and nothing else — a
+/// `provider://` spec never inherits `base`'s model, which belongs to the provider
+/// being LEFT.
+fn strict_spec_ref(cfg: &AgentConfig, spec: &ModelSpec, base: &ModelRef) -> Result<ModelRef> {
+    if let Some(reference) = spec.apply(base) {
+        return Ok(reference);
+    }
+    let ModelSpec::ProviderOnly(p) = spec else {
+        unreachable!("apply() answers None only for ProviderOnly");
+    };
+    let declared = cfg
+        .resolve_provider(p.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown provider '{p}' (built-ins: {}, or define [providers.{p}])",
+                BUILTIN_PROVIDERS.join(", ")
+            )
+        })?
+        .model;
+    let Some(m) = declared else {
+        bail!(
+            "provider '{p}' needs a model — name one as '{p}://<model>' \
+             (it declares no default)"
+        );
+    };
+    Ok(ModelRef::new(p.clone(), &m)?)
 }
 
 /// Apply the `task` tool's ad-hoc `model` argument — a [`ModelSpec`] — on top of an
@@ -1463,6 +1479,9 @@ impl SubagentTool {
                 let mut tags = match &p.model {
                     Some(ModelSpec::Full(r)) => format!("{} · {}", r.provider(), r.model()),
                     Some(ModelSpec::ModelOnly(m)) => m.clone(),
+                    // The provider, at whatever model it declares — resolved when the
+                    // sub-agent actually spawns, so the label names the provider only.
+                    Some(ModelSpec::ProviderOnly(p)) => p.to_string(),
                     None => "main provider".to_string(),
                 };
                 if p.read_only {
@@ -1597,7 +1616,11 @@ impl hrdr_tools::Tool for SubagentTool {
         // bare id rides on the parent's PROVIDER and never changes which endpoint the
         // request is sent to; a whole `provider://model` moves the endpoint with it.
         if let Some(spec) = &runtime.explicit_subagent_model {
-            let reference = spec.apply(live.reference());
+            // Strict, store-free: a `provider://` takes that provider's declared
+            // model, or the delegation fails — it never takes whatever a human last
+            // picked there, which would make this `task` run a different model on
+            // every machine.
+            let reference = strict_spec_ref(&cfg, spec, live.reference())?;
             let parent_ctx = AuthContext {
                 api_key: live.api_key(),
                 base_url: live.base_url(),
@@ -3143,7 +3166,16 @@ impl AgentConfig {
         // the provider in effect — which, here, is whatever the layer below settled
         // (the `local` default, until the CLI edge folds in the last-used identity).
         for spec in [file_spec, env_model_spec()].into_iter().flatten() {
-            cfg.model = spec.apply(&cfg.model);
+            // A `provider://` here is the INTERACTIVE chain's business (the model you
+            // last used on that provider, else its declared one). The CLI edge settles
+            // it against the last-used store; a config that cannot be answered at all
+            // simply leaves the identity as it was, and the CLI reports it.
+            if let Some(reference) = spec
+                .apply(&cfg.model)
+                .or_else(|| model_for_provider(spec.provider()?, &cfg).ok())
+            {
+                cfg.model = reference;
+            }
         }
         // An env-supplied identity outranks a resumed session's; a config-file one
         // doesn't (flag > env > session > config). The binary ORs in its `--model`
@@ -11054,5 +11086,149 @@ mod one_key_identity_tests {
         apply_task_overrides(&mut uri, &cfg, Some("local://qwen3")).unwrap();
         assert_eq!(uri.model, "local://qwen3".parse().unwrap());
         assert_eq!(uri.base_url, DEFAULT_BASE_URL, "the endpoint moved with it");
+    }
+}
+
+/// [`ModelSpec::ProviderOnly`] — a provider named with no model — and the TWO
+/// policies that answer it. They must never be merged.
+#[cfg(test)]
+mod provider_only_policy_tests {
+    use super::*;
+
+    fn spec(s: &str) -> ModelSpec {
+        s.parse().expect("a valid model spec")
+    }
+
+    fn cfg_on(model: &str) -> AgentConfig {
+        AgentConfig {
+            model: model.parse().expect("a valid identity"),
+            ..Default::default()
+        }
+    }
+
+    /// A profile can name a provider and let the provider pick: `model = "chatgpt://"`
+    /// takes the model IT declares (`gpt-5.5`).
+    #[test]
+    fn a_profile_naming_a_provider_takes_its_declared_model() {
+        let base = cfg_on("zen://kimi-k2");
+        let profile = SubagentProfile {
+            name: "codex".to_string(),
+            model: Some(spec("chatgpt://")),
+            description: None,
+            prompt: Some("Implement.".to_string()),
+            read_only: false,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+        let sub = config_for_agent_profile(&base, &profile).unwrap();
+        assert_eq!(
+            sub.model,
+            "chatgpt://gpt-5.5".parse().unwrap(),
+            "the provider's own declared model — never zen's kimi-k2"
+        );
+        assert_eq!(sub.base_url, CHATGPT_CODEX_BASE_URL, "and its endpoint");
+        assert_eq!(sub.agent_prompt.as_deref(), Some("Implement."));
+
+        // A `[providers.<name>]` entry's declared model answers the same way.
+        let mut cfg = base.clone();
+        cfg.providers.insert(
+            "mylocal".to_string(),
+            ProviderConfig {
+                base_url: "http://localhost:9099/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: Some("qwen3".to_string()),
+                remote: Some(false),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        assert_eq!(
+            named_spec_ref(&cfg, Some("mylocal://")).unwrap(),
+            Some("mylocal://qwen3".parse().unwrap())
+        );
+    }
+
+    /// …and a provider that declares NOTHING is an error, not a guess. `openai` has no
+    /// default model, so a profile naming it alone cannot be answered — and the strict
+    /// policy does not go looking in the interactive store for one.
+    #[test]
+    fn a_profile_naming_a_provider_with_no_default_is_an_error() {
+        let base = cfg_on("zen://kimi-k2");
+        let profile = SubagentProfile {
+            name: "impl".to_string(),
+            model: Some(spec("openai://")),
+            description: None,
+            prompt: None,
+            read_only: false,
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: false,
+            isolation: None,
+        };
+        let err = config_for_agent_profile(&base, &profile)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'openai' needs a model"), "{err}");
+        assert!(err.contains("openai://<model>"), "{err}");
+        assert!(
+            !err.contains("kimi-k2"),
+            "the model of the provider being LEFT is never the answer: {err}"
+        );
+    }
+
+    /// THE INVARIANT, pinned: the programmatic policy reads NO store.
+    ///
+    /// `strict_spec_ref` — the one resolver behind `task` arguments, `[[subagent]]`
+    /// profiles and `agents/*.md` — answers a `provider://` from the provider's own
+    /// declaration or not at all. It is not merely that it *happens* not to consult
+    /// `last_model.json` today: it cannot, because it takes no store and
+    /// `ModelSpec::apply` refuses to answer this shape at all. The interactive chain
+    /// (`model_for_provider_in`) takes the store as an explicit parameter, and lives at
+    /// the CLI / `/login` / picker edges only.
+    ///
+    /// Were the two merged, the same `task` call would run one model on a developer's
+    /// machine (whatever they last picked) and another in CI (nothing picked, ever).
+    #[test]
+    fn the_programmatic_policy_never_reads_the_last_used_store() {
+        let cfg = cfg_on("zen://kimi-k2");
+        let openai = ProviderName::new("openai");
+        let resolved = cfg.resolve_provider("openai").unwrap();
+
+        // A store that DOES remember a model on openai — the interactive chain uses it…
+        let store = LastModels {
+            last: None,
+            by_provider: [("openai".to_string(), "gpt-5.1-codex".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(
+            model_for_resolved_provider_in(&store, &openai, &resolved).unwrap(),
+            "openai://gpt-5.1-codex".parse().unwrap(),
+            "the interactive chain carries on with what you were using there"
+        );
+
+        // …and the programmatic one still errors, whatever that store says. Same
+        // process, same store, same provider: only the POLICY differs.
+        for spec in [
+            named_spec_ref(&cfg, Some("openai://")).err(),
+            apply_task_overrides(&mut cfg.clone(), &cfg, Some("openai://")).err(),
+        ] {
+            let err = spec.expect("the strict policy has no answer").to_string();
+            assert!(err.contains("provider 'openai' needs a model"), "{err}");
+            assert!(
+                !err.contains("gpt-5.1-codex"),
+                "a delegation must resolve the same in CI as on this machine: {err}"
+            );
+        }
     }
 }

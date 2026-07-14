@@ -261,11 +261,17 @@ impl From<ModelRef> for String {
     }
 }
 
-/// What the user asked to switch to: a whole new identity, or just a new model on
-/// the provider they are already on.
+/// What the user asked to switch to — the THREE shapes a model-naming input can
+/// take, and only these:
 ///
-/// The distinction is purely syntactic — the presence of `://` — which is why the
-/// parse never has to guess whether `moonshotai/kimi-k2` names a provider.
+/// * `openrouter://deepseek/deepseek-chat` — a whole identity ([`Full`](Self::Full));
+/// * `deepseek/deepseek-chat` — a model on the provider already in effect
+///   ([`ModelOnly`](Self::ModelOnly));
+/// * `openrouter://` — a PROVIDER, with the model left to be chosen
+///   ([`ProviderOnly`](Self::ProviderOnly)).
+///
+/// The distinction is purely syntactic — where the `://` is, if anywhere — which is
+/// why the parse never has to guess whether `moonshotai/kimi-k2` names a provider.
 ///
 /// This is the **input** type of every model-naming surface: `--model`,
 /// `$HRDR_MODEL`, `--subagent-model`, `model = …` in config.toml, an agent
@@ -275,23 +281,53 @@ impl From<ModelRef> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum ModelSpec {
-    /// The input carried a `://`: switch provider AND model.
+    /// A `://` with both halves: switch provider AND model.
     Full(ModelRef),
     /// No `://`: same provider, new model id (kept verbatim).
     ModelOnly(String),
+    /// A trailing `://` and nothing after it: the provider is named, the model is
+    /// not. **Incomplete by construction** — see [`apply`](Self::apply).
+    ProviderOnly(ProviderName),
 }
 
 impl ModelSpec {
-    /// Resolve against the identity currently in use: a [`Full`](Self::Full) spec
-    /// replaces it outright; a [`ModelOnly`](Self::ModelOnly) one keeps `base`'s
-    /// provider. Total — never needs a fallback.
-    pub fn apply(&self, base: &ModelRef) -> ModelRef {
+    /// Resolve against the identity currently in use — when the spec CAN be resolved
+    /// by itself.
+    ///
+    /// A [`Full`](Self::Full) spec replaces the identity outright; a
+    /// [`ModelOnly`](Self::ModelOnly) one keeps `base`'s provider. A
+    /// [`ProviderOnly`](Self::ProviderOnly) one answers `None`, and that is the
+    /// point: "which model on that provider?" has no answer in this type — it needs
+    /// a **policy**, and hrdr has two that must never be merged:
+    ///
+    /// * **interactive** (CLI startup, `/login`, the `/model` picker) —
+    ///   [`model_for_provider`](crate::model_for_provider): the model you last used
+    ///   on THAT provider, else the one it declares, else an error;
+    /// * **programmatic** (`task` arguments, `[[subagent]]` / `agents/*.md`
+    ///   profiles) — the provider's DECLARED model, else an error. Never the
+    ///   last-used store: a delegation must resolve to the same model on every
+    ///   machine and in CI, not to whatever a human last happened to pick.
+    ///
+    /// Returning `None` rather than picking one is what makes the compiler ask every
+    /// call site which it is. A default policy here is exactly how the interactive
+    /// store would leak back into delegation.
+    pub fn apply(&self, base: &ModelRef) -> Option<ModelRef> {
         match self {
-            Self::Full(r) => r.clone(),
-            Self::ModelOnly(m) => ModelRef {
+            Self::Full(r) => Some(r.clone()),
+            Self::ModelOnly(m) => Some(ModelRef {
                 provider: base.provider.clone(),
                 model: m.clone(),
-            },
+            }),
+            Self::ProviderOnly(_) => None,
+        }
+    }
+
+    /// The provider this spec names, when it names one (`Full` and `ProviderOnly`).
+    pub fn provider(&self) -> Option<&ProviderName> {
+        match self {
+            Self::Full(r) => Some(r.provider()),
+            Self::ProviderOnly(p) => Some(p),
+            Self::ModelOnly(_) => None,
         }
     }
 }
@@ -301,6 +337,15 @@ impl FromStr for ModelSpec {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
+        // A trailing `://` names a provider and no model. `://` alone, or `://model`,
+        // names no provider — and is refused, not read as a model id with punctuation.
+        if let Some(provider) = s.strip_suffix(SEP) {
+            let provider = provider.trim();
+            if provider.is_empty() {
+                return Err(ModelRefError::EmptyProvider);
+            }
+            return Ok(Self::ProviderOnly(ProviderName::new(provider)));
+        }
         if s.contains(SEP) {
             return Ok(Self::Full(s.parse()?));
         }
@@ -316,6 +361,7 @@ impl fmt::Display for ModelSpec {
         match self {
             Self::Full(r) => write!(f, "{r}"),
             Self::ModelOnly(m) => f.write_str(m),
+            Self::ProviderOnly(p) => write!(f, "{p}{SEP}"),
         }
     }
 }
@@ -546,14 +592,66 @@ mod tests {
             ModelSpec::ModelOnly("llama3:8b".to_string())
         );
         assert_eq!("".parse::<ModelSpec>(), Err(ModelRefError::EmptyModel));
+        // A TRAILING `://` is the third shape: a provider, with the model left open.
         assert_eq!(
-            "zen://".parse::<ModelSpec>(),
-            Err(ModelRefError::EmptyModel)
+            "zen://".parse::<ModelSpec>().unwrap(),
+            ModelSpec::ProviderOnly(ProviderName::new("zen"))
         );
-        // Display round-trips both shapes.
-        for s in ["openrouter://deepseek/deepseek-chat", "moonshotai/kimi-k2"] {
-            assert_eq!(s.parse::<ModelSpec>().unwrap().to_string(), s);
+        assert_eq!(
+            "  OPENCODE://  ".parse::<ModelSpec>().unwrap(),
+            ModelSpec::ProviderOnly(ProviderName::new("zen")),
+            "the provider half still folds"
+        );
+        // …but a `://` with no provider names nothing at all, and is refused — never
+        // read as a model id that happens to contain punctuation.
+        assert_eq!(
+            "://".parse::<ModelSpec>(),
+            Err(ModelRefError::EmptyProvider)
+        );
+        assert_eq!(
+            "://gpt-5.5".parse::<ModelSpec>(),
+            Err(ModelRefError::EmptyProvider)
+        );
+        // Display round-trips ALL THREE shapes.
+        for s in [
+            "openrouter://deepseek/deepseek-chat",
+            "moonshotai/kimi-k2",
+            "openai://",
+        ] {
+            assert_eq!(s.parse::<ModelSpec>().unwrap().to_string(), s, "{s}");
+            assert_eq!(
+                s.parse::<ModelSpec>()
+                    .unwrap()
+                    .to_string()
+                    .parse::<ModelSpec>(),
+                s.parse::<ModelSpec>()
+            );
         }
+    }
+
+    /// `apply` is deliberately PARTIAL. A `provider://` has no answer without a
+    /// policy — "which model on that provider?" — and hrdr has two that must never be
+    /// merged (interactive: the last-used store; programmatic: the provider's declared
+    /// model, never the store). Answering `None` here is what forces every call site
+    /// to say which one it is, instead of one of them quietly inheriting the other's.
+    #[test]
+    fn a_provider_only_spec_has_no_answer_without_a_policy() {
+        let base: ModelRef = "zen://kimi-k2".parse().unwrap();
+        let spec: ModelSpec = "openai://".parse().unwrap();
+        assert_eq!(spec.apply(&base), None);
+        assert_eq!(
+            spec.provider(),
+            Some(&ProviderName::new("openai")),
+            "…but it does name the provider a policy is to be applied to"
+        );
+        // The model of the provider being LEFT is never the answer, in any shape.
+        assert_ne!(spec.apply(&base), Some(base.clone()));
+        // The complete shapes still answer for themselves.
+        assert_eq!(
+            "gpt-5.5".parse::<ModelSpec>().unwrap().provider(),
+            None,
+            "a bare model id names no provider"
+        );
     }
 
     /// A spec is one string on disk too — exactly what the user typed. It is the
@@ -577,8 +675,17 @@ mod tests {
             serde_json::from_str::<ModelSpec>("\"anthropic://claude-opus-4-8\"").unwrap(),
             ModelSpec::Full("claude://claude-opus-4-8".parse().unwrap())
         );
-        // A half-written identity is refused rather than landing as a model id.
-        assert!(serde_json::from_str::<ModelSpec>("\"zen://\"").is_err());
+        // The provider-only shape is one string on disk too — `model = "openai://"`.
+        assert_eq!(
+            serde_json::to_string(&ModelSpec::ProviderOnly(ProviderName::new("openai"))).unwrap(),
+            "\"openai://\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ModelSpec>("\"zen://\"").unwrap(),
+            ModelSpec::ProviderOnly(ProviderName::new("zen"))
+        );
+        // A string naming NOTHING is still refused.
+        assert!(serde_json::from_str::<ModelSpec>("\"://\"").is_err());
         assert!(serde_json::from_str::<ModelSpec>("\"\"").is_err());
     }
 
@@ -589,14 +696,14 @@ mod tests {
         let base: ModelRef = "zen://kimi-k2".parse().unwrap();
         assert_eq!(
             "grok-code".parse::<ModelSpec>().unwrap().apply(&base),
-            "zen://grok-code".parse::<ModelRef>().unwrap()
+            Some("zen://grok-code".parse::<ModelRef>().unwrap())
         );
         assert_eq!(
             "local://llama3:8b"
                 .parse::<ModelSpec>()
                 .unwrap()
                 .apply(&base),
-            "local://llama3:8b".parse::<ModelRef>().unwrap()
+            Some("local://llama3:8b".parse::<ModelRef>().unwrap())
         );
         // The base is untouched by a bare-model apply.
         assert_eq!(base.to_string(), "zen://kimi-k2");

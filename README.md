@@ -237,6 +237,15 @@ A **bare model id** (`gpt-5.5`, `deepseek/deepseek-chat`, `llama3:8b`) means
 "that model, on the provider I am already on" — the separator is `://` and
 nothing else, so a slashed or colon'd model id is never mistaken for a provider.
 
+A **provider alone** (`openai://`, note the trailing `://`) says "switch me to
+this provider and pick the model for me". Interactively (`--model 'openai://'`,
+`/model openai://`, `/login`) that means the model you last used on _that_
+provider, else the one it declares. Programmatically (a `[[subagent]]` profile,
+the `task` tool) it means only the model the provider itself declares — a
+delegation must resolve to the same model on every machine and in CI, so it
+never reads what a human last picked. Either way it is never the model you were
+using on the provider you are _leaving_.
+
 There is no `--provider` flag and no `provider =` config key: a provider and a
 model that can be set independently are a pair that can disagree, and hrdr would
 have had to guess which half you meant.

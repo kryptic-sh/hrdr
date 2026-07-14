@@ -29,7 +29,15 @@ pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
             return;
         }
     };
-    let reference = spec.apply(&host.model_ref());
+    let Some(reference) = spec.apply(&host.model_ref()) else {
+        // `/model openai://` names a provider and no model — the one shape a spec
+        // cannot resolve by itself. This is an INTERACTIVE switch, so it gets the
+        // interactive policy: the model you last used on that provider, else the one
+        // it declares, else a picker filtered to it ([`apply_provider_or_pick`]).
+        let provider = spec.provider().expect("ProviderOnly names a provider");
+        let _ = apply_provider_or_pick(host, provider.as_str());
+        return;
+    };
     apply_reference(host, reference, None, true);
 }
 

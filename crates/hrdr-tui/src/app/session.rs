@@ -222,8 +222,9 @@ impl super::App {
         state.usage.context_window = probed_window.or(state.usage.context_window);
         // A pre-`provider://model` session file: its model, on the provider we are on.
         if state.provider_unset {
-            state.model =
-                hrdr_agent::ModelSpec::ModelOnly(state.model.model().to_string()).apply(&in_force);
+            state.model = hrdr_agent::ModelSpec::ModelOnly(state.model.model().to_string())
+                .apply(&in_force)
+                .expect("a bare model id always resolves");
             state.provider_unset = false;
         }
         if let Some(model) = pinned {
