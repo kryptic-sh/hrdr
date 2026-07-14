@@ -421,7 +421,23 @@ pub fn model_for_resolved_provider(
     provider: &ProviderName,
     resolved: &crate::ResolvedProvider,
 ) -> Result<ModelRef> {
-    if let Some(r) = last_model_on(provider) {
+    model_for_resolved_provider_in(&load_last_models(), provider, resolved)
+}
+
+/// [`model_for_resolved_provider`] against an explicit store — the pure core, so
+/// the chain's rules are testable without the real `<XDG data>/hrdr/last_model.json`.
+///
+/// The store is deliberately a parameter rather than a global read: a test that
+/// consults the developer's actual store is one that silently stops testing the
+/// moment they use that provider (it would have to guard on "only assert when the
+/// store happens to be empty"), and that guard passes green while asserting
+/// nothing.
+pub fn model_for_resolved_provider_in(
+    store: &LastModels,
+    provider: &ProviderName,
+    resolved: &crate::ResolvedProvider,
+) -> Result<ModelRef> {
+    if let Some(r) = store.on(provider) {
         return Ok(r);
     }
     if let Some(model) = resolved.model.as_deref() {
@@ -872,31 +888,53 @@ mod tests {
     /// model you were running on somewhere else.
     #[test]
     fn model_for_a_provider_falls_back_and_never_carries_the_old_model_over() {
-        // (1) is I/O-backed (`last_model_on`), so the pure chain is exercised from
-        // (2): a provider that declares a model yields it…
+        // Driven against an EXPLICIT store, never the developer's real
+        // `<XDG data>/hrdr/last_model.json`. A test that reads the real store has to
+        // guard every assertion with "…only if the store happens to be empty", which
+        // passes green while asserting nothing the moment you actually use that
+        // provider. Injecting the store lets every branch be asserted outright.
+        let empty = LastModels::default();
+        let zen = builtin_provider("zen").unwrap();
         let chatgpt = builtin_provider("chatgpt").unwrap();
+
+        // (1) The model last used ON THAT PROVIDER wins — including over a preset
+        //     default, which is the whole point of remembering it.
+        let mut remembered = LastModels::default();
+        remembered.record(&r("zen://kimi-k2"));
+        remembered.record(&r("chatgpt://gpt-5.6-sol"));
+        assert_eq!(
+            model_for_resolved_provider_in(&remembered, &ProviderName::new("zen"), &zen).unwrap(),
+            r("zen://kimi-k2"),
+        );
+        assert_eq!(
+            model_for_resolved_provider_in(&remembered, &ProviderName::new("chatgpt"), &chatgpt)
+                .unwrap(),
+            r("chatgpt://gpt-5.6-sol"),
+            "what you last used there beats the preset default",
+        );
+
+        // (2) Nothing remembered → a model the provider itself declares.
         assert_eq!(
             chatgpt.model.as_deref(),
             Some("gpt-5.5"),
             "the only built-in with one"
         );
         assert_eq!(
-            model_for_resolved_provider(&ProviderName::new("codex"), &chatgpt).unwrap(),
+            model_for_resolved_provider_in(&empty, &ProviderName::new("codex"), &chatgpt).unwrap(),
             r("chatgpt://gpt-5.5"),
+            "and the alias folds to the canonical name",
         );
-        // …and one that declares none is an ERROR naming the flag that settles it —
-        // *not* whatever model the caller happened to be using.
-        let zen = builtin_provider("zen").unwrap();
+
+        // (3) Nothing remembered and none declared → an ERROR naming the flag that
+        //     settles it. Emphatically NOT whatever model the caller was using
+        //     elsewhere: the old model silently following you onto a new provider is
+        //     the exact bug this whole refactor exists to kill.
         assert!(zen.model.is_none());
-        // (Only meaningful when the store has no `zen` entry — which is the case in
-        // a test process with no XDG data dir written for it.)
-        if last_model_on(&ProviderName::new("zen")).is_none() {
-            let err = model_for_resolved_provider(&ProviderName::new("zen"), &zen)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("provider 'zen' needs a model"), "{err}");
-            assert!(err.contains("--model 'zen://<model>'"), "{err}");
-        }
+        let err = model_for_resolved_provider_in(&empty, &ProviderName::new("zen"), &zen)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'zen' needs a model"), "{err}");
+        assert!(err.contains("--model 'zen://<model>'"), "{err}");
     }
 
     #[test]

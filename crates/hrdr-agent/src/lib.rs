@@ -1185,24 +1185,24 @@ fn apply_model_ref(
     Ok(())
 }
 
-/// The identity a *named* provider means for `cfg` when no model is named with
-/// it: the fallback chain ([`model_for_provider`]) — the model last used on that
-/// provider, else one the provider declares, else an error.
-///
-/// Never `cfg.model`'s model id. That is the bug: a model that belongs to the
-/// provider you are LEAVING has no meaning on the one you are arriving at.
-fn provider_switch_ref(cfg: &AgentConfig, provider: &str) -> Result<ModelRef> {
-    model_for_provider(&ProviderName::new(provider), cfg)
-}
-
 /// The identity a `(provider, model)` argument pair names, against the identity
-/// `cfg` is already on.
+/// `cfg` is already on. This is the **programmatic** entry point — agent profiles
+/// (`[[subagent]]`, `agents/*.md`).
 ///
 /// The three shapes a source can spell, and only these:
 /// - both → that exact identity;
 /// - a model alone → [`ModelSpec::ModelOnly`]: same provider, new model;
-/// - a provider alone → the fallback chain ([`provider_switch_ref`]) — NEVER
-///   `cfg`'s current model id, which belongs to the provider being left.
+/// - a provider alone → the model that provider itself DECLARES, else an error.
+///   NEVER `cfg`'s current model id, which belongs to the provider being left —
+///   that silent carry-over is the bug this whole seam exists to kill.
+///
+/// Note what is deliberately absent: the interactive last-used store
+/// ([`model_for_provider`]). A profile is configuration, so it must resolve the
+/// same way for everyone — folding in "whatever a human last picked on that
+/// provider" would make the same sub-agent run a different model on each
+/// developer's machine and a third one in CI. The store is consulted only by the
+/// interactive switches (`/login`, the `/model` picker), where carrying on with
+/// what you were using is precisely the intent.
 fn named_pair_ref(
     cfg: &AgentConfig,
     provider: Option<&str>,
@@ -1210,7 +1210,24 @@ fn named_pair_ref(
 ) -> Result<Option<ModelRef>> {
     Ok(match (provider, model) {
         (Some(p), Some(m)) => Some(ModelRef::new(ProviderName::new(p), m)?),
-        (Some(p), None) => Some(provider_switch_ref(cfg, p)?),
+        (Some(p), None) => {
+            let declared = cfg
+                .resolve_provider(p)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown provider '{p}' (built-ins: {}, or define [providers.{p}])",
+                        BUILTIN_PROVIDERS.join(", ")
+                    )
+                })?
+                .model;
+            let Some(m) = declared else {
+                bail!(
+                    "provider '{p}' needs a model — name one as '{p}://<model>' \
+                     (it declares no default)"
+                );
+            };
+            Some(ModelRef::new(ProviderName::new(p), &m)?)
+        }
         (None, Some(m)) => Some(ModelSpec::ModelOnly(m.to_string()).apply(&cfg.model)),
         (None, None) => None,
     })
@@ -1226,46 +1243,60 @@ fn apply_task_overrides(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    if let Some(pname) = provider {
-        // Resolve + gate against the PARENT's key/base_url, before switching.
-        let p = cfg.resolve_provider(pname).ok_or_else(|| {
-            anyhow::anyhow!(
-                "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
-                BUILTIN_PROVIDERS.join(", ")
-            )
-        })?;
-        let current_auth = provider_auth_state(
-            pname,
-            &p,
-            cfg.api_key.as_deref(),
-            Some(cfg.base_url.as_str()),
-        );
-        let parent_auth = provider_auth_state(
-            pname,
-            &p,
-            parent.api_key.as_deref(),
-            Some(parent.base_url.as_str()),
-        );
-        if current_auth == ProviderAuthState::Missing && parent_auth == ProviderAuthState::Missing {
-            // Only suggest an env var when the provider actually reads one;
-            // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
-            // would be sent chasing a var that resolve_api_key never consults.
-            let hint = match p.key_env.as_deref() {
-                Some(env) => format!("set ${env}, or run /login"),
-                None => format!(
-                    "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
-                ),
+    // The identity this delegation runs on.
+    //
+    // A `task` must be REPRODUCIBLE. When it names a provider but no model, the
+    // model comes from what the provider itself declares — never from the
+    // interactive last-used store. Consulting that store would make the same
+    // delegation resolve to a different model on a developer's machine than in CI,
+    // depending on what a human last happened to pick. The last-used fallback is
+    // for *interactive* switches (`/login`, the `/model` picker), where "carry on
+    // with what I was using" is the whole point; a spawned sub-agent is not that.
+    let reference = match (provider, model) {
+        (Some(pname), _) => {
+            // Resolve + gate against the PARENT's key/base_url, before switching.
+            let p = cfg.resolve_provider(pname).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
+                    BUILTIN_PROVIDERS.join(", ")
+                )
+            })?;
+            let current_auth = provider_auth_state(
+                pname,
+                &p,
+                cfg.api_key.as_deref(),
+                Some(cfg.base_url.as_str()),
+            );
+            let parent_auth = provider_auth_state(
+                pname,
+                &p,
+                parent.api_key.as_deref(),
+                Some(parent.base_url.as_str()),
+            );
+            if current_auth == ProviderAuthState::Missing
+                && parent_auth == ProviderAuthState::Missing
+            {
+                // Only suggest an env var when the provider actually reads one;
+                // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
+                // would be sent chasing a var that resolve_api_key never consults.
+                let hint = match p.key_env.as_deref() {
+                    Some(env) => format!("set ${env}, or run /login"),
+                    None => format!(
+                        "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
+                    ),
+                };
+                bail!("task: provider '{pname}' is not configured — {hint}");
+            }
+            let Some(m) = model.or(p.model.as_deref()) else {
+                bail!("task: provider '{pname}' requires an explicit model (it has no default)");
             };
-            bail!("task: provider '{pname}' is not configured — {hint}");
+            Some(ModelRef::new(ProviderName::new(pname), m)?)
         }
-        if model.is_none()
-            && p.model.is_none()
-            && last_model_on(&ProviderName::new(pname)).is_none()
-        {
-            bail!("task: provider '{pname}' requires an explicit model (it has no default)");
-        }
-    }
-    let Some(reference) = named_pair_ref(cfg, provider, model)? else {
+        // No provider named: a bare model overrides on the provider we are already on.
+        (None, Some(m)) => Some(ModelSpec::ModelOnly(m.to_string()).apply(&cfg.model)),
+        (None, None) => None,
+    };
+    let Some(reference) = reference else {
         return Ok(());
     };
     // Key inheritance: the CHILD's own context first (it may already sit on this
@@ -1573,6 +1604,11 @@ impl hrdr_tools::Tool for SubagentTool {
                 .get("model")
                 .and_then(|v| v.as_str())
                 .filter(|m| !m.trim().is_empty());
+            // No `last_model_on` escape here, deliberately: a profile-driven
+            // delegation is as programmatic as a `task` arg, so its model must come
+            // from the profile or the provider's own default — never from the
+            // interactive last-used store, which would make the same sub-agent run a
+            // different model for each developer.
             if let Some(provider) = profile.provider.as_deref()
                 && profile.model.is_none()
                 && self
@@ -1580,7 +1616,6 @@ impl hrdr_tools::Tool for SubagentTool {
                     .resolve_provider(provider)
                     .and_then(|p| p.model)
                     .is_none()
-                && last_model_on(&ProviderName::new(provider)).is_none()
                 && task_model.is_none()
             {
                 bail!(
@@ -7380,22 +7415,27 @@ mod tests {
     /// answer it is an ERROR, not a silent carry-over.
     #[test]
     fn a_provider_with_no_model_never_inherits_the_previous_providers_model() {
-        use super::{named_pair_ref, provider_switch_ref};
+        use super::named_pair_ref;
         let cfg = AgentConfig {
             model: r("zen://kimi-k2"),
             ..Default::default()
         };
-        // `openai` declares no default model, and (in a test process) nothing was
-        // ever used on it — so this cannot be answered, and says so.
-        if super::last_model_on(&super::ProviderName::new("openai")).is_none() {
-            let err = provider_switch_ref(&cfg, "openai").unwrap_err().to_string();
-            assert!(err.contains("provider 'openai' needs a model"), "{err}");
-            assert!(err.contains("--model 'openai://<model>'"), "{err}");
-            assert!(!err.contains("kimi-k2"), "the old model is not an answer");
-            // Same through the pair-shaped entry point the `task` tool and the
-            // profiles use.
-            assert!(named_pair_ref(&cfg, Some("openai"), None).is_err());
-        }
+        // `openai` declares no default model, so a profile naming it without one
+        // cannot be answered — and says so, naming what would settle it.
+        //
+        // Unconditional. An earlier revision guarded this on "…only if the last-used
+        // store has no `openai` entry", which meant that for any developer who had
+        // actually used openai, THE test protecting the central invariant of this
+        // refactor quietly asserted nothing at all and still reported green.
+        let err = named_pair_ref(&cfg, Some("openai"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'openai' needs a model"), "{err}");
+        assert!(err.contains("openai://<model>"), "{err}");
+        assert!(
+            !err.contains("kimi-k2"),
+            "the model from the provider being LEFT is never an answer: {err}"
+        );
         // A provider that DOES declare one answers with it — never with kimi-k2.
         assert_eq!(
             named_pair_ref(&cfg, Some("chatgpt"), None).unwrap(),
@@ -7452,16 +7492,19 @@ mod tests {
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.model, r("local://deepseek-x"));
 
-        // (c) provider without a default model and no model arg → error (nothing in
-        //     the last-used store for it in a test process).
-        if super::last_model_on(&super::ProviderName::new("local")).is_none() {
-            let mut cfg = base.clone();
-            let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("requires an explicit model"), "got: {err}");
-            assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"), "unchanged on error");
-        }
+        // (c) provider without a default model and no model arg → error.
+        //
+        // Unconditional, because a delegation never consults the interactive
+        // last-used store: the same `task` call must resolve to the same model on a
+        // developer's machine as in CI, not to whatever a human last picked. (An
+        // earlier revision guarded this on "…only if the store has no `local` entry",
+        // which passes green while asserting nothing for anyone who has used it.)
+        let mut cfg = base.clone();
+        let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires an explicit model"), "got: {err}");
+        assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"), "unchanged on error");
 
         // (d) unknown provider → error.
         let mut cfg = base.clone();
