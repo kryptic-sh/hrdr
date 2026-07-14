@@ -16,6 +16,24 @@ pub enum Role {
     Tool,
 }
 
+/// Internal origin of a message — distinguishes a real user turn from synthetic
+/// user-role context injected by the agent (steering, background results, …).
+///
+/// Used by `rewind_last_user` to skip past synthetic `Role::User` messages and
+/// find the actual user turn. Defaults to [`User`](MessageOrigin::User) so that
+/// existing serialized data (session files) correctly treats all messages as
+/// real user turns.
+///
+/// **Never serialized onto the provider wire** — only the session file preserves
+/// it (see `persisted_messages` in `hrdr-app`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MessageOrigin {
+    #[default]
+    User,
+    Steering,
+    BackgroundResult,
+}
+
 /// A single chat message. Used for both request and response — `content` is
 /// optional because assistant turns that only call tools carry no text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +56,15 @@ pub struct ChatMessage {
     /// are Anthropic-wire-only and must not go on the OpenAI wire.
     #[serde(default, skip_serializing)]
     pub anthropic_thinking_blocks: Vec<serde_json::Value>,
+    /// Internal origin marker — distinguishes real user turns from synthetic
+    /// user-role context injected by the agent (steering, background results).
+    /// Defaults to [`MessageOrigin::User`] (the rewindable kind) for backward
+    /// compatibility with existing session files.
+    ///
+    /// Never written onto the provider wire (`skip_serializing`); the session
+    /// file preserves it via `persisted_messages`.
+    #[serde(default, skip_serializing)]
+    pub origin: MessageOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Set on `Role::Tool` messages to bind the result to its call.
@@ -66,6 +93,7 @@ impl ChatMessage {
             content: Some(text.into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -79,6 +107,7 @@ impl ChatMessage {
             content: Some(content.into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
             name: None,
@@ -508,6 +537,7 @@ impl Accumulator {
             content: (!self.content.is_empty()).then_some(self.content),
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
             anthropic_thinking_blocks: self.anthropic_thinking_blocks,
+            origin: MessageOrigin::User,
             tool_calls: (!self.calls.is_empty()).then_some(self.calls),
             tool_call_id: None,
             name: None,
@@ -1039,6 +1069,7 @@ mod tests {
                 "thinking": "The user wants me to read a file.",
                 "signature": "SIG_ABCDEF"
             })],
+            origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
             name: None,

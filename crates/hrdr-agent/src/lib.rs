@@ -5014,29 +5014,16 @@ impl Agent {
         self.publish_delegation_runtime();
     }
 
-    /// Drop the last user turn (and everything after it) from history, returning
+    /// Drop the last real user turn (and everything after it) from history, returning
     /// that user message's text so it can be re-sent (`/retry`).
     ///
-    /// TODO: this can target a **synthetic** `Role::User` message rather than
-    /// the last real user turn. Both [`Agent::drain_steering`] and
-    /// [`Agent::drain_background`] push their content as plain
-    /// `ChatMessage::user(..)` (a steering message, or a
-    /// "[Background task #.. finished — its result:]" delivery) with nothing
-    /// distinguishing them from a real user turn, so if either lands after the
-    /// last real user message, `/retry` rewinds to the wrong point and re-sends
-    /// the wrong text. Not fixed here: there is no existing internal-only
-    /// marker on `ChatMessage` to test for, and adding one means changing the
-    /// wire type shared by hrdr-llm and hrdr-agent (plus its session-resume
-    /// (de)serialization and every call site that builds a `ChatMessage`
-    /// literal) — real fields on that struct already do carry
-    /// serialize-skipped, internal-only data (`reasoning_content`,
-    /// `anthropic_thinking_blocks`), so the pattern exists, but wiring it
-    /// through correctly is more than a one-line fix and deserves its own
-    /// change rather than a fragile guess here (e.g. sniffing the
-    /// "[Background task" prefix). Left as-is per explicit guidance to leave a
-    /// TODO rather than a fragile heuristic.
+    /// Skips synthetic `Role::User` messages injected by [`Agent::drain_steering`]
+    /// and [`Agent::drain_background`], which carry a non-default [`MessageOrigin`].
     pub fn rewind_last_user(&mut self) -> Option<String> {
-        let idx = self.messages.iter().rposition(|m| m.role == Role::User)?;
+        let idx = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::User && m.origin == MessageOrigin::User)?;
         let text = self.messages[idx].content.clone();
         self.messages.truncate(idx);
         text
@@ -5197,7 +5184,10 @@ impl Agent {
         for msg in pending {
             // The model reads the expanded form; the transcript shows what was typed.
             on_event(AgentEvent::Steered(msg.display));
-            self.messages.push(ChatMessage::user(msg.sent));
+            self.messages.push(ChatMessage {
+                origin: MessageOrigin::Steering,
+                ..ChatMessage::user(msg.sent)
+            });
         }
     }
 
@@ -5241,9 +5231,12 @@ impl Agent {
             on_event(AgentEvent::Notice(format!(
                 "background task #{id} ({label}) finished"
             )));
-            self.messages.push(ChatMessage::user(format!(
-                "[Background task #{id} ({label}) finished — its result:]\n{result}"
-            )));
+            self.messages.push(ChatMessage {
+                origin: MessageOrigin::BackgroundResult,
+                ..ChatMessage::user(format!(
+                    "[Background task #{id} ({label}) finished — its result:]\n{result}"
+                ))
+            });
         }
     }
 
@@ -5943,6 +5936,7 @@ impl Agent {
 
 // Re-exports consumers need without reaching into sub-crates.
 pub use hrdr_llm::ChatMessage as Message;
+pub use hrdr_llm::MessageOrigin;
 pub use hrdr_llm::Role as MessageRole;
 /// The models.dev catalog (context windows, price cards, effort levels) —
 /// re-exported so frontends don't need a direct `hrdr-llm` dependency.
@@ -6413,7 +6407,7 @@ mod tests {
         SubagentKind, TurnStats,
     };
     use futures_util::FutureExt;
-    use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
+    use hrdr_llm::{ChatMessage, FunctionCall, MessageOrigin, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
         agent.messages()[0].content.clone().unwrap_or_default()
@@ -6425,6 +6419,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: Some(
                 ids.iter()
                     .map(|id| ToolCall {
@@ -8851,6 +8846,63 @@ mod tests {
     }
 
     #[test]
+    fn rewind_last_user_skips_steering_and_background_origin_messages() {
+        use super::MessageOrigin;
+        let cfg = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+        // Reset to a clean state with a system message.
+        agent.set_messages(vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage::user("real prompt"),
+            ChatMessage {
+                origin: MessageOrigin::Steering,
+                ..ChatMessage::user("steering correction")
+            },
+            ChatMessage::assistant("I'll adjust"),
+            ChatMessage::tool_result("c1", "some output"),
+            ChatMessage {
+                origin: MessageOrigin::BackgroundResult,
+                ..ChatMessage::user("[Background task #1 finished — its result:] done")
+            },
+        ]);
+
+        let text = agent.rewind_last_user();
+        assert_eq!(text.as_deref(), Some("real prompt"));
+        // Only the system message survives; the real user turn itself and
+        // everything after it was truncated (that is the rewind contract).
+        assert_eq!(agent.message_count(), 1);
+        assert_eq!(
+            agent.messages()[0].content.as_deref(),
+            Some("you are helpful")
+        );
+    }
+
+    #[test]
+    fn rewind_last_user_returns_none_when_only_synthetic_user_messages() {
+        use super::MessageOrigin;
+        let cfg = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+
+        agent.set_messages(vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage {
+                origin: MessageOrigin::Steering,
+                ..ChatMessage::user("steering")
+            },
+        ]);
+
+        assert!(agent.rewind_last_user().is_none());
+        // History is untouched — no real user turn to rewind to.
+        assert_eq!(agent.message_count(), 2);
+    }
+
+    #[test]
     fn classifies_transient_and_overflow_errors() {
         let overflow = anyhow::anyhow!(
             "chat endpoint returned 400 Bad Request: This model's maximum context length is 8192 tokens"
@@ -10229,6 +10281,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
             name: None,

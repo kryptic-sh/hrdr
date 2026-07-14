@@ -659,7 +659,7 @@ fn delta_chunk(delta: Delta) -> ChatChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FunctionCall, ToolCall};
+    use crate::types::{FunctionCall, MessageOrigin, ToolCall};
 
     fn sys(t: &str) -> ChatMessage {
         ChatMessage::system(t)
@@ -701,6 +701,7 @@ mod tests {
             content: Some("let me check".into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
                 kind: "function".into(),
@@ -932,6 +933,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_bad".into(),
                 kind: "function".into(),
@@ -1076,6 +1078,7 @@ mod tests {
             anthropic_thinking_blocks: vec![
                 json!({"type":"thinking","thinking":"I should call read","signature":"SIG123"}),
             ],
+            origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_x".into(),
                 kind: "function".into(),
@@ -1234,6 +1237,7 @@ mod tests {
                 "thinking": "I should call read",
                 "signature": "SIG_ROUND_TRIP"
             })],
+            origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_rt".into(),
                 kind: "function".into(),

@@ -580,7 +580,7 @@ fn delta_chunk(delta: Delta) -> ChatChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Accumulator, FunctionCall, ToolCall};
+    use crate::types::{Accumulator, FunctionCall, MessageOrigin, ToolCall};
 
     fn sys(t: &str) -> ChatMessage {
         ChatMessage::system(t)
@@ -596,6 +596,7 @@ mod tests {
             content: Some("let me check".into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 kind: "function".into(),

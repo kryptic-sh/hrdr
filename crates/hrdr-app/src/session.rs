@@ -222,6 +222,7 @@ impl<'de> Deserialize<'de> for SessionState {
 /// affects the encode side, and both fields are `#[serde(default)]`.
 mod persisted_messages {
     use super::Message;
+    use hrdr_agent::MessageOrigin;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(messages: &[Message], s: S) -> Result<S::Ok, S::Error> {
@@ -242,6 +243,14 @@ mod persisted_messages {
                 obj.insert(
                     "anthropic_thinking_blocks".into(),
                     serde_json::Value::Array(m.anthropic_thinking_blocks.clone()),
+                );
+            }
+            // Preserve internal origin marker so `rewind_last_user` works
+            // correctly after a session resume.
+            if m.origin != MessageOrigin::User {
+                obj.insert(
+                    "origin".into(),
+                    serde_json::to_value(m.origin).map_err(S::Error::custom)?,
                 );
             }
             out.push(v);
@@ -1073,6 +1082,74 @@ mod roundtrip_audit {
         assert!(!wire.contains("secret thoughts"), "{wire}");
         assert!(!wire.contains("anthropic_thinking_blocks"), "{wire}");
         assert!(!wire.contains("reasoning_content"), "{wire}");
+    }
+
+    /// Origin markers survive a session-file round-trip, so `rewind_last_user`
+    /// works correctly after a resume. The wire form (OpenAI request) must never
+    /// carry the origin field.
+    #[test]
+    fn synthetic_origin_survives_session_file_and_is_absent_from_wire() {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let steer = Message {
+            origin: hrdr_agent::MessageOrigin::Steering,
+            ..Message::user("steer")
+        };
+        let bg = Message {
+            origin: hrdr_agent::MessageOrigin::BackgroundResult,
+            ..Message::user("bg result")
+        };
+
+        let st = SessionState {
+            cwd: cwd.clone(),
+            messages: vec![Message::user("real"), steer.clone(), bg.clone()],
+            ..Default::default()
+        };
+
+        // — Wire form (Message's own Serialize) drops origin —
+        let wire = serde_json::to_string(&steer).unwrap();
+        assert!(
+            !wire.contains("origin"),
+            "origin must not appear on the wire: {wire}"
+        );
+        let wire = serde_json::to_string(&bg).unwrap();
+        assert!(
+            !wire.contains("origin"),
+            "origin must not appear on the wire: {wire}"
+        );
+
+        // — Session file round-trip preserves origin —
+        let json = serde_json::to_string(&Session::new(st)).unwrap();
+        let back = serde_json::from_str::<Session>(&json).unwrap().state;
+
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(
+            back.messages[0].origin,
+            hrdr_agent::MessageOrigin::User,
+            "default-origin messages retain User"
+        );
+        assert_eq!(
+            back.messages[1].origin,
+            hrdr_agent::MessageOrigin::Steering,
+            "Steering origin survives session file"
+        );
+        assert_eq!(
+            back.messages[2].origin,
+            hrdr_agent::MessageOrigin::BackgroundResult,
+            "BackgroundResult origin survives session file"
+        );
+
+        // — Old session files (no origin field) default to User on read —
+        let old = r#"{"version":2,"created":0,"updated":0,"cwd":"/tmp","messages":[{"role":"user","content":"legacy"}]}"#;
+        let parsed: Session = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            parsed.state.messages[0].origin,
+            hrdr_agent::MessageOrigin::User,
+            "a message without an origin field defaults to User"
+        );
     }
 }
 
