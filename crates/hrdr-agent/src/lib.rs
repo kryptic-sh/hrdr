@@ -66,10 +66,12 @@ pub use models::{
 pub use usage::AgentUsage;
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
 use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
@@ -714,13 +716,15 @@ fn spawn_background(
     // The inner task does the actual work; the outer task is the panic guard:
     // it always sets `done = true` + a result, even on panic.
     let handle = tokio::spawn(async move {
-        // The slot is released when this task ends — including on panic, since
-        // the guard is dropped as the future is.
+        // The slot is released when this task ends — including on abort,
+        // since the entire future is dropped.
         let _slot = slot;
-        // Run the body in a nested spawn so a panic propagates as a JoinError
-        // (non-panicking error path: Result::Err) rather than crashing the
-        // outer task and leaving the registry entry live forever.
-        let inner = tokio::spawn(async move {
+        // Single task with catch_unwind so a panic sets done=true and writes a
+        // terminal End event rather than crashing and leaving the registry entry
+        // live forever. On abort the whole future is dropped — the slot and
+        // RunGuard are released, and no stale result reaches the registry or
+        // live-subagent store.
+        let result = AssertUnwindSafe(async move {
             let mut out = String::new();
             let result: anyhow::Result<()> = async {
                 let mut sub = Agent::new(cfg)?;
@@ -831,13 +835,17 @@ fn spawn_background(
                     format!("(background task failed: {e})")
                 }
             }
-        });
-        // Always set done = true, even if the inner task panicked. The inner
-        // task writes its own terminal `End` on Ok/Err; only panic and cancel
-        // reach the outer guard without one, so those are recorded here.
-        let final_result = match inner.await {
+        })
+        .catch_unwind()
+        .await;
+        let final_result = match result {
             Ok(s) => s,
-            Err(join_err) if join_err.is_panic() => {
+            Err(panic_err) => {
+                let msg = panic_err
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("(unknown panic)");
                 if let Ok(mut g) = ts_outer.lock()
                     && let Some(t) = g.as_mut()
                 {
@@ -846,24 +854,7 @@ fn spawn_background(
                         bytes: 0,
                     });
                 }
-                format!("(background task panicked: {join_err})")
-            }
-            Err(_) => {
-                // Defensive: today's only cancel path (`abort_background_tasks`)
-                // aborts the outer guard, which detaches from `inner` without
-                // cancelling it — so `inner` runs on to its own Ok/Failed `End`
-                // (or is dropped as an orphan on process exit) and this arm isn't
-                // reached. It records a terminal `End` for any future path that
-                // cancels the inner task directly.
-                if let Ok(mut g) = ts_outer.lock()
-                    && let Some(t) = g.as_mut()
-                {
-                    t.write(&subagent_transcript::Event::End {
-                        status: subagent_transcript::EndStatus::Cancelled,
-                        bytes: 0,
-                    });
-                }
-                "(background task was cancelled)".to_string()
+                format!("(background task panicked: {msg})")
             }
         };
         if let Ok(mut v) = reg_done.lock()
@@ -872,9 +863,10 @@ fn spawn_background(
             t.done = true;
             t.result = Some(final_result);
         }
-        // The sub-agent is idle now, but its answer is still owed to the main
-        // agent, so `delivered` stays false — the entry survives the prune until
-        // the result is injected (see `deliver_background`).
+        // The sub-agent is idle now (RunGuard's drop inside catch_unwind
+        // already sets running=false, done=true), but its answer is still
+        // owed to the main agent, so `delivered` stays false — the entry
+        // survives the prune until the result is injected via deliver_background.
         live_done.update(live_key, |e| {
             e.running = false;
             e.done = true;
@@ -4548,9 +4540,19 @@ impl Agent {
     /// reflected (the old system prompt is not kept around).
     ///
     /// Also aborts any running background sub-agent tasks so stale results from
-    /// a previous session don't land in the new conversation.
+    /// a previous session don't land in the new conversation, and removes all
+    /// background-registry / background live-subagent entries from the previous
+    /// session.
     pub fn clear(&mut self) {
         self.abort_background_tasks();
+        // Remove ALL background registry entries from the previous session.
+        if let Ok(mut v) = self.ctx.background_tasks.lock() {
+            v.clear();
+        }
+        // Remove ALL background live-subagent entries (not the main entry).
+        self.live_subagents.with(|v| {
+            v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
+        });
         self.messages.clear();
         self.reset_read_files();
         self.reset_session_cost();
@@ -4559,11 +4561,29 @@ impl Agent {
 
     /// Abort all running background sub-agent tasks and clear the handle list.
     /// A task that has already finished is a no-op.
+    /// Also removes stale entries from the background registry and live
+    /// sub-agents, so aborted tasks cannot deliver results into a fresh
+    /// conversation.
     pub fn abort_background_tasks(&mut self) {
-        if let Ok(mut v) = self.bg_handles.lock() {
+        let ids: Vec<u64> = if let Ok(mut v) = self.bg_handles.lock() {
+            let ids: Vec<u64> = v.iter().map(|(id, _)| *id).collect();
             for (_, handle) in v.drain(..) {
                 handle.abort();
             }
+            ids
+        } else {
+            return;
+        };
+        if !ids.is_empty() {
+            // Remove stale background registry entries for aborted tasks.
+            if let Ok(mut v) = self.ctx.background_tasks.lock() {
+                v.retain(|t| !ids.contains(&t.id));
+            }
+            // Remove stale live subagent entries for aborted background tasks.
+            // The main entry (key=0) is never removed.
+            self.live_subagents.with(|v| {
+                v.retain(|e| e.key == 0 || e.bg_id.is_none() || !ids.contains(&e.bg_id.unwrap()));
+            });
         }
     }
 
@@ -6386,8 +6406,13 @@ mod tests {
         subagent_transcript_id, tail_window, wants_background,
     };
     use crate::cwd_slug;
+    use crate::subagent_live;
     use crate::subagent_transcript;
-    use crate::{ModelRef, ModelSpec, ResolvedProviderKind};
+    use crate::{
+        LiveSubagent, LiveSubagents, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind,
+        SubagentKind, TurnStats,
+    };
+    use futures_util::FutureExt;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
@@ -8997,9 +9022,8 @@ mod tests {
         let registry: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handles = super::bg_handles();
-        // A config that will panic immediately in the inner spawn.
         // We can't actually run a sub-agent in unit tests (no server), so we
-        // simulate by injecting a panicking inner task directly.
+        // simulate the catch_unwind-based structure directly.
         let reg_clone = registry.clone();
         let id: u64 = 99;
         registry.lock().unwrap().push(hrdr_tools::BackgroundTask {
@@ -9011,15 +9035,23 @@ mod tests {
             result: None,
             delivered: false,
         });
-        // Build the outer-panics-inner structure manually.
+        // Build the flattened catch_unwind structure manually.
         let handle = tokio::spawn(async move {
-            let inner = tokio::spawn(async move { panic!("deliberate test panic") });
-            let final_result = match inner.await {
+            let result = std::panic::AssertUnwindSafe(async move {
+                panic!("deliberate test panic");
+            })
+            .catch_unwind()
+            .await;
+            let final_result = match result {
                 Ok(s) => s,
-                Err(join_err) if join_err.is_panic() => {
-                    format!("(background task panicked: {join_err})")
+                Err(panic_err) => {
+                    let msg = panic_err
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("(unknown panic)");
+                    format!("(background task panicked: {msg})")
                 }
-                Err(_) => "(background task was cancelled)".to_string(),
             };
             if let Ok(mut v) = reg_clone.lock()
                 && let Some(t) = v.iter_mut().find(|t| t.id == id)
@@ -9029,7 +9061,7 @@ mod tests {
             }
         });
         handles.lock().unwrap().push((id, handle));
-        // Wait for the outer task to settle.
+        // Wait for the task to settle.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let v = registry.lock().unwrap();
         let t = v.iter().find(|t| t.id == id).unwrap();
@@ -9038,6 +9070,247 @@ mod tests {
             t.result.as_deref().unwrap_or_default().contains("panicked"),
             "result should mention the panic"
         );
+    }
+
+    #[test]
+    fn background_abort_cleans_up_registry_and_live() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cfg = AgentConfig {
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            let mut agent = Agent::new(cfg).unwrap();
+            let id: u64 = 42;
+            // Inject a fake handle.
+            {
+                let h = tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await
+                });
+                if let Ok(mut v) = agent.bg_handles.lock() {
+                    v.push((id, h));
+                }
+            }
+            // Inject a matching background registry entry.
+            if let Ok(mut v) = agent.ctx.background_tasks.lock() {
+                v.push(hrdr_tools::BackgroundTask {
+                    id,
+                    tool_id: None,
+                    label: "test".to_string(),
+                    log: String::new(),
+                    done: false,
+                    result: None,
+                    delivered: false,
+                });
+            }
+            // Inject a matching live-subagent entry (background kind).
+            agent.live_subagents.with(|v| {
+                let entry_key = LiveSubagents::next_key();
+                v.push(LiveSubagent {
+                    key: entry_key,
+                    bg_id: Some(id),
+                    tool_id: None,
+                    label: "bg-test".to_string(),
+                    model: String::new(),
+                    provider: None,
+                    base_url: String::new(),
+                    effort: None,
+                    auto_compact: true,
+                    compaction_reserved: 0,
+                    todos: Default::default(),
+                    usage: crate::AgentUsage::default(),
+                    events: subagent_live::event_log(),
+                    turn: TurnStats::default(),
+                    kind: SubagentKind::Background,
+                    agent: Arc::new(tokio::sync::Mutex::new(
+                        Agent::new(AgentConfig {
+                            checkpoints: Some("off".to_string()),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    )),
+                    steering: steering_queue(),
+                    running: true,
+                    compacting: false,
+                    done: false,
+                    delivered: false,
+                    pinned: false,
+                });
+            });
+            // Also register the main entry so we can verify it survives.
+            agent.live_subagents.register_main(
+                Arc::new(tokio::sync::Mutex::new(
+                    Agent::new(AgentConfig {
+                        checkpoints: Some("off".to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )),
+                steering_queue(),
+                String::new(),
+                None,
+                String::new(),
+                crate::AgentUsage::default(),
+            );
+
+            assert_eq!(agent.bg_handle_count(), 1);
+            assert_eq!(
+                agent.ctx.background_tasks.lock().unwrap().len(),
+                1,
+                "background registry has the entry"
+            );
+            assert_eq!(
+                agent.live_subagents.len(),
+                2,
+                "live has main + background entry"
+            );
+
+            agent.abort_background_tasks();
+
+            assert_eq!(agent.bg_handle_count(), 0, "handles are drained");
+            assert!(
+                agent.ctx.background_tasks.lock().unwrap().is_empty(),
+                "background registry is cleaned up"
+            );
+            assert_eq!(
+                agent.live_subagents.len(),
+                1,
+                "only the main entry survives"
+            );
+            // The surviving entry is the main one.
+            agent.live_subagents.with(|v| {
+                assert_eq!(v[0].key, MAIN_KEY, "main entry is retained");
+            });
+        });
+    }
+
+    #[test]
+    fn clear_removes_all_background_entries_keeps_main() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cfg = AgentConfig {
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            let mut agent = Agent::new(cfg).unwrap();
+            // Inject several background entries at different lifecycle stages.
+            // Also register the main entry so we can verify it survives.
+
+            // 1. Running background task.
+            let id1: u64 = 1;
+            {
+                let h = tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await
+                });
+                if let Ok(mut v) = agent.bg_handles.lock() {
+                    v.push((id1, h));
+                }
+            }
+            if let Ok(mut v) = agent.ctx.background_tasks.lock() {
+                v.push(hrdr_tools::BackgroundTask {
+                    id: id1,
+                    tool_id: None,
+                    label: "running".to_string(),
+                    log: String::new(),
+                    done: false,
+                    result: None,
+                    delivered: false,
+                });
+            }
+
+            // 2. Finished but undelivered background task (handle already reaped).
+            let id2: u64 = 2;
+            if let Ok(mut v) = agent.ctx.background_tasks.lock() {
+                v.push(hrdr_tools::BackgroundTask {
+                    id: id2,
+                    tool_id: None,
+                    label: "finished".to_string(),
+                    log: String::new(),
+                    done: true,
+                    result: Some("done".to_string()),
+                    delivered: false,
+                });
+            }
+
+            // Inject background live entries for both.
+            let add_bg_live = |v: &mut Vec<LiveSubagent>, bg_id: u64| {
+                let key = LiveSubagents::next_key();
+                v.push(LiveSubagent {
+                    key,
+                    bg_id: Some(bg_id),
+                    tool_id: None,
+                    label: "bg".to_string(),
+                    model: String::new(),
+                    provider: None,
+                    base_url: String::new(),
+                    effort: None,
+                    auto_compact: true,
+                    compaction_reserved: 0,
+                    todos: Default::default(),
+                    usage: crate::AgentUsage::default(),
+                    events: subagent_live::event_log(),
+                    turn: TurnStats::default(),
+                    kind: SubagentKind::Background,
+                    agent: Arc::new(tokio::sync::Mutex::new(
+                        Agent::new(AgentConfig {
+                            checkpoints: Some("off".to_string()),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    )),
+                    steering: steering_queue(),
+                    running: bg_id == id1,
+                    compacting: false,
+                    done: bg_id == id2,
+                    delivered: false,
+                    pinned: false,
+                });
+            };
+            agent.live_subagents.with(|v| {
+                add_bg_live(v, id1);
+                add_bg_live(v, id2);
+            });
+
+            // Register the main entry.
+            agent.live_subagents.register_main(
+                Arc::new(tokio::sync::Mutex::new(
+                    Agent::new(AgentConfig {
+                        checkpoints: Some("off".to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )),
+                steering_queue(),
+                String::new(),
+                None,
+                String::new(),
+                crate::AgentUsage::default(),
+            );
+
+            assert_eq!(agent.live_subagents.len(), 3, "main + 2 bg entries");
+
+            agent.clear();
+
+            assert_eq!(agent.bg_handle_count(), 0, "handles are drained");
+            assert!(
+                agent.ctx.background_tasks.lock().unwrap().is_empty(),
+                "all background registry entries removed"
+            );
+            assert_eq!(
+                agent.live_subagents.len(),
+                1,
+                "only the main entry survives clear"
+            );
+            agent.live_subagents.with(|v| {
+                assert_eq!(v[0].key, MAIN_KEY, "main entry is retained");
+            });
+        });
     }
 
     #[test]
