@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- **The endpoint belongs to the provider.** An endpoint may now come from
+  exactly two places: a built-in provider preset, or the `[providers.<name>]`
+  table that defines a provider. Everything that could move a provider onto
+  another address is gone — the `--base-url` flag, the `$HRDR_BASE_URL` env var,
+  and the free-floating top-level `base_url =` key in `config.toml` (a config
+  still carrying it is refused at startup, with the `[providers.*]` table that
+  replaces it). This makes it impossible for the endpoint and the provider — and
+  therefore the provider's API key — to disagree. To use a server at another
+  address, define it:
+  `[providers.myserver] base_url = "http://localhost:1234/v1"`, then
+  `hrdr --model 'myserver://qwen'`. A bare `hrdr` still lands on
+  `local://default` at `http://localhost:8080/v1`, unchanged.
+- Removed with it: `AgentConfig::base_url_override`, `Agent::relocate_endpoint`,
+  `ResolvedModel::relocate`, `hrdr_agent::relocation_warnings` (the
+  wire-protocol-flip and "your API key will be sent to <host>" warnings — a flag
+  could relocate a keyed provider; nothing can now), and the resume notice about
+  a relocation that no longer applies.
+
 ## [0.3.2] - 2026-07-14
 
 **If you run hrdr on Windows, this is the release you need.** Every build before

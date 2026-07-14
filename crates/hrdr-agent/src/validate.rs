@@ -38,9 +38,7 @@ use crate::chatgpt_models::{CatalogSource, ChatGptModel, chatgpt_model_catalog};
 use crate::model_ref::ModelRef;
 use crate::oauth::coordinated_oauth_access;
 use crate::resolve::ResolvedModel;
-use crate::{
-    AgentConfig, ProviderConfig, ResolvedProviderKind, is_local_endpoint, resolve_provider_in,
-};
+use crate::{AgentConfig, ProviderConfig, ResolvedProviderKind, resolve_provider_in};
 
 /// The model id that means "whatever this server is serving" — a *placeholder*,
 /// not a name. Honest only against an endpoint with no model namespace to name a
@@ -330,55 +328,6 @@ pub fn validate_placeholder_model(
          '{PLACEHOLDER_MODEL}' only means something on a server with no model list. \
          It serves: {list}"
     )
-}
-
-/// The two things a `--base-url` relocation quietly changes, said out loud.
-///
-/// `--base-url` **relocates** a provider — same identity, same key, different
-/// address — which is exactly what a proxy (LiteLLM, a corporate gateway) needs,
-/// and exactly why two invisible things happen:
-///
-/// * **the wire protocol follows the HOST**, not the provider. `detect_backend`
-///   keys on the hostname, so moving `claude://sonnet` to `localhost` swaps the
-///   Anthropic Messages API for OpenAI chat-completions — a different request
-///   shape, silently.
-/// * **the API key follows the URL.** A relocated *keyed* provider sends that
-///   provider's credential to the new host. For a proxy that is the point (it needs
-///   the upstream key to forward). For `--base-url http://evil.example/v1` it is
-///   your Anthropic key, gone. So: a warning, never an error — hrdr cannot tell the
-///   two apart, and only the user can.
-///
-/// Silent when the endpoint was not relocated, and — deliberately — when the
-/// relocation is LOCAL (pointing at your own server is the overwhelmingly common
-/// case, and your machine is not a third party) or the provider is keyless.
-pub fn relocation_warnings(m: &ResolvedModel, canonical_base_url: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let relocated = m.base_url();
-    let canonical_host = hrdr_llm::url_host(canonical_base_url);
-    let host = hrdr_llm::url_host(relocated);
-    if relocated.trim_end_matches('/') == canonical_base_url.trim_end_matches('/') {
-        return out;
-    }
-    let name = m.reference().provider();
-
-    // (a) The wire protocol is a function of the host, so a relocation can change
-    //     which API hrdr speaks without changing a single line of config.
-    let was = hrdr_llm::wire_protocol(canonical_base_url);
-    let now = hrdr_llm::wire_protocol(relocated);
-    if was != now {
-        out.push(format!(
-            "⚠ --base-url moves {name} off {canonical_host} — hrdr will speak the {now} API here, not {was}'s"
-        ));
-    }
-
-    // (b) The credential rides along. Only worth saying when there IS one, and only
-    //     when it is leaving this machine for a host that is not the provider's own.
-    if m.api_key().is_some() && !is_local_endpoint(relocated) && host != canonical_host {
-        out.push(format!(
-            "⚠ your {name} API key will be sent to {host} (--base-url moved the endpoint off {canonical_host})"
-        ));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -718,96 +667,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--model 'mygateway://qwen3-coder'"), "{err}");
-    }
-
-    /// (a) THE WIRE-PROTOCOL FLIP. `detect_backend` keys on the HOST, so relocating
-    /// `claude` off api.anthropic.com stops speaking the Anthropic Messages API and
-    /// starts speaking OpenAI chat-completions — a different request shape, with no
-    /// config change to point at.
-    #[test]
-    fn relocating_a_provider_off_its_host_warns_that_the_api_changed() {
-        const ANTHROPIC: &str = "https://api.anthropic.com/v1";
-        let cfg = cfg();
-        let mut m = resolved("claude://claude-sonnet-4-5", &cfg);
-        assert_eq!(m.base_url(), ANTHROPIC);
-
-        m.relocate("http://localhost:1234/v1", None);
-        let warnings = relocation_warnings(&m, ANTHROPIC);
-        assert_eq!(
-            warnings,
-            [
-                "⚠ --base-url moves claude off api.anthropic.com — hrdr will speak the OpenAI API here, not Anthropic's"
-            ],
-            "the protocol flip is named; a keyless local move leaks nothing, so that is all",
-        );
-
-        // A relocation that does NOT cross a protocol boundary says nothing about the
-        // protocol: openai → an OpenAI-shaped gateway is still chat-completions.
-        let mut m = resolved("openai://gpt-5", &cfg);
-        let canonical = m.base_url().to_string();
-        m.relocate("http://localhost:4000/v1", None);
-        assert!(relocation_warnings(&m, &canonical).is_empty());
-
-        // Not relocated at all → nothing to warn about.
-        let m = resolved("claude://claude-sonnet-4-5", &cfg);
-        assert!(relocation_warnings(&m, ANTHROPIC).is_empty());
-        // The same host at a trailing slash is the same endpoint, not a relocation.
-        let mut same = resolved("claude://claude-sonnet-4-5", &cfg);
-        same.relocate(format!("{ANTHROPIC}/"), Some("sk-ant".to_string()));
-        assert!(relocation_warnings(&same, ANTHROPIC).is_empty());
-    }
-
-    /// (b) THE KEY FOLLOWS THE URL. Relocating a KEYED provider ships that
-    /// provider's credential to the new host. Intentional for a proxy (LiteLLM needs
-    /// the upstream key), catastrophic for a typo — so hrdr says where the key is
-    /// going and lets the user decide.
-    #[test]
-    fn relocating_a_keyed_provider_to_a_foreign_host_warns_where_the_key_is_going() {
-        const ANTHROPIC: &str = "https://api.anthropic.com/v1";
-        let cfg = cfg();
-        let mut m = resolved("claude://claude-sonnet-4-5", &cfg);
-        m.relocate("http://evil.example/v1", Some("sk-ant-secret".to_string()));
-
-        let warnings = relocation_warnings(&m, ANTHROPIC);
-        assert!(
-            warnings.contains(
-                &"⚠ your claude API key will be sent to evil.example (--base-url moved the endpoint off api.anthropic.com)"
-                    .to_string()
-            ),
-            "{warnings:?}"
-        );
-        // The message never contains the key itself.
-        assert!(!warnings.join("\n").contains("sk-ant-secret"));
-
-        // A LOCAL relocation is the common case — your own machine is not a third
-        // party. Keyed or not, no key warning.
-        let mut local = resolved("claude://claude-sonnet-4-5", &cfg);
-        local.relocate(
-            "http://localhost:1234/v1",
-            Some("sk-ant-secret".to_string()),
-        );
-        assert!(
-            !relocation_warnings(&local, ANTHROPIC)
-                .iter()
-                .any(|w| w.contains("API key will be sent")),
-            "pointing at your own server leaks nothing",
-        );
-        // A KEYLESS relocation has no credential to leak.
-        let mut keyless = resolved("claude://claude-sonnet-4-5", &cfg);
-        keyless.relocate("http://gateway.example/v1", None);
-        assert!(
-            !relocation_warnings(&keyless, ANTHROPIC)
-                .iter()
-                .any(|w| w.contains("API key will be sent")),
-        );
-        // A relocation to the provider's OWN host (a different path on it) is not a
-        // move off the provider at all.
-        let mut same_host = resolved("claude://claude-sonnet-4-5", &cfg);
-        same_host.relocate(
-            "https://api.anthropic.com/v2",
-            Some("sk-ant-secret".to_string()),
-        );
-        assert!(relocation_warnings(&same_host, ANTHROPIC).is_empty());
     }
 
     /// The real entry point agrees with the pure core on the one case that needs no

@@ -135,14 +135,13 @@ impl ResolvedModel {
     /// `api_key` / `api_version` / `headers`) for its identity, rather than
     /// re-deriving it.
     ///
-    /// Those fields are what an earlier [`resolve`] produced — but they may have
-    /// been *relocated* since (a `--base-url` / `$HRDR_BASE_URL` override, or a
-    /// free-floating `base_url =` in config.toml that names no provider). An agent
-    /// constructed from such a config must talk to the endpoint it was given, not
-    /// to the one its provider preset would resolve to, so construction adopts and
-    /// never re-resolves. The trust [`kind`](Self::kind) is still resolved from the
-    /// config (the sole trust gate), and the window is still derived from the
-    /// `(endpoint, model)` in force.
+    /// Those fields are what an earlier [`resolve`] produced for this identity — at
+    /// the CLI edge, in a `task` override, in the live endpoint a sub-agent inherits
+    /// — and the config they were resolved against is not always the one in hand (a
+    /// sub-agent may not carry the `[providers.*]` table that named its endpoint).
+    /// So construction adopts and never re-resolves. The trust [`kind`](Self::kind)
+    /// is still resolved from the config (the sole trust gate), and the window is
+    /// still derived from the `(endpoint, model)` in force.
     pub fn from_config(cfg: &AgentConfig) -> Self {
         let name = cfg.model.provider().as_str();
         let kind = cfg
@@ -157,24 +156,6 @@ impl ResolvedModel {
             kind,
             context_window: derived_context_window(Some(name), &cfg.base_url, cfg.model.model()),
         }
-    }
-
-    /// Move this resolved model onto another endpoint — the `--base-url` override,
-    /// which *relocates* a provider rather than replacing it.
-    ///
-    /// The identity and the trust kind ride along unchanged (this is still that
-    /// provider, at a different address), so the double gate re-evaluates honestly:
-    /// a built-in ChatGPT relocated off the Codex URL stops being
-    /// [`is_codex_oauth`](Self::is_codex_oauth) and is never handed the account's
-    /// bearer. The window is re-derived, since it is a fact about the endpoint.
-    pub fn relocate(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
-        self.base_url = base_url.into();
-        self.api_key = api_key;
-        self.context_window = derived_context_window(
-            Some(self.reference.provider().as_str()),
-            &self.base_url,
-            self.reference.model(),
-        );
     }
 }
 

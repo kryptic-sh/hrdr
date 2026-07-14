@@ -206,9 +206,8 @@ standard) walking up from the cwd.
 
 hrdr does **not** manage a model server — it talks to any running
 OpenAI-compatible `/v1` endpoint. Name the model you want as `provider://model`
-(below), or point hrdr at a server you run with `--base-url` / `$HRDR_BASE_URL`.
-The default endpoint is `http://localhost:8080/v1`, so a locally-running server
-needs no flags.
+(below). The default provider, `local`, is `http://localhost:8080/v1`, so a
+server running there needs no flags at all.
 
 To serve a model locally, run your own — for native tool calling either works:
 
@@ -217,8 +216,27 @@ infr serve <model> --addr 127.0.0.1:8080          # infr (native tools/tool_call
 llama-server -hf <hf-ref> --jinja --port 8080     # llama.cpp (--jinja enables tool calls)
 
 hrdr                                              # then just launch hrdr
-hrdr --base-url http://localhost:1234/v1          # or point at any other endpoint
 ```
+
+**The endpoint belongs to the provider.** There is no `--base-url` flag and no
+`$HRDR_BASE_URL`: an endpoint comes from a built-in preset, or from the
+`[providers.<name>]` table that defines the provider, and from nowhere else. So
+a server at another address is a provider you **define** — in
+`~/.config/hrdr/config.toml`:
+
+```toml
+[providers.myserver]
+base_url = "http://localhost:1234/v1"
+```
+
+```bash
+hrdr --model 'myserver://qwen'                    # …and name it like any other
+```
+
+Why: an endpoint that could be moved from outside the provider could carry that
+provider's API key to an address that isn't its own (`--base-url` +
+`claude://sonnet` sent your Anthropic key wherever the flag pointed). Tie the
+two together and the mismatch is not representable.
 
 ### Providers — the model names one
 
@@ -248,7 +266,10 @@ using on the provider you are _leaving_.
 
 There is no `--provider` flag and no `provider =` config key: a provider and a
 model that can be set independently are a pair that can disagree, and hrdr would
-have had to guess which half you meant.
+have had to guess which half you meant. For the same reason there is no
+`--base-url`, no `$HRDR_BASE_URL` and no top-level `base_url =` in config — the
+endpoint is a property of the provider (see above). A config still carrying
+either dead key is refused at startup, with the line that replaces it.
 
 Built-in presets:
 
@@ -263,11 +284,11 @@ Built-in presets:
 (`claude` / `anthropic` talks to Anthropic's **native Messages API**
 (`/v1/messages`, `x-api-key` auth) rather than its OpenAI-compat endpoint — that
 unlocks native **prompt caching** and **extended thinking** on Claude. Backend
-selection is automatic from the endpoint host, so pointing `--base-url` at
-`api.anthropic.com` works too. On this backend, `/effort` turns on a `thinking`
-budget (scaled from `max_tokens`; streamed to the reasoning pane), and
-`max_tokens` (config / `$HRDR_MAX_TOKENS`, default 8192) caps output — raise it
-for longer replies and deeper thinking. `local` needs no key.)
+selection is automatic from the endpoint host, so a `[providers.*]` pointed at
+`api.anthropic.com` gets it too. On this backend, `/effort` turns on a
+`thinking` budget (scaled from `max_tokens`; streamed to the reasoning pane),
+and `max_tokens` (config / `$HRDR_MAX_TOKENS`, default 8192) caps output — raise
+it for longer replies and deeper thinking. `local` needs no key.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
@@ -276,11 +297,9 @@ hrdr models                           # list the current provider's models
 hrdr --model grok-code                # a bare id: same provider, another model
 ```
 
-`--base-url` / `$HRDR_BASE_URL` **relocate** a provider — it is still that
-provider (its key, its headers), at another address. With no provider named, a
-bare `--base-url` is a `local` run: `hrdr --base-url http://localhost:1234/v1`
-resolves to `local://default`, which is exactly what `local` means (an
-OpenAI-compatible server you run, keyless, no catalog).
+With nothing named at all, `hrdr` is `local://default`: the OpenAI-compatible
+server you run at `http://localhost:8080/v1`, keyless, serving whatever it was
+started with.
 
 #### `/login` — guided setup
 
@@ -881,11 +900,14 @@ chrome, tool/loader accent, success/error), so any hjkl theme works.
 
 Configuration (CLI flags override env):
 
-| Env             | Default                            | Meaning                                                                                                           |
-| --------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `HRDR_BASE_URL` | `http://localhost:8080/v1`         | OpenAI-compatible endpoint — **relocates** the provider in force (it stays that provider, at another address).    |
-| `HRDR_MODEL`    | `local://default`                  | The model, as `provider://model` (switches provider + model) or a bare id (that model, on the provider in force). |
-| `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.                                                                                        |
+| Env            | Default                            | Meaning                                                                                                           |
+| -------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `HRDR_MODEL`   | `local://default`                  | The model, as `provider://model` (switches provider + model) or a bare id (that model, on the provider in force). |
+| `HRDR_API_KEY` | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.                                                                                        |
+
+(There is no `HRDR_BASE_URL`: the endpoint is a property of the provider — a
+built-in preset or a `[providers.<name>]` table — and nothing outside a provider
+definition can move it.)
 
 ## Recommended companion tools
 
@@ -935,8 +957,7 @@ The shell and search tools adapt to the host:
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom
-      `[providers.*]`, or any `--base-url`; bring your own OpenAI-compatible
-      server
+      `[providers.*]` at any endpoint; bring your own OpenAI-compatible server
 - [x] hjkl deps via crates.io registry pins (standalone CI)
 - [x] Shared UI-agnostic core (`hrdr-app`): one implementation of every slash
       command, sessions, status bar, and transcript model

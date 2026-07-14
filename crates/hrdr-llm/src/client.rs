@@ -240,11 +240,11 @@ fn detect_backend(base_url: &str) -> Backend {
 /// The NAME of the wire protocol hrdr will speak at `base_url` — the public face
 /// of [`detect_backend`], which keys on the HOST.
 ///
-/// Exposed because that host-keying is invisible and consequential: relocating a
-/// provider with `--base-url` (`claude://sonnet` at `http://localhost:1234/v1`)
-/// silently swaps the Anthropic Messages API for OpenAI chat-completions. A caller
-/// that compares this across two URLs can say so out loud rather than letting the
-/// request shape change under the user.
+/// Exposed because that host-keying is invisible and consequential: two providers
+/// that differ only in their `base_url` (a `[providers.*]` gateway on localhost
+/// versus `api.anthropic.com`) speak DIFFERENT APIs — chat-completions versus the
+/// Anthropic Messages API. A caller that compares this across two URLs can say so
+/// out loud rather than letting the request shape change under the user.
 pub fn wire_protocol(base_url: &str) -> &'static str {
     match detect_backend(base_url) {
         Backend::OpenAi => "OpenAI",
@@ -984,9 +984,9 @@ mod tests {
         assert_eq!(context_field(&json!({})), None);
     }
 
-    /// The wire protocol is a function of the HOST — which is exactly why moving a
-    /// provider with `--base-url` can change the API hrdr speaks without changing
-    /// anything the user typed about the API.
+    /// The wire protocol is a function of the HOST — which is exactly why the
+    /// `base_url` a provider is defined with decides the API hrdr speaks to it,
+    /// without anything being said about the API anywhere.
     #[test]
     fn the_wire_protocol_is_decided_by_the_host_alone() {
         assert_eq!(wire_protocol("https://api.anthropic.com/v1"), "Anthropic");

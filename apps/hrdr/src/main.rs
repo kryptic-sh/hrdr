@@ -5,9 +5,11 @@
 //! `hrdr models` lists available models from the configured endpoint.
 //!
 //! hrdr talks to any running OpenAI-compatible endpoint; name the model you want
-//! as `provider://model` (`--model chatgpt://gpt-5.5`), or point `--base-url` at a
-//! server you run. It does not manage a model server — start your own (infr,
-//! llama.cpp, vLLM, …) or point at a hosted provider.
+//! as `provider://model` (`--model chatgpt://gpt-5.5`). The endpoint is a property
+//! of the PROVIDER — a built-in preset, or a `[providers.<name>]` table in
+//! config.toml — so a server of your own is a provider you define, not a flag. It
+//! does not manage a model server — start your own (infr, llama.cpp, vLLM, …) or
+//! point at a hosted provider.
 
 use std::io::Write;
 use std::time::Duration;
@@ -32,10 +34,6 @@ const LOGO_ART: &str = include_str!("../art.txt");
     args_conflicts_with_subcommands = true,
 )]
 struct Cli {
-    /// OpenAI-compatible base URL (default: $HRDR_BASE_URL or http://localhost:8080/v1).
-    #[arg(long, global = true)]
-    base_url: Option<String>,
-
     /// The model to run, as `provider://model` (`chatgpt://gpt-5.5`,
     /// `openrouter://deepseek/deepseek-chat`) — which also sets the provider's
     /// endpoint and key — or a bare model id (`gpt-5.5`), which is that model on
@@ -259,27 +257,9 @@ fn settle_identity(
     Ok(identity)
 }
 
-/// The endpoint to talk to: the provider's `preset` URL, unless something
-/// **relocates** it.
-///
-/// `flag` (`--base-url` / `$HRDR_BASE_URL`) always wins — it is this run's decision.
-/// `file` (a free-floating `base_url =` in config.toml) is the endpoint of whatever
-/// provider the user wrote it for, so a provider named anywhere else
-/// (`provider_named`) supersedes it. A relocation keeps the identity: it is still that
-/// provider, at another address.
-fn settle_base_url(
-    flag: Option<String>,
-    file: Option<String>,
-    preset: &str,
-    provider_named: bool,
-) -> String {
-    flag.or_else(|| file.filter(|_| !provider_named))
-        .unwrap_or_else(|| preset.to_string())
-}
-
 /// The startup gate: **refuse what we KNOW is wrong, warn about what looks wrong.**
 ///
-/// Three questions, asked of the settled identity, in the order they can be
+/// Two questions, asked of the settled identity, in the order they can be
 /// answered:
 ///
 /// 1. **Is the model real?** ([`hrdr_agent::validate_identity`], then
@@ -290,11 +270,7 @@ fn settle_base_url(
 ///    anyone is refused, and a fetch that fails warns instead of blocking. models.dev
 ///    lags every release, so its silence is only ever a warning. Network-free unless
 ///    hrdr is about to refuse.
-/// 2. **Did `--base-url` change something invisible?**
-///    ([`hrdr_agent::relocation_warnings`]) — the wire protocol follows the host, and
-///    the API key follows the URL. Both are legitimate for a proxy; both are worth
-///    saying out loud. Network-free.
-/// 3. **Does `default` still mean anything here?**
+/// 2. **Does `default` still mean anything here?**
 ///    ([`hrdr_agent::validate_placeholder_model`]) — it is a placeholder for "whatever
 ///    you are serving", true only of a server with nothing to name. This is the one
 ///    question that needs the wire, and it is asked only when the model IS `default`,
@@ -305,20 +281,12 @@ fn settle_base_url(
 ///
 /// `listing` is `hrdr models` — the command whose entire job is to answer "what may I
 /// name?". Refusing it for not having named one would be a closed loop, so it is
-/// exempt from (3) alone; the identity checks still run.
+/// exempt from (2) alone; the identity checks still run.
 async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
     let resolved = hrdr_agent::ResolvedModel::from_config(config);
     let verdict = hrdr_agent::validate_identity(&resolved, config);
     for w in hrdr_agent::confirm_identity(verdict).await? {
         eprintln!("{w}");
-    }
-    // The provider's OWN address — a relocation is only a relocation relative to
-    // somewhere. Re-derived here (not captured earlier) because `--agent` may have
-    // moved the identity onto another provider entirely.
-    if let Some(canonical) = config.resolve_provider(resolved.reference().provider().as_str()) {
-        for w in hrdr_agent::relocation_warnings(&resolved, &canonical.base_url) {
-            eprintln!("{w}");
-        }
     }
     if !listing && resolved.reference().model() == hrdr_agent::PLACEHOLDER_MODEL {
         let probe = hrdr_llm::Client::new(
@@ -387,7 +355,6 @@ async fn main() -> Result<()> {
     // launch fallback, and the ONLY place startup consults that interactive store.
     // A delegation never does: it must resolve the same on every machine and in CI.
     let store = hrdr_agent::load_last_models();
-    let last_used = store.last.clone();
     let cli_spec = cli
         .model
         .as_deref()
@@ -404,10 +371,12 @@ async fn main() -> Result<()> {
     let identity = settle_identity(&store, &specs, &config)?;
 
     // The endpoint the identity's provider resolves to — its key, headers and
-    // api-version with it. A `--base-url` / `$HRDR_BASE_URL` **relocates** that
-    // provider (it is still that provider, at another address); a bare `--base-url`
-    // with nothing else named lands on `local`, which is exactly what `local` means:
-    // an OpenAI-compatible server you run.
+    // api-version with it. **The endpoint is a property of the provider**: it comes
+    // from the built-in preset, or from the `[providers.<name>]` table that DEFINES
+    // that provider, and from nowhere else. There is no flag, env var or free-floating
+    // config key that can move a provider onto someone else's address — which is what
+    // makes it impossible for a provider's API key to be sent to an endpoint that is
+    // not its own. A server of your own is a provider you define.
     let name = identity.provider().as_str().to_string();
     let p = config.resolve_provider(&name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -415,24 +384,7 @@ async fn main() -> Result<()> {
             hrdr_agent::BUILTIN_PROVIDERS.join(", ")
         )
     })?;
-    // A free-floating `base_url` in config.toml is the endpoint of whatever provider
-    // the user wrote it for; a provider named ANYWHERE (a `provider://model` spec,
-    // or the last-used identity) supersedes it, as it always has. A flag/env one
-    // relocates unconditionally.
-    let provider_named = last_used.is_some() || specs.iter().any(|s| s.provider().is_some());
-    let flag_url = cli
-        .base_url
-        .clone()
-        .or_else(|| std::env::var("HRDR_BASE_URL").ok());
-    // `AgentConfig::load` has already layered config.toml's `base_url` (and
-    // `$HRDR_BASE_URL`) into `config.base_url`; anything other than the default is a
-    // value the user wrote somewhere.
-    let file_url =
-        (config.base_url != hrdr_agent::DEFAULT_BASE_URL).then(|| config.base_url.clone());
-    // Remembered as the relocation it is: it moved THIS provider's endpoint. A
-    // resume onto another provider leaves it behind, and says so.
-    config.base_url_override = flag_url.clone();
-    config.base_url = settle_base_url(flag_url, file_url, &p.base_url, provider_named);
+    config.base_url = p.base_url.clone();
     // Key precedence: inline > key_env var > credential saved by `/login`.
     // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT login
     // with usable/refreshable credentials is `OAuth` (no key), so it must not draw
@@ -910,7 +862,7 @@ mod cli_tests {
         // Nothing named: the last-used identity is resumed, whole.
         assert_eq!(got(Some("zen://kimi-k2"), &[]), "zen://kimi-k2");
         // Nothing named and nothing used: `local://default` — the server you run,
-        // serving whatever it was started with. A bare `--base-url` run is this run.
+        // serving whatever it was started with. A bare `hrdr` is this run.
         assert_eq!(got(None, &[]), hrdr_agent::DEFAULT_MODEL_REF);
         assert_eq!(
             settle_identity(&store(None), &[], &cfg)
@@ -918,7 +870,7 @@ mod cli_tests {
                 .provider()
                 .as_str(),
             "local",
-            "a bare --base-url run is a `local` run"
+            "a bare `hrdr` is a `local` run"
         );
 
         // The layers COMPOSE, lowest first: a config `openrouter://deepseek-chat`
@@ -990,39 +942,63 @@ mod cli_tests {
         );
     }
 
-    /// The endpoint: the provider's, unless relocated. `--base-url` always relocates;
-    /// a config-file `base_url` yields to a provider named anywhere.
+    /// **THE ENDPOINT BELONGS TO THE PROVIDER.** There is no `--base-url` flag, and
+    /// no `$HRDR_BASE_URL`: an endpoint may come from a built-in preset or from the
+    /// `[providers.<name>]` table that defines the provider, and from nowhere else.
+    /// That is what makes it impossible for a provider's key to be sent to an
+    /// endpoint that is not its own.
     #[test]
-    fn base_url_relocates_the_provider_it_never_replaces_it() {
-        const PRESET: &str = "https://openrouter.ai/api/v1";
-        // A `--base-url` / `$HRDR_BASE_URL` wins over everything.
-        assert_eq!(
-            settle_base_url(Some("http://x/v1".into()), None, PRESET, true),
-            "http://x/v1"
+    fn there_is_no_endpoint_override_flag() {
+        // The flag does not parse — clap refuses an argument it does not know.
+        assert!(
+            Cli::try_parse_from(["hrdr", "--base-url", "http://evil.example/v1"]).is_err(),
+            "--base-url must not exist"
         );
-        // With no provider named, a bare `--base-url` is the `local` endpoint — the
-        // whole point of `local` (keyless, `remote: false`, a server you run).
-        assert_eq!(
-            settle_base_url(
-                Some("http://localhost:9099/v1".into()),
-                None,
-                hrdr_agent::DEFAULT_BASE_URL,
-                false
-            ),
-            "http://localhost:9099/v1"
+        // (`$HRDR_BASE_URL` is gone from the env table too — asserted where that table
+        // lives: `hrdr_base_url_is_not_a_knob` in hrdr-agent.)
+    }
+
+    /// A bare `hrdr` still lands on the `local` preset — the easy on-ramp is
+    /// unchanged: `local://default` at `http://localhost:8080/v1`.
+    #[test]
+    fn the_default_run_resolves_to_the_local_preset() {
+        let cfg = AgentConfig::default();
+        let identity = settle_identity(&hrdr_agent::LastModels::default(), &[], &cfg).unwrap();
+        assert_eq!(identity.to_string(), "local://default");
+        let p = cfg
+            .resolve_provider(identity.provider().as_str())
+            .expect("`local` is a built-in");
+        assert_eq!(p.base_url, hrdr_agent::DEFAULT_BASE_URL);
+        assert_eq!(p.base_url, "http://localhost:8080/v1");
+    }
+
+    /// A user-defined provider IS an endpoint definition — the only one there is.
+    /// `[providers.myserver] base_url = …` + `--model myserver://qwen` resolves to
+    /// that address, and the model rides on it.
+    #[test]
+    fn a_user_defined_provider_supplies_its_own_endpoint() {
+        use hrdr_agent::ProviderConfig;
+        let mut cfg = AgentConfig::default();
+        cfg.providers.insert(
+            "myserver".to_string(),
+            ProviderConfig {
+                base_url: "http://localhost:1234/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: None,
+                context_window: None,
+                headers: Default::default(),
+                api_version: None,
+            },
         );
-        // A config-file `base_url` applies when nothing named a provider…
-        assert_eq!(
-            settle_base_url(None, Some("http://file/v1".into()), PRESET, false),
-            "http://file/v1"
-        );
-        // …and yields to one that did: the preset belongs to the provider you named.
-        assert_eq!(
-            settle_base_url(None, Some("http://file/v1".into()), PRESET, true),
-            PRESET
-        );
-        // Nothing at all: the provider's own endpoint.
-        assert_eq!(settle_base_url(None, None, PRESET, true), PRESET);
+        let spec: hrdr_agent::ModelSpec = "myserver://qwen".parse().unwrap();
+        let identity = settle_identity(&hrdr_agent::LastModels::default(), &[spec], &cfg).unwrap();
+        assert_eq!(identity.to_string(), "myserver://qwen");
+        let p = cfg
+            .resolve_provider(identity.provider().as_str())
+            .expect("a [providers.*] table defines a provider");
+        assert_eq!(p.base_url, "http://localhost:1234/v1");
     }
 
     /// No command → nothing to run at startup (the plain TUI).

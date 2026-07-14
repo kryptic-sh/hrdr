@@ -128,9 +128,9 @@ fn apply_reference(
     window: Option<u32>,
     remember: bool,
 ) {
-    // A change of PROVIDER moves the endpoint; a change of model on the provider
-    // you are already on does not — that would undo a `--base-url` relocation,
-    // which is where this provider lives for this session. Same rule as the agent's.
+    // A change of PROVIDER moves the endpoint; a change of model on the provider you
+    // are already on does not — the endpoint is a property of the provider, so it
+    // cannot have moved. Same rule as the agent's.
     let moving_provider = host.model_ref().provider() != reference.provider();
     let endpoint = moving_provider
         .then(|| host.resolve_provider(reference.provider().as_str()))

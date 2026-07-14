@@ -36,7 +36,7 @@ pub use resolve::{AuthContext, ResolvedModel, resolve, resolve_in};
 mod validate;
 pub use validate::{
     Entitlements, Identity, PLACEHOLDER_MODEL, Unconfirmed, confirm_identity,
-    confirm_identity_with, relocation_warnings, validate_identity, validate_placeholder_model,
+    confirm_identity_with, validate_identity, validate_placeholder_model,
 };
 mod models;
 mod subagent_live;
@@ -1184,10 +1184,10 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
 /// and the `same_endpoint` guard inside [`resolve_api_key`] is what stops that key
 /// from leaking to a different provider's host.
 ///
-/// The endpoint is re-derived ONLY when the provider changes. A same-provider
-/// model change must not undo a *relocation*: a config (or a `--base-url`) that
-/// points a provider at another address is still that provider, and switching the
-/// model on it is not a request to move back to the preset's URL.
+/// The endpoint is re-derived ONLY when the provider changes — because it is a
+/// property OF the provider, and a same-provider model change cannot have moved it.
+/// (This is now a shortcut rather than a load-bearing rule: re-deriving it would
+/// produce the same URL.)
 fn apply_model_ref(
     cfg: &mut AgentConfig,
     reference: ModelRef,
@@ -1599,9 +1599,9 @@ impl hrdr_tools::Tool for SubagentTool {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         // The parent's LIVE resolved endpoint, whole — identity, endpoint, key,
-        // api-version and headers together, exactly as the parent resolved them (a
-        // relocation included). Overlaying them one at a time is what let a
-        // sub-agent end up on one provider's endpoint with another's model.
+        // api-version and headers together, exactly as the parent resolved them.
+        // Overlaying them one at a time is what let a sub-agent end up on one
+        // provider's endpoint with another's model.
         let live = runtime.endpoint.resolved;
         cfg.base_url = live.base_url().to_string();
         cfg.api_key = live.api_key().map(str::to_string);
@@ -1914,15 +1914,18 @@ impl hrdr_tools::Tool for SubagentTool {
 /// The model identity — WHICH model at WHICH provider — is the single
 /// [`model`](Self::model) field. `base_url` / `api_key` / `api_version` /
 /// `headers` are **derived** from it: they are the cached output of
-/// [`resolve`] for that identity (possibly relocated onto a `--base-url`
-/// override), not four independently-authoritative settings. Writing one of them
-/// by hand does not change which model is in force; changing the identity
-/// re-derives all of them together.
+/// [`resolve`] for that identity, not four independently-authoritative settings.
+/// Writing one of them by hand does not change which model is in force; changing
+/// the identity re-derives all of them together.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// DERIVED from [`model`](Self::model) (see the struct docs): the endpoint
-    /// [`resolve`] produced for it, unless a `--base-url` / `$HRDR_BASE_URL`
-    /// override relocated the provider elsewhere.
+    /// [`resolve`] produced for its provider — a built-in preset, or the
+    /// `[providers.<name>]` table that defines the provider. Nothing outside a
+    /// provider definition can set it: there is no `--base-url`, no
+    /// `$HRDR_BASE_URL`, and no free-floating `base_url` in config.toml. That is
+    /// what makes it impossible for a provider's API key to travel to an endpoint
+    /// that is not its own.
     pub base_url: String,
     /// DERIVED from [`model`](Self::model): the credential [`resolve_api_key`]
     /// found for its provider (inline → `key_env` → the `/login` store).
@@ -1941,18 +1944,6 @@ pub struct AgentConfig {
     /// unlimited. Estimates come from the models.dev catalog; calls on an
     /// unpriced model count as $0.
     pub max_cost: Option<f64>,
-    /// The `--base-url` / `$HRDR_BASE_URL` this run was launched with, if any —
-    /// the endpoint override that **relocated** the launch provider (it is still
-    /// that provider, at another address). `None` = no relocation; a
-    /// free-floating `base_url` in config.toml is not one (it names no provider,
-    /// so anything that does supersedes it).
-    ///
-    /// Kept as the *source* value, not just folded into [`base_url`](Self::base_url),
-    /// because a relocation is only meaningful relative to the provider it was
-    /// applied to: resuming a session that ran on ANOTHER provider moves the agent
-    /// off that provider, and the relocation stops applying. That has to be said out
-    /// loud rather than silently dropped (see the TUI's `adopt_state`).
-    pub base_url_override: Option<String>,
     /// The USER-CONFIGURED context window (`context_window` in config.toml, or a
     /// `[providers.<name>].context_window`), in tokens — for the status bar's
     /// "X of Y" and the auto-compaction trigger.
@@ -2451,7 +2442,6 @@ impl Default for AgentConfig {
             // `default` IS the default model id — the pair the two old fields
             // carried, now spelled as the one identity they always were.
             model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
-            base_url_override: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 300,
@@ -2564,11 +2554,10 @@ pub fn resolve_provider_in(
 /// kind AND the canonical [`CHATGPT_CODEX_BASE_URL`] endpoint.
 ///
 /// Both halves are required, and this is the only place the conjunction is
-/// written. The kind alone is not enough — a built-in `chatgpt` provider
-/// relocated onto another URL by `--base-url` must not have the OAuth bearer or
-/// the `ChatGPT-Account-Id` header injected into it. The URL alone is not enough
-/// — a `[providers.*]` entry aimed at the Codex URL resolves `Custom` and never
-/// earns the account's credentials.
+/// written. The kind alone is not enough — a `chatgpt` identity sitting at any
+/// other URL must not have the OAuth bearer or the `ChatGPT-Account-Id` header
+/// injected into it. The URL alone is not enough — a `[providers.*]` entry aimed
+/// at the Codex URL resolves `Custom` and never earns the account's credentials.
 ///
 /// [`ResolvedModel::is_codex_oauth`] is the same test, asked of a resolved model.
 pub fn is_codex_oauth(kind: ResolvedProviderKind, base_url: &str) -> bool {
@@ -2980,9 +2969,14 @@ pub(crate) struct ToolOutputConfig {
 /// — deserialized as a [`ModelSpec`] (a bare id is that model on the provider in
 /// effect). The old top-level `provider = …` selector is gone; a config still
 /// carrying it is refused at startup by [`legacy_config_error`].
+///
+/// So is the old top-level `base_url = …`: **the endpoint belongs to the provider**,
+/// and lives in the `[providers.<name>]` table that defines it (or in a built-in
+/// preset). A free-floating endpoint was an override that could relocate whichever
+/// provider was in force — and take that provider's API key with it. It is refused
+/// by [`legacy_config_error`] too.
 #[derive(serde::Deserialize, Default)]
 struct FileConfig {
-    base_url: Option<String>,
     api_key: Option<String>,
     model: Option<ModelSpec>,
     temperature: Option<f32>,
@@ -3053,14 +3047,19 @@ pub fn named_model_specs() -> Vec<ModelSpec> {
         .collect()
 }
 
-/// The startup refusal for a config.toml still written in the old two-key form —
-/// `Some(message)` when `text` carries the dead `provider` selector, `None` when it
-/// is already in the one-key form.
+/// The startup refusal for a config.toml still written in a dead form —
+/// `Some(message)` when `text` carries the old `provider` selector or a
+/// free-floating `base_url`, `None` when it is written the one way that is left.
 ///
-/// A HARD ERROR, not a migration: the two keys could always disagree, and guessing
-/// which of a contradictory pair the user meant is exactly the behavior this
-/// refactor exists to remove. The message names the file, echoes the values the
-/// user actually wrote, and prints the single line that replaces them.
+/// A HARD ERROR, not a migration. Both dead keys are the same bug in two costumes:
+/// a second, independent way to say where a request goes, which could always
+/// disagree with the provider actually in force — and guessing which half of a
+/// contradictory pair the user meant is exactly the behavior this design removes.
+/// A free-floating `base_url` *relocated* whichever provider was in effect, sending
+/// that provider's API key to an address that was not its own. The endpoint is a
+/// property of the provider: a built-in preset, or the `[providers.<name>]` table
+/// that defines it. The message names the file, echoes what the user wrote, and
+/// prints what replaces it.
 ///
 /// (Sessions are the opposite case — they are data, not config, and migrate
 /// silently. Config is a statement of intent, and a stale one is worth stopping
@@ -3070,6 +3069,23 @@ pub fn legacy_config_error(text: &str, path: &std::path::Path) -> Option<String>
         return None;
     };
     let as_str = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(str::to_string);
+
+    // The free-floating endpoint: `base_url = "http://localhost:1234/v1"` at the top
+    // level, belonging to no provider — so it moved whichever one was in force.
+    if let Some(base_url) = as_str(root.get("base_url")) {
+        let model = as_str(root.get("model"));
+        let model_line = match &model {
+            Some(m) if !m.contains("://") => format!("myserver://{m}"),
+            _ => "myserver://<model-id>".to_string(),
+        };
+        return Some(format!(
+            "hrdr: {} has a top-level `base_url` — the endpoint belongs to the provider.\n  \
+             replace:\n      base_url = \"{base_url}\"\n  with a provider that owns it:\n      \
+             [providers.myserver]\n      base_url = \"{base_url}\"\n  \
+             and name it in the model:\n      model = \"{model_line}\"",
+            path.display(),
+        ));
+    }
 
     // The top-level selector: `provider = "openrouter"` beside `model = "…"`.
     if let Some(provider) = as_str(root.get("provider")) {
@@ -3192,9 +3208,6 @@ impl AgentConfig {
     /// [`load_checked`](Self::load_checked) and applied there, since it layers
     /// against the environment.
     fn apply_file(&mut self, fc: FileConfig) {
-        if let Some(v) = fc.base_url {
-            self.base_url = v;
-        }
         if let Some(v) = fc.api_key {
             self.api_key = Some(v);
         }
@@ -3382,8 +3395,11 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// `$HRDR_MODEL` is deliberately NOT here: it names the one identity, as a
 /// [`ModelSpec`] layered against config.toml's `model` (see
 /// [`AgentConfig::load_checked`]), rather than a field assigned in isolation.
+///
+/// Nor is `$HRDR_BASE_URL` — there is no such var. [`AgentConfig::base_url`] is
+/// DERIVED from the identity's provider, and an environment variable that could
+/// move it would be an endpoint that belongs to nobody.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
-    ("HRDR_BASE_URL", |c, v| c.base_url = v),
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
     ("HRDR_ALLOW_OUTSIDE_CWD", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
@@ -3806,15 +3822,6 @@ pub struct Agent {
     /// new identity against the user's config. The only part of [`AgentConfig`] the
     /// agent must be able to re-read; everything else it has already unpacked.
     providers: HashMap<String, ProviderConfig>,
-    /// A `--base-url` / `$HRDR_BASE_URL` / free-floating `base_url =` override in
-    /// force: the endpoint the resolved provider's is REPLACED by.
-    ///
-    /// It is a *relocation*, not a provider: this is still that provider, at an
-    /// address the user chose, so it survives a model change on the same provider
-    /// (`/model` on a local server on a nonstandard port must not snap back to
-    /// `:8080`). A switch to a DIFFERENT provider drops it — the new provider's
-    /// endpoint is its own. See [`Agent::relocate_endpoint`].
-    relocation: Option<Relocation>,
     /// Sanitized live model state shared with introspection and delegation tools.
     delegation_runtime: SharedDelegationRuntime,
     /// Sub-agents this agent has delegated to and is still holding — the
@@ -4033,13 +4040,6 @@ fn build_system_prompt(
     Ok(append_persona(append_memory(system, memory), persona))
 }
 
-/// An endpoint override in force — see [`Agent::relocation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Relocation {
-    base_url: String,
-    api_key: Option<String>,
-}
-
 /// The initial delegation-runtime projection for `config`. The single place the
 /// live-state cell is built from a config, so `Agent::new` and any other
 /// constructor cannot seed it differently.
@@ -4066,20 +4066,13 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Result<Self> {
         let mut tools = ToolRegistry::with_defaults();
         // The identity's endpoint is ADOPTED from the config, not re-derived: those
-        // fields are what an earlier `resolve()` produced, and a `--base-url` may
-        // have relocated them since. Re-resolving here would silently undo that.
+        // fields are what an earlier `resolve()` produced for this identity — at the
+        // CLI edge, in a `task` override, in a sub-agent's inherited live endpoint —
+        // possibly against a `[providers.*]` table this agent's config no longer
+        // carries. Adopting keeps the agent talking to the endpoint it was handed;
+        // it can no longer be a *different* provider's, because nothing but a
+        // provider definition can name an endpoint.
         let resolved = ResolvedModel::from_config(&config);
-        // …and whether it *is* a relocation is exactly "the provider would have
-        // resolved somewhere else". Remembered, so a later model switch on the same
-        // provider keeps the endpoint the user chose (see `Agent::relocation`).
-        let relocation = resolve(&config.model, &config, None)
-            .ok()
-            .filter(|p| p.base_url() == config.base_url && p.api_key() == config.api_key.as_deref())
-            .is_none()
-            .then(|| Relocation {
-                base_url: config.base_url.clone(),
-                api_key: config.api_key.clone(),
-            });
         let delegation_runtime = new_delegation_runtime(&config, &resolved);
         let live_subagents = LiveSubagents::new();
         tools.register(Arc::new(ModelsTool {
@@ -4320,7 +4313,6 @@ impl Agent {
             client,
             resolved,
             providers: config.providers,
-            relocation,
             delegation_runtime,
             live_subagents,
             live_home: None,
@@ -4633,17 +4625,12 @@ impl Agent {
     ///
     /// Errors (leaving the agent untouched) when the identity names a provider that
     /// is neither a built-in nor a `[providers.<name>]`.
+    ///
+    /// The endpoint always comes back from [`resolve_in`] — the provider's own, and
+    /// there is no other kind. Nothing carried over from the endpoint in force can
+    /// survive a switch, because nothing but a provider definition ever named it.
     pub fn set_model_ref(&mut self, reference: ModelRef) -> Result<()> {
-        // A relocation belongs to the provider it relocated — keep it across a model
-        // change on that same provider, drop it when the provider itself changes.
-        let same_provider = reference.provider() == self.resolved.reference().provider();
-        if !same_provider {
-            self.relocation = None;
-        }
-        let mut resolved = resolve_in(&self.providers, &reference, None)?;
-        if let Some(r) = &self.relocation {
-            resolved.relocate(r.base_url.clone(), r.api_key.clone());
-        }
+        let resolved = resolve_in(&self.providers, &reference, None)?;
         self.adopt_resolved(resolved);
         Ok(())
     }
@@ -4659,37 +4646,11 @@ impl Agent {
     /// into a refusal.
     ///
     /// Resolves the candidate the same way `set_model_ref` will — same providers,
-    /// same relocation carried across a same-provider switch — so what is validated
-    /// is what would be adopted, not an approximation of it.
+    /// same endpoint — so what is validated is what would be adopted, not an
+    /// approximation of it.
     pub fn validate_ref(&self, reference: &ModelRef) -> Result<validate::Identity> {
-        let same_provider = reference.provider() == self.resolved.reference().provider();
-        let mut resolved = resolve_in(&self.providers, reference, None)?;
-        if let (Some(r), true) = (&self.relocation, same_provider) {
-            resolved.relocate(r.base_url.clone(), r.api_key.clone());
-        }
+        let resolved = resolve_in(&self.providers, reference, None)?;
         Ok(validate::validate_identity_in(&self.providers, &resolved))
-    }
-
-    /// Move the resolved endpoint elsewhere (`--base-url`) — a **relocation**, not
-    /// a provider switch: the identity, its trust kind and its catalog keep
-    /// pointing at the same provider, which is now simply reachable at another
-    /// address. There is no provider-less state to fall into.
-    ///
-    /// The trust gate re-evaluates honestly against the new URL: a built-in ChatGPT
-    /// relocated off the Codex endpoint stops passing [`ResolvedModel::is_codex_oauth`]
-    /// and is never handed the account's bearer. The key recorded for delegation is
-    /// the one passed here — a *resolved* credential; the ChatGPT OAuth bearer is
-    /// injected straight into the client by [`Agent::refresh_oauth_if_needed`] and
-    /// never travels through here, so it is never handed to a sub-agent.
-    pub fn relocate_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
-        let base_url = base_url.into();
-        self.relocation = Some(Relocation {
-            base_url: base_url.clone(),
-            api_key: api_key.clone(),
-        });
-        let mut resolved = self.resolved.clone();
-        resolved.relocate(base_url, api_key);
-        self.adopt_resolved(resolved);
     }
 
     /// Apply a resolved identity to the client and the runtime, atomically. The
@@ -5791,8 +5752,9 @@ impl Agent {
     /// strip any stale OAuth state when this is not ChatGPT.
     ///
     /// The gate is [`ResolvedModel::is_codex_oauth`] — the trusted kind AND the
-    /// canonical endpoint, one definition — so a custom shadow or a relocated
-    /// endpoint never receives the bearer/account header. On the non-ChatGPT path
+    /// canonical endpoint, one definition — so a custom shadow, or a ChatGPT
+    /// identity anywhere else, never receives the bearer/account header. On the
+    /// non-ChatGPT path
     /// the resolved provider's own headers are restored (dropping any
     /// `ChatGPT-Account-Id` left over from a prior ChatGPT turn); the API key is
     /// left untouched (it is the key provider's real credential).
@@ -6317,14 +6279,15 @@ mod tests {
 
     use super::SubagentDirCell;
     use super::{
-        Agent, AgentConfig, AgentEvent, DEFAULT_MAX_READONLY_SUBAGENTS,
+        Agent, AgentConfig, AgentEvent, DEFAULT_BASE_URL, DEFAULT_MAX_READONLY_SUBAGENTS,
         DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
         LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots,
         ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
         estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
-        is_transient, parse_env_bool, prune_tool_messages, repair_dangling_tool_calls,
-        resolve_subagent_dir, retry_after_hint, steering_queue, subagent_base_config,
-        subagent_event_for, subagent_transcript_id, tail_window, wants_background,
+        is_transient, legacy_config_error, parse_env_bool, prune_tool_messages,
+        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
+        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
+        tail_window, wants_background,
     };
     use crate::cwd_slug;
     use crate::subagent_transcript;
@@ -6636,54 +6599,67 @@ mod tests {
         assert_eq!(active, 1, "the active model must not be duplicated");
     }
 
-    /// A relocation (`--base-url`) publishes the whole endpoint too — a sub-agent
-    /// spawned after one must not be pointed at the endpoint the session left.
+    /// A provider switch publishes the whole endpoint — a sub-agent spawned after
+    /// one must not be pointed at the endpoint the session left.
     ///
     /// ASSERTION CHANGED (provider/model coupling): this was
     /// `individual_setters_publish_the_delegation_runtime`, and it drove the three
     /// setters (`set_endpoint` + `set_provider_identity` + `set_api_version`) that
     /// could each move a piece of the endpoint on their own. Those are gone: the
-    /// pieces move together or not at all. What survives of it is the *relocation*
-    /// — the one legitimate reason to move an endpoint without changing provider —
+    /// pieces move together or not at all. The one mutator left is `set_model_ref`,
     /// and the same guarantee is asserted of it.
     #[test]
-    fn a_relocation_publishes_the_whole_endpoint() {
-        let mut agent = Agent::new(AgentConfig {
+    fn a_provider_switch_publishes_the_whole_endpoint() {
+        use super::ProviderConfig;
+        let mut cfg = AgentConfig {
             model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
-        })
-        .unwrap();
-        agent.relocate_endpoint("https://new.example/v1", Some("new-key".to_string()));
+        };
+        cfg.providers.insert(
+            "new".to_string(),
+            ProviderConfig {
+                base_url: "https://new.example/v1".to_string(),
+                key_env: None,
+                api_key: Some("new-key".to_string()),
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        let mut agent = Agent::new(cfg).unwrap();
+        agent.set_model_ref(r("new://m")).unwrap();
 
         let runtime = agent
             .delegation_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let e = &runtime.endpoint.resolved;
+        // The endpoint is the PROVIDER'S — the only place one can come from — and the
+        // key, the kind and the identity moved with it, in one step.
         assert_eq!(e.base_url(), "https://new.example/v1");
         assert_eq!(e.api_key(), Some("new-key"));
-        // The identity rode along unchanged: this is still `local`, elsewhere.
-        assert_eq!(e.reference(), &r("local://old"));
-        assert_eq!(e.kind(), super::ResolvedProviderKind::BuiltIn);
+        assert_eq!(e.reference(), &r("new://m"));
+        assert_eq!(e.kind(), super::ResolvedProviderKind::Custom);
     }
 
     /// `validate_ref` asks about a CANDIDATE and moves nothing — that is the whole
     /// point: the `/model` switch path calls it *before* `set_model_ref`, so a refusal
     /// leaves the agent on the identity it already has.
     ///
-    /// It also resolves the candidate exactly as `set_model_ref` would: the relocation
-    /// rides along a same-provider switch and is dropped by a cross-provider one, so
-    /// what is validated is what would be adopted — not an approximation of it.
+    /// It also resolves the candidate exactly as `set_model_ref` would — same
+    /// providers, same endpoints — so what is validated is what would be adopted, not
+    /// an approximation of it.
     #[test]
     fn validate_ref_judges_a_candidate_without_moving_the_agent() {
-        let mut agent = Agent::new(AgentConfig {
+        let agent = Agent::new(AgentConfig {
             model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
-        agent.relocate_endpoint("http://localhost:9099/v1", None);
 
         // A provider that is neither a built-in nor a `[providers.*]` cannot even be
         // resolved, let alone validated — and the agent does not budge.
@@ -6702,8 +6678,8 @@ mod tests {
         );
         assert_eq!(
             agent.endpoint_base_url(),
-            "http://localhost:9099/v1",
-            "and the relocation is intact",
+            crate::DEFAULT_BASE_URL,
+            "and the agent is still on its provider's endpoint",
         );
     }
 
@@ -6731,9 +6707,9 @@ mod tests {
         assert_eq!(runtime.public.delegation_enabled, cfg.subagents);
         assert_eq!(runtime.explicit_subagent_model, cfg.subagent_model);
 
-        // The endpoint is the config's — ADOPTED, not re-resolved: `local` would
-        // have resolved to :8080, and re-deriving it here would have silently
-        // undone the relocation this config carries.
+        // The endpoint is the config's — ADOPTED, not re-resolved: it is what an
+        // earlier `resolve()` produced (against a provider table this agent may no
+        // longer hold), and construction must talk to what it was handed.
         let e = &runtime.endpoint.resolved;
         assert_eq!(e.reference(), &cfg.model);
         assert_eq!(e.base_url(), "https://custom.example/v1");
@@ -6797,16 +6773,13 @@ mod tests {
         assert_eq!(agent.client.base_url(), "https://next.example/v1");
     }
 
-    /// A model change on the SAME provider keeps a relocation; a change of provider
-    /// drops it. A relocated endpoint is where *this provider* lives for this
-    /// session (`--base-url http://localhost:9000/v1`), so `/model` on it must not
-    /// snap back to the preset's `:8080` — and a switch to another provider must
-    /// not carry that address across to it.
+    /// **THE ENDPOINT BELONGS TO THE PROVIDER.** A `/model` switch always lands on
+    /// the endpoint the identity's provider defines — there is no session-local
+    /// address that can outlive the resolve, because nothing but a provider
+    /// definition (a built-in preset, or a `[providers.*]` table) can name one.
     #[test]
-    fn a_relocation_survives_a_model_change_but_not_a_provider_change() {
+    fn a_model_change_always_lands_on_the_providers_endpoint() {
         let mut agent = Agent::new(AgentConfig {
-            // `--base-url`, applied by the CLI edge before construction.
-            base_url: "http://localhost:9000/v1".to_string(),
             model: r("local://old"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
@@ -6816,15 +6789,15 @@ mod tests {
         assert_eq!(agent.client.model, "new");
         assert_eq!(
             agent.client.base_url(),
-            "http://localhost:9000/v1",
-            "the endpoint the user chose for this provider survives a model switch"
+            crate::DEFAULT_BASE_URL,
+            "`local` is its preset endpoint, and a model switch cannot move it"
         );
 
         agent.set_model_ref(r("openai://gpt-5")).unwrap();
         assert_eq!(
             agent.client.base_url(),
             "https://api.openai.com/v1",
-            "…and never follows them onto a different provider"
+            "…and a provider switch lands on that provider's own endpoint"
         );
     }
 
@@ -7316,34 +7289,47 @@ mod tests {
         );
     }
 
-    /// The OAuth double gate, once: a built-in ChatGPT **relocated** off the Codex
-    /// endpoint is no longer the Codex endpoint, and is never handed the account's
-    /// bearer — the trust kind alone does not buy it.
+    /// The OAuth double gate, once: the trusted `chatgpt` KIND alone does not buy
+    /// the account's bearer — the endpoint has to be the Codex one too.
+    ///
+    /// The endpoint now comes only from a provider definition, so the CLI cannot
+    /// build the mismatched pair any more; this asserts the gate itself, against a
+    /// config that carries one, so the conjunction can never quietly become an `or`.
     #[tokio::test]
-    async fn a_relocated_chatgpt_is_not_the_codex_endpoint() {
+    async fn a_chatgpt_identity_away_from_the_codex_endpoint_gets_no_bearer() {
         use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
-        let mut agent = Agent::new(AgentConfig {
+        let codex = Agent::new(AgentConfig {
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             model: r("chatgpt://gpt-5.5"),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
-        assert!(agent.resolved().is_codex_oauth());
+        assert!(codex.resolved().is_codex_oauth());
 
-        agent.relocate_endpoint("http://localhost:9099/v1", None);
+        let mut elsewhere = Agent::new(AgentConfig {
+            base_url: "http://localhost:9099/v1".to_string(),
+            model: r("chatgpt://gpt-5.5"),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(
-            agent.provider_kind(),
+            elsewhere.provider_kind(),
             ResolvedProviderKind::ChatGptOAuth,
-            "it is still the built-in provider — relocation is not a shadow",
+            "the trust kind is the provider's, and it is still chatgpt",
         );
         assert!(
-            !agent.resolved().is_codex_oauth(),
+            !elsewhere.resolved().is_codex_oauth(),
             "…but it is not at the endpoint the account's credentials belong to",
         );
         // So the refresh path does not inject anything.
-        agent.refresh_oauth_if_needed().await;
-        assert!(!agent.client().extra_headers_contains("ChatGPT-Account-Id"));
+        elsewhere.refresh_oauth_if_needed().await;
+        assert!(
+            !elsewhere
+                .client()
+                .extra_headers_contains("ChatGPT-Account-Id")
+        );
     }
 
     #[test]
@@ -7898,10 +7884,19 @@ mod tests {
         {
             let mut rt = runtime.lock().unwrap();
             // `b-alias` IS the live endpoint; the key is the one the session holds
-            // for it after the switch.
-            let mut live = super::resolve(&r("b-alias://m-b"), &parent, None).unwrap();
+            // for it after the switch — inherited, since the switch happened on that
+            // very endpoint (the `same_endpoint` rule in `resolve_api_key`).
+            let live = super::resolve(
+                &r("b-alias://m-b"),
+                &parent,
+                Some(&super::AuthContext {
+                    api_key: Some("key-b"),
+                    base_url: LIVE,
+                }),
+            )
+            .unwrap();
             assert_eq!(live.base_url(), LIVE);
-            live.relocate(LIVE.to_string(), Some("key-b".to_string()));
+            assert_eq!(live.api_key(), Some("key-b"));
             rt.endpoint.resolved = live;
         }
 
@@ -8991,18 +8986,85 @@ mod tests {
         // pointer directly, without touching process environment.
         // `HRDR_MODEL` is deliberately absent: it names the one identity, as a
         // `ModelSpec` layered against config.toml's `model` — not a field set alone.
-        let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[
-            ("HRDR_BASE_URL", |c| &c.base_url),
-            ("HRDR_CHECKPOINTS", |c| {
-                c.checkpoints.as_deref().unwrap_or("")
-            }),
-        ];
+        let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[("HRDR_CHECKPOINTS", |c| {
+            c.checkpoints.as_deref().unwrap_or("")
+        })];
         for (key, getter) in cases {
             let setter = find_setter(key);
             let mut cfg = AgentConfig::default();
             setter(&mut cfg, "test_value".to_string());
             assert_eq!(getter(&cfg), "test_value", "setter for {key} did not apply");
         }
+    }
+
+    /// **`$HRDR_BASE_URL` IS NOT A KNOB.** The endpoint is a property of the
+    /// provider; an env var that moved it would be an endpoint belonging to nobody —
+    /// and would take the provider's API key with it. Nothing in the config layer
+    /// reads it, so exporting it does nothing at all.
+    #[test]
+    fn hrdr_base_url_is_not_a_knob() {
+        assert!(
+            !ENV_SETTERS.iter().any(|(k, _)| *k == "HRDR_BASE_URL"),
+            "no env var may set the endpoint"
+        );
+        // And `apply_env` — the only reader of the table — leaves the derived endpoint
+        // exactly where the provider put it.
+        let mut cfg = AgentConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+    }
+
+    /// A free-floating top-level `base_url =` in config.toml is the same override in
+    /// another costume — it relocated whichever provider was in force. It is a HARD
+    /// ERROR, like the `provider` key it stands beside in history, and the message
+    /// names the fix: define a provider that OWNS the endpoint.
+    #[test]
+    fn a_top_level_base_url_is_refused_with_a_migration_hint() {
+        let path = std::path::Path::new("/tmp/hrdr/config.toml");
+        let msg = legacy_config_error(
+            "base_url = \"http://localhost:1234/v1\"\nmodel = \"qwen3\"\n",
+            path,
+        )
+        .expect("a free-floating base_url is refused");
+        assert!(
+            msg.contains("the endpoint belongs to the provider"),
+            "{msg}"
+        );
+        assert!(msg.contains("[providers.myserver]"), "{msg}");
+        assert!(
+            msg.contains("base_url = \"http://localhost:1234/v1\""),
+            "{msg}"
+        );
+        assert!(msg.contains("model = \"myserver://qwen3\""), "{msg}");
+
+        // A `[providers.*]` base_url is a provider DEFINITION, not an override — the
+        // one place an endpoint may come from, and it is accepted.
+        assert!(
+            legacy_config_error(
+                "model = \"myserver://qwen3\"\n\n[providers.myserver]\nbase_url = \"http://localhost:1234/v1\"\n",
+                path,
+            )
+            .is_none(),
+        );
+    }
+
+    /// …and the parser has no field for it either: `FileConfig` cannot carry an
+    /// endpoint, so no code path can pick one up even if the refusal were bypassed.
+    /// A `[providers.*]` one still resolves, and `myserver://qwen` talks to it.
+    #[test]
+    fn only_a_provider_table_can_name_an_endpoint() {
+        let fc: FileConfig = toml::from_str(
+            "model = \"myserver://qwen\"\n\n[providers.myserver]\nbase_url = \"http://localhost:1234/v1\"\n",
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        // Untouched by the file: the endpoint is derived from the identity's provider.
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+
+        let resolved = resolve(&"myserver://qwen".parse().unwrap(), &cfg, None).unwrap();
+        assert_eq!(resolved.base_url(), "http://localhost:1234/v1");
+        assert_eq!(resolved.reference().model(), "qwen");
     }
 
     #[test]
@@ -9041,7 +9103,6 @@ mod tests {
             max_readonly_subagents: None,
             max_write_subagents: None,
             max_cost: Some(2.5),
-            base_url: Some("http://custom/v1".to_string()),
             api_key: Some("key123".to_string()),
             model: Some(spec("zen://gpt-4")),
             temperature: Some(0.5),
@@ -9094,7 +9155,9 @@ mod tests {
         assert_eq!(cfg.tool_max_bytes, 20_000);
         assert_eq!(cfg.compaction_tail_turns, 4);
         assert_eq!(cfg.preserve_recent_tokens, 12_000);
-        assert_eq!(cfg.base_url, "http://custom/v1");
+        // No `base_url`: `FileConfig` has no field for one. The endpoint is derived
+        // from the identity's provider, and only a `[providers.*]` table can name it.
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
         assert_eq!(cfg.temperature, Some(0.5));
         assert_eq!(cfg.context_window, Some(8192));

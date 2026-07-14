@@ -14,8 +14,11 @@
 //! clean exit. It is the smallest test that would have caught "the Windows build
 //! doesn't start".
 //!
-//! The agent never talks to anything: the endpoint points at a closed port, so the
-//! health probe fails and the TUI carries on — which is itself worth knowing.
+//! The agent never talks to anything: the config defines a provider on a closed
+//! port, so the health probe fails and the TUI carries on — which is itself worth
+//! knowing. (The endpoint belongs to the provider; there is no flag that could point
+//! hrdr at a dead address, so the test writes the provider it wants into an isolated
+//! config.toml.)
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -94,6 +97,17 @@ fn run_tui(keys: &str) -> Run {
     let home = tempfile::tempdir().expect("temp home");
     let project = tempfile::tempdir().expect("temp project");
 
+    // THE ENDPOINT BELONGS TO THE PROVIDER — so a deliberately-unreachable endpoint
+    // is a provider defined at one. `XDG_CONFIG_HOME` is this tempdir (below), so
+    // this is the config the child reads, and the developer's own is never touched.
+    let config_dir = home.path().join("hrdr");
+    std::fs::create_dir_all(&config_dir).expect("temp config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "model = \"dead://pty-smoke\"\n\n[providers.dead]\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )
+    .expect("write config.toml");
+
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 30,
@@ -104,15 +118,9 @@ fn run_tui(keys: &str) -> Run {
         .expect("open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_hrdr"));
-    // A closed port: the health probe fails, and the TUI must come up anyway.
-    cmd.args([
-        "--no-auto-resume",
-        "--no-bell",
-        "--base-url",
-        "http://127.0.0.1:1",
-        "--model",
-        "pty-smoke",
-    ]);
+    // The identity + endpoint come from the config above (`dead://pty-smoke` at a
+    // closed port): the health probe fails, and the TUI must come up anyway.
+    cmd.args(["--no-auto-resume", "--no-bell"]);
     cmd.cwd(project.path());
     // Point every "where does config/state live" knob at a throwaway directory, so
     // the test can't read the developer's config or write into their sessions.
@@ -128,8 +136,10 @@ fn run_tui(keys: &str) -> Run {
         cmd.env(key, value);
     }
     cmd.env("TERM", "xterm-256color");
-    // Whatever the developer has exported must not reach the child.
-    for key in ["HRDR_BASE_URL", "HRDR_MODEL", "HRDR_API_KEY"] {
+    // Whatever the developer has exported must not reach the child. (`$HRDR_BASE_URL`
+    // is not on the list because it no longer exists — the endpoint belongs to the
+    // provider, and only a provider definition can name one.)
+    for key in ["HRDR_MODEL", "HRDR_API_KEY"] {
         cmd.env_remove(key);
     }
 
@@ -297,9 +307,10 @@ fn the_tui_starts_paints_and_exits_cleanly() {
 /// A closed endpoint is a warning, not a crash.
 ///
 /// hrdr probes the endpoint on the way up (health + context window). The pty test
-/// above points it at a closed port, so this asserts what a user with a wrong
-/// `--base-url` sees: a running TUI that tells them, rather than a binary that dies
-/// on startup with a connection error.
+/// above runs on a provider defined at a closed port, so this asserts what a user
+/// whose `[providers.*]` `base_url` is wrong (or whose server is not up) sees: a
+/// running TUI that tells them, rather than a binary that dies on startup with a
+/// connection error.
 #[test]
 fn an_unreachable_endpoint_does_not_take_the_tui_down() {
     let Run {

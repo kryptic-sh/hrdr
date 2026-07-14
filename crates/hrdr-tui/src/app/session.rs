@@ -205,16 +205,8 @@ impl super::App {
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
         // The identity in force right now — the provider an OLD session file (one
-        // that named a model but no provider) means by "this model", and the provider
-        // a `--base-url` relocation (if any) was applied to.
+        // that named a model but no provider) means by "this model".
         let in_force = self.state().model.clone();
-        // A relocation is only in effect while we are still talking to it: a `/model`
-        // switch away from the launch provider already left it behind.
-        let relocation = self
-            .cfg
-            .base_url_override
-            .clone()
-            .filter(|u| *u == base_url);
 
         // The state *is* the main pane's — transcript, counters and all — so
         // adopting a session is one assignment. There is nothing left to hand back.
@@ -255,10 +247,7 @@ impl super::App {
         // talking is the thing being displayed. (The model alone used to be handed
         // over here, leaving the agent on the launch endpoint.)
         //
-        // One thing stops it: an identity the agent is **already on** needs no switch —
-        // and re-resolving it would throw away an endpoint the user chose (a
-        // `--base-url` relocation of that same provider) for the provider's canonical
-        // one.
+        // One thing stops it: an identity the agent is **already on** needs no switch.
         let (reference, window) = {
             let s = self.state();
             (s.model.clone(), s.usage.context_window)
@@ -299,17 +288,7 @@ impl super::App {
                     .map(|p| p.base_url)
                     .unwrap_or_default();
                 if !now.is_empty() {
-                    self.set_active_base_url(now.clone());
-                }
-                // …and a `--base-url` relocation is left behind with the provider it
-                // relocated. Dropping it is right — it named THAT provider's address —
-                // but never silently: an override the user typed and an endpoint they
-                // are not talking to must not disagree in silence.
-                if let Some(url) = relocation {
-                    self.system(format!(
-                        "note: this session runs on {name}; --base-url ({url}) applied to \
-                         {from} and no longer applies — talking to {now}"
-                    ));
+                    self.set_active_base_url(now);
                 }
             }
         }
