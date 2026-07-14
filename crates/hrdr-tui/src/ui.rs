@@ -1414,7 +1414,7 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
         // red, and a sub-agent on a 64k local model has its own threshold.
         auto_compact_enabled: pane.auto_compact,
         compaction_reserved: pane.compaction_reserved,
-        provider: pane.state.provider.as_deref(),
+        provider: Some(pane.provider()),
         model: pane.model(),
         session: Some(session.as_str()),
         effort: pane.effort.as_deref(),
@@ -1818,11 +1818,7 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
     // The header block describes the agent on screen, like the status bar.
     let pane = app.panes.active_pane();
     field("model", pane.model().to_string(), val);
-    field(
-        "provider",
-        pane.state.provider.clone().unwrap_or_else(|| "—".into()),
-        val,
-    );
+    field("provider", pane.provider().to_string(), val);
     if let Some(e) = &pane.effort {
         field("effort", e.clone(), val);
     }
@@ -2075,7 +2071,7 @@ fn header_hash(app: &App) -> u64 {
     let mut h = DefaultHasher::new();
     let pane = app.panes.active_pane();
     pane.model().hash(&mut h);
-    pane.state.provider.hash(&mut h);
+    pane.provider().hash(&mut h);
     pane.effort.hash(&mut h);
     app.dir.hash(&mut h);
     app.logo.hash(&mut h);

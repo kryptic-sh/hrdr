@@ -10,11 +10,16 @@ use std::path::{Path, PathBuf};
 
 use crate::Entry;
 use anyhow::{Context, Result};
-use hrdr_agent::{Message, cwd_slug};
+use hrdr_agent::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use hrdr_tools::TodoItem;
 use serde::{Deserialize, Serialize};
 
-const SESSION_VERSION: u32 = 1;
+/// v2: the identity is ONE key — `model: "provider://model"` — where v1 wrote
+/// `model` and `provider` side by side. A v1 file still loads (see
+/// [`SessionState`]'s `Deserialize`): sessions are DATA, and refusing to open a
+/// conversation because it predates a refactor would be hostile. Config is the
+/// opposite case, and is refused.
+const SESSION_VERSION: u32 = 2;
 
 /// The token counters the status bar shows, persisted so a resumed conversation
 /// picks up where it left off instead of restarting from zero.
@@ -43,7 +48,7 @@ pub use hrdr_agent::AgentUsage as SessionUsage;
 /// `messages` and `todos` mirror state whose runtime owners are the `Agent` and
 /// the `todo` tool respectively; [`SessionState::sync_from`] refreshes them
 /// before a save.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionState {
     /// Human-friendly session name (defaults to the first user message).
     #[serde(default)]
@@ -51,10 +56,17 @@ pub struct SessionState {
     /// The session's file id (stem). Derived from the filename, not stored in it.
     #[serde(skip)]
     pub id: Option<String>,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub provider: Option<String>,
+    /// What this agent runs on: the provider AND the model, as ONE value, written
+    /// as the single string `provider://model`.
+    ///
+    /// A v1 file's `model` + `provider` pair is folded into it on read (see the
+    /// hand-written `Deserialize`), so an old conversation opens without a word.
+    pub model: ModelRef,
+    /// The v1 file named a model but no provider — so its provider half above is a
+    /// placeholder, and the identity means "this model, on the provider currently in
+    /// effect". Derived at load; never persisted (a written file always names both).
+    #[serde(skip)]
+    pub provider_unset: bool,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
@@ -75,6 +87,111 @@ pub struct SessionState {
     /// Token counters for the status bar (see [`SessionUsage`]).
     #[serde(default)]
     pub usage: SessionUsage,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            id: None,
+            model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
+            provider_unset: false,
+            base_url: String::new(),
+            cwd: String::new(),
+            messages: Vec::new(),
+            todos: Vec::new(),
+            transcript: Vec::new(),
+            usage: SessionUsage::default(),
+        }
+    }
+}
+
+/// Reading a session file, v1 and v2 alike.
+///
+/// A session is DATA — the record of a conversation someone had. It is not a
+/// statement of intent that can be *stale*, the way a config file is, so an old one
+/// is migrated in place and never refused:
+///
+/// * v2 (`model: "zen://kimi-k2"`) parses as the identity it is;
+/// * v1 with both halves (`model: "kimi-k2"`, `provider: "zen"`) is folded into one
+///   [`ModelRef`] here, at the read;
+/// * v1 with a model but no provider means "this model, on the provider currently in
+///   effect" — which the file cannot know, so the identity is flagged
+///   [`provider_unset`](SessionState::provider_unset) and the *resume* supplies the
+///   provider in force (see the TUI's `adopt_state`);
+/// * a file naming nothing at all falls back to the default identity.
+impl<'de> Deserialize<'de> for SessionState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        /// The union of the v1 and v2 shapes, exactly as they appear on disk.
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            name: String,
+            /// v2: `provider://model`. v1: a bare model id.
+            #[serde(default)]
+            model: Option<String>,
+            /// v1 only.
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            base_url: String,
+            #[serde(default)]
+            cwd: String,
+            #[serde(default, with = "persisted_messages")]
+            messages: Vec<Message>,
+            #[serde(default)]
+            todos: Vec<TodoItem>,
+            #[serde(default)]
+            transcript: Vec<Entry>,
+            #[serde(default)]
+            usage: SessionUsage,
+        }
+
+        let raw = Raw::deserialize(d)?;
+        let spec = raw
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::parse::<ModelSpec>)
+            .transpose()
+            .ok()
+            .flatten();
+        let provider = raw
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let default: ModelRef = DEFAULT_MODEL_REF.parse().expect("a valid default identity");
+        let (model, provider_unset) = match (spec, provider) {
+            // v2, or a v1 file whose provider half we already have.
+            (Some(ModelSpec::Full(r)), _) => (r, false),
+            (Some(ModelSpec::ModelOnly(m)), Some(p)) => (
+                ModelRef::new(hrdr_agent::ProviderName::new(p), &m).unwrap_or(default),
+                false,
+            ),
+            // v1, model only: the provider is whatever this process is on.
+            (Some(spec @ ModelSpec::ModelOnly(_)), None) => (spec.apply(&default), true),
+            (None, Some(p)) => (
+                ModelRef::new(hrdr_agent::ProviderName::new(p), hrdr_agent::DEFAULT_MODEL)
+                    .unwrap_or(default),
+                false,
+            ),
+            (None, None) => (default, true),
+        };
+        Ok(SessionState {
+            name: raw.name,
+            id: None,
+            model,
+            provider_unset,
+            base_url: raw.base_url,
+            cwd: raw.cwd,
+            messages: raw.messages,
+            todos: raw.todos,
+            transcript: raw.transcript,
+            usage: raw.usage,
+        })
+    }
 }
 
 /// Serialize chat messages *for the session file*, which is not the OpenAI wire.
@@ -433,7 +550,7 @@ mod tests {
     pub(super) fn state(name: &str, cwd: &str) -> SessionState {
         SessionState {
             name: name.to_string(),
-            model: "model".to_string(),
+            model: "local://model".parse().unwrap(),
             base_url: "http://x/v1".to_string(),
             cwd: cwd.to_string(),
             messages: vec![Message::user("hi")],
@@ -753,8 +870,8 @@ mod roundtrip_audit {
         let state = SessionState {
             name: "Chat".into(),
             id: Some("chat".into()), // NOT persisted: it is the file name
-            model: "m".into(),
-            provider: Some("go".into()),
+            model: "go://m".parse().unwrap(),
+            provider_unset: false,
             base_url: "http://x/v1".into(),
             cwd: "/tmp/p".into(),
             messages: vec![Message::user("hi"), assistant],
@@ -805,7 +922,6 @@ mod roundtrip_audit {
         // Everything the file carries comes back byte-identical.
         assert_eq!(back.name, state.name);
         assert_eq!(back.model, state.model);
-        assert_eq!(back.provider, state.provider);
         assert_eq!(back.base_url, state.base_url);
         assert_eq!(back.cwd, state.cwd);
         assert_eq!(back.usage, state.usage);
@@ -947,5 +1063,93 @@ mod roundtrip_audit {
         assert!(!wire.contains("secret thoughts"), "{wire}");
         assert!(!wire.contains("anthropic_thinking_blocks"), "{wire}");
         assert!(!wire.contains("reasoning_content"), "{wire}");
+    }
+}
+
+/// The on-disk migration: an old session file is DATA, and opens without a word.
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// A v1 file carrying BOTH halves is folded into one identity on read.
+    #[test]
+    fn a_legacy_session_with_both_halves_migrates_silently() {
+        let v1 = serde_json::json!({
+            "version": 1,
+            "created": 1_700_000_000u64,
+            "updated": 1_700_000_000u64,
+            "name": "old chat",
+            "model": "deepseek/deepseek-chat",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "cwd": "/tmp/p",
+        });
+        let back: Session = serde_json::from_value(v1).expect("an old session still loads");
+        assert_eq!(
+            back.state.model,
+            "openrouter://deepseek/deepseek-chat".parse().unwrap(),
+            "the two halves are paired up at the read"
+        );
+        assert!(
+            !back.state.provider_unset,
+            "the file named a provider, so nothing needs supplying"
+        );
+        assert_eq!(back.state.name, "old chat", "and the rest is untouched");
+
+        // What is written back is the new, coupled form — one key, one string.
+        let json = serde_json::to_value(Session::new(back.state)).unwrap();
+        assert_eq!(json["model"], "openrouter://deepseek/deepseek-chat");
+        assert!(
+            json.get("provider").is_none(),
+            "the split key is gone: {json}"
+        );
+        assert_eq!(json["version"], 2);
+    }
+
+    /// A v1 file with a model but NO provider means "this model, on the provider
+    /// currently in effect" — which the file cannot know, so it is flagged and the
+    /// resume supplies it. It is never silently rehomed onto `local`.
+    #[test]
+    fn a_legacy_model_only_session_defers_to_the_provider_in_effect() {
+        let v1 = serde_json::json!({
+            "version": 1,
+            "created": 0u64,
+            "updated": 0u64,
+            "model": "kimi-k2",
+        });
+        let back: Session = serde_json::from_value(v1).expect("loads");
+        assert!(
+            back.state.provider_unset,
+            "the provider half is a placeholder, to be supplied by the resume"
+        );
+        assert_eq!(
+            back.state.model.model(),
+            "kimi-k2",
+            "the model is the file's"
+        );
+
+        // What the resume then does with it (the TUI's `adopt_state`): the model,
+        // on the identity in force.
+        let in_force: ModelRef = "zen://grok-code".parse().unwrap();
+        assert_eq!(
+            ModelSpec::ModelOnly(back.state.model.model().to_string()).apply(&in_force),
+            "zen://kimi-k2".parse().unwrap()
+        );
+    }
+
+    /// A v2 file is just read: one key, one string, no migration at all.
+    #[test]
+    fn a_v2_session_round_trips_as_one_key() {
+        let st = SessionState {
+            model: "zen://kimi-k2".parse().unwrap(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Session::new(st)).unwrap();
+        assert!(json.contains("\"model\":\"zen://kimi-k2\""), "{json}");
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state.model, "zen://kimi-k2".parse().unwrap());
+        assert!(!back.state.provider_unset);
+        assert_eq!(back.version, SESSION_VERSION);
     }
 }

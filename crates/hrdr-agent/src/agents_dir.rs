@@ -14,15 +14,21 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail};
+
 use crate::SubagentProfile;
 
 /// Discover agent-definition files across the Claude/opencode/hrdr locations,
 /// relative to `cwd` for project scopes and the home/XDG dirs for user scopes.
 /// Returns one profile per unique name (first source in precedence order wins).
-pub fn discover_agent_profiles(cwd: &Path) -> Vec<SubagentProfile> {
+///
+/// Errors when a file still spells the identity as the old `provider:` +  `model:`
+/// pair. An agent file is **configuration**, and the two keys could always
+/// disagree — so, like config.toml, a stale one is refused rather than guessed at.
+pub fn discover_agent_profiles(cwd: &Path) -> Result<Vec<SubagentProfile>> {
     let mut out: Vec<SubagentProfile> = Vec::new();
     for dir in agent_dirs(cwd) {
-        for profile in read_dir_profiles(&dir) {
+        for profile in read_dir_profiles(&dir)? {
             // First source wins: skip a name already registered.
             if out
                 .iter()
@@ -33,7 +39,7 @@ pub fn discover_agent_profiles(cwd: &Path) -> Vec<SubagentProfile> {
             out.push(profile);
         }
     }
-    out
+    Ok(out)
 }
 
 /// The agent directories to scan, in precedence order (highest first).
@@ -65,10 +71,11 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 }
 
 /// Parse every `*.md` file in `dir` (non-recursive) into a profile. Missing or
-/// unreadable directories yield nothing; a malformed file is skipped.
-fn read_dir_profiles(dir: &Path) -> Vec<SubagentProfile> {
+/// unreadable directories yield nothing; a file with no usable content is skipped.
+/// A file carrying the dead `provider:` key is an error, named by path.
+fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut profiles = Vec::new();
     for entry in entries.flatten() {
@@ -83,19 +90,28 @@ fn read_dir_profiles(dir: &Path) -> Vec<SubagentProfile> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        if let Some(p) = parse_agent_file(&text, stem) {
+        if let Some(p) = parse_agent_file(&text, stem).map_err(|e| legacy_error(&path, &e))? {
             profiles.push(p);
         }
     }
     // Stable order within a directory (read_dir order is unspecified).
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
-    profiles
+    Ok(profiles)
+}
+
+/// An agent file's parse error, named by the file it came from.
+fn legacy_error(path: &Path, err: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("hrdr: {}: {err:#}", path.display())
 }
 
 /// Parse one agent file (`text`) into a profile, using `filename_stem` as the
-/// fallback name. Returns `None` if there's no usable content (no name and no
+/// fallback name. `Ok(None)` if there's no usable content (no name and no
 /// body/prompt).
-pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfile> {
+///
+/// Errors on the old `provider:` key: the identity is ONE key now
+/// (`model: provider://model`), and a file naming a provider beside a model can
+/// name a pair that never agreed. The message says exactly what to write instead.
+pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<SubagentProfile>> {
     let (fm, body) = split_frontmatter(text);
     let body = body.trim();
 
@@ -105,7 +121,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| filename_stem.to_string());
     if name.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // System prompt: the body, else an inline `prompt:` frontmatter value.
@@ -121,14 +137,32 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         .get("description")
         .map(|v| v.scalar())
         .filter(|s| !s.is_empty());
-    let provider = fm
+    // The dead key. A provider beside a model is exactly the pair that could
+    // disagree — an agent file names the whole identity in `model`, or nothing.
+    if let Some(provider) = fm
         .get("provider")
         .map(|v| v.scalar())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+    {
+        let model = fm
+            .get("model")
+            .map(|v| v.scalar())
+            .filter(|s| !s.is_empty() && s != "inherit")
+            .unwrap_or_else(|| "<model-id>".to_string());
+        bail!(
+            "agent '{name}' uses the old split provider/model keys.\n  replace:\n      \
+             provider: {provider}\n      model: {model}\n  with:\n      \
+             model: {provider}://{model}"
+        );
+    }
+    // Claude's `inherit` = "the main agent's identity" = no spec at all.
     let model = fm
         .get("model")
         .map(|v| v.scalar())
-        .filter(|s| !s.is_empty() && s != "inherit"); // Claude's `inherit` = default
+        .filter(|s| !s.is_empty() && s != "inherit")
+        .map(|s| s.parse::<crate::ModelSpec>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("agent '{name}': model: {e}"))?;
 
     let temperature = fm.get("temperature").and_then(|v| v.scalar().parse().ok());
     let effort = fm
@@ -157,9 +191,8 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         .map(|v| v.scalar())
         .filter(|s| !s.is_empty());
 
-    Some(SubagentProfile {
+    Ok(Some(SubagentProfile {
         name,
-        provider,
         model,
         description,
         prompt,
@@ -171,7 +204,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         max_steps,
         proactive,
         isolation,
-    })
+    }))
 }
 
 /// A frontmatter value: a scalar, or a list (inline `[a, b]`, CSV, or `- item`
@@ -311,6 +344,17 @@ fn dequote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Parse a file that must parse, and must carry a profile.
+    fn parse(text: &str, stem: &str) -> SubagentProfile {
+        parse_agent_file(text, stem)
+            .expect("parses")
+            .expect("a profile")
+    }
+
+    fn spec(s: &str) -> crate::ModelSpec {
+        s.parse().expect("a valid model spec")
+    }
+
     #[test]
     fn parses_claude_style_agent() {
         let text = "---\n\
@@ -320,10 +364,10 @@ mod tests {
             tools: Read, Grep, Bash\n\
             ---\n\
             You are a careful code reviewer.\n";
-        let p = parse_agent_file(text, "fallback").unwrap();
+        let p = parse(text, "fallback");
         assert_eq!(p.name, "code-reviewer");
         assert_eq!(p.description.as_deref(), Some("Reviews code for quality"));
-        assert_eq!(p.model.as_deref(), Some("sonnet"));
+        assert_eq!(p.model, Some(spec("sonnet")));
         assert_eq!(
             p.tools.as_deref(),
             Some(&["Read".into(), "Grep".into(), "Bash".into()][..])
@@ -346,7 +390,7 @@ mod tests {
             \x20 - Grep\n\
             ---\n\
             Body prompt.\n";
-        let p = parse_agent_file(text, "planner").unwrap();
+        let p = parse(text, "planner");
         assert_eq!(p.name, "planner"); // from filename
         assert_eq!(p.temperature, Some(0.2));
         assert_eq!(p.effort.as_deref(), Some("high"));
@@ -370,30 +414,34 @@ mod tests {
             model: anthropic/claude-sonnet-4\n\
             ---\n\
             Do the thing.\n";
-        let p = parse_agent_file(text, "build").unwrap();
+        let p = parse(text, "build");
         assert_eq!(p.description.as_deref(), Some("Build agent"));
-        assert_eq!(p.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        // A bare slashed id is a MODEL, not a provider — `ModelSpec` splits on `://`
+        // and nothing else, so opencode's `anthropic/claude-sonnet-4` still names a
+        // model on the provider in force.
+        assert_eq!(p.model, Some(spec("anthropic/claude-sonnet-4")));
+        assert!(matches!(p.model, Some(crate::ModelSpec::ModelOnly(_))));
         assert!(p.tools.is_none(), "nested bool-map must not become a list");
     }
 
     #[test]
     fn parses_proactive_flag() {
         let text = "---\nname: reviewer\nproactive: true\n---\nreview stuff\n";
-        assert!(parse_agent_file(text, "x").unwrap().proactive);
+        assert!(parse(text, "x").proactive);
         let text = "---\nname: reviewer\n---\nreview stuff\n";
-        assert!(!parse_agent_file(text, "x").unwrap().proactive);
+        assert!(!parse(text, "x").proactive);
     }
 
     #[test]
     fn claude_inherit_model_is_treated_as_default() {
         let text = "---\nname: x\nmodel: inherit\n---\nbody\n";
-        let p = parse_agent_file(text, "x").unwrap();
+        let p = parse(text, "x");
         assert!(p.model.is_none());
     }
 
     #[test]
     fn no_frontmatter_is_all_body() {
-        let p = parse_agent_file("Just a system prompt.", "helper").unwrap();
+        let p = parse("Just a system prompt.", "helper");
         assert_eq!(p.name, "helper");
         assert_eq!(p.prompt.as_deref(), Some("Just a system prompt."));
         assert!(p.description.is_none());
@@ -419,10 +467,50 @@ mod tests {
         )
         .unwrap();
 
-        let found = discover_agent_profiles(cwd);
+        let found = discover_agent_profiles(cwd).unwrap();
         let revs: Vec<&SubagentProfile> = found.iter().filter(|p| p.name == "reviewer").collect();
         assert_eq!(revs.len(), 1, "same name registered once");
         // .claude precedes .opencode in the precedence order → it wins.
         assert_eq!(revs[0].description.as_deref(), Some("from claude"));
+    }
+
+    /// An agent file is CONFIG: the identity is one key, and a file still naming a
+    /// provider beside a model is refused — with the file, the two lines it wrote,
+    /// and the single line that replaces them.
+    #[test]
+    fn a_provider_key_in_an_agent_file_is_an_error_naming_the_fix() {
+        let text =
+            "---\nname: builder\nprovider: openrouter\nmodel: deepseek/deepseek-chat\n---\nbuild\n";
+        let err = parse_agent_file(text, "builder")
+            .expect_err("the old split keys are refused")
+            .to_string();
+        assert!(err.contains("old split provider/model keys"), "{err}");
+        assert!(err.contains("provider: openrouter"), "{err}");
+        assert!(
+            err.contains("model: openrouter://deepseek/deepseek-chat"),
+            "the fix is spelled out: {err}"
+        );
+
+        // …and the file it came from is named, so it can be found and fixed.
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".hrdr").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("builder.md"), text).unwrap();
+        let err = discover_agent_profiles(dir.path())
+            .expect_err("discovery refuses it too")
+            .to_string();
+        assert!(err.contains("builder.md"), "names the file: {err}");
+        assert!(
+            err.contains("model: openrouter://deepseek/deepseek-chat"),
+            "{err}"
+        );
+    }
+
+    /// `model: inherit` still means "the main agent's identity" — no spec at all.
+    #[test]
+    fn a_model_only_file_needs_no_provider_at_all() {
+        let p = parse("---\nname: x\nmodel: zen://kimi-k2\n---\nbody\n", "x");
+        assert_eq!(p.model, Some(spec("zen://kimi-k2")));
+        assert!(matches!(p.model, Some(crate::ModelSpec::Full(_))));
     }
 }

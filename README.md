@@ -205,9 +205,10 @@ standard) walking up from the cwd.
 ### Model endpoint
 
 hrdr does **not** manage a model server — it talks to any running
-OpenAI-compatible `/v1` endpoint. Point it at one with `--base-url` /
-`$HRDR_BASE_URL`, or use a `--provider` preset (below). The default endpoint is
-`http://localhost:8080/v1`, so a locally-running server needs no flags.
+OpenAI-compatible `/v1` endpoint. Name the model you want as `provider://model`
+(below), or point hrdr at a server you run with `--base-url` / `$HRDR_BASE_URL`.
+The default endpoint is `http://localhost:8080/v1`, so a locally-running server
+needs no flags.
 
 To serve a model locally, run your own — for native tool calling either works:
 
@@ -219,10 +220,26 @@ hrdr                                              # then just launch hrdr
 hrdr --base-url http://localhost:1234/v1          # or point at any other endpoint
 ```
 
-### Providers
+### Providers — the model names one
 
-`--provider <name>` (or `provider = "..."` in config, or `$HRDR_PROVIDER`)
-selects a preset endpoint + API-key env:
+A model belongs to a provider, so hrdr names them **together, as one value**:
+
+```
+provider://model         # chatgpt://gpt-5.5, openrouter://deepseek/deepseek-chat, local://llama3:8b
+```
+
+That one string is the whole identity, and it is what every model-naming surface
+takes — `--model`, `$HRDR_MODEL`, `model = "..."` in config, `/model`, a
+`[[subagent]]` profile, the `task` tool. Naming the provider **switches to it**:
+its endpoint, API key, headers and context window all follow.
+
+A **bare model id** (`gpt-5.5`, `deepseek/deepseek-chat`, `llama3:8b`) means
+"that model, on the provider I am already on" — the separator is `://` and
+nothing else, so a slashed or colon'd model id is never mistaken for a provider.
+
+There is no `--provider` flag and no `provider =` config key: a provider and a
+model that can be set independently are a pair that can disagree, and hrdr would
+have had to guess which half you meant.
 
 Built-in presets:
 
@@ -245,11 +262,16 @@ for longer replies and deeper thinking. `local` needs no key.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
-hrdr models --provider zen                 # list OpenCode Zen models
-hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
+hrdr --model zen://grok-build-0.1     # chat against a Zen model
+hrdr models                           # list the current provider's models
+hrdr --model grok-code                # a bare id: same provider, another model
 ```
 
-`--base-url` / `$HRDR_BASE_URL` still override a provider's endpoint.
+`--base-url` / `$HRDR_BASE_URL` **relocate** a provider — it is still that
+provider (its key, its headers), at another address. With no provider named, a
+bare `--base-url` is a `local` run: `hrdr --base-url http://localhost:1234/v1`
+resolves to `local://default`, which is exactly what `local` means (an
+OpenAI-compatible server you run, keyless, no catalog).
 
 #### `/login` — guided setup
 
@@ -268,10 +290,10 @@ without leaking secrets.
 
 Define your own in `~/.config/hrdr/config.toml` under `[providers.<name>]` — a
 custom entry shadows a built-in of the same name. Each can carry its own model
-and context window, so switching is a single `--provider <name>`:
+and context window, so switching to it is a single `--model mylocal://<model>`:
 
 ```toml
-provider = "mylocal"            # default provider for this config
+model = "mylocal://Qwen3-30B-A3B"   # the identity: one key, provider AND model
 
 [providers.mylocal]
 base_url = "http://localhost:8080/v1"
@@ -297,6 +319,11 @@ key_env = "OPENROUTER_API_KEY"
 HTTP-Referer = "https://your.app"  # OpenRouter attribution / ranking
 X-Title = "your-app"
 ```
+
+A `[providers.<name>]` table's own `model` is a **bare model id** — the provider
+is the table name, so a URI there would just repeat it. It is the model hrdr
+falls back to when something names that provider without a model (a `/login`
+switch, or a `provider://` spec).
 
 Each provider can carry `[providers.<name>.headers]` — arbitrary HTTP headers
 sent on every request (OpenRouter's `HTTP-Referer`/`X-Title`, or a custom
@@ -515,10 +542,10 @@ is flagged `current: true`.
 That is what makes **"delegate this to a model by name"** work: say
 `@explore the codebase using big pickle` and the agent resolves that human name
 to an id through `models`, then runs the `task` on it — staying on the provider
-it is already authenticated and billed on unless that provider doesn't offer the
-model, in which case it passes `provider` too and tells you. Availability is
-best-effort and does not guarantee account authorization; hrdr does not rank
-models by price.
+it is already authenticated and billed on (a bare model id) unless that provider
+doesn't offer the model, in which case it names the other one
+(`provider://model`) and tells you. Availability is best-effort and does not
+guarantee account authorization; hrdr does not rank models by price.
 
 `explore` and `review` are **proactive** — the main agent reaches for them on
 its own (explore for broad investigation, review after non-trivial changes)
@@ -534,40 +561,42 @@ subagent_model = "claude-sonnet-4-6"   # default for delegated sub-agents
 # subagents = false                    # disable the task tool entirely
 ```
 
-Or on an **entirely different provider** via named `[[subagent]]` profiles —
-e.g. Opus on Anthropic manages, while implementation/exploration runs on another
-provider's model. Each profile pins a `provider` (a built-in or
-`[providers.<name>]`) + `model`; the model selects one with the `task` tool's
-`agent` argument:
+Or on an **entirely different provider** — name it in the model, and the
+sub-agent's endpoint, key and headers follow: e.g. Opus on Anthropic manages,
+while implementation/exploration runs on another provider's model. A
+`[[subagent]]` profile carries one `model` key, and the agent selects the
+profile with the `task` tool's `agent` argument:
 
 ```toml
 [[subagent]]
 name = "implementer"
-provider = "openrouter"
-model = "moonshotai/kimi-k2"
+model = "openrouter://moonshotai/kimi-k2"   # another provider, its own key
 description = "focused implementation"
 
 [[subagent]]
 name = "explorer"
-provider = "zen"
-model = "grok-code"
+model = "zen://grok-code"
 description = "read-only codebase exploration"
+
+[[subagent]]
+name = "cheap"
+model = "claude-haiku-4-5"                  # bare id: the main provider
+description = "small, fast sub-tasks"
 ```
 
 The sub-agent runs on that profile's provider (its own endpoint, key, headers,
-and Azure/Anthropic quirks). The model can also override the model per call
-(`model` argument); also `$HRDR_SUBAGENT_MODEL` / `--subagent-model` for the
-default.
+and Azure/Anthropic quirks). `$HRDR_SUBAGENT_MODEL` / `--subagent-model` set the
+default for un-profiled delegations, and take the same two shapes.
 
-The `task` tool also accepts an optional `provider` argument to delegate to a
-different, already-configured provider without defining a `[[subagent]]` profile
-— e.g. a ChatGPT-hosted main agent delegating to
-`provider = "openrouter", model = "deepseek/deepseek-chat"`. The target provider
-must be configured and authenticated (a built-in with its key/OAuth set, or a
-`[providers.*]` entry); an unconfigured provider is rejected before the
-sub-agent starts. When `provider` is set, pass `model` too — the provider's
-default model is used only if it has one, otherwise the call errors. An explicit
-`model` always wins, including over a named profile's model.
+The `task` tool's own `model` argument overrides per call, and takes the same
+one value — so the agent can delegate to a different, already-configured
+provider without a profile: `model = "openrouter://deepseek/deepseek-chat"`. The
+target provider must be configured and authenticated (a built-in with its
+key/OAuth set, or a `[providers.*]` entry); an unconfigured one is rejected
+before the sub-agent starts. `model = "openrouter://"` uses that provider's own
+configured model, and errors if it declares none — the model you were using
+belongs to the provider you are leaving, and never follows you. An explicit
+`model` always wins, including over a named profile's.
 
 A profile can also carry a **custom system prompt** and a **scoped tool set** —
 this is how the built-in `explore`/`review` agents are defined, and a user
@@ -612,10 +641,12 @@ don't spawn MCP servers. Their file edits aren't captured by the parent's
 
 Beyond inline `[[subagent]]` config, hrdr discovers agents from **Markdown
 files** — one agent per file, the body is its system prompt, the frontmatter
-carries the fields above (`description`, `model`, `provider`, `read_only`,
-`tools`, `write_ext`, `temperature`, `effort`, `max_steps`; the `name` defaults
-to the filename). It reads both the **Claude Code** and **opencode** locations
-so existing agents work as-is:
+carries the fields above (`description`, `model`, `read_only`, `tools`,
+`write_ext`, `temperature`, `effort`, `max_steps`; the `name` defaults to the
+filename). `model:` is the same one key (`model: zen://grok-code`, or a bare id
+for the main provider; Claude's `model: inherit` means the main agent's
+identity). It reads both the **Claude Code** and **opencode** locations so
+existing agents work as-is:
 
 | Scope   | hrdr                     | Claude Code         | opencode                    |
 | ------- | ------------------------ | ------------------- | --------------------------- |
@@ -643,9 +674,9 @@ allow-list `tools` is honored.)
 #### Running as an agent (`--agent`)
 
 `--agent <name>` runs the **main** loop as a named agent — it adopts that
-agent's system prompt, tool scope, model/provider, and knobs, instead of only
-being able to delegate to it. The name resolves from the same set as the `task`
-tool (built-ins, discovered files, `[[subagent]]` config):
+agent's system prompt, tool scope, model (provider and all), and knobs, instead
+of only being able to delegate to it. The name resolves from the same set as the
+`task` tool (built-ins, discovered files, `[[subagent]]` config):
 
 ```bash
 hrdr --agent explore            # a read-only session for spelunking a codebase
@@ -841,11 +872,11 @@ chrome, tool/loader accent, success/error), so any hjkl theme works.
 
 Configuration (CLI flags override env):
 
-| Env             | Default                            | Meaning                     |
-| --------------- | ---------------------------------- | --------------------------- |
-| `HRDR_BASE_URL` | `http://localhost:8080/v1`         | OpenAI-compatible endpoint. |
-| `HRDR_MODEL`    | `default`                          | Model id.                   |
-| `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.  |
+| Env             | Default                            | Meaning                                                                                                           |
+| --------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `HRDR_BASE_URL` | `http://localhost:8080/v1`         | OpenAI-compatible endpoint — **relocates** the provider in force (it stays that provider, at another address).    |
+| `HRDR_MODEL`    | `local://default`                  | The model, as `provider://model` (switches provider + model) or a bare id (that model, on the provider in force). |
+| `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.                                                                                        |
 
 ## Recommended companion tools
 

@@ -263,8 +263,9 @@ fn last_model_path() -> Option<PathBuf> {
 /// What `last_model.json` remembers: the last identity used *overall*, and the
 /// last model used **on each provider**.
 ///
-/// The per-provider map is what makes a provider-only switch (`/login zen`,
-/// `--provider zen`) expressible at all: a provider names no model, and the model
+/// The per-provider map is what makes a provider-only switch (`/login zen`, the
+/// `/model` picker's provider rows) expressible at all: a provider names no model,
+/// and the model
 /// you were using on some *other* provider is exactly the one that must not follow
 /// you there. "The model you last used on THIS provider" is the answer that both
 /// exists and is right — see [`model_for_provider`].
@@ -387,8 +388,7 @@ pub fn record_last_model(r: &ModelRef) {
 }
 
 /// The identity to use when a provider is named but **no model is** — `/login
-/// <provider>`, `--provider <name>`, a `[[subagent]]` profile that names only a
-/// provider.
+/// <provider>`, the `/model` picker switching provider.
 ///
 /// A provider-only switch is not expressible as a [`ModelRef`], and that is the
 /// point: the bug this refactor exists to kill was `repoint_to_provider` leaving

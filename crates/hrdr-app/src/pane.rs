@@ -148,6 +148,16 @@ impl Pane {
 
     /// The model this pane's agent is on.
     pub fn model(&self) -> &str {
+        self.state.model.model()
+    }
+
+    /// The provider this pane's agent is on.
+    pub fn provider(&self) -> &str {
+        self.state.model.provider().as_str()
+    }
+
+    /// The whole identity this pane's agent runs on.
+    pub fn model_ref(&self) -> &hrdr_agent::ModelRef {
         &self.state.model
     }
 }
@@ -499,8 +509,13 @@ impl PaneSet {
             pane.auto_compact = s.auto_compact;
             pane.compaction_reserved = s.compaction_reserved;
             pane.todos = std::sync::Arc::clone(&s.todos);
-            pane.state.model = s.model.clone();
-            pane.state.provider = s.provider.clone();
+            // The registry still carries the agent's identity as two values; it is
+            // paired back up here, at the edge, exactly as the session file's is.
+            pane.state.model = hrdr_agent::ModelRef::new(
+                hrdr_agent::ProviderName::new(s.provider.as_deref().unwrap_or("local")),
+                &s.model,
+            )
+            .unwrap_or_else(|_| pane.state.model.clone());
             pane.state.base_url = s.base_url.clone();
             pane.state.usage = s.usage;
             // The main pane's name is the *session's*, which the session file owns —
@@ -755,7 +770,7 @@ mod tests {
         });
 
         let mut panes = PaneSet::new();
-        panes.main_mut().state.model = "opus".to_string();
+        panes.main_mut().state.model = "claude://opus".parse().unwrap();
         panes.sync(&live);
 
         // Looking at main: main's model.
@@ -766,7 +781,7 @@ mod tests {
         panes.focus(PaneId::Sub(1));
         let p = panes.active_pane();
         assert_eq!(p.model(), "haiku");
-        assert_eq!(p.state.provider.as_deref(), Some("claude"));
+        assert_eq!(p.provider(), "claude");
         assert_eq!(p.state.base_url, "https://api.anthropic.com/v1");
         assert_eq!(p.state.usage.ctx_used(), 900);
         assert_eq!(p.state.usage.context_window, Some(64_000));

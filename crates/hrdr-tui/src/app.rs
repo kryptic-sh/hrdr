@@ -349,7 +349,7 @@ impl App {
         ui: hrdr_app::UiConfig,
         logo: &'static str,
     ) -> Result<Self> {
-        let model = config.model.model().to_string();
+        let identity = config.model.clone();
         let vim_mode = ui.vim_mode;
         let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
@@ -371,9 +371,6 @@ impl App {
             .and_then(hjkl_icons::IconMode::from_config)
             .unwrap_or(hjkl_icons::IconMode::Nerd);
         let base_url = config.base_url.clone();
-        // The session's on-disk shape still spells the identity as two keys, so it
-        // is taken apart here — at the edge — and nowhere else.
-        let provider = Some(config.model.provider().to_string());
         // Shared transcript-dir cell: handed to the agent (so the `task` tool
         // can persist sub-agent runs) and kept here to repoint at the session's
         // dir once an id is assigned (`refresh_subagent_dir`).
@@ -419,8 +416,7 @@ impl App {
         // its counters and its transcript, held exactly the way a sub-agent's are.
         // The opening chrome (banner + welcome) is seeded straight into it.
         let state = hrdr_app::SessionState {
-            model,
-            provider,
+            model: identity,
             base_url,
             transcript,
             usage: hrdr_app::SessionUsage {
@@ -514,20 +510,18 @@ impl App {
     /// delegated one — so a `/model` switch, a resume, or a `/clear` has to land
     /// there, or the next frame would quietly restore the old values.
     pub(crate) fn publish_main_agent(&mut self) {
-        let (model, provider, base_url, usage) = {
+        let (reference, base_url, usage) = {
             let s = self.state();
-            (
-                s.model.clone(),
-                s.provider.clone(),
-                s.base_url.clone(),
-                s.usage,
-            )
+            (s.model.clone(), s.base_url.clone(), s.usage)
         };
+        // The live registry still carries the identity as two values (it is shared
+        // with the agent side, which has its own reasons); it is taken apart here, at
+        // the edge, and nowhere else.
         self.live_subagents.register_main(
             self.agent.clone(),
             self.steering.clone(),
-            model,
-            provider,
+            reference.model().to_string(),
+            Some(reference.provider().to_string()),
             base_url,
             usage,
         );
@@ -557,7 +551,7 @@ impl App {
     /// Stays silent on success so it doesn't clutter the transcript.
     pub(crate) fn spawn_health_check(&self) {
         let agent = self.agent.clone();
-        let model = self.state().model.clone();
+        let model = self.state().model.model().to_string();
         let base_url = self.state().base_url.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -1447,8 +1441,8 @@ impl App {
         let mut s = std::mem::take(&mut pane.state);
         f(&mut s);
         self.live_subagents.update(key, |e| {
-            e.model = s.model.clone();
-            e.provider = s.provider.clone();
+            e.model = s.model.model().to_string();
+            e.provider = Some(s.model.provider().to_string());
             e.base_url = s.base_url.clone();
             e.usage = s.usage;
         });
@@ -1468,16 +1462,9 @@ impl App {
     }
 
     /// What the agent being viewed is running on, as ONE value — read back out of
-    /// the two keys the pane's display state still holds it in.
+    /// the ONE value the pane's display state holds it in.
     pub(crate) fn active_model_ref(&self) -> hrdr_agent::ModelRef {
-        let pane = self.panes.active_pane();
-        let provider = pane.state.provider.as_deref().unwrap_or("local");
-        hrdr_agent::ModelRef::new(hrdr_agent::ProviderName::new(provider), pane.model())
-            .unwrap_or_else(|_| {
-                hrdr_agent::DEFAULT_MODEL_REF
-                    .parse()
-                    .expect("a valid default identity")
-            })
+        self.panes.active_pane().model_ref().clone()
     }
 
     /// `/model` (and `/login`'s provider switch) set the identity of the agent
@@ -1485,10 +1472,7 @@ impl App {
     /// compacts. Provider and model land together: the display can no more show a
     /// mismatched pair than the agent can run one.
     pub(crate) fn set_active_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
-        self.update_active_chrome(|s| {
-            s.model = reference.model().to_string();
-            s.provider = Some(reference.provider().to_string());
-        });
+        self.update_active_chrome(|s| s.model = reference);
     }
 
     pub(crate) fn set_active_base_url(&mut self, url: String) {

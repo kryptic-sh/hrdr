@@ -1027,7 +1027,7 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
     ];
     let state = hrdr_app::SessionState {
         name: "old chat".into(),
-        model: "test-model".into(),
+        model: "local://test-model".parse().unwrap(),
         base_url: h.app.state().base_url.clone(),
         cwd: h.app.current_cwd(),
         messages: vec![hrdr_agent::Message::system("sys")],
@@ -1757,7 +1757,7 @@ async fn the_header_persists_and_shows_live_details() {
     let mut h = Harness::new(vec![]).await;
     let state = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
-        model: "restored-model".into(),
+        model: "local://restored-model".parse().unwrap(),
         messages: vec![hrdr_agent::Message::system("sys")],
         transcript: vec![Entry::header()],
         ..Default::default()
@@ -1794,32 +1794,31 @@ async fn a_narrow_viewport_drops_the_header_details() {
     assert!(!screen.contains("model  "), "details dropped:\n{screen}");
 }
 
-/// Model / provider precedence, highest first: **flag > env > session > config**.
+/// Model precedence, highest first: **flag > env > session > config**.
 ///
-/// A flag or env var pins the value: resuming a session — automatically at
-/// startup or explicitly via `/resume` — must not switch the model out from
-/// under it. The endpoint is never taken from the session either.
+/// A flag or env var pins the identity — WHOLE, since it is one value: resuming a
+/// session — automatically at startup or explicitly via `/resume` — must not switch
+/// the model (or the provider) out from under it. The endpoint is never taken from
+/// the session either.
 ///
 /// Regression: resuming replaced the configured model with whatever the session
-/// last used, so `hrdr --provider go --model deepseek-v4-flash` in a directory
-/// with a saved session silently ran a different model, and the header showed
-/// the wrong one. `base_url` was clobbered too, contradicting the resume
-/// notice's "session endpoint was X (current: Y)".
+/// last used, so `hrdr --model go://deepseek-v4-flash` in a directory with a saved
+/// session silently ran a different model, and the header showed the wrong one.
+/// `base_url` was clobbered too, contradicting the resume notice's "session endpoint
+/// was X (current: Y)".
 #[tokio::test]
 async fn a_pinned_model_and_provider_survive_a_resume() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
-        // As if `--model flash --provider go` (or $HRDR_MODEL / $HRDR_PROVIDER).
-        // ONE pin now: the flags name one identity, so pinning is all-or-nothing.
+        // As if `--model go://flash` (or $HRDR_MODEL). ONE pin, for the one identity
+        // the flag names: pinning is all-or-nothing.
         h.app.cfg.model_pinned = true;
-        h.app.state_mut().model = "flash".into();
-        h.app.state_mut().provider = Some("go".into());
+        h.app.state_mut().model = "go://flash".parse().unwrap();
         let launch_endpoint = h.app.state().base_url.clone();
 
         let saved = hrdr_app::SessionState {
             cwd: h.app.current_cwd(),
-            model: "pro".into(),
-            provider: Some("zen".into()),
+            model: "zen://pro".parse().unwrap(),
             base_url: "https://saved.example/v1".into(),
             messages: vec![hrdr_agent::Message::system("sys")],
             transcript: vec![Entry::user("earlier")],
@@ -1833,14 +1832,9 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         }
 
         assert_eq!(
-            h.app.state().model,
-            "flash",
-            "pinned model wins (explicit_resume={explicit_resume})"
-        );
-        assert_eq!(
-            h.app.state().provider.as_deref(),
-            Some("go"),
-            "pinned provider wins (explicit_resume={explicit_resume})"
+            h.app.state().model.to_string(),
+            "go://flash",
+            "the pinned identity wins, whole (explicit_resume={explicit_resume})"
         );
         assert_eq!(
             h.app.state().base_url,
@@ -1875,8 +1869,7 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
 
     let saved = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
-        model: "deepseek-v4-flash".into(),
-        provider: Some("zen".into()),
+        model: "zen://deepseek-v4-flash".parse().unwrap(),
         messages: vec![hrdr_agent::Message::system("sys")],
         ..Default::default()
     };
@@ -1916,11 +1909,10 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     );
 
     h.app.sync_panes();
-    assert_eq!(h.app.state().model, "deepseek-v4-flash");
     assert_eq!(
-        h.app.state().provider.as_deref(),
-        Some("zen"),
-        "the bar names the provider the agent is actually talking to"
+        h.app.state().model.to_string(),
+        "zen://deepseek-v4-flash",
+        "the bar names the identity the agent is actually talking to"
     );
 }
 
@@ -1931,13 +1923,11 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
         assert!(!h.app.cfg.model_pinned, "the harness config isn't pinned");
-        h.app.state_mut().model = "from-config".into();
-        h.app.state_mut().provider = None;
+        h.app.state_mut().model = "local://from-config".parse().unwrap();
 
         let saved = hrdr_app::SessionState {
             cwd: h.app.current_cwd(),
-            model: "pro".into(),
-            provider: Some("zen".into()),
+            model: "zen://pro".parse().unwrap(),
             messages: vec![hrdr_agent::Message::system("sys")],
             ..Default::default()
         };
@@ -1949,11 +1939,10 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
         }
 
         assert_eq!(
-            h.app.state().model,
-            "pro",
-            "session beats config (explicit_resume={explicit_resume})"
+            h.app.state().model.to_string(),
+            "zen://pro",
+            "session beats config, whole (explicit_resume={explicit_resume})"
         );
-        assert_eq!(h.app.state().provider.as_deref(), Some("zen"));
     }
 }
 
@@ -3222,7 +3211,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
          frame, so a pane-only write would be silently undone"
     );
     assert_eq!(
-        h.app.state().model,
+        h.app.state().model.model(),
         "opus",
         "and the main agent is left alone"
     );
@@ -4472,8 +4461,8 @@ async fn browser_login_success_switches_provider() {
         "the switch transaction closed the modal"
     );
     assert_eq!(
-        h.app.state().provider.as_deref(),
-        Some("chatgpt"),
+        h.app.state().model.provider().as_str(),
+        "chatgpt",
         "the live provider switched to ChatGPT"
     );
 }

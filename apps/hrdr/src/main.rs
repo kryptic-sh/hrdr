@@ -4,9 +4,10 @@
 //! turn headlessly, streaming to stdout (scriptable, pipeable).
 //! `hrdr models` lists available models from the configured endpoint.
 //!
-//! hrdr talks to any running OpenAI-compatible endpoint; choose one with
-//! `--base-url` or a `--provider` preset. It does not manage a model server —
-//! start your own (infr, llama.cpp, vLLM, …) or point at a hosted provider.
+//! hrdr talks to any running OpenAI-compatible endpoint; name the model you want
+//! as `provider://model` (`--model chatgpt://gpt-5.5`), or point `--base-url` at a
+//! server you run. It does not manage a model server — start your own (infr,
+//! llama.cpp, vLLM, …) or point at a hosted provider.
 
 use std::io::Write;
 use std::time::Duration;
@@ -35,14 +36,12 @@ struct Cli {
     #[arg(long, global = true)]
     base_url: Option<String>,
 
-    /// Model id (default: $HRDR_MODEL).
-    #[arg(long, global = true)]
+    /// The model to run, as `provider://model` (`chatgpt://gpt-5.5`,
+    /// `openrouter://deepseek/deepseek-chat`) — which also sets the provider's
+    /// endpoint and key — or a bare model id (`gpt-5.5`), which is that model on
+    /// the provider already in effect. Default: $HRDR_MODEL.
+    #[arg(long, global = true, value_name = "PROVIDER://MODEL|MODEL")]
     model: Option<String>,
-
-    /// Provider preset: zen (OpenCode Zen), openai, or local. Sets the endpoint
-    /// and API-key env.
-    #[arg(long, global = true)]
-    provider: Option<String>,
 
     /// Use vim keybindings in the input pane (default: plain claude-style input).
     #[arg(long, global = true)]
@@ -57,14 +56,19 @@ struct Cli {
     #[arg(long, global = true)]
     effort: Option<String>,
 
-    /// Model for delegated sub-agents (the `task` tool). Same provider as the
-    /// main agent; defaults to the main model. E.g. Opus main + Sonnet subs.
-    #[arg(long = "subagent-model", global = true)]
+    /// Model for delegated sub-agents (the `task` tool), as `provider://model` or
+    /// a bare id (the main agent's provider, a cheaper model — Opus main + Sonnet
+    /// subs). Defaults to the main model.
+    #[arg(
+        long = "subagent-model",
+        global = true,
+        value_name = "PROVIDER://MODEL|MODEL"
+    )]
     subagent_model: Option<String>,
 
     /// Run the main agent AS a named agent (a built-in like `explore`/`plan`, a
     /// discovered `.claude`/`.opencode`/`.hrdr` agent file, or a `[[subagent]]`):
-    /// adopt its system prompt, tool scope, model/provider, and knobs.
+    /// adopt its system prompt, tool scope, model, and knobs.
     #[arg(long = "agent", global = true, value_name = "NAME")]
     agent: Option<String>,
 
@@ -211,6 +215,50 @@ enum Command {
     Models,
 }
 
+/// The identity this process runs on, from the sources that can name it.
+///
+/// `specs` are the `ModelSpec`s the sources named, **lowest precedence first**
+/// (config.toml, `$HRDR_MODEL`, `--model`), each applied onto what the layer below
+/// settled — so a bare model id always means "that model, on the provider already in
+/// effect", whichever layer wrote it.
+///
+/// The provider in effect *before any of them* is `last_used`: the identity the user
+/// last switched to interactively (the `/model` picker, `/login`). That is the launch
+/// fallback, and the only place startup reads that store — a delegation never does,
+/// because a `task` must resolve identically on every machine and in CI.
+fn settle_identity(
+    last_used: Option<hrdr_agent::ModelRef>,
+    specs: &[hrdr_agent::ModelSpec],
+) -> hrdr_agent::ModelRef {
+    let mut identity = last_used.unwrap_or_else(|| {
+        hrdr_agent::DEFAULT_MODEL_REF
+            .parse()
+            .expect("a valid default identity")
+    });
+    for spec in specs {
+        identity = spec.apply(&identity);
+    }
+    identity
+}
+
+/// The endpoint to talk to: the provider's `preset` URL, unless something
+/// **relocates** it.
+///
+/// `flag` (`--base-url` / `$HRDR_BASE_URL`) always wins — it is this run's decision.
+/// `file` (a free-floating `base_url =` in config.toml) is the endpoint of whatever
+/// provider the user wrote it for, so a provider named anywhere else
+/// (`provider_named`) supersedes it. A relocation keeps the identity: it is still that
+/// provider, at another address.
+fn settle_base_url(
+    flag: Option<String>,
+    file: Option<String>,
+    preset: &str,
+    provider_named: bool,
+) -> String {
+    flag.or_else(|| file.filter(|_| !provider_named))
+        .unwrap_or_else(|| preset.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -234,6 +282,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // A config still written in the old two-key form (`provider = …` beside
+    // `model = …`) is refused outright: the pair could always disagree, and picking
+    // one of a contradictory pair on the user's behalf is the whole class of bug
+    // this design removes. Sessions migrate silently; config does not.
+    if let Err(e) = hrdr_agent::check_config_compat() {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
     // Precedence: CLI flag > env var > config file > built-in default. Display
     // knobs live in UiConfig (hrdr-app); model/endpoint/loop knobs in
     // AgentConfig (hrdr-agent) — both read the same config.toml + HRDR_* vars.
@@ -241,119 +298,86 @@ async fn main() -> Result<()> {
     let mut ui = hrdr_app::UiConfig::load();
 
     // ── The identity edge ───────────────────────────────────────────────────
-    // config.toml, the environment and the CLI each spell the model identity as
-    // TWO keys (`provider = …`, `model = …`). This is the only place that is true:
-    // the halves are layered by precedence here, collapsed into one `ModelRef`, and
-    // the core never sees a half again.
-    let mut remote_provider = false;
-    // Last-used fallback: when nothing names a provider/model, resume the identity
-    // the user last switched to (recorded by the `/model` selector and `/login`).
+    // config.toml, the environment and the CLI each name the model with ONE key —
+    // `model = "provider://model"`, `$HRDR_MODEL`, `--model`. Each is a `ModelSpec`:
+    // a `provider://model` names the whole identity, a bare id names a model on the
+    // provider already in effect. They are layered here, lowest first, and what the
+    // core sees is the one `ModelRef` they settle to.
+    //
+    // The provider "already in effect" at launch, when nothing above names one, is
+    // the last-used identity (recorded by the `/model` picker and `/login`) — the
+    // launch fallback, and the ONLY place startup consults that interactive store.
+    // A delegation never does: it must resolve the same on every machine and in CI.
     let last_used = hrdr_agent::load_last_model();
-    // What config.toml + $HRDR_PROVIDER/$HRDR_MODEL named (`AgentConfig::load` has
-    // already collapsed these into `config.model`; the startup precedence below
-    // needs to know which halves were actually NAMED, and by whom).
-    let named = hrdr_agent::named_model();
-    let config_provider = named.provider.clone();
-    let config_had_provider = named.provider.is_some();
-    let config_had_model = named.model.is_some();
-    let provider_name = cli
-        .provider
-        .clone()
-        .or_else(|| named.provider.clone())
-        .or_else(|| last_used.as_ref().map(|r| r.provider().to_string()));
-    // A `model` in config.toml belongs to the provider config.toml names. It must
-    // NOT follow the user onto a provider they switched to — `model = "sonnet"`
-    // plus `hrdr --provider chatgpt` would otherwise suppress the ChatGPT preset's
-    // default and send a Claude model id to the Codex endpoint. A config model
-    // with no config provider is a global default, and so still yields to an
-    // explicit `--provider`.
-    let config_model_applies = config_had_model
-        && match (&config_provider, &provider_name) {
-            (Some(cp), Some(n)) => cp.eq_ignore_ascii_case(n),
-            (Some(_), None) => true,
-            (None, _) => cli.provider.is_none(),
-        };
-    let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
-    // The model half, settled: a flag/env or an applicable config model, else the
-    // model the provider ITSELF answers with (the last one used on it, else one it
-    // declares — `model_for_provider`), else the `default` sentinel.
-    let mut identity = config.model.clone();
-    if let Some(name) = &provider_name {
-        let provider = hrdr_agent::ProviderName::new(name);
-        let p = config.resolve_provider(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown provider '{name}' (built-ins: zen, openai, openrouter, claude, local; \
-                 or define [providers.{name}] in config)"
-            )
-        })?;
-        let model = if model_overridden || config_model_applies {
-            // Whatever the flag/env/config named, on this provider.
-            config.model.model().to_string()
-        } else {
-            // The provider is named but no model is: never carry the old one over.
-            // The fallback chain answers, or nothing does — in which case we launch
-            // on the `default` sentinel and say so below, exactly as before.
-            hrdr_agent::model_for_resolved_provider(&provider, &p)
-                .map(|r| r.model().to_string())
-                .unwrap_or_else(|_| hrdr_agent::DEFAULT_MODEL.to_string())
-        };
-        identity = hrdr_agent::ModelRef::new(provider, &model)?;
-
-        // Provider sets the endpoint unless an explicit --base-url / $HRDR_BASE_URL wins.
-        let base_overridden = cli.base_url.is_some() || std::env::var_os("HRDR_BASE_URL").is_some();
-        if !base_overridden {
-            config.base_url = p.base_url.clone();
-        }
-        // Key precedence: inline > key_env var > credential saved by `/login`.
-        // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT
-        // login with usable/refreshable credentials is `OAuth` (no key), so it
-        // must not draw the missing-key warning. Only a genuinely unconfigured
-        // remote provider (`Missing`) warns; the copy is unchanged.
-        let auth_state = hrdr_agent::provider_auth_state(name, &p, None, None);
-        if let Some(key) = hrdr_agent::resolve_api_key(name, &p, None, None) {
-            config.api_key = Some(key);
-        } else if config.api_key.is_none() && auth_state == hrdr_agent::ProviderAuthState::Missing {
-            let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
-            eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
-        }
-        // Stamp the provider's flat preset — EXCEPT for the Codex endpoint, whose
-        // preset is only right for its default model (gpt-5.5 = 272k) and would
-        // over-state a smaller entitled model (a 128k codex model). Codex is
-        // resolved per-model below, once the final model is known.
-        if config.context_window.is_none() && p.base_url != hrdr_agent::CHATGPT_CODEX_BASE_URL {
-            config.context_window = p.context_window;
-        }
-        config.headers = p.headers.into_iter().collect();
-        config.api_version = p.api_version;
-        remote_provider = p.remote;
-    }
-
-    // Restore the last-used identity as the final fallback: only when neither a
-    // flag/env nor config named a provider *or* a model (the pure fresh case), so
-    // the last-used identity beats a preset's default — whole, never half.
-    if !model_overridden
-        && !config_had_provider
-        && !config_had_model
-        && let Some(r) = &last_used
-    {
-        identity = r.clone();
-    }
-
-    if let Some(u) = cli.base_url {
-        config.base_url = u;
-    }
-    // A `--model` / `--provider` flag outranks everything, including a resumed
-    // session's (flag > env > session > config). `--model` is a bare model id here
-    // (slice D teaches it `provider://model`), so it rides on the provider settled
-    // above.
-    // ONE pin for ONE identity: either flag names the thing this process runs on,
-    // and a resumed session does not get to replace it.
-    if cli.model.is_some() || cli.provider.is_some() {
+    let cli_spec = cli
+        .model
+        .as_deref()
+        .map(str::parse::<hrdr_agent::ModelSpec>)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--model {}: {e}", cli.model.clone().unwrap_or_default()))?;
+    let named_specs = hrdr_agent::named_model_specs();
+    let specs: Vec<hrdr_agent::ModelSpec> =
+        named_specs.iter().chain(cli_spec.iter()).cloned().collect();
+    let identity = settle_identity(last_used.clone(), &specs);
+    // ONE pin for ONE identity: `--model` (like `$HRDR_MODEL`) names the thing this
+    // process runs on, and a resumed session does not get to replace it.
+    if cli_spec.is_some() {
         config.model_pinned = true;
     }
-    if let Some(m) = cli.model {
-        identity = hrdr_agent::ModelSpec::ModelOnly(m).apply(&identity);
+
+    // The endpoint the identity's provider resolves to — its key, headers and
+    // api-version with it. A `--base-url` / `$HRDR_BASE_URL` **relocates** that
+    // provider (it is still that provider, at another address); a bare `--base-url`
+    // with nothing else named lands on `local`, which is exactly what `local` means:
+    // an OpenAI-compatible server you run.
+    let name = identity.provider().as_str().to_string();
+    let p = config.resolve_provider(&name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown provider '{name}' (built-ins: {}; or define [providers.{name}] in config)",
+            hrdr_agent::BUILTIN_PROVIDERS.join(", ")
+        )
+    })?;
+    // A free-floating `base_url` in config.toml is the endpoint of whatever provider
+    // the user wrote it for; a provider named ANYWHERE (a `provider://model` spec,
+    // or the last-used identity) supersedes it, as it always has. A flag/env one
+    // relocates unconditionally.
+    let provider_named = last_used.is_some()
+        || specs
+            .iter()
+            .any(|s| matches!(s, hrdr_agent::ModelSpec::Full(_)));
+    let flag_url = cli
+        .base_url
+        .clone()
+        .or_else(|| std::env::var("HRDR_BASE_URL").ok());
+    // `AgentConfig::load` has already layered config.toml's `base_url` (and
+    // `$HRDR_BASE_URL`) into `config.base_url`; anything other than the default is a
+    // value the user wrote somewhere.
+    let file_url =
+        (config.base_url != hrdr_agent::DEFAULT_BASE_URL).then(|| config.base_url.clone());
+    config.base_url = settle_base_url(flag_url, file_url, &p.base_url, provider_named);
+    // Key precedence: inline > key_env var > credential saved by `/login`.
+    // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT login
+    // with usable/refreshable credentials is `OAuth` (no key), so it must not draw
+    // the missing-key warning. Only a genuinely unconfigured remote provider
+    // (`Missing`) warns; the copy is unchanged.
+    let auth_state = hrdr_agent::provider_auth_state(&name, &p, None, None);
+    if let Some(key) = hrdr_agent::resolve_api_key(&name, &p, None, None) {
+        config.api_key = Some(key);
+    } else if config.api_key.is_none() && auth_state == hrdr_agent::ProviderAuthState::Missing {
+        let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
+        eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
     }
+    // Stamp the provider's flat preset — EXCEPT for the Codex endpoint, whose preset
+    // is only right for its default model (gpt-5.5 = 272k) and would over-state a
+    // smaller entitled model (a 128k codex model). Codex is resolved per-model below,
+    // once the final model is known.
+    if config.context_window.is_none() && p.base_url != hrdr_agent::CHATGPT_CODEX_BASE_URL {
+        config.context_window = p.context_window;
+    }
+    config.headers = p.headers.into_iter().collect();
+    config.api_version = p.api_version;
+    let remote_provider = p.remote;
+
     config.model = identity;
     if cli.vim {
         ui.vim_mode = true;
@@ -365,7 +389,10 @@ async fn main() -> Result<()> {
         config.effort = Some(e);
     }
     if let Some(m) = cli.subagent_model {
-        config.subagent_model = Some(m);
+        config.subagent_model = Some(
+            m.parse()
+                .map_err(|e| anyhow::anyhow!("--subagent-model {m}: {e}"))?,
+        );
     }
     if let Some(d) = cli.memory_dir {
         config.memory_dir = Some(d);
@@ -375,7 +402,7 @@ async fn main() -> Result<()> {
     // tool (built-ins + discovered files + config), applied onto the main config
     // (delegation + MCP are kept, unlike a delegated sub-agent).
     if let Some(name) = cli.agent.as_deref() {
-        let profiles = hrdr_agent::resolve_agent_profiles(&config);
+        let profiles = hrdr_agent::resolve_agent_profiles(&config)?;
         let profile = profiles
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(name.trim()))
@@ -695,10 +722,52 @@ mod cli_tests {
     /// Flags still bind to hrdr, not to the command — as long as they come first.
     #[test]
     fn flags_before_the_command_still_reach_hrdr() {
-        let cli = Cli::parse_from(["hrdr", "--provider", "zen", "--vim", "/model"]);
-        assert_eq!(cli.provider.as_deref(), Some("zen"));
+        let cli = Cli::parse_from(["hrdr", "--model", "zen://kimi-k2", "--vim", "/model"]);
+        assert_eq!(cli.model.as_deref(), Some("zen://kimi-k2"));
         assert!(cli.vim);
         assert_eq!(cli.input.join(" "), "/model");
+    }
+
+    /// `--provider` is GONE: the provider is named in the model, or not at all.
+    /// Passing it is an error, not a silently-ignored flag.
+    #[test]
+    fn the_provider_flag_no_longer_exists() {
+        assert!(
+            Cli::try_parse_from(["hrdr", "--provider", "zen"]).is_err(),
+            "--provider must not parse — it is spelled `--model zen://<model>` now"
+        );
+    }
+
+    /// `--model` takes a whole `provider://model` identity or a bare model id, and
+    /// hands them to `ModelSpec` unchanged — `://` is the only separator, so a
+    /// slashed or colon'd model id is never mistaken for a provider.
+    #[test]
+    fn the_model_flag_takes_a_spec_of_either_shape() {
+        use hrdr_agent::{ModelRef, ModelSpec};
+        let spec = |argv: [&str; 3]| -> ModelSpec {
+            Cli::parse_from(argv)
+                .model
+                .expect("--model was passed")
+                .parse()
+                .expect("a valid spec")
+        };
+        let base: ModelRef = "zen://kimi-k2".parse().unwrap();
+
+        // A URI sets the whole identity.
+        let full = spec(["hrdr", "--model", "chatgpt://gpt-5.5"]);
+        assert_eq!(full, ModelSpec::Full("chatgpt://gpt-5.5".parse().unwrap()));
+        assert_eq!(full.apply(&base), "chatgpt://gpt-5.5".parse().unwrap());
+
+        // A bare id keeps the provider in effect — slashes and colons included.
+        for (arg, want) in [
+            ("gpt-5.5", "zen://gpt-5.5"),
+            ("moonshotai/kimi-k2", "zen://moonshotai/kimi-k2"),
+            ("llama3:8b", "zen://llama3:8b"),
+        ] {
+            let s = spec(["hrdr", "--model", arg]);
+            assert!(matches!(s, ModelSpec::ModelOnly(_)), "{arg}");
+            assert_eq!(s.apply(&base), want.parse().unwrap(), "{arg}");
+        }
     }
 
     /// The subcommands still win: adding a trailing command must not have turned
@@ -714,6 +783,91 @@ mod cli_tests {
 
         let cli = Cli::parse_from(["hrdr", "models"]);
         assert!(matches!(cli.command, Some(Command::Models)));
+    }
+
+    /// The launch identity, settled: a URI names the whole thing, a bare id rides on
+    /// the provider already in effect, and nothing at all resumes the last-used one.
+    #[test]
+    fn the_model_spec_layers_settle_the_launch_identity() {
+        use hrdr_agent::{ModelRef, ModelSpec};
+        let spec = |s: &str| s.parse::<ModelSpec>().unwrap();
+        let last = |s: &str| Some(s.parse::<ModelRef>().unwrap());
+        let got = |last_used, specs: &[ModelSpec]| settle_identity(last_used, specs).to_string();
+
+        // `--model chatgpt://gpt-5.5` sets the WHOLE identity — it does not matter
+        // what was in effect before.
+        assert_eq!(
+            got(last("zen://kimi-k2"), &[spec("chatgpt://gpt-5.5")]),
+            "chatgpt://gpt-5.5"
+        );
+        // `--model gpt-5.5` (bare) keeps the provider in effect.
+        assert_eq!(
+            got(last("zen://kimi-k2"), &[spec("gpt-5.5")]),
+            "zen://gpt-5.5"
+        );
+        // Nothing named: the last-used identity is resumed, whole.
+        assert_eq!(got(last("zen://kimi-k2"), &[]), "zen://kimi-k2");
+        // Nothing named and nothing used: `local://default` — the server you run,
+        // serving whatever it was started with.
+        assert_eq!(got(None, &[]), hrdr_agent::DEFAULT_MODEL_REF);
+        // A bare `--base-url` names no provider, so the identity stays `local` — and
+        // `local` IS "the OpenAI-compatible server I run".
+        assert_eq!(
+            settle_identity(None, &[]).provider().as_str(),
+            "local",
+            "a bare --base-url run is a `local` run"
+        );
+
+        // The layers COMPOSE, lowest first: a config `openrouter://deepseek-chat`
+        // under a `$HRDR_MODEL=kimi-k2` means kimi-k2 ON openrouter — a bare id never
+        // drops the provider a lower layer named.
+        assert_eq!(
+            got(None, &[spec("openrouter://deepseek-chat"), spec("kimi-k2")]),
+            "openrouter://kimi-k2"
+        );
+        // …and a URI at a higher layer replaces the lot.
+        assert_eq!(
+            got(
+                last("zen://kimi-k2"),
+                &[spec("openrouter://deepseek-chat"), spec("local://qwen3")]
+            ),
+            "local://qwen3"
+        );
+    }
+
+    /// The endpoint: the provider's, unless relocated. `--base-url` always relocates;
+    /// a config-file `base_url` yields to a provider named anywhere.
+    #[test]
+    fn base_url_relocates_the_provider_it_never_replaces_it() {
+        const PRESET: &str = "https://openrouter.ai/api/v1";
+        // A `--base-url` / `$HRDR_BASE_URL` wins over everything.
+        assert_eq!(
+            settle_base_url(Some("http://x/v1".into()), None, PRESET, true),
+            "http://x/v1"
+        );
+        // With no provider named, a bare `--base-url` is the `local` endpoint — the
+        // whole point of `local` (keyless, `remote: false`, a server you run).
+        assert_eq!(
+            settle_base_url(
+                Some("http://localhost:9099/v1".into()),
+                None,
+                hrdr_agent::DEFAULT_BASE_URL,
+                false
+            ),
+            "http://localhost:9099/v1"
+        );
+        // A config-file `base_url` applies when nothing named a provider…
+        assert_eq!(
+            settle_base_url(None, Some("http://file/v1".into()), PRESET, false),
+            "http://file/v1"
+        );
+        // …and yields to one that did: the preset belongs to the provider you named.
+        assert_eq!(
+            settle_base_url(None, Some("http://file/v1".into()), PRESET, true),
+            PRESET
+        );
+        // Nothing at all: the provider's own endpoint.
+        assert_eq!(settle_base_url(None, None, PRESET, true), PRESET);
     }
 
     /// No command → nothing to run at startup (the plain TUI).

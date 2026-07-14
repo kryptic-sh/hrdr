@@ -536,8 +536,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.skill_selector = Some(super::skill_selector(skills));
     }
     fn begin_model_selector(&mut self) {
-        let choices =
-            hrdr_agent::model_choices(&self.app.cfg, self.app.state().provider.as_deref());
+        let choices = hrdr_agent::model_choices(
+            &self.app.cfg,
+            Some(self.app.state().model.provider().as_str()),
+        );
         // A built-in ChatGPT login contributes rows asynchronously (its models
         // aren't in the sync catalog), so the picker may open even when the sync
         // list is empty — the async load fills it. Gated on the TRUSTED built-in
@@ -596,10 +598,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.session_selector = Some(super::session_selector(sessions));
     }
     fn begin_effort_selector(&mut self) {
-        let choices = hrdr_app::effort_choices(
-            self.app.state().provider.as_deref(),
-            &self.app.state().model,
-        );
+        let reference = self.app.state().model.clone();
+        let choices =
+            hrdr_app::effort_choices(Some(reference.provider().as_str()), reference.model());
         self.app.effort_selector = Some(super::effort_selector(choices));
     }
     fn begin_theme_selector(&mut self) {
@@ -1045,7 +1046,8 @@ impl super::App {
         if provider != "chatgpt" {
             return;
         }
-        let choices = hrdr_agent::model_choices(&self.cfg, self.state().provider.as_deref());
+        let choices =
+            hrdr_agent::model_choices(&self.cfg, Some(self.state().model.provider().as_str()));
         self.model_gen = self.model_gen.wrapping_add(1);
         self.model_source = None;
         self.model_selector = Some(super::model_selector(choices));
@@ -1131,9 +1133,9 @@ impl super::App {
             return; // token/refresh failed — keep the cached rows.
         }
         self.model_source = Some(source);
-        let provider = self.state().provider.clone();
+        let provider = self.state().model.provider().to_string();
         if let Some(sel) = &mut self.model_selector {
-            let base = hrdr_agent::model_choices(&self.cfg, provider.as_deref());
+            let base = hrdr_agent::model_choices(&self.cfg, Some(&provider));
             let usage = hrdr_agent::load_model_usage();
             let merged = hrdr_agent::merge_chatgpt_choices(base, &models, &usage);
             sel.replace_model_choices(merged);

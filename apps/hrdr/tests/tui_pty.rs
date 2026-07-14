@@ -129,12 +129,7 @@ fn run_tui(keys: &str) -> Run {
     }
     cmd.env("TERM", "xterm-256color");
     // Whatever the developer has exported must not reach the child.
-    for key in [
-        "HRDR_BASE_URL",
-        "HRDR_MODEL",
-        "HRDR_PROVIDER",
-        "HRDR_API_KEY",
-    ] {
+    for key in ["HRDR_BASE_URL", "HRDR_MODEL", "HRDR_API_KEY"] {
         cmd.env_remove(key);
     }
 

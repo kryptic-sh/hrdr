@@ -266,7 +266,14 @@ impl From<ModelRef> for String {
 ///
 /// The distinction is purely syntactic — the presence of `://` — which is why the
 /// parse never has to guess whether `moonshotai/kimi-k2` names a provider.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// This is the **input** type of every model-naming surface: `--model`,
+/// `$HRDR_MODEL`, `--subagent-model`, `model = …` in config.toml, an agent
+/// profile's `model:`, and the `task` tool's `model` argument. It serializes as
+/// the one string it was written as, so a config file carries exactly what the
+/// user typed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum ModelSpec {
     /// The input carried a `://`: switch provider AND model.
     Full(ModelRef),
@@ -310,6 +317,26 @@ impl fmt::Display for ModelSpec {
             Self::Full(r) => write!(f, "{r}"),
             Self::ModelOnly(m) => f.write_str(m),
         }
+    }
+}
+
+impl TryFrom<String> for ModelSpec {
+    type Error = ModelRefError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<ModelSpec> for String {
+    fn from(s: ModelSpec) -> Self {
+        s.to_string()
+    }
+}
+
+impl From<ModelRef> for ModelSpec {
+    fn from(r: ModelRef) -> Self {
+        Self::Full(r)
     }
 }
 
@@ -527,6 +554,32 @@ mod tests {
         for s in ["openrouter://deepseek/deepseek-chat", "moonshotai/kimi-k2"] {
             assert_eq!(s.parse::<ModelSpec>().unwrap().to_string(), s);
         }
+    }
+
+    /// A spec is one string on disk too — exactly what the user typed. It is the
+    /// type of every model-naming key now (`model = …` in config.toml, an agent
+    /// profile's `model:`, `subagent_model`), so what a config carries is what a
+    /// `/model` switch would have accepted.
+    #[test]
+    fn a_spec_serializes_as_the_one_string_it_was_written_as() {
+        for s in [
+            "openrouter://deepseek/deepseek-chat",
+            "moonshotai/kimi-k2",
+            "llama3:8b",
+        ] {
+            let spec: ModelSpec = s.parse().unwrap();
+            let json = serde_json::to_string(&spec).unwrap();
+            assert_eq!(json, format!("\"{s}\""));
+            assert_eq!(serde_json::from_str::<ModelSpec>(&json).unwrap(), spec);
+        }
+        // The provider half still folds through deserialization.
+        assert_eq!(
+            serde_json::from_str::<ModelSpec>("\"anthropic://claude-opus-4-8\"").unwrap(),
+            ModelSpec::Full("claude://claude-opus-4-8".parse().unwrap())
+        );
+        // A half-written identity is refused rather than landing as a model id.
+        assert!(serde_json::from_str::<ModelSpec>("\"zen://\"").is_err());
+        assert!(serde_json::from_str::<ModelSpec>("\"\"").is_err());
     }
 
     /// `apply` is total: a full spec replaces the identity, a bare model keeps the

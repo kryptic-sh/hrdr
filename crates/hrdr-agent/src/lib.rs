@@ -85,7 +85,10 @@ struct DelegationEndpoint {
 struct DelegationRuntime {
     public: PublicModelRuntime,
     endpoint: DelegationEndpoint,
-    explicit_subagent_model: Option<String>,
+    /// `--subagent-model` / `subagent_model = …`: a bare id (a different model on
+    /// the parent's provider) or a whole `provider://model` (a different provider
+    /// too).
+    explicit_subagent_model: Option<ModelSpec>,
 }
 
 type SharedDelegationRuntime = Arc<Mutex<DelegationRuntime>>;
@@ -154,11 +157,11 @@ impl hrdr_tools::Tool for ModelsTool {
         let default_model = runtime
             .public
             .delegation_enabled
-            .then(|| {
-                runtime
-                    .explicit_subagent_model
-                    .clone()
-                    .unwrap_or_else(|| active_model.clone())
+            .then(|| match &runtime.explicit_subagent_model {
+                // The spec resolved against the identity in force: a bare id names a
+                // model on this provider, a `provider://model` one names its own.
+                Some(spec) => spec.apply(&runtime.public.reference).model().to_string(),
+                None => active_model.clone(),
             })
             .filter(|m| m != DEFAULT_MODEL);
         let mut warnings = Vec::new();
@@ -1135,11 +1138,23 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     // Everything else — memory, compaction, guardrails, hooks, the cost ceiling
     // — is inherited, and the agent works with no UI attached.
     base.is_subagent = true;
-    // The sub-agent model, on the SAME provider — that is what
-    // `[subagent_model]` / `--subagent-model` mean (a bare model id: "Opus
-    // drives, Sonnet implements", same endpoint, same key, same bill).
-    if let Some(m) = &config.subagent_model {
-        base.model = ModelSpec::ModelOnly(m.clone()).apply(&config.model);
+    // The sub-agent model. A bare id is a model on the SAME provider — "Opus
+    // drives, Sonnet implements", same endpoint, same key, same bill. A whole
+    // `provider://model` moves the sub-agents to another provider, and the endpoint
+    // (key, headers, api-version) has to follow it, or they would be sent to the
+    // parent's endpoint under another provider's model id.
+    if let Some(spec) = &config.subagent_model {
+        let reference = spec.apply(&config.model);
+        let (key, url) = (base.api_key.clone(), base.base_url.clone());
+        let parent = AuthContext {
+            api_key: key.as_deref(),
+            base_url: &url,
+        };
+        if apply_model_ref(&mut base, reference.clone(), Some(&parent)).is_err() {
+            // An unresolvable provider is reported when a `task` actually spawns
+            // (where there is somewhere to report it); the identity still stands.
+            base.model = reference;
+        }
     }
     base
 }
@@ -1185,63 +1200,70 @@ fn apply_model_ref(
     Ok(())
 }
 
-/// The identity a `(provider, model)` argument pair names, against the identity
-/// `cfg` is already on. This is the **programmatic** entry point — agent profiles
-/// (`[[subagent]]`, `agents/*.md`).
+/// The identity a **model spec** names, against the identity `cfg` is already on.
+/// This is the **programmatic** entry point — agent profiles (`[[subagent]]`,
+/// `agents/*.md`) and the `task` tool's `model` argument.
 ///
 /// The three shapes a source can spell, and only these:
-/// - both → that exact identity;
-/// - a model alone → [`ModelSpec::ModelOnly`]: same provider, new model;
-/// - a provider alone → the model that provider itself DECLARES, else an error.
-///   NEVER `cfg`'s current model id, which belongs to the provider being left —
-///   that silent carry-over is the bug this whole seam exists to kill.
+/// - `provider://model` → that exact identity ([`ModelSpec::Full`]);
+/// - a bare `model` → [`ModelSpec::ModelOnly`]: same provider, new model;
+/// - `provider://` (a provider, no model) → the model that provider itself
+///   DECLARES, else an error. NEVER `cfg`'s current model id, which belongs to the
+///   provider being left — that silent carry-over is the bug this whole seam
+///   exists to kill.
 ///
 /// Note what is deliberately absent: the interactive last-used store
 /// ([`model_for_provider`]). A profile is configuration, so it must resolve the
 /// same way for everyone — folding in "whatever a human last picked on that
 /// provider" would make the same sub-agent run a different model on each
 /// developer's machine and a third one in CI. The store is consulted only by the
-/// interactive switches (`/login`, the `/model` picker), where carrying on with
-/// what you were using is precisely the intent.
-fn named_pair_ref(
-    cfg: &AgentConfig,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> Result<Option<ModelRef>> {
-    Ok(match (provider, model) {
-        (Some(p), Some(m)) => Some(ModelRef::new(ProviderName::new(p), m)?),
-        (Some(p), None) => {
-            let declared = cfg
-                .resolve_provider(p)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown provider '{p}' (built-ins: {}, or define [providers.{p}])",
-                        BUILTIN_PROVIDERS.join(", ")
-                    )
-                })?
-                .model;
-            let Some(m) = declared else {
-                bail!(
-                    "provider '{p}' needs a model — name one as '{p}://<model>' \
-                     (it declares no default)"
-                );
-            };
-            Some(ModelRef::new(ProviderName::new(p), &m)?)
-        }
-        (None, Some(m)) => Some(ModelSpec::ModelOnly(m.to_string()).apply(&cfg.model)),
-        (None, None) => None,
-    })
+/// interactive switches (`/login`, the `/model` picker) and by the startup launch
+/// fallback, where carrying on with what you were using is precisely the intent.
+fn named_spec_ref(cfg: &AgentConfig, spec: Option<&str>) -> Result<Option<ModelRef>> {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    // `provider://` — a provider with no model. The provider's DECLARED model, or
+    // nothing: never the model of the provider being left.
+    if let Some(p) = provider_only_spec(spec) {
+        let declared = cfg
+            .resolve_provider(&p)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown provider '{p}' (built-ins: {}, or define [providers.{p}])",
+                    BUILTIN_PROVIDERS.join(", ")
+                )
+            })?
+            .model;
+        let Some(m) = declared else {
+            bail!(
+                "provider '{p}' needs a model — name one as '{p}://<model>' \
+                 (it declares no default)"
+            );
+        };
+        return Ok(Some(ModelRef::new(ProviderName::new(&p), &m)?));
+    }
+    let spec: ModelSpec = spec.parse()?;
+    Ok(Some(spec.apply(&cfg.model)))
 }
 
-/// Apply the `task` tool's ad-hoc `provider`/`model` arguments on top of an
-/// already-resolved config (post agent-profile). With `provider`: auth-gate the
-/// target (fail fast before spawning) and switch. Without: `model` overrides on
-/// the current provider.
+/// The provider named by a `provider://` spec — a provider with no model, the one
+/// shape [`ModelSpec`] does not carry (it is by definition incomplete). `None` for
+/// every complete spec.
+fn provider_only_spec(spec: &str) -> Option<String> {
+    let p = spec.trim().strip_suffix("://")?.trim();
+    (!p.is_empty()).then(|| p.to_string())
+}
+
+/// Apply the `task` tool's ad-hoc `model` argument — a [`ModelSpec`] — on top of an
+/// already-resolved config (post agent-profile). A bare model id overrides on the
+/// provider in force; a `provider://model` (or a `provider://`, which takes the
+/// provider's declared model) switches provider too, and that target is auth-gated
+/// here — fail fast, before spawning.
 fn apply_task_overrides(
     cfg: &mut AgentConfig,
     parent: &AgentConfig,
-    provider: Option<&str>,
-    model: Option<&str>,
+    spec: Option<&str>,
 ) -> Result<()> {
     // The identity this delegation runs on.
     //
@@ -1252,53 +1274,46 @@ fn apply_task_overrides(
     // depending on what a human last happened to pick. The last-used fallback is
     // for *interactive* switches (`/login`, the `/model` picker), where "carry on
     // with what I was using" is the whole point; a spawned sub-agent is not that.
-    let reference = match (provider, model) {
-        (Some(pname), _) => {
-            // Resolve + gate against the PARENT's key/base_url, before switching.
-            let p = cfg.resolve_provider(pname).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
-                    BUILTIN_PROVIDERS.join(", ")
-                )
-            })?;
-            let current_auth = provider_auth_state(
-                pname,
-                &p,
-                cfg.api_key.as_deref(),
-                Some(cfg.base_url.as_str()),
-            );
-            let parent_auth = provider_auth_state(
-                pname,
-                &p,
-                parent.api_key.as_deref(),
-                Some(parent.base_url.as_str()),
-            );
-            if current_auth == ProviderAuthState::Missing
-                && parent_auth == ProviderAuthState::Missing
-            {
-                // Only suggest an env var when the provider actually reads one;
-                // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
-                // would be sent chasing a var that resolve_api_key never consults.
-                let hint = match p.key_env.as_deref() {
-                    Some(env) => format!("set ${env}, or run /login"),
-                    None => format!(
-                        "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
-                    ),
-                };
-                bail!("task: provider '{pname}' is not configured — {hint}");
-            }
-            let Some(m) = model.or(p.model.as_deref()) else {
-                bail!("task: provider '{pname}' requires an explicit model (it has no default)");
-            };
-            Some(ModelRef::new(ProviderName::new(pname), m)?)
-        }
-        // No provider named: a bare model overrides on the provider we are already on.
-        (None, Some(m)) => Some(ModelSpec::ModelOnly(m.to_string()).apply(&cfg.model)),
-        (None, None) => None,
-    };
+    let reference = named_spec_ref(cfg, spec).map_err(|e| anyhow::anyhow!("task: {e:#}"))?;
     let Some(reference) = reference else {
         return Ok(());
     };
+    // A change of PROVIDER is what needs gating: the sub-agent is about to be sent
+    // to another endpoint, with another credential.
+    let switching = reference.provider() != cfg.model.provider();
+    if switching {
+        let pname = reference.provider().as_str();
+        let p = cfg.resolve_provider(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "task: unknown provider '{pname}' (built-ins: {}, or define [providers.{pname}])",
+                BUILTIN_PROVIDERS.join(", ")
+            )
+        })?;
+        let current_auth = provider_auth_state(
+            pname,
+            &p,
+            cfg.api_key.as_deref(),
+            Some(cfg.base_url.as_str()),
+        );
+        let parent_auth = provider_auth_state(
+            pname,
+            &p,
+            parent.api_key.as_deref(),
+            Some(parent.base_url.as_str()),
+        );
+        if current_auth == ProviderAuthState::Missing && parent_auth == ProviderAuthState::Missing {
+            // Only suggest an env var when the provider actually reads one;
+            // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
+            // would be sent chasing a var that resolve_api_key never consults.
+            let hint = match p.key_env.as_deref() {
+                Some(env) => format!("set ${env}, or run /login"),
+                None => format!(
+                    "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
+                ),
+            };
+            bail!("task: provider '{pname}' is not configured — {hint}");
+        }
+    }
     // Key inheritance: the CHILD's own context first (it may already sit on this
     // endpoint), then the parent's. `AuthContext` carries the endpoint each key
     // belongs to, so `resolve_api_key`'s `same_endpoint` guard can refuse to hand
@@ -1322,7 +1337,7 @@ fn apply_task_overrides(
                 .and_then(|r| r.api_key().map(str::to_string))
         });
     apply_model_ref(cfg, reference, Some(&child_ctx))?;
-    if provider.is_some() {
+    if switching {
         cfg.api_key = inherited;
     }
     Ok(())
@@ -1339,9 +1354,8 @@ pub fn config_for_agent_profile(
     profile: &SubagentProfile,
 ) -> Result<AgentConfig> {
     let mut cfg = base.clone();
-    if let Some(reference) =
-        named_pair_ref(&cfg, profile.provider.as_deref(), profile.model.as_deref())?
-    {
+    let spec = profile.model.as_ref().map(ModelSpec::to_string);
+    if let Some(reference) = named_spec_ref(&cfg, spec.as_deref())? {
         // The profile's own endpoint inherits the parent's key only across the
         // SAME endpoint (`resolve_api_key`'s guard) — a profile naming another
         // provider must not be handed this one's credential. Snapshotted: the
@@ -1429,8 +1443,10 @@ impl SubagentTool {
              Issue several `task` calls in one turn to run sub-agents in **parallel** (e.g. \
              explore several areas at once), or set `background: true` to fire one off and keep \
              working — its result is delivered to you automatically when it finishes. Run \
-             cheaper/faster work on a different `model`, or delegate to a different, \
-             already-configured `provider`",
+             cheaper/faster work on another `model` — a bare id (`gpt-5.5-mini`) is that model \
+             on the provider you are already on, and `provider://model` \
+             (`openrouter://deepseek/deepseek-chat`) delegates to a different, already-configured \
+             provider",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -1441,11 +1457,13 @@ impl SubagentTool {
                  especially:\n",
             );
             for p in &profiles {
-                let mut tags = match (&p.provider, &p.model) {
-                    (Some(pr), Some(m)) => format!("{pr} · {m}"),
-                    (Some(pr), None) => pr.clone(),
-                    (None, Some(m)) => m.clone(),
-                    (None, None) => "main provider".to_string(),
+                // ONE key, so ONE label: `provider · model` for a whole identity, the
+                // bare model id for a model on the provider in force, and nothing at
+                // all when the profile names neither.
+                let mut tags = match &p.model {
+                    Some(ModelSpec::Full(r)) => format!("{} · {}", r.provider(), r.model()),
+                    Some(ModelSpec::ModelOnly(m)) => m.clone(),
+                    None => "main provider".to_string(),
                 };
                 if p.read_only {
                     tags.push_str(" · read-only");
@@ -1506,11 +1524,7 @@ impl hrdr_tools::Tool for SubagentTool {
             },
             "model": {
                 "type": "string",
-                "description": "Optional model override. Defaults to the profile's / configured subagent model, else the main model."
-            },
-            "provider": {
-                "type": "string",
-                "description": "Optional provider for the sub-agent — any built-in provider name or a [providers.*] entry from config that is configured and authenticated. Omit to keep the current provider; when set, pass `model` too (unless the provider has a default)."
+                "description": "Optional model override, named as `provider://model` or as a bare model id. A bare id (`gpt-5.5-mini`, `deepseek/deepseek-chat`) is that model on the provider you are already on. A `provider://model` (`openrouter://deepseek/deepseek-chat`) also switches the provider — it must be one that is configured and authenticated (a built-in name or a [providers.*] entry); `provider://` on its own uses that provider's configured default model. Defaults to the profile's / configured subagent model, else the main model."
             },
             "background": {
                 "type": "boolean",
@@ -1569,21 +1583,27 @@ impl hrdr_tools::Tool for SubagentTool {
         cfg.api_key = live.api_key().map(str::to_string);
         cfg.api_version = live.api_version().map(str::to_string);
         cfg.headers = live.headers().to_vec();
-        // The sub-agent model rides on the parent's PROVIDER — a bare model id
-        // never changes which endpoint it is sent to.
-        cfg.model = match &runtime.explicit_subagent_model {
-            Some(m) => ModelSpec::ModelOnly(m.clone()).apply(live.reference()),
-            None => live.reference().clone(),
-        };
+        cfg.model = live.reference().clone();
         cfg.effort = runtime.endpoint.effort;
-        // The parent's *live* endpoint + key, captured before an agent profile can
-        // repoint `cfg` away from it. This — not `self.base` — is the context an
-        // ad-hoc `provider` override inherits auth from. `self.base` names the
-        // endpoint the session *launched* on, and a `/model` switch since then
-        // would leave the gate judging a provider against an endpoint the session
-        // left long ago: an ad-hoc delegation back to the provider you are
-        // currently using could be rejected as "not configured".
+        // The parent's *live* endpoint + key, captured before the configured
+        // sub-agent model or an agent profile can repoint `cfg` away from it. This —
+        // not `self.base` — is the context an ad-hoc provider switch inherits auth
+        // from. `self.base` names the endpoint the session *launched* on, and a
+        // `/model` switch since then would leave the gate judging a provider against
+        // an endpoint the session left long ago: an ad-hoc delegation back to the
+        // provider you are currently using could be rejected as "not configured".
         let live_parent = cfg.clone();
+        // The configured sub-agent model (`--subagent-model` / `subagent_model`): a
+        // bare id rides on the parent's PROVIDER and never changes which endpoint the
+        // request is sent to; a whole `provider://model` moves the endpoint with it.
+        if let Some(spec) = &runtime.explicit_subagent_model {
+            let reference = spec.apply(live.reference());
+            let parent_ctx = AuthContext {
+                api_key: live.api_key(),
+                base_url: live.base_url(),
+            };
+            apply_model_ref(&mut cfg, reference, Some(&parent_ctx))?;
+        }
 
         let mut isolation: Option<String> = None;
         if let Some(name) = args.get("agent").and_then(|v| v.as_str())
@@ -1600,44 +1620,24 @@ impl hrdr_tools::Tool for SubagentTool {
                         known.join(", ")
                     )
                 })?;
-            let task_model = args
-                .get("model")
-                .and_then(|v| v.as_str())
-                .filter(|m| !m.trim().is_empty());
             // No `last_model_on` escape here, deliberately: a profile-driven
             // delegation is as programmatic as a `task` arg, so its model must come
-            // from the profile or the provider's own default — never from the
-            // interactive last-used store, which would make the same sub-agent run a
-            // different model for each developer.
-            if let Some(provider) = profile.provider.as_deref()
-                && profile.model.is_none()
-                && self
-                    .base
-                    .resolve_provider(provider)
-                    .and_then(|p| p.model)
-                    .is_none()
-                && task_model.is_none()
-            {
-                bail!(
-                    "subagent '{}': provider '{provider}' has no configured model; set task.model or profile.model",
-                    profile.name
-                );
-            }
+            // from the profile, the `task` call, or the provider's own default —
+            // never from the interactive last-used store, which would make the same
+            // sub-agent run a different model for each developer.
             isolation = profile.isolation.clone();
-            cfg = config_for_agent_profile(&cfg, profile)?;
+            cfg = config_for_agent_profile(&cfg, profile)
+                .map_err(|e| anyhow::anyhow!("subagent '{}': {e:#}", profile.name))?;
         }
         cfg.cwd = ctx.cwd.clone();
-        let provider_arg = args
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        // ONE argument for the one identity: a bare model id (same provider) or a
+        // whole `provider://model`.
         let model_arg = args
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        apply_task_overrides(&mut cfg, &live_parent, provider_arg, model_arg)?;
+        apply_task_overrides(&mut cfg, &live_parent, model_arg)?;
         if cfg.has_default_model() {
             bail!(
                 "no model configured — set `model` in config.toml, $HRDR_MODEL, or pass \
@@ -1913,8 +1913,8 @@ pub struct AgentConfig {
     /// unlimited. Estimates come from the models.dev catalog; calls on an
     /// unpriced model count as $0.
     pub max_cost: Option<f64>,
-    /// The model identity was set by a CLI flag (`--model` / `--provider`) or by
-    /// `$HRDR_MODEL` / `$HRDR_PROVIDER`, which outrank a resumed session's. A value
+    /// The model identity was set by the `--model` CLI flag or by `$HRDR_MODEL`,
+    /// which outrank a resumed session's. A value
     /// from the config file (or a provider preset's default) leaves this false, so
     /// a session may override it.
     ///
@@ -2061,11 +2061,11 @@ pub struct AgentConfig {
     /// `global/` scope subdirectories still apply beneath it. Config
     /// `memory_dir`, `--memory-dir`, `$HRDR_MEMORY_DIR`.
     pub memory_dir: Option<PathBuf>,
-    /// Default model for delegated sub-agents (same provider/endpoint as the main
-    /// agent). `None` reuses the main agent's model; the `task` tool's `model`
-    /// argument overrides per call. This is the "Opus drives, Sonnet implements"
-    /// knob.
-    pub subagent_model: Option<String>,
+    /// Default model for delegated sub-agents. A bare id is that model on the main
+    /// agent's provider/endpoint — the "Opus drives, Sonnet implements" knob; a
+    /// `provider://model` moves them to another provider entirely. `None` reuses the
+    /// main agent's identity; the `task` tool's `model` argument overrides per call.
+    pub subagent_model: Option<ModelSpec>,
     /// Named sub-agent profiles from `[[subagent]]` config, each pinning a
     /// provider + model. The `task` tool's `agent` argument selects one, letting
     /// a sub-agent run on a **different provider** than the main agent.
@@ -2093,20 +2093,24 @@ pub struct AgentConfig {
         Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>,
 }
 
-/// A named sub-agent profile (`[[subagent]]`): a provider + model the `task` tool
-/// can delegate to, so a sub-agent can run on a different provider than the main
-/// agent (e.g. Opus on Anthropic manages, a model on another provider implements).
+/// A named sub-agent profile (`[[subagent]]`): a model the `task` tool can
+/// delegate to, so a sub-agent can run on a different model — or a different
+/// **provider** — than the main agent (e.g. Opus on Anthropic manages, a model on
+/// another provider implements).
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct SubagentProfile {
     /// Name the model refers to (the `task` tool's `agent` argument).
     pub name: String,
-    /// Provider preset / `[providers.<name>]` to run this sub-agent on. Omit to
-    /// use the main agent's provider (just a different model).
+    /// The model this sub-agent runs on, as ONE key: a bare id (`kimi-k2`) is that
+    /// model on the main agent's provider; a `provider://model`
+    /// (`openrouter://deepseek/deepseek-chat`) names the provider too, and the
+    /// endpoint, key and headers follow it. Omit (or `model: inherit` in an
+    /// `agents/*.md` file) to run on the main agent's identity unchanged.
+    ///
+    /// There is no separate `provider` key — that pair could always disagree, and a
+    /// config still carrying one is refused at startup.
     #[serde(default)]
-    pub provider: Option<String>,
-    /// Model for this sub-agent. Omit to use the provider's default model.
-    #[serde(default)]
-    pub model: Option<String>,
+    pub model: Option<ModelSpec>,
     /// One-line hint shown to the model so it can pick the right sub-agent.
     #[serde(default)]
     pub description: Option<String>,
@@ -2170,7 +2174,7 @@ pub struct SubagentProfile {
 ///   agent to delegate to it **unprompted**) — it's forced to `false` even for
 ///   a non-colliding name, since prompting the model to reach for
 ///   attacker-controlled instructions without being asked is itself the risk.
-pub fn resolve_agent_profiles(config: &AgentConfig) -> Vec<SubagentProfile> {
+pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfile>> {
     fn overlay(profiles: &mut Vec<SubagentProfile>, incoming: SubagentProfile) {
         match profiles
             .iter_mut()
@@ -2182,7 +2186,7 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Vec<SubagentProfile> {
     }
     let mut profiles = builtin_subagent_profiles();
     let builtin_names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-    for mut p in discover_agent_profiles(&config.cwd) {
+    for mut p in discover_agent_profiles(&config.cwd)? {
         if builtin_names
             .iter()
             .any(|n| n.eq_ignore_ascii_case(&p.name))
@@ -2200,7 +2204,7 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Vec<SubagentProfile> {
     for up in config.subagent_profiles.clone() {
         overlay(&mut profiles, up);
     }
-    profiles
+    Ok(profiles)
 }
 
 /// The always-available built-in sub-agents: read-only `explore` and `review`
@@ -2210,7 +2214,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
     vec![
         SubagentProfile {
             name: "explore".to_string(),
-            provider: None,
             model: None,
             description: Some(
                 "Read-only codebase investigator — trace files, types, and call \
@@ -2230,7 +2233,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
         },
         SubagentProfile {
             name: "review".to_string(),
-            provider: None,
             model: None,
             description: Some(
                 "Read-only code reviewer — audit code or a change for bugs, edge \
@@ -2250,7 +2252,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
         },
         SubagentProfile {
             name: "plan".to_string(),
-            provider: None,
             model: None,
             description: Some(
                 "Planner — investigates read-only, then writes a step-by-step plan \
@@ -2270,7 +2271,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
         },
         SubagentProfile {
             name: "general".to_string(),
-            provider: None,
             model: None,
             description: Some(
                 "General-purpose agent — full tool access for open-ended, \
@@ -2415,7 +2415,7 @@ impl RepeatGuard {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080/v1".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             // `local` IS the default endpoint (`http://localhost:8080/v1`) and
             // `default` IS the default model id — the pair the two old fields
@@ -2477,6 +2477,10 @@ impl Default for AgentConfig {
 /// the user runs themselves (`http://localhost:8080/v1`), serving whatever model
 /// it was started with (`default` — let the endpoint pick).
 pub const DEFAULT_MODEL_REF: &str = "local://default";
+
+/// The endpoint a config with nothing set talks to — the `local` provider's, since
+/// `local` IS "the OpenAI-compatible server I run".
+pub const DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
 
 /// The model id meaning "whatever this endpoint serves" — not a model name.
 /// A remote provider needs a real id; this sentinel is only ever right for a
@@ -2941,13 +2945,17 @@ pub(crate) struct ToolOutputConfig {
 }
 
 /// Subset of config.toml we parse; all fields are optional.
+///
+/// The model identity is ONE key — `model = "openrouter://deepseek/deepseek-chat"`
+/// — deserialized as a [`ModelSpec`] (a bare id is that model on the provider in
+/// effect). The old top-level `provider = …` selector is gone; a config still
+/// carrying it is refused at startup by [`legacy_config_error`].
 #[derive(serde::Deserialize, Default)]
 struct FileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
-    model: Option<String>,
+    model: Option<ModelSpec>,
     temperature: Option<f32>,
-    provider: Option<String>,
     context_window: Option<u32>,
     max_tokens: Option<u32>,
     top_p: Option<f32>,
@@ -2961,7 +2969,7 @@ struct FileConfig {
     subagents: Option<bool>,
     memory: Option<bool>,
     memory_dir: Option<String>,
-    subagent_model: Option<String>,
+    subagent_model: Option<ModelSpec>,
     #[serde(default)]
     subagent: Vec<SubagentProfile>,
     effort: Option<String>,
@@ -2988,87 +2996,101 @@ struct FileConfig {
     lsp: Option<LspFileConfig>,
 }
 
-/// What a config SOURCE named about the model identity, in the two keys it
-/// spells it in (`provider = …` / `model = …`, `$HRDR_PROVIDER` / `$HRDR_MODEL`,
-/// `--provider` / `--model`).
-///
-/// The identity itself is one value ([`ModelRef`]) and the core only ever sees
-/// that. But the *sources* are two-key, and a source may name one half — so the
-/// halves exist for exactly as long as it takes to settle the precedence between
-/// sources, and then [`collapse`](Self::collapse) them. This is the edge, and the
-/// only place halves are allowed to be.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NamedModel {
-    /// The provider this source named, if any.
-    pub provider: Option<String>,
-    /// The model id this source named, if any.
-    pub model: Option<String>,
+/// The model spec `$HRDR_MODEL` names, if it names one.
+pub fn env_model_spec() -> Option<ModelSpec> {
+    std::env::var("HRDR_MODEL").ok()?.parse().ok()
 }
 
-impl NamedModel {
-    /// What `$HRDR_PROVIDER` / `$HRDR_MODEL` name (empty when neither is set).
-    pub fn from_env() -> Self {
-        Self {
-            provider: std::env::var("HRDR_PROVIDER").ok(),
-            model: std::env::var("HRDR_MODEL").ok(),
-        }
-    }
-
-    /// Overlay a **higher-precedence** source: each half it names wins, each half
-    /// it is silent about leaves this one's alone.
-    pub fn layer(&mut self, higher: &Self) {
-        if let Some(p) = &higher.provider {
-            self.provider = Some(p.clone());
-        }
-        if let Some(m) = &higher.model {
-            self.model = Some(m.clone());
-        }
-    }
-
-    /// Collapse the halves onto `base` — the identity in force — into ONE
-    /// [`ModelRef`]. An unnamed half keeps `base`'s; an empty/whitespace one is
-    /// not a name and is ignored (`ModelRef` rejects it anyway).
-    ///
-    /// This is the *last* moment halves exist. Note what it does NOT do: it never
-    /// carries a model onto a provider that a different source named — that
-    /// judgement (`config_model_applies`, and the fallback chain in
-    /// [`model_for_provider`]) belongs to the caller layering the sources, which
-    /// is why this takes an explicit `base`.
-    pub fn collapse(&self, base: &ModelRef) -> ModelRef {
-        let provider = self
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map_or_else(|| base.provider().clone(), ProviderName::new);
-        let model = self
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| base.model());
-        ModelRef::new(provider, model).unwrap_or_else(|_| base.clone())
-    }
+/// What config.toml and the environment NAMED for the model identity — ONE key
+/// each, as [`ModelSpec`]s, **lowest precedence first** (config.toml, then
+/// `$HRDR_MODEL`), for the ONE caller that needs them: the CLI startup edge, which
+/// applies them in order onto the identity in effect and layers its own `--model`
+/// on top (see the identity edge in `main.rs`).
+///
+/// They are a list, not one value, because they *compose*: a config naming
+/// `openrouter://deepseek-chat` and a `$HRDR_MODEL=kimi-k2` mean "kimi-k2, on
+/// openrouter" — a bare id rides on whatever provider is in effect, and only a
+/// `provider://model` moves the provider.
+///
+/// [`AgentConfig::load`] has already applied both onto [`AgentConfig::model`]
+/// (against the `local` default); this says what was actually *named*, which is what
+/// the startup precedence turns on.
+pub fn named_model_specs() -> Vec<ModelSpec> {
+    read_config_file::<FileConfig>()
+        .and_then(|fc| fc.model)
+        .into_iter()
+        .chain(env_model_spec())
+        .collect()
 }
 
-/// What config.toml and the environment NAMED for the model identity — the raw
-/// halves, for the ONE caller that needs them: the CLI startup edge, which layers
-/// its own `--provider` / `--model` on top and settles the precedence between all
-/// three before collapsing them (see [`NamedModel::collapse`]).
+/// The startup refusal for a config.toml still written in the old two-key form —
+/// `Some(message)` when `text` carries the dead `provider` selector, `None` when it
+/// is already in the one-key form.
 ///
-/// [`AgentConfig::load`] has already collapsed these into
-/// [`AgentConfig::model`]; this says which halves were actually *named*, which is
-/// what the precedence rules turn on (a config `model` belongs to the config's
-/// `provider` and must not follow the user onto a `--provider` they passed).
-pub fn named_model() -> NamedModel {
-    let mut named = read_config_file::<FileConfig>()
-        .map(|fc| NamedModel {
-            provider: fc.provider,
-            model: fc.model,
-        })
-        .unwrap_or_default();
-    named.layer(&NamedModel::from_env());
-    named
+/// A HARD ERROR, not a migration: the two keys could always disagree, and guessing
+/// which of a contradictory pair the user meant is exactly the behavior this
+/// refactor exists to remove. The message names the file, echoes the values the
+/// user actually wrote, and prints the single line that replaces them.
+///
+/// (Sessions are the opposite case — they are data, not config, and migrate
+/// silently. Config is a statement of intent, and a stale one is worth stopping
+/// for.)
+pub fn legacy_config_error(text: &str, path: &std::path::Path) -> Option<String> {
+    let toml::Value::Table(root) = text.parse::<toml::Value>().ok()? else {
+        return None;
+    };
+    let as_str = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(str::to_string);
+
+    // The top-level selector: `provider = "openrouter"` beside `model = "…"`.
+    if let Some(provider) = as_str(root.get("provider")) {
+        let model = as_str(root.get("model"));
+        let old = match &model {
+            Some(m) => format!("      provider = \"{provider}\"\n      model = \"{m}\""),
+            None => format!("      provider = \"{provider}\""),
+        };
+        let new = model.unwrap_or_else(|| "<model-id>".to_string());
+        return Some(format!(
+            "hrdr: {} uses the old split provider/model keys.\n  \
+             replace:\n{old}\n  with:\n      model = \"{provider}://{new}\"",
+            path.display(),
+        ));
+    }
+
+    // The same split, inside a `[[subagent]]` profile.
+    let profiles = root.get("subagent").and_then(|v| v.as_array())?;
+    for p in profiles {
+        let Some(provider) = as_str(p.get("provider")) else {
+            continue;
+        };
+        let name = as_str(p.get("name")).unwrap_or_else(|| "<name>".to_string());
+        let model = as_str(p.get("model"));
+        let old = match &model {
+            Some(m) => format!("      provider = \"{provider}\"\n      model = \"{m}\""),
+            None => format!("      provider = \"{provider}\""),
+        };
+        let new = model.unwrap_or_else(|| "<model-id>".to_string());
+        return Some(format!(
+            "hrdr: {} uses the old split provider/model keys in [[subagent]] '{name}'.\n  \
+             replace:\n{old}\n  with:\n      model = \"{provider}://{new}\"",
+            path.display(),
+        ));
+    }
+    None
+}
+
+/// [`legacy_config_error`] against the user's real config file. `Ok(())` when there
+/// is no config file, or it is already written in the one-key form.
+pub fn check_config_compat() -> Result<()> {
+    let Some(path) = config_file_path() else {
+        return Ok(());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    match legacy_config_error(&text, &path) {
+        Some(msg) => bail!(msg),
+        None => Ok(()),
+    }
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -3110,26 +3132,30 @@ impl AgentConfig {
     /// and fails to parse (for surfacing a warning + falling back to defaults).
     pub fn load_checked() -> Result<Self> {
         let mut cfg = Self::default();
-        let mut named = NamedModel::default();
-        if let Some(fc) = read_config_file::<FileConfig>() {
-            named.provider = fc.provider.clone();
-            named.model = fc.model.clone();
+        let file_spec = read_config_file::<FileConfig>().and_then(|fc| {
+            let spec = fc.model.clone();
             cfg.apply_file(fc);
-        }
+            spec
+        });
         cfg.apply_env();
-        named.layer(&NamedModel::from_env());
-        cfg.model = named.collapse(&cfg.model);
-        // Env-supplied identity outranks a resumed session's; a config-file one
-        // doesn't (flag > env > session > config). The binary ORs in its `--model` /
-        // `--provider` flags on top of this. ONE pin, because there is one identity.
-        cfg.model_pinned = NamedModel::from_env() != NamedModel::default();
+        // ONE key, layered by precedence: `$HRDR_MODEL` over config.toml's `model`.
+        // A `provider://model` names the whole identity; a bare id is that model on
+        // the provider in effect — which, here, is whatever the layer below settled
+        // (the `local` default, until the CLI edge folds in the last-used identity).
+        for spec in [file_spec, env_model_spec()].into_iter().flatten() {
+            cfg.model = spec.apply(&cfg.model);
+        }
+        // An env-supplied identity outranks a resumed session's; a config-file one
+        // doesn't (flag > env > session > config). The binary ORs in its `--model`
+        // flag on top of this. ONE pin, because there is one identity.
+        cfg.model_pinned = env_model_spec().is_some();
         Ok(cfg)
     }
 
-    /// Layer file values over the current config. The identity's two keys
-    /// (`provider = …`, `model = …`) are picked up by [`load_checked`](Self::load_checked)
-    /// and collapsed there — a source may name one half, and a half is not an
-    /// identity.
+    /// Layer file values over the current config. The identity's one key
+    /// (`model = "provider://model"`) is picked up by
+    /// [`load_checked`](Self::load_checked) and applied there, since it layers
+    /// against the environment.
     fn apply_file(&mut self, fc: FileConfig) {
         if let Some(v) = fc.base_url {
             self.base_url = v;
@@ -3318,9 +3344,9 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// single row here (non-capturing closures coerce to `fn` pointers). Values that
 /// need parsing (numbers, bools) silently keep the current value on a bad parse.
 ///
-/// `$HRDR_PROVIDER` / `$HRDR_MODEL` are deliberately NOT here: they name halves
-/// of the one identity, and are collapsed into it by [`NamedModel`] rather than
-/// assigned one at a time.
+/// `$HRDR_MODEL` is deliberately NOT here: it names the one identity, as a
+/// [`ModelSpec`] layered against config.toml's `model` (see
+/// [`AgentConfig::load_checked`]), rather than a field assigned in isolation.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_BASE_URL", |c, v| c.base_url = v),
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
@@ -3386,7 +3412,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
         }
     }),
     ("HRDR_PROMPT_CACHE_TTL", |c, v| c.prompt_cache_ttl = Some(v)),
-    ("HRDR_SUBAGENT_MODEL", |c, v| c.subagent_model = Some(v)),
+    ("HRDR_SUBAGENT_MODEL", |c, v| {
+        if let Ok(spec) = v.parse() {
+            c.subagent_model = Some(spec);
+        }
+    }),
     ("HRDR_SUBAGENTS", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
             c.subagents = b;
@@ -4071,7 +4101,7 @@ impl Agent {
             }
         }
         if config.subagents {
-            let profiles = resolve_agent_profiles(&config);
+            let profiles = resolve_agent_profiles(&config)?;
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
@@ -6170,6 +6200,12 @@ mod tests {
         s.parse().expect("a valid provider://model")
     }
 
+    /// What a `--model` / `task.model` / profile `model` names: a whole identity or
+    /// a bare model id on the provider in force.
+    fn spec(s: &str) -> super::ModelSpec {
+        s.parse().expect("a valid model spec")
+    }
+
     /// A new conversation starts from the `AGENTS.md` that is on disk *now*, and
     /// says so when that differs from what was in the prompt.
     ///
@@ -6583,7 +6619,7 @@ mod tests {
             effort: Some("low".to_string()),
             subagents: false,
             headers: vec![("X-Test".to_string(), "value".to_string())],
-            subagent_model: Some("subagent-model".to_string()),
+            subagent_model: Some(spec("subagent-model")),
             checkpoints: Some("off".to_string()),
             ..Default::default()
         };
@@ -7034,7 +7070,7 @@ mod tests {
         use super::subagent_base_config;
         let cfg = AgentConfig {
             model: r("claude://opus"),
-            subagent_model: Some("sonnet".to_string()),
+            subagent_model: Some(spec("sonnet")),
             ..Default::default()
         };
         let base = subagent_base_config(&cfg);
@@ -7305,8 +7341,7 @@ mod tests {
         // A profile pinning a built-in provider repoints endpoint + model.
         let prof = SubagentProfile {
             name: "implementer".to_string(),
-            provider: Some("openrouter".to_string()),
-            model: Some("moonshotai/kimi-k2".to_string()),
+            model: Some(spec("openrouter://moonshotai/kimi-k2")),
             description: None,
             prompt: Some("Implement precisely.".to_string()),
             read_only: false,
@@ -7333,8 +7368,7 @@ mod tests {
             &base,
             &SubagentProfile {
                 name: "x".to_string(),
-                provider: None,
-                model: Some("claude-haiku".to_string()),
+                model: Some(spec("claude-haiku")),
                 description: None,
                 prompt: None,
                 read_only: false,
@@ -7359,8 +7393,7 @@ mod tests {
                 &base,
                 &SubagentProfile {
                     name: "y".to_string(),
-                    provider: Some("nope".to_string()),
-                    model: None,
+                    model: Some(spec("nope://m")),
                     description: None,
                     prompt: None,
                     read_only: false,
@@ -7415,7 +7448,7 @@ mod tests {
     /// answer it is an ERROR, not a silent carry-over.
     #[test]
     fn a_provider_with_no_model_never_inherits_the_previous_providers_model() {
-        use super::named_pair_ref;
+        use super::named_spec_ref;
         let cfg = AgentConfig {
             model: r("zen://kimi-k2"),
             ..Default::default()
@@ -7427,7 +7460,7 @@ mod tests {
         // store has no `openai` entry", which meant that for any developer who had
         // actually used openai, THE test protecting the central invariant of this
         // refactor quietly asserted nothing at all and still reported green.
-        let err = named_pair_ref(&cfg, Some("openai"), None)
+        let err = named_spec_ref(&cfg, Some("openai://"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("provider 'openai' needs a model"), "{err}");
@@ -7438,19 +7471,21 @@ mod tests {
         );
         // A provider that DOES declare one answers with it — never with kimi-k2.
         assert_eq!(
-            named_pair_ref(&cfg, Some("chatgpt"), None).unwrap(),
+            named_spec_ref(&cfg, Some("chatgpt://")).unwrap(),
             Some(r("chatgpt://gpt-5.5"))
         );
-        // And an explicit model is always taken as given.
+        // And a whole `provider://model` is always taken as given.
         assert_eq!(
-            named_pair_ref(&cfg, Some("openai"), Some("gpt-5.5")).unwrap(),
+            named_spec_ref(&cfg, Some("openai://gpt-5.5")).unwrap(),
             Some(r("openai://gpt-5.5"))
         );
         // A bare model stays on the provider in force (`ModelSpec::ModelOnly`).
         assert_eq!(
-            named_pair_ref(&cfg, None, Some("grok-code")).unwrap(),
+            named_spec_ref(&cfg, Some("grok-code")).unwrap(),
             Some(r("zen://grok-code"))
         );
+        // Nothing named → nothing to change.
+        assert_eq!(named_spec_ref(&cfg, None).unwrap(), None);
     }
 
     #[test]
@@ -7480,7 +7515,7 @@ mod tests {
 
         // (a) un-authenticated provider → fail fast, no repoint.
         let mut cfg = base.clone();
-        let err = apply_task_overrides(&mut cfg, &base, Some("ghost"), Some("m"))
+        let err = apply_task_overrides(&mut cfg, &base, Some("ghost://m"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not configured"), "got: {err}");
@@ -7488,7 +7523,7 @@ mod tests {
 
         // (b) keyless `local` (built-in) with a model → switches the whole identity.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, &base, Some("local"), Some("deepseek-x")).unwrap();
+        apply_task_overrides(&mut cfg, &base, Some("local://deepseek-x")).unwrap();
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.model, r("local://deepseek-x"));
 
@@ -7500,25 +7535,32 @@ mod tests {
         // earlier revision guarded this on "…only if the store has no `local` entry",
         // which passes green while asserting nothing for anyone who has used it.)
         let mut cfg = base.clone();
-        let err = apply_task_overrides(&mut cfg, &base, Some("local"), None)
+        let err = apply_task_overrides(&mut cfg, &base, Some("local://"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("requires an explicit model"), "got: {err}");
+        assert!(err.contains("provider 'local' needs a model"), "got: {err}");
+        assert!(err.contains("local://<model>"), "got: {err}");
         assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"), "unchanged on error");
 
         // (d) unknown provider → error.
         let mut cfg = base.clone();
-        assert!(apply_task_overrides(&mut cfg, &base, Some("nope"), Some("m")).is_err());
+        assert!(apply_task_overrides(&mut cfg, &base, Some("nope://m")).is_err());
 
-        // (e) no provider, just a model → override on the current provider.
+        // (e) a BARE model id → override on the current provider, same endpoint.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, &base, None, Some("gpt-5.5")).unwrap();
+        apply_task_overrides(&mut cfg, &base, Some("gpt-5.5")).unwrap();
         assert_eq!(cfg.base_url, base.base_url); // still chatgpt endpoint
         assert_eq!(cfg.model, r("chatgpt://gpt-5.5"));
-
-        // (f) neither → no-op.
+        // …including a bare id with a SLASH in it: `://` is the only separator, so an
+        // OpenRouter-style id never gets mistaken for a provider.
         let mut cfg = base.clone();
-        apply_task_overrides(&mut cfg, &base, None, None).unwrap();
+        apply_task_overrides(&mut cfg, &base, Some("moonshotai/kimi-k2")).unwrap();
+        assert_eq!(cfg.base_url, base.base_url);
+        assert_eq!(cfg.model, r("chatgpt://moonshotai/kimi-k2"));
+
+        // (f) nothing named → no-op.
+        let mut cfg = base.clone();
+        apply_task_overrides(&mut cfg, &base, None).unwrap();
         assert_eq!(cfg.model, r("chatgpt://gpt-5.6-sol"));
     }
 
@@ -7540,8 +7582,7 @@ mod tests {
         // on the parent endpoint).
         let prof = SubagentProfile {
             name: "reviewer".to_string(),
-            provider: None,
-            model: Some("claude-sonnet".to_string()),
+            model: Some(spec("claude-sonnet")),
             description: None,
             prompt: Some("Review only.".to_string()),
             read_only: true,
@@ -7555,7 +7596,7 @@ mod tests {
         };
         let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
         // Ad-hoc override to a different provider + model.
-        apply_task_overrides(&mut cfg, &parent, Some("local"), Some("adhoc-model")).unwrap();
+        apply_task_overrides(&mut cfg, &parent, Some("local://adhoc-model")).unwrap();
         // Endpoint + model come from the ad-hoc override, together.
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.model, r("local://adhoc-model"));
@@ -7605,10 +7646,10 @@ mod tests {
                 api_version: None,
             },
         );
+        // `test-profile-b://` — the provider, at ITS OWN declared model.
         let profile = SubagentProfile {
             name: "reviewer".to_string(),
-            provider: Some("test-profile-b".to_string()),
-            model: None,
+            model: Some(spec("test-profile-b://profile-b-model")),
             description: None,
             prompt: Some("Preserve this persona.".to_string()),
             read_only: true,
@@ -7623,13 +7664,7 @@ mod tests {
 
         let base = subagent_base_config(&parent);
         let mut cfg = config_for_agent_profile(&base, &profile).unwrap();
-        apply_task_overrides(
-            &mut cfg,
-            &base,
-            Some("test-parent-a"),
-            Some("adhoc-a-model"),
-        )
-        .unwrap();
+        apply_task_overrides(&mut cfg, &base, Some("test-parent-a://adhoc-a-model")).unwrap();
 
         assert_eq!(cfg.base_url, parent_endpoint);
         assert_eq!(cfg.model, r("test-parent-a://adhoc-a-model"));
@@ -7670,7 +7705,7 @@ mod tests {
         );
 
         let mut cfg = parent.clone();
-        let err = apply_task_overrides(&mut cfg, &parent, Some("elsewhere"), Some("m"))
+        let err = apply_task_overrides(&mut cfg, &parent, Some("elsewhere://m"))
             .unwrap_err()
             .to_string();
         assert!(
@@ -7746,8 +7781,7 @@ mod tests {
 
         let profile = SubagentProfile {
             name: "reviewer".to_string(),
-            provider: Some("c-other".to_string()),
-            model: None,
+            model: Some(spec("c-other://m-c")),
             description: None,
             prompt: Some("Review.".to_string()),
             read_only: false,
@@ -8021,7 +8055,6 @@ mod tests {
         let base = subagent_base_config(&cfg);
         let profile = |t, e: Option<&str>, s| SubagentProfile {
             name: "k".to_string(),
-            provider: None,
             model: None,
             description: None,
             prompt: None,
@@ -8058,6 +8091,7 @@ mod tests {
             ..Default::default()
         };
         let general = resolve_agent_profiles(&base)
+            .unwrap()
             .into_iter()
             .find(|p| p.name == "general")
             .unwrap();
@@ -8100,7 +8134,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             ..Default::default()
         };
-        let profiles = resolve_agent_profiles(&cfg);
+        let profiles = resolve_agent_profiles(&cfg).unwrap();
 
         let explore = profiles.iter().find(|p| p.name == "explore").unwrap();
         assert!(
@@ -8859,8 +8893,8 @@ mod tests {
     fn env_setters_string_fields_directly() {
         // Exercise each string-typed setter in ENV_SETTERS by calling the fn
         // pointer directly, without touching process environment.
-        // `HRDR_PROVIDER` / `HRDR_MODEL` are deliberately absent: they name halves
-        // of one identity and are collapsed by `NamedModel`, never assigned singly.
+        // `HRDR_MODEL` is deliberately absent: it names the one identity, as a
+        // `ModelSpec` layered against config.toml's `model` — not a field set alone.
         let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[
             ("HRDR_BASE_URL", |c| &c.base_url),
             ("HRDR_CHECKPOINTS", |c| {
@@ -8913,9 +8947,8 @@ mod tests {
             max_cost: Some(2.5),
             base_url: Some("http://custom/v1".to_string()),
             api_key: Some("key123".to_string()),
-            model: Some("gpt-4".to_string()),
+            model: Some(spec("zen://gpt-4")),
             temperature: Some(0.5),
-            provider: Some("zen".to_string()),
             context_window: Some(8192),
             max_tokens: Some(16_000),
             top_p: Some(0.9),
@@ -8927,7 +8960,7 @@ mod tests {
             subagents: Some(false),
             memory: Some(false),
             memory_dir: Some("/tmp/mem".to_string()),
-            subagent_model: Some("claude-sonnet-4-6".to_string()),
+            subagent_model: Some(spec("claude-sonnet-4-6")),
             subagent: vec![],
             effort: Some("high".to_string()),
             auto_compact: Some(true),
@@ -8983,7 +9016,7 @@ mod tests {
             cfg.memory_dir.as_deref(),
             Some(std::path::Path::new("/tmp/mem"))
         );
-        assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(cfg.subagent_model, Some(spec("claude-sonnet-4-6")));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
@@ -10874,5 +10907,152 @@ mod tests {
             subagent_event_for(&AgentEvent::Reasoning("hmm".into())),
             None
         );
+    }
+}
+
+/// The one-key identity: what a config, an env var, a flag, a profile and a `task`
+/// argument all name now — and what the old two-key form is refused with.
+#[cfg(test)]
+mod one_key_identity_tests {
+    use super::*;
+
+    fn spec(s: &str) -> ModelSpec {
+        s.parse().expect("a valid model spec")
+    }
+
+    /// A config still carrying the split keys does not start — and the refusal names
+    /// the file, echoes the values the user actually wrote, and prints the ONE line
+    /// that replaces them. Nothing is guessed: a pair that can disagree is not
+    /// silently resolved in the user's favour, because there is no way to know which
+    /// half they meant.
+    #[test]
+    fn a_legacy_two_key_config_is_refused_and_names_the_exact_replacement() {
+        let path = std::path::Path::new("/home/me/.config/hrdr/config.toml");
+        let err = legacy_config_error(
+            "provider = \"openrouter\"\nmodel = \"deepseek/deepseek-chat\"\n",
+            path,
+        )
+        .expect("the old split keys are refused");
+        assert_eq!(
+            err,
+            "hrdr: /home/me/.config/hrdr/config.toml uses the old split provider/model keys.\n  \
+             replace:\n      provider = \"openrouter\"\n      model = \"deepseek/deepseek-chat\"\n  \
+             with:\n      model = \"openrouter://deepseek/deepseek-chat\"",
+        );
+
+        // The legacy `provider` key ALONE is just as dead — and just as clearly
+        // reported, with the model half left as a blank to fill in.
+        let err = legacy_config_error("provider = \"zen\"\n", path)
+            .expect("a lone provider key is refused too");
+        assert!(err.contains("old split provider/model keys"), "{err}");
+        assert!(err.contains("provider = \"zen\""), "{err}");
+        assert!(err.contains("model = \"zen://<model-id>\""), "{err}");
+
+        // The same split inside a `[[subagent]]` profile — also config, also refused.
+        let err = legacy_config_error(
+            "model = \"zen://kimi-k2\"\n\n[[subagent]]\nname = \"implementer\"\n\
+             provider = \"openrouter\"\nmodel = \"deepseek/deepseek-chat\"\n",
+            path,
+        )
+        .expect("a legacy subagent profile is refused");
+        assert!(err.contains("[[subagent]] 'implementer'"), "{err}");
+        assert!(
+            err.contains("model = \"openrouter://deepseek/deepseek-chat\""),
+            "{err}"
+        );
+
+        // …and a config already in the one-key form starts, `[providers.*]` tables
+        // (whose `model` is a BARE id — the provider is the table name) included.
+        assert_eq!(
+            legacy_config_error(
+                "model = \"openrouter://deepseek/deepseek-chat\"\n\n\
+                 [providers.mylocal]\nbase_url = \"http://localhost:9099/v1\"\n\
+                 model = \"qwen3\"\nremote = false\n\n\
+                 [[subagent]]\nname = \"implementer\"\nmodel = \"zen://kimi-k2\"\n",
+                path
+            ),
+            None,
+        );
+        assert_eq!(legacy_config_error("", path), None);
+    }
+
+    /// The `[providers.<name>]` table is untouched by all of this: its `model` is a
+    /// bare id (the provider IS the table name, so a URI there would be redundant),
+    /// and it is what a `provider://` spec resolves to.
+    #[test]
+    fn a_provider_table_still_declares_a_bare_model_id() {
+        let fc: FileConfig = toml::from_str(
+            "model = \"mylocal://qwen3\"\n\n[providers.mylocal]\n\
+             base_url = \"http://localhost:9099/v1\"\nmodel = \"qwen3\"\nremote = false\n",
+        )
+        .expect("the one-key form parses");
+        assert_eq!(fc.model, Some(spec("mylocal://qwen3")));
+        assert_eq!(
+            fc.providers["mylocal"].model.as_deref(),
+            Some("qwen3"),
+            "a provider table declares a BARE model id"
+        );
+
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        // `mylocal://` — the provider, at the model IT declares.
+        assert_eq!(
+            named_spec_ref(&cfg, Some("mylocal://")).unwrap(),
+            Some("mylocal://qwen3".parse().unwrap())
+        );
+    }
+
+    /// A `[[subagent]]` profile names the whole identity in one key — a bare id for
+    /// "a different model on my provider", a URI for "a different provider too".
+    #[test]
+    fn a_subagent_profile_deserializes_one_model_key() {
+        let fc: FileConfig = toml::from_str(
+            "[[subagent]]\nname = \"implementer\"\nmodel = \"openrouter://deepseek/deepseek-chat\"\n\n\
+             [[subagent]]\nname = \"cheap\"\nmodel = \"kimi-k2\"\n\n\
+             [[subagent]]\nname = \"inherits\"\n",
+        )
+        .expect("profiles parse");
+        assert_eq!(
+            fc.subagent[0].model,
+            Some(spec("openrouter://deepseek/deepseek-chat"))
+        );
+        assert_eq!(fc.subagent[1].model, Some(spec("kimi-k2")));
+        assert_eq!(fc.subagent[2].model, None, "omitted = inherit");
+    }
+
+    /// The `task` tool's ONE `model` argument, both shapes — the schema carries no
+    /// `provider` key at all any more.
+    #[tokio::test]
+    async fn the_task_tools_schema_has_one_model_arg_for_both_shapes() {
+        let cfg = AgentConfig {
+            model: "zen://kimi-k2".parse().unwrap(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let agent = Agent::new(cfg.clone()).unwrap();
+        let def = agent
+            .tools
+            .defs()
+            .into_iter()
+            .find(|d| d.function.name == "task")
+            .expect("the task tool is registered");
+        let schema = def.function.parameters;
+        let props = &schema["properties"];
+        assert!(props.get("provider").is_none(), "the provider arg is gone");
+        let desc = props["model"]["description"].as_str().unwrap();
+        assert!(desc.contains("provider://model"), "{desc}");
+        assert!(desc.contains("bare model id"), "{desc}");
+
+        // And what the arg *does*, at both shapes: a bare id keeps the endpoint, a
+        // URI moves it.
+        let mut bare = cfg.clone();
+        apply_task_overrides(&mut bare, &cfg, Some("grok-code")).unwrap();
+        assert_eq!(bare.model, "zen://grok-code".parse().unwrap());
+        assert_eq!(bare.base_url, cfg.base_url, "same provider, same endpoint");
+
+        let mut uri = cfg.clone();
+        apply_task_overrides(&mut uri, &cfg, Some("local://qwen3")).unwrap();
+        assert_eq!(uri.model, "local://qwen3".parse().unwrap());
+        assert_eq!(uri.base_url, DEFAULT_BASE_URL, "the endpoint moved with it");
     }
 }
