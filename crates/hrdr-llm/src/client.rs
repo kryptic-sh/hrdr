@@ -237,6 +237,22 @@ fn detect_backend(base_url: &str) -> Backend {
     }
 }
 
+/// The NAME of the wire protocol hrdr will speak at `base_url` — the public face
+/// of [`detect_backend`], which keys on the HOST.
+///
+/// Exposed because that host-keying is invisible and consequential: relocating a
+/// provider with `--base-url` (`claude://sonnet` at `http://localhost:1234/v1`)
+/// silently swaps the Anthropic Messages API for OpenAI chat-completions. A caller
+/// that compares this across two URLs can say so out loud rather than letting the
+/// request shape change under the user.
+pub fn wire_protocol(base_url: &str) -> &'static str {
+    match detect_backend(base_url) {
+        Backend::OpenAi => "OpenAI",
+        Backend::Anthropic => "Anthropic",
+        Backend::Codex => "Codex",
+    }
+}
+
 impl Client {
     /// `base_url` should include the `/v1` suffix, e.g. `http://localhost:8080/v1`.
     pub fn new(
@@ -966,5 +982,25 @@ mod tests {
     #[test]
     fn context_field_empty_object_is_none() {
         assert_eq!(context_field(&json!({})), None);
+    }
+
+    /// The wire protocol is a function of the HOST — which is exactly why moving a
+    /// provider with `--base-url` can change the API hrdr speaks without changing
+    /// anything the user typed about the API.
+    #[test]
+    fn the_wire_protocol_is_decided_by_the_host_alone() {
+        assert_eq!(wire_protocol("https://api.anthropic.com/v1"), "Anthropic");
+        assert_eq!(
+            wire_protocol("https://chatgpt.com/backend-api/codex"),
+            "Codex"
+        );
+        assert_eq!(wire_protocol("https://api.openai.com/v1"), "OpenAI");
+        // The flip that Deliverable 3(a) exists to announce: same provider, same
+        // model, different host — and a different request shape on the wire.
+        assert_ne!(
+            wire_protocol("https://api.anthropic.com/v1"),
+            wire_protocol("http://localhost:1234/v1"),
+        );
+        assert_eq!(wire_protocol("http://localhost:1234/v1"), "OpenAI");
     }
 }

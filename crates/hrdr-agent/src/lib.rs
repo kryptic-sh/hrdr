@@ -33,6 +33,10 @@ mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod resolve;
 pub use resolve::{AuthContext, ResolvedModel, resolve, resolve_in};
+mod validate;
+pub use validate::{
+    PLACEHOLDER_MODEL, relocation_warnings, validate_identity, validate_placeholder_model,
+};
 mod models;
 mod subagent_live;
 pub use subagent_live::{
@@ -4645,6 +4649,24 @@ impl Agent {
         Ok(())
     }
 
+    /// Would `reference` be a real identity on this agent's providers? — the
+    /// network-free check that runs BEFORE [`set_model_ref`](Self::set_model_ref)
+    /// moves anything.
+    ///
+    /// `Err` refuses (the agent stays exactly where it is); `Ok(warnings)` proceeds.
+    /// Resolves the candidate the same way `set_model_ref` will — same providers,
+    /// same relocation carried across a same-provider switch — so what is validated
+    /// is what would be adopted, not an approximation of it.
+    /// See [`validate_identity`](crate::validate_identity).
+    pub fn validate_ref(&self, reference: &ModelRef) -> Result<Vec<String>> {
+        let same_provider = reference.provider() == self.resolved.reference().provider();
+        let mut resolved = resolve_in(&self.providers, reference, None)?;
+        if let (Some(r), true) = (&self.relocation, same_provider) {
+            resolved.relocate(r.base_url.clone(), r.api_key.clone());
+        }
+        validate::validate_identity_in(&self.providers, &resolved)
+    }
+
     /// Move the resolved endpoint elsewhere (`--base-url`) — a **relocation**, not
     /// a provider switch: the identity, its trust kind and its catalog keep
     /// pointing at the same provider, which is now simply reachable at another
@@ -6641,6 +6663,41 @@ mod tests {
         // The identity rode along unchanged: this is still `local`, elsewhere.
         assert_eq!(e.reference(), &r("local://old"));
         assert_eq!(e.kind(), super::ResolvedProviderKind::BuiltIn);
+    }
+
+    /// `validate_ref` asks about a CANDIDATE and moves nothing — that is the whole
+    /// point: the `/model` switch path calls it *before* `set_model_ref`, so a refusal
+    /// leaves the agent on the identity it already has.
+    ///
+    /// It also resolves the candidate exactly as `set_model_ref` would: the relocation
+    /// rides along a same-provider switch and is dropped by a cross-provider one, so
+    /// what is validated is what would be adopted — not an approximation of it.
+    #[test]
+    fn validate_ref_judges_a_candidate_without_moving_the_agent() {
+        let mut agent = Agent::new(AgentConfig {
+            model: r("local://old"),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.relocate_endpoint("http://localhost:9099/v1", None);
+
+        // A provider that is neither a built-in nor a `[providers.*]` cannot even be
+        // resolved, let alone validated — and the agent does not budge.
+        assert!(agent.validate_ref(&r("nosuchprovider://m")).is_err());
+        // A real one validates (the test process has no cached catalogs and no OAuth
+        // store, so there is nothing to refuse WITH — and nothing is refused).
+        assert!(agent.validate_ref(&r("local://qwen3")).is_ok());
+        assert_eq!(
+            agent.model_ref(),
+            &r("local://old"),
+            "asking a question moves nothing",
+        );
+        assert_eq!(
+            agent.endpoint_base_url(),
+            "http://localhost:9099/v1",
+            "and the relocation is intact",
+        );
     }
 
     #[test]

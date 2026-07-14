@@ -128,6 +128,38 @@ fn apply_reference(
     window: Option<u32>,
     remember: bool,
 ) {
+    // Is this identity even REAL? Ask before anything moves, so that a refusal — a
+    // ChatGPT model this account is not entitled to — leaves the agent *and* the
+    // chrome that describes it on the identity in force, together. The check is
+    // network-free (cached catalogs only), so it is affordable on the UI thread.
+    //
+    // `try_lock` fails only while a turn holds the agent. The switch future below
+    // then runs the same check under the real lock (`validated` says whether it
+    // still has to), so a refusal is never skipped — it merely arrives with the
+    // future rather than with the keystroke, and the agent still never moves.
+    let agent = host.agent();
+    let mut warnings = Vec::new();
+    let mut validated = false;
+    if let Ok(a) = agent.try_lock() {
+        match a.validate_ref(&reference) {
+            Ok(w) => {
+                warnings = w;
+                validated = true;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                drop(a);
+                host.info(msg);
+                return;
+            }
+        }
+    }
+    // What merely LOOKS wrong (models.dev has never heard of this id) is said, not
+    // enforced: the catalog lags every release, and a model shipped today must run.
+    for w in warnings {
+        host.info(w);
+    }
+
     // A change of PROVIDER moves the endpoint; a change of model on the provider
     // you are already on does not — that would undo a `--base-url` relocation,
     // which is where this provider lives for this session. Same rule as the agent's.
@@ -150,11 +182,19 @@ fn apply_reference(
         hrdr_agent::record_last_model(&reference);
     }
 
-    let agent = host.agent();
     let post = host.context_window_poster();
     let probe_after = window.is_none();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
+        // The busy-agent path: validate under the real lock. A refusal returns before
+        // `set_model_ref`, so the agent stays exactly where it is.
+        let mut deferred = String::new();
+        if !validated {
+            match a.validate_ref(&reference) {
+                Ok(w) => deferred = w.join("\n"),
+                Err(e) => return format!("{e:#}"),
+            }
+        }
         // ONE call: endpoint, key, api-version, headers, trust kind and model move
         // together, under the same lock, so a probe can never see a half-switch.
         if let Err(e) = a.set_model_ref(reference) {
@@ -163,7 +203,7 @@ fn apply_reference(
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);
         }
-        String::new()
+        deferred
     }));
 }
 
@@ -265,21 +305,27 @@ pub(crate) fn unreachable_guidance(base_url: &str, err: &str) -> String {
 }
 
 /// Probe the endpoint (list its models) and return a warning line when it
-/// looks unreachable or doesn't advertise `model`; `None` when healthy. The
+/// looks unreachable, doesn't advertise `model`, or is being addressed with the
+/// `default` placeholder despite serving a model list; `None` when healthy. The
 /// startup health-check core — both frontends spawn it and surface the
 /// warning as a system line before the first turn.
+///
+/// The `default` rule rides on THIS probe rather than one of its own: `/v1/models`
+/// is already on the wire here, and its answer is exactly what decides whether
+/// `default` names anything (see [`hrdr_agent::validate_placeholder_model`]).
 pub async fn endpoint_health_warning(
     agent: Arc<Mutex<Agent>>,
     model: String,
     base_url: String,
 ) -> Option<String> {
-    let (client, kind, has_credential, provider) = {
+    let (client, kind, has_credential, provider, reference) = {
         let a = agent.lock().await;
         (
             a.client(),
             a.provider_kind(),
             a.has_credential(),
             a.provider_name().to_string(),
+            a.model_ref().clone(),
         )
     };
     // Never call a provider that requires auth with no auth. The 401 that comes
@@ -302,7 +348,15 @@ pub async fn endpoint_health_warning(
     match client.list_models().await {
         Err(e) => Some(unreachable_guidance(&base_url, &e.to_string())),
         Ok(models) => {
-            if model != "default" && !models.is_empty() && !models.iter().any(|m| m == &model) {
+            // `default` is a PLACEHOLDER, and an endpoint that advertises a model
+            // namespace has something to name — so it names nothing there.
+            if let Err(e) = hrdr_agent::validate_placeholder_model(&reference, Some(&models)) {
+                return Some(format!("⚠ {e}"));
+            }
+            if model != hrdr_agent::PLACEHOLDER_MODEL
+                && !models.is_empty()
+                && !models.iter().any(|m| m == &model)
+            {
                 let sample = models
                     .iter()
                     .take(8)

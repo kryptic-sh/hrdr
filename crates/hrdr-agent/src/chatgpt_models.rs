@@ -281,6 +281,31 @@ pub fn cached_context_window(slug: &str) -> Option<u32> {
     cached_context_window_at(&cache_path()?, slug)
 }
 
+/// The account's ENTITLED models, from the on-disk cache, network-free — the
+/// authoritative "what may this account run" list, as opposed to
+/// [`cached_context_window`]'s "how big is this model", which is a fact about the
+/// model and therefore account-independent.
+///
+/// Every gate matters here, because a caller REFUSES on the strength of this list:
+/// schema, compatibility version and account digest must all match, and the row set
+/// must be non-empty. `None` means *we do not know* (cold cache, another account's
+/// cache, a layout bump) — never "nothing is entitled". A caller that cannot tell
+/// the difference would refuse an entitled model on a cold cache.
+fn cached_entitlements_at(path: &Path, account_id: &str) -> Option<Vec<ChatGptModel>> {
+    let cache = load_cache_at(path)?;
+    if !cache_matches(&cache, &account_digest(account_id)) || cache.models.is_empty() {
+        return None;
+    }
+    Some(cache.models)
+}
+
+/// [`cached_entitlements_at`] against the real per-account cache file. `None` when
+/// there is no usable cache for `account_id` — see that function: not knowing and
+/// knowing-nothing-is-entitled are different answers.
+pub fn cached_entitlements(account_id: &str) -> Option<Vec<ChatGptModel>> {
+    cached_entitlements_at(&cache_path()?, account_id)
+}
+
 /// A cache entry is usable — for fresh OR stale serve — only when its schema,
 /// account digest, and compatibility version all match the current credential.
 fn cache_matches(entry: &CacheFile, digest: &str) -> bool {
@@ -731,6 +756,54 @@ mod tests {
         let bad_path = dir.path().join("bad_schema.json");
         write_cache_at(&bad_path, &bad).unwrap();
         assert_eq!(cached_context_window_at(&bad_path, "gpt-5.5"), None);
+    }
+
+    /// ENTITLEMENT is account-scoped, and a caller REFUSES on the strength of it —
+    /// so every gate is load-bearing. `None` must mean "we do not know", never
+    /// "nothing is entitled": a cold cache, another account's cache, or a layout bump
+    /// would otherwise refuse a model the user is paying for.
+    ///
+    /// Contrast [`cached_context_window_at`], which is deliberately laxer: a model's
+    /// window is the same for every account, so a slug match is authoritative there
+    /// no matter who wrote the file.
+    #[test]
+    fn entitlements_are_only_read_from_this_accounts_own_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatgpt_models.json");
+        let e = entry(&account_digest("acct"), 0);
+        write_cache_at(&path, &e).unwrap();
+
+        // The account that wrote it sees its rows — however old they are (entitlement
+        // does not go stale in five minutes; the serve path refetches, this one only
+        // needs to know what is on the list).
+        let rows = cached_entitlements_at(&path, "acct").expect("this account's own cache");
+        assert_eq!(
+            rows.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(),
+            ["cached"]
+        );
+
+        // ANOTHER account's cache says nothing about this one's entitlements.
+        assert_eq!(cached_entitlements_at(&path, "other"), None);
+        // A missing file is ignorance, not an empty entitlement list.
+        assert_eq!(
+            cached_entitlements_at(&dir.path().join("nope.json"), "acct"),
+            None
+        );
+        // An incompatible schema, or a stale compat pin: the rows may not mean what
+        // this build thinks they mean, so they are not trusted to refuse with.
+        for mutate in [
+            (|c: &mut CacheFile| c.schema = CATALOG_CACHE_SCHEMA + 1) as fn(&mut CacheFile),
+            |c: &mut CacheFile| c.compat_version = "0.0.0".to_string(),
+            // A structurally valid but EMPTY row set is not "nothing is entitled"
+            // either — the serve path treats an empty catalog as recoverable.
+            |c: &mut CacheFile| c.models.clear(),
+        ] {
+            let mut bad = e.clone();
+            mutate(&mut bad);
+            let bad_path = dir.path().join("bad.json");
+            write_cache_at(&bad_path, &bad).unwrap();
+            assert_eq!(cached_entitlements_at(&bad_path, "acct"), None);
+        }
     }
 
     // ── Decision logic ──────────────────────────────────────────────────────

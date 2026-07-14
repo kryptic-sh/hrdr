@@ -277,6 +277,61 @@ fn settle_base_url(
         .unwrap_or_else(|| preset.to_string())
 }
 
+/// The startup gate: **refuse what we KNOW is wrong, warn about what looks wrong.**
+///
+/// Three questions, asked of the settled identity, in the order they can be
+/// answered:
+///
+/// 1. **Is the model real?** ([`hrdr_agent::validate_identity`]) — the ChatGPT
+///    account catalog is the account's own entitlement list, so a model missing from
+///    a populated one is a refusal; models.dev is a third-party index that lags every
+///    release, so its silence is only ever a warning. Network-free.
+/// 2. **Did `--base-url` change something invisible?**
+///    ([`hrdr_agent::relocation_warnings`]) — the wire protocol follows the host, and
+///    the API key follows the URL. Both are legitimate for a proxy; both are worth
+///    saying out loud. Network-free.
+/// 3. **Does `default` still mean anything here?**
+///    ([`hrdr_agent::validate_placeholder_model`]) — it is a placeholder for "whatever
+///    you are serving", true only of a server with nothing to name. This is the one
+///    question that needs the wire, and it is asked only when the model IS `default`,
+///    so no other run pays for it. A failed probe FAILS OPEN: refusing a session over
+///    a network blip would be hostile, and the unreachable-endpoint warning covers it.
+///
+/// `Err` exits non-zero; warnings go to stderr, as the missing-key notice already does.
+///
+/// `listing` is `hrdr models` — the command whose entire job is to answer "what may I
+/// name?". Refusing it for not having named one would be a closed loop, so it is
+/// exempt from (3) alone; the identity checks still run.
+async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
+    let resolved = hrdr_agent::ResolvedModel::from_config(config);
+    for w in hrdr_agent::validate_identity(&resolved, config)? {
+        eprintln!("{w}");
+    }
+    // The provider's OWN address — a relocation is only a relocation relative to
+    // somewhere. Re-derived here (not captured earlier) because `--agent` may have
+    // moved the identity onto another provider entirely.
+    if let Some(canonical) = config.resolve_provider(resolved.reference().provider().as_str()) {
+        for w in hrdr_agent::relocation_warnings(&resolved, &canonical.base_url) {
+            eprintln!("{w}");
+        }
+    }
+    if !listing && resolved.reference().model() == hrdr_agent::PLACEHOLDER_MODEL {
+        let probe = hrdr_llm::Client::new(
+            resolved.base_url().to_string(),
+            resolved.api_key().map(str::to_string),
+            hrdr_agent::PLACEHOLDER_MODEL.to_string(),
+        );
+        // Same 3s budget as the context-window probe: a firewall-DROPped endpoint
+        // must not hold startup open, and a timeout is simply "we cannot know".
+        let advertised = tokio::time::timeout(Duration::from_secs(3), probe.list_models())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        hrdr_agent::validate_placeholder_model(resolved.reference(), advertised.as_deref())?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -487,6 +542,18 @@ async fn main() -> Result<()> {
         eprintln!(
             "hrdr: set a model with --model (run `hrdr models` to list this provider's models)"
         );
+    }
+
+    // ── Is the settled identity real? ───────────────────────────────────────
+    // The identity is final here — every layer has spoken, `--agent` included — so
+    // this is the first and only moment it can be checked as a whole. Everything
+    // below is network-free except the one `default` probe, and nothing below
+    // consults the interactive last-used store: validation is store-free, so a
+    // `hrdr run` in CI validates exactly what it will send.
+    let listing = matches!(cli.command, Some(Command::Models));
+    if let Err(e) = startup_checks(&config, listing).await {
+        eprintln!("hrdr: {e:#}");
+        std::process::exit(2);
     }
 
     // Resolve the context window (drives the status bar's "X of Y" + the
