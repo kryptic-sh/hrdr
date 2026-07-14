@@ -277,6 +277,12 @@ impl Harness {
     }
 
     async fn with_max_steps(replies: Vec<MockReply>, max_steps: usize) -> Self {
+        // A harnessed app is a REAL app: it autosaves sessions, appends to the input
+        // history, persists a `/timestamps` toggle, records a `/model` pick. Every one
+        // of those lands under `$HOME` — so the floor every e2e test stands on is a
+        // throwaway home, installed once for the process, and a test that forgets to
+        // ask for isolation still cannot reach the developer's files.
+        hrdr_agent::test_support::isolate_user_state();
         let mock = MockServer::start(replies).await;
         let tmp = tempfile::tempdir().unwrap();
         let config = AgentConfig {
@@ -380,23 +386,51 @@ fn without_bar(row: &str) -> &str {
     row.trim_start_matches(crate::ui::BORDER_BAR).trim()
 }
 
-/// Point `sessions_dir()` *and* the user config at a temp directory for the
-/// duration of a test.
+/// A PRIVATE, EMPTY `sessions_dir()` and user config for the duration of one test —
+/// for the tests that assert on exactly what they wrote there, and would read another
+/// test's files as their own.
 ///
-/// `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-global, so the tests that
-/// write session files or persist settings must not run concurrently — they'd
-/// overwrite each other's roots (or, unisolated, the developer's real config).
-/// The returned guard holds a lock for the whole test and keeps the temp dir
-/// alive.
-fn isolated_data_home() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+/// Isolation from the *developer's* files is not this guard's job and never depends on
+/// remembering to call it: [`isolate_user_state`](hrdr_agent::test_support::isolate_user_state)
+/// has already moved `$HOME` and the XDG roots to a throwaway directory for the whole
+/// process. This narrows that shared root to one nobody else can write, and hands it
+/// back on drop — `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-global, so a test
+/// holding a private root must hold the lock while it does, and must not leave the vars
+/// pointing at a temp dir that is about to be deleted.
+fn isolated_data_home() -> DataHomeGuard {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The process-wide floor first: whatever this guard does, and whenever it is
+    // dropped, the roots never fall back to the developer's home.
+    hrdr_agent::test_support::isolate_user_state();
     // A previous test's panic must not poison the lock for everyone else.
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: the lock above serializes every writer and reader of these vars.
     unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
     unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-    (guard, tmp)
+    DataHomeGuard {
+        _lock: guard,
+        _tmp: tmp,
+    }
+}
+
+/// The lifetime of a private data home: holds the env lock and the temp dir, and puts
+/// the process-wide roots back when the test ends.
+struct DataHomeGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _tmp: tempfile::TempDir,
+}
+
+impl Drop for DataHomeGuard {
+    fn drop(&mut self) {
+        let (data, config, _cache) = hrdr_agent::test_support::user_state_dirs();
+        // SAFETY: the lock is still held (it is dropped after this), so no other test
+        // is reading or writing these vars.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", data);
+            std::env::set_var("XDG_CONFIG_HOME", config);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1886,6 +1920,9 @@ async fn a_resumed_session_keeps_its_own_model_over_a_launch_flag() {
 /// for a session that hasn't got one.
 #[tokio::test]
 async fn a_model_pick_is_what_a_later_resume_restores() {
+    // A pick is REMEMBERED (`apply_choice` → `record_last_model`), so it writes the
+    // interactive last-used store — keep it away from the developer's real one.
+    let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.app
         .apply_model_choice_for_test("zen", "kimi-k2", Some(200_000));
@@ -3229,6 +3266,9 @@ async fn the_agent_list_switches_the_focused_agent() {
 /// state, not a display copy.
 #[tokio::test]
 async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
+    // It picks a model below (`apply_model_choice_for_test` → `apply_choice`), which
+    // records the last-used identity — never into the developer's real store.
+    let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.app.state_mut().usage = hrdr_app::SessionUsage {
         tokens_in: 5_000,

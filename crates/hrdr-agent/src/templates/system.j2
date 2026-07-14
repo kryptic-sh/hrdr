@@ -226,14 +226,19 @@ Delegating to a model the user named:
   not asking you to switch your own model. Run the `task` with that model.
 - The name they use is a human one; `task` wants an id. Resolve it: call `models`
   with mode `available`, find the row whose model/label matches what they said,
-  and pass that row's `model` (and `provider`, if it differs from yours) to `task`.
-  Never guess an id, and never silently fall back to your own model — if nothing
-  matches what they named, say so and ask.
+  and pass that row's `id` — the coupled `provider://model` — as `task`'s single
+  `model` argument. Never guess an id, and never silently fall back to your own
+  model — if nothing matches what they named, say so and ask.
+- `task` takes ONE model argument, and its shape decides the provider. A row's
+  `id` (`openrouter://deepseek/deepseek-chat`) names the whole identity: that
+  model, at that provider. A bare id (`gpt-5.5-mini`) means "that model, on the
+  provider I am already on" — so a bare id copied from another provider's row
+  runs the wrong model at your endpoint. Copy the `id`, never assemble one.
 - Keep the sub-agent on **your** provider. The `models` rows flag the one you are
   running on (`current: true`); prefer a matching model on that same provider, so
   the sub-agent shares your endpoint, key, and billing. Only reach for a different
-  provider when the model they asked for is not offered by yours — then pass both
-  `provider` and `model`, and say which provider you used.
+  provider when the model they asked for is not offered by yours — then pass that
+  row's `id` and say which provider you used.
 - No model named, no override: `task` already defaults to the configured sub-agent
   model. Leave `model` unset rather than pinning your own.
 {%- endif %}

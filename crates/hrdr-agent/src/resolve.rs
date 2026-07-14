@@ -365,6 +365,90 @@ mod tests {
         );
     }
 
+    /// A `[providers.*]` entry spelled with an ALIAS is the same provider — and is
+    /// found by the identity that folds onto it.
+    ///
+    /// Regression (the one this test exists for): `ProviderName` folded
+    /// `anthropic` → `claude`, but the provider table was looked up by the raw key,
+    /// so a `claude://…` identity never matched `[providers.anthropic]`. The
+    /// built-in silently won — with the built-in's endpoint and the built-in's key —
+    /// and the user's gateway `base_url`/`api_key` were discarded without a word.
+    #[test]
+    fn an_alias_spelled_provider_entry_is_the_provider_it_folds_onto() {
+        const URL: &str = "http://localhost:9999/v1";
+        for (spelling, canonical) in [
+            ("anthropic", "claude"),
+            ("opencode", "zen"),
+            ("opencode-zen", "zen"),
+            ("opencode-go", "go"),
+            ("infr", "local"),
+            ("openai-oauth", "chatgpt"),
+        ] {
+            let mut p = provider_config(URL);
+            p.api_key = Some("my-gateway-key".to_string());
+            // Keyed exactly as the user wrote it: `resolve_provider_in` folds BOTH
+            // sides, so the table need not have been rekeyed for the entry to be found.
+            let cfg = cfg_with(spelling, p.clone());
+            // …and every spelling of that provider reaches it — the one the user wrote,
+            // and the one their `model = "…://…"` folded onto.
+            for name in [spelling, canonical] {
+                let m = resolve(&r(&format!("{name}://some-model")), &cfg, None).unwrap();
+                assert_eq!(
+                    m.base_url(),
+                    URL,
+                    "{name}: the user's endpoint, not the built-in's"
+                );
+                assert_eq!(
+                    m.api_key(),
+                    Some("my-gateway-key"),
+                    "{name}: the user's key"
+                );
+                assert_eq!(
+                    m.kind(),
+                    ResolvedProviderKind::Custom,
+                    "{name}: a user-defined entry is Custom"
+                );
+                assert!(!m.is_codex_oauth(), "{name}");
+            }
+        }
+    }
+
+    /// BUG 1c, pinned: `[providers.codex]` SHADOWS the ChatGPT built-in.
+    ///
+    /// The shadow the design leans on ("a user-defined entry is Custom — never
+    /// OAuth-trusted, even when spelled `chatgpt`/`codex`/`openai-oauth`") held only
+    /// for the literal spelling `chatgpt`. A `codex` entry folded to `chatgpt`, missed
+    /// the raw-keyed map, and resolved the BUILT-IN `ChatGptOAuth` preset — so the
+    /// account's OAuth bearer and `ChatGPT-Account-Id` header were injected into an
+    /// endpoint the user had configured as their own.
+    #[test]
+    fn a_config_entry_named_codex_shadows_the_builtin_and_is_never_oauth() {
+        const URL: &str = "http://localhost:9099/v1";
+        for spelling in ["codex", "openai-oauth", "chatgpt"] {
+            let cfg = cfg_with(spelling, provider_config(URL));
+            for name in ["codex", "openai-oauth", "chatgpt"] {
+                let m = resolve(&r(&format!("{name}://gpt-5.5")), &cfg, None).unwrap();
+                assert_eq!(
+                    m.kind(),
+                    ResolvedProviderKind::Custom,
+                    "[providers.{spelling}] resolved via {name}"
+                );
+                assert_eq!(m.base_url(), URL, "the user's endpoint, not Codex's");
+                assert!(
+                    !m.is_codex_oauth(),
+                    "[providers.{spelling}] must never earn the account's OAuth trust"
+                );
+                assert_eq!(m.api_key(), None, "and no key it was never given");
+            }
+        }
+        // …while an UNSHADOWED `codex://` is still the real thing.
+        assert!(
+            resolve(&r("codex://gpt-5.5"), &cfg(), None)
+                .unwrap()
+                .is_codex_oauth()
+        );
+    }
+
     /// The surprising-but-correct interaction, pinned: the TRUST gate keys on the
     /// name-vs-config shadow, the WINDOW gate keys on the endpoint. A custom
     /// provider aimed at the real Codex URL is therefore `Custom` (no OAuth) yet

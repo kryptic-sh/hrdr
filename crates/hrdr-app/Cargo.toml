@@ -25,3 +25,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# A test never writes the developer's real sessions/config/history.
+hrdr-agent = { workspace = true, features = ["test-support"] }

@@ -56,8 +56,14 @@ struct ConfiguredProvider {
 fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<ConfiguredProvider> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<ConfiguredProvider> = Vec::new();
+    // Every name a row carries is CANONICAL — `[providers.anthropic]` offers rows
+    // on `claude`, the same name `resolve_provider` looks the entry up by. A row
+    // spelled with an alias would be validated against one endpoint (the auth gate
+    // resolves it) and talked to on another (`ModelRef::new` folds it): the picker
+    // is the one place both halves are composed, so it must not hold the split.
     let mut push = |name: String, model: Option<String>| {
-        if seen.insert(name.to_ascii_lowercase()) {
+        let name = ProviderName::new(&name).as_str().to_string();
+        if seen.insert(name.clone()) {
             let catalog_key = builtin_catalog_key(&name)
                 .map_or_else(|| name.to_ascii_lowercase(), str::to_string);
             out.push(ConfiguredProvider {
@@ -771,6 +777,53 @@ mod tests {
         assert_eq!(out[0].model, "Qwen3-30B");
         assert_eq!(out[0].provider_label, "Mylocal"); // prettified fallback
         assert_eq!(out[0].model_label, "Qwen3-30B");
+    }
+
+    /// The picker's rows name providers CANONICALLY — `[providers.anthropic]` offers
+    /// rows on `claude`.
+    ///
+    /// The row's name is used twice on a pick: once to resolve the provider (the auth
+    /// gate, `host.resolve_provider`) and once to build the identity (`ModelRef::new`,
+    /// which FOLDS it). An alias-spelled row made those two disagree — one endpoint
+    /// validated, another talked to. Canonical rows leave nothing to disagree about.
+    #[test]
+    fn picker_rows_name_providers_canonically() {
+        let mut cfg = crate::AgentConfig::default();
+        cfg.providers.insert(
+            "anthropic".to_string(),
+            crate::ProviderConfig {
+                base_url: "http://localhost:9999/v1".to_string(),
+                key_env: None,
+                api_key: Some("k".to_string()),
+                model: Some("claude-x".to_string()),
+                remote: None,
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        let ps = configured_providers(&cfg, None);
+        let claude = ps
+            .iter()
+            .find(|p| p.name == "claude")
+            .expect("the entry is offered under the name it folds onto");
+        assert_eq!(
+            claude.catalog_key, "anthropic",
+            "…and windows/labels via models.dev's key"
+        );
+        assert_eq!(claude.configured_model.as_deref(), Some("claude-x"));
+        assert!(
+            !ps.iter().any(|p| p.name == "anthropic"),
+            "no row carries a name `ModelRef` would fold away underneath it"
+        );
+        // Both spellings resolve to that one entry, so the pick and the auth gate agree.
+        for name in ["claude", "anthropic"] {
+            assert_eq!(
+                cfg.resolve_provider(name).map(|p| p.base_url),
+                Some("http://localhost:9999/v1".to_string()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

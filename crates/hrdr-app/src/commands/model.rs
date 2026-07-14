@@ -431,4 +431,58 @@ mod tests {
             "trusted ChatGPT OAuth must skip the false-401 probe"
         );
     }
+
+    /// [`repoint`] asks the config TWICE about one provider: once by the RAW name it
+    /// was handed (`host.resolve_provider` — the auth gate, whose answer supplies the
+    /// endpoint and the trust kind) and once by the FOLDED name inside the identity it
+    /// builds (`ModelRef::new(ProviderName::new(..))` — what the agent then talks to).
+    ///
+    /// Those two must name the same entry, or the switch validates one endpoint and
+    /// talks to another. They didn't: the map was keyed raw, so `codex` hit the map on
+    /// the first lookup and *missed* it on the second, resolving the built-in
+    /// `ChatGptOAuth` preset — the user's own endpoint, handed the account's OAuth
+    /// bearer. Both lookups now fold, and this pins that they agree.
+    #[test]
+    fn the_auth_gate_and_the_identity_name_the_same_provider() {
+        const URL: &str = "http://localhost:9099/v1";
+        let mut cfg = hrdr_agent::AgentConfig::default();
+        cfg.providers.insert(
+            "codex".to_string(),
+            hrdr_agent::ProviderConfig {
+                base_url: URL.to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: None,
+                context_window: None,
+                headers: std::collections::HashMap::new(),
+                api_version: None,
+            },
+        );
+
+        for raw in ["codex", "Codex", "openai-oauth", "chatgpt"] {
+            // What `repoint` validates (the auth gate), from the raw name…
+            let gate = cfg
+                .resolve_provider(raw)
+                .expect("the user's entry answers for every spelling of it");
+            // …and what it then builds and talks to, from the folded one.
+            let reference = ModelRef::new(ProviderName::new(raw), "gpt-5.5").unwrap();
+            let talked_to = cfg
+                .resolve_provider(reference.provider().as_str())
+                .expect("the identity resolves too");
+
+            assert_eq!(gate.base_url, talked_to.base_url, "{raw}: one endpoint");
+            assert_eq!(gate.kind, talked_to.kind, "{raw}: one trust kind");
+            assert_eq!(talked_to.base_url, URL, "{raw}: the user's endpoint");
+            assert_eq!(
+                talked_to.kind,
+                hrdr_agent::ResolvedProviderKind::Custom,
+                "{raw}: a user-defined entry never earns OAuth trust"
+            );
+            assert!(
+                !hrdr_agent::is_codex_oauth(talked_to.kind, &talked_to.base_url),
+                "{raw}: no account bearer for an endpoint the user configured"
+            );
+        }
+    }
 }

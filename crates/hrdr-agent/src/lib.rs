@@ -45,6 +45,11 @@ pub use subagent_live::{
     age_completed_todos, event_log,
 };
 mod subagent_transcript;
+/// Isolation for tests that touch user state — see [`test_support`]. Compiled only
+/// for hrdr's own test builds (`cfg(test)`, and the `test-support` feature the other
+/// crates' test binaries turn on); never part of a release build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod turn;
 pub use turn::TurnStats;
 mod usage;
@@ -276,6 +281,7 @@ impl hrdr_tools::Tool for ModelsTool {
                     // should I keep the sub-agent on" is right there in the row.
                     let current = active_provider == m.provider && active_model == m.model;
                     serde_json::json!({
+                        "id": model_row_id(&m.provider, &m.model),
                         "provider": m.provider,
                         "model": m.model,
                         "label": m.label,
@@ -316,6 +322,20 @@ impl hrdr_tools::Tool for ModelsTool {
     }
 }
 
+/// A `models` row's **actionable** field: the coupled `provider://model` identity,
+/// exactly as the `task` tool's one `model` argument wants it.
+///
+/// `task` takes ONE model argument, and it is a [`ModelSpec`]: a bare id means "that
+/// model, on the provider I am already on". So an agent that reads a row's `model`
+/// and delegates with it — the obvious thing to do, and what the prompt used to say —
+/// silently runs another provider's model on its OWN endpoint. Handing it the pair
+/// already coupled means there is nothing to compose, and so nothing to compose wrong:
+/// copy `id` into `model` and the identity survives the hop.
+fn model_row_id(provider: &str, model: &str) -> String {
+    ModelRef::new(ProviderName::new(provider), model)
+        .map_or_else(|_| model.to_string(), |r| r.to_string())
+}
+
 /// The `models_truncated` warning, naming how many rows were dropped so the
 /// caller knows the list is partial rather than exhaustive.
 fn truncation_warning(dropped: usize) -> serde_json::Value {
@@ -347,6 +367,7 @@ fn fit_models_to_budget(
         .enumerate()
         .map(|(i, m)| {
             let v = serde_json::json!({
+                "id": model_row_id(&m.provider, &m.model),
                 "provider": m.provider,
                 "model": m.model,
                 "label": m.label,
@@ -2523,14 +2544,22 @@ impl AgentConfig {
 
 /// [`AgentConfig::resolve_provider`] against a bare provider table — the form
 /// [`resolve_in`] and a live [`Agent`] need (neither holds a whole config).
+///
+/// BOTH sides of the lookup go through [`ProviderName`], the one owner of what a
+/// provider name *is*. The map is keyed canonically ([`canonical_providers`] rekeys
+/// it at config load) and the name being looked up is folded here, so a
+/// `[providers.anthropic]` entry is found by a `claude://…` identity — and, the
+/// other way, a `[providers.codex]` entry SHADOWS the built-in ChatGPT preset
+/// instead of missing the map and handing the user's own endpoint the account's
+/// OAuth bearer. Folding on only one side is exactly that bug.
 pub fn resolve_provider_in(
     providers: &HashMap<String, ProviderConfig>,
     name: &str,
 ) -> Option<ResolvedProvider> {
-    let lname = name.trim().to_ascii_lowercase();
+    let canonical = ProviderName::new(name);
     if let Some((_, c)) = providers
         .iter()
-        .find(|(k, _)| k.to_ascii_lowercase() == lname)
+        .find(|(k, _)| ProviderName::new(k) == canonical)
     {
         return Some(ResolvedProvider {
             base_url: c.base_url.clone(),
@@ -2548,6 +2577,66 @@ pub fn resolve_provider_in(
         });
     }
     builtin_provider(name)
+}
+
+/// Rekey a raw `[providers.*]` map by the CANONICAL provider name, so the table
+/// and every lookup into it live in the same namespace.
+///
+/// The TOML keys are whatever the user typed (`anthropic`, `Codex`, `opencode`);
+/// every identity that reaches the table is a [`ProviderName`], which has already
+/// folded those onto `claude` / `chatgpt` / `zen`. Rekeying here is the other half
+/// of the fold in [`resolve_provider_in`] — with both, no consumer of the map (the
+/// `/model` picker, `subagent_usage`, the auth gate) can disagree with `resolve()`
+/// about which entry a name means.
+///
+/// Two spellings of ONE provider are a collision, and are refused at startup by
+/// [`provider_alias_collision_error`]; this function is total, so it settles them
+/// deterministically (first by original key order) rather than by `HashMap` luck.
+pub fn canonical_providers(
+    raw: HashMap<String, ProviderConfig>,
+) -> HashMap<String, ProviderConfig> {
+    let mut keys: Vec<String> = raw.keys().cloned().collect();
+    keys.sort();
+    let mut out: HashMap<String, ProviderConfig> = HashMap::new();
+    for k in keys {
+        let canonical = ProviderName::new(&k).as_str().to_string();
+        let Some(c) = raw.get(&k) else { continue };
+        out.entry(canonical).or_insert_with(|| c.clone());
+    }
+    out
+}
+
+/// The startup refusal for a config naming ONE provider twice — `[providers.anthropic]`
+/// beside `[providers.claude]`, `[providers.codex]` beside `[providers.chatgpt]`, and
+/// so on. `Some(message)` names both spellings and the one name they fold onto.
+///
+/// The aliases are not two providers; they are two ways to write one. Before the
+/// fold, a table could carry both and hrdr would pick whichever the `HashMap`
+/// handed it. Now they are the same key — so the config is asking for two different
+/// endpoints under one identity, and the only honest answer is to stop and say so.
+pub fn provider_alias_collision_error(text: &str, path: &std::path::Path) -> Option<String> {
+    let toml::Value::Table(root) = text.parse::<toml::Value>().ok()? else {
+        return None;
+    };
+    let providers = root.get("providers")?.as_table()?;
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut names: Vec<&String> = providers.keys().collect();
+    names.sort();
+    for name in names {
+        let canonical = ProviderName::new(name).as_str().to_string();
+        if let Some(first) = seen.get(&canonical) {
+            return Some(format!(
+                "hrdr: {} defines the same provider twice.\n  \
+                 [providers.{first}] and [providers.{name}] are both `{canonical}` — \
+                 they are two spellings of one provider, not two providers.\n  \
+                 Keep one of them (`[providers.{canonical}]` is the canonical spelling) \
+                 and delete the other.",
+                path.display(),
+            ));
+        }
+        seen.insert(canonical, name.clone());
+    }
+    None
 }
 
 /// **The** Codex OAuth gate: the trusted [`ResolvedProviderKind::ChatGptOAuth`]
@@ -3124,8 +3213,9 @@ pub fn legacy_config_error(text: &str, path: &std::path::Path) -> Option<String>
     None
 }
 
-/// [`legacy_config_error`] against the user's real config file. `Ok(())` when there
-/// is no config file, or it is already written in the one-key form.
+/// [`legacy_config_error`] and [`provider_alias_collision_error`] against the user's
+/// real config file. `Ok(())` when there is no config file, or it says one thing
+/// once: no dead two-key form, and no provider named twice under two spellings.
 pub fn check_config_compat() -> Result<()> {
     let Some(path) = config_file_path() else {
         return Ok(());
@@ -3133,7 +3223,8 @@ pub fn check_config_compat() -> Result<()> {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(());
     };
-    match legacy_config_error(&text, &path) {
+    match legacy_config_error(&text, &path).or_else(|| provider_alias_collision_error(&text, &path))
+    {
         Some(msg) => bail!(msg),
         None => Ok(()),
     }
@@ -3278,7 +3369,9 @@ impl AgentConfig {
             self.checkpoints = Some(v);
         }
         if !fc.providers.is_empty() {
-            self.providers = fc.providers;
+            // Rekey by the canonical name: `[providers.anthropic]` IS `claude`'s
+            // table, and every lookup arrives already folded.
+            self.providers = canonical_providers(fc.providers);
         }
         if !fc.guardrails.is_empty() {
             self.guardrails = fc.guardrails;
@@ -6284,13 +6377,14 @@ mod tests {
         LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots,
         ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
         estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
-        is_transient, legacy_config_error, parse_env_bool, prune_tool_messages,
-        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
-        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
-        tail_window, wants_background,
+        is_transient, legacy_config_error, parse_env_bool, provider_alias_collision_error,
+        prune_tool_messages, repair_dangling_tool_calls, resolve, resolve_subagent_dir,
+        retry_after_hint, steering_queue, subagent_base_config, subagent_event_for,
+        subagent_transcript_id, tail_window, wants_background,
     };
     use crate::cwd_slug;
     use crate::subagent_transcript;
+    use crate::{ModelRef, ModelSpec, ResolvedProviderKind};
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
@@ -6470,6 +6564,64 @@ mod tests {
             system.contains("current: true"),
             "and stay on the provider the rows flag as ours"
         );
+        // The COUPLED id is what gets handed to `task` — one string, one identity.
+        assert!(
+            system.contains("`provider://model`"),
+            "the row's id is the whole identity: {system}"
+        );
+        assert!(
+            system.contains("`task`'s single\n  `model` argument"),
+            "one model argument, not a provider/model pair: {system}"
+        );
+    }
+
+    /// The `task` schema has NO `provider` property — only `description`, `prompt`,
+    /// `model`, `background`, `agent`. A prompt that tells the model to pass one
+    /// therefore teaches it to emit an IGNORED argument beside a BARE model id,
+    /// which resolves as `ModelSpec::ModelOnly` on the parent's provider: the
+    /// cross-provider delegation silently runs on the wrong endpoint. The two must
+    /// be pinned together, or the prompt drifts back.
+    #[test]
+    fn the_prompt_never_tells_the_model_to_pass_a_provider_to_task() {
+        let agent = Agent::new(AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let system = agent
+            .messages()
+            .first()
+            .map(|m| m.content.clone().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            system.contains("Delegating to a model the user named:"),
+            "the guidance is present at all"
+        );
+        for forbidden in [
+            "pass both `provider` and `model`",
+            "and `provider`",
+            "`provider` and `model` to `task`",
+        ] {
+            assert!(
+                !system.contains(forbidden),
+                "the prompt still names a `provider` argument to `task`: {forbidden}"
+            );
+        }
+        // …and the schema really has none, so there is nothing for it to name.
+        let defs = agent.tools.defs();
+        let task = defs
+            .iter()
+            .find(|d| d.function.name == "task")
+            .expect("the `task` tool is registered");
+        let props = task.function.parameters["properties"]
+            .as_object()
+            .expect("properties");
+        assert!(
+            !props.contains_key("provider"),
+            "`task` has no `provider` argument: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        assert!(props.contains_key("model"));
     }
 
     #[tokio::test]
@@ -10065,6 +10217,10 @@ mod tests {
         /// Minimal agent config pointing at `base_url`, with checkpoints and
         /// subagents disabled for test isolation.
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
+            // A real agent run refreshes the models.dev cache, writes checkpoints and
+            // reads the auth store — all under `$HOME`. Every mock-server test funnels
+            // through here, so this is where that stops being the developer's `$HOME`.
+            crate::test_support::isolate_user_state();
             AgentConfig {
                 base_url,
                 model: "local://test-model".parse().unwrap(),
@@ -11066,6 +11222,133 @@ mod tests {
             subagent_event_for(&AgentEvent::Reasoning("hmm".into())),
             None
         );
+    }
+
+    /// The config's `[providers.*]` map is rekeyed by the CANONICAL name at load, so
+    /// the table lives in the same namespace as every identity that looks into it.
+    ///
+    /// Without this, `[providers.anthropic]` was a table nothing could ever find: a
+    /// `ModelRef` folds `anthropic` → `claude` on the way in, and the raw-keyed map
+    /// had no `claude`. The built-in won, silently, with its own endpoint and key.
+    #[test]
+    fn the_providers_map_is_rekeyed_by_the_canonical_name_at_load() {
+        let fc: FileConfig = toml::from_str(
+            "model = \"anthropic://claude-x\"\n\n\
+             [providers.anthropic]\nbase_url = \"http://localhost:9999/v1\"\napi_key = \"my-gateway-key\"\n\n\
+             [providers.opencode-go]\nbase_url = \"http://localhost:9998/v1\"\n\n\
+             [providers.MyCustom]\nbase_url = \"http://localhost:9997/v1\"\n",
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+
+        let mut keys: Vec<&str> = cfg.providers.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["claude", "go", "mycustom"], "keyed canonically");
+
+        // …and the endpoint a `claude://` identity reaches is the user's, not the
+        // built-in `https://api.anthropic.com/v1`.
+        let resolved = resolve::resolve(&r("claude://claude-x"), &cfg, None).unwrap();
+        assert_eq!(resolved.base_url(), "http://localhost:9999/v1");
+        assert_eq!(resolved.api_key(), Some("my-gateway-key"));
+        assert_eq!(resolved.kind(), ResolvedProviderKind::Custom);
+    }
+
+    /// Two spellings of ONE provider are a collision, not two providers — and hrdr
+    /// stops rather than silently keeping whichever the `HashMap` handed it.
+    #[test]
+    fn a_config_naming_one_provider_twice_is_refused_at_startup() {
+        let path = std::path::Path::new("/home/u/.config/hrdr/config.toml");
+        let err = provider_alias_collision_error(
+            "[providers.anthropic]\nbase_url = \"http://a/v1\"\n\n\
+             [providers.claude]\nbase_url = \"http://b/v1\"\n",
+            path,
+        )
+        .expect("a collision is an error");
+        assert!(err.contains("defines the same provider twice"), "{err}");
+        assert!(err.contains("[providers.anthropic]"), "{err}");
+        assert!(err.contains("[providers.claude]"), "{err}");
+        assert!(
+            err.contains("`claude`"),
+            "it names what they fold onto: {err}"
+        );
+        assert!(err.contains("Keep one of them"), "{err}");
+
+        // Every alias family collides the same way.
+        for (a, b) in [
+            ("opencode", "zen"),
+            ("opencode-zen", "opencode"),
+            ("codex", "chatgpt"),
+            ("openai-oauth", "codex"),
+            ("infr", "local"),
+            ("opencode-go", "go"),
+        ] {
+            assert!(
+                provider_alias_collision_error(
+                    &format!(
+                        "[providers.{a}]\nbase_url = \"http://a/v1\"\n\n\
+                         [providers.{b}]\nbase_url = \"http://b/v1\"\n"
+                    ),
+                    path,
+                )
+                .is_some(),
+                "[providers.{a}] + [providers.{b}] is one provider twice"
+            );
+        }
+
+        // Distinct providers are not a collision, however many there are.
+        assert_eq!(
+            provider_alias_collision_error(
+                "[providers.anthropic]\nbase_url = \"http://a/v1\"\n\n\
+                 [providers.openrouter]\nbase_url = \"http://b/v1\"\n\n\
+                 [providers.mycustom]\nbase_url = \"http://c/v1\"\n",
+                path,
+            ),
+            None
+        );
+        assert_eq!(provider_alias_collision_error("", path), None);
+    }
+
+    /// A `models` row's `id` is the COUPLED identity — the one string `task` wants.
+    ///
+    /// The rows used to carry `provider` and `model` as separate fields, and the
+    /// prompt told the agent to hand `task` both. `task` has no `provider` argument:
+    /// the bare `model` resolved as `ModelSpec::ModelOnly` — that model id, on the
+    /// PARENT's provider. Coupling the pair in the row leaves nothing to compose, and
+    /// so nothing to compose wrong.
+    #[tokio::test]
+    async fn model_rows_carry_the_coupled_id_task_takes() {
+        let agent = Agent::new(AgentConfig {
+            model: r("openai://gpt-5"),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let out = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rows = value["available_models"].as_array().expect("rows");
+        assert!(!rows.is_empty(), "{out}");
+        for row in rows {
+            let id = row["id"].as_str().expect("every row carries an id");
+            // It is a `provider://model` — and it parses back to exactly the pair the
+            // row shows, so copying it into `task` moves the whole identity.
+            let reference: ModelRef = id.parse().expect("the id is a ModelRef");
+            assert_eq!(reference.provider().as_str(), row["provider"]);
+            assert_eq!(reference.model(), row["model"]);
+            // …and as a `task` argument it is a `Full` spec: the provider comes with it.
+            assert!(matches!(
+                id.parse::<ModelSpec>().unwrap(),
+                ModelSpec::Full(_)
+            ));
+        }
     }
 }
 
