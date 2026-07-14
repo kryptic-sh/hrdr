@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::config_dir;
+use crate::{ProviderName, config_dir};
 
 /// Path to the credential store (`~/.config/hrdr/auth.toml`), if `HOME` is set.
 pub fn auth_file_path() -> Option<PathBuf> {
@@ -31,10 +31,16 @@ pub fn load_auth_tokens() -> HashMap<String, String> {
 /// account (the same `OPENCODE_API_KEY`), so they share one stored entry
 /// (`opencode`): logging in to any of them covers them all. Every other provider
 /// keys on its own name.
+///
+/// One source of truth for the sharing rule: [`ProviderName::auth_key`]. The
+/// borrow is returned from `provider` itself for every non-OpenCode name, so a
+/// custom provider keeps its own spelling.
 pub fn auth_key(provider: &str) -> &str {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "zen" | "go" | "opencode" | "opencode-zen" | "opencode-go" => "opencode",
-        _ => provider,
+    const SHARED: &str = "opencode";
+    if ProviderName::new(provider).auth_key() == SHARED {
+        SHARED
+    } else {
+        provider
     }
 }
 

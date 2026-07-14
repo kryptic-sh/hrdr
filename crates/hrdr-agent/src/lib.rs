@@ -29,6 +29,8 @@ pub use chatgpt_models::{
 };
 mod paths;
 pub use paths::cwd_slug;
+mod model_ref;
+pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod models;
 mod subagent_live;
 pub use subagent_live::{
@@ -1043,13 +1045,16 @@ impl Drop for CompactingGuard {
 /// subscription windows live — `/v1/models` 401s and models.dev lists the
 /// differently-windowed API model of the same id), with the built-in preset as a
 /// cold-cache floor. models.dev is never consulted for it. Every other endpoint
-/// resolves from the models.dev catalog.
+/// resolves from the models.dev catalog — through [`catalog_provider_key`], since
+/// the catalog is keyed by ITS names (`opencode`, `anthropic`), not hrdr's
+/// (`zen`, `claude`); handing it the raw name matched nothing and silently fell
+/// back to the smallest window any provider reported for the id.
 pub fn context_window_for(provider: Option<&str>, base_url: &str, model: &str) -> Option<u32> {
     if base_url == CHATGPT_CODEX_BASE_URL {
         return chatgpt_models::cached_context_window(model)
             .or_else(|| builtin_provider("chatgpt").and_then(|p| p.context_window));
     }
-    hrdr_llm::catalog::context_window_cached(provider, model)
+    hrdr_llm::catalog::context_window_cached(catalog_provider_key(provider).as_deref(), model)
 }
 
 /// The context window a delegated sub-agent should run against, given the window
@@ -4388,8 +4393,12 @@ impl Agent {
             self.client.model
         );
         if self.cost_rates.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
-            let rates =
-                hrdr_llm::catalog::model_cost(self.provider.as_deref(), &self.client.model).await;
+            // The catalog's namespace, not the app's — see `catalog_provider_key`.
+            let rates = hrdr_llm::catalog::model_cost(
+                catalog_provider_key(self.provider.as_deref()).as_deref(),
+                &self.client.model,
+            )
+            .await;
             self.cost_rates = Some((key, rates));
         }
         self.cost_rates.as_ref().and_then(|(_, r)| *r)
@@ -4447,7 +4456,11 @@ impl Agent {
                 &self.client.model,
             );
         }
-        hrdr_llm::catalog::context_window(self.provider.as_deref(), &self.client.model).await
+        hrdr_llm::catalog::context_window(
+            catalog_provider_key(self.provider.as_deref()).as_deref(),
+            &self.client.model,
+        )
+        .await
     }
 
     /// Tell the agent its context window — e.g. a frontend that probed the

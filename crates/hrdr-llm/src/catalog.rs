@@ -99,7 +99,12 @@ pub fn context_window_cached(provider: Option<&str>, model: &str) -> Option<u32>
 
 /// Find `model`'s window in an already-loaded catalog. Pure, so the resolution
 /// rules are testable without a cache or a network.
-fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u32> {
+///
+/// `provider` is a models.dev **catalog key**, not an app provider name — the two
+/// are different namespaces (hrdr's `zen` is models.dev's `opencode`). Callers
+/// map before they ask; a name that isn't a catalog key silently falls through to
+/// the cross-provider scan below.
+pub fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u32> {
     let window = |p: &Value| -> Option<u32> {
         p.get("models")?
             .get(model)?

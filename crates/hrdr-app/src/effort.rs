@@ -39,9 +39,14 @@ const FALLBACK: &[&str] = &["minimal", "low", "medium", "high"];
 /// fallback ladder when the catalog doesn't carry the model). Reads the
 /// models.dev catalog synchronously from cache — the picker builds its list on
 /// a keypress and can't await a fetch.
+///
+/// `provider` is the app's name for it (`zen`, `claude`); the catalog is keyed by
+/// its own (`opencode`, `anthropic`), so it goes through
+/// [`hrdr_agent::catalog_provider_key`] first.
 pub fn effort_choices(provider: Option<&str>, model: &str) -> Vec<EffortChoice> {
+    let key = hrdr_agent::catalog_provider_key(provider);
     let values = hrdr_agent::catalog::load_cached()
-        .and_then(|c| hrdr_agent::catalog::lookup_effort_levels(&c, provider, model))
+        .and_then(|c| hrdr_agent::catalog::lookup_effort_levels(&c, key.as_deref(), model))
         .unwrap_or_else(|| FALLBACK.iter().map(|v| (*v).to_string()).collect());
     choices_from(&values)
 }

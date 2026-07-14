@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::{AgentConfig, BUILTIN_PROVIDERS, builtin_provider, resolve_api_key, write_atomic};
+use crate::{
+    AgentConfig, BUILTIN_PROVIDERS, ProviderName, builtin_provider, resolve_api_key, write_atomic,
+};
 
 /// One pickable model in the selector: the ids to switch to plus the friendly
 /// labels to show.
@@ -29,16 +31,10 @@ pub struct ModelChoice {
 }
 
 /// The models.dev catalog key for a built-in preset (or a catalog-matching
-/// alias). `local` self-hosted endpoints have no catalog entry.
+/// alias). `local` self-hosted endpoints have no catalog entry. One source of
+/// truth: [`ProviderName::catalog_key`].
 pub fn builtin_catalog_key(name: &str) -> Option<&'static str> {
-    Some(match name.trim().to_ascii_lowercase().as_str() {
-        "zen" | "opencode" | "opencode-zen" => "opencode",
-        "go" | "opencode-go" => "opencode-go",
-        "openai" => "openai",
-        "openrouter" => "openrouter",
-        "claude" | "anthropic" => "anthropic",
-        _ => return None,
-    })
+    ProviderName::new(name).catalog_key()
 }
 
 /// A provider the user can pick a model from.
