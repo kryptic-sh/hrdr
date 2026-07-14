@@ -4550,46 +4550,36 @@ impl Agent {
     /// session.
     pub fn clear(&mut self) {
         self.abort_background_tasks();
-        // Remove ALL background registry entries from the previous session.
-        if let Ok(mut v) = self.ctx.background_tasks.lock() {
-            v.clear();
-        }
-        // Remove ALL background live-subagent entries (not the main entry).
-        self.live_subagents.with(|v| {
-            v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
-        });
         self.messages.clear();
         self.reset_read_files();
         self.reset_session_cost();
         self.refresh_system();
     }
 
-    /// Abort all running background sub-agent tasks and clear the handle list.
-    /// A task that has already finished is a no-op.
-    /// Also removes stale entries from the background registry and live
-    /// sub-agents, so aborted tasks cannot deliver results into a fresh
-    /// conversation.
+    /// Abort all running background sub-agent tasks and remove every background
+    /// registry/live entry. Finished-but-undelivered tasks are discarded too.
     pub fn abort_background_tasks(&mut self) {
-        let ids: Vec<u64> = if let Ok(mut v) = self.bg_handles.lock() {
-            let ids: Vec<u64> = v.iter().map(|(id, _)| *id).collect();
-            for (_, handle) in v.drain(..) {
-                handle.abort();
-            }
-            ids
-        } else {
-            return;
-        };
-        if !ids.is_empty() {
-            // Remove stale background registry entries for aborted tasks.
-            if let Ok(mut v) = self.ctx.background_tasks.lock() {
-                v.retain(|t| !ids.contains(&t.id));
-            }
-            // Remove stale live subagent entries for aborted background tasks.
-            // The main entry (key=0) is never removed.
-            self.live_subagents.with(|v| {
-                v.retain(|e| e.key == 0 || e.bg_id.is_none() || !ids.contains(&e.bg_id.unwrap()));
-            });
+        let mut handles = self
+            .bg_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, handle) in handles.drain(..) {
+            handle.abort();
         }
+        drop(handles);
+
+        // Workers publish only by finding their pre-existing registry/live entry.
+        // Clearing both stores while holding their locks means a worker either
+        // publishes before this cleanup (and is then removed) or finds no entry
+        // afterward; no stale result can be recreated.
+        self.ctx
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.live_subagents.with(|v| {
+            v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
+        });
     }
 
     /// Number of background sub-agent tasks currently tracked (running or
@@ -5209,9 +5199,11 @@ impl Agent {
     /// [`AgentEvent::Notice`] per delivery.
     fn drain_background<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
         let finished: Vec<(u64, String, String)> = {
-            let Ok(mut v) = self.ctx.background_tasks.lock() else {
-                return;
-            };
+            let mut v = self
+                .ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut out = Vec::new();
             for t in v.iter_mut().filter(|t| t.done && !t.delivered) {
                 t.delivered = true;
