@@ -128,38 +128,6 @@ fn apply_reference(
     window: Option<u32>,
     remember: bool,
 ) {
-    // Is this identity even REAL? Ask before anything moves, so that a refusal — a
-    // ChatGPT model this account is not entitled to — leaves the agent *and* the
-    // chrome that describes it on the identity in force, together. The check is
-    // network-free (cached catalogs only), so it is affordable on the UI thread.
-    //
-    // `try_lock` fails only while a turn holds the agent. The switch future below
-    // then runs the same check under the real lock (`validated` says whether it
-    // still has to), so a refusal is never skipped — it merely arrives with the
-    // future rather than with the keystroke, and the agent still never moves.
-    let agent = host.agent();
-    let mut warnings = Vec::new();
-    let mut validated = false;
-    if let Ok(a) = agent.try_lock() {
-        match a.validate_ref(&reference) {
-            Ok(w) => {
-                warnings = w;
-                validated = true;
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                drop(a);
-                host.info(msg);
-                return;
-            }
-        }
-    }
-    // What merely LOOKS wrong (models.dev has never heard of this id) is said, not
-    // enforced: the catalog lags every release, and a model shipped today must run.
-    for w in warnings {
-        host.info(w);
-    }
-
     // A change of PROVIDER moves the endpoint; a change of model on the provider
     // you are already on does not — that would undo a `--base-url` relocation,
     // which is where this provider lives for this session. Same rule as the agent's.
@@ -169,41 +137,45 @@ fn apply_reference(
         .flatten()
         .map(|p| p.base_url);
 
-    host.set_model_ref(reference.clone());
-    if let Some(url) = endpoint {
-        host.set_base_url(url);
-    }
-    if let Some(w) = window {
-        host.set_context_window(Some(w));
-    }
-    if remember {
-        // Remembered per provider, so a later `/login <provider>` (which names no
-        // model) can come back to the model you were actually using there.
-        hrdr_agent::record_last_model(&reference);
-    }
-
+    let agent = host.agent();
+    let show = host.identity_poster();
     let post = host.context_window_poster();
     let probe_after = window.is_none();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
-        // The busy-agent path: validate under the real lock. A refusal returns before
-        // `set_model_ref`, so the agent stays exactly where it is.
-        let mut deferred = String::new();
-        if !validated {
-            match a.validate_ref(&reference) {
-                Ok(w) => deferred = w.join("\n"),
-                Err(e) => return format!("{e:#}"),
-            }
-        }
+        // Is this identity even REAL? The cached pass is network-free; settling it may
+        // not be (a ChatGPT slug our cached entitlement list has never seen has to be
+        // confirmed against a fresh one before anyone is told it does not exist).
+        //
+        // NOTHING has moved yet — not the agent, not the chrome. A refusal returns
+        // here, and both stay exactly where they were, together. That is why the
+        // chrome is written below, from this task, rather than optimistically on the
+        // keystroke: the display must never run ahead of the agent.
+        let verdict = match a.validate_ref(&reference) {
+            Ok(v) => v,
+            Err(e) => return format!("{e:#}"),
+        };
+        let warnings = match hrdr_agent::confirm_identity(verdict).await {
+            Ok(w) => w,
+            Err(e) => return format!("{e:#}"),
+        };
         // ONE call: endpoint, key, api-version, headers, trust kind and model move
         // together, under the same lock, so a probe can never see a half-switch.
-        if let Err(e) = a.set_model_ref(reference) {
+        if let Err(e) = a.set_model_ref(reference.clone()) {
             return format!("{e:#}");
+        }
+        show(reference.clone(), endpoint, window);
+        if remember {
+            // Remembered per provider, so a later `/login <provider>` (which names no
+            // model) can come back to the model you were actually using there.
+            hrdr_agent::record_last_model(&reference);
         }
         if probe_after && let Some(w) = a.probe_context_window().await {
             post(w);
         }
-        deferred
+        // What merely LOOKS wrong (models.dev has never heard of this id; we could not
+        // reach the entitlement catalog to check) is said, not enforced.
+        warnings.join("\n")
     }));
 }
 

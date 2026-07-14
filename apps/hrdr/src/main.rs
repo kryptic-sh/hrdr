@@ -282,10 +282,14 @@ fn settle_base_url(
 /// Three questions, asked of the settled identity, in the order they can be
 /// answered:
 ///
-/// 1. **Is the model real?** ([`hrdr_agent::validate_identity`]) — the ChatGPT
-///    account catalog is the account's own entitlement list, so a model missing from
-///    a populated one is a refusal; models.dev is a third-party index that lags every
-///    release, so its silence is only ever a warning. Network-free.
+/// 1. **Is the model real?** ([`hrdr_agent::validate_identity`], then
+///    [`hrdr_agent::confirm_identity`]) — the ChatGPT account catalog is the account's
+///    own entitlement list, and the only thing allowed to refuse. A *cached* copy of
+///    it may only prove PRESENCE (an entitlement list grows, so a stale absence proves
+///    nothing) — so an absence is confirmed against a freshly fetched list before
+///    anyone is refused, and a fetch that fails warns instead of blocking. models.dev
+///    lags every release, so its silence is only ever a warning. Network-free unless
+///    hrdr is about to refuse.
 /// 2. **Did `--base-url` change something invisible?**
 ///    ([`hrdr_agent::relocation_warnings`]) — the wire protocol follows the host, and
 ///    the API key follows the URL. Both are legitimate for a proxy; both are worth
@@ -304,7 +308,8 @@ fn settle_base_url(
 /// exempt from (3) alone; the identity checks still run.
 async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
     let resolved = hrdr_agent::ResolvedModel::from_config(config);
-    for w in hrdr_agent::validate_identity(&resolved, config)? {
+    let verdict = hrdr_agent::validate_identity(&resolved, config);
+    for w in hrdr_agent::confirm_identity(verdict).await? {
         eprintln!("{w}");
     }
     // The provider's OWN address — a relocation is only a relocation relative to

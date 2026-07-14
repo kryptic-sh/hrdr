@@ -10,25 +10,33 @@
 //!
 //! The rule that governs every check here: **REFUSE only what we KNOW is wrong.**
 //!
-//! * The ChatGPT account catalog is an ENTITLEMENT list — it is the account's own
-//!   answer to "what may I run". A model missing from a populated one is a fact,
-//!   so it is a refusal.
-//! * The models.dev catalog is a THIRD-PARTY index, and it lags: a model released
-//!   this morning is not in it. Absence there is evidence, never proof, so it is a
-//!   warning and the request still goes out.
+//! * The ChatGPT account catalog is an ENTITLEMENT list — the account's own answer
+//!   to "what may I run", published by the endpoint that would serve it. It is the
+//!   one source allowed to refuse. But a *cached* copy of it may only ever prove
+//!   PRESENCE: an entitlement list grows (OpenAI ships a model, your account gets
+//!   it, your hour-old cache does not know), so an absence from a stale snapshot is
+//!   not evidence of anything. Absence is therefore a distinct outcome
+//!   ([`Identity::Unconfirmed`]) that the *edge* must resolve by fetching a fresh
+//!   list — and only a FRESH list may produce an `Err`.
+//! * The models.dev catalog is a THIRD-PARTY index, and it lags too. Absence there
+//!   is evidence, never proof, so it is a warning and the request still goes out.
 //! * A local server, a custom `[providers.*]`, a provider models.dev has never
 //!   heard of — we know nothing at all. Silence, not a guess.
 //!
-//! Everything below is pure over its inputs (the caches are loaded at the edges),
-//! so the rules are testable without a network, a cache file, or a `$HOME`.
+//! The [`validate_identity`] pass is pure over its inputs (the caches are loaded at
+//! its edge) and never touches the network, so it is affordable on every `/model`
+//! switch. The one round-trip lives in [`confirm_identity`], and is paid only in the
+//! rare case where hrdr is about to refuse someone — exactly when it is worth paying.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::chatgpt_models::ChatGptModel;
+use crate::chatgpt_models::{CatalogSource, ChatGptModel, chatgpt_model_catalog};
 use crate::model_ref::ModelRef;
+use crate::oauth::coordinated_oauth_access;
 use crate::resolve::ResolvedModel;
 use crate::{
     AgentConfig, ProviderConfig, ResolvedProviderKind, is_local_endpoint, resolve_provider_in,
@@ -52,16 +60,66 @@ fn sample(items: impl IntoIterator<Item = String>, total: usize) -> String {
     s
 }
 
+/// What the network-free pass concluded — and, crucially, what it did NOT conclude.
+///
+/// The whole point of the type is that it has no "refused" arm. Nothing that can be
+/// decided from a cache alone is allowed to refuse a ChatGPT identity, because the
+/// only cached evidence for a refusal — absence from a stored entitlement list — is
+/// exactly the evidence a stale cache cannot supply. The absence therefore comes
+/// back as [`Unconfirmed`](Self::Unconfirmed), which has no way to become an error
+/// except by going through [`confirm_identity`] and its fresh fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    /// Everything a cache can establish, established. Proceed, saying these
+    /// warnings (which are never fatal — see the module docs on models.dev).
+    Known(Vec<String>),
+    /// The model is not in the ChatGPT entitlement list we hold — which is a
+    /// question, not an answer. Only the edge can settle it.
+    Unconfirmed(Unconfirmed),
+}
+
+/// A ChatGPT identity whose entitlement could not be established from cache: the
+/// slug is absent from a stored list, or there is no usable list at all.
+///
+/// It carries everything [`confirm_identity`] needs to go and ask, and *nothing*
+/// that would let a caller turn it into a refusal on its own. That is deliberate: a
+/// stale snapshot is authoritative about what WAS entitled, never about what is new,
+/// and a `gpt-5.7` shipped this morning must not be refused by an hour-old cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unconfirmed {
+    model: String,
+    kind: ResolvedProviderKind,
+    base_url: String,
+}
+
+impl Unconfirmed {
+    /// The slug whose entitlement is in question.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// A ChatGPT entitlement list, and how much it is worth.
+///
+/// The distinction is the entire fix: [`Fresh`](Self::Fresh) came off the endpoint
+/// just now and is authoritative about ABSENCE as well as presence, so it may refuse.
+/// [`Unavailable`](Self::Unavailable) means we could not get one (offline, 401,
+/// timeout, rate-limited, a stale cache served instead) — so we could not confirm,
+/// and something we could not confirm must never block a launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entitlements {
+    /// Fetched live (or revalidated with a 304): proof, in both directions.
+    Fresh(Vec<String>),
+    /// No authoritative answer, and why.
+    Unavailable(String),
+}
+
 /// Validate a resolved identity against the catalogs already cached on disk.
 ///
-/// `Err` = **refuse**: we know this model is not on this provider, and sending the
-/// request would only produce a worse error later. `Ok(warnings)` = proceed, having
-/// said what looks wrong.
-///
 /// Network-free and cheap — safe to call on every `/model` switch, not just at
-/// startup. See the module docs for why exactly one of the two catalogs is allowed
-/// to refuse.
-pub fn validate_identity(m: &ResolvedModel, cfg: &AgentConfig) -> Result<Vec<String>> {
+/// startup — and, by construction, unable to refuse: see [`Identity`]. Hand the
+/// result to [`confirm_identity`] to settle it.
+pub fn validate_identity(m: &ResolvedModel, cfg: &AgentConfig) -> Identity {
     validate_identity_in(&cfg.providers, m)
 }
 
@@ -76,7 +134,7 @@ pub fn validate_identity(m: &ResolvedModel, cfg: &AgentConfig) -> Result<Vec<Str
 pub fn validate_identity_in(
     providers: &HashMap<String, ProviderConfig>,
     m: &ResolvedModel,
-) -> Result<Vec<String>> {
+) -> Identity {
     // The account catalog is keyed by ACCOUNT: only the credential currently in the
     // OAuth store can say which rows are this account's entitlements.
     let entitled = m
@@ -100,29 +158,27 @@ fn validate_identity_with(
     m: &ResolvedModel,
     entitled: Option<&[ChatGptModel]>,
     catalog: Option<&Value>,
-) -> Result<Vec<String>> {
+) -> Identity {
     let reference = m.reference();
     let model = reference.model();
 
-    // 1. The ChatGPT/Codex endpoint is AUTHORITATIVE about itself. The account
-    //    catalog is not an index of models that exist — it is the list of models
-    //    THIS ACCOUNT may run, published by the endpoint that will serve them. A
-    //    populated one that omits the slug is proof, and proof refuses.
+    // 1. The ChatGPT/Codex endpoint is AUTHORITATIVE about itself — but a CACHE of
+    //    its answer is not, and only in one direction. An entitlement list grows:
+    //    presence in a stale copy still means entitled (near enough), while absence
+    //    from one means only that the model did not exist for this account when the
+    //    copy was taken. So presence settles it here, for free; absence — and a cold
+    //    or foreign-account cache, which is the same ignorance by another route — is
+    //    handed on unresolved, for the edge to confirm against a fresh list.
     if m.is_codex_oauth() {
-        // No usable cache (cold, or written for another account): we cannot know,
-        // so we do not refuse — and we do not warn either, because there is nothing
-        // to report but our own ignorance.
-        let Some(rows) = entitled.filter(|r| !r.is_empty()) else {
-            return Ok(Vec::new());
-        };
-        if !rows.iter().any(|r| r.slug == model) {
-            let slugs = sample(rows.iter().map(|r| r.slug.clone()), rows.len());
-            bail!(
-                "model '{model}' is not entitled on this ChatGPT account — \
-                 entitled: {slugs} (run `/model` to pick one)"
-            );
+        let known = entitled.is_some_and(|rows| rows.iter().any(|r| r.slug == model));
+        if known {
+            return Identity::Known(Vec::new());
         }
-        return Ok(Vec::new());
+        return Identity::Unconfirmed(Unconfirmed {
+            model: model.to_string(),
+            kind: m.kind(),
+            base_url: m.base_url().to_string(),
+        });
     }
 
     // 2. A `[providers.<name>]` entry SHADOWS the built-in: the endpoint is the
@@ -133,7 +189,7 @@ fn validate_identity_with(
     let shadowed = resolve_provider_in(providers, name.as_str())
         .is_some_and(|p| p.kind == ResolvedProviderKind::Custom);
     if shadowed || m.kind() == ResolvedProviderKind::Custom {
-        return Ok(Vec::new());
+        return Identity::Known(Vec::new());
     }
 
     // 3. models.dev knows this provider → it may only WARN. The catalog lags every
@@ -141,23 +197,102 @@ fn validate_identity_with(
     //    on its silence would make hrdr unusable on exactly the models people are
     //    most excited to try.
     let Some(catalog) = catalog else {
-        return Ok(Vec::new());
+        return Identity::Known(Vec::new());
     };
     let Some(key) = name.catalog_key() else {
         // `local`, `chatgpt`, a custom name — models.dev covers none of them.
-        return Ok(Vec::new());
+        return Identity::Known(Vec::new());
     };
     // The provider is absent from the cached catalog (a partial or stale index):
     // that is a fact about the catalog, not about the model. Silence.
     let Some((_, models)) = hrdr_llm::catalog::provider_models(catalog, key) else {
-        return Ok(Vec::new());
+        return Identity::Known(Vec::new());
     };
     if models.is_empty() || models.iter().any(|(id, _)| id == model) {
-        return Ok(Vec::new());
+        return Identity::Known(Vec::new());
     }
-    Ok(vec![format!(
+    Identity::Known(vec![format!(
         "⚠ models.dev doesn't list '{model}' on {name} — it may be new, or a typo"
     )])
+}
+
+/// Settle an [`Identity`] — the ONE place a ChatGPT model may be refused.
+///
+/// [`Known`](Identity::Known) passes straight through: **no network**, which is the
+/// overwhelmingly common path (the model is in the cache, or the provider is not
+/// ChatGPT at all). Only an [`Unconfirmed`] one pays for a round-trip, and it is
+/// paid precisely when hrdr is otherwise about to tell someone their model does not
+/// exist — the one moment the cost is obviously worth it.
+pub async fn confirm_identity(v: Identity) -> Result<Vec<String>> {
+    confirm_identity_with(v, fetch_entitlements).await
+}
+
+/// [`confirm_identity`] with the fetch injected, so the confirm/refuse/warn rules —
+/// and the fact that a cached hit fetches NOTHING — are testable without a network
+/// or an OAuth store.
+pub async fn confirm_identity_with<F, Fut>(v: Identity, fetch: F) -> Result<Vec<String>>
+where
+    F: FnOnce(Unconfirmed) -> Fut,
+    Fut: Future<Output = Entitlements>,
+{
+    match v {
+        Identity::Known(warnings) => Ok(warnings),
+        Identity::Unconfirmed(u) => {
+            let model = u.model.clone();
+            confirm(&model, fetch(u).await)
+        }
+    }
+}
+
+/// The refusal rule, pure: a FRESH entitlement list is proof in both directions; an
+/// unavailable one is proof of nothing.
+///
+/// An empty "fresh" list is treated as unavailable rather than as "nothing is
+/// entitled": an account with zero entitled models is not a thing, so an empty
+/// answer means the catalog failed to say anything, and hrdr must not refuse on it.
+fn confirm(model: &str, entitlements: Entitlements) -> Result<Vec<String>> {
+    let why = match entitlements {
+        Entitlements::Fresh(slugs) if !slugs.is_empty() => {
+            if slugs.iter().any(|s| s == model) {
+                return Ok(Vec::new());
+            }
+            let listed = sample(slugs.iter().cloned(), slugs.len());
+            bail!(
+                "model '{model}' is not entitled on this ChatGPT account — \
+                 entitled: {listed} (run `/model` to pick one)"
+            );
+        }
+        Entitlements::Fresh(_) => "the account catalog came back empty".to_string(),
+        Entitlements::Unavailable(why) => why,
+    };
+    // We could not confirm — so we do not block. Say so and carry on: a user who
+    // knows their model exists must never be stopped by hrdr's inability to check.
+    Ok(vec![format!(
+        "⚠ couldn't confirm '{model}' against your ChatGPT entitlements ({why}) — continuing"
+    )])
+}
+
+/// Fetch the account's entitlements, live. Only a catalog the endpoint actually
+/// answered for ([`CatalogSource::Fresh`], which includes a `304`-revalidated cache)
+/// is authoritative; a stale cache or the built-in fallback is exactly the
+/// not-good-enough evidence this whole path exists to avoid refusing on.
+async fn fetch_entitlements(u: Unconfirmed) -> Entitlements {
+    let access = match coordinated_oauth_access(u.kind, &u.base_url).await {
+        Ok(a) => a,
+        Err(e) => return Entitlements::Unavailable(format!("{e}")),
+    };
+    // `force`: the whole point is to get past the cache that could not answer.
+    let result = chatgpt_model_catalog(&access, true).await;
+    match result.source {
+        CatalogSource::Fresh => {
+            Entitlements::Fresh(result.models.into_iter().map(|m| m.slug).collect())
+        }
+        CatalogSource::Stale | CatalogSource::BuiltInFallback => Entitlements::Unavailable(
+            result
+                .warning
+                .unwrap_or_else(|| "the account catalog was unavailable".to_string()),
+        ),
+    }
 }
 
 /// `"default"` is only honest against a server with **no model namespace**.
@@ -309,48 +444,141 @@ mod tests {
         })
     }
 
-    /// THE REFUSAL: the ChatGPT account catalog is the account's own entitlement
-    /// list, published by the endpoint that would serve the request. A populated one
-    /// that omits the slug is not a hint — it is the answer.
-    #[test]
-    fn a_chatgpt_model_absent_from_a_populated_account_catalog_is_refused() {
+    /// A counting fetcher: the confirmation round-trip must be paid ONLY when hrdr is
+    /// about to refuse someone, never on the ordinary path.
+    fn counting(
+        answer: Entitlements,
+    ) -> (
+        impl FnOnce(Unconfirmed) -> std::future::Ready<Entitlements>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let f = move |_u: Unconfirmed| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(answer)
+        };
+        (f, calls)
+    }
+
+    async fn settle(v: Identity, answer: Entitlements) -> (Result<Vec<String>>, usize) {
+        let (fetch, calls) = counting(answer);
+        let out = confirm_identity_with(v, fetch).await;
+        (out, calls.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// PRESENCE in a cached entitlement list settles it — and settles it for FREE.
+    /// The fetch is not attempted, because there is nothing left to ask.
+    #[tokio::test]
+    async fn a_model_present_in_the_cached_entitlements_is_accepted_without_a_fetch() {
         let cfg = cfg();
-        let m = resolved("chatgpt://gpt-4o", &cfg);
+        let m = resolved("chatgpt://gpt-5.5-codex", &cfg);
         assert!(
             m.is_codex_oauth(),
             "the real Codex endpoint, or no authority"
         );
+        // A STALE list — the cache carries no freshness signal here, and does not need
+        // to: an entitlement list only grows, so a model that was entitled an hour ago
+        // is entitled now.
         let rows = entitlements(&["gpt-5.5", "gpt-5.5-codex", "gpt-5.3-codex-spark"]);
+        let v = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()));
+        assert_eq!(v, Identity::Known(Vec::new()));
 
-        let err = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()))
-            .expect_err("a model this account cannot run is refused")
+        let (out, calls) = settle(v, Entitlements::Fresh(vec!["unused".to_string()])).await;
+        assert_eq!(out.unwrap(), Vec::<String>::new());
+        assert_eq!(calls, 0, "a cached hit costs no round-trip");
+    }
+
+    /// THE BUG THIS EXISTS TO KILL: a STALE cache that omits the model must not refuse
+    /// when the refresh fails. An entitlement list grows — OpenAI ships `gpt-5.7`, the
+    /// account gets it, the hour-old cache has never heard of it — so absence from a
+    /// snapshot is not evidence, and hrdr must not tell a user their real model is not
+    /// real just because it could not check.
+    #[tokio::test]
+    async fn a_stale_absence_warns_when_it_cannot_be_confirmed_and_never_refuses() {
+        let cfg = cfg();
+        let m = resolved("chatgpt://gpt-5.7", &cfg); // shipped this morning
+        let rows = entitlements(&["gpt-5.5", "gpt-5.5-codex"]); // yesterday's list
+        let v = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()));
+        assert!(
+            matches!(&v, Identity::Unconfirmed(u) if u.model() == "gpt-5.7"),
+            "an absence from a cache is a QUESTION, and the type says so: {v:?}",
+        );
+
+        // The refresh fails (offline, 401, timeout, rate-limited) → warn, carry on.
+        let (out, calls) = settle(
+            v.clone(),
+            Entitlements::Unavailable("endpoint unreachable".to_string()),
+        )
+        .await;
+        assert_eq!(
+            out.unwrap(),
+            [
+                "⚠ couldn't confirm 'gpt-5.7' against your ChatGPT entitlements (endpoint unreachable) — continuing"
+            ],
+        );
+        assert_eq!(calls, 1, "and it did try");
+
+        // An "empty" fresh catalog is not "nothing is entitled" — an account with zero
+        // entitled models is not a thing. Treated as unconfirmable, never as proof.
+        let (out, _) = settle(v.clone(), Entitlements::Fresh(Vec::new())).await;
+        assert!(out.unwrap()[0].contains("couldn't confirm 'gpt-5.7'"));
+
+        // A FRESH list that DOES have it: the cache was simply behind. No warning.
+        let (out, _) = settle(
+            v,
+            Entitlements::Fresh(vec!["gpt-5.5".to_string(), "gpt-5.7".to_string()]),
+        )
+        .await;
+        assert_eq!(out.unwrap(), Vec::<String>::new());
+    }
+
+    /// THE REFUSAL, and the only one: a model absent from a list fetched JUST NOW. The
+    /// account catalog is the account's own answer to "what may I run", and a fresh
+    /// one is authoritative about absence as well as presence — so now, and only now,
+    /// the statement "this model is not entitled" is true.
+    #[tokio::test]
+    async fn a_confirmed_absence_from_a_fresh_entitlement_list_is_refused() {
+        let cfg = cfg();
+        let m = resolved("chatgpt://gpt-4o", &cfg);
+        let rows = entitlements(&["gpt-5.5", "gpt-5.5-codex"]);
+        let v = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()));
+
+        let (out, calls) = settle(
+            v,
+            Entitlements::Fresh(vec![
+                "gpt-5.5".to_string(),
+                "gpt-5.5-codex".to_string(),
+                "gpt-5.3-codex-spark".to_string(),
+            ]),
+        )
+        .await;
+        assert_eq!(calls, 1, "we paid for proof before refusing");
+        let err = out
+            .expect_err("a CONFIRMED absence is a refusal")
             .to_string();
         assert!(err.contains("'gpt-4o' is not entitled"), "{err}");
         assert!(err.contains("gpt-5.5"), "it names what IS entitled: {err}");
         assert!(err.contains("/model"), "and how to fix it: {err}");
-
-        // An entitled slug passes, silently.
-        let ok = resolved("chatgpt://gpt-5.5-codex", &cfg);
-        assert_eq!(
-            validate_identity_with(&cfg.providers, &ok, Some(&rows), Some(&catalog())).unwrap(),
-            Vec::<String>::new()
-        );
     }
 
-    /// …and the SAME model is NOT refused when we have no cache to refuse it from.
-    /// A cold cache, or one written for a different account, is ignorance — and
-    /// ignorance never refuses. (`cached_entitlements` returns `None` for both, so a
-    /// `None` here IS the cold/other-account case.)
-    #[test]
-    fn a_cold_or_empty_account_catalog_refuses_nothing_and_warns_about_nothing() {
+    /// A COLD cache (or one written for another account — `cached_entitlements`
+    /// returns `None` for both) is ignorance, and it routes through the very same
+    /// "cannot confirm" path: a failed refresh warns, and never refuses.
+    #[tokio::test]
+    async fn a_cold_account_catalog_routes_through_confirmation_and_never_refuses() {
         let cfg = cfg();
         let m = resolved("chatgpt://gpt-4o", &cfg);
         for entitled in [None, Some(&[][..])] {
-            assert_eq!(
-                validate_identity_with(&cfg.providers, &m, entitled, Some(&catalog())).unwrap(),
-                Vec::<String>::new(),
-                "no usable catalog → no refusal, and nothing to say either",
+            let v = validate_identity_with(&cfg.providers, &m, entitled, Some(&catalog()));
+            assert!(matches!(v, Identity::Unconfirmed(_)), "{v:?}");
+            let (out, calls) =
+                settle(v, Entitlements::Unavailable("no credentials".to_string())).await;
+            assert!(
+                out.unwrap()[0].contains("couldn't confirm 'gpt-4o'"),
+                "an unconfirmable absence warns; it never blocks a launch",
             );
+            assert_eq!(calls, 1);
         }
         // And models.dev never gets a say about ChatGPT: it lists the differently
         // windowed *API* models under `openai`, which are not this account's
@@ -359,17 +587,19 @@ mod tests {
     }
 
     /// A `[providers.chatgpt]` shadow is `Custom`, never OAuth — so it is never
-    /// measured against somebody's account entitlements. It is the user's own server.
-    #[test]
-    fn a_shadowed_chatgpt_provider_is_never_refused_by_the_account_catalog() {
+    /// measured against somebody's account entitlements, and never even asks. It is
+    /// the user's own server.
+    #[tokio::test]
+    async fn a_shadowed_chatgpt_provider_is_never_refused_by_the_account_catalog() {
         let cfg = cfg_with("chatgpt", "http://localhost:9099/v1");
         let m = resolved("chatgpt://gpt-4o", &cfg);
         assert!(!m.is_codex_oauth());
         let rows = entitlements(&["gpt-5.5"]);
-        assert_eq!(
-            validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog())).unwrap(),
-            Vec::<String>::new()
-        );
+        let v = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()));
+        assert_eq!(v, Identity::Known(Vec::new()));
+        let (out, calls) = settle(v, Entitlements::Fresh(vec!["gpt-5.5".to_string()])).await;
+        assert_eq!(out.unwrap(), Vec::<String>::new());
+        assert_eq!(calls, 0);
     }
 
     /// models.dev only ever WARNS. It is a third-party index and it lags: a model
@@ -379,26 +609,26 @@ mod tests {
     fn an_unknown_model_on_a_models_dev_provider_warns_but_never_errs() {
         let cfg = cfg();
         let m = resolved("claude://claude-sonet-4-5", &cfg); // typo'd
-        let warnings = validate_identity_with(&cfg.providers, &m, None, Some(&catalog()))
-            .expect("models.dev NEVER refuses");
         assert_eq!(
-            warnings,
-            ["⚠ models.dev doesn't list 'claude-sonet-4-5' on claude — it may be new, or a typo"],
+            validate_identity_with(&cfg.providers, &m, None, Some(&catalog())),
+            Identity::Known(vec![
+                "⚠ models.dev doesn't list 'claude-sonet-4-5' on claude — it may be new, or a typo"
+                    .to_string()
+            ]),
+            "models.dev NEVER refuses — it cannot even express a refusal from here",
         );
         // A model it does list is silent.
         let known = resolved("claude://claude-opus-4-8", &cfg);
-        assert!(
-            validate_identity_with(&cfg.providers, &known, None, Some(&catalog()))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            validate_identity_with(&cfg.providers, &known, None, Some(&catalog())),
+            Identity::Known(Vec::new())
         );
         // The warning is keyed through the CATALOG name (`claude` → `anthropic`), so
         // an alias spelling folds onto the same answer.
         let alias = resolved("anthropic://claude-opus-4-8", &cfg);
-        assert!(
-            validate_identity_with(&cfg.providers, &alias, None, Some(&catalog()))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            validate_identity_with(&cfg.providers, &alias, None, Some(&catalog())),
+            Identity::Known(Vec::new())
         );
     }
 
@@ -408,41 +638,38 @@ mod tests {
     #[test]
     fn what_we_cannot_know_we_do_not_mention() {
         let catalog = catalog();
+        let silent = Identity::Known(Vec::new());
         // `local`: no catalog key. A local server serves whatever it was started with.
         let cfg = cfg();
         for spec in ["local://qwen3-coder-next", "local://default"] {
             let m = resolved(spec, &cfg);
-            assert!(
-                validate_identity_with(&cfg.providers, &m, None, Some(&catalog))
-                    .unwrap()
-                    .is_empty(),
+            assert_eq!(
+                validate_identity_with(&cfg.providers, &m, None, Some(&catalog)),
+                silent,
                 "{spec}"
             );
         }
         // A custom `[providers.*]`: models.dev describes somebody else's server.
         let custom = cfg_with("mygateway", "https://gw.internal/v1");
         let m = resolved("mygateway://whatever-v9", &custom);
-        assert!(
-            validate_identity_with(&custom.providers, &m, None, Some(&catalog))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            validate_identity_with(&custom.providers, &m, None, Some(&catalog)),
+            silent
         );
         // A built-in models.dev DOES key (`openrouter`) but which is absent from this
         // cached index: that is a fact about the catalog, not the model. Silence.
         let m = resolved("openrouter://deepseek/deepseek-v4", &cfg);
         assert!(m.reference().provider().catalog_key().is_some());
-        assert!(
-            validate_identity_with(&cfg.providers, &m, None, Some(&catalog))
-                .unwrap()
-                .is_empty(),
+        assert_eq!(
+            validate_identity_with(&cfg.providers, &m, None, Some(&catalog)),
+            silent,
             "a provider the catalog does not carry is not evidence of anything",
         );
         // No cached catalog at all → nothing to say about anyone.
         let m = resolved("claude://claude-sonet-4-5", &cfg);
-        assert!(
-            validate_identity_with(&cfg.providers, &m, None, None)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            validate_identity_with(&cfg.providers, &m, None, None),
+            silent
         );
     }
 
@@ -590,7 +817,7 @@ mod tests {
     fn the_public_entry_point_is_network_free_and_refuses_nothing_it_cannot_prove() {
         let cfg = cfg();
         let m = resolved("local://qwen3", &cfg);
-        assert!(validate_identity(&m, &cfg).is_ok());
+        assert_eq!(validate_identity(&m, &cfg), Identity::Known(Vec::new()));
         assert_eq!(m.base_url(), "http://localhost:8080/v1");
         // …and the Codex endpoint is the authoritative one, so the double gate that
         // decides it is worth pinning here too.

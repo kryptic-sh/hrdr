@@ -8,6 +8,11 @@ use tokio::sync::Mutex;
 use super::dispatch::open_system_handler;
 use super::types::{ExpandMode, LineFuture, LineKind};
 
+/// The sink [`CommandHost::identity_poster`] hands to a switch task: the identity the
+/// agent actually adopted, plus the endpoint and window that moved with it (each
+/// `None` when it did not).
+pub type IdentityPoster = Box<dyn Fn(hrdr_agent::ModelRef, Option<String>, Option<u32>) + Send>;
+
 /// The capabilities a frontend exposes so the shared commands can drive it.
 pub trait CommandHost {
     /// Emit a system line immediately (on the UI thread).
@@ -274,6 +279,21 @@ pub trait CommandHost {
     /// switch can honor the new model's advertised max context.
     fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
         Box::new(|_| {})
+    }
+
+    /// A `Send`able sink that applies an identity the agent has ACTUALLY ADOPTED —
+    /// model, and optionally the endpoint and window that moved with it — onto the
+    /// chrome, from the background task that adopted it.
+    ///
+    /// The chrome must not run ahead of the agent. Settling a `/model` switch can
+    /// need a network round-trip (confirming a ChatGPT entitlement the cache cannot
+    /// vouch for), and a switch that is then refused must leave the status bar where
+    /// the agent stayed — so nothing is displayed until the agent has taken it. The
+    /// async analogue of [`set_model_ref`](Self::set_model_ref) +
+    /// [`set_base_url`](Self::set_base_url) + [`set_context_window`](Self::set_context_window),
+    /// the way [`context_window_poster`](Self::context_window_poster) is of the last.
+    fn identity_poster(&self) -> IdentityPoster {
+        Box::new(|_, _, _| {})
     }
 
     /// Begin the `/login` wizard. A frontend that supports it stashes

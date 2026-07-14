@@ -342,6 +342,18 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             let _ = tx.send(TurnMsg::ContextWindow(id, tokens));
         })
     }
+    fn identity_poster(
+        &self,
+    ) -> Box<dyn Fn(hrdr_agent::ModelRef, Option<String>, Option<u32>) + Send> {
+        let tx = self.app.tx.clone();
+        // Bind the pane *now*, as `context_window_poster` does: the switch lands
+        // later, and the identity belongs to the agent that was switched, not to
+        // whatever the reader happens to be looking at when it arrives.
+        let id = self.app.panes.active();
+        Box::new(move |reference, base_url, window| {
+            let _ = tx.send(TurnMsg::Identity(id, reference, base_url, window));
+        })
+    }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
         // Commands act on the agent you are looking at — the same rule as the
         // input box. A sub-agent is an agent: `/compact`, `/tools`, `/prompt`,

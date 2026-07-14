@@ -35,7 +35,8 @@ mod resolve;
 pub use resolve::{AuthContext, ResolvedModel, resolve, resolve_in};
 mod validate;
 pub use validate::{
-    PLACEHOLDER_MODEL, relocation_warnings, validate_identity, validate_placeholder_model,
+    Entitlements, Identity, PLACEHOLDER_MODEL, Unconfirmed, confirm_identity,
+    confirm_identity_with, relocation_warnings, validate_identity, validate_placeholder_model,
 };
 mod models;
 mod subagent_live;
@@ -4650,21 +4651,25 @@ impl Agent {
     }
 
     /// Would `reference` be a real identity on this agent's providers? — the
-    /// network-free check that runs BEFORE [`set_model_ref`](Self::set_model_ref)
+    /// network-free pass that runs BEFORE [`set_model_ref`](Self::set_model_ref)
     /// moves anything.
     ///
-    /// `Err` refuses (the agent stays exactly where it is); `Ok(warnings)` proceeds.
+    /// `Err` only when the provider itself does not resolve. The *model* is never
+    /// refused here: an unproven absence comes back as
+    /// [`Identity::Unconfirmed`](crate::Identity::Unconfirmed), which only
+    /// [`confirm_identity`](crate::confirm_identity) — and its fresh fetch — may turn
+    /// into a refusal.
+    ///
     /// Resolves the candidate the same way `set_model_ref` will — same providers,
     /// same relocation carried across a same-provider switch — so what is validated
     /// is what would be adopted, not an approximation of it.
-    /// See [`validate_identity`](crate::validate_identity).
-    pub fn validate_ref(&self, reference: &ModelRef) -> Result<Vec<String>> {
+    pub fn validate_ref(&self, reference: &ModelRef) -> Result<validate::Identity> {
         let same_provider = reference.provider() == self.resolved.reference().provider();
         let mut resolved = resolve_in(&self.providers, reference, None)?;
         if let (Some(r), true) = (&self.relocation, same_provider) {
             resolved.relocate(r.base_url.clone(), r.api_key.clone());
         }
-        validate::validate_identity_in(&self.providers, &resolved)
+        Ok(validate::validate_identity_in(&self.providers, &resolved))
     }
 
     /// Move the resolved endpoint elsewhere (`--base-url`) — a **relocation**, not
@@ -6685,9 +6690,13 @@ mod tests {
         // A provider that is neither a built-in nor a `[providers.*]` cannot even be
         // resolved, let alone validated — and the agent does not budge.
         assert!(agent.validate_ref(&r("nosuchprovider://m")).is_err());
-        // A real one validates (the test process has no cached catalogs and no OAuth
-        // store, so there is nothing to refuse WITH — and nothing is refused).
-        assert!(agent.validate_ref(&r("local://qwen3")).is_ok());
+        // A real one validates. Note what it CANNOT return: the pass is network-free,
+        // and nothing network-free is allowed to refuse a model — an unproven absence
+        // comes back as `Unconfirmed` for the edge to settle, never as an `Err`.
+        assert_eq!(
+            agent.validate_ref(&r("local://qwen3")).unwrap(),
+            crate::validate::Identity::Known(Vec::new()),
+        );
         assert_eq!(
             agent.model_ref(),
             &r("local://old"),

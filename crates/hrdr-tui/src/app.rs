@@ -144,6 +144,17 @@ pub(crate) enum TurnMsg {
     /// Carries the pane whose agent was switched: `/model` acts on the agent being
     /// viewed, so its probe result belongs to that agent and not to the session's.
     ContextWindow(hrdr_app::PaneId, u32),
+    /// A `/model` switch was ACCEPTED by the agent: adopt the identity it actually
+    /// took — and the endpoint/window that moved with it — onto that pane's chrome.
+    /// Sent by the switch task, never by the keystroke: settling a switch can need a
+    /// network round-trip (confirming a ChatGPT entitlement), and a switch that is
+    /// then refused must leave the status bar where the agent stayed.
+    Identity(
+        hrdr_app::PaneId,
+        hrdr_agent::ModelRef,
+        Option<String>,
+        Option<u32>,
+    ),
     /// A browser OAuth login's exchange/save step finished. Carries the typed
     /// outcome (with its originating `login_id`) so the loop can reject a stale
     /// login and, on a match, run the live provider switch.
@@ -1907,6 +1918,16 @@ impl App {
                 self.file_index = files;
                 self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
+            }
+            TurnMsg::Identity(id, reference, base_url, window) => {
+                // The agent has taken it; the chrome may now say so.
+                self.update_chrome(id, |s| s.model = reference);
+                if let Some(url) = base_url {
+                    self.update_chrome(id, |s| s.base_url = url);
+                }
+                if let Some(w) = window {
+                    self.set_pane_context_window(id, Some(w));
+                }
             }
             TurnMsg::ContextWindow(id, tokens) => {
                 // A model/provider switch re-probed the endpoint; honor the new

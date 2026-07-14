@@ -319,6 +319,25 @@ impl Harness {
         self.pump().await;
     }
 
+    /// Let a `/model` switch LAND: drain until the switch task posts the identity the
+    /// agent actually adopted.
+    ///
+    /// The chrome is deliberately not written on the keystroke any more. Settling a
+    /// switch can need a network round-trip (confirming a ChatGPT entitlement the
+    /// cached list cannot vouch for), and a switch that is then refused must leave the
+    /// status bar exactly where the agent stayed — so the display only ever follows
+    /// the agent, one message later. The real event loop drains that message; a test
+    /// that switches has to as well.
+    async fn settle_switch(&mut self) {
+        while let Some(msg) = self.rx.recv().await {
+            let landed = matches!(msg, TurnMsg::Identity(..));
+            self.app.on_turn_msg(msg);
+            if landed {
+                return;
+            }
+        }
+    }
+
     /// Drain the turn channel until the agent is no longer running.
     async fn pump(&mut self) {
         while self.app.running() {
@@ -1764,6 +1783,8 @@ async fn the_header_persists_and_shows_live_details() {
     };
     h.app
         .apply_session("s".to_string(), hrdr_app::Session::new(state));
+    // The chrome follows the agent, never leads it: let the repoint land.
+    h.settle_switch().await;
 
     let mut term = Terminal::new(TestBackend::new(64, 32)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3195,6 +3216,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     // the same path the picker's confirm takes.
     h.app
         .apply_model_choice_for_test("openai", "gpt-5", Some(400_000));
+    h.settle_switch().await;
     assert_eq!(
         h.app.active_model_ref(),
         "openai://gpt-5".parse().unwrap(),
@@ -4456,6 +4478,7 @@ async fn browser_login_success_switches_provider() {
         token_saved: true,
         error: None,
     });
+    h.settle_switch().await;
     assert!(
         h.app.login_modal.is_none(),
         "the switch transaction closed the modal"
