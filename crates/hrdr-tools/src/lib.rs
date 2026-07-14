@@ -403,6 +403,13 @@ pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
 /// Canonicalize `path` by resolving its nearest existing ancestor (the path
 /// itself may not exist yet — e.g. a file about to be created) and re-joining
 /// the non-existent remainder.
+///
+/// The result is **normalized**: lexical `..` and `.` components in the
+/// unresolved suffix are resolved against the canonical prefix so that the
+/// returned path never contains unprocessed `ParentDir` components. This
+/// prevents a confinement bypass where a path like
+/// `cwd/nonexistent/../../etc/passwd` would pass a `starts_with(cwd)` check
+/// despite escaping the working directory.
 pub(crate) fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
@@ -412,16 +419,57 @@ pub(crate) fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
             for c in rest.iter().rev() {
                 out.push(c);
             }
-            return out;
+            return normalize_path(&out);
         }
         match (existing.parent(), existing.file_name()) {
             (Some(parent), Some(name)) => {
                 rest.push(name.to_os_string());
                 existing = parent;
             }
-            _ => return path.to_path_buf(),
+            _ => return normalize_path(path),
         }
     }
+}
+
+/// Resolve lexical `..` and `.` path components so the returned `PathBuf`
+/// contains no unprocessed parent-directory or current-directory components.
+///
+/// For absolute paths, `..` at the root is a no-op (cannot go above `/`).
+/// For relative paths, a leading `..` is preserved because it refers to the
+/// (unknown) working directory's parent.
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => { /* skip */ }
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = stack.last() {
+                    stack.pop();
+                } else if matches!(
+                    stack.last(),
+                    Some(Component::RootDir) | Some(Component::Prefix(_))
+                ) {
+                    // absolute path at root — `..` is a no-op
+                } else {
+                    // relative path with no normal component — preserve `..`
+                    stack.push(Component::ParentDir);
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    let mut result = PathBuf::new();
+    for component in &stack {
+        match component {
+            Component::RootDir => result.push("/"),
+            Component::Prefix(p) => result.push(p.as_os_str()),
+            Component::Normal(s) => result.push(s),
+            Component::ParentDir => result.push(".."),
+            Component::CurDir => result.push("."),
+        }
+    }
+    result
 }
 
 /// Credential/secret file patterns the content-reading tools (`read`, `grep`)
@@ -1759,6 +1807,196 @@ b:2:y"
         assert_eq!(
             ctx.resolve("sub/file.txt"),
             PathBuf::from("/my/cwd/sub/file.txt")
+        );
+    }
+
+    // ---- canonicalize_nearest / normalize_path ----
+
+    #[test]
+    fn canonicalize_nearest_removes_dotdot_within_unresolved_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        // cwd with a known-existing subdirectory to make the exercise realistic.
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Path where the unresolved suffix contains `..` that would escape
+        // above cwd: project/nonexistent/../../outside/file
+        let path = cwd.join("nonexistent/../../outside/file");
+
+        let canon = canonicalize_nearest(&path);
+        // The normalized result must NOT start with cwd (the `../../..` escapes).
+        assert!(
+            !canon.starts_with(&cwd),
+            "escaped path {canon:?} must not start with cwd {cwd:?}"
+        );
+        // The result should be inside the tempdir parent (one level above cwd).
+        assert!(
+            canon.starts_with(dir.path()),
+            "escaped path {canon:?} must resolve within the temp root {dir:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_nearest_preserves_legitimate_deep_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // A non-existing nested file inside cwd stays under cwd after normalization.
+        let path = cwd.join("src/main.rs");
+        let canon = canonicalize_nearest(&path);
+        assert!(
+            canon.starts_with(&cwd),
+            "legitimate path {canon:?} must start with cwd {cwd:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_nearest_resolves_dotdot_in_middle_of_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // `sub` doesn't exist, but `../other` inside the unresolved suffix
+        // should resolve to just `other` at cwd level.
+        let path = cwd.join("sub/../other/file");
+        let canon = canonicalize_nearest(&path);
+        assert_eq!(canon, cwd.join("other/file"));
+    }
+
+    #[test]
+    fn ensure_inside_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
+        // Use a non-temp cwd so the temp-dir escape hatch doesn't mask the result.
+        let cwd = Path::new("/nonexistent-hrdr-test/cwd");
+        let ctx = ToolContext::new(cwd);
+
+        // Path: cwd/nonexistent/../../escape — escapes above cwd via
+        // `..` in the unresolved suffix.
+        let path = cwd.join("nonexistent/../../escape/file");
+        let err = ctx.ensure_inside_cwd(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_inside_cwd_preserves_legitimate_deep_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ctx = ToolContext::new(&cwd);
+
+        // Non-existing nested file inside cwd: must be allowed.
+        let path = cwd.join("src/main.rs");
+        assert!(
+            ctx.ensure_inside_cwd(&path).is_ok(),
+            "deep path inside cwd must be allowed"
+        );
+        // Non-existing file using `..` to stay inside cwd.
+        let path = cwd.join("sub/../other/file");
+        assert!(
+            ctx.ensure_inside_cwd(&path).is_ok(),
+            "path with .. staying inside cwd must be allowed"
+        );
+    }
+
+    #[test]
+    fn ensure_read_inside_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ctx = ToolContext::new(&cwd);
+
+        // Same escape via unresolved `..` suffix — reads must also be confined.
+        let path = cwd.join("nonexistent/../../outside/file");
+        let err = ctx.ensure_read_inside_cwd(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_within_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
+        // Use a non-temp cwd so the temp-dir escape hatch doesn't mask the result.
+        let cwd = Path::new("/nonexistent-hrdr-test/cwd");
+        let ctx = ToolContext::new(cwd);
+
+        // Mutation confinement through the same escape vector.
+        let path = cwd.join("nonexistent/../../escape/file");
+        let err = ctx.ensure_within_cwd(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_within_cwd_still_allows_temp_scratch() {
+        // The temp-dir escape hatch for writes must survive normalization.
+        let ctx = ToolContext::new("/etc");
+        let tmp = std::env::temp_dir().join("hrdr-scratch.txt");
+        assert!(
+            ctx.ensure_within_cwd(&tmp).is_ok(),
+            "temp dir scratch must still be allowed"
+        );
+    }
+
+    #[test]
+    fn normalize_path_handles_existing_and_nonexistent_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Create a symlink inside the project pointing outside.
+        let outside = dir.path().join("outside_file");
+        std::fs::write(&outside, "content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+
+        // Path using the symlink component + `..` escape in unresolved suffix.
+        // project/link/../../outside/other — `link` follows to `outside_file`,
+        // but the `..` in the unresolved part should be normalized.
+        let path = cwd.join("link/../../other/file");
+        let canon = canonicalize_nearest(&path);
+        // The `..` from inside the symlink-target dir resolves above it;
+        // the result must not start with cwd (the path escapes).
+        assert!(
+            !canon.starts_with(&cwd),
+            "symlink-escaped path {canon:?} must not start with cwd {cwd:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_inside_cwd_accepts_dotdot_inside_existing_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let sub = cwd.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let ctx = ToolContext::new(&cwd);
+
+        // sub exists and ../other stays inside cwd — must be allowed.
+        let path = cwd.join("sub/../other/file");
+        assert!(
+            ctx.ensure_inside_cwd(&path).is_ok(),
+            ".. inside existing subdir staying in cwd must be allowed"
+        );
+    }
+
+    #[test]
+    fn ensure_inside_cwd_accepts_existing_target_with_trailing_dotdot_inside_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let sub = cwd.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let existing_file = sub.join("file.txt");
+        std::fs::write(&existing_file, "data").unwrap();
+        let ctx = ToolContext::new(&cwd);
+
+        // Existing target with `..` that stays inside cwd.
+        let path = cwd.join("sub/../file.txt");
+        assert!(
+            ctx.ensure_inside_cwd(&path).is_ok(),
+            "existing file reached via .. staying in cwd must be allowed"
         );
     }
 }
