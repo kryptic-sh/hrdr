@@ -31,6 +31,8 @@ mod paths;
 pub use paths::cwd_slug;
 mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
+mod resolve;
+pub use resolve::{AuthContext, ResolvedModel, resolve};
 mod models;
 mod subagent_live;
 pub use subagent_live::{
@@ -1049,12 +1051,12 @@ impl Drop for CompactingGuard {
 /// the catalog is keyed by ITS names (`opencode`, `anthropic`), not hrdr's
 /// (`zen`, `claude`); handing it the raw name matched nothing and silently fell
 /// back to the smallest window any provider reported for the id.
+///
+/// Thin entry point: the rule itself lives in [`resolve::derived_context_window`],
+/// which [`resolve`] also uses — one implementation, so the seam and the call
+/// sites can never disagree about a model's window.
 pub fn context_window_for(provider: Option<&str>, base_url: &str, model: &str) -> Option<u32> {
-    if base_url == CHATGPT_CODEX_BASE_URL {
-        return chatgpt_models::cached_context_window(model)
-            .or_else(|| builtin_provider("chatgpt").and_then(|p| p.context_window));
-    }
-    hrdr_llm::catalog::context_window_cached(catalog_provider_key(provider).as_deref(), model)
+    resolve::derived_context_window(provider, base_url, model)
 }
 
 /// The context window a delegated sub-agent should run against, given the window
