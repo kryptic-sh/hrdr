@@ -5317,3 +5317,79 @@ async fn completion_popup_caps_at_five_rows_and_scrolls() {
         "window slid to keep the selection visible"
     );
 }
+
+/// The TODO panel shows the current agent's list — not a global one. Each
+/// agent keeps its own TODO list in its live entry; switching panes switches
+/// which TODOs are rendered below the sub-agent panel. The existing tests
+/// exercise the main agent; this one verifies the sub-agent's own list
+/// appears when its pane is active.
+#[tokio::test]
+async fn the_todo_panel_shows_the_active_agents_list() {
+    let mut h = Harness::new(vec![]).await;
+
+    // Give the main agent a TODO.
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "main task".to_string(),
+        status: "in_progress".to_string(),
+    }];
+
+    // Register a sub-agent with its own TODO.
+    let sub_key = 1u64;
+    let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
+        content: "sub task".to_string(),
+        status: "pending".to_string(),
+    }]));
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: sub_key,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: sub_todos.clone(),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
+        steering: hrdr_agent::steering_queue(),
+        running: false,
+        compacting: false,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
+    h.app.sync_panes();
+
+    // On the main agent: only the main agent's TODO shows.
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("main task"),
+        "main agent's todos:\n{screen}"
+    );
+    assert!(
+        !screen.contains("sub task"),
+        "sub-agent's todos not on main:\n{screen}"
+    );
+
+    // Switch to the sub-agent: now only its TODO shows.
+    h.app.focus_pane(hrdr_app::PaneId::Sub(sub_key));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("main task"),
+        "main's todos hidden on sub:\n{screen}"
+    );
+    assert!(screen.contains("sub task"), "sub-agent's todos:\n{screen}");
+}

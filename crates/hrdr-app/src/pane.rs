@@ -254,7 +254,10 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
         // A steered message is a real user turn in this conversation.
         AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
-        AgentEvent::Usage { .. } | AgentEvent::History(_) | AgentEvent::TurnDone => {}
+        AgentEvent::Usage { .. }
+        | AgentEvent::History(_)
+        | AgentEvent::TurnDone
+        | AgentEvent::TodoUpdated(_) => {}
     }
 }
 

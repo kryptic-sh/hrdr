@@ -483,6 +483,10 @@ pub enum AgentEvent {
     /// conversation — the frontend shows it as a user message at this point, so
     /// display order matches the model's view.
     Steered(String),
+    /// The agent's TODO list was updated by the `todo` tool. Carries the full
+    /// new list so a frontend or event log reader can see the state without
+    /// reaching into the shared Arc.
+    TodoUpdated(Vec<hrdr_tools::TodoItem>),
     /// The model produced a final answer with no further tool calls.
     TurnDone,
 }
@@ -5673,6 +5677,17 @@ impl Agent {
             result: body.clone(),
             ok,
         });
+        // The `todo` tool replaces the shared list; emit the new state so every
+        // listener — including this agent's own event log — records the update.
+        if call.function.name == "todo" {
+            let todos = self
+                .ctx
+                .todos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            on_event(AgentEvent::TodoUpdated(todos));
+        }
         self.messages
             .push(ChatMessage::tool_result(call.id.clone(), body));
     }
