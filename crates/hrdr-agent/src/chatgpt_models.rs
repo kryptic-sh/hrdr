@@ -245,6 +245,42 @@ fn write_cache_at(path: &Path, entry: &CacheFile) -> std::io::Result<()> {
     write_atomic(path, &json)
 }
 
+/// Pure slug→window lookup over a model list, so the resolution rule is testable
+/// without a cache file.
+fn context_window_in(models: &[ChatGptModel], slug: &str) -> Option<u32> {
+    models
+        .iter()
+        .find(|m| m.slug == slug)
+        .and_then(|m| m.context_window)
+}
+
+/// The advertised context window for `slug` in the catalog cache file at `path`,
+/// network-free. Path-injectable so it is testable without the real XDG cache.
+///
+/// Only the cache SCHEMA is gated (a layout bump invalidates older files). The
+/// account digest and TTL are deliberately not: a model's context window is a
+/// property of the model, identical across every entitled account, so a slug
+/// match is authoritative regardless of which account wrote the cache or how old
+/// it is — unlike *entitlement* (which rows exist), which those checks guard on
+/// the serve path.
+fn cached_context_window_at(path: &Path, slug: &str) -> Option<u32> {
+    let cache = load_cache_at(path)?;
+    if cache.schema != CATALOG_CACHE_SCHEMA {
+        return None;
+    }
+    context_window_in(&cache.models, slug)
+}
+
+/// The context window for ChatGPT model `slug` from the on-disk account catalog
+/// cache (`chatgpt_models.json`), network-free. This is the only source that
+/// knows per-model windows for ChatGPT *subscription* models: the endpoint's
+/// `/v1/models` returns 401 and models.dev lists the differently-windowed API
+/// models. `None` when there is no cache, the slug is absent, or the row
+/// advertised no window.
+pub fn cached_context_window(slug: &str) -> Option<u32> {
+    cached_context_window_at(&cache_path()?, slug)
+}
+
 /// A cache entry is usable — for fresh OR stale serve — only when its schema,
 /// account digest, and compatibility version all match the current credential.
 fn cache_matches(entry: &CacheFile, digest: &str) -> bool {
@@ -645,6 +681,56 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("bearer"));
         assert!(!raw.contains("acct"));
+    }
+
+    #[test]
+    fn cached_window_reads_the_persisted_per_model_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatgpt_models.json");
+        let mut e = entry(&account_digest("acct"), 0);
+        e.models = vec![
+            ChatGptModel {
+                slug: "gpt-5.5".to_string(),
+                label: "GPT-5.5".to_string(),
+                context_window: Some(272_000),
+            },
+            ChatGptModel {
+                slug: "gpt-5.3-codex-spark".to_string(),
+                label: "Spark".to_string(),
+                context_window: Some(128_000),
+            },
+            ChatGptModel {
+                slug: "no-window".to_string(),
+                label: "x".to_string(),
+                context_window: None,
+            },
+        ];
+        write_cache_at(&path, &e).unwrap();
+
+        // Each entitled model resolves to its OWN advertised window — not a
+        // single provider-wide constant.
+        assert_eq!(cached_context_window_at(&path, "gpt-5.5"), Some(272_000));
+        assert_eq!(
+            cached_context_window_at(&path, "gpt-5.3-codex-spark"),
+            Some(128_000)
+        );
+        // A row that advertised no window, and a slug not in the cache, are both
+        // `None` — the caller falls back rather than inventing a number.
+        assert_eq!(cached_context_window_at(&path, "no-window"), None);
+        assert_eq!(cached_context_window_at(&path, "absent"), None);
+        // A missing file is `None`, not an error.
+        assert_eq!(
+            cached_context_window_at(&dir.path().join("nope.json"), "gpt-5.5"),
+            None
+        );
+
+        // A cache written under an incompatible schema is not trusted, even though
+        // it deserializes — the row layout may mean something else.
+        let mut bad = e.clone();
+        bad.schema = CATALOG_CACHE_SCHEMA + 1;
+        let bad_path = dir.path().join("bad_schema.json");
+        write_cache_at(&bad_path, &bad).unwrap();
+        assert_eq!(cached_context_window_at(&bad_path, "gpt-5.5"), None);
     }
 
     // ── Decision logic ──────────────────────────────────────────────────────

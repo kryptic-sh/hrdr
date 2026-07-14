@@ -304,7 +304,11 @@ async fn main() -> Result<()> {
             // model id in place.
             config.model = p.model.clone().unwrap_or_else(|| "default".to_string());
         }
-        if config.context_window.is_none() {
+        // Stamp the provider's flat preset — EXCEPT for the Codex endpoint, whose
+        // preset is only right for its default model (gpt-5.5 = 272k) and would
+        // over-state a smaller entitled model (a 128k codex model). Codex is
+        // resolved per-model below, once the final model is known.
+        if config.context_window.is_none() && p.base_url != hrdr_agent::CHATGPT_CODEX_BASE_URL {
             config.context_window = p.context_window;
         }
         config.headers = p.headers.into_iter().collect();
@@ -440,16 +444,27 @@ async fn main() -> Result<()> {
     // A 3-second timeout prevents a firewall-DROPped endpoint from hanging
     // startup forever before the TUI appears. Timeout ≡ no context window known.
     if config.context_window.is_none() {
-        let probe = hrdr_llm::Client::new(
-            config.base_url.clone(),
-            config.api_key.clone(),
-            config.model.clone(),
-        );
-        config.context_window =
-            tokio::time::timeout(Duration::from_secs(3), probe.context_window())
-                .await
-                .ok()
-                .flatten();
+        if config.base_url == hrdr_agent::CHATGPT_CODEX_BASE_URL {
+            // The Codex endpoint 401s on `/v1/models`, so the server probe can't
+            // read it. Resolve per-model from the account catalog cache instead —
+            // now that the final model is known — falling back to the preset floor.
+            config.context_window = hrdr_agent::context_window_for(
+                config.provider.as_deref(),
+                &config.base_url,
+                &config.model,
+            );
+        } else {
+            let probe = hrdr_llm::Client::new(
+                config.base_url.clone(),
+                config.api_key.clone(),
+                config.model.clone(),
+            );
+            config.context_window =
+                tokio::time::timeout(Duration::from_secs(3), probe.context_window())
+                    .await
+                    .ok()
+                    .flatten();
+        }
     }
 
     match cli.command {

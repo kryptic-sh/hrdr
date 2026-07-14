@@ -1032,19 +1032,68 @@ impl Drop for CompactingGuard {
     }
 }
 
+/// Per-model context window, network-free, from the source that actually knows
+/// THIS endpoint's models.
+///
+/// The ChatGPT branch is gated on the **endpoint** (`base_url ==
+/// [`CHATGPT_CODEX_BASE_URL`]`), NOT the provider name: a user's
+/// `[providers.chatgpt]` pointed at some other URL is a `Custom` provider that
+/// happens to share the spelling, and must resolve like any other endpoint. Only
+/// the real Codex endpoint uses the account catalog cache (the only place
+/// subscription windows live — `/v1/models` 401s and models.dev lists the
+/// differently-windowed API model of the same id), with the built-in preset as a
+/// cold-cache floor. models.dev is never consulted for it. Every other endpoint
+/// resolves from the models.dev catalog.
+pub fn context_window_for(provider: Option<&str>, base_url: &str, model: &str) -> Option<u32> {
+    if base_url == CHATGPT_CODEX_BASE_URL {
+        return chatgpt_models::cached_context_window(model)
+            .or_else(|| builtin_provider("chatgpt").and_then(|p| p.context_window));
+    }
+    hrdr_llm::catalog::context_window_cached(provider, model)
+}
+
+/// The context window a delegated sub-agent should run against, given the window
+/// it would inherit from its parent and the sub-agent's own
+/// `(provider, base_url, model)`.
+///
+/// The Codex endpoint is the only path this fix changes: its account catalog is
+/// authoritative and per-model, so a Codex sub-agent ALWAYS re-derives and never
+/// carries a wrong inherited preset — the reported overflow (a sub-agent told the
+/// old 400k, or a repoint's 272k preset, for a 128k model).
+///
+/// Every other endpoint keeps the pre-existing behaviour: prefer `inherited`,
+/// which may be the parent's endpoint-probed value (a local server's
+/// `max_model_len` / `n_ctx`) or a user-configured window — both more exact for
+/// this model than a generic catalog — and fall back to the catalog only to fill
+/// a gap, never blinding the agent. (A stale `inherited` after a cross-provider
+/// `/model` switch is a pre-existing, separately-tracked limitation; correcting it
+/// needs the parent's live window published on the delegation runtime.)
+fn subagent_context_window(
+    inherited: Option<u32>,
+    provider: Option<&str>,
+    base_url: &str,
+    model: &str,
+) -> Option<u32> {
+    if base_url == CHATGPT_CODEX_BASE_URL {
+        return context_window_for(provider, base_url, model);
+    }
+    inherited.or_else(|| context_window_for(provider, base_url, model))
+}
+
 /// The opening usage counters for a delegated sub-agent — zeroed, but knowing
 /// the context window it is working against.
 ///
 /// The window is resolved the same way the agent resolves its own
-/// (`Agent::ensure_context_window`): the config's, else the models.dev catalog,
+/// (`Agent::ensure_context_window`): the config's, else per-model via
+/// [`context_window_for`] (the ChatGPT account cache, or models.dev),
 /// network-free. Without it a sub-agent's pane had a used-tokens count and no
 /// maximum, so its gauge could not draw — it showed a bare number where the main
 /// agent shows a bar.
 fn subagent_usage(cfg: &AgentConfig) -> AgentUsage {
     AgentUsage {
-        context_window: cfg.context_window.or_else(|| {
-            hrdr_llm::catalog::context_window_cached(cfg.provider.as_deref(), &cfg.model)
-        }),
+        context_window: cfg
+            .context_window
+            .or_else(|| context_window_for(cfg.provider.as_deref(), &cfg.base_url, &cfg.model)),
         ..Default::default()
     }
 }
@@ -1494,6 +1543,18 @@ impl hrdr_tools::Tool for SubagentTool {
                  `--model` / `--subagent-model` on the CLI"
             );
         }
+        // Resolve the window for the sub-agent's OWN (endpoint, model) now that both
+        // are final (endpoint overlay, profile, and task overrides all applied). The
+        // value inherited from the parent describes the parent's model/provider;
+        // carrying it onto a different one is the overflow bug (e.g. a ChatGPT
+        // parent's window following a plain delegation onto a smaller model). Runs
+        // before both the background and blocking spawns below.
+        cfg.context_window = subagent_context_window(
+            cfg.context_window,
+            cfg.provider.as_deref(),
+            &cfg.base_url,
+            &cfg.model,
+        );
         let label = args
             .get("description")
             .and_then(|v| v.as_str())
@@ -2652,7 +2713,13 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
             api_key: None,
             model: Some("gpt-5.5".to_string()),
             remote: true,
-            context_window: Some(400_000),
+            // The account catalog's window for the default model (gpt-5.5). A
+            // last-resort floor only: per-model windows are resolved live from
+            // the account catalog cache (`chatgpt_models::cached_context_window`)
+            // — the endpoint 401s on `/v1/models` and models.dev lists the
+            // differently-windowed *API* models, so neither can be trusted here.
+            // The old 400k was wrong for every entitled model, gpt-5.5 included.
+            context_window: Some(272_000),
             headers: HashMap::new(),
             api_version: None,
             kind: ResolvedProviderKind::ChatGptOAuth,
@@ -4369,6 +4436,17 @@ impl Agent {
         if let Some(n) = self.client.context_window().await {
             return Some(n);
         }
+        // ChatGPT's `/v1/models` 401s (the client returned `None` above), so resolve
+        // per-model from the account catalog cache — NOT models.dev, whose
+        // cross-provider fallback would return the same-id API model's (different)
+        // window. Mirrors `context_window_for`; keeps every probe path consistent.
+        if self.client.base_url() == CHATGPT_CODEX_BASE_URL {
+            return context_window_for(
+                self.provider.as_deref(),
+                self.client.base_url(),
+                &self.client.model,
+            );
+        }
         hrdr_llm::catalog::context_window(self.provider.as_deref(), &self.client.model).await
     }
 
@@ -5133,8 +5211,11 @@ impl Agent {
             return;
         }
         self.context_window_probed = true;
-        self.context_window =
-            hrdr_llm::catalog::context_window_cached(self.provider.as_deref(), &self.client.model);
+        self.context_window = context_window_for(
+            self.provider.as_deref(),
+            self.client.base_url(),
+            &self.client.model,
+        );
     }
 
     /// Forget what we knew about the window — the model or endpoint changed, so
@@ -6459,9 +6540,141 @@ mod tests {
             "so it can still tell that it is nearly full"
         );
 
-        // A preset that *does* declare one still wins.
+        // A preset that *does* declare one still wins. The ChatGPT preset's window
+        // is the account catalog's figure for its default model (gpt-5.5 = 272k),
+        // NOT the old hardcoded 400k — the per-model window for other entitled
+        // models is resolved from the account catalog cache, not this constant.
         repoint_to_provider(&mut cfg, "chatgpt", Some("gpt-5.5")).unwrap();
-        assert_eq!(cfg.context_window, Some(400_000));
+        assert_eq!(cfg.context_window, Some(272_000));
+    }
+
+    #[test]
+    fn context_window_for_is_gated_on_the_codex_endpoint_not_the_name() {
+        use super::{CHATGPT_CODEX_BASE_URL, context_window_for};
+        // The real Codex endpoint resolves an uncached slug to the preset floor —
+        // models.dev is never consulted for it (an API model of the same id would
+        // carry the wrong window). Deterministic: the slug is absent from any cache.
+        assert_eq!(
+            context_window_for(
+                Some("chatgpt"),
+                CHATGPT_CODEX_BASE_URL,
+                "totally-fake-model-xyz"
+            ),
+            Some(272_000),
+            "the Codex endpoint falls back to its preset floor, never to models.dev"
+        );
+        // The same unknown slug on a non-Codex endpoint has no models.dev entry → None.
+        assert_eq!(
+            context_window_for(
+                Some("zen"),
+                "https://opencode.ai/zen/v1",
+                "totally-fake-model-xyz"
+            ),
+            None
+        );
+        // REGRESSION (name-vs-endpoint): a provider *named* "chatgpt" but pointed at
+        // some other URL is a Custom endpoint — it must NOT hit the account cache /
+        // preset floor. It resolves via models.dev (here: None), never 272k.
+        assert_eq!(
+            context_window_for(
+                Some("chatgpt"),
+                "http://localhost:9099/v1",
+                "totally-fake-model-xyz"
+            ),
+            None,
+            "a chatgpt-named provider off the Codex URL is not the Codex endpoint"
+        );
+    }
+
+    #[test]
+    fn subagent_usage_resolves_chatgpt_window_from_the_account_catalog() {
+        use super::subagent_usage;
+        let cfg = AgentConfig {
+            provider: Some("chatgpt".into()),
+            base_url: super::CHATGPT_CODEX_BASE_URL.into(),
+            model: "totally-fake-model-xyz".into(),
+            // No inherited window → force resolution. A delegated ChatGPT
+            // sub-agent's gauge must read the account-catalog window (preset floor
+            // for an uncached slug), not the models.dev `None` this used to give.
+            context_window: None,
+            ..Default::default()
+        };
+        assert_eq!(subagent_usage(&cfg).context_window, Some(272_000));
+    }
+
+    #[test]
+    fn subagent_window_on_codex_endpoint_always_rederives_never_inheriting() {
+        use super::{CHATGPT_CODEX_BASE_URL, subagent_context_window};
+        // On the Codex endpoint the per-model catalog is authoritative and total, so
+        // an inherited window is ALWAYS dropped — the "per-model wins over inherited"
+        // branch, deterministic via the preset floor. This is the whole fix: a stale
+        // 400k inherited from the parent never reaches the sub-agent.
+        assert_eq!(
+            subagent_context_window(
+                Some(400_000),
+                Some("chatgpt"),
+                CHATGPT_CODEX_BASE_URL,
+                "totally-fake-model-xyz"
+            ),
+            Some(272_000),
+            "the Codex endpoint re-derives, never inherits"
+        );
+    }
+
+    #[test]
+    fn subagent_window_off_codex_prefers_inherited() {
+        use super::subagent_context_window;
+        // Off the Codex endpoint, an inherited window is ALWAYS preferred — this is
+        // the pre-existing behaviour, kept intact so the fix regresses nothing.
+        //
+        // Anti-regression (local server): a served id that models.dev happens to know
+        // (`gpt-4o`) must NOT override the parent's endpoint-probed window. The real
+        // server window (8k) wins over the catalog figure — inheriting short-circuits
+        // before any catalog lookup, so this holds with or without a models.dev cache.
+        assert_eq!(
+            subagent_context_window(
+                Some(8_000),
+                Some("openai"),
+                "http://localhost:1234/v1",
+                "gpt-4o"
+            ),
+            Some(8_000),
+            "a local server's probed window is never overridden by models.dev"
+        );
+        // Off-catalog with an inherited value → inherited survives (never blinded).
+        assert_eq!(
+            subagent_context_window(
+                Some(50_000),
+                Some("zen"),
+                "https://opencode.ai/zen/v1",
+                "totally-fake-model-xyz"
+            ),
+            Some(50_000)
+        );
+        // REGRESSION (name-vs-endpoint): a provider named "chatgpt" pointed at a
+        // local URL is NOT the Codex endpoint — its explicitly-configured window is
+        // preserved, not overwritten by the 272k preset floor.
+        assert_eq!(
+            subagent_context_window(
+                Some(32_768),
+                Some("chatgpt"),
+                "http://localhost:9099/v1",
+                "totally-fake-model-xyz"
+            ),
+            Some(32_768),
+            "a chatgpt-named non-Codex endpoint keeps its own window"
+        );
+        // Off-catalog with NO inherited value → falls to the catalog (here None),
+        // never inventing a number.
+        assert_eq!(
+            subagent_context_window(
+                None,
+                Some("zen"),
+                "https://opencode.ai/zen/v1",
+                "totally-fake-model-xyz"
+            ),
+            None
+        );
     }
 
     /// Compacting must clear the last prompt reading, whoever triggered it.
