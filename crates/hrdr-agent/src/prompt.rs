@@ -495,6 +495,60 @@ mod tests {
         assert!(p.contains("do not quietly change it"));
     }
 
+    /// A shell-capable agent gets the verify loop, and is told to let the
+    /// formatter/linter auto-fix (write mode) rather than run them check-only.
+    #[test]
+    fn the_prompt_closes_the_verify_loop_in_fix_mode() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
+        // Discover the project's own commands, then loop to green.
+        assert!(p.contains("Learn the project's own commands"), "{p}");
+        assert!(p.contains("Close the loop before you call it done"), "{p}");
+        // Fix mode, not check mode — the tool corrects the file.
+        assert!(p.contains("write/fix mode, not check mode"), "{p}");
+        assert!(p.contains("cargo fmt` (not `--check`)"), "{p}");
+        assert!(p.contains("prettier --write"), "{p}");
+        assert!(
+            p.contains("Only hand-edit what the tool reports but can't auto-fix"),
+            "{p}"
+        );
+    }
+
+    /// The verify loop is gated on having a shell: a read-only agent (no shell)
+    /// can't build/lint, so it must not be told to.
+    #[test]
+    fn the_verify_loop_needs_a_shell() {
+        let mut env = Environment::new();
+        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
+        let render = |has_bash: bool| {
+            env.get_template("system")
+                .unwrap()
+                .render(context! {
+                    cwd => "/tmp/x", os => "test", tool_names => "read",
+                    can_write => false, can_delegate => false,
+                    has_bash => has_bash, has_powershell => false,
+                    instructions => None::<&str>,
+                })
+                .unwrap()
+        };
+        assert!(render(true).contains("Close the loop before you call it done"));
+        assert!(!render(false).contains("Close the loop before you call it done"));
+    }
+
+    /// Scope keeps the agent from spraying files and from leaving stub/half-done
+    /// code behind.
+    #[test]
+    fn scope_forbids_stray_files_and_unfinished_code() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
+        assert!(
+            p.contains("never add a README, a docs page, or a summary/notes file"),
+            "{p}"
+        );
+        assert!(p.contains("Finish what you write"), "{p}");
+        assert!(p.contains("never swallow an error to make code run"), "{p}");
+    }
+
     /// The prompt tells the agent to report what happened, not what it meant to
     /// happen.
     ///

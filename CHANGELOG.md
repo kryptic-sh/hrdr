@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **System prompt: stronger daily-driver coding defaults.** A shell-capable
+  agent is now told to discover the project's own commands (`package.json`
+  scripts, `Makefile`/`justfile`, `CONTRIBUTING.md`, CI) instead of guessing,
+  and to close a real verify loop — build, test, format, lint, fix, repeat until
+  green — before calling anything done. It's nudged to let the formatter/linter
+  **auto-fix** (`cargo fmt`, `cargo clippy --fix`, `prettier --write`,
+  `eslint --fix`, `ruff --fix`, `gofmt -w`) and only hand-edit what the tool
+  can't. Scope now forbids creating stray files (READMEs/docs/notes the task
+  didn't ask for) and leaving stub/`TODO`/error-swallowing code behind. The
+  built-in agent personas are richer too: `explore` searches from multiple
+  angles, `review` runs a correctness/edge/concurrency/security/tests checklist,
+  verifies each finding against real code, and ends with a ship/-don't verdict,
+  and `plan` spells out the plan's shape and is told to plan, not implement.
+
 - **Lower per-tool output caps: 24 KB / 1500 lines** (was 50 KB / 2000). ~24 KB
   is ~6k tokens — a normal `git diff`/`status`/`ls -la` still returns inline (no
   follow-up round-trip), but a `cargo build`/`test` wall or a whole-file diff
