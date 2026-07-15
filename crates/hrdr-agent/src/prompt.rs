@@ -806,6 +806,16 @@ mod tests {
             "the main agent is not told it is a sub-agent"
         );
 
+        // The fresh-checkout note (regenerate deps/caches; no secrets) is
+        // sub-agent-only.
+        assert!(
+            sub.contains("fresh checkout of")
+                && sub.contains("regenerate them first")
+                && sub.contains("do not go looking for them"),
+            "sub-agent is told its worktree is a bare checkout"
+        );
+        assert!(!main.contains("fresh checkout of"), "main is not");
+
         // Commit-as-you-go + clean-worktree discipline is sub-agent-only.
         assert!(
             sub.contains("do NOT wait to be asked to commit")
