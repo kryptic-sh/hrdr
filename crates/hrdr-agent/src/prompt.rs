@@ -549,6 +549,26 @@ mod tests {
         assert!(p.contains("never swallow an error to make code run"), "{p}");
     }
 
+    /// Coding-centric guardrails: verify APIs exist, mirror the existing pattern,
+    /// write secure code, own callers of a changed interface, don't hand-edit
+    /// generated files, and debug to root cause (then clean up).
+    #[test]
+    fn the_prompt_carries_coding_agent_guardrails() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
+        assert!(p.contains("Don't invent APIs"), "{p}");
+        assert!(p.contains("find how the codebase already does"), "{p}");
+        assert!(p.contains("Write secure code"), "{p}");
+        assert!(p.contains("you own its callers"), "{p}");
+        assert!(p.contains("Don't hand-edit generated files"), "{p}");
+        // A real debugging method, and cleaning up after.
+        assert!(p.contains("fix THAT, not the symptom"), "{p}");
+        assert!(
+            p.contains("remove the prints, logging, and scratch code"),
+            "{p}"
+        );
+    }
+
     /// The prompt tells the agent to report what happened, not what it meant to
     /// happen.
     ///

@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **System prompt: more coding-agent guardrails.** Don't invent APIs — confirm a
+  function/type/argument exists and its real signature before using it. Find how
+  the codebase already solves the same kind of problem and mirror that pattern,
+  reusing its helpers. Write secure code (parameterized SQL, no hardcoded
+  secrets, validate input, no injection). When changing a shared/public
+  interface, update its callers in the same change. Don't hand-edit generated
+  files (lockfiles, build output, generated bindings) — change the source and
+  regenerate. And a real debugging discipline: reproduce, read the full error,
+  fix the root cause not the symptom, then remove the prints/scratch code before
+  finishing.
 - **System prompt: sharper delegation discipline.** An agent that delegates is
   now told to scope the work before handing it off — gather the exact files,
   symbols, and before→after itself, or delegate the investigation to `explore`
