@@ -2196,6 +2196,47 @@ b:2:y"
         );
     }
 
+    /// Windows-native escape: a relative path using backslash `..` components to
+    /// climb above cwd. Windows treats `\` as a path separator; Unix does not
+    /// (there `..\..\x` is a single filename), hence the `cfg(windows)` gate.
+    #[cfg(windows)]
+    #[test]
+    fn validate_attach_path_rejects_backslash_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project").join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // A real file two levels above cwd, reached via a `..\..` backslash escape.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "x").unwrap();
+
+        let err = validate_attach_path("..\\..\\secret.txt", &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error for backslash escape, got: {err}"
+        );
+    }
+
+    /// Windows-native escape: an absolute path on the same drive but outside cwd
+    /// (`C:\…`) must be rejected. Unix has no drive letters, so this is
+    /// `cfg(windows)`; the cross-platform `validate_attach_path_rejects_absolute_path`
+    /// covers the generic absolute-outside case.
+    #[cfg(windows)]
+    #[test]
+    fn validate_attach_path_rejects_drive_absolute_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // A real file outside cwd, given by its full `C:\…` path.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "x").unwrap();
+
+        let err = validate_attach_path(&secret.to_string_lossy(), &cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected outside-cwd error for a drive-absolute path, got: {err}"
+        );
+    }
+
     #[test]
     fn validate_attach_path_rejects_secret_file() {
         let dir = tempfile::tempdir().unwrap();

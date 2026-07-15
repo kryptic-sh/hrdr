@@ -2104,20 +2104,26 @@ impl hrdr_tools::Tool for TaskCancelTool {
         let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
             anyhow::anyhow!("task_cancel needs an integer `id` (see `task_list`)")
         })?;
-        // Abort the worker if it is still running.
-        let aborted = {
+        // Abort the worker if it is still running, and AWAIT the aborted task so
+        // its future is fully dropped before we touch the worktree — otherwise the
+        // worker could still be mid-write when we assess and remove it. Bounded so
+        // a wedged task can't hang the cancel; abort resolves promptly for the
+        // I/O-bound sub-agent in the common case.
+        let handle = {
             let mut handles = self
                 .bg_handles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(pos) = handles.iter().position(|(hid, _)| *hid == id) {
-                let (_, handle) = handles.remove(pos);
-                handle.abort();
-                true
-            } else {
-                false
-            }
+            handles
+                .iter()
+                .position(|(hid, _)| *hid == id)
+                .map(|pos| handles.remove(pos).1)
         };
+        let aborted = handle.is_some();
+        if let Some(h) = handle {
+            h.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
+        }
         // Mark the registry entry cancelled and take its worktree for discard.
         let worktree = {
             let mut v = ctx

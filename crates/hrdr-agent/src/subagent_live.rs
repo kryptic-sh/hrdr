@@ -398,7 +398,15 @@ impl LiveSubagents {
     pub fn take_pending_or_finish(&self, key: u64) -> Option<crate::Steer> {
         self.with(|v| {
             let e = v.iter_mut().find(|e| e.key == key)?;
-            let next = e.steering.lock().ok()?.pop_front();
+            // Poison-tolerant, like every other lock here: a `.ok()?` would bail
+            // out on a poisoned queue and skip marking the turn finished, leaving
+            // `running` stuck true (RunGuard would later correct it, but the state
+            // would be briefly inconsistent).
+            let next = e
+                .steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
             if next.is_none() {
                 e.running = false;
                 e.turn.end();
