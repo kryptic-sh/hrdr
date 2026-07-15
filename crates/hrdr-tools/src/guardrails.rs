@@ -7,6 +7,16 @@
 //! force-push, hook skipping, destructive resets, interactive commands that
 //! need a TTY). Users can add project-specific rules via `[[guardrails]]`
 //! entries in `config.toml`.
+//!
+//! **This is a safety net against model *mistakes*, not a security boundary.**
+//! It stops the obvious foot-gun the model typed by accident; it does not stop a
+//! model (or prompt-injected content) that is *trying* to run something. A
+//! shell has unbounded ways to obscure a command — `eval "$(base64 -d …)"`,
+//! writing a script and running it, `git -c alias.x='!…'`, environment tricks —
+//! and no pattern set catches them all. Treat it as a seatbelt, not a lock. The
+//! defense against a hostile *instruction* is not letting untrusted text reach a
+//! shell in the first place (see the untrusted-content marking on the read/web
+//! tools), not this list.
 
 use regex::Regex;
 
@@ -175,22 +185,25 @@ fn extract_shell_c_args(cmd: &str) -> Vec<String> {
     results
 }
 
-/// First matching rule's message, if `command` trips any guardrail. Quoted
-/// spans are blanked before matching so string *arguments* that merely mention
-/// a blocked command (e.g. `rg 'git add -A'`) don't false-positive. Nested
-/// `sh -c '...'` payloads are extracted and re-scanned recursively (depth ≤ 4)
-/// so a model cannot bypass the rules by wrapping them in a subshell.
+/// First matching rule's message, if `command` trips any guardrail. The command
+/// is word-split the way the shell will split it, then matched — so a rule fires
+/// on the program+flags actually being run, and a blocked pattern that merely
+/// appears inside a quoted string *argument* (e.g. `rg 'git add -A'`) does not
+/// false-positive, while a quoted *flag* (`git push "--force"`) is still caught.
+/// Nested `sh -c '...'` payloads are extracted and re-scanned recursively
+/// (depth ≤ 4) so a model cannot bypass the rules by wrapping them in a subshell.
 pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a str> {
     check_guardrails_depth(command, rails, 0)
 }
 
 fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) -> Option<&'a str> {
-    // Match against the stripped command (quotes blanked) to avoid false
-    // positives from string arguments that mention blocked patterns.
-    let stripped = strip_quoted(command);
+    // Match against the word-split command so quoting a flag can't hide it
+    // (`git push "--force"`) yet a blocked pattern quoted whole as one argument
+    // (`rg 'git add -A'`) doesn't false-positive.
+    let normalized = tokenized_for_match(command);
     if let Some(msg) = rails
         .iter()
-        .find(|r| r.pattern.is_match(&stripped))
+        .find(|r| r.pattern.is_match(&normalized))
         .map(|r| r.message.as_str())
     {
         return Some(msg);
@@ -209,36 +222,30 @@ fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) 
     None
 }
 
-/// Replace the contents of single-/double-quoted spans with spaces (quotes
-/// kept, backslash escapes honored inside double quotes). Unterminated quotes
-/// blank to the end of the string — conservative in the blocking direction is
-/// wrong here, so an unterminated quote can't hide a real command anyway (the
-/// shell would error before running it).
-fn strip_quoted(cmd: &str) -> String {
-    let mut out = String::with_capacity(cmd.len());
-    let mut chars = cmd.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' => {
-                out.push(c);
-                while let Some(q) = chars.next() {
-                    if q == '\\' && c == '"' {
-                        chars.next();
-                        out.push(' ');
-                        out.push(' ');
-                        continue;
-                    }
-                    if q == c {
-                        out.push(c);
-                        break;
-                    }
-                    out.push(' ');
-                }
-            }
-            _ => out.push(c),
-        }
+/// Reconstruct the command as the shell will word-split it, so a rule matches
+/// the program+flags actually being run — not a blocked pattern that merely
+/// appears inside a quoted string *argument*.
+///
+/// Each shell word becomes one space-separated token, with the quotes removed
+/// (so `git push "--force"` → `git push --force`, which the force-push rule
+/// catches). Whitespace *inside* a single quoted word is replaced with a
+/// sentinel first, so a multi-word argument (`rg 'git add -A'` → one word
+/// `git add -A`) can't masquerade as a command sequence — the rules look for
+/// real whitespace (`\s`) between a program and its subcommand, and the sentinel
+/// is not whitespace.
+///
+/// Falls back to the raw command when the line can't be word-split (unbalanced
+/// quotes — malformed, and the shell would reject it too; err toward matching so
+/// a real command isn't hidden behind a stray quote).
+fn tokenized_for_match(cmd: &str) -> String {
+    match shell_words::split(cmd) {
+        Ok(words) => words
+            .iter()
+            .map(|w| w.replace(char::is_whitespace, "\u{1}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(_) => cmd.to_string(),
     }
-    out
 }
 
 #[cfg(test)]
@@ -482,5 +489,35 @@ mod tests {
         assert!(!blocked("rg 'git add -A' docs/"));
         // Plain form still caught.
         assert!(blocked("git add -A"));
+    }
+
+    /// Quoting a *flag* used to slip past the guardrails: the old matcher blanked
+    /// quoted spans before matching, so `git push "--force"` became
+    /// `git push        ` and no rule fired — while the shell still ran the
+    /// force-push. Word-splitting removes the quotes, so the flag is seen.
+    #[test]
+    fn quoting_a_flag_does_not_bypass_the_guardrail() {
+        assert!(blocked(r#"git push "--force""#));
+        assert!(blocked(r#"git push '--force'"#));
+        assert!(blocked(r#"git add "-A""#));
+        assert!(blocked(r#"git add '--all'"#));
+        assert!(blocked(r#"git commit "--no-verify" -m x"#));
+        assert!(blocked(r#"git reset "--hard" HEAD~1"#));
+        assert!(blocked(r#"rm -rf "/""#));
+        assert!(blocked(r#"rm -rf '/'"#));
+        assert!(blocked(r#"rm -rf "~""#));
+        // Partial quoting (the flag split across quote boundaries) too.
+        assert!(blocked(r#"git push --for"ce""#));
+        assert!(blocked(r#"git push "--fo"rce"#));
+    }
+
+    /// The complement: a blocked pattern quoted **whole** as a single argument to
+    /// another program is a mention, not an invocation, and must still pass.
+    #[test]
+    fn a_blocked_pattern_quoted_as_one_argument_is_not_blocked() {
+        assert!(!blocked(r#"rg 'git add -A' docs/"#));
+        assert!(!blocked(r#"echo "git push --force""#));
+        assert!(!blocked(r#"grep -r "rm -rf /" ."#));
+        assert!(!blocked(r#"printf '%s\n' 'git reset --hard'"#));
     }
 }

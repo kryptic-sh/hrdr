@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Quoting a flag no longer bypasses a shell guardrail.** The matcher used to
+  blank quoted spans before testing its rules, so `git push "--force"` became
+  `git push        ` and tripped nothing — while the shell still ran the
+  force-push. `rm -rf "/"`, `git add "-A"`, `git commit "--no-verify"` all
+  slipped through the same way. The command is now word-split (via
+  `shell-words`) and the rules match the program+flags actually being run, so a
+  quoted flag is caught while a blocked pattern quoted _whole_ as one argument
+  (`rg 'git add -A'`) still correctly passes. The module now also documents that
+  these guardrails are a safety net against model _mistakes_, not a security
+  boundary — a shell has unbounded ways to obscure an intentional command.
+
 ### Fixed
 
 - **A `write` can no longer silently clobber a change made on disk since the

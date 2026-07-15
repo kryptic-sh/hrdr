@@ -23,6 +23,7 @@ futures-util = { workspace = true }
 diffy = "0.5"
 which = "7"
 serde_path_to_error = "0.1.20"
+shell-words = "1"
 
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
