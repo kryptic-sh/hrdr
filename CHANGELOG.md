@@ -41,6 +41,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A self-hosted SearXNG on `localhost` works with `search` again.** The SSRF
+  guard that (correctly) blocks `fetch` from reaching internal hosts also
+  governed `search`, so `SEARXNG_URL=http://localhost:8080` — the documented
+  self-host — was refused, while `http://127.0.0.1:8080` slipped through
+  (literal IPs skip DNS resolution): the same loopback address behaved two
+  different ways. `SEARXNG_URL` is operator configuration, not an
+  attacker-controlled URL, so `search` now reaches it through a dedicated client
+  that trusts that one endpoint (redirects disabled, timeout and body-cap
+  retained). `fetch` and the DuckDuckGo path keep the full SSRF guard,
+  unchanged.
 - **`replace` now reports formatter/diagnostic notes and a diff that matches
   disk.** A project-wide `replace` discarded the post-edit hook and LSP
   diagnostic notes that `edit`/`write` surface, and showed the pre-hook diff —

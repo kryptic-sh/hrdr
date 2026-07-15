@@ -81,6 +81,15 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
     }
 }
 
+/// Shared base config (UA, timeout) for every HTTP client this module builds,
+/// so the guarded and trusted clients below can't drift on anything but the
+/// DNS resolver / redirect policy that actually distinguishes them.
+fn base_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(HTTP_TIMEOUT)
+}
+
 /// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
 /// timeout. Built once and reused for every web tool call so connection pools
 /// and DNS results are shared. A build failure (TLS-backend misconfiguration)
@@ -93,10 +102,11 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
 /// check (full, DNS-resolving) and the custom redirect policy (literal-only, so
 /// its synchronous closure never blocks on DNS) reject obviously-internal hosts
 /// earlier with a clearer message and cap the hop count.
+///
+/// Used by `fetch` (an attacker-influenceable URL, via prompt injection) and
+/// `ddg_search` — both must stay fully SSRF-guarded.
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(HTTP_TIMEOUT)
+    base_client_builder()
         .dns_resolver(Arc::new(SsrfGuardResolver))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
@@ -123,9 +133,43 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
         .map_err(|e| format!("building HTTP client (TLS backend missing or misconfigured): {e}"))
 });
 
-/// The shared HTTP client, or a tool error if it failed to build.
+/// The shared, SSRF-guarded HTTP client, or a tool error if it failed to
+/// build. Used for `fetch` and `ddg_search`.
 fn http_client() -> Result<&'static reqwest::Client> {
     HTTP_CLIENT.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))
+}
+
+/// Lazily-initialised HTTP client for `searxng_search`, deliberately built
+/// *without* [`SsrfGuardResolver`] (plain OS DNS resolution instead).
+///
+/// `SEARXNG_URL` is operator-set configuration (an env var), not a value an
+/// attacker can influence through tool arguments or fetched content — prompt
+/// injection cannot set environment variables. So it is not an SSRF vector,
+/// and guarding it actively breaks the documented self-host setup: with the
+/// guarded resolver, `SEARXNG_URL=http://localhost:8080` resolves to
+/// `127.0.0.1` and gets refused, while `SEARXNG_URL=http://127.0.0.1:8080` (a
+/// literal IP reqwest never hands to the resolver) connects fine — two
+/// spellings of the same address behaving inconsistently, with the documented
+/// form broken.
+///
+/// This client still disables redirects (`Policy::none()`): SearXNG's JSON API
+/// never redirects, so this costs nothing, and it stops a *compromised*
+/// instance from using a redirect to steer the request at an internal host
+/// after the fact. `fetch` and `ddg_search` are unaffected — they keep using
+/// the guarded [`HTTP_CLIENT`] above.
+static SEARXNG_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    base_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("building HTTP client (TLS backend missing or misconfigured): {e}"))
+});
+
+/// The trusted (unguarded, no-redirect) HTTP client used only for
+/// `searxng_search`, or a tool error if it failed to build.
+fn searxng_http_client() -> Result<&'static reqwest::Client> {
+    SEARXNG_HTTP_CLIENT
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!(e.clone()))
 }
 
 // ---- fetch ----
@@ -303,13 +347,19 @@ impl Tool for WebSearchTool {
 type Hit = (String, String, String);
 
 /// Query a SearXNG instance's JSON API.
+///
+/// Uses [`searxng_http_client`] (unguarded DNS, no redirects) rather than the
+/// shared SSRF-guarded client: `base` comes from the operator-set
+/// `SEARXNG_URL` env var, not attacker-influenceable input, so a self-hosted
+/// instance on `localhost`/`127.0.0.1` is trusted and reachable. See the
+/// client's doc comment for the full rationale.
 async fn searxng_search(base: &str, query: &str, n: usize) -> Result<Vec<Hit>> {
     let url = format!(
         "{}/search?q={}&format=json",
         base.trim_end_matches('/'),
         percent_encode(query)
     );
-    let resp = http_client()?.get(&url).send().await?;
+    let resp = searxng_http_client()?.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("SearXNG HTTP {} from {base}", resp.status());
     }
@@ -335,6 +385,12 @@ async fn searxng_search(base: &str, query: &str, n: usize) -> Result<Vec<Hit>> {
 }
 
 /// Query DuckDuckGo's HTML endpoint and scrape the result list.
+///
+/// No explicit `is_blocked_host` pre-check here (unlike `fetch`): the target
+/// host is the hardcoded constant `html.duckduckgo.com`, never attacker- or
+/// user-influenced, so the check would always pass and add nothing. This path
+/// stays on the guarded [`http_client`], whose [`SsrfGuardResolver`] would
+/// still catch a hostile DNS/rebinding answer for that host at connect time.
 async fn ddg_search(query: &str, n: usize) -> Result<Vec<Hit>> {
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
@@ -865,6 +921,70 @@ mod tests {
                 "unexpected error: {e}"
             ),
         }
+    }
+
+    /// Minimal in-process HTTP server that answers a single request with a
+    /// canned SearXNG-shaped JSON body (mirrors the mock-server pattern used
+    /// in `hrdr-agent`/`hrdr-llm`'s tests, trimmed to one accept + one
+    /// response). Returns the `http://127.0.0.1:PORT` base URL.
+    async fn serve_one_searxng_response() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Read (and discard) the request; a GET has no body, so reading
+            // up to the end of headers is enough to drain the client's write.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"results":[{"title":"T","url":"https://x","content":"c"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The key regression guard: `searxng_search` against a loopback base
+    /// must succeed rather than being refused by the SSRF guard. Before the
+    /// fix, `searxng_search` shared the guarded `HTTP_CLIENT`, whose
+    /// `SsrfGuardResolver` drops loopback addresses from DNS answers and
+    /// would refuse this (a literal `127.0.0.1` bypasses the resolver, but
+    /// `localhost` below would not have).
+    #[tokio::test]
+    async fn searxng_search_reaches_loopback_by_ip() {
+        let base = serve_one_searxng_response().await;
+        let hits = searxng_search(&base, "q", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "T");
+        assert_eq!(hits[0].1, "https://x");
+        assert_eq!(hits[0].2, "c");
+    }
+
+    /// Same as above but with the `localhost` spelling — the form the
+    /// documented self-host setup (`SEARXNG_URL=http://localhost:8080`) uses.
+    /// Under the old shared guarded client this was blocked outright (unlike
+    /// the `127.0.0.1` literal, which slipped past the resolver); this test
+    /// proves both spellings now behave the same. Relies on `localhost`
+    /// resolving to loopback on the test runner.
+    #[tokio::test]
+    async fn searxng_search_reaches_loopback_by_localhost() {
+        let base = serve_one_searxng_response().await;
+        let localhost_base = base.replacen("127.0.0.1", "localhost", 1);
+        let hits = searxng_search(&localhost_base, "q", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, "https://x");
     }
 
     #[test]
