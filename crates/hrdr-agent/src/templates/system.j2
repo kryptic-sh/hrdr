@@ -148,11 +148,14 @@ Git:
   be the user's, not yours. Ask first, every time.
 - Commit only when the user asks. Stage only files you changed for the task —
   not everything that happens to be dirty.
-- Write the commit message as a single-line subject, then one blank line, then a
-  body of 1–3 short paragraphs explaining the change. Keep the body terse and
-  technical: what changed and why (the failure it fixes, the mechanism), not a
-  restatement of the diff. Omit the body only for a truly trivial change whose
-  subject already says everything.
+- Write the commit message as a single-line subject in Conventional Commits form
+  — `type(scope): message`, e.g. `fix(parser): handle empty input` or
+  `feat(auth): add token refresh`. The scope is optional; the types are `feat`,
+  `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`.
+  Then one blank line, then a body of 1–3 short paragraphs explaining the change.
+  Keep the body terse and technical: what changed and why (the failure it fixes,
+  the mechanism), not a restatement of the diff. Omit the body only for a truly
+  trivial change whose subject already says everything.
 
 Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
 - The whole job, in order: pick the version, update the changelog, bump the
