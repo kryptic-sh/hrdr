@@ -246,12 +246,20 @@ fn build_sorted(
 /// Render the collected entries as a tree with box-drawing characters.
 ///
 /// `entries` is in DFS pre-order (see `build_sorted`): a node's whole subtree is
-/// contiguous and immediately follows it, so the subtree of the ancestor at any
-/// depth `da` ends exactly where the *next* entry's depth drops to `da` or less.
-/// That makes a single one-step look-ahead — the depth of entry `i + 1` — enough
-/// to draw every column and connector in `O(n · depth)`, byte-for-byte identical
-/// to the earlier `O(n² · depth)` all-pairs look-ahead (which asked the same
-/// "is anything left in this ancestor's subtree?" question the slow way).
+/// contiguous and immediately follows it. Whether entry `i` is the *last* child
+/// of its parent is NOT decided by comparing depth to the very next entry
+/// (`i`'s own children, if any, are deeper and would be misread as "more
+/// siblings follow"). It's decided by the first LATER entry whose depth is
+/// `<=` `i`'s own depth: if that entry doesn't exist, or is strictly shallower
+/// (we popped out of `i`'s parent entirely), `i` was the last child; if it's
+/// exactly as deep, that's a sibling, so `i` was not last.
+///
+/// We compute that "first later entry at depth `<=` mine" for every `i` in one
+/// right-to-left pass with a monotonic stack (classic "next smaller-or-equal
+/// element" — O(n) total, each index pushed/popped once), then render in a
+/// second left-to-right pass carrying a small stack of each open ancestor's
+/// own last-child flag (that's what decides whether its column draws a
+/// continuation bar `│` or a blank gap).
 fn render_tree(root_label: &str, entries: &[Collected]) -> String {
     let mut buf = format!("{}/\n", root_label);
     if entries.is_empty() {
@@ -259,29 +267,44 @@ fn render_tree(root_label: &str, entries: &[Collected]) -> String {
     }
 
     let n = entries.len();
-    for i in 0..n {
-        let depth = entries[i].components.len();
-        // Depth of the next entry (0 past the end): the subtree of the ancestor
-        // at depth `da` still has more entries after `i` iff `next_depth > da`.
-        let next_depth = entries.get(i + 1).map_or(0, |e| e.components.len());
+    let depths: Vec<usize> = entries.iter().map(|e| e.components.len()).collect();
 
-        // Prefix: one column per ancestor (depths `1..depth`) — a blank gap once
-        // that ancestor's subtree is spent, otherwise a continuation bar.
-        for ancestor_depth in 1..depth {
-            if next_depth <= ancestor_depth {
-                buf.push_str("    ");
+    // is_last[i] = true iff the next entry at depth <= depths[i] (if any) is
+    // strictly shallower — i.e. entry i closes out its parent's child list.
+    let mut is_last = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for i in (0..n).rev() {
+        while let Some(&top) = stack.last() {
+            if depths[top] > depths[i] {
+                stack.pop();
             } else {
-                buf.push_str("│   ");
+                break;
             }
         }
+        is_last[i] = match stack.last() {
+            None => true,
+            Some(&j) => depths[j] < depths[i],
+        };
+        stack.push(i);
+    }
 
-        // Connector: the parent sits at depth `depth - 1`; this is its last
-        // shown child once nothing deeper follows (`next_depth < depth`).
-        if next_depth < depth {
-            buf.push_str("└── ");
-        } else {
-            buf.push_str("├── ");
+    // ancestor_is_last[d] (0-indexed) is the last-child flag of the ancestor
+    // that owns prefix column `d`, i.e. the ancestor at depth `d + 1`.
+    let mut ancestor_is_last: Vec<bool> = Vec::new();
+    for i in 0..n {
+        let depth = depths[i];
+        // Pop back to i's parent's ancestor chain (length depth - 1).
+        ancestor_is_last.truncate(depth - 1);
+
+        for &al in &ancestor_is_last {
+            buf.push_str(if al { "    " } else { "│   " });
         }
+
+        buf.push_str(if is_last[i] {
+            "└── "
+        } else {
+            "├── "
+        });
 
         let name = &entries[i].components[depth - 1];
         let suffix = if entries[i].is_symlink {
@@ -292,13 +315,25 @@ fn render_tree(root_label: &str, entries: &[Collected]) -> String {
             ""
         };
         buf.push_str(&format!("{name}{suffix}\n"));
+
+        ancestor_is_last.push(is_last[i]);
     }
 
     buf
 }
 
-/// The original `O(n² · depth)` look-ahead renderer, kept as the reference the
-/// linear `render_tree` is proven byte-identical against. Test-only.
+/// Independent reference renderer, kept as a cross-check that `render_tree` is
+/// byte-identical against. Deliberately uses a different technique — a bounded
+/// forward scan per entry instead of `render_tree`'s monotonic-stack passes —
+/// so the two implementations can't share a bug by construction.
+///
+/// For "is entry `i` the last child", scan forward from `i + 1` and stop at the
+/// FIRST entry shallower than `i` (that means we've left `i`'s parent's child
+/// list entirely — nothing beyond it is relevant). If a same-depth entry with
+/// the same parent path shows up before that, it's a later sibling and `i` is
+/// not last. Entries deeper than `i` (its own descendants) never match either
+/// condition, so they're correctly skipped over rather than mistaken for
+/// siblings — that conflation was the original bug.
 #[cfg(test)]
 fn render_tree_naive(root_label: &str, entries: &[Collected]) -> String {
     let mut buf = format!("{}/\n", root_label);
@@ -306,37 +341,48 @@ fn render_tree_naive(root_label: &str, entries: &[Collected]) -> String {
         return buf;
     }
 
-    let n = entries.len();
-    for i in 0..n {
-        let depth = entries[i].components.len();
+    // Is the entry at `idx` (depth `at_depth`, with `at_depth - 1` leading
+    // components identifying its parent) the last child of its parent?
+    let is_last_child = |idx: usize, at_depth: usize| -> bool {
+        for entry in &entries[idx + 1..] {
+            let d = entry.components.len();
+            if d < at_depth {
+                return true; // left the parent's child list: no sibling followed
+            }
+            if d == at_depth
+                && entry.components[..at_depth - 1] == entries[idx].components[..at_depth - 1]
+            {
+                return false; // later sibling
+            }
+            // d > at_depth (a descendant of some later-or-equal node) or a
+            // same-depth entry under a different parent: keep scanning.
+        }
+        true // ran off the end without finding a sibling
+    };
 
-        let is_last = (i + 1..n).all(|j| {
-            entries[j].components.len() < depth
-                || entries[j].components[..depth - 1] != entries[i].components[..depth - 1]
-        });
+    for (i, entry) in entries.iter().enumerate() {
+        let depth = entry.components.len();
 
         for level in 0..depth.saturating_sub(1) {
-            let ancestor_last = (i + 1..n).all(|j| {
-                entries[j].components.len() <= level
-                    || entries[j].components[..=level] != entries[i].components[..=level]
-            });
-            if ancestor_last {
+            // The ancestor owning this column sits at depth `level + 1`; is
+            // *it* the last child of *its* parent?
+            if is_last_child(i, level + 1) {
                 buf.push_str("    ");
             } else {
                 buf.push_str("│   ");
             }
         }
 
-        if is_last {
+        if is_last_child(i, depth) {
             buf.push_str("└── ");
         } else {
             buf.push_str("├── ");
         }
 
-        let name = &entries[i].components[depth - 1];
-        let suffix = if entries[i].is_symlink {
+        let name = &entry.components[depth - 1];
+        let suffix = if entry.is_symlink {
             "@"
-        } else if entries[i].is_dir {
+        } else if entry.is_dir {
             "/"
         } else {
             ""
@@ -392,11 +438,14 @@ mod tests {
         .collect()
     }
 
-    /// The linear renderer must be byte-for-byte identical to the reference
-    /// look-ahead renderer — the mechanical equivalence proof for the `O(n²)`→
-    /// `O(n · depth)` rewrite. Preferred over a hand-written golden (which could
-    /// silently encode a bug): every drawn byte is checked against the original
-    /// code over a realistic tree plus edge cases.
+    /// The two independently-implemented renderers must be byte-for-byte
+    /// identical — a mechanical cross-check between `render_tree`'s O(n)
+    /// monotonic-stack pass and `render_tree_naive`'s bounded forward-scan
+    /// approach. Preferred over a hand-written golden (which could silently
+    /// encode a bug): every drawn byte is checked against a second, differently
+    /// derived implementation over a realistic tree plus edge cases — including
+    /// the last-child-directory-with-children and non-last-directory-keeps-bar
+    /// cases that the original (shared) bug in both functions used to hide.
     #[test]
     fn render_tree_matches_naive_reference() {
         let entries = sample_entries();
@@ -416,6 +465,132 @@ mod tests {
         assert_eq!(
             render_tree("root", &chain),
             render_tree_naive("root", &chain)
+        );
+
+        // Bug case A: a LAST top-level directory that itself has children.
+        let last_dir_with_children: Vec<Collected> = ["a.txt", "d/", "d/c.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        assert_eq!(
+            render_tree("root", &last_dir_with_children),
+            render_tree_naive("root", &last_dir_with_children)
+        );
+
+        // Bug case B: a NON-last directory whose children must keep the `│`
+        // continuation bar.
+        let non_last_dir_with_children: Vec<Collected> = ["d/", "d/c.txt", "z.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        assert_eq!(
+            render_tree("root", &non_last_dir_with_children),
+            render_tree_naive("root", &non_last_dir_with_children)
+        );
+
+        // Deep (3-level) cases combining both, once with a trailing sibling
+        // (non-last `a/`) and once without (last `a/`).
+        let deep_non_last: Vec<Collected> = ["a/", "a/b/", "a/b/c.txt", "z.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        assert_eq!(
+            render_tree("root", &deep_non_last),
+            render_tree_naive("root", &deep_non_last)
+        );
+        let deep_last: Vec<Collected> = ["a/", "a/b/", "a/b/c.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        assert_eq!(
+            render_tree("root", &deep_last),
+            render_tree_naive("root", &deep_last)
+        );
+    }
+
+    /// Bug case A: a directory that is the LAST entry at its level but still
+    /// has children must draw `└── `, not `├── ` — and its child's
+    /// continuation column for that directory's level must be blank, not `│`.
+    #[test]
+    fn render_tree_last_child_dir_with_children() {
+        let entries: Vec<Collected> = ["a.txt", "d/", "d/c.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        let out = render_tree("root", &entries);
+
+        assert!(
+            out.contains("└── d/"),
+            "last-child dir with children needs └──: {out}"
+        );
+        assert!(
+            !out.contains("├── d/"),
+            "last-child dir with children must not use ├──: {out}"
+        );
+        assert!(
+            out.contains("    └── c.txt"),
+            "d's child must have a blank continuation column: {out}"
+        );
+        assert!(
+            !out.contains("│   └── c.txt"),
+            "d's child must not carry a │ bar (d has no later sibling): {out}"
+        );
+    }
+
+    /// Bug case B: a NON-last directory's children must keep the `│`
+    /// continuation bar all the way down, even for the directory's own last
+    /// child.
+    #[test]
+    fn render_tree_non_last_dir_keeps_bar() {
+        let entries: Vec<Collected> = ["d/", "d/c.txt", "z.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        let out = render_tree("root", &entries);
+
+        assert!(out.contains("├── d/"), "non-last dir needs ├──: {out}");
+        assert!(
+            out.contains("│   └── c.txt"),
+            "non-last dir's child must keep the │ continuation bar: {out}"
+        );
+        assert!(
+            out.contains("└── z.txt"),
+            "trailing sibling needs └──: {out}"
+        );
+    }
+
+    /// A 3-level-deep tree exercising both bug cases together, so each
+    /// ancestor's prefix column is checked independently at depth 3.
+    #[test]
+    fn render_tree_deep_ancestor_columns() {
+        // `a/` is NOT last (z.txt follows) — every column tracing through `a`
+        // must carry a `│` bar, while `b` (a's only, thus last, child) still
+        // contributes a blank column for depths below it.
+        let non_last: Vec<Collected> = ["a/", "a/b/", "a/b/c.txt", "z.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        let out = render_tree("root", &non_last);
+        assert!(out.contains("├── a/"), "non-last a/: {out}");
+        assert!(out.contains("│   └── b/"), "b under non-last a/: {out}");
+        assert!(
+            out.contains("│       └── c.txt"),
+            "c.txt: bar from a/, blank from (last) b/: {out}"
+        );
+        assert!(out.contains("└── z.txt"), "trailing sibling: {out}");
+
+        // `a/` IS last (no trailing sibling) — every column collapses to
+        // blank all the way down.
+        let last: Vec<Collected> = ["a/", "a/b/", "a/b/c.txt"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        let out = render_tree("root", &last);
+        assert!(out.contains("└── a/"), "last a/: {out}");
+        assert!(out.contains("    └── b/"), "b under last a/: {out}");
+        assert!(
+            out.contains("        └── c.txt"),
+            "c.txt: blank from both last a/ and last b/: {out}"
         );
     }
 
@@ -628,7 +803,12 @@ mod tests {
             out.contains("│   ├── x.rs"),
             "nested non-last needs │: {out}"
         );
-        // y.rs inside a/ (last child) should have blank prefix from parent
-        assert!(out.contains("    └── y.rs"), "nested last child: {out}");
+        // y.rs inside a/ (a's own last child) must still carry the │ bar for
+        // a's column, because a/ itself is NOT last (z.txt follows it) — the
+        // column reflects a's last-child status, not y.rs's.
+        assert!(
+            out.contains("│   └── y.rs"),
+            "nested last child under a non-last dir keeps │: {out}"
+        );
     }
 }

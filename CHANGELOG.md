@@ -41,6 +41,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`tree` draws correct connectors and continuation bars at any depth.** The
+  renderer conflated a node's own descendants with its later siblings, so a
+  last-child directory that had children drew `├──` instead of `└──`, and
+  continuation `│` bars went missing at depth ≥3. It now decides each connector
+  and column from whether the node (and each ancestor) is actually its parent's
+  last child, so nested trees render correctly.
 - **A self-hosted SearXNG on `localhost` works with `search` again.** The SSRF
   guard that (correctly) blocks `fetch` from reaching internal hosts also
   governed `search`, so `SEARXNG_URL=http://localhost:8080` — the documented
