@@ -41,6 +41,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`replace` now reports formatter/diagnostic notes and a diff that matches
+  disk.** A project-wide `replace` discarded the post-edit hook and LSP
+  diagnostic notes that `edit`/`write` surface, and showed the pre-hook diff —
+  so a sweep that broke the build in three files reported only "Replaced N
+  occurrences", with a diff that didn't match what a formatter then rewrote on
+  disk. It now diffs against the post-hook content and lists each file's notes
+  (tagged with the file, ahead of the diff so a build-break isn't buried).
+  `dry_run` is unchanged (in-memory diff, no hooks).
 - **A tool's live-output stream can no longer grow memory without limit.** The
   channel carrying a tool's progress lines to the UI was unbounded, so a command
   emitting output faster than the UI drains it (millions of lines) queued them

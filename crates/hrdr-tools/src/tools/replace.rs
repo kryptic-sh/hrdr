@@ -105,9 +105,11 @@ impl Tool for ReplaceTool {
         // any of them is written, so a file this agent may not touch aborts the
         // whole sweep rather than leaving it half applied. `MAX_FILES` bounds
         // the files that actually *match* — not every candidate the walk
-        // turns up — so a large repo with few hits still succeeds.
+        // turns up — so a large repo with few hits still succeeds. The diff is
+        // *not* built here for a real run: a post-edit hook can rewrite the
+        // file again, and the diff must reflect what actually lands on disk —
+        // see phase 2.
         let mut planned = Vec::new();
-        let mut diffs = String::new();
         let mut total = 0usize;
         for path in candidates {
             let Ok(before) = tokio::fs::read_to_string(&path).await else {
@@ -159,16 +161,27 @@ impl Tool for ReplaceTool {
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            diffs.push_str(&unified_diff(&rel, &before, &after));
-            planned.push((path, after, rel));
+            planned.push((path, before, after, rel));
         }
 
-        // Phase 2 — write.
+        // Phase 2 — write. For a real run, the diff and hook/diagnostic notes
+        // are taken from `apply_file_change`'s return: the post-hook content
+        // actually written to disk, not the in-memory substitution — a
+        // formatter hook can rewrite the file again after this tool's own
+        // write.
         let mut changed = Vec::new();
-        for (path, after, rel) in planned {
-            if !a.dry_run {
-                apply_file_change(ctx, &path, "replace", &after).await?;
+        let mut diffs = String::new();
+        let mut notes = String::new();
+        for (path, before, after, rel) in planned {
+            if a.dry_run {
+                diffs.push_str(&unified_diff(&rel, &before, &after));
+            } else {
+                let fc = apply_file_change(ctx, &path, "replace", &after).await?;
                 ctx.mark_read(&path);
+                for note in &fc.notes {
+                    notes.push_str(&format!("[{rel}] {note}\n"));
+                }
+                diffs.push_str(&unified_diff(&rel, &before, &fc.content_after));
             }
             changed.push(rel);
         }
@@ -181,16 +194,21 @@ impl Tool for ReplaceTool {
         } else {
             "Replaced"
         };
-        Ok(truncate(
-            &format!(
-                "{verb} {total} occurrence{} across {} file{}:\n{}\n\n{diffs}",
-                if total == 1 { "" } else { "s" },
-                changed.len(),
-                if changed.len() == 1 { "" } else { "s" },
-                changed.join("\n")
-            ),
-            ctx.max_output,
-        ))
+        let mut header = format!(
+            "{verb} {total} occurrence{} across {} file{}:\n{}",
+            if total == 1 { "" } else { "s" },
+            changed.len(),
+            if changed.len() == 1 { "" } else { "s" },
+            changed.join("\n")
+        );
+        // Notes (formatter-hook failures, build-breaking LSP diagnostics) go
+        // right after the file list and before the diffs — a long diff must
+        // not bury a "this now fails to build" warning.
+        if !notes.is_empty() {
+            header.push('\n');
+            header.push_str(notes.trim_end_matches('\n'));
+        }
+        Ok(truncate(&format!("{header}\n\n{diffs}"), ctx.max_output))
     }
 }
 
@@ -474,5 +492,104 @@ mod tests {
             .unwrap();
         assert!(out.contains("across 1 file"), "{out}");
         assert_eq!(read(&dir.path().join("hit.txt")).await, "found\n");
+    }
+
+    /// A post-edit hook that further rewrites the file is reflected in the
+    /// diff `replace` reports — the diff must show what actually landed on
+    /// disk, not the tool's own in-memory substitution.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_reflects_post_hook_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "replace".to_string(),
+            glob: None,
+            run: "printf 'hooked\\n' >> {path}".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        write(&dir.path().join("a.txt"), "old\n").await;
+
+        let out = ReplaceTool
+            .execute(json!({"find": "old", "replace": "new"}), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(read(&dir.path().join("a.txt")).await, "new\nhooked\n");
+        assert!(
+            out.contains("+hooked"),
+            "diff must show the post-hook content:\n{out}"
+        );
+    }
+
+    /// A hook that fails is surfaced in the result, tagged with the file it
+    /// belongs to — a project-wide rename that breaks the build must not
+    /// report bare success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_hook_note_is_surfaced_and_tagged_with_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "replace".to_string(),
+            glob: None,
+            run: "exit 7".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        write(&dir.path().join("a.txt"), "old\n").await;
+
+        let out = ReplaceTool
+            .execute(json!({"find": "old", "replace": "new"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("[a.txt] [hook `exit 7` failed"),
+            "note must be tagged with its file:\n{out}"
+        );
+        // Placed before the diff section, not buried under it.
+        let note_pos = out.find("[a.txt] [hook").unwrap();
+        let diff_pos = out.find("--- a/a.txt").unwrap();
+        assert!(note_pos < diff_pos, "note must precede the diff:\n{out}");
+        // The file was still written despite the hook failing.
+        assert_eq!(read(&dir.path().join("a.txt")).await, "new\n");
+    }
+
+    /// `dry_run` still shows the `before -> after` diff computed in memory,
+    /// and runs no hooks at all — nothing is written, so there's nothing for
+    /// a hook to fire on and no notes to report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dry_run_shows_the_in_memory_diff_and_runs_no_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "replace".to_string(),
+            glob: None,
+            run: "printf 'hooked\\n' >> {path}".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        write(&dir.path().join("a.txt"), "old\n").await;
+
+        let out = ReplaceTool
+            .execute(
+                json!({"find": "old", "replace": "new", "dry_run": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.starts_with("Would replace 1 occurrence across 1 file"),
+            "{out}"
+        );
+        assert!(out.contains("-old"), "{out}");
+        assert!(out.contains("+new"), "{out}");
+        assert!(!out.contains("hooked"), "no hook note or effect: {out}");
+        assert_eq!(
+            read(&dir.path().join("a.txt")).await,
+            "old\n",
+            "nothing written, so the hook never ran"
+        );
     }
 }
