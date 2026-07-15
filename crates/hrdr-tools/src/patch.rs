@@ -274,7 +274,19 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
         String::new() // creating a new file
     };
     let original = exists.then(|| base.clone());
-    let normalized = normalize_diff(&fd.diff, &base, !exists)
+    // Run the diffy round-trip in LF space. `normalize_diff` splits on
+    // `str::lines()` (which drops a trailing `\r`) and the diff the model
+    // supplies is LF, so the repaired patch is always LF; a CRLF base would then
+    // never byte-match the patch's context lines and every hunk would fail to
+    // apply. Normalize the base to LF for location + application, then restore
+    // the file's CRLF endings on the result so untouched lines keep them.
+    let uses_crlf = base.contains("\r\n");
+    let base_lf: std::borrow::Cow<str> = if uses_crlf {
+        std::borrow::Cow::Owned(base.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(&base)
+    };
+    let normalized = normalize_diff(&fd.diff, &base_lf, !exists)
         .map_err(|e| anyhow!("{}: invalid diff — {e}", path.display()))?;
     let patch = diffy::Patch::from_str(&normalized).map_err(|e| {
         anyhow!(
@@ -282,8 +294,13 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
             path.display()
         )
     })?;
-    let content = diffy::apply(&base, &patch)
+    let content_lf = diffy::apply(&base_lf, &patch)
         .map_err(|e| anyhow!("{}: hunks don't apply — {e}", path.display()))?;
+    let content = if uses_crlf {
+        content_lf.replace('\n', "\r\n")
+    } else {
+        content_lf
+    };
     Ok(FileOp::Write {
         path,
         content,
@@ -765,6 +782,42 @@ diff --git a/bar.txt b/bar.txt
             "one\nTWO\nthree\n"
         );
         assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "X\ny\n");
+    }
+
+    #[tokio::test]
+    async fn applies_a_patch_to_a_crlf_file_and_keeps_crlf() {
+        // Regression: `normalize_diff` works in LF space, so a CRLF base must be
+        // normalized for the diffy round-trip or every hunk fails to apply. The
+        // file's `\r\n` endings must survive on the untouched lines too.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        tokio::fs::write(&a, "one\r\ntwo\r\nthree\r\n")
+            .await
+            .unwrap();
+
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&a);
+
+        // An LF-terminated diff (what a model emits) against a CRLF file.
+        let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+";
+        let out = PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .expect("patch applies to a CRLF file");
+        assert!(out.contains("1 file"), "{out}");
+        assert_eq!(
+            tokio::fs::read_to_string(&a).await.unwrap(),
+            "one\r\nTWO\r\nthree\r\n"
+        );
     }
 
     #[tokio::test]
