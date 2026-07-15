@@ -41,6 +41,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`edit` works on CRLF files instead of looping forever.** `read` renders
+  lines via `str::lines()`, which strips the `\r`, so on a Windows-checkout
+  (CRLF) file the model copies a multi-line `old_string` with bare `\n` — which
+  never matched the on-disk `\r\n`, and the "not found" error told it to copy
+  the exact text it already had, retrying endlessly. `edit` now retries a failed
+  match against a CRLF-translated form on CRLF-dominant files and writes the
+  replacement with the file's own `\r\n` endings (edited and untouched regions
+  alike), so a CRLF repo is editable and its line endings are preserved.
 - **Killing a shell now kills the whole process tree, not just the shell.**
   Subprocesses were reaped by pid only, so a `bash -c "npm run dev"` that forked
   `node` left `node` holding its port forever on timeout or when the turn was
