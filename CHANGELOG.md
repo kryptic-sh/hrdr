@@ -17,7 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   files (lockfiles, build output, generated bindings) — change the source and
   regenerate. And a real debugging discipline: reproduce, read the full error,
   fix the root cause not the symptom, then remove the prints/scratch code before
-  finishing.
+  finishing. Factor out repetition only when it's real — call existing code
+  instead of copying it, and pull shared logic into one helper the moment a
+  second place needs it, but don't build a helper or a "for later" abstraction
+  for a single caller.
 - **System prompt: sharper delegation discipline.** An agent that delegates is
   now told to scope the work before handing it off — gather the exact files,
   symbols, and before→after itself, or delegate the investigation to `explore`
@@ -67,6 +70,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`git commit -a`/`--all`/`-am` is now blocked at the shell**, like
+  `git add -A`/`--all`/`.` already was. Both sweep every tracked change into the
+  commit — scratch files, a half-finished edit, a file with a secret — so the
+  guardrail now refuses them with a corrective error ("stage the files you
+  changed by name"). The system prompt names the `-am` spelling explicitly too.
 - **External tool output is now wrapped as untrusted data.** A fetched web page,
   a search result, and a third-party MCP server's output are the classic
   prompt-injection vectors — text in them that says "ignore your instructions"

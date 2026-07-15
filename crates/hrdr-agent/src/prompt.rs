@@ -558,6 +558,13 @@ mod tests {
         let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
         assert!(p.contains("Don't invent APIs"), "{p}");
         assert!(p.contains("find how the codebase already does"), "{p}");
+        // Factor-out-on-second-use, but don't abstract ahead of need (DRY + YAGNI
+        // in plain terms).
+        assert!(
+            p.contains("Factor out repetition when it's real, not before"),
+            "{p}"
+        );
+        assert!(p.contains("don't abstract ahead of need"), "{p}");
         assert!(p.contains("Write secure code"), "{p}");
         assert!(p.contains("you own its callers"), "{p}");
         assert!(p.contains("Don't hand-edit generated files"), "{p}");
@@ -627,7 +634,13 @@ mod tests {
     fn the_prompt_forbids_wildcard_staging_and_says_why() {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
-        for forbidden in ["git add -A", "git add --all", "git add .", "git commit -a"] {
+        for forbidden in [
+            "git add -A",
+            "git add --all",
+            "git add .",
+            "git commit -a",
+            "git commit -am",
+        ] {
             assert!(
                 p.contains(forbidden),
                 "the prompt must name `{forbidden}` as forbidden, or the model \
