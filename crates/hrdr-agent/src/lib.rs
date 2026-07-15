@@ -2132,6 +2132,100 @@ impl hrdr_tools::Tool for TaskCancelTool {
     }
 }
 
+/// `task_cleanup`: after the parent has merged a finished write sub-agent's work
+/// into its own working dir, remove that worktree and drop the task. This is the
+/// explicit "merged, done with it" signal — it does NOT perform the merge.
+struct TaskCleanupTool {
+    live: LiveSubagents,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskCleanupTool {
+    fn name(&self) -> &'static str {
+        "task_cleanup"
+    }
+    fn description(&self) -> &'static str {
+        "Remove a finished write sub-agent's worktree once you have merged its work into your \
+         own working dir. Use it as the 'I'm done with this one' signal AFTER you have brought \
+         the changes over (via git merge / cherry-pick / apply — this tool does NOT merge for \
+         you). Pass the task `id` (from `task_list`). It refuses if the worktree still has \
+         uncommitted changes — commit or handle those first so nothing is lost. Committed work \
+         is trusted as merged and the worktree + its branch are removed."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("task_cleanup needs an integer `id` (see `task_list`)")
+        })?;
+        // Look up the task's worktree. The entry persists after delivery exactly
+        // so this is addressable by id.
+        let worktree = {
+            let v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match v.iter().find(|t| t.id == id) {
+                Some(t) => t.worktree.clone().zip(t.branch.clone()),
+                None => anyhow::bail!("no background task #{id} (see `task_list`)"),
+            }
+        };
+        let Some((path, branch)) = worktree else {
+            // No worktree (a read-only or shared-dir task) — nothing to remove;
+            // just drop the entry.
+            ctx.background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|t| t.id != id);
+            return Ok(format!("Task #{id} has no worktree to clean up."));
+        };
+        // Refuse while the working tree is dirty — uncommitted changes are
+        // definitely NOT merged, so removing the worktree would lose them.
+        let dirty = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(true);
+        if dirty {
+            anyhow::bail!(
+                "worktree for task #{id} has uncommitted changes ({}) — commit or bring them \
+                 over first, then clean up. Nothing was removed.",
+                path.display()
+            );
+        }
+        remove_worktree(&ctx.cwd, &path, &branch);
+        ctx.background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|t| t.id != id);
+        self.live.with(|v| {
+            for e in v.iter_mut().filter(|e| e.bg_id == Some(id)) {
+                e.running = false;
+                e.done = true;
+                e.delivered = true;
+            }
+        });
+        Ok(format!("Cleaned up the worktree for task #{id}."))
+    }
+}
+
 /// Agent configuration.
 ///
 /// The model identity — WHICH model at WHICH provider — is the single
@@ -4679,6 +4773,9 @@ impl Agent {
                 bg_handles: Arc::clone(&bg_handles),
                 live: live_subagents.clone(),
             }));
+            tools.register(Arc::new(TaskCleanupTool {
+                live: live_subagents.clone(),
+            }));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
         // read-only sub-agent drops the writer) and resolve its storage roots
@@ -5693,8 +5790,12 @@ impl Agent {
                     worktree: t.worktree.clone().zip(t.branch.clone()),
                 });
             }
-            // Drop delivered results and discarded (cancelled) entries alike.
-            v.retain(|t| !t.delivered && !t.cancelled);
+            // Prune cancelled entries and delivered ones that have no worktree
+            // (read-only / shared-dir tasks — nothing left to manage). A delivered
+            // WRITE task is retained: its worktree is still on disk awaiting the
+            // parent's review + merge, and it stays addressable in `task_list` /
+            // `task_cleanup` / `task_cancel` until the parent resolves it.
+            v.retain(|t| !t.cancelled && !(t.delivered && t.worktree.is_none()));
             out
         };
         // The main agent now has these answers, so the live entries are no longer
@@ -5736,7 +5837,8 @@ impl Agent {
                          lost.\n  2. `git -C {p} \
                          log --oneline` — check its commits are present and sensibly split.\n  \
                          3. `git -C {p} diff` — review the actual changes; fix any issues.\nThen \
-                         merge the branch into your working dir. Its report:]\n{result}"
+                         merge the branch into your working dir, and once its work is in, call \
+                         `task_cleanup` with id {id} to remove the worktree. Its report:]\n{result}"
                     )
                 }
                 None => {
@@ -9351,8 +9453,13 @@ mod tests {
             !last.contains("should be discarded"),
             "a cancelled task is never delivered"
         );
-        // Both entries are pruned (one delivered, one discarded).
-        assert!(agent.background_tasks().lock().unwrap().is_empty());
+        // The cancelled entry is pruned, but the delivered WRITE task is retained
+        // (its worktree awaits the parent's merge + `task_cleanup`).
+        let reg = agent.background_tasks();
+        let v = reg.lock().unwrap();
+        assert_eq!(v.len(), 1, "the delivered worktree task is kept");
+        assert_eq!(v[0].id, 1);
+        assert!(v[0].delivered && v[0].worktree.is_some());
     }
 
     /// `task_list` reports id, status and worktree; `steer` queues additional
@@ -9779,6 +9886,112 @@ mod tests {
             "a clean worktree has no keep note: {msg2}"
         );
         assert!(!clean_path.exists(), "a clean worktree is removed");
+    }
+
+    /// `task_cleanup` removes a merged worktree (committed work, clean tree =
+    /// trusted as merged) and prunes the entry, but REFUSES while the worktree
+    /// still has uncommitted changes — those aren't merged and must not be lost.
+    #[tokio::test]
+    async fn task_cleanup_removes_merged_refuses_uncommitted() {
+        use super::{LiveSubagents, TaskCleanupTool, Worktree};
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        let ctx = hrdr_tools::ToolContext::new(repo);
+        let cleanup = TaskCleanupTool {
+            live: LiveSubagents::new(),
+        };
+
+        // Committed work, clean tree → trusted as merged → removed + pruned.
+        let wt_ok = Worktree::create(repo).await.unwrap();
+        let wt_ok_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt_ok.path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        std::fs::write(wt_ok.path.join("work.txt"), "done").unwrap();
+        wt_ok_git(&["add", "."]);
+        wt_ok_git(&["commit", "-qm", "sub work"]);
+        let ok = wt_ok.keep();
+        let ok_path = ok.path.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 1,
+                delivered: true,
+                worktree: Some(ok.path.clone()),
+                branch: Some(ok.branch.clone()),
+                ..Default::default()
+            });
+        let msg = cleanup
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(msg.contains("Cleaned up"), "{msg}");
+        assert!(!ok_path.exists(), "a merged worktree is removed");
+        assert!(
+            !ctx.background_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == 1),
+            "the entry is pruned"
+        );
+
+        // Uncommitted changes → refused, worktree kept, entry kept.
+        let wt_dirty = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt_dirty.path.join("wip.txt"), "x").unwrap();
+        let dirty = wt_dirty.keep();
+        let dirty_path = dirty.path.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 2,
+                delivered: true,
+                worktree: Some(dirty.path.clone()),
+                branch: Some(dirty.branch.clone()),
+                ..Default::default()
+            });
+        let err = cleanup
+            .execute(serde_json::json!({"id": 2}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("uncommitted changes"),
+            "refuses on uncommitted work: {err}"
+        );
+        assert!(dirty_path.exists(), "the worktree is not removed");
+        assert!(
+            ctx.background_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == 2),
+            "the entry is kept"
+        );
     }
 
     /// A session reset (`/new` / `/clear` → `abort_background_tasks`) removes a
