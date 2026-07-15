@@ -386,20 +386,36 @@ struct LspClient {
     send_timeout: Duration,
     /// Owns the process; `kill_on_drop` reaps it when the registry drops.
     _child: tokio::process::Child,
+    /// Owns the process group / job object `_child` was placed in. Declared
+    /// after `_child` so it drops after it. Its `Drop` group-kills the server
+    /// *and any workers it forked* when the registry (and this `Arc`) goes away
+    /// — unix `kill(-pgid)`, Windows job-handle close — not just the leader
+    /// `_child`'s `kill_on_drop` reaps.
+    _group: Option<crate::proc::ProcessGroup>,
 }
 
 impl LspClient {
     /// Spawn + `initialize` + `initialized`.
     async fn start(config: &LspServerConfig, root: &Path, wait_ms: u64) -> Result<Arc<Self>> {
-        let mut child = tokio::process::Command::new(&config.command)
-            .args(&config.args)
+        let mut cmd = tokio::process::Command::new(&config.command);
+        cmd.args(&config.args)
             .current_dir(root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Own process group / job object: an LSP server (`typescript-language-server`,
+        // `rust-analyzer`, …) can itself spawn worker/build processes. This client
+        // tears the server down only via drop (the registry going away), and the
+        // `ProcessGroup` guard's `Drop` covers that on both platforms — unix
+        // signals `kill(-pgid)`, Windows closes the job handle
+        // (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) — so a forked worker isn't leaked
+        // when the session ends.
+        crate::proc::configure(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning {}", config.command))?;
+        let group = crate::proc::ProcessGroup::attach(&child).ok();
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
         let client = Arc::new(Self {
@@ -413,6 +429,7 @@ impl LspClient {
             degraded: AtomicBool::new(false),
             send_timeout: Duration::from_millis(wait_ms),
             _child: child,
+            _group: group,
         });
         tokio::spawn(Self::read_loop(Arc::clone(&client), stdout));
 

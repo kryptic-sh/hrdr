@@ -1304,6 +1304,7 @@ dependencies = [
  "hrdr-llm",
  "hrdr-test-support",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",
@@ -1314,6 +1315,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "which",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

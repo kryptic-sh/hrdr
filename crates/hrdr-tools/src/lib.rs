@@ -27,6 +27,7 @@ mod lsp;
 mod mcp;
 mod memory;
 mod patch;
+mod proc;
 mod tools;
 mod web;
 

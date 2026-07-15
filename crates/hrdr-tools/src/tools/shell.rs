@@ -135,7 +135,13 @@ async fn run_streamed_command(
     cmd.stdin(Stdio::null());
     // Cancelled future → child must not linger.
     cmd.kill_on_drop(true);
+    // Own process group / job object, so the timeout path below can kill the
+    // whole tree the command forked, not just its own pid — `kill_on_drop`
+    // and a bare `child.kill()` only ever reach the leader.
+    crate::proc::configure(&mut cmd);
     let mut child = cmd.spawn().context("spawning command")?;
+    let pid = child.id();
+    let group = crate::proc::ProcessGroup::attach(&child).context("attaching process group")?;
     let stdout = child.stdout.take().context("capturing stdout")?;
     let stderr = child.stderr.take().context("capturing stderr")?;
     let mut out_reader = BufReader::new(stdout);
@@ -286,6 +292,10 @@ async fn run_streamed_command(
     let status = match timed {
         Ok(inner) => Some(inner?),
         Err(_) => {
+            // Kill the whole process tree, not just `child`: `bash -c "npm
+            // run dev"` forks `node`, and `child.kill()` alone only reaps
+            // `bash` — `node` would keep holding its port forever.
+            group.kill(pid);
             let _ = child.kill().await;
             let msg = format!(
                 "[command timed out after {}ms; process killed — raise timeout_ms or \
@@ -541,6 +551,65 @@ mod tests {
             Duration::from_millis(given.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
             Duration::from_secs(900),
             "a model that asks for fifteen minutes gets fifteen minutes"
+        );
+    }
+
+    /// The point of the whole `proc` module: a timeout must kill the entire
+    /// process tree, not just the `bash` leader. `bash -c "npm run dev"`
+    /// forking `node` is the motivating case — this stands a `sleep`
+    /// (backgrounded, so it outlives `bash`'s own foreground sleep) in for
+    /// `node` and checks it's actually dead, not just `bash`.
+    ///
+    /// Without the process-group kill, `child.kill()` alone reaps only
+    /// `bash`; the backgrounded `sleep` — same process group, same session,
+    /// no controlling terminal to notice `bash` is gone — keeps running for
+    /// its full 5s, and the marker file would appear right on schedule.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_tree_not_just_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild-finished");
+        let pid_file = dir.path().join("grandchild.pid");
+
+        // Background a subshell that sleeps 5s and then touches `marker`
+        // (standing in for a long-lived `node` server); record its pid; then
+        // block in the foreground on a sleep of our own so `bash` is still
+        // alive when the 300ms timeout below fires.
+        let command = format!(
+            "(sleep 5 && touch {m}) & echo $! > {p}; sleep 5",
+            m = marker.display(),
+            p = pid_file.display(),
+        );
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let out = BashTool
+            .execute(json!({"command": command, "timeout_ms": 300}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("timed out"), "{out}");
+
+        // Give the group-kill a moment to land, then check the grandchild
+        // (background `sleep`) directly via `kill(pid, 0)` — no signal sent,
+        // just a liveness probe; ESRC means it's gone.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let grandchild_pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the background job recorded its pid before bash was killed")
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
+        assert!(
+            !alive,
+            "grandchild pid {grandchild_pid} survived the timeout — only the \
+             `bash` leader was killed, not its process group"
+        );
+
+        // And it never got far enough to touch the marker — proof the kill
+        // landed well before the grandchild's own 5s sleep would have
+        // finished on its own.
+        assert!(
+            !marker.exists(),
+            "the grandchild's sleep completed — it was never actually killed"
         );
     }
 }

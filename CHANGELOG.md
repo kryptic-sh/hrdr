@@ -41,6 +41,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Killing a shell now kills the whole process tree, not just the shell.**
+  Subprocesses were reaped by pid only, so a `bash -c "npm run dev"` that forked
+  `node` left `node` holding its port forever on timeout or when the turn was
+  cancelled (Esc). Every subprocess (shell, `watch`, hooks, LSP servers) is now
+  put in its own process group (unix) / Job Object (Windows), and the whole
+  group is killed on both the explicit timeout path and the drop/cancel path —
+  so Esc really does stop everything. (A deliberately detached process is now
+  killed with the turn.)
 - **A `write` can no longer silently clobber a change made on disk since the
   model read the file.** The read-before-mutate tracker recorded only _that_ a
   file was read, never its state. So: model reads a file, the user (or a

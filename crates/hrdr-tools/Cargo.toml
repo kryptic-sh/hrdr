@@ -25,6 +25,21 @@ which = "7"
 serde_path_to_error = "0.1.20"
 shell-words = "1"
 
+[target.'cfg(unix)'.dependencies]
+# Group-kill for subprocesses: `libc::kill(-pgid, SIGKILL)` reaches every
+# descendant of a spawned shell, not just the direct child. See `src/proc.rs`.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects for tree-kill on Windows (the process-group analogue). See
+# `src/proc.rs`.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
