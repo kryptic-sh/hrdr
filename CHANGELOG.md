@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-16
+
 ### Changed
 
 - **System prompt: more coding-agent guardrails.** Don't invent APIs — confirm a
