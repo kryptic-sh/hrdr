@@ -4273,6 +4273,12 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
 
     h.app.cancel_turn();
     assert!(!h.app.running(), "cancelled");
+    // `cancel_turn`'s save is best-effort (it `try_lock`s and skips while the
+    // just-aborted turn task still holds the agent lock). Await the reap to
+    // release it, then save — the deterministic equivalent of the catch-up save
+    // a later checkpoint performs.
+    h.app.reap_cancelled_turn().await;
+    h.app.autosave();
 
     let id = h
         .app
@@ -4325,6 +4331,13 @@ async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
         .on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     assert!(h.app.should_quit, "Ctrl+Q arms the quit");
     assert!(!h.app.running(), "the in-flight turn was cancelled first");
+
+    // Finish the quit the way the run loop does: await the aborted turn (which
+    // releases the agent lock) then run the final autosave. Without this, the
+    // reap-then-save the loop performs on `should_quit` never happens, and the
+    // best-effort save in `cancel_turn` skips while the lock is still held.
+    h.app.reap_cancelled_turn().await;
+    h.app.autosave();
 
     let id = h
         .app

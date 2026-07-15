@@ -1963,7 +1963,11 @@ b:2:y"
     #[test]
     fn canonicalize_nearest_preserves_legitimate_deep_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
+        // Canonicalize the temp root first: on macOS it lives under a `/var` →
+        // `/private/var` symlink, so `canonicalize_nearest` (which resolves the
+        // real ancestors) would otherwise not start with the un-resolved path.
+        // A no-op on Linux.
+        let cwd = std::fs::canonicalize(dir.path()).unwrap().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
 
         // A non-existing nested file inside cwd stays under cwd after normalization.
@@ -2006,7 +2010,10 @@ b:2:y"
     #[test]
     fn ensure_inside_cwd_preserves_legitimate_deep_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
+        // Canonicalize the temp root (macOS `/var` → `/private/var` symlink);
+        // a no-op on Linux. Otherwise the resolved target wouldn't sit under the
+        // un-resolved cwd.
+        let cwd = std::fs::canonicalize(dir.path()).unwrap().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
         let ctx = ToolContext::new(&cwd);
 
