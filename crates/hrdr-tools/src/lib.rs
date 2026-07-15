@@ -531,7 +531,10 @@ pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result
     let resolved = resolve_under(cwd, path_str);
     let mut file = std::fs::File::open(&resolved)
         .map_err(|e| anyhow::anyhow!("can't open {}: {e}", resolved.display()))?;
-    let canon = validate_attach_path(path_str, cwd)?;
+    // Validate on every platform (rejects unsafe attaches); the returned path is
+    // only consumed by the Unix handle-identity check below, so it is
+    // `_`-prefixed to stay warning-clean on Windows under `-D warnings`.
+    let _canon = validate_attach_path(path_str, cwd)?;
 
     // On Unix, prove the opened descriptor is the same object canonicalization
     // validated. If any path component changed during validation, reject it.
@@ -539,7 +542,7 @@ pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result
     {
         use std::os::unix::fs::MetadataExt;
         let opened = file.metadata()?;
-        let validated = std::fs::metadata(&canon)?;
+        let validated = std::fs::metadata(&_canon)?;
         if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
             anyhow::bail!(
                 "{} changed while it was being validated",
