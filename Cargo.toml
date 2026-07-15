@@ -30,20 +30,22 @@ hrdr-tui = { path = "crates/hrdr-tui", version = "0.3.0" }
 # Path-only on purpose — cargo strips a versionless path dev-dependency on publish.
 hrdr-test-support = { path = "crates/hrdr-test-support" }
 
-# hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
-hjkl-engine = "0.33"
-hjkl-vim = "0.33"
-hjkl-buffer = "0.33"
-hjkl-buffer-tui = "0.33"
-hjkl-engine-tui = "0.33"
-hjkl-clipboard = "0.33"
-hjkl-theme = "0.33"
-hjkl-theme-tui = "0.33"
-hjkl-markdown = "0.33"
-hjkl-markdown-tui = "0.33"
-hjkl-xdg = "0.33"
-hjkl-icons = "0.33"
-hjkl-splash = "0.33"
+# hjkl — crates.io pins. Pinned EXACT (`=0.33.5`): 0.33.6 dropped
+# `Editor::buffer_selection()` (used by hrdr-editor to render the visual
+# selection) with no public replacement. Bump when a fixed release restores it.
+hjkl-engine = "=0.33.5"
+hjkl-vim = "=0.33.5"
+hjkl-buffer = "=0.33.5"
+hjkl-buffer-tui = "=0.33.5"
+hjkl-engine-tui = "=0.33.5"
+hjkl-clipboard = "=0.33.5"
+hjkl-theme = "=0.33.5"
+hjkl-theme-tui = "=0.33.5"
+hjkl-markdown = "=0.33.5"
+hjkl-markdown-tui = "=0.33.5"
+hjkl-xdg = "=0.33.5"
+hjkl-icons = "=0.33.5"
+hjkl-splash = "=0.33.5"
 
 # third-party
 tokio = { version = "1", features = ["full"] }
