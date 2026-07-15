@@ -168,11 +168,14 @@ pub struct ToolContext {
     /// Shell-command guardrails ([`default_guardrails`] plus any user rules);
     /// the shell tools reject a matching command with the rule's message.
     pub guardrails: Arc<Vec<Guardrail>>,
-    /// Files whose current content the model has seen (read, or written by it
-    /// this session). `edit`/`write` refuse to mutate an existing file
-    /// that isn't here — blind edits against guessed content are the top
-    /// source of corrupt patches.
-    pub read_files: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Files whose content the model has seen this session (read, or written by
+    /// it), each with whether the read was **complete** and the file's
+    /// change-signature at the time. `edit`/`write`/`patch` consult this via
+    /// [`read_state`](Self::read_state): a blind mutation against guessed content
+    /// is the top source of corrupt patches, a `write` after a partial read
+    /// drops the unseen tail, and a `write` over a file that changed on disk
+    /// silently clobbers the change.
+    pub read_files: Arc<Mutex<std::collections::HashMap<PathBuf, ReadRecord>>>,
     /// When set, file-mutating tools (`write`/`edit`/`patch`) may only touch
     /// files with one of these extensions (case-insensitive, no dot — e.g.
     /// `["md", "markdown"]`). `None` = any extension. Used to scope a sub-agent
@@ -206,7 +209,7 @@ impl ToolContext {
             stream: None,
             call_id: None,
             guardrails: Arc::new(default_guardrails()),
-            read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            read_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_allow_ext: None,
             memory_project: None,
             memory_global: None,
@@ -228,13 +231,27 @@ impl ToolContext {
         resolve_under(&self.cwd, path)
     }
 
-    /// Record that the model has seen `path`'s current content (a successful
-    /// read, or a write it authored). Canonicalized so relative/absolute
-    /// spellings of the same file agree.
+    /// Record that the model has seen `path`'s **whole** current content (a full
+    /// read, or a write/edit it authored). Canonicalized so relative/absolute
+    /// spellings of the same file agree; the file's current signature is captured
+    /// so a later change on disk is detectable.
     pub fn mark_read(&self, path: &std::path::Path) {
+        self.record_read(path, true);
+    }
+
+    /// Like [`mark_read`](Self::mark_read), but records a **partial** read
+    /// (paged with `offset`/`limit`, or truncated): enough for `edit`/`patch`,
+    /// which re-read the file and operate on its live content, but not for a
+    /// `write` that would overwrite the unseen remainder.
+    pub fn mark_read_partial(&self, path: &std::path::Path) {
+        self.record_read(path, false);
+    }
+
+    fn record_read(&self, path: &std::path::Path, complete: bool) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if let Ok(mut set) = self.read_files.lock() {
-            set.insert(canon);
+        let sig = file_sig(&canon);
+        if let Ok(mut map) = self.read_files.lock() {
+            map.insert(canon, ReadRecord { complete, sig });
         }
     }
 
@@ -263,18 +280,96 @@ impl ToolContext {
         ))
     }
 
-    /// Whether the model has seen `path`'s current content this session.
+    /// Whether the model has read `path` at all this session (any read, partial
+    /// or complete). The coarse gate for `delete`/`move` — "did you look at what
+    /// you're about to destroy?"; the mutating tools use the finer-grained
+    /// [`read_state`](Self::read_state) instead.
     pub fn was_read(&self, path: &std::path::Path) -> bool {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        // Recover a poisoned lock and answer from the real set. Failing open
+        // Recover a poisoned lock and answer from the real map. Failing open
         // (`unwrap_or(true)`) would report *every* file as read for the rest of
         // the session, silently disabling the read-before-mutate guardrail; the
-        // set itself isn't corrupted by an unrelated panic, so honor it.
+        // map itself isn't corrupted by an unrelated panic, so honor it.
         self.read_files
             .lock()
-            .map(|set| set.contains(&canon))
-            .unwrap_or_else(|e| e.into_inner().contains(&canon))
+            .map(|m| m.contains_key(&canon))
+            .unwrap_or_else(|e| e.into_inner().contains_key(&canon))
     }
+
+    /// The read-before-mutate verdict for `path`: has the model seen its current,
+    /// whole content? Compares the recorded read against the file's live
+    /// signature, so a change on disk since the read — the user saving in their
+    /// editor, a formatter rewriting it — is caught before a `write` overwrites
+    /// it. See [`ReadState`].
+    pub fn read_state(&self, path: &std::path::Path) -> ReadState {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let rec = self
+            .read_files
+            .lock()
+            .map(|m| m.get(&canon).copied())
+            .unwrap_or_else(|e| e.into_inner().get(&canon).copied());
+        let Some(rec) = rec else {
+            return ReadState::Unread;
+        };
+        // Stale beats partial: both are fixed by re-reading, but a change on disk
+        // is the more urgent (a stale full read still looks "complete"). A file
+        // we can't stat now (deleted/renamed) isn't stale in a way re-reading
+        // fixes — fall through to the completeness check.
+        if let Some(now) = file_sig(&canon)
+            && let Some(then) = rec.sig
+            && now != then
+        {
+            return ReadState::Stale;
+        }
+        if !rec.complete {
+            return ReadState::Partial;
+        }
+        ReadState::Fresh
+    }
+}
+
+/// A file's cheap change-signature — `(byte length, modified time)` — captured
+/// when the model reads a file and re-checked before it overwrites one, so an
+/// edit made in the meantime isn't silently clobbered. `mtime` is `None` when
+/// the platform/filesystem doesn't report one (length still guards); the whole
+/// value is `None` when the path can't be stat'd. Not a hash: `(len, mtime)` is
+/// free at stat time and catches every real editor/formatter save; a same-length
+/// change within one mtime tick is the only gap, and not worth hashing every
+/// read for.
+type FileSig = Option<(u64, Option<std::time::SystemTime>)>;
+
+/// Current on-disk signature of `path` (blocking stat — cheap, matches the
+/// existing blocking `canonicalize` in [`ToolContext::mark_read`]).
+fn file_sig(path: &std::path::Path) -> FileSig {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()))
+}
+
+/// What the model has seen of a file, recorded per read/write on a
+/// [`ToolContext`].
+#[derive(Clone, Copy, Debug)]
+pub struct ReadRecord {
+    /// The recorded read covered the whole file (line 1 to EOF, no per-line or
+    /// output-byte truncation). A partial read is not enough to safely `write`
+    /// (full overwrite) — the unread tail would be dropped.
+    complete: bool,
+    /// The file's signature at read time; a mismatch now means it changed on
+    /// disk since.
+    sig: FileSig,
+}
+
+/// The read-before-mutate verdict for a path (see [`ToolContext::read_state`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadState {
+    /// Never read this session.
+    Unread,
+    /// Read, but only part of it (paged or truncated) — unsafe to overwrite the
+    /// whole file, though fine for `edit`/`patch` (which re-read live content).
+    Partial,
+    /// Read, but the file changed on disk since — the model's view is stale.
+    Stale,
+    /// Read in full and unchanged on disk since.
+    Fresh,
 }
 
 /// Resolve `path` against `base`: absolute paths pass through unchanged,

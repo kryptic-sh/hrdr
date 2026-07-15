@@ -61,12 +61,22 @@ impl Tool for EditTool {
         }
         let path = ctx.resolve(&a.path);
         ctx.ensure_writable_ext(&path)?;
-        if !ctx.was_read(&path) {
-            bail!(
+        // `edit` matches `old_string` against the file's live on-disk content, so
+        // a partial read is fine — but the model must have read it at all, and its
+        // view must not be stale (a change on disk since could move or erase the
+        // text it's matching).
+        match ctx.read_state(&path) {
+            crate::ReadState::Unread => bail!(
                 "you haven't read {} yet — call read first, then copy old_string \
                  exactly from its output",
                 path.display()
-            );
+            ),
+            crate::ReadState::Stale => bail!(
+                "{} changed on disk since you read it — re-read it and copy old_string \
+                 from the current content",
+                path.display()
+            ),
+            crate::ReadState::Partial | crate::ReadState::Fresh => {}
         }
         // Stat before reading: `read_to_string` buffers the whole file, so a
         // multi-gigabyte target would OOM before a single match is found. Reuse
@@ -132,6 +142,9 @@ impl Tool for EditTool {
             text.replacen(&a.old_string, &a.new_string, 1)
         };
         let fc = apply_file_change(ctx, &path, "edit", &updated).await?;
+        // Re-record with the post-edit (post-hook) signature, so a follow-up
+        // edit/write this turn sees Fresh rather than a false Stale.
+        ctx.mark_read(&path);
         let mut warn = fc.notes.join("\n");
         if !warn.is_empty() {
             warn.insert(0, '\n');

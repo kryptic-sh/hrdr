@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `write` can no longer silently clobber a change made on disk since the
+  model read the file.** The read-before-mutate tracker recorded only _that_ a
+  file was read, never its state. So: model reads a file, the user (or a
+  formatter) saves a change in the meantime, the model `write`s content
+  reconstructed from its stale view → the change is gone, reported as success.
+  The tracker now stores each file's `(length, mtime)` at read time and
+  re-checks it before a mutation; `write`/`edit`/`patch` refuse a target that
+  changed on disk with "changed on disk since you read it — re-read it first."
+- **A partial read no longer lets `write` drop the unread remainder.** A `read`
+  with `offset`/`limit` (or one truncated by the output cap) marked the whole
+  file "seen", so a subsequent `write` — which replaces the _entire_ file —
+  passed the gate and discarded every line the model never saw. `read` now
+  records whether it covered the whole file, and `write` requires a complete
+  read of an existing file (`edit`/`patch` still accept a partial read, since
+  they match against the file's live content rather than reconstructing it).
+
 ## [0.4.0] - 2026-07-16
 
 ### Removed

@@ -40,12 +40,29 @@ impl Tool for WriteTool {
         let path = ctx.resolve(&a.path);
         ctx.ensure_writable_ext(&path)?;
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
-        if existed && !ctx.was_read(&path) {
-            bail!(
-                "{} exists but you haven't read it — call read first so the rewrite \
-                 starts from its real content (or use edit for a partial change)",
-                path.display()
-            );
+        if existed {
+            // A `write` replaces the whole file, so the model must have seen the
+            // whole current content: not unread, not a partial page, and not a
+            // version that has since changed on disk.
+            match ctx.read_state(&path) {
+                crate::ReadState::Unread => bail!(
+                    "{} exists but you haven't read it — call read first so the rewrite \
+                     starts from its real content (or use edit for a partial change)",
+                    path.display()
+                ),
+                crate::ReadState::Partial => bail!(
+                    "you've only read part of {} — a write replaces the whole file, so read \
+                     it in full first (no offset/limit, or page to the end) or the unread \
+                     lines will be lost; use edit for a partial change",
+                    path.display()
+                ),
+                crate::ReadState::Stale => bail!(
+                    "{} changed on disk since you read it — re-read it before overwriting, \
+                     or the edit made in the meantime (an editor save, a formatter) is lost",
+                    path.display()
+                ),
+                crate::ReadState::Fresh => {}
+            }
         }
         let old = if existed {
             tokio::fs::read_to_string(&path).await.unwrap_or_default()

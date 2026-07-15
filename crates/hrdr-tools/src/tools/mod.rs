@@ -167,6 +167,139 @@ mod tests {
         ToolContext::new(cwd)
     }
 
+    // ---- read → write contract: partial-read (#8) + stale-file (#4) guards ----
+
+    /// A full read of a file lets a `write` overwrite it; a paged (`limit`) read
+    /// of the same file does not — the unread tail would be silently dropped.
+    #[tokio::test]
+    async fn write_requires_a_complete_read_not_a_partial_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let body = (1..=50)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, &body).unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        // Partial read (first line only) → write refused, file untouched.
+        ReadTool
+            .execute(json!({"path": p, "limit": 1}), &c)
+            .await
+            .unwrap();
+        let err = WriteTool
+            .execute(json!({"path": p, "content": "rewritten\n"}), &c)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only read part of"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+
+        // A full read lifts the gate.
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        WriteTool
+            .execute(json!({"path": p, "content": "rewritten\n"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rewritten\n");
+    }
+
+    /// A `write` is refused when the file changed on disk since the model read it
+    /// — the change (a user's editor save, a formatter) must not be clobbered.
+    #[tokio::test]
+    async fn write_refused_when_file_changed_on_disk_since_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, "v1\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        // Someone else edits it (different length → detected regardless of mtime).
+        std::fs::write(&path, "v2 with the user's own change\n").unwrap();
+
+        let err = WriteTool
+            .execute(json!({"path": p, "content": "model rewrite\n"}), &c)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "v2 with the user's own change\n"
+        );
+    }
+
+    /// `edit` matches against the file's live content, so a partial read is
+    /// enough — but a stale read (file changed on disk since) is still refused.
+    #[tokio::test]
+    async fn edit_accepts_a_partial_read_but_refuses_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        // Partial read → edit still allowed (it re-reads the file to match).
+        ReadTool
+            .execute(json!({"path": p, "limit": 1}), &c)
+            .await
+            .unwrap();
+        EditTool
+            .execute(
+                json!({"path": p, "old_string": "fn b() {}", "new_string": "fn b() { todo!() }"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("todo!()"));
+
+        // The file changes underneath; the next edit is refused as stale.
+        std::fs::write(&path, "totally different and longer content here\n").unwrap();
+        let err = EditTool
+            .execute(
+                json!({"path": p, "old_string": "totally", "new_string": "TOTALLY"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+    }
+
+    /// Two edits in a row are fine: the first re-records the file post-edit, so
+    /// the second doesn't mistake its own change for a stale-on-disk mismatch.
+    #[tokio::test]
+    async fn consecutive_edits_do_not_trip_the_stale_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha beta gamma\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        EditTool
+            .execute(
+                json!({"path": p, "old_string": "alpha", "new_string": "ALPHA"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        EditTool
+            .execute(
+                json!({"path": p, "old_string": "gamma", "new_string": "GAMMA"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ALPHA beta GAMMA\n"
+        );
+    }
+
     // ---- read deny-list (credential exfiltration guard) ----
 
     #[tokio::test]

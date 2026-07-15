@@ -225,8 +225,15 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
             .ok_or_else(|| anyhow!("patch section has no file path"))?;
         let path = ctx.resolve(old);
         ctx.ensure_writable_ext(&path)?;
-        if !ctx.was_read(&path) {
-            bail!("{}: read it before deleting it via patch", path.display());
+        match ctx.read_state(&path) {
+            crate::ReadState::Unread => {
+                bail!("{}: read it before deleting it via patch", path.display())
+            }
+            crate::ReadState::Stale => bail!(
+                "{}: changed on disk since you read it — re-read it before patching",
+                path.display()
+            ),
+            crate::ReadState::Partial | crate::ReadState::Fresh => {}
         }
         let original = tokio::fs::read_to_string(&path)
             .await
@@ -259,8 +266,13 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
     ctx.ensure_writable_ext(&path)?;
     let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
     let base = if exists {
-        if !ctx.was_read(&path) {
-            bail!("{}: read it before patching it", path.display());
+        match ctx.read_state(&path) {
+            crate::ReadState::Unread => bail!("{}: read it before patching it", path.display()),
+            crate::ReadState::Stale => bail!(
+                "{}: changed on disk since you read it — re-read it before patching",
+                path.display()
+            ),
+            crate::ReadState::Partial | crate::ReadState::Fresh => {}
         }
         tokio::fs::read_to_string(&path)
             .await

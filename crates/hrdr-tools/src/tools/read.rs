@@ -72,17 +72,36 @@ impl Tool for ReadTool {
                 return Err(e).with_context(|| format!("reading {}", path.display()));
             }
         };
-        ctx.mark_read(&path);
         let start = a.offset.unwrap_or(1).max(1);
         let limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
+        let total_lines = text.lines().count();
         let mut out = String::new();
+        let mut any_line_truncated = false;
         for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
             let n = i + 1;
-            let line = &line[..crate::floor_char_boundary(line, MAX_LINE)];
-            out.push_str(&format!("{n:>6}: {line}\n"));
+            let cut = crate::floor_char_boundary(line, MAX_LINE);
+            if cut < line.len() {
+                any_line_truncated = true;
+            }
+            out.push_str(&format!("{n:>6}: {}\n", &line[..cut]));
         }
         if out.is_empty() {
             out.push_str("(file is empty or offset past end)");
+        }
+        // The read covered the whole file only if it started at line 1, its
+        // window reached EOF, no line was clipped to `MAX_LINE`, and the output
+        // wasn't byte-truncated below. A partial read is recorded as such so a
+        // later `write` (full overwrite) is refused rather than dropping the
+        // unseen remainder.
+        let byte_truncated = out.len() > ctx.max_output;
+        let complete = start == 1
+            && start - 1 + limit >= total_lines
+            && !any_line_truncated
+            && !byte_truncated;
+        if complete {
+            ctx.mark_read(&path);
+        } else {
+            ctx.mark_read_partial(&path);
         }
         Ok(truncate(&out, ctx.max_output))
     }
