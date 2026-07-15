@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Lower per-tool output caps: 24 KB / 1500 lines** (was 50 KB / 2000). ~24 KB
+  is ~6k tokens — a normal `git diff`/`status`/`ls -la` still returns inline (no
+  follow-up round-trip), but a `cargo build`/`test` wall or a whole-file diff
+  routes to a file sooner. Tunable via `[tool_output]` in `config.toml`.
+- **`auto_prune` now defaults to OFF.** Rewriting the model history to drop old
+  tool-output bodies invalidates the prompt cache from the first changed message
+  on, and a cached input token costs a fraction of a fresh one — so pruning to
+  shave context usually _raised_ the bill by re-charging the tail at the
+  uncached rate. With per-call output already capped (big results go to a file,
+  not into context) and compaction as the real overflow backstop, leaving
+  history verbatim keeps the cache warm and is cheaper. Set `auto_prune = true`
+  to opt back in.
 - **Run commands raw; hrdr handles big output.** The system prompt no longer
   tells the model to redirect slow/noisy commands to a file by hand
   (`<cmd> > log 2>&1`, then grep it) — that was redundant with, and

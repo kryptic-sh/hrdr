@@ -400,15 +400,20 @@ hrdr keeps context under control in three layers (modeled on opencode), all
 tunable in `config.toml`:
 
 ```toml
-# Per-tool output caps: over either limit, bash/grep output is truncated and the
-# full text saved to a temp file the model can read/grep.
+# Per-tool output caps: over either limit, bash/grep/git output is truncated and
+# the full text saved to a temp file the model can read/grep. ~24 KB is ~6k
+# tokens — enough for a normal diff/status inline, small enough to catch a build
+# wall. Raise for fewer file hand-offs, lower for a leaner context.
 [tool_output]
-max_lines = 2000
-max_bytes = 51200
+max_lines = 1500
+max_bytes = 24576
 
 # Prune: clear old tool-output bodies from the model context before each request
-# (keeps a recent window; the UI transcript keeps everything). Cheap, no model call.
-auto_prune = true
+# (keeps a recent window; the UI transcript keeps everything). OFF by default —
+# rewriting history invalidates the prompt cache, and cached tokens are far
+# cheaper than the fresh tokens a prune re-charges, so it usually costs more than
+# it saves. Turn on only when context size matters more than cache hits.
+auto_prune = false
 
 # Compaction: when context fills, summarize the old head and keep the recent tail.
 auto_compact = true            # on/off toggle (legacy 0<x≤1 still enables; 0 disables)
@@ -949,9 +954,10 @@ The shell and search tools adapt to the host:
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
       instructions
 - [x] Network retry + auto-compact on overflow
-- [x] Tool-output pruning: old tool results are cleared from the model context
-      (recent window + last 2 turns kept) before compaction — cheap, no model
-      call (`auto_prune`, on by default)
+- [x] Tool-output pruning: old tool results can be cleared from the model
+      context (recent window + last 2 turns kept) before compaction — cheap, no
+      model call (`auto_prune`, **off by default**: it invalidates the prompt
+      cache, which usually costs more than the context it saves)
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom

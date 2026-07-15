@@ -2390,10 +2390,17 @@ pub struct AgentConfig {
     pub max_write_subagents: usize,
     /// Prune old tool-call *output* from the model history before each request:
     /// bodies older than the recent protected window are replaced with a short
-    /// placeholder (the tool call + args stay). Cheap, no model call — the first
-    /// line of defence against tool output ballooning context, before
-    /// compaction. Off leaves every result verbatim. Default `true`. Only the
-    /// model-facing history is touched; the UI transcript keeps the full output.
+    /// placeholder (the tool call + args stay). Only the model-facing history is
+    /// touched; the UI transcript keeps the full output.
+    ///
+    /// **Default `false`.** Rewriting history invalidates the prompt cache from
+    /// the first changed message onward, and a cached input token costs a
+    /// fraction of a fresh one — so pruning to shave context usually *raises* the
+    /// bill, re-charging the whole tail at the uncached rate. With per-call output
+    /// already capped (large results go to a file, not into context) and
+    /// compaction as the real overflow backstop, leaving history verbatim keeps
+    /// the cache warm and is cheaper. Turn it on only when context size matters
+    /// more than cache hits.
     pub auto_prune: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
@@ -2865,7 +2872,7 @@ impl Default for AgentConfig {
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
             max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
             max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
-            auto_prune: true,
+            auto_prune: false,
             providers: HashMap::new(),
             guardrails: Vec::new(),
             hooks: Vec::new(),
@@ -11035,7 +11042,9 @@ mod tests {
             effort: Some("high".to_string()),
             auto_compact: Some(true),
             compaction_reserved: Some(12_345),
-            auto_prune: Some(false),
+            // Differs from the default (`false`) so this proves the field is
+            // actually applied, not just left at its default.
+            auto_prune: Some(true),
             providers: HashMap::new(),
             guardrails: vec![],
             hooks: vec![],
@@ -11090,7 +11099,7 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
-        assert!(!cfg.auto_prune);
+        assert!(cfg.auto_prune);
     }
 
     #[test]

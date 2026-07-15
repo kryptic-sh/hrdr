@@ -52,14 +52,22 @@ pub use tools::{
 pub use web::{WebFetchTool, WebSearchTool};
 
 /// Default cap on a single tool's textual output, in bytes. Larger results are
-/// truncated (and, for `bash`/`grep`, saved to disk) so the model's context is
-/// never blown by one call. Matches opencode's `tool_output.max_bytes`.
-pub const DEFAULT_MAX_OUTPUT: usize = 51_200;
+/// truncated (and, for `bash`/`grep`/`git`, saved to disk with a pointer) so
+/// the model's context is never blown by one call.
+///
+/// 24 KiB is ~6k tokens — enough to hand back `git status`, `ls -la`, and a
+/// normal `git diff` in full (no follow-up round-trip), while a `cargo build`
+/// wall or a whole-file diff routes to a file the model can `grep`/`read`. The
+/// balance is economic: inline output is cheap *input* tokens, but making the
+/// model re-fetch from a file costs pricier *output* tokens (the follow-up tool
+/// call it must generate), so the cap sits above what a routine command emits.
+pub const DEFAULT_MAX_OUTPUT: usize = 24_576;
 
 /// Default cap on a single tool's output in *lines*, applied alongside
-/// [`DEFAULT_MAX_OUTPUT`] by [`truncate_saved`] (whichever limit is hit first).
-/// Matches opencode's `tool_output.max_lines`.
-pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
+/// [`DEFAULT_MAX_OUTPUT`] by [`truncate_saved`] (whichever limit is hit first) —
+/// the secondary guard for output that's byte-small but line-heavy (a long list
+/// of short entries).
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 1_500;
 
 /// A single TODO item tracked by `todo`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
