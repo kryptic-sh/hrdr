@@ -105,6 +105,14 @@ pub struct BackgroundTask {
     pub worktree: Option<PathBuf>,
     /// The scratch branch the [`worktree`](Self::worktree) is on, if any.
     pub branch: Option<String>,
+    /// The model the sub-agent runs on, for `task_list`.
+    pub model: String,
+    /// When the run started, for a `task_list` elapsed readout. `None` in tests /
+    /// synthetic entries that never actually ran.
+    pub started: Option<std::time::Instant>,
+    /// The sub-agent's durable transcript file, when one was opened — a `task_output`
+    /// fallback the parent can `read` for the full run after live events are gone.
+    pub transcript: Option<PathBuf>,
 }
 
 /// A background task's coarse state, derived from its flags for reporting by the

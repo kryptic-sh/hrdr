@@ -64,6 +64,14 @@ pub enum Event {
 /// An open append-only transcript file for one sub-agent run.
 pub struct SubagentTranscript {
     file: File,
+    path: std::path::PathBuf,
+}
+
+impl SubagentTranscript {
+    /// The transcript file's path, so a caller can point a reader at it later.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl SubagentTranscript {
@@ -93,8 +101,9 @@ impl SubagentTranscript {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts.open(dir.join(format!("{id}.jsonl")))?;
-        Ok(Self { file })
+        let path = dir.join(format!("{id}.jsonl"));
+        let file = opts.open(&path)?;
+        Ok(Self { file, path })
     }
 
     /// Append one event as a JSON line and flush. All errors are swallowed: a

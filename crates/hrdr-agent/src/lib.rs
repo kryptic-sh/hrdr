@@ -725,6 +725,27 @@ fn spawn_background(
         delivered: false,
         pinned: false,
     });
+    // Open the durable transcript first, so its path can go onto the registry
+    // entry as a `task_output` fallback. Shared so the inner task records events
+    // and the outer guard can still write a terminal `End` on panic/cancel.
+    let transcript = Arc::new(Mutex::new(
+        resolve_subagent_dir(&transcript_dir)
+            .and_then(|dir| open_next_subagent_transcript(&dir, &label)),
+    ));
+    let transcript_path = transcript
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|t| t.path().to_path_buf()));
+    if let Ok(mut g) = transcript.lock()
+        && let Some(t) = g.as_mut()
+    {
+        t.write(&subagent_transcript::Event::Start {
+            model: model_for_live.clone(),
+            label: label.clone(),
+            kind: subagent_transcript::SpawnKind::Background,
+            prompt: prompt.clone(),
+        });
+    }
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -737,22 +758,9 @@ fn spawn_background(
             cancelled: false,
             worktree: worktree.as_ref().map(|w| w.path.clone()),
             branch: worktree.as_ref().map(|w| w.branch.clone()),
-        });
-    }
-    // Shared so the inner task records events and the outer guard can still
-    // write a terminal `End` if the inner task panics or is cancelled.
-    let transcript = Arc::new(Mutex::new(
-        resolve_subagent_dir(&transcript_dir)
-            .and_then(|dir| open_next_subagent_transcript(&dir, &label)),
-    ));
-    if let Ok(mut g) = transcript.lock()
-        && let Some(t) = g.as_mut()
-    {
-        t.write(&subagent_transcript::Event::Start {
             model: model_for_live.clone(),
-            label: label.clone(),
-            kind: subagent_transcript::SpawnKind::Background,
-            prompt: prompt.clone(),
+            started: Some(std::time::Instant::now()),
+            transcript: transcript_path,
         });
     }
     let ts_inner = transcript.clone();
@@ -1843,9 +1851,21 @@ fn render_events_peek(events: &[AgentEvent]) -> String {
     out.trim().to_string()
 }
 
+/// Compact human duration for `task_list`: `8s`, `3m12s`, `1h4m`.
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
 /// `task_list`: report the background sub-agents `task` spawned — id, label,
-/// status, and (for a write-capable one) its worktree — so the parent can check
-/// on them without waiting.
+/// status, model, elapsed, and (for a write-capable one) its worktree — so the
+/// parent can check on them without waiting.
 struct TaskListTool;
 
 #[async_trait::async_trait]
@@ -1878,6 +1898,12 @@ impl hrdr_tools::Tool for TaskListTool {
             v.iter()
                 .map(|t| {
                     let mut row = format!("#{} [{}] {}", t.id, t.status().as_str(), t.label);
+                    if !t.model.is_empty() {
+                        row.push_str(&format!("  model: {}", t.model));
+                    }
+                    if let Some(started) = t.started {
+                        row.push_str(&format!("  {}", fmt_elapsed(started.elapsed())));
+                    }
                     if let Some(wt) = &t.worktree {
                         row.push_str(&format!("  worktree: {}", wt.display()));
                     }
@@ -1950,13 +1976,26 @@ impl hrdr_tools::Tool for TaskOutputTool {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             v.iter().find(|t| t.id == id).map(|t| {
-                t.result
+                let body = t
+                    .result
                     .clone()
-                    .unwrap_or_else(|| format!("(task #{id} is {})", t.status().as_str()))
+                    .unwrap_or_else(|| format!("(task #{id} is {})", t.status().as_str()));
+                (body, t.transcript.clone())
             })
         };
         match done {
-            Some(text) => Ok(hrdr_tools::truncate(&text, ctx.max_output)),
+            Some((text, transcript)) => {
+                let mut out = hrdr_tools::truncate(&text, ctx.max_output);
+                // Point at the durable transcript for the full run — richer than
+                // the stored summary, and it outlives the live event log.
+                if let Some(p) = transcript {
+                    out.push_str(&format!(
+                        "\n\n(full transcript: {} — `read` it for the complete run)",
+                        p.display()
+                    ));
+                }
+                Ok(out)
+            }
             None => anyhow::bail!("no background task #{id} (see `task_list`)"),
         }
     }
@@ -9603,6 +9642,8 @@ mod tests {
                 label: "running task".to_string(),
                 worktree: Some(std::path::PathBuf::from("/tmp/wt-1")),
                 branch: Some("hrdr/task-1".to_string()),
+                model: "sonnet".to_string(),
+                started: Some(std::time::Instant::now()),
                 ..Default::default()
             });
             v.push(hrdr_tools::BackgroundTask {
@@ -9653,6 +9694,10 @@ mod tests {
             .unwrap();
         assert!(list.contains("#1") && list.contains("running"), "{list}");
         assert!(list.contains("/tmp/wt-1"), "worktree shown: {list}");
+        assert!(
+            list.contains("model: sonnet") && list.contains("0s"),
+            "model + elapsed shown: {list}"
+        );
         assert!(list.contains("#2") && list.contains("done"), "{list}");
 
         let steer = SteerTool { live: live.clone() };
@@ -9705,6 +9750,39 @@ mod tests {
                 .execute(serde_json::json!({"id": 999}), &ctx)
                 .await
                 .is_err()
+        );
+    }
+
+    /// With no live events left, `task_output` returns the stored result and
+    /// points at the durable transcript so the parent can read the full run.
+    #[tokio::test]
+    async fn task_output_falls_back_to_result_and_transcript() {
+        use super::{LiveSubagents, TaskOutputTool};
+        use hrdr_tools::Tool;
+        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 7,
+                label: "done".to_string(),
+                done: true,
+                delivered: true,
+                result: Some("the answer".to_string()),
+                transcript: Some(std::path::PathBuf::from("/tmp/hrdr/007-done.jsonl")),
+                ..Default::default()
+            });
+        // Empty live store → falls through to the registry entry.
+        let out = TaskOutputTool {
+            live: LiveSubagents::new(),
+        }
+        .execute(serde_json::json!({"id": 7}), &ctx)
+        .await
+        .unwrap();
+        assert!(out.contains("the answer"), "shows the stored result: {out}");
+        assert!(
+            out.contains("full transcript") && out.contains("007-done.jsonl"),
+            "points at the durable transcript: {out}"
         );
     }
 
