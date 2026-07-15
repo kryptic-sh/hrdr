@@ -678,9 +678,6 @@ fn spawn_background(
 ) -> Result<String> {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    // Detach the worktree's automatic cleanup: it must outlive this task so the
-    // parent can review the changes. Its path/branch go onto the registry entry.
-    let worktree = worktree.map(|w| w.keep());
     let header = format!("↳ task#{id} ({}): {label}", cfg.model.model());
     // Identity for the live registry, taken before `tool_id` is moved into the
     // background-task row below.
@@ -694,6 +691,11 @@ fn spawn_background(
     // Build and register synchronously so `steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
+    // Detach the worktree's automatic cleanup only now that the agent exists — so
+    // if `Agent::new` fails above, the still-un-kept worktree is torn down by its
+    // `Drop` instead of being orphaned (it is not yet on any registry). It must
+    // outlive the run from here on; its path/branch go onto the registry entry.
+    let worktree = worktree.map(|w| w.keep());
     sub.cost_total = cost_total;
     sub.attach_live(live.clone(), live_key);
     sub.ctx.lsp = lsp;
@@ -2037,10 +2039,11 @@ impl hrdr_tools::Tool for TaskCancelTool {
     }
     fn description(&self) -> &'static str {
         "Cancel a running background sub-agent by its `id` (from `task_list`). Its work is \
-         abandoned. If it was write-capable and its isolated worktree is clean, the worktree is \
-         removed; if the worktree has uncommitted changes they are NOT thrown away — the worktree \
-         is kept and this call tells you where it is so you can review and merge or discard it. \
-         Use when the user asks to stop a task or it is no longer needed."
+         abandoned. If it was write-capable and its isolated worktree has no changes, the worktree \
+         is removed; if it has changes — uncommitted files OR commits the sub-agent made on its \
+         branch — they are NOT thrown away: the worktree is kept and this call tells you where it \
+         is so you can review and merge or discard it. Use when the user asks to stop a task or it \
+         is no longer needed."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2097,11 +2100,13 @@ impl hrdr_tools::Tool for TaskCancelTool {
         // Only a clean worktree is removed.
         let kept_note = match worktree {
             Some((path, branch)) => {
-                if worktree_has_changes(&path).await {
+                if worktree_has_changes(&ctx.cwd, &path, &branch).await {
                     Some(format!(
-                        " Its worktree has uncommitted changes, so it was kept for you to \
-                         review — review (`git -C {} diff`) and merge or discard it yourself:\n  \
-                         worktree: {}\n  branch:   {branch}",
+                        " Its worktree has changes (uncommitted files or commits on its branch), \
+                         so it was kept for you to review — review (`git -C {} diff` and `git -C \
+                         {} log`) and merge or discard it yourself:\n  worktree: {}\n  branch:   \
+                         {branch}",
+                        path.display(),
                         path.display(),
                         path.display(),
                     ))
@@ -3959,9 +3964,16 @@ impl Worktree {
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let branch = format!("hrdr/task-{uniq}");
-        let path = std::env::temp_dir()
-            .join("hrdr-worktrees")
-            .join(format!("wt-{uniq}"));
+        // Worktrees live under `<repo>/.hrdr/worktrees/` — inside the working tree
+        // (so the parent agent can review them with its cwd-confined file tools and
+        // on the same filesystem, no cross-device rename), but ignored via the
+        // repo's local `info/exclude` so a fresh checkout never shows in
+        // `git status` or gets staged by `git add -A`. `.hrdr/` is git-ignored, so
+        // it is also skipped by `grep`/`tree` and won't pollute searches.
+        let top = git_toplevel(repo).await;
+        let worktrees_dir = top.join(".hrdr").join("worktrees");
+        ensure_worktree_ignored(repo, &worktrees_dir).await;
+        let path = worktrees_dir.join(format!("wt-{uniq}"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -4011,19 +4023,45 @@ struct KeptWorktree {
     branch: String,
 }
 
-/// Whether a worktree holds uncommitted work (modified/staged/untracked files),
-/// so cancelling its task must NOT silently throw the changes away. Best-effort:
-/// a git failure reports "no changes" rather than blocking cleanup.
-async fn worktree_has_changes(path: &std::path::Path) -> bool {
-    tokio::process::Command::new("git")
+/// Whether a sub-agent's worktree holds work that cancelling its task must NOT
+/// silently throw away: either uncommitted files in the checkout, OR commits the
+/// sub-agent made on its scratch `branch` that are not yet on the main line
+/// (`HEAD..branch`). Checking only `git status` misses the latter — a sub-agent
+/// that ran `git commit` leaves a clean working tree, and removing the branch
+/// with `git branch -D` would then delete the commits. Best-effort and biased
+/// toward keeping: any git failure reports "has changes" so cleanup can't destroy
+/// unreviewed work on a bad read.
+async fn worktree_has_changes(
+    repo: &std::path::Path,
+    path: &std::path::Path,
+    branch: &str,
+) -> bool {
+    // Uncommitted work in the checkout (modified/staged/untracked).
+    let dirty = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
         .args(["status", "--porcelain"])
         .output()
         .await
-        .ok()
         .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false)
+        .unwrap_or(true); // a failed read → assume changes, never delete blindly
+    if dirty {
+        return true;
+    }
+    // Commits on the scratch branch that aren't reachable from the main HEAD.
+    let range = format!("HEAD..{branch}");
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() != "0")
+        // A failed count (e.g. branch/HEAD unresolvable) → assume commits exist.
+        .unwrap_or(true)
 }
 
 /// Force-remove a background sub-agent's worktree and its scratch branch. Run
@@ -4056,6 +4094,98 @@ async fn prune_stale_worktrees(repo: &std::path::Path) {
         .args(["worktree", "prune"])
         .output()
         .await;
+}
+
+/// The working-tree root of `repo` (`git rev-parse --show-toplevel`), so a
+/// worktree checkout sits at the repo root even when `repo` is a subdirectory.
+/// Falls back to `repo` itself if git can't answer.
+async fn git_toplevel(repo: &std::path::Path) -> std::path::PathBuf {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| repo.to_path_buf())
+}
+
+/// The shared git dir (`--git-common-dir`, made absolute). Its `info/exclude`
+/// holds local, per-clone ignore rules that are never committed. Resolves
+/// correctly for a normal repo, a linked worktree, and a submodule.
+async fn git_common_dir(repo: &std::path::Path) -> std::path::PathBuf {
+    let raw = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| repo.join(".git"));
+    if raw.is_absolute() {
+        raw
+    } else {
+        repo.join(raw)
+    }
+}
+
+/// Make sure the sub-agent worktree dir is git-ignored, WITHOUT touching the
+/// repo's tracked `.gitignore`.
+///
+/// If `worktrees_dir` is already ignored — by the repo's `.gitignore`, a global
+/// gitignore, or a previous `info/exclude` entry (`git check-ignore` sees all of
+/// these) — nothing is done. Otherwise a `/.hrdr/` rule is appended to the
+/// clone-local `<git-common-dir>/info/exclude`, which is never committed, so the
+/// worktree checkouts stay out of `git status` and `git add -A` without adding
+/// anything to a file the repo tracks. Idempotent and best-effort.
+async fn ensure_worktree_ignored(repo: &std::path::Path, worktrees_dir: &std::path::Path) {
+    // Already ignored by any mechanism → leave it alone.
+    let already_ignored = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "-q", "--"])
+        .arg(worktrees_dir)
+        .output()
+        .await
+        .map(|o| o.status.success()) // exit 0 = the path is ignored
+        .unwrap_or(false);
+    if already_ignored {
+        return;
+    }
+    // Not ignored: add a clone-local exclude rule (not the tracked `.gitignore`).
+    let exclude = git_common_dir(repo).await.join("info").join("exclude");
+    const ENTRY: &str = "/.hrdr/";
+    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == ENTRY) {
+        return;
+    }
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+    {
+        let lead = if current.is_empty() || current.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let _ = write!(
+            f,
+            "{lead}# hrdr sub-agent worktrees (local, not committed)\n{ENTRY}\n"
+        );
+    }
 }
 
 /// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
@@ -4336,8 +4466,9 @@ fn build_system_prompt(
     docs: Option<&str>,
     memory: Option<&str>,
     persona: Option<&str>,
+    is_subagent: bool,
 ) -> Result<String> {
-    let system = render_system(tools, cwd, docs)?;
+    let system = render_system(tools, cwd, docs, is_subagent)?;
     Ok(append_persona(append_memory(system, memory), persona))
 }
 
@@ -4565,6 +4696,7 @@ impl Agent {
             project_docs.as_deref(),
             memory.as_deref(),
             config.agent_prompt.as_deref(),
+            config.is_subagent,
         )?;
 
         // File checkpoint store, keyed by working directory (like sessions).
@@ -4872,6 +5004,7 @@ impl Agent {
             self.project_docs.as_deref(),
             memory.as_deref(),
             self.agent_prompt.as_deref(),
+            self.is_subagent,
         ) else {
             return;
         };
@@ -5486,18 +5619,27 @@ impl Agent {
                 "background task #{id} ({label}) finished"
             )));
             // A write-capable sub-agent's changes are in its worktree — nothing has
-            // touched the main working dir. Tell the parent to review and merge.
+            // touched the main working dir. Give the parent the full picture and
+            // tell it to trust-but-verify the branch before merging.
             let body = match worktree {
-                Some((path, branch)) => format!(
-                    "[Background task #{id} ({label}) finished. Its changes are in an isolated \
-                     git worktree — NOTHING has landed in your working dir yet.\n  worktree: \
-                     {}\n  branch:   {branch}\nReview the diff (`git -C {} diff` and `git -C {} \
-                     status` for untracked files), fix any issues, then merge into your working \
-                     dir. Its report:]\n{result}",
-                    path.display(),
-                    path.display(),
-                    path.display(),
-                ),
+                Some((path, branch)) => {
+                    let p = path.display();
+                    format!(
+                        "[Background task #{id} ({label}) finished. Its changes are on branch \
+                         `{branch}` in an isolated git worktree — NOTHING has landed in your \
+                         working dir yet.\n  worktree: {p}\n  branch:   {branch}\n\nTrust but \
+                         verify before you merge. The sub-agent was told to commit all its work \
+                         and leave a clean tree, but confirm it actually did:\n  1. `git -C {p} \
+                         status --porcelain` — MUST be empty. If it is not, the sub-agent left \
+                         changes uncommitted or untracked; review those changes and commit them \
+                         YOURSELF (a proper Conventional Commits message) before merging — do not \
+                         re-delegate to another sub-agent, just handle it — or that work is \
+                         lost.\n  2. `git -C {p} \
+                         log --oneline` — check its commits are present and sensibly split.\n  \
+                         3. `git -C {p} diff` — review the actual changes; fix any issues.\nThen \
+                         merge the branch into your working dir. Its report:]\n{result}"
+                    )
+                }
                 None => {
                     format!("[Background task #{id} ({label}) finished — its result:]\n{result}")
                 }
@@ -9096,8 +9238,15 @@ mod tests {
             "worktree note: {last}"
         );
         assert!(
-            last.contains("/tmp/wt-x") && last.contains("Review"),
-            "{last}"
+            last.contains("/tmp/wt-x"),
+            "gives the worktree path: {last}"
+        );
+        // Trust-but-verify handoff: check the branch is clean/committed before merge.
+        assert!(
+            last.contains("Trust but verify")
+                && last.contains("status --porcelain")
+                && last.contains("commit them YOURSELF"),
+            "handoff tells the parent to verify + commit leftovers itself: {last}"
         );
         assert!(
             !last.contains("should be discarded"),
@@ -9282,6 +9431,114 @@ mod tests {
         assert!(!p2.exists(), "dropping an un-kept worktree removes it");
     }
 
+    /// Worktrees live under `<repo>/.hrdr/worktrees/` (inside the tree, on the
+    /// same filesystem, reachable by the parent's cwd-confined tools) and are
+    /// ignored via the clone-local `info/exclude` — so they never show in
+    /// `git status`, `git add -A` never stages them, and the tracked `.gitignore`
+    /// is left untouched.
+    #[tokio::test]
+    async fn worktree_lives_under_dot_hrdr_and_is_git_ignored() {
+        use super::Worktree;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let wt = Worktree::create(repo).await.unwrap();
+        // Placed under `.hrdr/worktrees/`, inside the repo.
+        assert!(
+            wt.path.components().any(|c| c.as_os_str() == ".hrdr")
+                && wt.path.components().any(|c| c.as_os_str() == "worktrees"),
+            "worktree is under .hrdr/worktrees: {}",
+            wt.path.display()
+        );
+
+        // The parent repo sees nothing untracked — the `.hrdr/` dir is ignored.
+        let status = git(&["status", "--porcelain"]);
+        assert!(
+            status.stdout.is_empty(),
+            "the worktree dir is ignored, so status is clean: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        // `git add -A` stages nothing from `.hrdr/`.
+        git(&["add", "-A"]);
+        let staged = git(&["diff", "--cached", "--name-only"]);
+        assert!(
+            !String::from_utf8_lossy(&staged.stdout).contains(".hrdr"),
+            "git add -A does not stage the worktree dir"
+        );
+        // The rule lives in the clone-local exclude, not the tracked .gitignore.
+        assert!(
+            !repo.join(".gitignore").exists(),
+            "the tracked .gitignore was not created/modified"
+        );
+        let exclude =
+            std::fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap();
+        assert!(
+            exclude.contains("/.hrdr/"),
+            "the ignore rule is in info/exclude: {exclude}"
+        );
+    }
+
+    /// When `.hrdr/` is already ignored (e.g. the repo's own `.gitignore`),
+    /// `ensure_worktree_ignored` must NOT append a redundant `info/exclude` rule.
+    #[tokio::test]
+    async fn worktree_ignore_respects_an_existing_gitignore_rule() {
+        use super::Worktree;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        // The repo already ignores `.hrdr/` via its tracked .gitignore.
+        std::fs::write(repo.join(".gitignore"), ".hrdr/\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        let _wt = Worktree::create(repo).await.unwrap();
+        // info/exclude must be untouched (no `.hrdr` rule added), since the repo's
+        // own .gitignore already covers it.
+        let exclude = std::fs::read_to_string(repo.join(".git").join("info").join("exclude"))
+            .unwrap_or_default();
+        assert!(
+            !exclude.contains(".hrdr"),
+            "no redundant exclude rule when already ignored: {exclude}"
+        );
+        // And status is still clean.
+        let status = git(&["status", "--porcelain"]);
+        assert!(
+            status.stdout.is_empty(),
+            "status clean via the existing rule: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
     /// Cancelling a write task discards a CLEAN worktree but KEEPS a dirty one,
     /// telling the caller where the (unreviewed) changes are so they aren't lost.
     #[tokio::test]
@@ -9333,7 +9590,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            msg.contains("uncommitted changes") && msg.contains(&dirty_path.display().to_string()),
+            msg.contains("has changes") && msg.contains(&dirty_path.display().to_string()),
             "dirty worktree is reported: {msg}"
         );
         assert!(
@@ -9341,7 +9598,58 @@ mod tests {
             "a dirty worktree is kept, not discarded"
         );
 
-        // Clean worktree → removed, no keep note.
+        // Committed work but a CLEAN working tree → still kept (the regression:
+        // `git status` is empty, but the branch has a commit that `branch -D`
+        // would destroy).
+        let wt_c = Worktree::create(repo).await.unwrap();
+        let wt_c_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt_c.path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        std::fs::write(wt_c.path.join("work.txt"), "committed").unwrap();
+        wt_c_git(&["add", "."]);
+        wt_c_git(&["commit", "-qm", "sub-agent work"]);
+        let committed_kept = wt_c.keep();
+        let committed_path = committed_kept.path.clone();
+        // Working tree is clean now.
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&committed_path)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty(),
+            "the committed worktree has a clean status"
+        );
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 3,
+                worktree: Some(committed_kept.path.clone()),
+                branch: Some(committed_kept.branch.clone()),
+                ..Default::default()
+            });
+        let msg_c = cancel
+            .execute(serde_json::json!({"id": 3}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            msg_c.contains("has changes"),
+            "committed work is reported as changes: {msg_c}"
+        );
+        assert!(
+            committed_path.exists(),
+            "a worktree with committed work is kept, not discarded"
+        );
+
+        // No changes at all → removed, no keep note.
         let wt2 = Worktree::create(repo).await.unwrap();
         let kept2 = wt2.keep();
         let clean_path = kept2.path.clone();
@@ -9359,7 +9667,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !msg2.contains("uncommitted"),
+            !msg2.contains("has changes"),
             "a clean worktree has no keep note: {msg2}"
         );
         assert!(!clean_path.exists(), "a clean worktree is removed");
@@ -12145,13 +12453,11 @@ mod tests {
             );
             let handle = bg_handles.lock().unwrap().pop().unwrap().1;
             handle.await.unwrap();
-            let recorded_worktree = ctx
-                .background_tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.id == 1)
-                .and_then(|t| t.worktree.clone());
+            let recorded_worktree = {
+                let reg = ctx.background_tasks.lock().unwrap();
+                let t = reg.first().expect("a background task was registered");
+                t.worktree.clone()
+            };
             assert!(recorded_worktree.is_none(), "no worktree recorded");
 
             // With one write slot held, a second writer is refused (limit 1).
@@ -12167,6 +12473,103 @@ mod tests {
                 err.to_string().contains("not a git repo"),
                 "serialized with a helpful hint: {err}"
             );
+        }
+
+        /// A write-capable sub-agent spawned in a git repo runs with its cwd set to
+        /// its own worktree — so all its tool calls (`bash`, `git`, `read`, `edit`)
+        /// operate inside the worktree with no `git -C`/path juggling.
+        #[tokio::test]
+        async fn write_subagent_cwd_is_its_worktree() {
+            use super::super::{LiveSubagents, SubagentTool};
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "done"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "t@t"]);
+            git(&["config", "user.name", "t"]);
+            std::fs::write(repo.join("f.txt"), "hi").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "init"]);
+            if !repo.join(".git").exists() {
+                return;
+            }
+
+            // Write-capable (test_cfg leaves read_only = false).
+            let cfg = test_cfg(server.base_url(), repo);
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let live = LiveSubagents::new();
+            let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                bg_handles.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                None,
+                None,
+                live.clone(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(repo);
+
+            let ack = tool
+                .execute(json!({"prompt": "do it", "description": "impl"}), &ctx)
+                .await
+                .unwrap();
+            assert!(ack.starts_with("Started background task"), "{ack}");
+
+            // The task got a worktree under `.hrdr/worktrees/`. The registry is
+            // fresh per test, so it holds exactly this one entry — its id comes
+            // from the process-wide `BG_SEQ`, so read it rather than assuming 1.
+            let (task_id, worktree) = {
+                let reg = ctx.background_tasks.lock().unwrap();
+                let t = reg.first().expect("a background task was registered");
+                (
+                    t.id,
+                    t.worktree
+                        .clone()
+                        .expect("a write sub-agent gets a worktree"),
+                )
+            };
+            assert!(
+                worktree.components().any(|c| c.as_os_str() == ".hrdr"),
+                "worktree under .hrdr: {}",
+                worktree.display()
+            );
+
+            // Let the sub-agent's run finish so its agent lock frees, then read the
+            // cwd its tools operate in: it must be the worktree, not the parent repo.
+            let handle = bg_handles.lock().unwrap().pop().unwrap().1;
+            handle.await.unwrap();
+            let agent = live
+                .with(|v| {
+                    v.iter()
+                        .find(|e| e.bg_id == Some(task_id))
+                        .map(|e| std::sync::Arc::clone(&e.agent))
+                })
+                .expect("the sub-agent is registered");
+            let sub_cwd = agent.lock().await.cwd();
+            assert_eq!(
+                sub_cwd, worktree,
+                "the sub-agent's tools run inside its worktree"
+            );
+            assert_ne!(sub_cwd, repo, "and NOT in the parent repo root");
         }
     } // mod mock_server
 

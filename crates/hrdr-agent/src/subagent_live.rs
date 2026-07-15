@@ -97,6 +97,21 @@ pub enum PromptDelivery {
     StartedTurn,
 }
 
+/// The decision `send_prompt` reaches while holding the entry lock: the entry is
+/// gone, the steer was enqueued on a running turn, or the agent is idle and a
+/// fresh turn must be started (with `input` handed back so the spawn happens
+/// outside the lock). Carrying `input` back out keeps the running-check and the
+/// enqueue atomic without holding the lock across the turn spawn.
+enum SendOutcome {
+    Unknown,
+    Steered,
+    Idle {
+        agent: Arc<tokio::sync::Mutex<crate::Agent>>,
+        steering: crate::SteeringQueue,
+        input: crate::Steer,
+    },
+}
+
 /// How a sub-agent was delegated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentKind {
@@ -464,18 +479,38 @@ impl LiveSubagents {
     where
         F: FnMut(crate::AgentEvent) + Send + 'static,
     {
-        let (agent, steering, running) = self.with(|v| {
-            v.iter()
-                .find(|e| e.key == key)
-                .map(|e| (Arc::clone(&e.agent), Arc::clone(&e.steering), e.running))
-        })?;
-
-        if running {
-            if let Ok(mut q) = steering.lock() {
-                q.push_back(input);
+        // Decide and enqueue under the SAME entry lock the worker takes in
+        // `take_pending_or_finish`, so a steer can't be pushed into the queue
+        // *after* the worker has read it empty and marked the turn finished (a
+        // lost message wrongly reported as `Steered`). The running-branch push
+        // happens inside the closure; the idle branch hands `input` back out so a
+        // fresh turn can be started without holding the lock across the spawn.
+        let outcome = self.with(move |v| {
+            let Some(e) = v.iter().find(|e| e.key == key) else {
+                return SendOutcome::Unknown;
+            };
+            if e.running {
+                if let Ok(mut q) = e.steering.lock() {
+                    q.push_back(input);
+                }
+                SendOutcome::Steered
+            } else {
+                SendOutcome::Idle {
+                    agent: Arc::clone(&e.agent),
+                    steering: Arc::clone(&e.steering),
+                    input,
+                }
             }
-            return Some(PromptDelivery::Steered);
-        }
+        });
+        let (agent, steering, input) = match outcome {
+            SendOutcome::Unknown => return None,
+            SendOutcome::Steered => return Some(PromptDelivery::Steered),
+            SendOutcome::Idle {
+                agent,
+                steering,
+                input,
+            } => (agent, steering, input),
+        };
 
         // Idle: a further turn on the agent we kept alive for exactly this.
         //
