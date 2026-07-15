@@ -4064,10 +4064,39 @@ async fn worktree_has_changes(
         .unwrap_or(true)
 }
 
+/// Blocking twin of [`worktree_has_changes`] for the synchronous reset path
+/// ([`Agent::abort_background_tasks`]), which cannot `.await`. Same semantics:
+/// true if the checkout is dirty OR the branch has commits not on the main line,
+/// biased toward "has changes" on any git failure so a reset never deletes
+/// unreviewed work.
+fn worktree_has_changes_sync(repo: &std::path::Path, path: &std::path::Path, branch: &str) -> bool {
+    let dirty = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(true);
+    if dirty {
+        return true;
+    }
+    let range = format!("HEAD..{branch}");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true)
+}
+
 /// Force-remove a background sub-agent's worktree and its scratch branch. Run
 /// against the main repo (`repo`), best-effort — used by `task_cancel` and by
-/// [`Agent::abort_background_tasks`] to discard unreviewed work. Synchronous so
-/// it can run from non-async cleanup paths.
+/// [`Agent::abort_background_tasks`] for a worktree with no unreviewed work.
+/// Synchronous so it can run from non-async cleanup paths.
 fn remove_worktree(repo: &std::path::Path, path: &std::path::Path, branch: &str) {
     let _ = std::process::Command::new("git")
         .arg("-C")
@@ -4913,6 +4942,11 @@ impl Agent {
 
     /// Abort all running background sub-agent tasks and remove every background
     /// registry/live entry. Finished-but-undelivered tasks are discarded too.
+    ///
+    /// Clean worktrees are removed, but a worktree with **changes** (uncommitted
+    /// files or commits on its branch) is **kept** — a `/new` or `/clear` must not
+    /// silently throw away a sub-agent's unreviewed work. It stays on disk under
+    /// `.hrdr/worktrees/` (recoverable via `git worktree list`).
     pub fn abort_background_tasks(&mut self) {
         let mut handles = self
             .bg_handles
@@ -4926,9 +4960,8 @@ impl Agent {
         // Workers publish only by finding their pre-existing registry/live entry.
         // Clearing both stores while holding their locks means a worker either
         // publishes before this cleanup (and is then removed) or finds no entry
-        // afterward; no stale result can be recreated. Collect the worktrees of
-        // the discarded tasks first — they held unreviewed edits, so a reset
-        // throws them away.
+        // afterward; no stale result can be recreated. Collect the worktrees
+        // first so we can tear down the clean ones after releasing the lock.
         let worktrees: Vec<(std::path::PathBuf, String)> = {
             let mut reg = self
                 .ctx
@@ -4944,7 +4977,11 @@ impl Agent {
         };
         let repo = self.ctx.cwd.clone();
         for (path, branch) in worktrees {
-            remove_worktree(&repo, &path, &branch);
+            // Keep a worktree that holds unreviewed work — a reset must not throw
+            // it away. Only remove the clean ones.
+            if !worktree_has_changes_sync(&repo, &path, &branch) {
+                remove_worktree(&repo, &path, &branch);
+            }
         }
         self.live_subagents.with(|v| {
             v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
@@ -9671,6 +9708,78 @@ mod tests {
             "a clean worktree has no keep note: {msg2}"
         );
         assert!(!clean_path.exists(), "a clean worktree is removed");
+    }
+
+    /// A session reset (`/new` / `/clear` → `abort_background_tasks`) removes a
+    /// clean worktree but KEEPS a dirty one, so it never silently throws away a
+    /// sub-agent's unreviewed work.
+    #[tokio::test]
+    async fn abort_background_tasks_keeps_dirty_worktree_removes_clean() {
+        use super::Worktree;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        let mut agent = Agent::new(AgentConfig {
+            cwd: repo.to_path_buf(),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // A dirty worktree (untracked file) and a clean one.
+        let wt_dirty = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt_dirty.path.join("new.txt"), "x").unwrap();
+        let dirty = wt_dirty.keep();
+        let dirty_path = dirty.path.clone();
+        let wt_clean = Worktree::create(repo).await.unwrap();
+        let clean = wt_clean.keep();
+        let clean_path = clean.path.clone();
+
+        {
+            let reg = agent.background_tasks();
+            let mut v = reg.lock().unwrap();
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                worktree: Some(dirty.path),
+                branch: Some(dirty.branch),
+                ..Default::default()
+            });
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                worktree: Some(clean.path),
+                branch: Some(clean.branch),
+                ..Default::default()
+            });
+        }
+
+        agent.abort_background_tasks();
+
+        assert!(
+            dirty_path.exists(),
+            "a reset keeps a worktree with unreviewed changes"
+        );
+        assert!(!clean_path.exists(), "a reset removes a clean worktree");
+        assert!(
+            agent.background_tasks().lock().unwrap().is_empty(),
+            "the background registry is cleared either way"
+        );
     }
 
     #[test]
