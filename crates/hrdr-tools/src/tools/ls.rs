@@ -38,7 +38,6 @@ impl Tool for LsTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: LsArgs = crate::tool_args("ls", args)?;
         let dir = ctx.resolve(a.path.as_deref().unwrap_or("."));
-        ctx.ensure_read_inside_cwd(&dir)?;
         let mut rd = tokio::fs::read_dir(&dir)
             .await
             .with_context(|| format!("listing {}", dir.display()))?;
@@ -65,22 +64,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn ls_refuses_a_directory_outside_cwd() {
+    async fn ls_allows_a_directory_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("a.txt"), "").unwrap();
 
         let ctx = ToolContext::new(cwd.path().to_path_buf());
-        let err = LsTool
+        let out = LsTool
             .execute(
                 serde_json::json!({"path": outside.path().to_str().unwrap()}),
                 &ctx,
             )
             .await
-            .expect_err("listing outside cwd must be denied");
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "unexpected error: {err}"
-        );
+            .expect("listing outside cwd is allowed");
+        assert!(out.contains("a.txt"), "got: {out}");
     }
 }

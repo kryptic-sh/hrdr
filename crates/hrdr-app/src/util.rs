@@ -755,29 +755,24 @@ mod tests {
         );
     }
 
-    /// `@file` mention with `..` escape is gracefully skipped (mention stays, no content).
+    /// `@file` mentions are no longer confined to cwd (full-access default): a
+    /// `..` escape and an absolute path both attach their contents.
     #[test]
-    fn expand_mentions_skips_dotdot_escape() {
+    fn expand_mentions_accepts_paths_outside_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
         let outside = dir.path().join("leak.txt");
-        std::fs::write(&outside, "data").unwrap();
+        std::fs::write(&outside, "outside content").unwrap();
 
+        // Relative `..` escape.
         let out = expand_mentions("check @../leak.txt", &root);
-        // Original text unchanged (mention stays in display copy).
-        assert_eq!(out, "check @../leak.txt");
-    }
+        assert!(out.starts_with("check @../leak.txt"));
+        assert!(out.contains("outside content"), "got: {out}");
 
-    /// `@file` mention with absolute path is gracefully skipped.
-    #[test]
-    fn expand_mentions_skips_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let out = expand_mentions("check @/etc/passwd", &root);
-        assert_eq!(out, "check @/etc/passwd");
+        // Absolute path outside cwd.
+        let out = expand_mentions(&format!("check @{}", outside.display()), &root);
+        assert!(out.contains("outside content"), "got: {out}");
     }
 
     /// `@file` mention of a secret file is gracefully skipped.

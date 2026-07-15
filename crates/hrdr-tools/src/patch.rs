@@ -229,7 +229,7 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
             .as_ref()
             .ok_or_else(|| anyhow!("patch section has no file path"))?;
         let path = ctx.resolve(old);
-        ctx.ensure_within_cwd(&path)?;
+        ctx.ensure_writable_ext(&path)?;
         if !ctx.was_read(&path) {
             bail!("{}: read it before deleting it via patch", path.display());
         }
@@ -261,7 +261,7 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
     }
 
     let path = ctx.resolve(fd.new_path.as_ref().unwrap());
-    ctx.ensure_within_cwd(&path)?;
+    ctx.ensure_writable_ext(&path)?;
     let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
     let base = if exists {
         if !ctx.was_read(&path) {
@@ -752,8 +752,7 @@ diff --git a/bar.txt b/bar.txt
         tokio::fs::write(&a, "one\ntwo\nthree\n").await.unwrap();
         tokio::fs::write(&b, "x\ny\n").await.unwrap();
 
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&a);
         ctx.mark_read(&b);
 
@@ -795,8 +794,7 @@ diff --git a/bar.txt b/bar.txt
             .await
             .unwrap();
 
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&a);
 
         // An LF-terminated diff (what a model emits) against a CRLF file.
@@ -828,8 +826,7 @@ diff --git a/bar.txt b/bar.txt
         tokio::fs::write(&a, "one\n").await.unwrap();
         tokio::fs::write(&b, "keep\n").await.unwrap();
 
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&a);
         ctx.mark_read(&b);
 
@@ -861,8 +858,7 @@ diff --git a/bar.txt b/bar.txt
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("same.txt");
         tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&path);
 
         let patch = "--- a/same.txt\n+++ b/same.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- a/same.txt\n+++ b/same.txt\n@@ -2 +2 @@\n-two\n+TWO\n";
@@ -882,8 +878,7 @@ diff --git a/bar.txt b/bar.txt
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keep.txt");
         tokio::fs::write(&path, "keep\n").await.unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&path);
 
         let patch = "--- a/keep.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n";
@@ -899,8 +894,7 @@ diff --git a/bar.txt b/bar.txt
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keep.txt");
         tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&path);
 
         let patch = "--- a/keep.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-one\n";
@@ -923,8 +917,7 @@ diff --git a/bar.txt b/bar.txt
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("old.txt");
         tokio::fs::write(&old, "old\n").await.unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&old);
 
         let patch = "--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-old\n+new\n";
@@ -947,8 +940,7 @@ diff --git a/bar.txt b/bar.txt
         let sub = dir.path().join("adir");
         tokio::fs::create_dir(&sub).await.unwrap();
 
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(dir.path());
         ctx.mark_read(&sub);
 
         let patch = "--- a/adir\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";

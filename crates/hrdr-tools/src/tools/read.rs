@@ -47,7 +47,6 @@ impl Tool for ReadTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ReadArgs = crate::tool_args("read", args)?;
         let path = ctx.resolve(&a.path);
-        ctx.ensure_read_inside_cwd(&path)?;
         crate::guard_secret_read(&path)?;
         if let Ok(meta) = tokio::fs::metadata(&path).await
             && meta.len() > MAX_READ_BYTES
@@ -94,36 +93,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn read_refuses_a_path_outside_cwd() {
-        let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "secret-ish project data").unwrap();
-
-        let ctx = ToolContext::new(cwd.path().to_path_buf());
-        let err = ReadTool
-            .execute(serde_json::json!({"path": target.to_str().unwrap()}), &ctx)
-            .await
-            .expect_err("reading outside cwd must be denied");
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_allows_outside_cwd_when_restriction_is_off() {
+    async fn read_allows_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "data").unwrap();
 
-        let mut ctx = ToolContext::new(cwd.path().to_path_buf());
-        ctx.restrict_to_cwd = false;
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
         let out = ReadTool
             .execute(serde_json::json!({"path": target.to_str().unwrap()}), &ctx)
             .await
-            .expect("escape hatch lets it through");
+            .expect("reads are not confined to cwd");
         assert!(out.contains("data"), "got: {out}");
     }
 }

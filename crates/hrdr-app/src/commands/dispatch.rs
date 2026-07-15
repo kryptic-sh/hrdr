@@ -871,53 +871,30 @@ mod tests {
         );
     }
 
-    /// `/add` rejects paths that escape the working directory via `..`
+    /// `/add` attaches files outside the working directory (full-access default):
+    /// a `..` escape and an absolute path both go through. Only secret/credential
+    /// files stay off-limits (see `add_rejects_secret_file`).
     #[tokio::test]
-    async fn add_rejects_dotdot_escape() {
+    async fn add_allows_paths_outside_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
-        // Place a file outside the cwd but inside the temp dir so it exists.
         let outside = dir.path().join("leak.txt");
         std::fs::write(&outside, "data").unwrap();
-        let mut host = TestHost::new(root);
 
+        // Relative `..` escape.
+        let mut host = TestHost::new(root.clone());
         assert!(dispatch(&mut host, "/add ../leak.txt"));
         assert!(
-            host.info_log
-                .iter()
-                .any(|l| l.contains("outside the working directory")),
-            "expected outside-cwd error, got: {:?}",
+            !host.input.is_empty(),
+            "a path above cwd must attach, got info_log: {:?}",
             host.info_log
         );
-        assert!(
-            host.input.is_empty(),
-            "escaped path must not attach content"
-        );
-    }
 
-    /// `/add` rejects absolute paths (outside cwd)
-    #[tokio::test]
-    async fn add_rejects_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(&root).unwrap();
-        // A real file OUTSIDE the project, given by absolute path — absolute and
-        // outside on every platform (a bare "/etc/passwd" is not absolute on
-        // Windows and would resolve inside the current drive instead).
-        let outside = dir.path().join("secret.txt");
-        std::fs::write(&outside, "x").unwrap();
+        // Absolute path outside cwd.
         let mut host = TestHost::new(root);
-
         assert!(dispatch(&mut host, &format!("/add {}", outside.display())));
-        assert!(
-            host.info_log
-                .iter()
-                .any(|l| l.contains("outside the working directory")),
-            "expected outside-cwd error, got: {:?}",
-            host.info_log
-        );
-        assert!(host.input.is_empty());
+        assert!(!host.input.is_empty(), "info_log: {:?}", host.info_log);
     }
 
     /// `/add` rejects secret/credential files

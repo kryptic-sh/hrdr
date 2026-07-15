@@ -79,7 +79,6 @@ impl Tool for TreeTool {
         let max_entries = a.max_entries;
 
         let root = ctx.resolve(a.path.as_deref().unwrap_or("."));
-        ctx.ensure_read_inside_cwd(&root)?;
 
         // Collect entries from the ignore walker.
         let entries = collect_entries(&root, depth, max_entries)?;
@@ -457,23 +456,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tree_refuses_a_root_outside_cwd() {
+    async fn tree_allows_a_root_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("a.txt"), "").unwrap();
 
         let ctx = ToolContext::new(cwd.path().to_path_buf());
-        let err = TreeTool
+        let out = TreeTool
             .execute(
                 serde_json::json!({"path": outside.path().to_str().unwrap()}),
                 &ctx,
             )
             .await
-            .expect_err("walking a tree outside cwd must be denied");
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "unexpected error: {err}"
-        );
+            .expect("walking a tree outside cwd is allowed");
+        assert!(out.contains("a.txt"), "got: {out}");
     }
 
     #[tokio::test]

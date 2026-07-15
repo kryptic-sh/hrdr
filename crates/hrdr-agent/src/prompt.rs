@@ -282,9 +282,9 @@ mod tests {
         // It cannot edit a manifest, commit, or tag — a release workflow is a
         // workflow it has no way to carry out.
         assert!(!p.contains("Releasing"), "{p}");
-        // The read/search workflow and the confinement safety line remain.
+        // The read/search workflow and the working-directory safety line remain.
         assert!(p.contains("grep/find/ls/tree/read"), "{p}");
-        assert!(p.contains("confined to the working directory"), "{p}");
+        assert!(p.contains("working directory is your home base"), "{p}");
         // And so do the rules that bind *any* agent, whatever it can reach: a
         // read-only sub-agent still reports its findings (and can still lie about
         // them), and still reads web pages and files that may try to instruct it.

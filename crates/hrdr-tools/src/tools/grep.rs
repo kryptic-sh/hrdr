@@ -110,7 +110,6 @@ impl Tool for GrepTool {
         // no path it searches cwd, which is confined by construction.
         if let Some(p) = &a.path {
             let root = ctx.resolve(p);
-            ctx.ensure_read_inside_cwd(&root)?;
             crate::guard_secret_read(&root)?;
         }
         match self.backend {
@@ -601,13 +600,13 @@ mod tests {
     /// root is an exfiltration vector. Backend-independent: the guard lives in
     /// `execute`, so `GrepTool::detect()`'s chosen backend doesn't matter.
     #[tokio::test]
-    async fn grep_refuses_a_path_outside_cwd() {
+    async fn grep_allows_a_path_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
 
         let ctx = ToolContext::new(cwd.path());
-        let err = GrepTool::detect()
+        let out = GrepTool::detect()
             .execute(
                 serde_json::json!({
                     "pattern": "needle",
@@ -616,11 +615,8 @@ mod tests {
                 &ctx,
             )
             .await
-            .expect_err("grepping outside cwd must be denied");
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "unexpected error: {err}"
-        );
+            .expect("grepping outside cwd is allowed");
+        assert!(out.contains("needle"), "got: {out}");
     }
 
     /// With `context > 0`, a `.env` line adjacent to a match must not leak via

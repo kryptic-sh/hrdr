@@ -178,10 +178,6 @@ pub struct ToolContext {
     /// that isn't here — blind edits against guessed content are the top
     /// source of corrupt patches.
     pub read_files: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
-    /// When set (the default), `write`/`edit` refuse paths outside the
-    /// working directory (the system temp dir is always allowed for scratch).
-    /// Disable via config `allow_outside_cwd = true`.
-    pub restrict_to_cwd: bool,
     /// When set, file-mutating tools (`write`/`edit`/`patch`) may only touch
     /// files with one of these extensions (case-insensitive, no dot — e.g.
     /// `["md", "markdown"]`). `None` = any extension. Used to scope a sub-agent
@@ -217,7 +213,6 @@ impl ToolContext {
             checkpoints: None,
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            restrict_to_cwd: true,
             write_allow_ext: None,
             memory_project: None,
             memory_global: None,
@@ -282,121 +277,6 @@ impl ToolContext {
         if let Ok(mut set) = self.read_files.lock() {
             set.insert(canon);
         }
-    }
-
-    /// Guard for the file-mutating tools: `Err` when `path` escapes both the
-    /// working directory and the system temp dir (scratch space) while
-    /// [`restrict_to_cwd`](Self::restrict_to_cwd) is on. Compares canonical
-    /// paths (via the nearest existing ancestor, so not-yet-created files
-    /// resolve too) — `../` tricks don't slip through.
-    pub fn ensure_within_cwd(&self, path: &std::path::Path) -> Result<()> {
-        self.ensure_writable_ext(path)?;
-        self.ensure_inside_cwd(path)?;
-        self.ensure_no_symlink_components(path)
-    }
-
-    /// Refuse mutating through symlink path components. Canonical confinement
-    /// proves where a path points at check time; this additional lexical walk
-    /// prevents later pathname operations from following project-controlled
-    /// symlinks and narrows swap races between validation and mutation.
-    pub fn ensure_no_symlink_components(&self, path: &std::path::Path) -> Result<()> {
-        if !self.restrict_to_cwd {
-            return Ok(());
-        }
-        // Where the walk stops: the project root, and the system temp dir that
-        // [`ensure_inside_cwd`](Self::ensure_inside_cwd) admits as scratch. Above
-        // those, symlinks are the *user's* filesystem, not something the project
-        // could have planted — a home directory reached through a symlink, or (on
-        // macOS) a temp dir that lives under `/var`, which **is** a symlink to
-        // `/private/var`. Without a stop, that one symlink would refuse every
-        // scratch file hrdr writes on a Mac.
-        //
-        // Compared canonically, on both sides, and computed once. Path equality is
-        // textual — `/var/folders/…` and `/private/var/folders/…` are the same
-        // directory and different `Path`s — so a stop that compares raw paths misses
-        // whenever a caller hands us a resolved path (or `$TMPDIR` is spelled another
-        // way), the walk sails past the stop, finds the symlink above it, and refuses
-        // a write that was always legitimate. An environment-dependent, macOS-only
-        // refusal is precisely the bug you cannot reproduce on the machine you have.
-        //
-        // The stop is *at* the temp dir, not below it: `/tmp` is world-writable, and
-        // a symlink planted inside it by another local user is the oldest trick
-        // there is. Components below the stop are still checked.
-        let stops = [
-            canonicalize_nearest(&self.cwd),
-            canonicalize_nearest(&std::env::temp_dir()),
-        ];
-        let mut current = Some(path);
-        while let Some(candidate) = current {
-            if stops.contains(&canonicalize_nearest(candidate)) {
-                break;
-            }
-            match std::fs::symlink_metadata(candidate) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(anyhow!(
-                        "{} contains symlink component {} — mutations through symlinks are refused",
-                        path.display(),
-                        candidate.display()
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(anyhow!(
-                        "checking path component {}: {error}",
-                        candidate.display()
-                    ));
-                }
-            }
-            current = candidate.parent();
-        }
-        Ok(())
-    }
-
-    /// Confinement only, without the [`write_allow_ext`](Self::write_allow_ext)
-    /// gate: for paths that are read or searched rather than written (a search
-    /// root has no extension to allow).
-    pub fn ensure_inside_cwd(&self, path: &std::path::Path) -> Result<()> {
-        if !self.restrict_to_cwd {
-            return Ok(());
-        }
-        let canon = canonicalize_nearest(path);
-        let cwd = canonicalize_nearest(&self.cwd);
-        if canon.starts_with(&cwd) || canon.starts_with(canonicalize_nearest(&std::env::temp_dir()))
-        {
-            return Ok(());
-        }
-        Err(anyhow!(
-            "{} is outside the working directory ({}) — file changes are confined to the \
-             project; ask the user to change it themselves (or to set allow_outside_cwd)",
-            path.display(),
-            self.cwd.display()
-        ))
-    }
-
-    /// Confinement for the content-reading/listing tools (`read`, `grep`,
-    /// `ls`, `tree`): `Err` when `path` resolves outside the working directory
-    /// while [`restrict_to_cwd`](Self::restrict_to_cwd) is on. Stricter than
-    /// [`ensure_inside_cwd`](Self::ensure_inside_cwd), which also admits the
-    /// system temp dir as write scratch — reading arbitrary temp is an
-    /// exfiltration path (another session's tool output, other users' files),
-    /// so reads are confined to the project alone. `..`-escapes are resolved
-    /// before the check.
-    pub fn ensure_read_inside_cwd(&self, path: &std::path::Path) -> Result<()> {
-        if !self.restrict_to_cwd {
-            return Ok(());
-        }
-        let canon = canonicalize_nearest(path);
-        let cwd = canonicalize_nearest(&self.cwd);
-        if canon.starts_with(&cwd) {
-            return Ok(());
-        }
-        Err(anyhow!(
-            "{} is outside the working directory ({}) — reads are confined to the \
-             project; ask the user to change it themselves (or to set allow_outside_cwd)",
-            path.display(),
-            self.cwd.display()
-        ))
     }
 
     /// Guard for [`write_allow_ext`](Self::write_allow_ext): `Err` when a
@@ -562,8 +442,7 @@ pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result
 /// `path_str` is the user-provided path (e.g., from `@file.txt` or `/add file.txt`).
 /// It is resolved against `cwd`, canonicalized, and checked against security policies:
 ///
-/// * Must be a regular, readable file (not a directory, symlink, etc.)
-/// * Must be within `cwd` (no `..` escape, no symlink escape)
+/// * Must be a regular, readable file (not a directory, socket, etc.)
 /// * Must not be a secret/credential file (see [`secret_file_reason`])
 ///
 /// Returns the canonicalized [`PathBuf`] on success.
@@ -577,18 +456,6 @@ pub fn validate_attach_path(path_str: &str, cwd: &std::path::Path) -> anyhow::Re
     let canon = resolved
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("can't resolve {}: {e}", resolved.display()))?;
-    // Confine to cwd (canonical form catches symlink escapes).
-    let canon_cwd = cwd
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("can't resolve cwd {}: {e}", cwd.display()))?;
-    if !canon.starts_with(&canon_cwd) {
-        anyhow::bail!(
-            "{} is outside the working directory ({}) — file attachments are confined \
-             to the project",
-            resolved.display(),
-            cwd.display(),
-        );
-    }
     // Reject secret/credential files.
     if let Some(reason) = secret_file_reason(&canon) {
         anyhow::bail!(
@@ -1776,39 +1643,6 @@ b:2:y"
         assert_eq!(cap_matches(ctx_out, 3), ctx_out.trim_end());
     }
 
-    #[test]
-    fn ensure_within_cwd_confines_writes() {
-        // NB: tempdirs live under the system temp dir, which the gate always
-        // allows for scratch — so "outside" fixtures must be non-temp paths.
-        // The gate is a pure check (it fires before any I/O), so the paths
-        // don't need to exist or be writable.
-        let mut ctx = ToolContext::new("/etc");
-        // Inside cwd (including not-yet-created nested paths): allowed.
-        assert!(ctx.ensure_within_cwd(Path::new("/etc/sub/new.txt")).is_ok());
-        // Outside cwd: refused, with the recovery in the message.
-        let err = ctx
-            .ensure_within_cwd(Path::new("/usr/lib/x.txt"))
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
-        // `..` escapes are resolved before the check.
-        assert!(
-            ctx.ensure_within_cwd(Path::new("/etc/../usr/escape.txt"))
-                .is_err()
-        );
-        // The system temp dir is always fair game for scratch…
-        assert!(
-            ctx.ensure_within_cwd(&std::env::temp_dir().join("hrdr-scratch.txt"))
-                .is_ok()
-        );
-        // …a temp cwd is inside by definition…
-        let dir = tempfile::tempdir().unwrap();
-        let tmp_ctx = ToolContext::new(dir.path());
-        assert!(tmp_ctx.ensure_within_cwd(&dir.path().join("a.txt")).is_ok());
-        // …and the knob disables the gate entirely.
-        ctx.restrict_to_cwd = false;
-        assert!(ctx.ensure_within_cwd(Path::new("/usr/lib/x.txt")).is_ok());
-    }
-
     /// A malformed tool call names the offending field. Each tool wraps
     /// `serde_json::from_value` in a `.context("invalid <tool> args")`, which is
     /// a summary — the field name lives in the *source*, and only the alternate
@@ -1901,22 +1735,25 @@ b:2:y"
         let mut ctx = ToolContext::new(dir.path());
         ctx.write_allow_ext = Some(vec!["md".into(), "markdown".into()]);
         // Listed extensions pass (case-insensitive)…
-        assert!(ctx.ensure_within_cwd(&dir.path().join("PLAN.md")).is_ok());
+        assert!(ctx.ensure_writable_ext(&dir.path().join("PLAN.md")).is_ok());
         assert!(
-            ctx.ensure_within_cwd(&dir.path().join("a.MARKDOWN"))
+            ctx.ensure_writable_ext(&dir.path().join("a.MARKDOWN"))
                 .is_ok()
         );
-        // …anything else is refused, even inside cwd.
+        // …anything else is refused.
         let err = ctx
-            .ensure_within_cwd(&dir.path().join("src/main.rs"))
+            .ensure_writable_ext(&dir.path().join("src/main.rs"))
             .unwrap_err();
         assert!(err.to_string().contains("only modify"), "{err}");
         // Extensionless paths aren't in the list → refused.
-        assert!(ctx.ensure_within_cwd(&dir.path().join("Makefile")).is_err());
+        assert!(
+            ctx.ensure_writable_ext(&dir.path().join("Makefile"))
+                .is_err()
+        );
         // No list → no restriction.
         ctx.write_allow_ext = None;
         assert!(
-            ctx.ensure_within_cwd(&dir.path().join("src/main.rs"))
+            ctx.ensure_writable_ext(&dir.path().join("src/main.rs"))
                 .is_ok()
         );
     }
@@ -2003,88 +1840,6 @@ b:2:y"
     }
 
     #[test]
-    fn ensure_inside_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
-        // Use a non-temp cwd so the temp-dir escape hatch doesn't mask the result.
-        let cwd = Path::new("/nonexistent-hrdr-test/cwd");
-        let ctx = ToolContext::new(cwd);
-
-        // Path: cwd/nonexistent/../../escape — escapes above cwd via
-        // `..` in the unresolved suffix.
-        let path = cwd.join("nonexistent/../../escape/file");
-        let err = ctx.ensure_inside_cwd(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn ensure_inside_cwd_preserves_legitimate_deep_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        // Canonicalize the temp root (macOS `/var` → `/private/var` symlink);
-        // a no-op on Linux. Otherwise the resolved target wouldn't sit under the
-        // un-resolved cwd.
-        let cwd = std::fs::canonicalize(dir.path()).unwrap().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let ctx = ToolContext::new(&cwd);
-
-        // Non-existing nested file inside cwd: must be allowed.
-        let path = cwd.join("src/main.rs");
-        assert!(
-            ctx.ensure_inside_cwd(&path).is_ok(),
-            "deep path inside cwd must be allowed"
-        );
-        // Non-existing file using `..` to stay inside cwd.
-        let path = cwd.join("sub/../other/file");
-        assert!(
-            ctx.ensure_inside_cwd(&path).is_ok(),
-            "path with .. staying inside cwd must be allowed"
-        );
-    }
-
-    #[test]
-    fn ensure_read_inside_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let ctx = ToolContext::new(&cwd);
-
-        // Same escape via unresolved `..` suffix — reads must also be confined.
-        let path = cwd.join("nonexistent/../../outside/file");
-        let err = ctx.ensure_read_inside_cwd(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn ensure_within_cwd_rejects_dotdot_escape_below_nonexistent_ancestor() {
-        // Use a non-temp cwd so the temp-dir escape hatch doesn't mask the result.
-        let cwd = Path::new("/nonexistent-hrdr-test/cwd");
-        let ctx = ToolContext::new(cwd);
-
-        // Mutation confinement through the same escape vector.
-        let path = cwd.join("nonexistent/../../escape/file");
-        let err = ctx.ensure_within_cwd(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn ensure_within_cwd_still_allows_temp_scratch() {
-        // The temp-dir escape hatch for writes must survive normalization.
-        let ctx = ToolContext::new("/etc");
-        let tmp = std::env::temp_dir().join("hrdr-scratch.txt");
-        assert!(
-            ctx.ensure_within_cwd(&tmp).is_ok(),
-            "temp dir scratch must still be allowed"
-        );
-    }
-
-    #[test]
     fn normalize_path_handles_existing_and_nonexistent_symlink_targets() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("project");
@@ -2108,133 +1863,23 @@ b:2:y"
         );
     }
 
-    #[test]
-    fn ensure_inside_cwd_accepts_dotdot_inside_existing_subdir() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        let sub = cwd.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let ctx = ToolContext::new(&cwd);
-
-        // sub exists and ../other stays inside cwd — must be allowed.
-        let path = cwd.join("sub/../other/file");
-        assert!(
-            ctx.ensure_inside_cwd(&path).is_ok(),
-            ".. inside existing subdir staying in cwd must be allowed"
-        );
-    }
-
-    #[test]
-    fn ensure_inside_cwd_accepts_existing_target_with_trailing_dotdot_inside_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        let sub = cwd.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let existing_file = sub.join("file.txt");
-        std::fs::write(&existing_file, "data").unwrap();
-        let ctx = ToolContext::new(&cwd);
-
-        // Existing target with `..` that stays inside cwd.
-        let path = cwd.join("sub/../file.txt");
-        assert!(
-            ctx.ensure_inside_cwd(&path).is_ok(),
-            "existing file reached via .. staying in cwd must be allowed"
-        );
-    }
-
     // ---- validate_attach_path ----
 
+    /// Attachments are no longer confined to cwd (full-access default): a file
+    /// above cwd, reached by `..` or an absolute path, attaches fine. Only the
+    /// secret-file and is-file gates remain.
     #[test]
-    fn validate_attach_path_rejects_dotdot_escape() {
+    fn validate_attach_path_allows_outside_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
-        // Place a decoy so the escape target exists.
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "data").unwrap();
 
-        let err = validate_attach_path("../outside.txt", &cwd).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_attach_path_rejects_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        // A real file OUTSIDE cwd, referenced by its absolute path — absolute and
-        // outside on every platform (a bare "/etc/passwd" is not absolute on
-        // Windows, where it would resolve *inside* the current drive/cwd instead).
-        let outside = dir.path().join("secret.txt");
-        std::fs::write(&outside, "x").unwrap();
-
-        let err = validate_attach_path(&outside.to_string_lossy(), &cwd).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error, got: {err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn validate_attach_path_rejects_symlink_escape() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        // Symlink inside the project pointing outside.
-        let outside = dir.path().join("outside_file");
-        std::fs::write(&outside, "content").unwrap();
-        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
-
-        let err = validate_attach_path("link", &cwd).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error for symlink escape, got: {err}"
-        );
-    }
-
-    /// Windows-native escape: a relative path using backslash `..` components to
-    /// climb above cwd. Windows treats `\` as a path separator; Unix does not
-    /// (there `..\..\x` is a single filename), hence the `cfg(windows)` gate.
-    #[cfg(windows)]
-    #[test]
-    fn validate_attach_path_rejects_backslash_escape() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project").join("sub");
-        std::fs::create_dir_all(&cwd).unwrap();
-        // A real file two levels above cwd, reached via a `..\..` backslash escape.
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, "x").unwrap();
-
-        let err = validate_attach_path("..\\..\\secret.txt", &cwd).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error for backslash escape, got: {err}"
-        );
-    }
-
-    /// Windows-native escape: an absolute path on the same drive but outside cwd
-    /// (`C:\…`) must be rejected. Unix has no drive letters, so this is
-    /// `cfg(windows)`; the cross-platform `validate_attach_path_rejects_absolute_path`
-    /// covers the generic absolute-outside case.
-    #[cfg(windows)]
-    #[test]
-    fn validate_attach_path_rejects_drive_absolute_escape() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        // A real file outside cwd, given by its full `C:\…` path.
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, "x").unwrap();
-
-        let err = validate_attach_path(&secret.to_string_lossy(), &cwd).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the working directory"),
-            "expected outside-cwd error for a drive-absolute path, got: {err}"
-        );
+        // Relative `..` escape.
+        assert!(validate_attach_path("../outside.txt", &cwd).is_ok());
+        // Absolute path outside cwd.
+        assert!(validate_attach_path(&outside.to_string_lossy(), &cwd).is_ok());
     }
 
     #[test]

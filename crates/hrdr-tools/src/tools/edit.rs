@@ -60,7 +60,7 @@ impl Tool for EditTool {
             );
         }
         let path = ctx.resolve(&a.path);
-        ctx.ensure_within_cwd(&path)?;
+        ctx.ensure_writable_ext(&path)?;
         if !ctx.was_read(&path) {
             bail!(
                 "you haven't read {} yet — call read first, then copy old_string \

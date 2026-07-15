@@ -2403,9 +2403,6 @@ pub struct AgentConfig {
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
     /// of the built-in rules.
     pub guardrails: Vec<GuardrailConfig>,
-    /// Let `write`/`edit` touch paths outside the working directory
-    /// (default `false`; the system temp dir is always allowed).
-    pub allow_outside_cwd: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
     pub hooks: Vec<HookConfig>,
     /// Post-edit LSP diagnostics (default `true`): after a mutating tool
@@ -2858,7 +2855,6 @@ impl Default for AgentConfig {
             checkpoints: None,
             providers: HashMap::new(),
             guardrails: Vec::new(),
-            allow_outside_cwd: false,
             hooks: Vec::new(),
             tool_max_bytes: hrdr_tools::DEFAULT_MAX_OUTPUT,
             tool_max_lines: hrdr_tools::DEFAULT_MAX_OUTPUT_LINES,
@@ -3471,7 +3467,6 @@ struct FileConfig {
     providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     guardrails: Vec<GuardrailConfig>,
-    allow_outside_cwd: Option<bool>,
     #[serde(default)]
     hooks: Vec<HookConfig>,
     tool_output: Option<ToolOutputConfig>,
@@ -3750,9 +3745,6 @@ impl AgentConfig {
         if !fc.guardrails.is_empty() {
             self.guardrails = fc.guardrails;
         }
-        if let Some(v) = fc.allow_outside_cwd {
-            self.allow_outside_cwd = v;
-        }
         if !fc.hooks.is_empty() {
             self.hooks = fc.hooks;
         }
@@ -3868,11 +3860,6 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// move it would be an endpoint that belongs to nobody.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
-    ("HRDR_ALLOW_OUTSIDE_CWD", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.allow_outside_cwd = b;
-        }
-    }),
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Some(b) = parse_toggle_or_num(&v) {
             c.auto_compact = b;
@@ -4960,8 +4947,8 @@ impl Agent {
             tools.retain_only(allow);
         } else if config.write_ext.is_some() {
             let mut allow = tools.read_only_names();
-            // The mutating tools, all of which gate on `ensure_within_cwd` and so
-            // inherit the extension allow-list. No shell: that would bypass both.
+            // The mutating tools, all of which gate on `ensure_writable_ext` and
+            // so inherit the extension allow-list. No shell: that would bypass it.
             allow.extend(
                 [
                     "write", "edit", "patch", "move", "delete", "copy", "replace",
@@ -4979,7 +4966,6 @@ impl Agent {
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.lsp = lsp;
-        ctx.restrict_to_cwd = !config.allow_outside_cwd;
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
         // A write-scoped sub-agent (e.g. `plan`) may only touch these extensions.
@@ -7857,7 +7843,6 @@ mod tests {
             auto_compact: true,
             auto_prune: true,
             max_cost: Some(5.0),
-            allow_outside_cwd: false,
             ..Default::default()
         };
         let sub = subagent_base_config(&parent);
@@ -7872,7 +7857,6 @@ mod tests {
 
         // Safety-scoped: comes along.
         assert_eq!(sub.max_cost, Some(5.0), "the cost ceiling still applies");
-        assert!(!sub.allow_outside_cwd, "the cwd sandbox still applies");
         assert!(
             sub.auto_prune,
             "cheap tool-output pruning is not compaction"
@@ -9336,7 +9320,7 @@ mod tests {
         assert_eq!(tools("review"), readers);
 
         // `plan` adds the mutating tools — still no shell. Each gates on
-        // `ensure_within_cwd`, which enforces `write_ext`, so its writes are
+        // `ensure_writable_ext`, which enforces `write_ext`, so its writes are
         // confined to markdown (patch validates before it writes anything, and
         // move/delete guard both the source and the destination). LSP `rename`
         // is not in the writer allow-list: a server-computed workspace edit
@@ -11222,7 +11206,6 @@ mod tests {
             checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
             guardrails: vec![],
-            allow_outside_cwd: Some(true),
             hooks: vec![],
             tool_output: Some(ToolOutputConfig {
                 max_lines: Some(500),
@@ -11277,7 +11260,6 @@ mod tests {
         assert_eq!(cfg.compaction_reserved, 12_345);
         assert!(!cfg.auto_prune);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
-        assert!(cfg.allow_outside_cwd);
     }
 
     #[test]

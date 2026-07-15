@@ -2,7 +2,7 @@
 //!
 //! The alternative a model reaches for is `bash sed -i`, which is the single
 //! worst mutation path available to it: not checkpointed (so `/undo` cannot
-//! revert it), not confined to the working directory, and silent about what it
+//! revert it), not held to the `write_ext` allow-list, and silent about what it
 //! changed — a bad regex corrupts the tree and the model reports success.
 //!
 //! This tool walks the project respecting `.gitignore`, matches a **literal**
@@ -87,9 +87,6 @@ impl Tool for ReplaceTool {
             Some(p) => ctx.resolve(p),
             None => ctx.cwd.clone(),
         };
-        // Confinement only: the root is searched, not written, and a directory
-        // has no extension for the `write_ext` gate to admit.
-        ctx.ensure_inside_cwd(&root)?;
 
         let re = if a.regex {
             regex::Regex::new(&a.find).with_context(|| format!("invalid regex: {}", a.find))?
@@ -129,7 +126,7 @@ impl Tool for ReplaceTool {
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
-            ctx.ensure_within_cwd(&path)?;
+            ctx.ensure_writable_ext(&path)?;
             // A literal substitution's output size is exactly computable from the
             // hit count, so bound it before allocating: `find="e"`, `replace=50KB`
             // could expand even a single sub-2 MB file into gigabytes. (A regex

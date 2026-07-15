@@ -57,12 +57,12 @@ sudo rpm -i hrdr-*.rpm
   `dry_run`), `move`, `copy`, `delete`, `find`, `ls`, `tree`, `grep`, `git`
   (read-only: status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell,
   and any MCP-server tools. The file-mutating tools are **checkpointed** (so
-  `/undo` reverts them), and every file tool — read, search, and write alike —
-  is **confined** to the project (paths outside it are refused), with
-  credential/secret files off-limits to the read tools — unlike the same access
-  through the shell, which has neither guard. Token-bounded outputs and
-  line-numbered reads for precise edits — and when `bash`/`grep` output
-  overflows, the **full** result is saved to a temp file and the model is
+  `/undo` reverts them), and the read tools keep **credential/secret files**
+  off-limits — unlike the same access through the shell, which has neither
+  guard. The file tools otherwise have full filesystem access (hrdr runs in a
+  codebase you trust); a process-level sandbox mode is planned. Token-bounded
+  outputs and line-numbered reads for precise edits — and when `bash`/`grep`
+  output overflows, the **full** result is saved to a temp file and the model is
   pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
   out are **presence-aware**: the shell tool is `bash` and/or `powershell`
   depending on what's installed, and `grep` uses ripgrep → POSIX grep → a
@@ -756,16 +756,17 @@ more reliable than a prompt rule alone. `sudo` itself is allowed — installing
 system packages at the user's request is the user's call — but it can't launder
 an otherwise-blocked command.
 
-Every file tool is confined to the working directory. `read`, `grep`, `ls`, and
-`tree` refuse paths outside it, and `write`/`edit` are limited to it too (writes
-may also use the system temp dir for scratch); set `allow_outside_cwd = true` in
-config (or `$HRDR_ALLOW_OUTSIDE_CWD`) to lift the confinement. On top of that,
-the read tools refuse known **credential/secret files** — SSH and other private
-keys, `.env`, cloud credentials (AWS/GCP/kube/Docker), `.netrc`/`.npmrc`/
-`.pypirc`/`.git-credentials`, keystores, and the like — so prompt-injected
-content can't have the agent read them out. And `fetch` blocks
-internal/loopback/private and cloud-metadata hosts (SSRF), re-checking on every
-redirect hop and at connect time so a DNS rebind can't slip through.
+The file tools have full filesystem access — hrdr is meant to run in a codebase
+you trust, and a working directory that also let the model reach a sibling repo
+or a generated file just upstream removes a whole class of needless friction.
+`write`-scoped sub-agents (like `plan`) are still held to their extension
+allow-list. On top of that, the read tools refuse known **credential/secret
+files** — SSH and other private keys, `.env`, cloud credentials
+(AWS/GCP/kube/Docker), `.netrc`/`.npmrc`/ `.pypirc`/`.git-credentials`,
+keystores, and the like — so prompt-injected content can't have the agent read
+them out. And `fetch` blocks internal/loopback/private and cloud-metadata hosts
+(SSRF), re-checking on every redirect hop and at connect time so a DNS rebind
+can't slip through.
 
 Add project- or workflow-specific rules in config; they apply on top of the
 built-ins:

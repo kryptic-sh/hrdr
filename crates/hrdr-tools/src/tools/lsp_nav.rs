@@ -45,7 +45,7 @@ async fn locate(
     symbol: Option<&str>,
 ) -> Result<(std::path::PathBuf, String, u32, u32)> {
     let path = ctx.resolve(path);
-    ctx.ensure_within_cwd(&path)?;
+    ctx.ensure_writable_ext(&path)?;
     let content = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
@@ -261,7 +261,7 @@ impl Tool for RenameTool {
         // confinement plus a clean application of every file's edits.
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {
-            ctx.ensure_within_cwd(&file.path)?;
+            ctx.ensure_writable_ext(&file.path)?;
             let before = tokio::fs::read_to_string(&file.path)
                 .await
                 .with_context(|| format!("reading {}", file.path.display()))?;

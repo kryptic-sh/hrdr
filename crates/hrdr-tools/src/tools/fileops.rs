@@ -1,12 +1,12 @@
 //! Guarded file operations: `move`, `delete`, `copy`.
 //!
-//! The shells can already do all three, but a shell mutation escapes both of the
-//! safety nets the file tools sit behind: it is not checkpointed (so `/undo`
-//! can't revert it) and it is not confined to the working directory (nor to a
-//! sub-agent's `write_ext` allow-list). These tools route the same operations
-//! through [`ToolContext::ensure_within_cwd`] and [`ToolContext::checkpoint`],
-//! which also makes them available to sub-agents that have no shell at all
-//! (`plan` writes markdown, and can now rename and delete it).
+//! The shells can already do all three, but a shell mutation escapes the safety
+//! nets the file tools sit behind: it is not checkpointed (so `/undo` can't
+//! revert it) and it is not held to a sub-agent's `write_ext` allow-list. These
+//! tools route the same operations through [`ToolContext::ensure_writable_ext`]
+//! and [`ToolContext::checkpoint`], which also makes them available to sub-agents
+//! that have no shell at all (`plan` writes markdown, and can now rename and
+//! delete it).
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use crate::{Tool, ToolContext};
 /// Guard a path that is about to be created or overwritten: inside the working
 /// directory, and of a permitted extension for this agent.
 fn guard_dest(ctx: &ToolContext, path: &std::path::Path) -> Result<()> {
-    ctx.ensure_within_cwd(path)
+    ctx.ensure_writable_ext(path)
 }
 
 /// Guard a path whose current contents are about to disappear (the source of a
@@ -26,7 +26,7 @@ fn guard_dest(ctx: &ToolContext, path: &std::path::Path) -> Result<()> {
 /// mutate gate the other tools apply: the model must have seen what it's about
 /// to destroy.
 async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> Result<()> {
-    ctx.ensure_within_cwd(path)?;
+    ctx.ensure_writable_ext(path)?;
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         bail!(
             "{} does not exist — relative paths resolve against the project root ({}); \
@@ -412,7 +412,7 @@ impl Tool for CopyTool {
         let to = ctx.resolve(&a.to);
         // The source survives a copy, so it needs confinement but not the
         // read-before-destroy gate.
-        ctx.ensure_within_cwd(&from)?;
+        ctx.ensure_writable_ext(&from)?;
         if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
             bail!(
                 "{} does not exist — relative paths resolve against the project root ({}); \
@@ -447,7 +447,7 @@ impl Tool for CopyTool {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        ctx.ensure_within_cwd(&from)?;
+        ctx.ensure_writable_ext(&from)?;
         guard_dest(ctx, &to)?;
         if from.is_dir() {
             staged_copy_dir(&from, &to).await?;
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_refuses_a_missing_path_and_one_outside_the_project() {
+    async fn delete_refuses_a_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path());
         let err = DeleteTool
@@ -674,18 +674,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
-
-        // `/etc/hosts` exists on every CI platform's unix images; on Windows the
-        // path simply doesn't exist, and either error is a refusal.
-        let err = DeleteTool
-            .execute(json!({"path": "/etc/hosts"}), &c)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("outside the working directory") || msg.contains("does not exist"),
-            "{msg}"
-        );
     }
 
     /// `move` and `copy` create the destination's missing parent directories,

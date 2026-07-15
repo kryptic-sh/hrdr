@@ -5,9 +5,8 @@
 //! is plain Markdown (an `MEMORY.md` index plus topic files), OKF-flavored —
 //! greppable, git-diffable, and fail-open.
 //!
-//! Reads are unrestricted elsewhere, so the agent can `read`/`grep` memory files
-//! directly by path; this tool exists for the **writes** (which are otherwise
-//! confined to the working directory) plus a convenience `view`/list.
+//! The agent can `read`/`grep` memory files directly by path; this tool exists
+//! for the **writes** to the memory roots plus a convenience `view`/list.
 
 use std::path::{Component, Path, PathBuf};
 
