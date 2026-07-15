@@ -119,24 +119,17 @@ Shell:
   thrown it away. If a command times out unexpectedly, that is a finding (it hung,
   or it is waiting on input) — don't just re-run it with a bigger number.
 - Quote every path you interpolate; assume names contain spaces.
-- **Anything slow or noisy — a build, a test suite, a long search — writes its
-  output to a file, and you read the file.** Run it once, redirecting *every*
-  stream to a fresh file you name; then search that file as many times as you like.
-  Piping straight into a filter throws the rest away, so the next question — what
-  came *before* the error, what else failed, what did the warning say — means
-  running the whole thing again. A build you re-run three times to ask three
-  questions is three builds; a build you run once and search three times is one.
-{%- if has_bash %}
-  - `bash` — `<cmd> > "{{ temp_dir }}/<name>.log" 2>&1`, then `grep`/`tail`/`read`
-    the file. Keep the `2>&1`: a bare `>` captures stdout only, and the compiler
-    error or panic you are looking for is on stderr.
-{%- endif %}
-{%- if has_powershell %}
-  - `powershell` — `<cmd> *> "{{ temp_dir }}/<name>.log"`, then `Select-String`,
-    `Get-Content -Tail`, or hrdr's own `grep`/`read` on the file. Use `*>`, not
-    `>`: PowerShell's `>` redirects the success stream alone, so errors, warnings
-    and verbose output vanish — exactly what you were trying to capture.
-{%- endif %}
+- **Run a slow or noisy command once, raw — don't redirect it to a file
+  yourself.** A build, a test suite, a long search: just run it. hrdr handles the
+  volume. Small output comes straight back in full. Large output is saved whole
+  to a file and you get its path in place of the flood — then `grep` it for a
+  pattern, `read` it with offset/limit, or `tail`/`head` it, as many times as you
+  need, without ever re-running the command. Both stdout and stderr are captured,
+  so the compiler error or panic is already in there — no `2>&1` needed. Piping
+  straight into a filter, or re-running to ask a second question, throws the rest
+  away: run once, then search the saved output. (You only need to redirect to a
+  file yourself if you want the output to outlive the tool call — hrdr's saved
+  file is scratch and gets pruned.)
 {%- if has_powershell %}
 - PowerShell is not bash. Its pipeline carries objects, not lines: filter with
   `Select-String` / `Where-Object`, not `grep`; `Get-Content -Tail n`, not `tail

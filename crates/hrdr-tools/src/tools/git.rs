@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Tool, ToolContext, truncate};
+use crate::{Tool, ToolContext};
 
 /// The subcommands this tool will run. All are read-only: none writes to the
 /// index, the working tree, the object store, or a remote.
@@ -376,14 +376,23 @@ impl Tool for GitTool {
             };
             bail!("git {sub} failed: {msg}");
         }
-        let body = if stdout.trim().is_empty() {
-            "(no output)".to_string()
-        } else {
-            // Redact any diff hunk for a secret file before it reaches the model
-            // (a `diff`/`log -p`/`show` can otherwise echo `.env`'s contents).
-            redact_secret_diffs(&stdout)
-        };
-        Ok(truncate(&body, ctx.max_output))
+        if stdout.trim().is_empty() {
+            return Ok("(no output)".to_string());
+        }
+        // Redact any diff hunk for a secret file before it reaches the model
+        // (a `diff`/`log -p`/`show` can otherwise echo `.env`'s contents) — the
+        // saved overflow file below therefore holds the redacted text too.
+        let body = redact_secret_diffs(&stdout);
+        // Big output (`log -p`, a wide `diff`, a long `show`) is saved whole to a
+        // file the model can `grep`/`read`, same as `bash`/`grep` — so it isn't
+        // byte-truncated and lost. Small output comes straight back.
+        Ok(crate::truncate_saved(
+            &body,
+            ctx.max_output,
+            ctx.max_output_lines,
+            crate::TruncateSide::Head,
+            "git",
+        ))
     }
 }
 
@@ -742,5 +751,43 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("one"), "{out}");
+    }
+
+    /// Big git output is saved whole to a file the model can `grep`/`read`, not
+    /// byte-truncated and lost — the same overflow handling `bash`/`grep` get.
+    #[tokio::test]
+    async fn large_output_is_saved_to_a_file() {
+        let dir = repo().await;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap()
+        };
+        // A file with more lines than the display cap, so `show` overflows.
+        let big: String = (1..=(crate::DEFAULT_MAX_OUTPUT_LINES + 100))
+            .map(|n| format!("line {n}\n"))
+            .collect();
+        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "big"]);
+
+        let ctx = ToolContext::new(dir.path());
+        let out = GitTool
+            .execute(
+                json!({"subcommand": "show", "args": ["HEAD:big.txt"]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        // The model gets a pointer to the saved file, not the whole flood.
+        assert!(out.contains("saved to"), "big output must be saved: {out}");
+        assert!(out.contains("grep"), "{out}");
+        assert!(out.len() < big.len(), "the inline output is bounded: {out}");
     }
 }

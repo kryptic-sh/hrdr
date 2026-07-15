@@ -59,12 +59,13 @@ sudo rpm -i hrdr-*.rpm
   off-limits — unlike the same access through the shell, which has no such
   guard. The file tools otherwise have full filesystem access (hrdr runs in a
   codebase you trust); a process-level sandbox mode is planned. Token-bounded
-  outputs and line-numbered reads for precise edits — and when `bash`/`grep`
-  output overflows, the **full** result is saved to a temp file and the model is
-  pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
-  out are **presence-aware**: the shell tool is `bash` and/or `powershell`
-  depending on what's installed, and `grep` uses ripgrep → POSIX grep → a
-  built-in walker — so the model is only ever offered tools it can actually run.
+  outputs and line-numbered reads for precise edits — and when
+  `bash`/`grep`/`git` output overflows, the **full** result is saved to a temp
+  file and the model is pointed at it (`read`/`grep`) instead of losing the
+  overflow. Tools that shell out are **presence-aware**: the shell tool is
+  `bash` and/or `powershell` depending on what's installed, and `grep` uses
+  ripgrep → POSIX grep → a built-in walker — so the model is only ever offered
+  tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a

@@ -55,20 +55,14 @@ pub fn render_system(
             // an isolated worktree and must hand back a clean, properly-committed
             // git history (see the sub-agent commit section).
             is_subagent => is_subagent,
-            // The shell rules are written in a shell. `bash` and `powershell` are
-            // registered only when their interpreter is actually on PATH, so this
-            // asks the same question the tool set already answered: telling an
-            // agent to redirect with `2>&1` when its only shell is PowerShell (where
-            // the idiom is `*>`) is advice that silently drops the errors it was
-            // meant to capture. A machine with both gets both.
+            // The shell section only renders when a shell exists, and the
+            // PowerShell-specific note (its pipeline carries objects, not lines)
+            // only when `powershell` is the shell — `bash` and `powershell` are
+            // registered only when their interpreter is on PATH, so this asks the
+            // same question the tool set already answered. Advice for a shell the
+            // machine doesn't have is worse than none.
             has_bash => has("bash"),
             has_powershell => has("powershell"),
-            // The temp directory the *running machine* actually has, not a
-            // hard-coded `/tmp`: that path doesn't exist on Windows, and
-            // PowerShell's own `$env:TEMP` is unset when `pwsh` runs on Linux — so
-            // either literal is wrong on some machine hrdr supports. An example the
-            // model can't paste is worse than no example.
-            temp_dir => temp_dir(),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -83,25 +77,6 @@ pub fn render_system(
     // `.gitattributes` now pins the checkout to LF, but that only helps a fresh
     // clone — this makes it true of the string we actually send, always.
     Ok(rendered.replace("\r\n", "\n"))
-}
-
-/// This machine's temp directory, as a path the shell in the prompt's examples can
-/// actually be handed.
-///
-/// [`std::env::temp_dir`] answers per-platform and honours the environment:
-/// `$TMPDIR` when set (macOS gives every process its own `/var/folders/…` sandbox),
-/// `/tmp` on Linux otherwise, `%TEMP%` on Windows (`C:\Users\<you>\AppData\Local\
-/// Temp`). Backslashes are normalised to `/`, which every shell hrdr drives —
-/// bash, and PowerShell on any platform — accepts as a separator, so one example
-/// serves both.
-fn temp_dir() -> String {
-    std::env::temp_dir()
-        .display()
-        .to_string()
-        .replace('\\', "/")
-        // A trailing separator would render as `C:/…/Temp//build.log`.
-        .trim_end_matches('/')
-        .to_string()
 }
 
 /// One-line OS description for the system prompt: kernel/family, the distro
@@ -355,45 +330,42 @@ mod tests {
         assert!(p.contains("**by name**"));
     }
 
-    /// A slow command's output is captured to a file, not piped into a filter.
+    /// The prompt tells the model to run slow/noisy commands raw and let the
+    /// harness handle the volume — not to redirect to a file by hand.
     ///
-    /// `cargo test 2>&1 | grep FAILED` answers exactly one question and destroys
-    /// the evidence for every other one. The next question — what preceded the
-    /// failure, what else broke, what did the warning say — costs another full
-    /// build. Redirect once, then search the file as many times as you like: three
-    /// questions become one build instead of three.
-    ///
-    /// The *rule* is shell-agnostic; the syntax is not, so the syntax is gated on
-    /// which shell this machine actually has (below).
+    /// hrdr already returns small output directly and saves large output to a file
+    /// it points the model at, so the old "redirect every stream to a file you
+    /// name, then grep it" advice was redundant with (and contradicted) the
+    /// runtime. The prompt now describes the automatic behavior instead.
     #[test]
-    fn the_prompt_captures_slow_output_to_a_file() {
+    fn the_prompt_says_run_raw_and_let_hrdr_save_big_output() {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
+        // Run raw; the harness saves large output to a file.
         assert!(
-            p.contains("writes its\n  output to a file, and you read the file"),
-            "slow/noisy commands are captured, not piped away"
+            p.contains("Run a slow or noisy command once, raw"),
+            "the model runs the command raw: {p}"
         );
-        // The reason, not just the rule: re-running a build to ask a second
-        // question is the cost being avoided.
-        assert!(p.contains("Piping straight into a filter throws the rest away"));
-        assert!(p.contains("is three builds; a build you run once and search three times is one"),);
-        // And it must not read as licence to clobber an existing file — `>` is
-        // called out elsewhere as truncating on open.
         assert!(
-            p.contains("a fresh file you name"),
-            "the redirect target is a new file, not an existing one"
+            p.contains("Large output is saved whole\n  to a file and you get its path"),
+            "big output comes back as a saved-file path"
         );
+        // The recovery verbs the model uses on that file.
+        assert!(p.contains("`grep` it") && p.contains("`tail`/`head` it"));
+        // Both streams are captured, so no manual `2>&1`.
+        assert!(p.contains("no `2>&1` needed"), "{p}");
+        // The old manual-redirect syntax is gone.
+        assert!(!p.contains(".log` 2>&1"), "no manual redirect syntax: {p}");
     }
 
-    /// The shell rules are written in the shell the machine actually has.
+    /// The Shell section renders only when a shell exists, and the
+    /// PowerShell-specific note only when `powershell` is the shell.
     ///
     /// `bash` and `powershell` are registered only when their interpreter is on
-    /// PATH, so the prompt keys off the tool set. This matters more than a style
-    /// nit: `2>&1` is the bash idiom for "capture stderr too", and in PowerShell
-    /// the equivalent is `*>` — a plain `>` there redirects the success stream
-    /// alone, so an agent told the bash idiom would write a log with the errors
-    /// *missing*, which is precisely what it was trying to capture. Advice for a
-    /// shell you do not have is worse than no advice.
+    /// PATH, so the prompt keys off the tool set. PowerShell's pipeline carries
+    /// objects, not lines, so the model needs `Select-String`/`$LASTEXITCODE`
+    /// advice a bash-only machine must not see (and vice versa). The run-raw rule
+    /// itself is shell-agnostic and stated once whenever a shell is present.
     #[test]
     fn the_shell_rules_match_the_shell_the_machine_has() {
         // Drive the template's gates directly: which shell tools exist depends on
@@ -413,127 +385,38 @@ mod tests {
                     can_delegate => false,
                     has_bash => has_bash,
                     has_powershell => has_powershell,
-                    temp_dir => "/scratch",
                     instructions => None::<&str>,
                 })
                 .unwrap()
         };
 
-        // bash only: the bash idiom, and not a word about PowerShell.
+        // bash only: the Shell section + the run-raw rule, and NOT a word about
+        // PowerShell's object pipeline.
         let p = render(true, false);
-        assert!(p.contains(r#"`bash` — `<cmd> > "/scratch/<name>.log" 2>&1`"#));
-        assert!(
-            p.contains("Keep the `2>&1`"),
-            "the bash idiom, with the reason stderr matters"
-        );
+        assert!(p.contains("Shell:"), "{p}");
+        assert!(p.contains("Run a slow or noisy command once, raw"), "{p}");
         assert!(!p.contains("PowerShell is not bash"), "{p}");
-        assert!(!p.contains("`*>`"), "{p}");
 
-        // PowerShell only: `*>`, and not a word of bash.
+        // PowerShell only: the Shell section + the run-raw rule + the PowerShell
+        // note.
         let p = render(false, true);
-        assert!(p.contains(r#"`powershell` — `<cmd> *> "/scratch/<name>.log"`"#));
-        assert!(
-            p.contains("Use `*>`, not\n    `>`"),
-            "`>` in PowerShell drops the errors — the whole point of capturing"
-        );
-        assert!(p.contains("PowerShell is not bash"));
-        assert!(!p.contains("2>&1"), "no bash syntax: {p}");
-        assert!(
-            !p.contains("grep`/`tail`/`read` the"),
-            "no bash syntax: {p}"
-        );
+        assert!(p.contains("Shell:"), "{p}");
+        assert!(p.contains("Run a slow or noisy command once, raw"), "{p}");
+        assert!(p.contains("PowerShell is not bash"), "{p}");
 
-        // Both (a machine with `pwsh` on PATH beside bash): both idioms, and the
-        // shared rule stated once.
+        // Both (a machine with `pwsh` on PATH beside bash): the shared rule once,
+        // plus the PowerShell note.
         let p = render(true, true);
-        assert!(p.contains("`bash` — "));
-        assert!(p.contains("`powershell` — "));
+        assert!(p.contains("PowerShell is not bash"), "{p}");
         assert_eq!(
-            p.matches("writes its\n  output to a file").count(),
+            p.matches("Run a slow or noisy command once, raw").count(),
             1,
-            "the rule is stated once; only its syntax is per-shell"
+            "the run-raw rule is stated once, shell-agnostic"
         );
 
         // Neither: no shell, no shell rules.
         let p = render(false, false);
         assert!(!p.contains("Shell:"), "{p}");
-    }
-
-    /// The redirect example names a temp directory that exists on *this* machine.
-    ///
-    /// A hard-coded `/tmp` is a path Windows does not have, and PowerShell's own
-    /// `$env:TEMP` is unset when `pwsh` runs on Linux — so any literal in the
-    /// template is wrong on some platform hrdr ships to, and an example the model
-    /// cannot paste is worse than none. The path comes from the machine instead.
-    ///
-    /// Whatever it is, it must be absolute (the shell runs in the *project* cwd, so
-    /// a relative path would drop build logs into the user's repo), it must exist,
-    /// and it must be the path the example actually shows.
-    #[test]
-    fn the_redirect_example_points_at_a_temp_dir_that_exists_here() {
-        let dir = temp_dir();
-        let path = Path::new(&dir);
-        assert!(path.is_absolute(), "temp dir must be absolute: {dir}");
-        assert!(path.is_dir(), "temp dir must exist: {dir}");
-        assert!(!dir.ends_with('/'), "no trailing separator: {dir}");
-        assert!(!dir.contains('\\'), "separators normalised to `/`: {dir}");
-
-        // And the prompt shows *that* directory, not a literal someone typed.
-        let tools = ToolRegistry::with_defaults();
-        let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
-        if p.contains("Shell:") {
-            assert!(
-                p.contains(&format!("{dir}/<name>.log")),
-                "the example must use this machine's temp dir ({dir}): {p}"
-            );
-        }
-    }
-
-    /// Linux: `/tmp`, unless `$TMPDIR` says otherwise.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn temp_dir_on_linux() {
-        // `std::env::temp_dir` honours `$TMPDIR` first; on a stock box (and on CI)
-        // nothing sets it and the answer is `/tmp`. Assert the *rule*, not the
-        // machine, so a developer with `TMPDIR` set doesn't get a spurious failure.
-        let expected = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        let expected = expected.trim_end_matches('/');
-        assert_eq!(temp_dir(), expected);
-    }
-
-    /// macOS: the per-process sandbox `$TMPDIR` points at (`/var/folders/…`), not
-    /// `/tmp` — which exists, but is not where a Mac puts scratch files.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn temp_dir_on_macos() {
-        let dir = temp_dir();
-        let expected = std::env::var("TMPDIR").unwrap_or_else(|_| "/var/folders".to_string());
-        assert!(
-            dir.starts_with(expected.trim_end_matches('/')) || dir.starts_with("/var/folders"),
-            "macOS temp is the TMPDIR sandbox, got {dir}"
-        );
-        assert!(dir.starts_with('/'), "absolute: {dir}");
-    }
-
-    /// Windows: `%TEMP%` (`C:\Users\<you>\AppData\Local\Temp`), rendered with `/`
-    /// separators — which PowerShell accepts, and which keeps the example from
-    /// carrying backslashes that a shell would read as escapes.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn temp_dir_on_windows() {
-        let dir = temp_dir();
-        assert!(!dir.contains('\\'), "separators normalised: {dir}");
-        assert!(
-            dir.chars().nth(1) == Some(':'),
-            "a drive-qualified absolute path: {dir}"
-        );
-        assert!(
-            dir.to_ascii_lowercase().contains("temp"),
-            "Windows scratch lives under Temp: {dir}"
-        );
-        // `/tmp` — the thing a hard-coded example would have said — is exactly what
-        // this must *not* be.
-        assert_ne!(dir, "/tmp");
     }
 
     /// The gates are wired to the tool set, not to a guess about the platform.
@@ -547,15 +430,16 @@ mod tests {
         let names: Vec<String> = tools.defs().into_iter().map(|d| d.function.name).collect();
         let p = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
 
+        let has_shell = names.iter().any(|n| n == "bash" || n == "powershell");
         assert_eq!(
-            names.iter().any(|n| n == "bash"),
-            p.contains("`bash` — "),
-            "bash advice appears exactly when the bash tool does"
+            has_shell,
+            p.contains("Shell:"),
+            "the Shell section appears exactly when a shell tool does"
         );
         assert_eq!(
             names.iter().any(|n| n == "powershell"),
-            p.contains("`powershell` — "),
-            "PowerShell advice appears exactly when the powershell tool does"
+            p.contains("PowerShell is not bash"),
+            "the PowerShell-specific note appears exactly when the powershell tool does"
         );
     }
 

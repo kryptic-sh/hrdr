@@ -6,7 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.4.1] - 2026-07-16
+### Changed
+
+- **Run commands raw; hrdr handles big output.** The system prompt no longer
+  tells the model to redirect slow/noisy commands to a file by hand
+  (`<cmd> > log 2>&1`, then grep it) — that was redundant with, and
+  contradicted, the runtime, which already returns small output directly and
+  saves large output to a file it points the model at. The prompt now describes
+  that automatic behavior: run once, raw; small output comes straight back;
+  large output comes back as a saved-file path to `grep`/`read`/`tail`/`head`
+  (both stdout and stderr are captured, so no `2>&1`). `git` output now gets the
+  same overflow-to-file handling as `bash`/`grep` — a big
+  `git log -p`/`diff`/`show` is saved whole (redacted) rather than
+  byte-truncated and lost.
 
 ### Security
 
