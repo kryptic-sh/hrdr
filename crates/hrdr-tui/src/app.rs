@@ -1,6 +1,7 @@
 //! App state, the async event loop, and agent orchestration.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -352,6 +353,11 @@ pub(crate) struct App {
     tx: mpsc::UnboundedSender<TurnMsg>,
     pub(crate) rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     pub(crate) should_quit: bool,
+    /// Set by a turn task that *caught* a tool panic: the process-global panic
+    /// hook already tore the terminal down (left the alt screen, dropped raw
+    /// mode) before `catch_unwind` recovered, so the driver must re-enter it
+    /// before the next frame. The driver clears the flag once it has restored.
+    terminal_lost: Arc<AtomicBool>,
 }
 
 impl App {
@@ -504,6 +510,7 @@ impl App {
             tx,
             rx: Some(rx),
             should_quit: false,
+            terminal_lost: Arc::new(AtomicBool::new(false)),
         };
         // The session's agent joins the registry alongside every delegated one, so
         // the frontend can build its view the same way for all of them.
@@ -1715,6 +1722,12 @@ impl App {
         }
     }
 
+    /// True exactly once after a turn caught a tool panic: the terminal driver
+    /// must re-enter the alt screen before its next frame. Clears the flag.
+    pub(crate) fn take_terminal_lost(&self) -> bool {
+        self.terminal_lost.swap(false, Ordering::AcqRel)
+    }
+
     fn spawn_turn(&mut self, input: String) {
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
@@ -1748,6 +1761,7 @@ impl App {
         let steering = self.steering.clone();
         let tx = self.tx.clone();
         let tx_events = tx.clone();
+        let terminal_lost = self.terminal_lost.clone();
         let handle = tokio::spawn(async move {
             use futures_util::FutureExt;
             // Release the agent lock before signalling Done, so the UI's
@@ -1769,7 +1783,12 @@ impl App {
             let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
             let err = match outcome {
                 Ok(result) => result.err().map(|e| e.to_string()),
-                Err(payload) => Some(format!("turn crashed: {}", panic_message(&*payload))),
+                Err(payload) => {
+                    // The panic hook already left the alt screen and dropped raw
+                    // mode; tell the driver to restore before it draws again.
+                    terminal_lost.store(true, Ordering::Release);
+                    Some(format!("turn crashed: {}", panic_message(&*payload)))
+                }
             };
             let _ = tx.send(TurnMsg::Done(err));
         });
@@ -2127,6 +2146,44 @@ mod tests {
             Err(payload) => Some(format!("turn crashed: {}", super::panic_message(&*payload))),
         };
         assert_eq!(err.as_deref(), Some("turn crashed: tool exploded"));
+    }
+
+    /// A caught tool panic must flag the terminal as lost (the panic hook already
+    /// left the alt screen) so the driver re-enters before the next frame; a
+    /// clean turn must leave the flag untouched.
+    #[tokio::test]
+    async fn caught_panic_flags_terminal_lost_but_clean_run_does_not() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        async fn model(panics: bool, flag: &Arc<AtomicBool>) {
+            let run = async {
+                if panics {
+                    panic!("tool exploded")
+                }
+            };
+            if std::panic::AssertUnwindSafe(run)
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                flag.store(true, Ordering::Release);
+            }
+        }
+
+        let clean = Arc::new(AtomicBool::new(false));
+        model(false, &clean).await;
+        assert!(
+            !clean.swap(false, Ordering::AcqRel),
+            "clean run set the flag"
+        );
+
+        let crashed = Arc::new(AtomicBool::new(false));
+        model(true, &crashed).await;
+        assert!(
+            crashed.swap(false, Ordering::AcqRel),
+            "caught panic did not flag terminal lost"
+        );
     }
 
     /// `panic_message` extracts both `&str` and `String` payloads and falls back

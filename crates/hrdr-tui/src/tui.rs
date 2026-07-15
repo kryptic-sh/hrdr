@@ -88,6 +88,14 @@ pub(crate) async fn run_loop(
         // A detached sub-agent that finished while the agent was idle wakes it,
         // so its result reaches the model without waiting for the user to type.
         app.maybe_deliver_background();
+        // A turn that caught a tool panic ran through the process-global panic
+        // hook, which left the alt screen and dropped raw mode before
+        // `catch_unwind` recovered. Re-enter before drawing, or every frame from
+        // here on paints onto the normal screen with input handling broken.
+        if app.take_terminal_lost() {
+            resume_terminal(terminal)?;
+            terminal.clear()?;
+        }
         terminal.draw(|f| ui::draw(f, app))?;
         sync_cursor(
             terminal.backend_mut(),
