@@ -4125,6 +4125,52 @@ async fn prune_stale_worktrees(repo: &std::path::Path) {
         .await;
 }
 
+/// Sweep leftover sub-agent worktrees under `.hrdr/worktrees/`: remove the CLEAN
+/// ones — a finished/merged task, or an orphan left when a previous run exited —
+/// and KEEP any with unreviewed changes (uncommitted files or unmerged commits),
+/// same rule as `task_cancel`/reset. Only touches worktrees on the
+/// `.hrdr/worktrees` path; other worktrees the user made are left alone.
+///
+/// Meant to run once at MAIN-agent startup, when this process owns no worktrees
+/// yet, so it never removes a live one. Synchronous + best-effort.
+fn gc_worktrees(repo: &std::path::Path) {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    // `--porcelain` emits one block per worktree, blocks separated by a blank
+    // line: `worktree <path>` / `HEAD <sha>` / `branch refs/heads/<name>` (or
+    // `detached`). Flush on each blank line, plus a final sentinel for the last.
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let (Some(p), Some(b)) = (path.take(), branch.take()) {
+                let ours = p.components().any(|c| c.as_os_str() == ".hrdr")
+                    && p.components().any(|c| c.as_os_str() == "worktrees");
+                if ours && p.exists() && !worktree_has_changes_sync(repo, &p, &b) {
+                    remove_worktree(repo, &p, &b);
+                }
+            }
+            // A detached worktree (no branch line) or a partial block is skipped.
+            path = None;
+            branch = None;
+        } else if let Some(rest) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+        }
+    }
+}
+
 /// The working-tree root of `repo` (`git rev-parse --show-toplevel`), so a
 /// worktree checkout sits at the repo root even when `repo` is a subdirectory.
 /// Falls back to `repo` itself if git can't answer.
@@ -4171,10 +4217,11 @@ async fn git_common_dir(repo: &std::path::Path) -> std::path::PathBuf {
 ///
 /// If `worktrees_dir` is already ignored — by the repo's `.gitignore`, a global
 /// gitignore, or a previous `info/exclude` entry (`git check-ignore` sees all of
-/// these) — nothing is done. Otherwise a `/.hrdr/` rule is appended to the
-/// clone-local `<git-common-dir>/info/exclude`, which is never committed, so the
-/// worktree checkouts stay out of `git status` and `git add -A` without adding
-/// anything to a file the repo tracks. Idempotent and best-effort.
+/// these) — nothing is done. Otherwise a `/.hrdr/worktrees/` rule is appended to
+/// the clone-local `<git-common-dir>/info/exclude`, which is never committed, so
+/// the worktree checkouts stay out of `git status` and `git add -A` without
+/// touching a tracked file — and without ignoring the rest of `.hrdr/` (e.g. a
+/// tracked `.hrdr/skills/`). Idempotent and best-effort.
 async fn ensure_worktree_ignored(repo: &std::path::Path, worktrees_dir: &std::path::Path) {
     // Already ignored by any mechanism → leave it alone.
     let already_ignored = tokio::process::Command::new("git")
@@ -4190,8 +4237,10 @@ async fn ensure_worktree_ignored(repo: &std::path::Path, worktrees_dir: &std::pa
         return;
     }
     // Not ignored: add a clone-local exclude rule (not the tracked `.gitignore`).
+    // Scoped to `.hrdr/worktrees/` specifically — NOT all of `.hrdr/`, which also
+    // holds user-authored `.hrdr/skills/` that the repo may legitimately track.
     let exclude = git_common_dir(repo).await.join("info").join("exclude");
-    const ENTRY: &str = "/.hrdr/";
+    const ENTRY: &str = "/.hrdr/worktrees/";
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     if current.lines().any(|l| l.trim() == ENTRY) {
         return;
@@ -4588,6 +4637,19 @@ impl Agent {
                 let lsp = Arc::clone(lsp);
                 handle.spawn(async move { lsp.pre_warm(&exts).await });
             }
+        }
+        // Sweep leftover sub-agent worktrees from earlier sessions (clean ones
+        // only; unreviewed work is kept). Main agent only, and only where
+        // delegation is on and this is a git repo — backgrounded off the startup
+        // path, and skipped entirely without a runtime (sync tests), so it never
+        // delays first paint or races the sync test suite.
+        if config.subagents
+            && !config.is_subagent
+            && in_git_repo(&config.cwd)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let cwd = config.cwd.clone();
+            handle.spawn_blocking(move || gc_worktrees(&cwd));
         }
         if config.subagents {
             let profiles = resolve_agent_profiles(&config)?;
@@ -9527,8 +9589,17 @@ mod tests {
         let exclude =
             std::fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap();
         assert!(
-            exclude.contains("/.hrdr/"),
-            "the ignore rule is in info/exclude: {exclude}"
+            exclude.contains("/.hrdr/worktrees/"),
+            "the ignore rule is scoped to worktrees in info/exclude: {exclude}"
+        );
+        // The rule is scoped to `.hrdr/worktrees/` — it must NOT hide the rest of
+        // `.hrdr/`, e.g. a tracked `.hrdr/skills/`.
+        std::fs::create_dir_all(repo.join(".hrdr").join("skills")).unwrap();
+        std::fs::write(repo.join(".hrdr").join("skills").join("s.md"), "x").unwrap();
+        let ignored = git(&["check-ignore", ".hrdr/skills/s.md"]);
+        assert!(
+            !ignored.status.success(),
+            "a skill under .hrdr/skills is NOT ignored by the worktree rule"
         );
     }
 
@@ -9779,6 +9850,49 @@ mod tests {
         assert!(
             agent.background_tasks().lock().unwrap().is_empty(),
             "the background registry is cleared either way"
+        );
+    }
+
+    /// The startup sweep (`gc_worktrees`) removes leftover CLEAN worktrees from a
+    /// previous session but keeps any with unreviewed changes.
+    #[tokio::test]
+    async fn gc_worktrees_removes_clean_keeps_dirty() {
+        use super::{Worktree, gc_worktrees};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        // Two orphaned worktrees (kept so they persist on disk like a crashed run).
+        let clean = Worktree::create(repo).await.unwrap().keep();
+        let clean_path = clean.path.clone();
+        let dirty_wt = Worktree::create(repo).await.unwrap();
+        std::fs::write(dirty_wt.path.join("new.txt"), "x").unwrap();
+        let dirty = dirty_wt.keep();
+        let dirty_path = dirty.path.clone();
+        assert!(clean_path.exists() && dirty_path.exists());
+
+        gc_worktrees(repo);
+
+        assert!(!clean_path.exists(), "gc removes a clean orphan worktree");
+        assert!(
+            dirty_path.exists(),
+            "gc keeps a worktree with unreviewed changes"
         );
     }
 
