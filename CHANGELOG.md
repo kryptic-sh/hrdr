@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The `git` tool no longer leaks credential/secret files.** `read`/`grep`
+  refuse `.env`, `id_rsa`, `~/.aws/credentials` and the like, but
+  `git show HEAD:.env`, `git blame .env`, and any `diff`/`log -p`/`show` that
+  touched a secret echoed the contents straight into the transcript — reachable
+  by the read-only `explore`/`review` sub-agents, which have `git` but no shell.
+  The git tool now refuses the whole-file reveal forms (`show <rev>:<secret>`,
+  `blame <secret>`) and redacts the hunk body of any diff section whose file is
+  a secret, keeping the header so the model still sees _that_ it changed.
 - **Quoting a flag no longer bypasses a shell guardrail.** The matcher used to
   blank quoted spans before testing its rules, so `git push "--force"` became
   `git push        ` and tripped nothing — while the shell still ran the

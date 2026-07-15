@@ -185,6 +185,88 @@ fn check_branch_args(args: &[String]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A non-flag operand that would dump a **secret file's whole content**:
+/// `git show <rev>:<secret>` (the raw file at a revision) or `git blame <secret>`
+/// (every line of the file). The read/grep tools refuse these files via
+/// [`crate::secret_file_reason`]; the git tool must too, or a read-only
+/// `explore`/`review` sub-agent (which has `git` but no shell) could read a
+/// credential out of history. Diffs that merely *touch* a secret are redacted in
+/// the output instead (see [`redact_secret_diffs`]); this refuses only the forms
+/// that reveal the entire file.
+fn secret_content_operand<'a>(sub: &str, args: &'a [String]) -> Option<(&'a str, &'static str)> {
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        // `<tree-ish>:<path>` — the part after the last `:` names a path in the
+        // tree (`rsplit` so a stage prefix like `:0:.env` still resolves to
+        // `.env`). `git show HEAD:.env` dumps that file's content verbatim.
+        if let Some((_, path)) = arg.rsplit_once(':')
+            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(path))
+        {
+            return Some((arg, reason));
+        }
+        // `git blame <path>` prints every line of the file, annotated.
+        if sub == "blame"
+            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(arg))
+        {
+            return Some((arg, reason));
+        }
+    }
+    None
+}
+
+/// The file path a diff-section header names, if `line` starts one:
+/// `diff --git a/<p> b/<p>` (prefer the `b/` destination), or a merge diff's
+/// `diff --cc <p>` / `diff --combined <p>`. `None` for any other line.
+fn diff_section_path(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        if let Some(idx) = rest.rfind(" b/") {
+            return Some(rest[idx + 3..].to_string());
+        }
+        return rest
+            .strip_prefix("a/")
+            .map(|p| p.split(' ').next().unwrap_or(p).to_string());
+    }
+    for pre in ["diff --cc ", "diff --combined "] {
+        if let Some(rest) = line.strip_prefix(pre) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Redact the hunk body of any diff section whose file is a credential/secret
+/// store, keeping the section header so the model still sees *that* the file
+/// changed — just not its content. Covers `diff`, `show`, and `log -p` output;
+/// a no-op on plain `status`/`log`/`branch` output (no diff headers).
+fn redact_secret_diffs(output: &str) -> String {
+    let mut out = String::with_capacity(output.len());
+    let mut lines = output.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(path) = diff_section_path(line) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        out.push_str(line);
+        out.push('\n');
+        if crate::secret_file_reason(std::path::Path::new(&path)).is_some() {
+            out.push_str(
+                "[redacted: this file is a credential/secret store — its diff is withheld]\n",
+            );
+            // Drop the rest of this section (up to the next `diff` header / EOF).
+            while let Some(peek) = lines.peek() {
+                if diff_section_path(peek).is_some() {
+                    break;
+                }
+                lines.next();
+            }
+        }
+    }
+    out
+}
+
 pub struct GitTool;
 
 #[derive(Deserialize)]
@@ -260,6 +342,12 @@ impl Tool for GitTool {
         {
             bail!(msg);
         }
+        if let Some((bad, reason)) = secret_content_operand(sub, &a.args) {
+            bail!(
+                "`{bad}` would reveal {reason} — the git tool won't dump a \
+                 credential/secret file's content"
+            );
+        }
 
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(sub)
@@ -291,7 +379,9 @@ impl Tool for GitTool {
         let body = if stdout.trim().is_empty() {
             "(no output)".to_string()
         } else {
-            stdout.into_owned()
+            // Redact any diff hunk for a secret file before it reaches the model
+            // (a `diff`/`log -p`/`show` can otherwise echo `.env`'s contents).
+            redact_secret_diffs(&stdout)
         };
         Ok(truncate(&body, ctx.max_output))
     }
@@ -556,5 +646,101 @@ mod tests {
             .execute(json!({"subcommand": "branch", "args": ["-a"]}), &ctx)
             .await
             .unwrap();
+    }
+
+    /// A repo with a committed `.env`, to exercise the secret-file guards.
+    async fn repo_with_secret() -> tempfile::TempDir {
+        let dir = repo().await;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap()
+        };
+        std::fs::write(dir.path().join(".env"), "API_KEY=supersecret123\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add env"]);
+        dir
+    }
+
+    /// `git show HEAD:.env` dumps the file verbatim — refused, and the secret is
+    /// not echoed in the refusal message.
+    #[tokio::test]
+    async fn show_of_a_secret_file_is_refused() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        let err = GitTool
+            .execute(json!({"subcommand": "show", "args": ["HEAD:.env"]}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("credential") || err.contains("secret"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("supersecret"),
+            "the secret must not leak: {err}"
+        );
+    }
+
+    /// `git blame .env` prints every line of the file — refused.
+    #[tokio::test]
+    async fn blame_of_a_secret_file_is_refused() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        let err = GitTool
+            .execute(json!({"subcommand": "blame", "args": [".env"]}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("credential") || err.contains("secret"),
+            "{err}"
+        );
+    }
+
+    /// A `diff` touching both a secret and a normal file shows the normal file's
+    /// change and that the secret changed, but withholds the secret's content.
+    #[tokio::test]
+    async fn diff_redacts_a_secret_files_hunk_but_keeps_others() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        std::fs::write(dir.path().join(".env"), "API_KEY=rotated_secret_456\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+
+        let out = GitTool
+            .execute(json!({"subcommand": "diff", "args": []}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("a.txt") && out.contains("changed"),
+            "the normal file's change stays visible: {out}"
+        );
+        assert!(
+            out.contains(".env") && out.contains("redacted"),
+            "the model should see .env changed, redacted: {out}"
+        );
+        assert!(
+            !out.contains("rotated_secret_456"),
+            "the secret content must not leak: {out}"
+        );
+    }
+
+    /// The guards don't over-block: `show` of a non-secret path still works.
+    #[tokio::test]
+    async fn show_of_a_normal_path_still_works() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        let out = GitTool
+            .execute(json!({"subcommand": "show", "args": ["HEAD:a.txt"]}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("one"), "{out}");
     }
 }
