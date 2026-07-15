@@ -555,7 +555,13 @@ fn map_event(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
             let kind = match err_type {
-                "rate_limit_error" | "overloaded_error" => crate::client::ChatErrorKind::Transient,
+                // Anthropic's retryable server-side error types. `api_error` is
+                // their internal 500-equivalent and rides alongside
+                // `overloaded_error` (529); classifying it terminal aborts the
+                // turn on a transient hiccup that a retry would ride out.
+                "rate_limit_error" | "overloaded_error" | "api_error" => {
+                    crate::client::ChatErrorKind::Transient
+                }
                 _ => crate::client::ChatErrorKind::Other,
             };
             let err_msg = if err_type.is_empty() {
@@ -1362,6 +1368,36 @@ mod tests {
         );
         assert!(chat_err.message.contains("overloaded_error"));
         assert!(chat_err.message.contains("Server overloaded"));
+    }
+
+    #[test]
+    fn api_error_is_transient() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        // `api_error` is Anthropic's 500-equivalent — retryable, like overload.
+        let ev =
+            json!({"type":"error","error":{"type":"api_error","message":"Internal server error"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::Transient,
+            "api_error must be transient"
+        );
+        assert!(chat_err.message.contains("api_error"));
     }
 
     #[test]
