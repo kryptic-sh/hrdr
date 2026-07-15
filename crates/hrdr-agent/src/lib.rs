@@ -2149,14 +2149,20 @@ impl hrdr_tools::Tool for TaskCleanupTool {
          own working dir. Use it as the 'I'm done with this one' signal AFTER you have brought \
          the changes over (via git merge / cherry-pick / apply — this tool does NOT merge for \
          you). Pass the task `id` (from `task_list`). It refuses if the worktree still has \
-         uncommitted changes — commit or handle those first so nothing is lost. Committed work \
-         is trusted as merged and the worktree + its branch are removed."
+         uncommitted changes, or if its branch has commits not yet reachable from your HEAD (it \
+         looks unmerged) — so you can't delete work by accident. If you DID bring those commits \
+         over by cherry-pick or squash (so the originals aren't reachable), pass `force: true` to \
+         confirm and remove anyway."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." },
+                "force": {
+                    "type": "boolean",
+                    "description": "Remove even if the branch has commits not reachable from HEAD — confirm you already merged them (e.g. cherry-pick / squash). Default false."
+                }
             },
             "required": ["id"]
         })
@@ -2209,6 +2215,33 @@ impl hrdr_tools::Tool for TaskCleanupTool {
                  over first, then clean up. Nothing was removed.",
                 path.display()
             );
+        }
+        // Guard against removing work that was never merged. Count the branch's
+        // commits not reachable from HEAD; if any, the branch looks unmerged, so
+        // refuse unless `force` (the parent brought them over via cherry-pick /
+        // squash, which leaves the originals unreachable). Biased to refuse: a
+        // failed count is treated as "unmerged" so nothing is deleted on a bad read.
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !force {
+            let unmerged = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&ctx.cwd)
+                .args(["rev-list", "--count", &format!("HEAD..{branch}")])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            if unmerged != "0" {
+                anyhow::bail!(
+                    "branch `{branch}` (task #{id}) has {unmerged} commit(s) not reachable from \
+                     your HEAD — it looks unmerged. Merge it first, or if you already brought the \
+                     work over (cherry-pick / squash) call task_cleanup again with force:true. \
+                     Nothing was removed."
+                );
+            }
         }
         remove_worktree(&ctx.cwd, &path, &branch);
         ctx.background_tasks
@@ -10004,21 +10037,24 @@ mod tests {
             live: LiveSubagents::new(),
         };
 
-        // Committed work, clean tree → trusted as merged → removed + pruned.
-        let wt_ok = Worktree::create(repo).await.unwrap();
-        let wt_ok_git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&wt_ok.path)
-                .args(args)
-                .output()
-                .unwrap()
+        let commit_in = |wt: &std::path::Path, msg: &str| {
+            std::fs::write(wt.join("work.txt"), msg).unwrap();
+            for a in [vec!["add", "."], vec!["commit", "-qm", msg]] {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(wt)
+                    .args(&a)
+                    .output()
+                    .unwrap();
+            }
         };
-        std::fs::write(wt_ok.path.join("work.txt"), "done").unwrap();
-        wt_ok_git(&["add", "."]);
-        wt_ok_git(&["commit", "-qm", "sub work"]);
+
+        // Case 1 — committed AND merged into HEAD (reachable) → removed, no force.
+        let wt_ok = Worktree::create(repo).await.unwrap();
+        commit_in(&wt_ok.path, "sub work");
         let ok = wt_ok.keep();
         let ok_path = ok.path.clone();
+        git(&["merge", "-q", &ok.branch]); // bring the commit onto HEAD
         ctx.background_tasks
             .lock()
             .unwrap()
@@ -10044,7 +10080,38 @@ mod tests {
             "the entry is pruned"
         );
 
-        // Uncommitted changes → refused, worktree kept, entry kept.
+        // Case 2 — committed but NOT merged → refuse; `force:true` overrides.
+        let wt_um = Worktree::create(repo).await.unwrap();
+        commit_in(&wt_um.path, "unmerged work");
+        let um = wt_um.keep();
+        let um_path = um.path.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 3,
+                delivered: true,
+                worktree: Some(um.path.clone()),
+                branch: Some(um.branch.clone()),
+                ..Default::default()
+            });
+        let err = cleanup
+            .execute(serde_json::json!({"id": 3}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not reachable"),
+            "refuses an unmerged branch: {err}"
+        );
+        assert!(um_path.exists(), "the unmerged worktree is kept");
+        let msg = cleanup
+            .execute(serde_json::json!({"id": 3, "force": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(msg.contains("Cleaned up"), "force removes it: {msg}");
+        assert!(!um_path.exists(), "force removes the unmerged worktree");
+
+        // Case 3 — uncommitted changes → refused, and `force` does NOT override.
         let wt_dirty = Worktree::create(repo).await.unwrap();
         std::fs::write(wt_dirty.path.join("wip.txt"), "x").unwrap();
         let dirty = wt_dirty.keep();
@@ -10060,12 +10127,12 @@ mod tests {
                 ..Default::default()
             });
         let err = cleanup
-            .execute(serde_json::json!({"id": 2}), &ctx)
+            .execute(serde_json::json!({"id": 2, "force": true}), &ctx)
             .await
             .unwrap_err();
         assert!(
             err.to_string().contains("uncommitted changes"),
-            "refuses on uncommitted work: {err}"
+            "force does not override uncommitted work: {err}"
         );
         assert!(dirty_path.exists(), "the worktree is not removed");
         assert!(
