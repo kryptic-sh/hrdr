@@ -41,6 +41,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A tool's live-output stream can no longer grow memory without limit.** The
+  channel carrying a tool's progress lines to the UI was unbounded, so a command
+  emitting output faster than the UI drains it (millions of lines) queued them
+  all. Both hops of that stream are now bounded (1024 lines) and drop the excess
+  rather than block or buffer — the model-facing tool result is unaffected (it's
+  captured and size-capped separately; the stream is advisory only). This fully
+  defeats a synchronous emit tight-loop; a lagging renderer's own downstream
+  event queue is a separate, known follow-up.
 - **`edit` works on CRLF files instead of looping forever.** `read` renders
   lines via `str::lines()`, which strips the `\r`, so on a Windows-checkout
   (CRLF) file the model copies a multi-line `old_string` with bare `\n` — which

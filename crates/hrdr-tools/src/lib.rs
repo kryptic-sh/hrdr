@@ -161,7 +161,15 @@ pub struct ToolContext {
     /// Optional live-output sink: long-running tools (e.g. `bash`) send partial
     /// output here as it's produced so the UI can show progress. `None` = no
     /// streaming consumer.
-    pub stream: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ///
+    /// Bounded: this is advisory UI progress, not the authoritative tool
+    /// result (that's the tool's return value, independently size-capped —
+    /// see e.g. `shell`'s head/tail ring). A flood of output (millions of
+    /// lines faster than the UI drains them) must never grow memory without
+    /// limit, so [`emit`](Self::emit) uses `try_send` and silently drops
+    /// lines once the channel is full rather than buffering unboundedly or
+    /// blocking the tool.
+    pub stream: Option<tokio::sync::mpsc::Sender<String>>,
     /// The id of the tool call being executed, matching its transcript entry.
     /// `task` records it on the [`BackgroundTask`] it spawns so the frontend can
     /// jump from a panel row to the call that started it. `None` outside a call.
@@ -221,9 +229,17 @@ impl ToolContext {
     }
 
     /// Send a chunk of live output to the streaming sink, if one is attached.
+    ///
+    /// Best-effort and never blocks: the sink is a bounded channel, so under
+    /// flood (producer faster than the UI consumer drains it) this silently
+    /// drops the chunk (`Full`) rather than backing up memory or stalling the
+    /// tool. A closed receiver (`Closed`, e.g. the UI went away) is dropped
+    /// the same way. Either way the live stream is lossy by design — the
+    /// authoritative tool output is the tool's return value, unaffected by
+    /// what this sends or drops.
     pub fn emit(&self, chunk: impl Into<String>) {
         if let Some(tx) = &self.stream {
-            let _ = tx.send(chunk.into());
+            let _ = tx.try_send(chunk.into());
         }
     }
 
@@ -1565,6 +1581,52 @@ mod tests {
         assert!(
             !ctx.was_read(&unseen),
             "poison must not make every file look read (that disables the guardrail)"
+        );
+    }
+
+    // ---- ToolContext::emit / stream backpressure ----
+
+    #[test]
+    fn emit_drops_excess_under_flood_without_blocking_or_growing_unboundedly() {
+        const CAP: usize = 8;
+        const FLOOD: usize = 10_000;
+
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(CAP);
+        ctx.stream = Some(tx);
+
+        // Flood far past capacity with the receiver never drained. `emit` is
+        // fire-and-forget (`try_send`), so this must return promptly instead
+        // of blocking — if it blocked or grew unboundedly, this loop alone
+        // would hang or allocate FLOOD strings' worth of channel slots.
+        let start = std::time::Instant::now();
+        for i in 0..FLOOD {
+            ctx.emit(format!("line {i}\n"));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "emit must never block on a full channel; took {elapsed:?} for {FLOOD} calls"
+        );
+
+        // Memory is bounded: the channel holds at most CAP queued items,
+        // never anywhere close to FLOOD.
+        let mut drained = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            drained.push(chunk);
+        }
+        assert!(
+            drained.len() <= CAP,
+            "receiver held {} items, expected at most CAP={CAP} — memory is not bounded",
+            drained.len()
+        );
+        assert!(!drained.is_empty(), "some lines should have been queued");
+
+        // The excess (FLOOD - drained.len() lines) was silently dropped, not
+        // buffered elsewhere and not causing emit (or this test) to fail.
+        assert!(
+            drained.len() < FLOOD,
+            "expected most of the flood to be dropped, not queued"
         );
     }
 

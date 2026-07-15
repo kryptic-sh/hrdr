@@ -2760,6 +2760,23 @@ const PRUNE_PLACEHOLDER: &str = "[old tool output cleared to save context]";
 /// (appended to the last tool result of that round).
 const WRAP_UP_WARNING_ROUNDS: usize = 3;
 
+/// Capacity of the per-tool and shared live-output channels used to forward
+/// [`ToolContext::stream`](hrdr_tools::ToolContext::stream) chunks to the UI
+/// (see `run_tool_batch`). This is advisory progress output, not the
+/// authoritative tool result, so both channels are bounded rather than
+/// unbounded: a tool that emits output faster than the UI drains it (e.g. a
+/// shell command printing millions of lines) must never queue without limit.
+/// 1024 lines is generous for a normal burst — far more than a screen's worth
+/// — while keeping the per-in-flight-tool buffer small and fixed; anything past
+/// the cap is dropped (`try_send` returns `Full`), never queued or blocked on.
+///
+/// This bounds the two channels this pipeline owns (`ctx.stream` and the shared
+/// forwarder), which fully defeats a synchronous emit tight-loop. The frontend's
+/// own `AgentEvent` queue downstream is a separate, still-unbounded hop, so a
+/// *streaming* flood can still grow memory there under a lagging renderer — a
+/// known follow-up (bound/coalesce that queue), not covered here.
+const UI_STREAM_CAP: usize = 1024;
+
 /// Consecutive identical failures after which the exact same call is refused
 /// without executing (small models loop on verbatim retries).
 const REPEAT_REFUSE_AFTER: u32 = 2;
@@ -6380,7 +6397,17 @@ impl Agent {
     ) {
         // One shared (id, chunk) channel; each call gets a private sink whose
         // chunks a forwarder task tags with the call id.
-        let (shared_tx, mut shared_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        //
+        // Both channels are bounded — this is advisory live-progress output,
+        // not the tool result, so a producer that outruns the UI consumer
+        // (e.g. a shell command emitting millions of lines) must never queue
+        // unboundedly. UI_STREAM_CAP buffers a normal burst; past that,
+        // `ctx.emit`'s `try_send` (see `ToolContext::emit`) drops lines
+        // rather than blocking the tool, and the forwarder below does the
+        // same into `shared_tx` — dropping at either stage just means the UI
+        // sees gaps in the live stream, never the model or the tool result.
+        let (shared_tx, mut shared_rx) =
+            tokio::sync::mpsc::channel::<(String, String)>(UI_STREAM_CAP);
         let mut futs = Vec::with_capacity(batch.len());
         for call in batch {
             on_event(AgentEvent::ToolStart {
@@ -6388,12 +6415,12 @@ impl Agent {
                 name: call.function.name.clone(),
                 args: call.function.arguments.clone(),
             });
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(UI_STREAM_CAP);
             let fwd_tx = shared_tx.clone();
             let fwd_id = call.id.clone();
             tokio::spawn(async move {
                 while let Some(chunk) = rx.recv().await {
-                    let _ = fwd_tx.send((fwd_id.clone(), chunk));
+                    let _ = fwd_tx.try_send((fwd_id.clone(), chunk));
                 }
             });
             let mut ctx = self.ctx.clone();
