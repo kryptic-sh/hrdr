@@ -3441,6 +3441,7 @@ async fn a_finished_background_task_wakes_an_idle_model() {
         done,
         result: done.then(|| "found it".to_string()),
         delivered,
+        ..Default::default()
     };
 
     // Still running: nothing to deliver.

@@ -377,6 +377,21 @@ impl LiveSubagents {
         })
     }
 
+    /// Atomically take the next queued message, or mark the turn idle when none
+    /// remains. Both this and `send_prompt` lock the entry before its queue, so a
+    /// prompt cannot be accepted after the worker decides it is finished.
+    pub fn take_pending_or_finish(&self, key: u64) -> Option<crate::Steer> {
+        self.with(|v| {
+            let e = v.iter_mut().find(|e| e.key == key)?;
+            let next = e.steering.lock().ok()?.pop_front();
+            if next.is_none() {
+                e.running = false;
+                e.turn.end();
+            }
+            next
+        })
+    }
+
     /// A snapshot of `key`'s turn clock, for the frontend showing that agent.
     pub fn turn(&self, key: u64) -> Option<crate::TurnStats> {
         self.with(|v| v.iter().find(|e| e.key == key).map(|e| e.turn))

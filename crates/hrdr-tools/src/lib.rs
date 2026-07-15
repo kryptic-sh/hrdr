@@ -75,11 +75,11 @@ fn default_status() -> String {
     "pending".to_string()
 }
 
-/// A detached background sub-agent (`task` with `background: true`): it runs
+/// A detached background sub-agent (every `task` runs detached): it runs
 /// concurrently with the main agent, streaming into `log`; when `done`, its
 /// `result` is delivered into the conversation and the entry is pruned. Shared
 /// via [`ToolContext::background_tasks`] so the frontend can show live progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BackgroundTask {
     /// Stable id for the run — shown to the model and used for delivery matching.
     pub id: u64,
@@ -96,6 +96,47 @@ pub struct BackgroundTask {
     pub result: Option<String>,
     /// Whether the result has been injected into the conversation yet.
     pub delivered: bool,
+    /// Whether the task was cancelled by the parent (`task_cancel`) — its result
+    /// (if any) is discarded, not delivered.
+    pub cancelled: bool,
+    /// For a **write-capable** sub-agent: the isolated git worktree its edits
+    /// land in (nothing touches the main working dir until the parent reviews and
+    /// merges). `None` for a read-only sub-agent, which shares the main dir.
+    pub worktree: Option<PathBuf>,
+    /// The scratch branch the [`worktree`](Self::worktree) is on, if any.
+    pub branch: Option<String>,
+}
+
+/// A background task's coarse state, derived from its flags for reporting by the
+/// task-management tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundStatus {
+    Running,
+    Done,
+    Cancelled,
+}
+
+impl BackgroundTask {
+    /// The task's reportable status.
+    pub fn status(&self) -> BackgroundStatus {
+        if self.cancelled {
+            BackgroundStatus::Cancelled
+        } else if self.done {
+            BackgroundStatus::Done
+        } else {
+            BackgroundStatus::Running
+        }
+    }
+}
+
+impl BackgroundStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackgroundStatus::Running => "running",
+            BackgroundStatus::Done => "done",
+            BackgroundStatus::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// Shared execution context handed to every tool call.

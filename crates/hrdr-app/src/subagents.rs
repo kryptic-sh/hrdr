@@ -133,6 +133,7 @@ mod tests {
             done,
             result: None,
             delivered: false,
+            ..Default::default()
         }
     }
 

@@ -297,7 +297,7 @@ impl hrdr_tools::Tool for ModelsTool {
                 .collect();
             value["available_models"] = serde_json::Value::Array(rows);
         }
-        let mut out = serde_json::to_string(&value)?;
+        let mut out = serde_json::to_string_pretty(&value)?;
         if out.len() > ctx.max_output && mode == "available" {
             // Trim to fit. Popping from the tail of a (provider, model)-sorted
             // list would delete whole providers off the end of the alphabet, so
@@ -313,15 +313,31 @@ impl hrdr_tools::Tool for ModelsTool {
             // its digit count is maximal); the real message can only be shorter.
             let mut envelope = value.clone();
             envelope["available_models"] = serde_json::Value::Array(Vec::new());
-            let base_len = serde_json::to_string(&envelope)?.len();
-            let budget = ctx.max_output.saturating_sub(base_len);
-
-            let (kept, dropped) = fit_models_to_budget(&available, budget)?;
-            let last = value["warnings"].as_array_mut().expect("array");
-            last.pop();
-            last.push(truncation_warning(dropped));
-            value["available_models"] = serde_json::Value::Array(kept);
-            out = serde_json::to_string(&value)?;
+            let base_len = serde_json::to_string_pretty(&envelope)?.len();
+            let mut budget = ctx.max_output.saturating_sub(base_len);
+            loop {
+                let (kept, dropped) = fit_models_to_budget(&available, budget)?;
+                let warnings = value["warnings"].as_array_mut().expect("array");
+                warnings.pop();
+                warnings.push(truncation_warning(dropped));
+                value["available_models"] = serde_json::Value::Array(kept);
+                out = serde_json::to_string_pretty(&value)?;
+                if out.len() <= ctx.max_output {
+                    break;
+                }
+                let overflow = out.len() - ctx.max_output;
+                if budget == 0 {
+                    anyhow::bail!(
+                        "models output limit ({}) is too small for valid JSON (needs {} bytes)",
+                        ctx.max_output,
+                        out.len()
+                    );
+                }
+                // Re-run the same round-robin selector with a smaller budget.
+                // This preserves provider fairness instead of popping sorted tail
+                // rows to compensate for whole-document pretty indentation.
+                budget = budget.saturating_sub(overflow.max(1));
+            }
         }
         Ok(out)
     }
@@ -378,7 +394,7 @@ fn fit_models_to_budget(
                 "label": m.label,
                 "source": m.source
             });
-            let len = serde_json::to_string(&v).map(|s| s.len())?;
+            let len = serde_json::to_string_pretty(&v).map(|s| s.len())?;
             Ok((i, v, len))
         })
         .collect::<Result<_>>()?;
@@ -621,11 +637,10 @@ fn bg_handles() -> BgHandles {
 /// registry and, on completion, records its result there for the run loop to
 /// deliver. Returns immediately with an acknowledgement for the model.
 ///
-/// Background tasks default to **write-capable**, same as the main agent
-/// (`subagent_base_config` leaves `read_only = false`) — they share the main
-/// agent's cwd and there is no isolation, so interleaved file writes are a
-/// race. Only an explicit sub-agent profile (`read_only`, `write_ext`, or an
-/// explicit `tools` allow-list) narrows that down.
+/// A write-capable sub-agent is handed its own git `worktree` (its `cfg.cwd` is
+/// already pointed at it); the worktree's cleanup is detached here so it survives
+/// the run for the parent to review and merge. A read-only sub-agent has
+/// `worktree = None` and shares the main dir.
 ///
 /// The task is wrapped in a nested spawn so a panic in the body sets
 /// `done = true` with an error message rather than leaving the registry entry
@@ -642,20 +657,6 @@ fn tool_error_text(e: &anyhow::Error) -> String {
     format!("Error: {e:#}")
 }
 
-/// Whether a `task` call runs detached.
-///
-/// Detached by default: a sub-agent must not block the main conversation. An
-/// explicit `background` in the args wins — the model passes `false` when it
-/// needs the answer before its next step. An isolated (worktree) sub-agent can't
-/// detach yet, so it stays blocking unless the model asked for both, which
-/// `TaskTool` rejects.
-fn wants_background(args: &serde_json::Value, isolated: bool) -> bool {
-    match args.get("background").and_then(|v| v.as_bool()) {
-        Some(explicit) => explicit,
-        None => !isolated,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_background(
     cfg: AgentConfig,
@@ -669,9 +670,17 @@ fn spawn_background(
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     transcript_dir: SubagentDirCell,
     live: LiveSubagents,
-) -> String {
+    // Present for a write-capable sub-agent: its isolated worktree. `cfg.cwd` is
+    // already set to the worktree by the caller; here we record its path/branch
+    // on the registry entry and *detach* its cleanup, so it survives the run for
+    // the parent to review and merge (removed only by `task_cancel` / reset).
+    worktree: Option<Worktree>,
+) -> Result<String> {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    // Detach the worktree's automatic cleanup: it must outlive this task so the
+    // parent can review the changes. Its path/branch go onto the registry entry.
+    let worktree = worktree.map(|w| w.keep());
     let header = format!("↳ task#{id} ({}): {label}", cfg.model.model());
     // Identity for the live registry, taken before `tool_id` is moved into the
     // background-task row below.
@@ -682,6 +691,38 @@ fn spawn_background(
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
     let usage_for_live = subagent_usage(&cfg);
+    // Build and register synchronously so `steer` can address the id as soon as
+    // `task` returns; registration inside the spawned future races the caller.
+    let mut sub = Agent::new(cfg)?;
+    sub.cost_total = cost_total;
+    sub.attach_live(live.clone(), live_key);
+    sub.ctx.lsp = lsp;
+    let steering = steering_queue();
+    let sub = Arc::new(tokio::sync::Mutex::new(sub));
+    live.register(LiveSubagent {
+        key: live_key,
+        bg_id: Some(id),
+        tool_id: tool_id_for_live,
+        label: label_for_live,
+        model: model_for_live.clone(),
+        provider: provider_for_live,
+        base_url: base_url_for_live,
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: Default::default(),
+        usage: usage_for_live,
+        events: subagent_live::event_log(),
+        turn: TurnStats::default(),
+        kind: SubagentKind::Background,
+        agent: Arc::clone(&sub),
+        steering: Arc::clone(&steering),
+        running: true,
+        compacting: false,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -691,6 +732,9 @@ fn spawn_background(
             done: false,
             result: None,
             delivered: false,
+            cancelled: false,
+            worktree: worktree.as_ref().map(|w| w.path.clone()),
+            branch: worktree.as_ref().map(|w| w.branch.clone()),
         });
     }
     // Shared so the inner task records events and the outer guard can still
@@ -703,7 +747,7 @@ fn spawn_background(
         && let Some(t) = g.as_mut()
     {
         t.write(&subagent_transcript::Event::Start {
-            model: cfg.model.model().to_string(),
+            model: model_for_live.clone(),
             label: label.clone(),
             kind: subagent_transcript::SpawnKind::Background,
             prompt: prompt.clone(),
@@ -731,44 +775,6 @@ fn spawn_background(
         let result = AssertUnwindSafe(async move {
             let mut out = String::new();
             let result: anyhow::Result<()> = async {
-                let mut sub = Agent::new(cfg)?;
-                sub.cost_total = cost_total;
-                // Its chrome is published by the agent itself, so what a frontend
-                // shows for it is what it is actually running on.
-                sub.attach_live(live.clone(), live_key);
-                // Share the parent's language servers (its config disabled
-                // building an own registry) — one warm set for the session.
-                sub.ctx.lsp = lsp;
-                // Retain the sub-agent and the queue its `run` drains, so the
-                // frontend can steer it, watch it, and drive further turns on it.
-                // Registered here rather than before the spawn because `Agent::new`
-                // may fail, and a failed spawn has no sub-agent to address.
-                let steering = steering_queue();
-                let sub = Arc::new(tokio::sync::Mutex::new(sub));
-                live.register(LiveSubagent {
-                    key: live_key,
-                    bg_id: Some(id),
-                    tool_id: tool_id_for_live,
-                    label: label_for_live,
-                    model: model_for_live,
-                    provider: provider_for_live,
-                    base_url: base_url_for_live,
-                    effort: None,
-                    auto_compact: true,
-                    compaction_reserved: 0,
-                    todos: Default::default(),
-                    usage: usage_for_live,
-                    events: subagent_live::event_log(),
-                    turn: TurnStats::default(),
-                    kind: SubagentKind::Background,
-                    agent: Arc::clone(&sub),
-                    steering: Arc::clone(&steering),
-                    running: true,
-                    compacting: false,
-                    done: false,
-                    delivered: false,
-                    pinned: false,
-                });
                 // Open its record with the task it was given, so its transcript shows
                 // the question and not just the answer.
                 live.begin_turn(live_key);
@@ -776,34 +782,43 @@ fn spawn_background(
                 let _run_guard = RunGuard::new(live.clone(), live_key);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
-                sub.run(prompt, steering, |ev| {
-                    // Its run is recorded on its own entry — what it did and what it
-                    // spent. This is the *only* way a background sub-agent's work
-                    // reaches a frontend: its `task` call returned the instant it was
-                    // spawned, so there is no live tool call left to stream through.
-                    usage_live.record(live_key, &ev);
-                    if let Ok(mut g) = ts_inner.lock()
-                        && let Some(t) = g.as_mut()
-                        && let Some(tev) = subagent_event_for(&ev)
-                    {
-                        t.write(&tev);
-                    }
-                    let chunk = match ev {
-                        AgentEvent::Text(t) => {
-                            out.push_str(&t);
-                            Some(t)
+                let mut next_prompt = prompt;
+                loop {
+                    sub.run(next_prompt, Arc::clone(&steering), |ev| {
+                        // Its run is recorded on its own entry — what it did and what it
+                        // spent. This is the *only* way a background sub-agent's work
+                        // reaches a frontend: its `task` call returned the instant it was
+                        // spawned, so there is no live tool call left to stream through.
+                        usage_live.record(live_key, &ev);
+                        if let Ok(mut g) = ts_inner.lock()
+                            && let Some(t) = g.as_mut()
+                            && let Some(tev) = subagent_event_for(&ev)
+                        {
+                            t.write(&tev);
                         }
-                        AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
-                        _ => None,
+                        let chunk = match ev {
+                            AgentEvent::Text(t) => {
+                                out.push_str(&t);
+                                Some(t)
+                            }
+                            AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
+                            _ => None,
+                        };
+                        if let Some(c) = chunk
+                            && let Ok(mut v) = reg.lock()
+                            && let Some(t) = v.iter_mut().find(|t| t.id == id)
+                        {
+                            t.log.push_str(&c);
+                        }
+                    })
+                    .await?;
+                    let Some(next) = live.take_pending_or_finish(live_key) else {
+                        break;
                     };
-                    if let Some(c) = chunk
-                        && let Ok(mut v) = reg.lock()
-                        && let Some(t) = v.iter_mut().find(|t| t.id == id)
-                    {
-                        t.log.push_str(&c);
-                    }
-                })
-                .await?;
+                    live.begin_turn(live_key);
+                    live.record(live_key, &AgentEvent::Steered(next.display));
+                    next_prompt = next.sent;
+                }
                 Ok(())
             }
             .await;
@@ -886,11 +901,18 @@ fn spawn_background(
         v.retain(|(_, h)| !h.is_finished());
         v.push((id, handle));
     }
-    format!(
+    let isolation = if worktree.is_some() {
+        " It is write-capable, so it works in its own isolated git worktree; when it \
+         finishes you review its changes and merge them into your working dir."
+    } else {
+        ""
+    };
+    Ok(format!(
         "Started background task #{id} ({label}) — it runs concurrently in the background. \
          You will be notified automatically, and its result will be delivered to you when it \
-         finishes; continue with your other work — do not poll or wait."
-    )
+         finishes; continue with your other work — do not poll or wait. If you have nothing to \
+         do until it finishes, tell the user in one line what it is doing and end your turn.{isolation}"
+    ))
 }
 
 /// The shared, lazily-resolved sub-agent transcript directory cell (see
@@ -1477,18 +1499,24 @@ impl SubagentTool {
     ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
-            "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
-             (it can't see this conversation, so make `prompt` complete and standalone). Use \
-             it to keep the main context clean — broad exploration, or a focused piece of \
+            "Delegate a self-contained sub-task to a fresh sub-agent with its own context. It \
+             CANNOT see this conversation or anything you know — it gets only its system prompt \
+             and the `prompt` you pass — so make `prompt` complete and standalone. Use it to \
+             keep the main context clean: broad exploration, or a focused piece of \
              implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
-             but can't itself delegate. It runs to completion and returns its final summary. \
-             Issue several `task` calls in one turn to run sub-agents in **parallel** (e.g. \
-             explore several areas at once), or set `background: true` to fire one off and keep \
-             working — its result is delivered to you automatically when it finishes. Run \
-             cheaper/faster work on another `model` — a bare id (`gpt-5.5-mini`) is that model \
-             on the provider you are already on, and `provider://model` \
-             (`openrouter://deepseek/deepseek-chat`) delegates to a different, already-configured \
-             provider",
+             but can't itself delegate. Every task runs in the **background**: this call returns \
+             immediately with a task id and the sub-agent's result is delivered to you \
+             automatically when it finishes — keep working, spawn more, or (if you can't proceed \
+             until it's done) tell the user in one line what it's doing and end your turn. Never \
+             poll or wait. Issue several `task` calls at once to run sub-agents in **parallel**. \
+             A write-capable sub-agent runs in an isolated git worktree — when it reports back, \
+             review its changes and merge them before they affect your working dir (if the \
+             project is not a git repo it instead edits your dir directly, and only one write \
+             sub-agent runs at a time); a read-only sub-agent shares your dir and changes \
+             nothing. Run cheaper/faster work on another \
+             `model` — a bare id (`gpt-5.5-mini`) is that model on the provider you are already \
+             on, and `provider://model` (`openrouter://deepseek/deepseek-chat`) delegates to a \
+             different, already-configured provider",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -1570,10 +1598,6 @@ impl hrdr_tools::Tool for SubagentTool {
             "model": {
                 "type": "string",
                 "description": "Optional model override, named as `provider://model` or as a bare model id. A bare id (`gpt-5.5-mini`, `deepseek/deepseek-chat`) is that model on the provider you are already on. A `provider://model` (`openrouter://deepseek/deepseek-chat`) also switches the provider — it must be one that is configured and authenticated (a built-in name or a [providers.*] entry); `provider://` on its own uses that provider's configured default model. Defaults to the profile's / configured subagent model, else the main model."
-            },
-            "background": {
-                "type": "boolean",
-                "description": "Default true: the sub-agent runs detached, this call returns immediately with a task id, and its result is delivered to you automatically when it finishes — so keep working, or end your turn. Pass false to block until it finishes and get its result inline, when you need the answer before your next step. Ignored (always false) when the sub-agent runs in an isolated worktree."
             }
         });
         if !self.profiles.is_empty() {
@@ -1654,7 +1678,6 @@ impl hrdr_tools::Tool for SubagentTool {
             apply_model_ref(&mut cfg, reference, Some(&parent_ctx))?;
         }
 
-        let mut isolation: Option<String> = None;
         if let Some(name) = args.get("agent").and_then(|v| v.as_str())
             && !name.trim().is_empty()
         {
@@ -1674,7 +1697,10 @@ impl hrdr_tools::Tool for SubagentTool {
             // from the profile, the `task` call, or the provider's own default —
             // never from the interactive last-used store, which would make the same
             // sub-agent run a different model for each developer.
-            isolation = profile.isolation.clone();
+            //
+            // A profile's `isolation` field is now informational: worktree
+            // isolation is applied to *every* write-capable sub-agent below,
+            // whether or not the profile asked for it.
             cfg = config_for_agent_profile(&cfg, profile)
                 .map_err(|e| anyhow::anyhow!("subagent '{}': {e:#}", profile.name))?;
         }
@@ -1711,23 +1737,30 @@ impl hrdr_tools::Tool for SubagentTool {
             .unwrap_or("sub-task")
             .to_string();
 
-        // Detached by default: spawn and return immediately so the sub-agent never
-        // blocks the main conversation. The run loop delivers its result when it
-        // lands (the frontend shows live progress). `background: false` opts back
-        // into waiting, for when the model needs the answer to continue.
+        // Every task runs **detached**: spawn and return immediately so the
+        // sub-agent never blocks the main conversation. The run loop delivers its
+        // result when it lands (the frontend shows live progress). There is no
+        // foreground mode — if the parent needs the answer before its next step it
+        // acknowledges the task and ends its turn; it is woken on completion.
         //
-        // An isolated (worktree) sub-agent can't detach yet, so it stays blocking
-        // unless the model explicitly asks for both — which is an error.
-        // Bound how many sub-agents run at once. Write-capable ones are capped
-        // lower: they share the main agent's working tree, so interleaved edits
-        // race. Refusing is better than queueing — the model gets told, and can
-        // do something else or wait.
+        // Isolation is decided by capability, not a flag. A write-capable
+        // sub-agent runs in its OWN git worktree, so concurrent writers never step
+        // on each other or on the main tree. When the project is NOT a git repo,
+        // there are no worktrees to hand out, so a writer falls back to sharing the
+        // main dir — and then only ONE write-capable sub-agent may run at a time,
+        // or two of them would race on the same files. A read-only sub-agent
+        // always shares the dir; it changes nothing, so there is nothing to race.
         let write_capable = !cfg.read_only;
+        let worktrees_available = write_capable && in_git_repo(&ctx.cwd);
+
+        // Bound how many run at once. Read-only agents get the higher cap. A
+        // worktree-isolated writer gets the write cap; a shared-dir writer (no git
+        // repo) is limited to one at a time so concurrent writers can't collide.
         let (max_readonly, max_write) = self.caps;
-        let cap = if write_capable {
-            max_write
-        } else {
-            max_readonly
+        let cap = match (write_capable, worktrees_available) {
+            (false, _) => max_readonly,
+            (true, true) => max_write,
+            (true, false) => 1,
         };
         let kind = if write_capable {
             "write-capable"
@@ -1735,197 +1768,361 @@ impl hrdr_tools::Tool for SubagentTool {
             "read-only"
         };
         let Some(slot) = self.slots.acquire(write_capable, cap) else {
+            let hint = if write_capable && !worktrees_available {
+                " (this directory is not a git repo, so write sub-agents run one at a time)"
+            } else {
+                ""
+            };
             bail!(
-                "too many sub-agents: {} {kind} already running (limit {cap}). Wait for one to \
-                 finish — its result is delivered to you automatically — then try again, or run \
-                 this work yourself.",
+                "too many sub-agents: {} {kind} already running (limit {cap}){hint}. Wait for one \
+                 to finish — you are notified automatically — then try again, or run this work \
+                 yourself.",
                 self.slots.live(write_capable),
             );
         };
 
-        if wants_background(&args, isolation.is_some()) {
-            if isolation.is_some() {
-                bail!("a background task can't also use `isolation` (worktree) yet");
+        let worktree = if worktrees_available {
+            // Isolate the writer in its own worktree; the parent reviews and merges
+            // it when the sub-agent reports back.
+            let wt = Worktree::create(&ctx.cwd)
+                .await
+                .context("creating an isolated worktree for a write-capable sub-agent")?;
+            cfg.cwd = wt.path.clone();
+            ctx.emit(format!("  · isolated worktree: {}\n", wt.path.display()));
+            Some(wt)
+        } else {
+            // Read-only, or a writer with no git repo to isolate into: share the
+            // main dir. A shared-dir writer's edits land directly in the working
+            // dir (serialized by the cap of 1 above), so there is no worktree to
+            // review — the changes are simply already there.
+            if write_capable {
+                ctx.emit(
+                    "  · no git repo — sub-agent works directly in the working dir\n".to_string(),
+                );
             }
-            return Ok(spawn_background(
-                cfg,
-                prompt,
-                label,
-                ctx.call_id.clone(),
-                slot,
-                &ctx.background_tasks,
-                &self.bg_handles,
-                Arc::clone(&self.cost_total),
-                self.lsp.clone(),
-                self.transcript_dir.clone(),
-                self.live.clone(),
-            ));
-        }
-        // Blocking: hold the slot until this call returns.
-        let _slot = slot;
-
-        // `isolation = "worktree"`: run the sub-agent in a fresh git worktree so
-        // its edits don't touch the working tree until reviewed.
-        let worktree = match isolation.as_deref() {
-            Some("worktree") => {
-                let wt = Worktree::create(&ctx.cwd).await?;
-                cfg.cwd = wt.path.clone();
-                ctx.emit(format!("  · isolated worktree: {}\n", wt.path.display()));
-                Some(wt)
-            }
-            Some(other) => bail!("unknown isolation mode '{other}' (supported: worktree)"),
-            None => None,
+            None
         };
 
-        let model = cfg.model.model().to_string();
-        ctx.emit(format!("↳ task ({model}): {label}\n"));
+        spawn_background(
+            cfg,
+            prompt,
+            label,
+            ctx.call_id.clone(),
+            slot,
+            &ctx.background_tasks,
+            &self.bg_handles,
+            Arc::clone(&self.cost_total),
+            self.lsp.clone(),
+            self.transcript_dir.clone(),
+            self.live.clone(),
+            worktree,
+        )
+    }
+}
 
-        // Open a durable transcript for this sub-agent (best-effort — a failure
-        // to persist must never block the run). The full prompt is recorded so a
-        // crashed sub-agent's work is recoverable independent of the parent.
-        let mut transcript = resolve_subagent_dir(&self.transcript_dir)
-            .and_then(|dir| open_next_subagent_transcript(&dir, &label));
-        if let Some(t) = transcript.as_mut() {
-            t.write(&subagent_transcript::Event::Start {
-                model: model.clone(),
-                label: label.clone(),
-                kind: subagent_transcript::SpawnKind::Blocking,
-                prompt: prompt.clone(),
-            });
+/// Render a background sub-agent's live event log into a compact, human-readable
+/// peek (for `task_output`): assistant text verbatim, tool activity as one-line
+/// markers. Bulky/structural events (usage, history, token deltas) are skipped.
+fn render_events_peek(events: &[AgentEvent]) -> String {
+    let mut out = String::new();
+    for ev in events {
+        match ev {
+            AgentEvent::Text(t) => out.push_str(t),
+            AgentEvent::Reasoning(_) => {}
+            AgentEvent::ToolStart { name, .. } => out.push_str(&format!("\n· {name}")),
+            AgentEvent::ToolEnd { name, ok, .. } => {
+                out.push_str(&format!(" {} {name}\n", if *ok { "✓" } else { "✗" }))
+            }
+            AgentEvent::Notice(n) => out.push_str(&format!("\n[{n}]\n")),
+            AgentEvent::Steered(s) => out.push_str(&format!("\n» {s}\n")),
+            _ => {}
         }
+    }
+    out.trim().to_string()
+}
 
-        // Captured before `cfg` is moved into the sub-agent.
-        let provider_for_run = Some(cfg.model.provider().to_string());
-        let base_url_for_live = cfg.base_url.clone();
-        let usage_for_live = subagent_usage(&cfg);
-        let mut sub =
-            Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
-        sub.cost_total = Arc::clone(&self.cost_total);
-        // Share the parent's language servers (base config has `lsp = false`).
-        sub.ctx.lsp = self.lsp.clone();
+/// `task_list`: report the background sub-agents `task` spawned — id, label,
+/// status, and (for a write-capable one) its worktree — so the parent can check
+/// on them without waiting.
+struct TaskListTool;
 
-        // Retain the sub-agent and the very queue its `run` will drain, so the
-        // frontend can steer it mid-run, watch it, and drive further turns on it
-        // once this call returns. It is pruned when finished, delivered, and
-        // unpinned — see `LiveSubagents::prune`.
-        let key = LiveSubagents::next_key();
-        // Its chrome is published by the agent itself, so what a frontend shows for
-        // it is what it is actually running on (see `Agent::attach_live`).
-        sub.attach_live(self.live.clone(), key);
-        let cfg_provider = provider_for_run.clone();
-        let steering = steering_queue();
-        let sub = Arc::new(tokio::sync::Mutex::new(sub));
-        self.live.register(LiveSubagent {
-            key,
-            bg_id: None,
-            tool_id: ctx.call_id.clone(),
-            label: label.clone(),
-            model: model.clone(),
-            provider: cfg_provider,
-            base_url: base_url_for_live,
-            effort: None,
-            auto_compact: true,
-            compaction_reserved: 0,
-            todos: Default::default(),
-            usage: usage_for_live,
-            events: subagent_live::event_log(),
-            turn: TurnStats::default(),
-            kind: SubagentKind::Blocking,
-            agent: Arc::clone(&sub),
-            steering: Arc::clone(&steering),
-            running: true,
-            compacting: false,
-            done: false,
-            delivered: false,
-            pinned: false,
-        });
-        // Open its record with the task it was given, so its transcript shows the
-        // question and not just the answer.
-        self.live.begin_turn(key);
-        self.live.record(key, &AgentEvent::Steered(prompt.clone()));
-
-        // Cancelling the parent turn drops this future mid-`await`; the guard is
-        // what marks the sub-agent idle in that case.
-        let _run_guard = RunGuard::new(self.live.clone(), key);
-        let usage_live = self.live.clone();
-        let mut output = String::new();
-        let mut sub_guard = sub.lock().await;
-        let run = sub_guard
-            .run(prompt, steering, |ev| {
-                // Its tokens are its own: counted on its entry, so a frontend
-                // showing this agent shows *its* context and cost, not the parent's.
-                usage_live.record(key, &ev);
-                if let Some(t) = transcript.as_mut()
-                    && let Some(tev) = subagent_event_for(&ev)
-                {
-                    t.write(&tev);
-                }
-                match ev {
-                    // Stream the sub-agent's answer text to the parent's live
-                    // output (the frontend's sub-agent panel) as well as
-                    // accumulating it.
-                    AgentEvent::Text(t) => {
-                        output.push_str(&t);
-                        ctx.emit(t);
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskListTool {
+    fn name(&self) -> &'static str {
+        "task_list"
+    }
+    fn description(&self) -> &'static str {
+        "List the background sub-agents you started with `task`: each one's id, label, status \
+         (running / done / cancelled) and — for a write-capable sub-agent — the isolated git \
+         worktree its changes are in. A finished task's result is delivered to you automatically; \
+         use this only to check progress, not to collect results."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let rows: Vec<String> = {
+            let v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.iter()
+                .map(|t| {
+                    let mut row = format!("#{} [{}] {}", t.id, t.status().as_str(), t.label);
+                    if let Some(wt) = &t.worktree {
+                        row.push_str(&format!("  worktree: {}", wt.display()));
                     }
-                    AgentEvent::ToolStart { name, .. } => ctx.emit(format!("\n· {name}")),
-                    _ => {}
-                }
-            })
-            .await;
-        drop(sub_guard);
-        // The task has landed. Its answer becomes this tool call's result, so the
-        // main agent has it the moment we return: mark it delivered here.
-        self.live.update(key, |e| {
-            e.running = false;
-            e.done = true;
-            e.delivered = true;
-        });
-        // Tear down / preserve the worktree before surfacing errors.
-        let worktree_note = match worktree {
-            Some(wt) => wt.finish().await,
-            None => None,
+                    row
+                })
+                .collect()
         };
-        // Record the terminal outcome before the `?` below can propagate it.
-        // `bytes` is the *trimmed* output length, matching the background path —
-        // the two used to disagree (this one counted the untrimmed buffer), which
-        // made the field useless for comparing runs.
-        let bytes = output.trim().len();
-        if let Some(t) = transcript.as_mut() {
-            match &run {
-                Ok(()) => t.write(&subagent_transcript::Event::End {
-                    status: subagent_transcript::EndStatus::Ok,
-                    bytes,
-                }),
-                Err(e) => {
-                    t.write(&subagent_transcript::Event::Error {
-                        msg: format!("{e:#}"),
-                    });
-                    t.write(&subagent_transcript::Event::End {
-                        status: subagent_transcript::EndStatus::Failed,
-                        bytes,
-                    });
+        if rows.is_empty() {
+            return Ok("No background tasks.".to_string());
+        }
+        Ok(hrdr_tools::truncate(&rows.join("\n"), ctx.max_output))
+    }
+}
+
+/// `task_output`: peek a background sub-agent's live progress without waiting.
+struct TaskOutputTool {
+    live: LiveSubagents,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskOutputTool {
+    fn name(&self) -> &'static str {
+        "task_output"
+    }
+    fn description(&self) -> &'static str {
+        "Peek the current progress of a background sub-agent by its `id` (from `task_list`), \
+         without blocking. Returns a snapshot of its output so far — useful if the user asks how \
+         a task is going. The final result is still delivered to you automatically when it \
+         finishes; you do not need to poll."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("task_output needs an integer `id` (see `task_list`)")
+        })?;
+        // Prefer the live event log; fall back to the registry entry's stored
+        // result if the task already finished and its live entry was pruned.
+        let peek = self.live.with(|v| {
+            v.iter().find(|e| e.bg_id == Some(id)).map(|e| {
+                let events = e
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .since(0)
+                    .0;
+                render_events_peek(&events)
+            })
+        });
+        if let Some(text) = peek.filter(|t| !t.is_empty()) {
+            return Ok(hrdr_tools::truncate(&text, ctx.max_output));
+        }
+        let done = {
+            let v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.iter().find(|t| t.id == id).map(|t| {
+                t.result
+                    .clone()
+                    .unwrap_or_else(|| format!("(task #{id} is {})", t.status().as_str()))
+            })
+        };
+        match done {
+            Some(text) => Ok(hrdr_tools::truncate(&text, ctx.max_output)),
+            None => anyhow::bail!("no background task #{id} (see `task_list`)"),
+        }
+    }
+}
+
+/// `steer`: add instructions to a background sub-agent's in-flight turn.
+struct SteerTool {
+    live: LiveSubagents,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for SteerTool {
+    fn name(&self) -> &'static str {
+        "steer"
+    }
+    fn description(&self) -> &'static str {
+        "Give additional instructions to a running background sub-agent. The message is queued \
+         on the sub-agent's active turn and reaches it before its next model request; if its current \
+         response finishes first, the retained sub-agent starts a follow-up turn with the message. \
+         Use the task id from `task` / `task_list`; finished or unknown tasks cannot be steered."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The running task id (see `task_list`)." },
+                "prompt": { "type": "string", "description": "Additional instructions for the sub-agent." }
+            },
+            "required": ["id", "prompt"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("steer needs an integer `id` (see `task_list`)"))?;
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("steer needs a non-empty `prompt`"))?;
+        let queued = self.live.with(|entries| {
+            let entry = entries.iter().find(|e| e.bg_id == Some(id))?;
+            if !entry.running {
+                return Some(false);
+            }
+            entry
+                .steering
+                .lock()
+                .ok()
+                .map(|mut queue| queue.push_back(Steer::plain(prompt)))?;
+            Some(true)
+        });
+        match queued {
+            Some(true) => Ok(format!("Steered background task #{id}.")),
+            Some(false) => anyhow::bail!("background task #{id} is no longer running"),
+            None => anyhow::bail!("no running background task #{id} (see `task_list`)"),
+        }
+    }
+}
+
+/// `task_cancel`: abort one background sub-agent and discard its (unreviewed)
+/// worktree.
+struct TaskCancelTool {
+    bg_handles: BgHandles,
+    live: LiveSubagents,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskCancelTool {
+    fn name(&self) -> &'static str {
+        "task_cancel"
+    }
+    fn description(&self) -> &'static str {
+        "Cancel a running background sub-agent by its `id` (from `task_list`). Its work is \
+         abandoned. If it was write-capable and its isolated worktree is clean, the worktree is \
+         removed; if the worktree has uncommitted changes they are NOT thrown away — the worktree \
+         is kept and this call tells you where it is so you can review and merge or discard it. \
+         Use when the user asks to stop a task or it is no longer needed."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("task_cancel needs an integer `id` (see `task_list`)")
+        })?;
+        // Abort the worker if it is still running.
+        let aborted = {
+            let mut handles = self
+                .bg_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pos) = handles.iter().position(|(hid, _)| *hid == id) {
+                let (_, handle) = handles.remove(pos);
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+        // Mark the registry entry cancelled and take its worktree for discard.
+        let worktree = {
+            let mut v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match v.iter_mut().find(|t| t.id == id) {
+                Some(t) => {
+                    t.cancelled = true;
+                    t.done = true;
+                    t.worktree.clone().zip(t.branch.clone())
+                }
+                None if !aborted => anyhow::bail!("no background task #{id} (see `task_list`)"),
+                None => None,
+            }
+        };
+        // A worktree with uncommitted work is NOT thrown away: keep it and tell
+        // the caller where it is, so the (possibly partial) changes aren't lost.
+        // Only a clean worktree is removed.
+        let kept_note = match worktree {
+            Some((path, branch)) => {
+                if worktree_has_changes(&path).await {
+                    Some(format!(
+                        " Its worktree has uncommitted changes, so it was kept for you to \
+                         review — review (`git -C {} diff`) and merge or discard it yourself:\n  \
+                         worktree: {}\n  branch:   {branch}",
+                        path.display(),
+                        path.display(),
+                    ))
+                } else {
+                    remove_worktree(&ctx.cwd, &path, &branch);
+                    None
                 }
             }
-        }
-        run.with_context(|| format!("sub-agent (model={model}) failed"))?;
-
-        let mut output = output.trim().to_string();
-        if let Some(note) = worktree_note {
-            output.push_str(&note);
-        }
-        if output.is_empty() {
-            return Ok("(sub-agent finished with no text output)".to_string());
-        }
-        // A concise summary is returned inline; a large report is saved to a file
-        // and the parent gets a bounded preview + a pointer to `read`/`grep` it,
-        // so a big sub-agent result doesn't flood the main context.
-        Ok(hrdr_tools::truncate_saved(
-            &output,
-            ctx.max_output,
-            ctx.max_output_lines,
-            hrdr_tools::TruncateSide::Head,
-            "task",
+            None => None,
+        };
+        // Clear its live panel entry.
+        self.live.with(|v| {
+            for e in v.iter_mut().filter(|e| e.bg_id == Some(id)) {
+                e.running = false;
+                e.done = true;
+                e.delivered = true;
+            }
+        });
+        Ok(format!(
+            "Cancelled background task #{id}.{}",
+            kept_note.unwrap_or_default()
         ))
     }
 }
@@ -3794,46 +3991,57 @@ impl Worktree {
         })
     }
 
-    /// After the sub-agent finishes: if the worktree is clean, remove it and its
-    /// branch and return `None`; otherwise leave it and return a note pointing at
-    /// the branch/path so the parent can review and merge.
-    async fn finish(mut self) -> Option<String> {
-        // Mark cleaned first so Drop doesn't double-clean if this future is
-        // aborted or dropped after completion.
-        self.cleaned = true;
-        let dirty = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.path)
-            .args(["status", "--porcelain"])
-            .output()
-            .await
-            .ok()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if dirty {
-            return Some(format!(
-                "\n\n[isolated worktree kept: the sub-agent's changes are on branch `{}` \
-                 at {} — review and merge them]",
-                self.branch,
-                self.path.display()
-            ));
+    /// Detach automatic cleanup and hand back the worktree's location. Used when
+    /// a background write sub-agent's worktree must **outlive** its run — the
+    /// changes stay for the parent to review and merge, and are removed only by
+    /// an explicit `task_cancel` or a session reset (see [`remove_worktree`]).
+    fn keep(mut self) -> KeptWorktree {
+        self.cleaned = true; // Drop becomes a no-op
+        KeptWorktree {
+            path: self.path.clone(),
+            branch: self.branch.clone(),
         }
-        // Clean: tear down the worktree and its branch.
-        let _ = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output()
-            .await;
-        let _ = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["branch", "-D", &self.branch])
-            .output()
-            .await;
-        None
     }
+}
+
+/// The surviving location of a [`Worktree`] whose cleanup was detached via
+/// [`Worktree::keep`]. Removal is later done explicitly with [`remove_worktree`].
+struct KeptWorktree {
+    path: PathBuf,
+    branch: String,
+}
+
+/// Whether a worktree holds uncommitted work (modified/staged/untracked files),
+/// so cancelling its task must NOT silently throw the changes away. Best-effort:
+/// a git failure reports "no changes" rather than blocking cleanup.
+async fn worktree_has_changes(path: &std::path::Path) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Force-remove a background sub-agent's worktree and its scratch branch. Run
+/// against the main repo (`repo`), best-effort — used by `task_cancel` and by
+/// [`Agent::abort_background_tasks`] to discard unreviewed work. Synchronous so
+/// it can run from non-async cleanup paths.
+fn remove_worktree(repo: &std::path::Path, path: &std::path::Path, branch: &str) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "-D", branch])
+        .output();
 }
 
 /// Run `git worktree prune` in `repo` to clean up leftover worktree entries
@@ -4234,6 +4442,21 @@ impl Agent {
                 config.subagent_transcript_dir.clone(),
                 live_subagents.clone(),
             )));
+            // Management tools for the background sub-agents `task` spawns: check
+            // on them, peek their output, steer or cancel one. They read the shared
+            // background-task registry (via the tool context) and, for cancel,
+            // the same `bg_handles` the owning agent aborts on reset.
+            tools.register(Arc::new(TaskListTool));
+            tools.register(Arc::new(TaskOutputTool {
+                live: live_subagents.clone(),
+            }));
+            tools.register(Arc::new(SteerTool {
+                live: live_subagents.clone(),
+            }));
+            tools.register(Arc::new(TaskCancelTool {
+                bg_handles: Arc::clone(&bg_handles),
+                live: live_subagents.clone(),
+            }));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
         // read-only sub-agent drops the writer) and resolve its storage roots
@@ -4571,12 +4794,26 @@ impl Agent {
         // Workers publish only by finding their pre-existing registry/live entry.
         // Clearing both stores while holding their locks means a worker either
         // publishes before this cleanup (and is then removed) or finds no entry
-        // afterward; no stale result can be recreated.
-        self.ctx
-            .background_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        // afterward; no stale result can be recreated. Collect the worktrees of
+        // the discarded tasks first — they held unreviewed edits, so a reset
+        // throws them away.
+        let worktrees: Vec<(std::path::PathBuf, String)> = {
+            let mut reg = self
+                .ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let wts = reg
+                .iter()
+                .filter_map(|t| t.worktree.clone().zip(t.branch.clone()))
+                .collect();
+            reg.clear();
+            wts
+        };
+        let repo = self.ctx.cwd.clone();
+        for (path, branch) in worktrees {
+            remove_worktree(&repo, &path, &branch);
+        }
         self.live_subagents.with(|v| {
             v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
         });
@@ -5198,18 +5435,34 @@ impl Agent {
     /// mid-turn (before the next model request) or at the next turn. Emits a
     /// [`AgentEvent::Notice`] per delivery.
     fn drain_background<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
-        let finished: Vec<(u64, String, String)> = {
+        struct Finished {
+            id: u64,
+            label: String,
+            result: String,
+            worktree: Option<(std::path::PathBuf, String)>,
+        }
+        let finished: Vec<Finished> = {
             let mut v = self
                 .ctx
                 .background_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut out = Vec::new();
-            for t in v.iter_mut().filter(|t| t.done && !t.delivered) {
+            // A cancelled task's result is discarded, never delivered.
+            for t in v
+                .iter_mut()
+                .filter(|t| t.done && !t.delivered && !t.cancelled)
+            {
                 t.delivered = true;
-                out.push((t.id, t.label.clone(), t.result.clone().unwrap_or_default()));
+                out.push(Finished {
+                    id: t.id,
+                    label: t.label.clone(),
+                    result: t.result.clone().unwrap_or_default(),
+                    worktree: t.worktree.clone().zip(t.branch.clone()),
+                });
             }
-            v.retain(|t| !t.delivered);
+            // Drop delivered results and discarded (cancelled) entries alike.
+            v.retain(|t| !t.delivered && !t.cancelled);
             out
         };
         // The main agent now has these answers, so the live entries are no longer
@@ -5217,22 +5470,41 @@ impl Agent {
         // at turn end drops the rest.
         self.live_subagents.with(|v| {
             for e in v.iter_mut() {
-                if e.bg_id
-                    .is_some_and(|b| finished.iter().any(|(id, _, _)| *id == b))
-                {
+                if e.bg_id.is_some_and(|b| finished.iter().any(|f| f.id == b)) {
                     e.delivered = true;
                 }
             }
         });
-        for (id, label, result) in finished {
+        for f in finished {
+            let Finished {
+                id,
+                label,
+                result,
+                worktree,
+            } = f;
             on_event(AgentEvent::Notice(format!(
                 "background task #{id} ({label}) finished"
             )));
+            // A write-capable sub-agent's changes are in its worktree — nothing has
+            // touched the main working dir. Tell the parent to review and merge.
+            let body = match worktree {
+                Some((path, branch)) => format!(
+                    "[Background task #{id} ({label}) finished. Its changes are in an isolated \
+                     git worktree — NOTHING has landed in your working dir yet.\n  worktree: \
+                     {}\n  branch:   {branch}\nReview the diff (`git -C {} diff` and `git -C {} \
+                     status` for untracked files), fix any issues, then merge into your working \
+                     dir. Its report:]\n{result}",
+                    path.display(),
+                    path.display(),
+                    path.display(),
+                ),
+                None => {
+                    format!("[Background task #{id} ({label}) finished — its result:]\n{result}")
+                }
+            };
             self.messages.push(ChatMessage {
                 origin: MessageOrigin::BackgroundResult,
-                ..ChatMessage::user(format!(
-                    "[Background task #{id} ({label}) finished — its result:]\n{result}"
-                ))
+                ..ChatMessage::user(body)
             });
         }
     }
@@ -6414,7 +6686,7 @@ mod tests {
         is_transient, legacy_config_error, parse_env_bool, provider_alias_collision_error,
         prune_tool_messages, repair_dangling_tool_calls, resolve, resolve_subagent_dir,
         retry_after_hint, steering_queue, subagent_base_config, subagent_event_for,
-        subagent_transcript_id, tail_window, wants_background,
+        subagent_transcript_id, tail_window,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -6576,6 +6848,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn models_output_is_pretty_and_truncation_stays_bounded() {
+        let mut agent = Agent::new(AgentConfig {
+            model: r("openai://gpt-5"),
+            api_key: Some("k".to_string()),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let current = agent
+            .tools
+            .execute("models", serde_json::json!({}), &agent.ctx)
+            .await
+            .unwrap();
+        assert!(current.contains('\n'), "pretty JSON must be multiline");
+        serde_json::from_str::<serde_json::Value>(&current).unwrap();
+
+        agent.ctx.max_output = 512;
+        let available = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(available.len() <= agent.ctx.max_output, "{available}");
+        serde_json::from_str::<serde_json::Value>(&available).unwrap();
+
+        agent.ctx.max_output = 1;
+        let err = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too small for valid JSON"));
+    }
+
     /// The delegation guidance reaches an agent that can actually delegate.
     ///
     /// `task` and `models` are registered by `Agent::new`, so this is the only
@@ -6600,6 +6915,10 @@ mod tests {
         );
         assert!(system.contains("call `models`"), "resolve, don't guess");
         assert!(system.contains("Never guess an id"));
+        assert!(
+            system.contains("do not duplicate it yourself"),
+            "delegated work must not be repeated by the parent"
+        );
         assert!(
             system.contains("current: true"),
             "and stay on the provider the rows flag as ours"
@@ -6724,7 +7043,7 @@ mod tests {
 
         // A budget big enough for ~2 rows must spend it on one row from EACH
         // provider, not two rows of `alpha`.
-        let one_row_len = serde_json::to_string(&full.0[0]).unwrap().len();
+        let one_row_len = serde_json::to_string_pretty(&full.0[0]).unwrap().len();
         let (kept, dropped) = fit_models_to_budget(&rows, one_row_len * 2 + 1).unwrap();
         assert_eq!(dropped, 3);
         let providers: Vec<&str> = kept
@@ -8058,7 +8377,10 @@ mod tests {
             model: Some(spec("c-other://m-c")),
             description: None,
             prompt: Some("Review.".to_string()),
-            read_only: false,
+            // Read-only so the sub-agent shares the cwd (no git worktree needed):
+            // this test exercises the auth gate, which runs before the spawn
+            // regardless of capability.
+            read_only: true,
             tools: None,
             write_ext: None,
             temperature: None,
@@ -8115,7 +8437,6 @@ mod tests {
                     "agent": "reviewer",
                     "provider": "b-alias",
                     "model": "m",
-                    "background": true,
                 }),
                 &ctx,
             )
@@ -8675,33 +8996,6 @@ mod tests {
         );
     }
 
-    /// A `task` runs detached unless the model says otherwise — a sub-agent must
-    /// never block the main conversation.
-    ///
-    /// Regression: `background` defaulted to false, so every ordinary `task` call
-    /// held the turn open until the sub-agent finished, and anything the user
-    /// typed meanwhile could not reach the model.
-    #[test]
-    fn a_task_is_detached_unless_told_otherwise() {
-        use serde_json::json;
-        let plain = json!({"description": "map the crate"});
-        assert!(wants_background(&plain, false), "detached by default");
-
-        // The model can still wait for the answer when it needs it.
-        assert!(!wants_background(&json!({"background": false}), false));
-        assert!(wants_background(&json!({"background": true}), false));
-
-        // A worktree sub-agent can't detach, so it defaults to blocking…
-        assert!(!wants_background(&plain, true));
-        // …but asking for both is caught by the caller, not silently ignored.
-        assert!(wants_background(&json!({"background": true}), true));
-
-        // A non-boolean `background` is not a request to detach or to block: it
-        // falls back to the default rather than being coerced.
-        assert!(wants_background(&json!({"background": "yes"}), false));
-        assert!(!wants_background(&json!({"background": "yes"}), true));
-    }
-
     #[test]
     fn drain_background_delivers_finished_and_prunes() {
         let cfg = AgentConfig {
@@ -8721,6 +9015,7 @@ mod tests {
                 done: true,
                 result: Some("found it".to_string()),
                 delivered: false,
+                ..Default::default()
             });
             v.push(hrdr_tools::BackgroundTask {
                 id: 2,
@@ -8730,6 +9025,7 @@ mod tests {
                 done: false,
                 result: None,
                 delivered: false,
+                ..Default::default()
             });
         }
         let mut events = Vec::new();
@@ -8756,9 +9052,197 @@ mod tests {
         assert_eq!(v[0].id, 2);
     }
 
+    /// A finished write-capable task is delivered with review-and-merge
+    /// instructions (its changes are in a worktree, not the working dir), and a
+    /// cancelled task is discarded without delivery.
+    #[test]
+    fn drain_background_worktree_delivery_and_cancelled_skip() {
+        let cfg = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+        {
+            let reg = agent.background_tasks();
+            let mut v = reg.lock().unwrap();
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                label: "impl: feature".to_string(),
+                done: true,
+                result: Some("did the work".to_string()),
+                worktree: Some(std::path::PathBuf::from("/tmp/wt-x")),
+                branch: Some("hrdr/task-x".to_string()),
+                ..Default::default()
+            });
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                label: "cancelled one".to_string(),
+                done: true,
+                cancelled: true,
+                result: Some("should be discarded".to_string()),
+                ..Default::default()
+            });
+        }
+        let mut events = Vec::new();
+        agent.drain_background(&mut |e| events.push(e));
+        let last = agent
+            .messages()
+            .last()
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            last.contains("isolated git worktree"),
+            "worktree note: {last}"
+        );
+        assert!(
+            last.contains("/tmp/wt-x") && last.contains("Review"),
+            "{last}"
+        );
+        assert!(
+            !last.contains("should be discarded"),
+            "a cancelled task is never delivered"
+        );
+        // Both entries are pruned (one delivered, one discarded).
+        assert!(agent.background_tasks().lock().unwrap().is_empty());
+    }
+
+    /// `task_list` reports id, status and worktree; `steer` queues additional
+    /// instructions; `task_cancel` aborts the worker and clears its live row.
     #[tokio::test]
-    async fn worktree_removed_when_clean_kept_when_dirty() {
-        use super::Worktree;
+    async fn task_list_and_cancel_manage_background_tasks() {
+        use super::{
+            LiveSubagent, LiveSubagents, SteerTool, SubagentKind, TaskCancelTool, TaskListTool,
+            TurnStats, bg_handles, steering_queue, subagent_live,
+        };
+        use hrdr_tools::Tool;
+        let live = LiveSubagents::new();
+        let bg_handles = bg_handles();
+        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+
+        // A running task (id 1) with a live handle + panel row, and a done one (id 2).
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        bg_handles.lock().unwrap().push((1, handle));
+        {
+            let mut v = ctx.background_tasks.lock().unwrap();
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                label: "running task".to_string(),
+                worktree: Some(std::path::PathBuf::from("/tmp/wt-1")),
+                branch: Some("hrdr/task-1".to_string()),
+                ..Default::default()
+            });
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                label: "done task".to_string(),
+                done: true,
+                result: Some("ok".to_string()),
+                ..Default::default()
+            });
+        }
+        let key = LiveSubagents::next_key();
+        live.with(|v| {
+            v.push(LiveSubagent {
+                key,
+                bg_id: Some(1),
+                tool_id: None,
+                label: "running task".to_string(),
+                model: "m".to_string(),
+                provider: None,
+                base_url: String::new(),
+                effort: None,
+                auto_compact: true,
+                compaction_reserved: 0,
+                todos: Default::default(),
+                usage: crate::AgentUsage::default(),
+                events: subagent_live::event_log(),
+                turn: TurnStats::default(),
+                kind: SubagentKind::Background,
+                agent: Arc::new(tokio::sync::Mutex::new(
+                    Agent::new(AgentConfig {
+                        checkpoints: Some("off".to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )),
+                steering: steering_queue(),
+                running: true,
+                compacting: false,
+                done: false,
+                delivered: false,
+                pinned: false,
+            });
+        });
+
+        let list = TaskListTool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(list.contains("#1") && list.contains("running"), "{list}");
+        assert!(list.contains("/tmp/wt-1"), "worktree shown: {list}");
+        assert!(list.contains("#2") && list.contains("done"), "{list}");
+
+        let steer = SteerTool { live: live.clone() };
+        let msg = steer
+            .execute(
+                serde_json::json!({"id": 1, "prompt": "Use serde's pretty printer"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg, "Steered background task #1.");
+        assert_eq!(
+            live.take_pending(key).map(|s| s.sent),
+            Some("Use serde's pretty printer".to_string())
+        );
+        assert!(
+            steer
+                .execute(serde_json::json!({"id": 2, "prompt": "too late"}), &ctx,)
+                .await
+                .is_err(),
+            "a finished task cannot be steered"
+        );
+
+        let cancel = TaskCancelTool {
+            bg_handles: Arc::clone(&bg_handles),
+            live: live.clone(),
+        };
+        let msg = cancel
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(msg.contains("Cancelled background task #1"), "{msg}");
+        // The handle was removed, the entry marked cancelled, the row cleared.
+        assert!(bg_handles.lock().unwrap().is_empty());
+        let cancelled = ctx
+            .background_tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == 1)
+            .map(|t| t.cancelled)
+            .unwrap();
+        assert!(cancelled, "entry #1 is marked cancelled");
+        let row_done = live.with(|v| v.iter().find(|e| e.bg_id == Some(1)).map(|e| e.done));
+        assert_eq!(row_done, Some(true), "live row cleared");
+
+        // Cancelling an unknown id is an error.
+        assert!(
+            cancel
+                .execute(serde_json::json!({"id": 999}), &ctx)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A background write sub-agent's worktree must OUTLIVE its run so the parent
+    /// can review it: `keep()` detaches the automatic `Drop` cleanup, and only an
+    /// explicit `remove_worktree` tears it down. An un-kept worktree (a cancelled
+    /// setup) is still cleaned by `Drop`.
+    #[tokio::test]
+    async fn kept_worktree_survives_until_remove_worktree() {
+        use super::{Worktree, remove_worktree};
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let git = |args: &[&str]| {
@@ -8778,18 +9262,107 @@ mod tests {
         if !repo.join(".git").exists() {
             return; // git unavailable — skip
         }
-        // Clean worktree → finish removes it, no note.
+        // keep() detaches cleanup: the worktree survives being dropped, even with
+        // uncommitted changes (unreviewed work the parent will merge).
         let wt = Worktree::create(repo).await.unwrap();
         let p = wt.path.clone();
         assert!(p.exists());
-        assert!(wt.finish().await.is_none());
-        assert!(!p.exists(), "a clean worktree is torn down");
-        // Dirty worktree → finish keeps it with a pointer note.
+        let kept = wt.keep();
+        std::fs::write(p.join("new.txt"), "x").unwrap();
+        assert!(p.exists(), "a kept worktree is not auto-removed");
+        // Explicit teardown removes the checkout and its branch.
+        remove_worktree(repo, &kept.path, &kept.branch);
+        assert!(!p.exists(), "remove_worktree tears the worktree down");
+
+        // An un-kept worktree is cleaned by Drop (the cancelled-before-spawn path).
         let wt2 = Worktree::create(repo).await.unwrap();
-        std::fs::write(wt2.path.join("new.txt"), "x").unwrap();
         let p2 = wt2.path.clone();
-        let note = wt2.finish().await.unwrap();
-        assert!(note.contains("branch") && p2.exists());
+        assert!(p2.exists());
+        drop(wt2);
+        assert!(!p2.exists(), "dropping an un-kept worktree removes it");
+    }
+
+    /// Cancelling a write task discards a CLEAN worktree but KEEPS a dirty one,
+    /// telling the caller where the (unreviewed) changes are so they aren't lost.
+    #[tokio::test]
+    async fn task_cancel_keeps_dirty_worktree_removes_clean() {
+        use super::{LiveSubagents, TaskCancelTool, Worktree, bg_handles};
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let ctx = hrdr_tools::ToolContext::new(repo);
+        let cancel = TaskCancelTool {
+            bg_handles: bg_handles(),
+            live: LiveSubagents::new(),
+        };
+
+        // Dirty worktree (untracked file) → kept, and the message points at it.
+        let wt = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt.path.join("new.txt"), "x").unwrap();
+        let kept = wt.keep();
+        let dirty_path = kept.path.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 1,
+                worktree: Some(kept.path.clone()),
+                branch: Some(kept.branch.clone()),
+                ..Default::default()
+            });
+        let msg = cancel
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            msg.contains("uncommitted changes") && msg.contains(&dirty_path.display().to_string()),
+            "dirty worktree is reported: {msg}"
+        );
+        assert!(
+            dirty_path.exists(),
+            "a dirty worktree is kept, not discarded"
+        );
+
+        // Clean worktree → removed, no keep note.
+        let wt2 = Worktree::create(repo).await.unwrap();
+        let kept2 = wt2.keep();
+        let clean_path = kept2.path.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 2,
+                worktree: Some(kept2.path.clone()),
+                branch: Some(kept2.branch.clone()),
+                ..Default::default()
+            });
+        let msg2 = cancel
+            .execute(serde_json::json!({"id": 2}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !msg2.contains("uncommitted"),
+            "a clean worktree has no keep note: {msg2}"
+        );
+        assert!(!clean_path.exists(), "a clean worktree is removed");
     }
 
     #[test]
@@ -9103,6 +9676,7 @@ mod tests {
             done: false,
             result: None,
             delivered: false,
+            ..Default::default()
         });
         // Build the flattened catch_unwind structure manually.
         let handle = tokio::spawn(async move {
@@ -9173,6 +9747,7 @@ mod tests {
                     done: false,
                     result: None,
                     delivered: false,
+                    ..Default::default()
                 });
             }
             // Inject a matching live-subagent entry (background kind).
@@ -9290,6 +9865,7 @@ mod tests {
                     done: false,
                     result: None,
                     delivered: false,
+                    ..Default::default()
                 });
             }
 
@@ -9304,6 +9880,7 @@ mod tests {
                     done: true,
                     result: Some("done".to_string()),
                     delivered: false,
+                    ..Default::default()
                 });
             }
 
@@ -11222,7 +11799,11 @@ mod tests {
             let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.to_path_buf(),
             ))));
-            let cfg = test_cfg(base_url, cwd);
+            let mut cfg = test_cfg(base_url, cwd);
+            // Read-only: the mock sub-agent only streams text, and a read-only
+            // sub-agent shares the cwd (no git worktree is set up), keeping the
+            // test's tempdir free of git plumbing.
+            cfg.read_only = true;
             let runtime = super::super::new_delegation_runtime(
                 &cfg,
                 &super::super::ResolvedModel::from_config(&cfg),
@@ -11237,6 +11818,25 @@ mod tests {
                 cell,
                 super::super::LiveSubagents::new(),
             )
+        }
+
+        /// Drive a just-spawned background sub-agent to completion: await its
+        /// handle, then return the delivered result recorded on the registry.
+        async fn await_background(tool: &SubagentTool, ctx: &hrdr_tools::ToolContext) -> String {
+            let handle = tool
+                .bg_handles
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("a background task handle")
+                .1;
+            handle.await.expect("background task joins");
+            ctx.background_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|t| t.result.clone())
+                .unwrap_or_default()
         }
 
         fn read_events(
@@ -11271,16 +11871,19 @@ mod tests {
             .await;
             let cwd = tempfile::tempdir().unwrap();
             let live = LiveSubagents::new();
-            let cfg = test_cfg(server.base_url(), cwd.path());
+            let mut cfg = test_cfg(server.base_url(), cwd.path());
+            // Read-only: shares the cwd, so no git worktree is needed.
+            cfg.read_only = true;
             let runtime = super::super::new_delegation_runtime(
                 &cfg,
                 &super::super::ResolvedModel::from_config(&cfg),
             );
+            let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool = SubagentTool::new(
                 cfg,
                 runtime,
                 Vec::new(),
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                bg_handles.clone(),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
                 None,
                 None,
@@ -11288,26 +11891,31 @@ mod tests {
             );
             let ctx = hrdr_tools::ToolContext::new(cwd.path());
 
-            let out = tool
-                .execute(
-                    json!({"prompt": "p", "description": "probe", "background": false}),
-                    &ctx,
-                )
+            let ack = tool
+                .execute(json!({"prompt": "p", "description": "probe"}), &ctx)
                 .await
                 .unwrap();
-            assert!(out.contains("sub work done"));
+            assert!(ack.starts_with("Started background task"), "{ack}");
+            // Drive the detached task to completion.
+            let handle = bg_handles.lock().unwrap().pop().unwrap().1;
+            handle.await.unwrap();
 
-            // Retained and idle. Its answer *is* the tool result, so the main
-            // agent already has it — the entry is no longer owed.
+            // Retained and idle. A background sub-agent's answer is owed until the
+            // run loop delivers it, so it is NOT delivered yet.
             let (key, kind, running, done, delivered) = live.with(|v| {
                 assert_eq!(v.len(), 1, "the delegated sub-agent is registered");
                 let e = &v[0];
                 (e.key, e.kind, e.running, e.done, e.delivered)
             });
-            assert_eq!(kind, SubagentKind::Blocking);
-            assert!(!running && done && delivered);
+            assert_eq!(kind, SubagentKind::Background);
+            assert!(!running && done && !delivered, "done but still owed");
 
-            // Pinned (the user is viewing it) → kept, and still addressable.
+            // Undelivered → survives the prune even unpinned (its answer is owed).
+            live.prune();
+            assert_eq!(live.len(), 1, "an undelivered sub-agent is retained");
+
+            // Deliver it (what `drain_background` does), then it's freed unless pinned.
+            live.update(key, |e| e.delivered = true);
             live.update(key, |e| e.pinned = true);
             live.prune();
             assert_eq!(live.len(), 1, "a pinned sub-agent survives the prune");
@@ -11322,10 +11930,11 @@ mod tests {
             );
         }
 
-        /// A blocking sub-agent records Start (full prompt) → Text → End(ok), and
-        /// the file reads back as complete.
+        /// A sub-agent records Start (full prompt) → Text → End(ok), and the file
+        /// reads back as complete. Every task is background now, so drive it to
+        /// completion before reading the transcript.
         #[tokio::test]
-        async fn blocking_subagent_records_start_text_end_ok() {
+        async fn subagent_records_start_text_end_ok() {
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("c1", "sub work done"),
@@ -11337,16 +11946,20 @@ mod tests {
             let ts_dir = tempfile::tempdir().unwrap();
             let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
             let ctx = hrdr_tools::ToolContext::new(cwd.path());
-            let args =
-                json!({"prompt": "do the sub task", "description": "probe", "background": false});
+            let args = json!({"prompt": "do the sub task", "description": "probe"});
 
-            let out = tool.execute(args, &ctx).await.unwrap();
-            assert!(out.contains("sub work done"), "returns sub output: {out}");
+            let ack = tool.execute(args, &ctx).await.unwrap();
+            assert!(ack.starts_with("Started background task"), "{ack}");
+            let result = await_background(&tool, &ctx).await;
+            assert!(
+                result.contains("sub work done"),
+                "delivered result: {result}"
+            );
 
             let (path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Blocking, prompt, .. } if prompt == "do the sub task"),
-                "first event is a blocking Start with the full prompt: {:?}",
+                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
+                "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
             assert!(
@@ -11366,11 +11979,11 @@ mod tests {
             assert!(subagent_transcript::is_complete(&path));
         }
 
-        /// A blocking sub-agent whose model call fails records Error then
-        /// End(failed) — the failure cause is durable even though `execute`
-        /// returns the error.
+        /// A sub-agent whose model call fails records Error then End(failed) — the
+        /// failure cause is durable, and the failure text is delivered as the
+        /// task's result (spawning still succeeded, so `execute` returns Ok).
         #[tokio::test]
-        async fn blocking_subagent_failure_records_error_end_failed() {
+        async fn subagent_failure_records_error_end_failed() {
             use hrdr_tools::Tool;
             // 400 is non-transient, so the run errors on the first attempt.
             let server = MockServer::start(vec![MockResp::HttpError(400)]).await;
@@ -11378,10 +11991,15 @@ mod tests {
             let ts_dir = tempfile::tempdir().unwrap();
             let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
             let ctx = hrdr_tools::ToolContext::new(cwd.path());
-            let args = json!({"prompt": "will fail", "description": "probe", "background": false});
+            let args = json!({"prompt": "will fail", "description": "probe"});
 
-            let result = tool.execute(args, &ctx).await;
-            assert!(result.is_err(), "execute surfaces the sub-agent error");
+            let ack = tool.execute(args, &ctx).await.unwrap();
+            assert!(ack.starts_with("Started background task"), "{ack}");
+            let result = await_background(&tool, &ctx).await;
+            assert!(
+                result.contains("failed"),
+                "the failure is delivered as the result: {result}"
+            );
 
             let (path, events) = read_events(ts_dir.path());
             assert!(
@@ -11419,7 +12037,7 @@ mod tests {
             let ts_dir = tempfile::tempdir().unwrap();
             let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
             let ctx = hrdr_tools::ToolContext::new(cwd.path());
-            let args = json!({"prompt": "bg task", "description": "probe", "background": true});
+            let args = json!({"prompt": "bg task", "description": "probe"});
 
             let out = tool.execute(args, &ctx).await.unwrap();
             assert!(
@@ -11479,6 +12097,75 @@ mod tests {
                     }
                 ),
                 "ends ok: {events:?}"
+            );
+        }
+
+        /// Outside a git repo there are no worktrees, so a write-capable sub-agent
+        /// falls back to sharing the working dir (no worktree recorded) — and only
+        /// ONE may run at a time, or concurrent writers would collide.
+        #[tokio::test]
+        async fn write_delegation_without_git_shares_dir_and_serializes() {
+            use super::super::SubagentTool;
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "edited a file"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap(); // deliberately NOT a git repo
+            // Write-capable (test_cfg leaves read_only = false).
+            let cfg = test_cfg(server.base_url(), cwd.path());
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                bg_handles.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                None,
+                None,
+                super::super::LiveSubagents::new(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            // The writer spawns and shares the cwd — no worktree.
+            let ack = tool
+                .execute(json!({"prompt": "p", "description": "d"}), &ctx)
+                .await
+                .unwrap();
+            assert!(ack.starts_with("Started background task"), "{ack}");
+            assert!(
+                !ack.contains("worktree"),
+                "no worktree without a git repo: {ack}"
+            );
+            let handle = bg_handles.lock().unwrap().pop().unwrap().1;
+            handle.await.unwrap();
+            let recorded_worktree = ctx
+                .background_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == 1)
+                .and_then(|t| t.worktree.clone());
+            assert!(recorded_worktree.is_none(), "no worktree recorded");
+
+            // With one write slot held, a second writer is refused (limit 1).
+            let _held = tool
+                .slots
+                .acquire(true, 1)
+                .expect("take the single write slot");
+            let err = tool
+                .execute(json!({"prompt": "p2", "description": "d2"}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not a git repo"),
+                "serialized with a helpful hint: {err}"
             );
         }
     } // mod mock_server

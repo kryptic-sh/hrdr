@@ -41,6 +41,28 @@ fn subagent_scroll(items: usize, height: u16) -> u16 {
     (items as u16).saturating_sub(height)
 }
 
+/// TODO-panel sort order by status: the one in progress on top, the not-yet-
+/// started (pending) ones in the middle, the completed ones at the bottom.
+fn todo_sort_key(status: &str) -> u8 {
+    match status {
+        "in_progress" => 0,
+        "completed" => 2,
+        _ => 1,
+    }
+}
+
+/// Agent-panel sort order: the main agent on top, the still-running (or idle)
+/// sub-agents in the middle, the finished (Done) ones at the bottom.
+fn agent_sort_key(row: &hrdr_app::PaneRow) -> u8 {
+    if row.id.is_main() {
+        0
+    } else if row.status == hrdr_app::PaneStatus::Done {
+        2
+    } else {
+        1
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
@@ -54,13 +76,17 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // the renderer both use the same snapshot.
     // The TODO list belongs to the agent on screen — every agent has its own, and
     // the `todo` tool a sub-agent calls writes to *its* list, not the main one's.
-    let todos = app
+    let mut todos = app
         .panes
         .active_pane()
         .todos
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
+    // Sort for the panel: the one being worked on (in_progress) at the top, then
+    // the not-yet-started (pending) ones, then the completed ones at the bottom.
+    // Stable, so items keep their relative order within each group.
+    todos.sort_by_key(|t| todo_sort_key(&t.status));
     let todo_height = if todos.is_empty() {
         0
     } else {
@@ -90,11 +116,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // The switcher lists every agent — main first, so there is always a way back.
     // It stays hidden while the main agent is the only one: a one-row list of the
     // thing you are already looking at is noise.
-    let subagent_items: Vec<hrdr_app::PaneRow> = if app.panes.show_switcher() {
+    let mut subagent_items: Vec<hrdr_app::PaneRow> = if app.panes.show_switcher() {
         hrdr_app::pane_rows(&app.panes)
     } else {
         Vec::new()
     };
+    // Sort the agent list: the main agent on top (always the way back), then the
+    // still-running sub-agents, then the finished (Done) ones at the bottom.
+    // Stable, so agents keep their spawn order within each group.
+    subagent_items.sort_by_key(agent_sort_key);
     let subagent_height = subagent_panel_height(&subagent_items);
 
     // Build the row stack dynamically, remembering each section's index. Every
@@ -111,8 +141,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         })
     };
     let loader_idx = section(&mut constraints, loader_height);
-    let subagent_idx = section(&mut constraints, subagent_height);
+    // TODO list first, then the agent list below it.
     let todo_idx = section(&mut constraints, todo_height);
+    let subagent_idx = section(&mut constraints, subagent_height);
     let input_idx = section(&mut constraints, input_height).expect("the input pane always renders");
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
     // renders as a block, so it carries the same padding as the transcript's —
@@ -2902,8 +2933,61 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod subagent_tests {
-    use super::{SUBAGENT_PANEL_MAX_ROWS, subagent_panel_height, subagent_scroll};
+    use super::{
+        SUBAGENT_PANEL_MAX_ROWS, agent_sort_key, subagent_panel_height, subagent_scroll,
+        todo_sort_key,
+    };
     use hrdr_app::{PaneId, PaneRow, PaneStatus};
+
+    /// The TODO panel groups by status: in-progress on top, pending in the
+    /// middle, completed at the bottom — and stable within each group.
+    #[test]
+    fn todos_sort_in_progress_then_pending_then_done() {
+        let mut rows = [
+            ("done a", "completed"),
+            ("pending a", "pending"),
+            ("active", "in_progress"),
+            ("done b", "completed"),
+            ("pending b", "pending"),
+        ];
+        rows.sort_by_key(|(_, status)| todo_sort_key(status));
+        let order: Vec<&str> = rows.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            order,
+            vec!["active", "pending a", "pending b", "done a", "done b"]
+        );
+    }
+
+    /// The agent panel groups: main on top, running/idle in the middle, finished
+    /// (Done) at the bottom — stable within each group.
+    #[test]
+    fn agents_sort_main_then_running_then_done() {
+        let row = |id: PaneId, status: PaneStatus| PaneRow {
+            id,
+            title: String::new(),
+            status,
+            active: false,
+        };
+        let mut rows = [
+            row(PaneId::Sub(1), PaneStatus::Done),
+            row(PaneId::Sub(2), PaneStatus::Running),
+            row(PaneId::Main, PaneStatus::Idle),
+            row(PaneId::Sub(3), PaneStatus::Idle),
+            row(PaneId::Sub(4), PaneStatus::Done),
+        ];
+        rows.sort_by_key(agent_sort_key);
+        let order: Vec<PaneId> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(
+            order,
+            vec![
+                PaneId::Main,
+                PaneId::Sub(2), // running
+                PaneId::Sub(3), // idle (not finished) stays with the middle group
+                PaneId::Sub(1), // done
+                PaneId::Sub(4),
+            ]
+        );
+    }
 
     fn items(n: usize) -> Vec<PaneRow> {
         (0..n)
