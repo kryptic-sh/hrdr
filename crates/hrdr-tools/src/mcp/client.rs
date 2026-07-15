@@ -194,18 +194,19 @@ impl McpClient {
             let pending = pending.clone();
             tokio::spawn(async move {
                 let mut stream = resp.bytes_stream();
-                let mut connection_bytes = 0usize;
                 // Use the shared SseDecoder for byte-safe incremental parsing:
                 // raw bytes are fed directly (no lossy UTF-8 conversion), and
                 // the decoder handles chunk boundaries including mid-codepoint
                 // splits via per-line buffering.
                 let mut decoder = SseDecoder::new();
+                // Per-message cap: bytes buffered since the last complete event.
+                // Reset to 0 on every successful drain, so it bounds a single
+                // oversized message — NOT the stream's whole lifetime. (A
+                // cumulative cap here would silently retire the long-lived SSE
+                // channel mid-session once total traffic crossed the limit,
+                // dropping every waiter and wedging the server.)
                 let mut undecoded_bytes = 0usize;
                 while let Some(Ok(chunk)) = stream.next().await {
-                    connection_bytes = connection_bytes.saturating_add(chunk.len());
-                    if connection_bytes > super::MAX_MCP_MESSAGE_BYTES {
-                        break;
-                    }
                     undecoded_bytes = undecoded_bytes.saturating_add(chunk.len());
                     if undecoded_bytes > super::MAX_MCP_MESSAGE_BYTES {
                         break;
