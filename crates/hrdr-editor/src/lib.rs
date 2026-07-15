@@ -21,6 +21,10 @@ mod plain;
 
 use hjkl_buffer_tui::{BufferView, Gutter};
 use hjkl_engine::{CoarseMode, Editor, Host, Options};
+// `buffer_selection`/`vim_mode`/`visual_anchor` moved from inherent `Editor`
+// methods into this extension trait (hjkl 0.33.6); bring it into scope to call
+// them.
+use hjkl_vim::VimEditorExt;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
