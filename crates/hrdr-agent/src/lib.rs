@@ -4012,22 +4012,12 @@ struct Worktree {
 impl Drop for Worktree {
     fn drop(&mut self) {
         if self.cleaned {
-            return; // already handled by finish() or a previous drop
+            return; // already handled by keep() or a previous drop
         }
-        // Best-effort synchronous cleanup for a worktree abandoned by a
-        // cancelled future. `--force` removes even if the index is dirty
-        // (the parent turn was interrupted, so no commit was made).
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["branch", "-D", &self.branch])
-            .output();
+        // Best-effort synchronous cleanup for a worktree abandoned before it was
+        // kept (a cancelled future). `remove_worktree` double-forces, so it clears
+        // the lock this process placed at creation.
+        remove_worktree(&self.repo, &self.path, &self.branch);
     }
 }
 
@@ -4089,6 +4079,19 @@ impl Worktree {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        // Lock the worktree, tagging the lock with this process's pid. A lock stops
+        // any sweep (`git worktree prune`, this or another hrdr instance's startup
+        // GC) from removing it while it is live; the pid lets a later sweep tell a
+        // still-running owner (skip it) from a crashed one (stale lock → reclaim).
+        // Best-effort — a failed lock just means less protection.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "lock", "--reason"])
+            .arg(format!("hrdr:pid={}", std::process::id()))
+            .arg(&path)
+            .output()
+            .await;
         Ok(Self {
             repo: repo.to_path_buf(),
             path,
@@ -4192,10 +4195,13 @@ fn worktree_has_changes_sync(repo: &std::path::Path, path: &std::path::Path, bra
 /// [`Agent::abort_background_tasks`] for a worktree with no unreviewed work.
 /// Synchronous so it can run from non-async cleanup paths.
 fn remove_worktree(repo: &std::path::Path, path: &std::path::Path, branch: &str) {
+    // `--force --force`: the first overrides the "has modifications" guard, the
+    // second overrides the lock (this is an explicit, owner-driven removal, so the
+    // lock has served its purpose). A single `--force` refuses a locked worktree.
     let _ = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["worktree", "remove", "--force"])
+        .args(["worktree", "remove", "--force", "--force"])
         .arg(path)
         .output();
     let _ = std::process::Command::new("git")
@@ -4219,14 +4225,38 @@ async fn prune_stale_worktrees(repo: &std::path::Path) {
         .await;
 }
 
+/// Whether process `pid` is still alive, so a lock tagged with it can be told
+/// apart from a crashed owner's stale lock. `kill -0` on unix (0 = alive);
+/// conservative `true` elsewhere and on any error, so a live worktree is never
+/// reclaimed by mistake — the cost is only that a crash orphan lingers.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Sweep leftover sub-agent worktrees under `.hrdr/worktrees/`: remove the CLEAN
 /// ones — a finished/merged task, or an orphan left when a previous run exited —
 /// and KEEP any with unreviewed changes (uncommitted files or unmerged commits),
 /// same rule as `task_cancel`/reset. Only touches worktrees on the
 /// `.hrdr/worktrees` path; other worktrees the user made are left alone.
 ///
-/// Meant to run once at MAIN-agent startup, when this process owns no worktrees
-/// yet, so it never removes a live one. Synchronous + best-effort.
+/// A LIVE worktree is protected by its `git worktree lock`: if the lock's
+/// `hrdr:pid=N` owner is still running, the entry is skipped, so a second hrdr
+/// instance (or this one, later, if ever run in-session) never deletes a
+/// worktree out from under a running sub-agent. Only a stale lock (dead owner) or
+/// an unlocked entry is eligible. Runs `git worktree prune` and reaps orphaned
+/// `hrdr/task-*` branches too. Synchronous + best-effort.
 fn gc_worktrees(repo: &std::path::Path) {
     let Ok(out) = std::process::Command::new("git")
         .arg("-C")
@@ -4242,26 +4272,80 @@ fn gc_worktrees(repo: &std::path::Path) {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
+    let mut lock: Option<Option<u32>> = None; // Some(pid?) once a `locked` line is seen
     // `--porcelain` emits one block per worktree, blocks separated by a blank
     // line: `worktree <path>` / `HEAD <sha>` / `branch refs/heads/<name>` (or
-    // `detached`). Flush on each blank line, plus a final sentinel for the last.
+    // `detached`) / optional `locked [<reason>]`. Flush on each blank line, plus a
+    // final sentinel for the last block.
     for line in text.lines().chain(std::iter::once("")) {
         if line.is_empty() {
             if let (Some(p), Some(b)) = (path.take(), branch.take()) {
                 let ours = p.components().any(|c| c.as_os_str() == ".hrdr")
                     && p.components().any(|c| c.as_os_str() == "worktrees");
-                if ours && p.exists() && !worktree_has_changes_sync(repo, &p, &b) {
+                // A lock whose owning pid is still alive means the worktree is
+                // live in some hrdr process — never touch it.
+                let live_lock = matches!(lock, Some(Some(pid)) if pid_alive(pid));
+                if ours && p.exists() && !live_lock && !worktree_has_changes_sync(repo, &p, &b) {
                     remove_worktree(repo, &p, &b);
                 }
             }
-            // A detached worktree (no branch line) or a partial block is skipped.
             path = None;
             branch = None;
+            lock = None;
         } else if let Some(rest) = line.strip_prefix("worktree ") {
             path = Some(PathBuf::from(rest));
         } else if let Some(rest) = line.strip_prefix("branch ") {
             branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+        } else if let Some(rest) = line.strip_prefix("locked") {
+            // `locked hrdr:pid=N` (or bare `locked`). Extract the pid if present.
+            let pid = rest
+                .trim()
+                .strip_prefix("hrdr:pid=")
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            lock = Some(pid);
         }
+    }
+    // Drop worktree metadata for checkouts whose directory is gone, then reap
+    // orphaned scratch branches. `git branch -d` (lowercase) only deletes a fully
+    // MERGED branch and refuses one with unreviewed commits, and it can't touch a
+    // branch still checked out by a kept worktree — so this never loses work.
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+    reap_orphan_task_branches(repo);
+}
+
+/// `git branch -d` every `hrdr/task-*` branch: git deletes only the fully-merged,
+/// not-checked-out ones and safely refuses the rest, so crash-orphaned scratch
+/// branches don't pile up. Best-effort.
+fn reap_orphan_task_branches(repo: &std::path::Path) {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/hrdr/task-*",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    for b in String::from_utf8_lossy(&out.stdout).lines() {
+        let b = b.trim();
+        if b.is_empty() {
+            continue;
+        }
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "-d", b])
+            .output();
     }
 }
 
@@ -10091,13 +10175,17 @@ mod tests {
             return;
         }
 
-        // Two orphaned worktrees (kept so they persist on disk like a crashed run).
+        // Two orphaned worktrees (kept so they persist on disk like a crashed
+        // run). Unlock them so they look like a *previous, dead* session — a live
+        // lock (this process's pid) would correctly protect them from the sweep.
         let clean = Worktree::create(repo).await.unwrap().keep();
         let clean_path = clean.path.clone();
         let dirty_wt = Worktree::create(repo).await.unwrap();
         std::fs::write(dirty_wt.path.join("new.txt"), "x").unwrap();
         let dirty = dirty_wt.keep();
         let dirty_path = dirty.path.clone();
+        git(&["worktree", "unlock", &clean_path.to_string_lossy()]);
+        git(&["worktree", "unlock", &dirty_path.to_string_lossy()]);
         assert!(clean_path.exists() && dirty_path.exists());
 
         gc_worktrees(repo);
@@ -10106,6 +10194,45 @@ mod tests {
         assert!(
             dirty_path.exists(),
             "gc keeps a worktree with unreviewed changes"
+        );
+    }
+
+    /// A worktree whose lock names a still-running owner is protected from the
+    /// sweep — even a clean one is left alone, so a concurrent hrdr instance can't
+    /// delete a worktree out from under a live sub-agent.
+    #[tokio::test]
+    async fn gc_skips_live_locked_worktree() {
+        use super::{Worktree, gc_worktrees};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        // Clean, but locked by THIS (running) process — create() locks with our
+        // live pid, so the sweep must leave it alone.
+        let wt = Worktree::create(repo).await.unwrap().keep();
+        let path = wt.path.clone();
+
+        gc_worktrees(repo);
+
+        assert!(
+            path.exists(),
+            "a live-locked worktree is protected from the sweep"
         );
     }
 
