@@ -902,9 +902,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
+        // A real file OUTSIDE the project, given by absolute path — absolute and
+        // outside on every platform (a bare "/etc/passwd" is not absolute on
+        // Windows and would resolve inside the current drive instead).
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "x").unwrap();
         let mut host = TestHost::new(root);
 
-        assert!(dispatch(&mut host, "/add /etc/passwd"));
+        assert!(dispatch(&mut host, &format!("/add {}", outside.display())));
         assert!(
             host.info_log
                 .iter()

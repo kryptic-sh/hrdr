@@ -1942,8 +1942,13 @@ b:2:y"
     #[test]
     fn canonicalize_nearest_removes_dotdot_within_unresolved_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        // cwd with a known-existing subdirectory to make the exercise realistic.
-        let cwd = dir.path().join("project");
+        // Canonicalize the temp root so both sides of the comparisons share the
+        // real ancestor form: resolves the macOS `/var` → `/private/var` symlink
+        // and matches the `\\?\` verbatim prefix `std::fs::canonicalize` adds on
+        // Windows (`canonicalize_nearest` canonicalizes the existing ancestor). A
+        // no-op on Linux.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cwd = root.join("project");
         std::fs::create_dir_all(&cwd).unwrap();
 
         // Path where the unresolved suffix contains `..` that would escape
@@ -1958,8 +1963,8 @@ b:2:y"
         );
         // The result should be inside the tempdir parent (one level above cwd).
         assert!(
-            canon.starts_with(dir.path()),
-            "escaped path {canon:?} must resolve within the temp root {dir:?}"
+            canon.starts_with(&root),
+            "escaped path {canon:?} must resolve within the temp root {root:?}"
         );
     }
 
@@ -1985,7 +1990,10 @@ b:2:y"
     #[test]
     fn canonicalize_nearest_resolves_dotdot_in_middle_of_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
+        // Canonical root so the expected path matches `canonicalize_nearest`'s
+        // resolved ancestor on macOS (`/private`) and Windows (`\\?\`). No-op on
+        // Linux.
+        let cwd = std::fs::canonicalize(dir.path()).unwrap().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
         // `sub` doesn't exist, but `../other` inside the unresolved suffix
         // should resolve to just `other` at cwd level.
@@ -2157,8 +2165,13 @@ b:2:y"
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
+        // A real file OUTSIDE cwd, referenced by its absolute path — absolute and
+        // outside on every platform (a bare "/etc/passwd" is not absolute on
+        // Windows, where it would resolve *inside* the current drive/cwd instead).
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "x").unwrap();
 
-        let err = validate_attach_path("/etc/passwd", &cwd).unwrap_err();
+        let err = validate_attach_path(&outside.to_string_lossy(), &cwd).unwrap_err();
         assert!(
             err.to_string().contains("outside the working directory"),
             "expected outside-cwd error, got: {err}"
