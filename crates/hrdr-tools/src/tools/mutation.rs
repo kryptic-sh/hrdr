@@ -87,6 +87,10 @@ pub(crate) async fn atomic_write(path: &Path, content: &str) -> std::io::Result<
 /// Write `content` to a sibling temp file, fsync it, apply `perms` (if any), and
 /// rename it over `path`. Any error removes the temp file so a failed write
 /// leaves no `.hrdr-tmp` litter behind.
+/// Process-wide counter giving each temp file a unique name (paired with the
+/// PID), so concurrent writes to one path never collide on the same temp.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn write_via_temp(
     path: &Path,
     content: &str,
@@ -96,9 +100,12 @@ async fn write_via_temp(
 
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     // Same directory as the target, so the final `rename` is intra-filesystem
-    // (hence atomic). `std::process::id()` keeps the name deterministic — no
-    // random/time API, which this codebase's scripts can't rely on.
-    let tmp = path.with_file_name(format!(".{name}.hrdr-tmp-{}", std::process::id()));
+    // (hence atomic). PID keeps the name predictable and a process-wide counter
+    // makes it unique per call — two concurrent writes to the *same* path must
+    // not share a temp name, or one would truncate the other's in-flight file
+    // and the renames would race. No random/time API (deterministic).
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.hrdr-tmp-{}-{seq}", std::process::id()));
 
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await?;
