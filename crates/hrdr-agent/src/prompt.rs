@@ -717,6 +717,38 @@ mod tests {
         );
     }
 
+    /// A delegator is told to scope work before handing it off (investigate, or
+    /// use `explore`), to read the whole diff before merging, and to verify
+    /// findings that don't sound right.
+    #[test]
+    fn the_delegation_guidance_scopes_and_verifies() {
+        let mut env = Environment::new();
+        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
+        let p = env
+            .get_template("system")
+            .unwrap()
+            .render(context! {
+                cwd => "/tmp/x", os => "test", tool_names => "task, models",
+                can_write => true, can_delegate => true, is_subagent => false,
+                has_bash => true, has_powershell => false,
+                instructions => None::<&str>,
+            })
+            .unwrap();
+        // Investigate/scope before delegating mechanical work.
+        assert!(p.contains("Scope the work before you hand it off"), "{p}");
+        assert!(p.contains("delegate the investigation to `explore`"), "{p}");
+        assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
+        // Read the ENTIRE diff before merging, review it like a PR.
+        assert!(
+            p.contains("read the **entire** `git -C <path> diff` before you merge"),
+            "{p}"
+        );
+        assert!(p.contains("review it like a PR"), "{p}");
+        // Trust but verify the findings of read-only agents, too.
+        assert!(p.contains("Trust but verify the **findings**"), "{p}");
+        assert!(p.contains("against the code yourself"), "{p}");
+    }
+
     #[test]
     fn system_prompt_appends_project_instructions() {
         let tools = ToolRegistry::with_defaults();

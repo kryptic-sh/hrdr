@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **System prompt: sharper delegation discipline.** An agent that delegates is
+  now told to scope the work before handing it off — gather the exact files,
+  symbols, and before→after itself, or delegate the investigation to `explore`
+  first, then give the coder sub-agent a precise brief (investigate, THEN
+  delegate). On the way back it's "trust but verify" in full: read the
+  **entire** diff before merging a write sub-agent's worktree (review it like a
+  PR, not just that commits exist), and spot-check an `explore`/`review`
+  sub-agent's findings against the code before acting on anything that matters
+  or doesn't sound right.
 - **System prompt: stronger daily-driver coding defaults.** A shell-capable
   agent is now told to discover the project's own commands (`package.json`
   scripts, `Makefile`/`justfile`, `CONTRIBUTING.md`, CI) instead of guessing,
