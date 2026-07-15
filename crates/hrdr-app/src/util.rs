@@ -112,20 +112,16 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
         if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
             continue;
         }
-        // Validate — skip unreadable, out-of-cwd, or secret paths gracefully
-        // (the mention stays in the display copy; only the sent copy omits it).
-        let Ok(path) = hrdr_tools::validate_attach_path(rel, cwd) else {
+        let Ok(text) = hrdr_tools::read_attach_file(rel, cwd) else {
             continue;
         };
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let text = if text.len() > MAX_ATTACH_BYTES {
-                let end = floor_char_boundary(&text, MAX_ATTACH_BYTES);
-                format!("{}\n…[truncated]", &text[..end])
-            } else {
-                text
-            };
-            attached.push((rel.to_string(), text));
-        }
+        let text = if text.len() > MAX_ATTACH_BYTES {
+            let end = floor_char_boundary(&text, MAX_ATTACH_BYTES);
+            format!("{}\n…[truncated]", &text[..end])
+        } else {
+            text
+        };
+        attached.push((rel.to_string(), text));
     }
     if attached.is_empty() {
         return input.to_string();

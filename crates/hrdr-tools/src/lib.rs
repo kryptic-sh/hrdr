@@ -472,6 +472,39 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
     result
 }
 
+/// Open and read a file that is safe to attach to a model request.
+///
+/// The file handle is opened before validation and read through that same handle,
+/// preventing the validated path from being replaced between validation and read.
+pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let resolved = resolve_under(cwd, path_str);
+    let mut file = std::fs::File::open(&resolved)
+        .map_err(|e| anyhow::anyhow!("can't open {}: {e}", resolved.display()))?;
+    let canon = validate_attach_path(path_str, cwd)?;
+
+    // On Unix, prove the opened descriptor is the same object canonicalization
+    // validated. If any path component changed during validation, reject it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let validated = std::fs::metadata(&canon)?;
+        if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
+            anyhow::bail!(
+                "{} changed while it was being validated",
+                resolved.display()
+            );
+        }
+    }
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| anyhow::anyhow!("can't read {}: {e}", resolved.display()))?;
+    Ok(text)
+}
+
 /// Validate that a file path is safe to attach (read and share with the model).
 ///
 /// `path_str` is the user-provided path (e.g., from `@file.txt` or `/add file.txt`).

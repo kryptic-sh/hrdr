@@ -279,8 +279,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info("usage: /add <file>".to_string());
                 return true;
             }
-            let path = match hrdr_tools::validate_attach_path(&arg, &host.cwd()) {
-                Ok(p) => p,
+            let content = match hrdr_tools::read_attach_file(&arg, &host.cwd()) {
+                Ok(content) => content,
                 Err(e) => {
                     host.info(format!("can't add {arg}: {e}"));
                     return true;
@@ -290,29 +290,17 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             // `MAX_ATTACH_BYTES` and truncates; `/add` names one file
             // explicitly, so silently truncating it would be more confusing
             // than useful — reject it with a clear error instead.
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.len() as usize > crate::MAX_ATTACH_BYTES => {
-                    host.info(format!(
-                        "{arg} is {} KiB, over the {} KiB /add limit — too large to attach",
-                        meta.len() / 1024,
-                        crate::MAX_ATTACH_BYTES / 1024,
-                    ));
-                    return true;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    host.info(format!("can't read {arg}: {e}"));
-                    return true;
-                }
+            if content.len() > crate::MAX_ATTACH_BYTES {
+                host.info(format!(
+                    "{arg} is {} KiB, over the {} KiB /add limit — too large to attach",
+                    content.len() / 1024,
+                    crate::MAX_ATTACH_BYTES / 1024,
+                ));
+                return true;
             }
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let n = content.lines().count();
-                    host.prepend_input(format!("`{arg}`:\n```\n{content}\n```\n\n"));
-                    host.info(format!("added {arg} ({n} lines) to the input"));
-                }
-                Err(e) => host.info(format!("can't read {arg}: {e}")),
-            }
+            let n = content.lines().count();
+            host.prepend_input(format!("`{arg}`:\n```\n{content}\n```\n\n"));
+            host.info(format!("added {arg} ({n} lines) to the input"));
         }
         "paste" => {
             let Some(text) = host.read_clipboard().filter(|t| !t.is_empty()) else {
