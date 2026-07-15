@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **External tool output is now wrapped as untrusted data.** A fetched web page,
+  a search result, and a third-party MCP server's output are the classic
+  prompt-injection vectors — text in them that says "ignore your instructions"
+  or "run …" is data, not a command. `fetch`, `search`, and MCP results are now
+  wrapped in an `<untrusted-content source="…">` envelope (reinforcing the
+  standing system-prompt rule with a machine-clear per-payload boundary), and
+  the payload's own literal closing tag is neutralized so hostile content can't
+  forge the boundary to "escape" it. Local shell/git output is left unwrapped —
+  wrapping every command's stdout would be noise, and it's the model's own
+  workflow data, not a third party's.
 - **The `git` tool no longer leaks credential/secret files.** `read`/`grep`
   refuse `.env`, `id_rsa`, `~/.aws/credentials` and the like, but
   `git show HEAD:.env`, `git blame .env`, and any `diff`/`log -p`/`show` that

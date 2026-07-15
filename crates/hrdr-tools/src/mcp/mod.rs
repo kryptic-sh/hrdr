@@ -334,11 +334,13 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let echo = by("echo");
         assert!(echo.read_only());
         assert!(echo.description().contains("Echo"));
-        assert_eq!(
+        // Output is wrapped in an <untrusted-content> envelope (a third-party MCP
+        // server is external data), so assertions check for the inner payload.
+        assert!(
             echo.execute(json!({ "text": "hi there" }), &ctx)
                 .await
-                .unwrap(),
-            "echo: hi there"
+                .unwrap()
+                .contains("echo: hi there")
         );
 
         // A non-read-only tool that reports `isError` → `execute` surfaces it.
@@ -356,7 +358,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 
         // Non-text (image) tool content is noted, not dumped inline.
         let pic = by("pic").execute(json!({}), &ctx).await.unwrap();
-        assert_eq!(pic, "[image content omitted]");
+        assert!(pic.contains("[image content omitted]"), "{pic}");
 
         // Concurrent calls are routed back to the right caller by id.
         let outs = futures_util::future::join_all((0..8).map(|n| {
@@ -370,7 +372,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         }))
         .await;
         for (n, out) in outs.iter().enumerate() {
-            assert_eq!(*out, format!("echo: n{n}"));
+            assert!(out.contains(&format!("echo: n{n}")), "{out}");
         }
 
         let listed = by("list_resources").execute(json!({}), &ctx).await.unwrap();
@@ -379,13 +381,13 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             .execute(json!({ "uri": "file:///readme" }), &ctx)
             .await
             .unwrap();
-        assert_eq!(read, "resource body for file:///readme");
+        assert!(read.contains("resource body for file:///readme"), "{read}");
         // A binary (blob) resource is noted, not dumped.
         let blob = by("read_resource")
             .execute(json!({ "uri": "blob://logo" }), &ctx)
             .await
             .unwrap();
-        assert_eq!(blob, "[binary resource content omitted]");
+        assert!(blob.contains("[binary resource content omitted]"), "{blob}");
 
         let prompts = by("list_prompts").execute(json!({}), &ctx).await.unwrap();
         assert!(prompts.contains("greet(who)"), "prompts: {prompts}");
@@ -396,7 +398,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             )
             .await
             .unwrap();
-        assert_eq!(rendered, "user: Hello Sam");
+        assert!(rendered.contains("user: Hello Sam"), "{rendered}");
     }
 
     // The MCP client is cross-platform; these end-to-end tests are unix-only to
@@ -439,7 +441,13 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         // later requests: `whoami` echoes back the session id it saw.
         let ctx = ToolContext::new(".");
         let whoami = tools.iter().find(|t| t.name() == "http_whoami").unwrap();
-        assert_eq!(whoami.execute(json!({}), &ctx).await.unwrap(), "sess-1");
+        assert!(
+            whoami
+                .execute(json!({}), &ctx)
+                .await
+                .unwrap()
+                .contains("sess-1")
+        );
         exercise_all("http", tools).await;
     }
 
@@ -515,13 +523,19 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             let want = format!("empty_{suffix}");
             tools.iter().find(|t| t.name() == want).cloned().unwrap()
         };
-        assert_eq!(
-            by("list_resources").execute(json!({}), &ctx).await.unwrap(),
-            "(no resources)"
+        assert!(
+            by("list_resources")
+                .execute(json!({}), &ctx)
+                .await
+                .unwrap()
+                .contains("(no resources)")
         );
-        assert_eq!(
-            by("list_prompts").execute(json!({}), &ctx).await.unwrap(),
-            "(no prompts)"
+        assert!(
+            by("list_prompts")
+                .execute(json!({}), &ctx)
+                .await
+                .unwrap()
+                .contains("(no prompts)")
         );
     }
 
@@ -560,9 +574,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             .execute(json!({ "text": "round-trip" }), &ctx)
             .await
             .unwrap();
-        assert_eq!(
-            result, "echo: round-trip",
-            "tools/call must relay the server's content verbatim"
+        assert!(
+            result.contains("echo: round-trip"),
+            "tools/call must relay the server's content verbatim: {result}"
         );
     }
 

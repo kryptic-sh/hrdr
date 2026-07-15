@@ -64,6 +64,11 @@ impl Tool for McpTool {
                 self.client.get_prompt(name, arguments).await?
             }
         };
-        Ok(truncate(&out, ctx.max_output))
+        // A third-party MCP server's output is external, untrusted data — wrap
+        // it so injected "instructions" can't be mistaken for the harness's own.
+        Ok(crate::wrap_untrusted(
+            &format!("mcp tool {}", self.exposed_name),
+            &truncate(&out, ctx.max_output),
+        ))
     }
 }
