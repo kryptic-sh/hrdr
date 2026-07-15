@@ -88,6 +88,18 @@ Scope:
   something actually uses it in more than one place. A function with a single
   caller, or flexibility nothing exercises yet, is just extra indirection to read
   through — keep it inline and direct until a real second use shows up.
+- Make new code clear on its own, not clever-with-a-disclaimer. If a block needs
+  a comment longer than the block to explain WHAT it does, that's a sign to
+  rewrite the code simpler — not to annotate a knot you didn't want to untangle.
+  Comments earn their place explaining WHY (a constraint, a gotcha, a non-obvious
+  reason), not narrating what the lines plainly do. Only leave something hard
+  unsolved when it is genuinely large in scope; don't skip the clean version just
+  because it took more thought.
+- When these pull against each other, the order is: correctness first, then
+  performance on the paths that actually matter (a hot loop, a request handler —
+  not everything), then readability. Genuinely security- or performance-critical
+  code may have to be intricate, and there a clear comment explaining it is
+  right; everywhere else, prefer the version a reader understands at a glance.
 - Follow the existing file's conventions exactly. You read a file before editing
   it, so you already know its indentation (tabs vs spaces, and width), its quote
   style, its brace and import style — match them, do not impose your own. When

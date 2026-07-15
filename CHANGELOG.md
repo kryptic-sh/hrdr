@@ -20,7 +20,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   finishing. Factor out repetition only when it's real — call existing code
   instead of copying it, and pull shared logic into one helper the moment a
   second place needs it, but don't build a helper or a "for later" abstraction
-  for a single caller.
+  for a single caller. Write code that's clear on its own rather than
+  clever-behind-a-long-comment — a comment longer than the code it explains is a
+  sign to simplify the code, and comments should say WHY, not narrate WHAT. When
+  goals conflict, the order is correctness → performance on the paths that
+  matter → readability (security/perf-critical code may be intricate; everywhere
+  else, prefer the version a reader gets at a glance).
 - **System prompt: sharper delegation discipline.** An agent that delegates is
   now told to scope the work before handing it off — gather the exact files,
   symbols, and before→after itself, or delegate the investigation to `explore`

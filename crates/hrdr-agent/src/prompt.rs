@@ -565,6 +565,10 @@ mod tests {
             "{p}"
         );
         assert!(p.contains("don't abstract ahead of need"), "{p}");
+        // Clear code over clever-with-a-disclaimer; a comment longer than the
+        // code is a smell. And the priority order when they conflict.
+        assert!(p.contains("a comment longer than the block"), "{p}");
+        assert!(p.contains("the order is: correctness first"), "{p}");
         assert!(p.contains("Write secure code"), "{p}");
         assert!(p.contains("you own its callers"), "{p}");
         assert!(p.contains("Don't hand-edit generated files"), "{p}");
