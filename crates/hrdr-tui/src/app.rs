@@ -1574,12 +1574,6 @@ impl App {
         crate::ui::clear_transcript_cache();
     }
 
-    /// Truncate the transcript to `len`.
-    fn truncate_transcript(&mut self, len: usize) {
-        self.panes.main_mut().transcript_mut().truncate(len);
-        crate::ui::clear_transcript_cache();
-    }
-
     /// The tools' current working directory (agent's, or the process cwd while
     /// a turn holds the agent lock).
     fn current_cwd(&self) -> String {

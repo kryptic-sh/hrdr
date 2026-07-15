@@ -1,12 +1,11 @@
 //! Guarded file operations: `move`, `delete`, `copy`.
 //!
 //! The shells can already do all three, but a shell mutation escapes the safety
-//! nets the file tools sit behind: it is not checkpointed (so `/undo` can't
-//! revert it) and it is not held to a sub-agent's `write_ext` allow-list. These
-//! tools route the same operations through [`ToolContext::ensure_writable_ext`]
-//! and [`ToolContext::checkpoint`], which also makes them available to sub-agents
-//! that have no shell at all (`plan` writes markdown, and can now rename and
-//! delete it).
+//! net the file tools sit behind: it is not held to a sub-agent's `write_ext`
+//! allow-list. These tools route the same operations through
+//! [`ToolContext::ensure_writable_ext`], which also makes them available to
+//! sub-agents that have no shell at all (`plan` writes markdown, and can now
+//! rename and delete it).
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -77,7 +76,7 @@ impl Tool for MoveTool {
     fn description(&self) -> &'static str {
         "Rename or relocate a file or directory. Parent directories of the destination are \
          created as needed. Refuses to clobber an existing destination unless `overwrite` is \
-         true. Prefer this over `bash mv`: it is undoable and confined to the project."
+         true. Prefer this over `bash mv`: it validates the operation and reports what changed."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -106,22 +105,6 @@ impl Tool for MoveTool {
                 "{} already exists — pass overwrite: true to replace it",
                 to.display()
             );
-        }
-        // Both sides are checkpointed: undo has to restore the source *and* undo
-        // the clobbering of an overwritten destination.
-        if from.is_dir() {
-            ctx.checkpoint_tree(&from)?;
-        } else {
-            ctx.checkpoint(&from);
-        }
-        if dest_exists {
-            if to.is_dir() {
-                ctx.checkpoint_tree(&to)?;
-            } else {
-                ctx.checkpoint(&to);
-            }
-        } else {
-            ctx.checkpoint_missing(&to)?;
         }
         if let Some(parent) = to.parent() {
             tokio::fs::create_dir_all(parent)
@@ -309,7 +292,7 @@ impl Tool for DeleteTool {
     }
     fn description(&self) -> &'static str {
         "Delete a file, or a directory with `recursive: true`. A file must have been read \
-         first. Prefer this over `bash rm`: it is undoable and confined to the project."
+         first. Prefer this over `bash rm`: it validates the operation and reports what changed."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -333,7 +316,6 @@ impl Tool for DeleteTool {
                     path.display()
                 );
             }
-            ctx.checkpoint_tree(&path)?;
             let count = walk_files(&path).await?.len();
             guard_victim(ctx, &path, "delete").await?;
             tokio::fs::remove_dir_all(&path)
@@ -345,7 +327,6 @@ impl Tool for DeleteTool {
                 if count == 1 { "" } else { "s" }
             ))
         } else {
-            ctx.checkpoint(&path);
             guard_victim(ctx, &path, "delete").await?;
             tokio::fs::remove_file(&path)
                 .await
@@ -432,15 +413,6 @@ impl Tool for CopyTool {
                 "{} already exists — pass overwrite: true to replace it",
                 to.display()
             );
-        }
-        if dest_exists {
-            if to.is_dir() {
-                ctx.checkpoint_tree(&to)?;
-            } else {
-                ctx.checkpoint(&to);
-            }
-        } else {
-            ctx.checkpoint_missing(&to)?;
         }
         if let Some(parent) = to.parent() {
             tokio::fs::create_dir_all(parent)

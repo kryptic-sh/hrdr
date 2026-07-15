@@ -115,10 +115,9 @@ impl super::App {
 
     /// Persist the conversation. Sessions auto-save continuously: any non-empty
     /// conversation is written to disk, with a stable file id assigned (from the
-    /// name) on first save. Called after every completed turn, `/undo`,
-    /// `/retry`, `/rename`, a cancelled turn, and right before the app quits —
-    /// so the visible user message + any partial reply from a turn that never
-    /// finished isn't lost.
+    /// name) on first save. Called after every completed turn, `/rename`, a
+    /// cancelled turn, and right before the app quits — so the visible user
+    /// message + any partial reply from a turn that never finished isn't lost.
     pub(crate) fn autosave(&mut self) {
         // A running turn holds the agent lock; skip this save rather than block
         // the UI thread (the next one will catch up).

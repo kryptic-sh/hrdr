@@ -1,14 +1,14 @@
 //! `replace`: one substitution applied across many files, under the guards.
 //!
 //! The alternative a model reaches for is `bash sed -i`, which is the single
-//! worst mutation path available to it: not checkpointed (so `/undo` cannot
-//! revert it), not held to the `write_ext` allow-list, and silent about what it
-//! changed — a bad regex corrupts the tree and the model reports success.
+//! worst mutation path available to it: not held to the `write_ext` allow-list,
+//! and silent about what it changed — a bad regex corrupts the tree and the
+//! model reports success.
 //!
 //! This tool walks the project respecting `.gitignore`, matches a **literal**
-//! string by default (a regex only when asked), checkpoints every file it
-//! touches, and returns a unified diff per file so the change is visible in the
-//! transcript. `dry_run: true` reports what *would* change without writing.
+//! string by default (a regex only when asked), and returns a unified diff per
+//! file so the change is visible in the transcript. `dry_run: true` reports what
+//! *would* change without writing.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -60,8 +60,8 @@ impl Tool for ReplaceTool {
         "Replace text across many files at once — the safe way to do a project-wide rename. \
          `find` is a literal string unless `regex` is true. Narrow the sweep with `glob` \
          (e.g. \"src/**/*.rs\") and/or `path`. Returns a unified diff of every file changed. \
-         Use `dry_run: true` to preview first. Prefer this over `bash sed -i`: it is undoable, \
-         confined to the project, and shows you exactly what it changed."
+         Use `dry_run: true` to preview first. Prefer this over `bash sed -i`: it shows you \
+         exactly what it changed."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

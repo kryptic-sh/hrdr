@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **The file checkpoint system, and `/undo` / `/retry`.** hrdr no longer keeps
+  per-turn file pre-images: the `checkpoint` module, the `checkpoints` config
+  knob (and `--checkpoints` / `$HRDR_CHECKPOINTS`), and the `/revert` and
+  `/checkpoints` commands that read the store are all gone. The `/undo` and
+  `/retry` commands (conversation rewind) are removed alongside them. Use git —
+  branches and worktrees — to snapshot and revert file changes; it is what most
+  sessions run inside anyway, and it does the job better than a parallel
+  per-turn store.
+- **cwd confinement in the file tools.** Reads, searches, and file changes are
+  no longer restricted to the working directory (the `restrict_to_cwd` guards,
+  the `allow_outside_cwd` config knob, and `$HRDR_ALLOW_OUTSIDE_CWD` are gone).
+  hrdr is meant to run in a codebase you trust, and full filesystem access
+  removes needless friction reaching a sibling repo or an absolute path. The
+  `write_ext` allow-list (for write-scoped sub-agents) and the
+  credential/secret-file denial for the read tools are unchanged. A
+  process-level sandbox mode for untrusted use is planned.
+
 ### Fixed
 
 - **No test can touch the developer's real user state — and no test has to

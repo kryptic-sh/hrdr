@@ -1,8 +1,7 @@
 //! `patch` tool: apply a unified diff (git/patch format) across one or more
-//! files in a single call. Integrates with hrdr's cwd confinement, the
-//! read-before-edit gate, per-turn checkpoints, and post-edit hooks. Applied
-//! **atomically** — every file's hunks are validated in memory first, and only
-//! if all apply is anything written.
+//! files in a single call. Integrates with the read-before-edit gate and
+//! post-edit hooks. Applied **atomically** — every file's hunks are validated in
+//! memory first, and only if all apply is anything written.
 
 use std::path::PathBuf;
 
@@ -113,7 +112,6 @@ impl Tool for PatchTool {
         for i in 0..ops.len() {
             let result = match &ops[i] {
                 FileOp::Write { path, content, .. } => {
-                    ctx.checkpoint(path);
                     if let Some(parent) = path.parent() {
                         tokio::fs::create_dir_all(parent).await.ok();
                     }
@@ -121,12 +119,9 @@ impl Tool for PatchTool {
                         .await
                         .with_context(|| format!("writing {}", path.display()))
                 }
-                FileOp::Delete { path, .. } => {
-                    ctx.checkpoint(path);
-                    tokio::fs::remove_file(path)
-                        .await
-                        .with_context(|| format!("deleting {}", path.display()))
-                }
+                FileOp::Delete { path, .. } => tokio::fs::remove_file(path)
+                    .await
+                    .with_context(|| format!("deleting {}", path.display())),
             };
             if let Err(error) = result {
                 let rollback_errors = rollback_ops(&ops[..=i]).await;

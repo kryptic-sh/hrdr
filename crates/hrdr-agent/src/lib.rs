@@ -74,7 +74,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
-use hrdr_tools::{Checkpoints, TodoItem, ToolContext, ToolRegistry};
+use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
 
 #[derive(Clone)]
 struct PublicModelRuntime {
@@ -2395,9 +2395,6 @@ pub struct AgentConfig {
     /// compaction. Off leaves every result verbatim. Default `true`. Only the
     /// model-facing history is touched; the UI transcript keeps the full output.
     pub auto_prune: bool,
-    /// File checkpointing: `on`, `off`, or `auto` (default) — `auto` enables it
-    /// only outside a git repo (git already provides revert).
-    pub checkpoints: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
@@ -2852,7 +2849,6 @@ impl Default for AgentConfig {
             max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
             max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
             auto_prune: true,
-            checkpoints: None,
             providers: HashMap::new(),
             guardrails: Vec::new(),
             hooks: Vec::new(),
@@ -3462,7 +3458,6 @@ struct FileConfig {
     max_readonly_subagents: Option<usize>,
     max_write_subagents: Option<usize>,
     auto_prune: Option<bool>,
-    checkpoints: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -3734,9 +3729,6 @@ impl AgentConfig {
         if let Some(v) = fc.auto_prune {
             self.auto_prune = v;
         }
-        if let Some(v) = fc.checkpoints {
-            self.checkpoints = Some(v);
-        }
         if !fc.providers.is_empty() {
             // Rekey by the canonical name: `[providers.anthropic]` IS `claude`'s
             // table, and every lookup arrives already folded.
@@ -3859,7 +3851,6 @@ type EnvSetter = fn(&mut AgentConfig, String);
 /// DERIVED from the identity's provider, and an environment variable that could
 /// move it would be an endpoint that belongs to nobody.
 const ENV_SETTERS: &[(&str, EnvSetter)] = &[
-    ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Some(b) = parse_toggle_or_num(&v) {
             c.auto_compact = b;
@@ -4509,13 +4500,6 @@ async fn ensure_worktree_ignored(repo: &std::path::Path, worktrees_dir: &std::pa
     }
 }
 
-/// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
-fn checkpoint_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
-    hjkl_xdg::data_dir("hrdr")
-        .ok()
-        .map(|d| d.join("checkpoints").join(cwd_slug(&cwd.to_string_lossy())))
-}
-
 fn read_config_doc(path: &std::path::Path) -> toml_edit::DocumentMut {
     std::fs::read_to_string(path)
         .ok()
@@ -4628,8 +4612,6 @@ pub struct Agent {
     /// The last `refresh_system` found different project docs on disk than were in
     /// the prompt. Read by a frontend after `/new` to say so.
     project_docs_changed: bool,
-    /// File checkpoint store (per-turn pre-images), if a store dir is available.
-    checkpoints: Option<Arc<Mutex<Checkpoints>>>,
     /// MCP servers to connect (consumed by [`Self::connect_mcp`]).
     mcp_configs: Vec<McpServerConfig>,
     /// Live MCP connections, kept alive for the process (their tools hold clones
@@ -5035,41 +5017,6 @@ impl Agent {
             config.is_subagent,
         )?;
 
-        // File checkpoint store, keyed by working directory (like sessions).
-        // `auto` (default) enables it only outside a git repo — git already
-        // provides revert, so checkpointing there is redundant.
-        // The bool spellings come from `parse_env_bool` (plus `always`/`never`)
-        // so they can't drift from the other on/off knobs; anything else (incl.
-        // `auto`) falls through to the git-repo heuristic.
-        let enable_checkpoints = config
-            .checkpoints
-            .as_deref()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .and_then(|v| match v.as_str() {
-                "always" => Some(true),
-                "never" => Some(false),
-                other => parse_env_bool(other),
-            })
-            .unwrap_or_else(|| !in_git_repo(&config.cwd));
-        let checkpoints = enable_checkpoints
-            .then(|| checkpoint_dir(&config.cwd))
-            .flatten()
-            .and_then(|dir| match Checkpoints::open(dir) {
-                Ok(cp) => Some(cp),
-                // Checkpointing is a convenience (`/undo`), not a precondition for
-                // running — a data dir that can't be written or locked (NFS without
-                // lockd, an odd container mount) turns it off rather than stopping
-                // the session. Say so once: a silent `.ok()` here would leave the
-                // user to discover it at the moment they reach for `/undo`.
-                Err(error) => {
-                    eprintln!("hrdr: checkpoints disabled — {error} (/undo unavailable)");
-                    None
-                }
-            })
-            .map(|c| Arc::new(Mutex::new(c)));
-
-        ctx.checkpoints = checkpoints.clone();
-
         let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
         let mut client = Client::new(
             config.base_url,
@@ -5121,7 +5068,6 @@ impl Agent {
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
             project_docs_changed,
-            checkpoints,
             mcp_configs: config.mcp,
             mcp_clients: Vec::new(),
             agent_prompt: config.agent_prompt,
@@ -5202,11 +5148,6 @@ impl Agent {
             self.refresh_system();
         }
         notices
-    }
-
-    /// The file checkpoint store, if available (for `/revert` / `/checkpoints`).
-    pub fn checkpoints(&self) -> Option<Arc<Mutex<Checkpoints>>> {
-        self.checkpoints.clone()
     }
 
     /// The gathered `AGENTS.md` project instructions for the current cwd, if any.
@@ -5723,21 +5664,6 @@ impl Agent {
         self.publish_delegation_runtime();
     }
 
-    /// Drop the last real user turn (and everything after it) from history, returning
-    /// that user message's text so it can be re-sent (`/retry`).
-    ///
-    /// Skips synthetic `Role::User` messages injected by [`Agent::drain_steering`]
-    /// and [`Agent::drain_background`], which carry a non-default [`MessageOrigin`].
-    pub fn rewind_last_user(&mut self) -> Option<String> {
-        let idx = self
-            .messages
-            .iter()
-            .rposition(|m| m.role == Role::User && m.origin == MessageOrigin::User)?;
-        let text = self.messages[idx].content.clone();
-        self.messages.truncate(idx);
-        text
-    }
-
     /// Shared TODO list, mutated by the `todo` tool.
     pub fn todos(&self) -> Arc<Mutex<Vec<TodoItem>>> {
         self.ctx.todos.clone()
@@ -5758,8 +5684,8 @@ impl Agent {
     /// Whether this is a delegated sub-agent rather than the session's own agent.
     ///
     /// A frontend showing sub-agent panes asks this before offering anything
-    /// session-scoped — compaction, `/undo`, saving, session lifecycle hooks.
-    /// Those act on the conversation the *user* owns, and a sub-agent is not it.
+    /// session-scoped — compaction, saving, session lifecycle hooks. Those act
+    /// on the conversation the *user* owns, and a sub-agent is not it.
     pub fn is_subagent(&self) -> bool {
         self.is_subagent
     }
@@ -6049,12 +5975,6 @@ impl Agent {
                 }
             }
             self.messages.push(ChatMessage::user(user_input));
-        }
-        // Start a fresh file checkpoint for this turn's edits.
-        if let Some(cp) = &self.checkpoints
-            && let Ok(mut c) = cp.lock()
-        {
-            c.begin_turn();
         }
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
@@ -7130,7 +7050,6 @@ mod tests {
 
         let mut agent = Agent::new(AgentConfig {
             cwd: dir.path().to_path_buf(),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7271,7 +7190,6 @@ mod tests {
             model: r("openai://old"),
             effort: Some("high".to_string()),
             api_key: Some("top-secret".to_string()),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7304,7 +7222,6 @@ mod tests {
         let agent = Agent::new(AgentConfig {
             model: r("openai://gpt-5"),
             api_key: Some("k".to_string()),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7344,7 +7261,6 @@ mod tests {
         let mut agent = Agent::new(AgentConfig {
             model: r("openai://gpt-5"),
             api_key: Some("k".to_string()),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7391,7 +7307,6 @@ mod tests {
     #[test]
     fn the_delegation_guidance_reaches_an_agent_that_can_delegate() {
         let agent = Agent::new(AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7434,7 +7349,6 @@ mod tests {
     #[test]
     fn the_prompt_never_tells_the_model_to_pass_a_provider_to_task() {
         let agent = Agent::new(AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7478,7 +7392,6 @@ mod tests {
     async fn models_available_filters_default_and_returns_valid_json() {
         let agent = Agent::new(AgentConfig {
             model: r("local://default"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7564,7 +7477,6 @@ mod tests {
         let agent = Agent::new(AgentConfig {
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             model: r("codex://gpt-5.5"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7615,7 +7527,6 @@ mod tests {
         use super::ProviderConfig;
         let mut cfg = AgentConfig {
             model: r("local://old"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         cfg.providers.insert(
@@ -7658,7 +7569,6 @@ mod tests {
     fn validate_ref_judges_a_candidate_without_moving_the_agent() {
         let agent = Agent::new(AgentConfig {
             model: r("local://old"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7694,7 +7604,6 @@ mod tests {
             subagents: false,
             headers: vec![("X-Test".to_string(), "value".to_string())],
             subagent_model: Some(spec("subagent-model")),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
 
@@ -7731,7 +7640,6 @@ mod tests {
         use super::{ProviderConfig, ResolvedProviderKind};
         let mut cfg = AgentConfig {
             model: r("local://old"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         cfg.providers.insert(
@@ -7783,7 +7691,6 @@ mod tests {
     fn a_model_change_always_lands_on_the_providers_endpoint() {
         let mut agent = Agent::new(AgentConfig {
             model: r("local://old"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -7808,7 +7715,6 @@ mod tests {
         let mut agent = Agent::new(AgentConfig {
             model: r("openai://m"),
             effort: Some("off".to_string()),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -8052,7 +7958,6 @@ mod tests {
         use super::should_auto_compact;
         let mut agent = Agent::new(AgentConfig {
             context_window: Some(64_000),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -8090,7 +7995,6 @@ mod tests {
         use super::subagent_base_config;
         let main = Agent::new(AgentConfig {
             memory: true,
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -8109,7 +8013,6 @@ mod tests {
         // A delegated sub-agent keeps it — being delegated is not a permission.
         let sub = Agent::new(subagent_base_config(&AgentConfig {
             memory: true,
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         }))
         .unwrap();
@@ -8123,7 +8026,6 @@ mod tests {
         // its permissions say no. That is the axis features are gated on.
         let mut ro_cfg = subagent_base_config(&AgentConfig {
             memory: true,
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         });
         ro_cfg.read_only = true;
@@ -8301,7 +8203,6 @@ mod tests {
         let codex = Agent::new(AgentConfig {
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             model: r("chatgpt://gpt-5.5"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -8310,7 +8211,6 @@ mod tests {
         let mut elsewhere = Agent::new(AgentConfig {
             base_url: "http://localhost:9099/v1".to_string(),
             model: r("chatgpt://gpt-5.5"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -8824,7 +8724,6 @@ mod tests {
             base_url: "https://startup-a.invalid/v1".to_string(),
             api_key: Some("key-a".to_string()),
             model: r("startup-a://m-a"),
-            checkpoints: Some("off".to_string()),
             cwd: cwd.path().to_path_buf(),
             ..Default::default()
         };
@@ -8996,7 +8895,6 @@ mod tests {
         let has_task = |subagents: bool| {
             let cfg = AgentConfig {
                 subagents,
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             Agent::new(cfg)
@@ -9014,7 +8912,6 @@ mod tests {
         let has_memory = |memory: bool| {
             let cfg = AgentConfig {
                 memory,
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             Agent::new(cfg)
@@ -9089,7 +8986,6 @@ mod tests {
         // A read-only profile (like `explore`) drops the mutating tools and
         // appends its persona to the system prompt.
         let base = AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let prof = &builtin_subagent_profiles()[0]; // explore
@@ -9112,7 +9008,6 @@ mod tests {
     fn plan_agent_gets_read_tools_plus_markdown_writes() {
         use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
         let base = AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let plan = builtin_subagent_profiles()
@@ -9282,7 +9177,6 @@ mod tests {
     fn each_builtin_subagent_gets_exactly_the_tools_it_should() {
         let base = AgentConfig {
             model: r("local://m"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let base = super::subagent_base_config(&base);
@@ -9488,7 +9382,6 @@ mod tests {
     #[test]
     fn drain_background_delivers_finished_and_prunes() {
         let cfg = AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let mut agent = Agent::new(cfg).unwrap();
@@ -9547,7 +9440,6 @@ mod tests {
     #[test]
     fn drain_background_worktree_delivery_and_cancelled_skip() {
         let cfg = AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let mut agent = Agent::new(cfg).unwrap();
@@ -9664,7 +9556,6 @@ mod tests {
                 kind: SubagentKind::Background,
                 agent: Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig {
-                        checkpoints: Some("off".to_string()),
                         ..Default::default()
                     })
                     .unwrap(),
@@ -10241,7 +10132,6 @@ mod tests {
 
         let mut agent = Agent::new(AgentConfig {
             cwd: repo.to_path_buf(),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -10379,7 +10269,6 @@ mod tests {
 
         let cfg = AgentConfig {
             cwd: dir.path().to_path_buf(),
-            checkpoints: Some("off".to_string()), // keep the test hermetic
             ..Default::default()
         };
         let mut agent = Agent::new(cfg).unwrap();
@@ -10402,7 +10291,6 @@ mod tests {
     #[test]
     fn drain_steering_injects_messages_and_signals() {
         let cfg = AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let mut agent = Agent::new(cfg).unwrap();
@@ -10439,63 +10327,6 @@ mod tests {
         assert_eq!(steered, ["use ripgrep instead", "and skip the tests"]);
         // …and the queue is drained.
         assert!(!Agent::has_steering(&steering));
-    }
-
-    #[test]
-    fn rewind_last_user_skips_steering_and_background_origin_messages() {
-        use super::MessageOrigin;
-        let cfg = AgentConfig {
-            checkpoints: Some("off".to_string()),
-            ..Default::default()
-        };
-        let mut agent = Agent::new(cfg).unwrap();
-        // Reset to a clean state with a system message.
-        agent.set_messages(vec![
-            ChatMessage::system("you are helpful"),
-            ChatMessage::user("real prompt"),
-            ChatMessage {
-                origin: MessageOrigin::Steering,
-                ..ChatMessage::user("steering correction")
-            },
-            ChatMessage::assistant("I'll adjust"),
-            ChatMessage::tool_result("c1", "some output"),
-            ChatMessage {
-                origin: MessageOrigin::BackgroundResult,
-                ..ChatMessage::user("[Background task #1 finished — its result:] done")
-            },
-        ]);
-
-        let text = agent.rewind_last_user();
-        assert_eq!(text.as_deref(), Some("real prompt"));
-        // Only the system message survives; the real user turn itself and
-        // everything after it was truncated (that is the rewind contract).
-        assert_eq!(agent.message_count(), 1);
-        assert_eq!(
-            agent.messages()[0].content.as_deref(),
-            Some("you are helpful")
-        );
-    }
-
-    #[test]
-    fn rewind_last_user_returns_none_when_only_synthetic_user_messages() {
-        use super::MessageOrigin;
-        let cfg = AgentConfig {
-            checkpoints: Some("off".to_string()),
-            ..Default::default()
-        };
-        let mut agent = Agent::new(cfg).unwrap();
-
-        agent.set_messages(vec![
-            ChatMessage::system("you are helpful"),
-            ChatMessage {
-                origin: MessageOrigin::Steering,
-                ..ChatMessage::user("steering")
-            },
-        ]);
-
-        assert!(agent.rewind_last_user().is_none());
-        // History is untouched — no real user turn to rewind to.
-        assert_eq!(agent.message_count(), 2);
     }
 
     #[test]
@@ -10645,7 +10476,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cfg = AgentConfig {
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             let mut agent = Agent::new(cfg).unwrap();
@@ -10729,7 +10559,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cfg = AgentConfig {
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             let mut agent = Agent::new(cfg).unwrap();
@@ -10777,7 +10606,6 @@ mod tests {
                     kind: SubagentKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig {
-                            checkpoints: Some("off".to_string()),
                             ..Default::default()
                         })
                         .unwrap(),
@@ -10794,7 +10622,6 @@ mod tests {
             agent.live_subagents.register_main(
                 Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig {
-                        checkpoints: Some("off".to_string()),
                         ..Default::default()
                     })
                     .unwrap(),
@@ -10845,7 +10672,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cfg = AgentConfig {
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             let mut agent = Agent::new(cfg).unwrap();
@@ -10911,7 +10737,6 @@ mod tests {
                     kind: SubagentKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig {
-                            checkpoints: Some("off".to_string()),
                             ..Default::default()
                         })
                         .unwrap(),
@@ -10933,7 +10758,6 @@ mod tests {
             agent.live_subagents.register_main(
                 Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig {
-                        checkpoints: Some("off".to_string()),
                         ..Default::default()
                     })
                     .unwrap(),
@@ -11057,24 +10881,6 @@ mod tests {
             .find(|(k, _)| *k == key)
             .map(|(_, s)| *s)
             .unwrap_or_else(|| panic!("setter not found for {key}"))
-    }
-
-    #[test]
-    #[allow(clippy::type_complexity)]
-    fn env_setters_string_fields_directly() {
-        // Exercise each string-typed setter in ENV_SETTERS by calling the fn
-        // pointer directly, without touching process environment.
-        // `HRDR_MODEL` is deliberately absent: it names the one identity, as a
-        // `ModelSpec` layered against config.toml's `model` — not a field set alone.
-        let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[("HRDR_CHECKPOINTS", |c| {
-            c.checkpoints.as_deref().unwrap_or("")
-        })];
-        for (key, getter) in cases {
-            let setter = find_setter(key);
-            let mut cfg = AgentConfig::default();
-            setter(&mut cfg, "test_value".to_string());
-            assert_eq!(getter(&cfg), "test_value", "setter for {key} did not apply");
-        }
     }
 
     /// **`$HRDR_BASE_URL` IS NOT A KNOB.** The endpoint is a property of the
@@ -11203,7 +11009,6 @@ mod tests {
             auto_compact: Some(true),
             compaction_reserved: Some(12_345),
             auto_prune: Some(false),
-            checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
             guardrails: vec![],
             hooks: vec![],
@@ -11259,7 +11064,6 @@ mod tests {
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
         assert!(!cfg.auto_prune);
-        assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
     }
 
     #[test]
@@ -11952,7 +11756,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cfg = AgentConfig {
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             };
             let agent = Agent::new(cfg).unwrap();
@@ -12152,14 +11955,13 @@ mod tests {
             .unwrap()
         }
 
-        /// Minimal agent config pointing at `base_url`, with checkpoints and
-        /// subagents disabled for test isolation.
+        /// Minimal agent config pointing at `base_url`, with subagents disabled
+        /// for test isolation.
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
             AgentConfig {
                 base_url,
                 model: "local://test-model".parse().unwrap(),
                 cwd: cwd.to_path_buf(),
-                checkpoints: Some("off".to_string()),
                 subagents: false,
                 memory: false,
                 auto_prune: false,
@@ -13479,7 +13281,6 @@ mod tests {
     async fn model_rows_carry_the_coupled_id_task_takes() {
         let agent = Agent::new(AgentConfig {
             model: r("openai://gpt-5"),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -13627,7 +13428,6 @@ mod one_key_identity_tests {
     async fn the_task_tools_schema_has_one_model_arg_for_both_shapes() {
         let cfg = AgentConfig {
             model: "zen://kimi-k2".parse().unwrap(),
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         };
         let agent = Agent::new(cfg.clone()).unwrap();

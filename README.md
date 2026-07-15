@@ -11,11 +11,10 @@ OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
 > Active development, released as **v0.2.x**. The agent loop, adaptive tool set,
-> sub-agents, sessions, file checkpoints, config hot-reload, and a rich TUI are
-> in place. hrdr connects to any running OpenAI-compatible endpoint — a hosted
-> provider or a server you run yourself
-> ([`infr`](https://github.com/kryptic-sh/infr), llama.cpp, vLLM, …). See the
-> roadmap for what's next.
+> sub-agents, sessions, config hot-reload, and a rich TUI are in place. hrdr
+> connects to any running OpenAI-compatible endpoint — a hosted provider or a
+> server you run yourself ([`infr`](https://github.com/kryptic-sh/infr),
+> llama.cpp, vLLM, …). See the roadmap for what's next.
 
 ## Install
 
@@ -56,9 +55,8 @@ sudo rpm -i hrdr-*.rpm
   unified-diff), `replace` (project-wide substitution with a diff and a
   `dry_run`), `move`, `copy`, `delete`, `find`, `ls`, `tree`, `grep`, `git`
   (read-only: status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell,
-  and any MCP-server tools. The file-mutating tools are **checkpointed** (so
-  `/undo` reverts them), and the read tools keep **credential/secret files**
-  off-limits — unlike the same access through the shell, which has neither
+  and any MCP-server tools. The read tools keep **credential/secret files**
+  off-limits — unlike the same access through the shell, which has no such
   guard. The file tools otherwise have full filesystem access (hrdr runs in a
   codebase you trust); a process-level sandbox mode is planned. Token-bounded
   outputs and line-numbered reads for precise edits — and when `bash`/`grep`
@@ -81,7 +79,7 @@ sudo rpm -i hrdr-*.rpm
 | Crate         | Role                                                            |
 | ------------- | --------------------------------------------------------------- |
 | `hrdr-llm`    | OpenAI-compatible client: types, streaming, tool-call assembly. |
-| `hrdr-tools`  | The tool set + registry + file checkpoints.                     |
+| `hrdr-tools`  | The tool set + registry.                                        |
 | `hrdr-agent`  | The agent loop + minijinja system prompt.                       |
 | `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).              |
 | `hrdr-app`    | UI-agnostic app core: shared slash commands, sessions, status.  |
@@ -189,10 +187,10 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
   OpenAI-style reasoning models, or a `thinking` budget on the native Anthropic
   backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
-  `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
-- **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
-  `/undo`, `/cost` (alias `/usage`; session tokens + estimated USD, priced from
-  the models.dev catalog, sub-agents included)
+  `/tools`, `/expand`, `/paste`
+- **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/cost` (alias
+  `/usage`; session tokens + estimated USD, priced from the models.dev catalog,
+  sub-agents included)
 - **Appearance** — `/theme` (picker with live preview; 5 built-in palettes +
   `~/.config/hrdr/themes/*.toml`), `/timestamps [none|relative|exact]`,
   `/statusbar [none|truncate|wrap]`, `/todo-ttl [turns]`
@@ -662,8 +660,7 @@ temperature = 0.1
 ```
 
 Sub-agents can't themselves delegate (recursion is bounded to one level) and
-don't spawn MCP servers. Their file edits aren't captured by the parent's
-`/revert` yet — use git.
+don't spawn MCP servers.
 
 #### Agents as files
 
@@ -881,11 +878,10 @@ extensions = ["zig"]
 The same warm servers back three **model tools**: `definition` and `references`
 (read-only lookups — the model gives a file, a 1-based line, and the symbol text
 on that line; results come back as `path:line:col`), and `rename`, which applies
-the server-computed workspace edit through the normal checkpointed write path —
-so `/undo` reverts the whole rename, formatter hooks and post-edit diagnostics
-run per touched file, and edits are validated atomically before anything is
-written. Read-only sub-agents (`explore`, `review`) get the lookups; `rename` is
-pruned with the other writers.
+the server-computed workspace edit through the normal write path — so formatter
+hooks and post-edit diagnostics run per touched file, and edits are validated
+atomically before anything is written. Read-only sub-agents (`explore`,
+`review`) get the lookups; `rename` is pruned with the other writers.
 
 ### Theme
 
@@ -919,7 +915,7 @@ these are on `PATH`. It detects what's available and adapts.
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | **bash** and/or **PowerShell** | The shell tool. At least one lets the model run builds/tests/commands. `bash` on unix; `pwsh` runs anywhere.      |
 | **ripgrep** (`rg`)             | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.                    |
-| **git**                        | Repo awareness (branch in the status bar). In a git repo, file checkpoints auto-disable since git covers it.      |
+| **git**                        | Repo awareness (branch in the status bar).                                                                        |
 | **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                                |
 | A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).                |
 | **infr** or **llama.cpp**      | Only to self-host a model locally — run one yourself (infr or `llama-server`). Not needed with a hosted provider. |
@@ -931,7 +927,7 @@ results than the zero-config DuckDuckGo default.
 
 Built and tested in CI on **Linux, macOS, and Windows** (fmt + clippy + tests on
 all three). The TUI, model streaming, web tools, theming, clipboard, config
-hot-reload, sessions, and file checkpoints are cross-platform.
+hot-reload, and sessions are cross-platform.
 
 The shell and search tools adapt to the host:
 
@@ -951,7 +947,7 @@ The shell and search tools adapt to the host:
       search/goto, timestamps, configurable status bar, themes
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
       instructions
-- [x] File checkpoints + `/revert`; network retry + auto-compact on overflow
+- [x] Network retry + auto-compact on overflow
 - [x] Tool-output pruning: old tool results are cleared from the model context
       (recent window + last 2 turns kept) before compaction — cheap, no model
       call (`auto_prune`, on by default)

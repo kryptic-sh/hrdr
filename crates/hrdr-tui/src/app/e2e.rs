@@ -288,7 +288,6 @@ impl Harness {
             base_url: mock.base_url.clone(),
             model: "local://test-model".parse().unwrap(),
             cwd: tmp.path().to_path_buf(),
-            checkpoints: Some("off".to_string()),
             context_window: Some(1000),
             max_steps,
             ..Default::default()
@@ -2970,7 +2969,6 @@ async fn the_input_pane_matches_the_user_prompt_block() {
 async fn switching_agents_keeps_each_ones_place_and_draft() {
     let mut h = Harness::new(vec![]).await;
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -3042,7 +3040,6 @@ async fn the_input_box_routes_to_the_focused_agent() {
     let mut h = Harness::new(vec![]).await;
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -3146,7 +3143,6 @@ async fn the_agent_list_switches_the_focused_agent() {
     h.app
         .push_entry(Entry::tool_running("call-1", "task", "{}"));
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -3290,7 +3286,6 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     }
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -3878,7 +3873,6 @@ async fn the_loader_stops_while_the_models_tools_run() {
 async fn the_loader_belongs_to_the_agent_on_screen() {
     let mut h = Harness::new(vec![]).await;
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -5354,7 +5348,6 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         status: "pending".to_string(),
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        checkpoints: Some("off".to_string()),
         ..Default::default()
     })
     .unwrap();

@@ -245,8 +245,8 @@ mod persisted_messages {
                     serde_json::Value::Array(m.anthropic_thinking_blocks.clone()),
                 );
             }
-            // Preserve internal origin marker so `rewind_last_user` works
-            // correctly after a session resume.
+            // Preserve internal origin marker so real user turns stay
+            // distinguishable from injected context after a session resume.
             if m.origin != MessageOrigin::User {
                 obj.insert(
                     "origin".into(),
@@ -1084,9 +1084,9 @@ mod roundtrip_audit {
         assert!(!wire.contains("reasoning_content"), "{wire}");
     }
 
-    /// Origin markers survive a session-file round-trip, so `rewind_last_user`
-    /// works correctly after a resume. The wire form (OpenAI request) must never
-    /// carry the origin field.
+    /// Origin markers survive a session-file round-trip, so real user turns stay
+    /// distinguishable from injected context after a resume. The wire form
+    /// (OpenAI request) must never carry the origin field.
     #[test]
     fn synthetic_origin_survives_session_file_and_is_absent_from_wire() {
         let cwd = std::env::current_dir()

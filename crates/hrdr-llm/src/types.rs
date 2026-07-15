@@ -19,8 +19,8 @@ pub enum Role {
 /// Internal origin of a message — distinguishes a real user turn from synthetic
 /// user-role context injected by the agent (steering, background results, …).
 ///
-/// Used by `rewind_last_user` to skip past synthetic `Role::User` messages and
-/// find the actual user turn. Defaults to [`User`](MessageOrigin::User) so that
+/// Lets the agent tell a real user turn apart from synthetic `Role::User`
+/// context it injected. Defaults to [`User`](MessageOrigin::User) so that
 /// existing serialized data (session files) correctly treats all messages as
 /// real user turns.
 ///
@@ -58,7 +58,7 @@ pub struct ChatMessage {
     pub anthropic_thinking_blocks: Vec<serde_json::Value>,
     /// Internal origin marker — distinguishes real user turns from synthetic
     /// user-role context injected by the agent (steering, background results).
-    /// Defaults to [`MessageOrigin::User`] (the rewindable kind) for backward
+    /// Defaults to [`MessageOrigin::User`] (a real user turn) for backward
     /// compatibility with existing session files.
     ///
     /// Never written onto the provider wire (`skip_serializing`); the session

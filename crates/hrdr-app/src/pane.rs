@@ -928,7 +928,6 @@ mod tests {
         let agent = || {
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-                    checkpoints: Some("off".to_string()),
                     ..Default::default()
                 })
                 .unwrap(),
@@ -1066,7 +1065,6 @@ mod tests {
         let live = LiveSubagents::new();
         for &key in keys {
             let agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-                checkpoints: Some("off".to_string()),
                 ..Default::default()
             })
             .unwrap();

@@ -72,8 +72,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
-    ("/revert", "undo the last turn's file edits"),
-    ("/checkpoints", "list revertible file checkpoints"),
     ("/thinking", "show/hide model reasoning (on|off)"),
     ("/reasoning", "alias of /thinking"),
     ("/timestamps", "set timestamps (none|relative|exact)"),
@@ -93,8 +91,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
-    ("/retry", "re-run last turn (optional model)"),
-    ("/undo", "undo last turn (edit & resend)"),
     ("/help", "list commands"),
     ("/exit", "quit"),
     // Aliases for users switching from other agents (resolved by resolve_alias).
@@ -124,19 +120,10 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Files & context",
         &[
-            "/init",
-            "/add",
-            "/edit",
-            "/diff",
-            "/revert",
-            "/checkpoints",
-            "/cwd",
-            "/tools",
-            "/expand",
-            "/paste",
+            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/expand", "/paste",
         ],
     ),
-    ("Reply", &["/copy", "/export", "/retry", "/undo", "/cost"]),
+    ("Reply", &["/copy", "/export", "/cost"]),
     (
         "Appearance",
         &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
@@ -195,7 +182,7 @@ pub fn help_body_for(show: impl Fn(&str) -> bool) -> String {
             .map(|(_, d)| *d)
             .unwrap_or("")
     };
-    // Column width from the longest command so long names (`/checkpoints`)
+    // Column width from the longest command so long names (`/timestamps`)
     // never run into their descriptions.
     let width = HELP_GROUPS
         .iter()

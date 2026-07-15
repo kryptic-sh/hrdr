@@ -132,10 +132,6 @@ struct Cli {
     #[arg(long, global = true)]
     statusbar: Option<String>,
 
-    /// File checkpointing: on, off, or auto (default; off inside a git repo).
-    #[arg(long, global = true)]
-    checkpoints: Option<String>,
-
     /// Turns a completed TODO item stays visible before it's pruned (default 5).
     #[arg(long, global = true)]
     todo_ttl: Option<u64>,
@@ -487,9 +483,6 @@ async fn main() -> Result<()> {
     }
     if let Some(s) = cli.statusbar {
         ui.statusbar = Some(s);
-    }
-    if let Some(c) = cli.checkpoints {
-        config.checkpoints = Some(c);
     }
     if let Some(p) = cli.prompt_cache {
         config.prompt_cache = Some(p);

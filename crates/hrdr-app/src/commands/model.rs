@@ -1,45 +1,10 @@
 use std::sync::Arc;
 
-use hrdr_agent::{Agent, ModelRef, ModelSpec, ProviderName};
+use hrdr_agent::{Agent, ModelRef, ProviderName};
 use tokio::sync::Mutex;
 
 use super::helpers::busy_generic;
 use super::host::CommandHost;
-
-/// Switch **the active agent's** model — `/model <spec>`, where the spec is either
-/// a bare model id (same provider) or a whole `provider://model` identity — and,
-/// in the *same* locked step, re-probe the endpoint for the new model's advertised
-/// context window, delivering it to the UI so auto-compaction honors the model's
-/// real max. Folding the probe into the switch future (rather than a separate
-/// task) avoids racing a probe of the old model against the switch.
-///
-/// `/model` means "change the model of the conversation I am looking at", exactly
-/// as `/compact` means "compact the conversation I am looking at".
-/// [`set_model_ref`] writes to that same agent's chrome, so the status bar follows
-/// it — the two are the same piece of state, not a display copy of one.
-///
-/// [`set_model_ref`]: CommandHost::set_model_ref
-pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
-    // A bare id keeps the provider in force; `provider://model` replaces it whole.
-    // Either way what reaches the agent is a COMPLETE identity.
-    let spec: ModelSpec = match name.parse() {
-        Ok(s) => s,
-        Err(e) => {
-            host.info(format!("/model {name}: {e}"));
-            return;
-        }
-    };
-    let Some(reference) = spec.apply(&host.model_ref()) else {
-        // `/model openai://` names a provider and no model — the one shape a spec
-        // cannot resolve by itself. This is an INTERACTIVE switch, so it gets the
-        // interactive policy: the model you last used on that provider, else the one
-        // it declares, else a picker filtered to it ([`apply_provider_or_pick`]).
-        let provider = spec.provider().expect("ProviderOnly names a provider");
-        let _ = apply_provider_or_pick(host, provider.as_str());
-        return;
-    };
-    apply_reference(host, reference, None, true);
-}
 
 /// Why switching to a named provider didn't happen.
 ///

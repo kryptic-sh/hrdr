@@ -3,7 +3,7 @@ use std::path::Path;
 use super::conversation::export_conversation;
 use super::helpers::{RESUME_BUSY_MSG, busy_generic, busy_guard, git_working_diff};
 use super::host::CommandHost;
-use super::model::{endpoint_health_warning, switch_model};
+use super::model::endpoint_health_warning;
 use super::types::ExpandMode;
 
 /// Handle a `/…` command shared by both frontends. Returns `true` if it was a
@@ -317,108 +317,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(format!("attached @{trimmed} from clipboard"));
             } else {
                 host.insert_input(text);
-            }
-        }
-        "revert" => {
-            if host.is_busy() {
-                host.info(busy_guard("revert"));
-                return true;
-            }
-            host.files_changed(); // files may change; invalidate @-completion
-            let agent = host.agent();
-            host.spawn_line(Box::pin(async move {
-                let Some(cp) = agent.lock().await.checkpoints() else {
-                    return "checkpoints are off (auto-disabled in git repos — use git, or set \
-                            checkpoints = on)"
-                        .to_string();
-                };
-                let result = match cp.lock() {
-                    Ok(mut c) => c.revert_last(),
-                    Err(_) => return "checkpoint store busy".to_string(),
-                };
-                match result {
-                    Ok(files) if files.is_empty() => "nothing to revert".to_string(),
-                    Ok(files) => {
-                        let names = files
-                            .iter()
-                            .map(|p| {
-                                p.file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| p.display().to_string())
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("reverted {} file(s): {names}", files.len())
-                    }
-                    Err(e) => format!("revert failed: {e}"),
-                }
-            }));
-        }
-        "checkpoints" => {
-            let agent = host.agent();
-            host.spawn_line(Box::pin(async move {
-                let Some(cp) = agent.lock().await.checkpoints() else {
-                    return "checkpoints are off (auto-disabled in git repos — use git, or set \
-                            checkpoints = on)"
-                        .to_string();
-                };
-                let infos = match cp.lock() {
-                    Ok(c) => c.list(),
-                    Err(_) => return "checkpoint store busy".to_string(),
-                };
-                if infos.is_empty() {
-                    return "no file checkpoints yet".to_string();
-                }
-                let mut s =
-                    String::from("file checkpoints (newest first; /revert undoes the latest):");
-                for info in infos.iter().take(20) {
-                    let names = info
-                        .files
-                        .iter()
-                        .map(|f| {
-                            std::path::Path::new(f)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| f.clone())
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    s.push_str(&format!(
-                        "\n  turn {} · {} file(s): {names}",
-                        info.turn,
-                        info.files.len()
-                    ));
-                }
-                s
-            }));
-        }
-        "retry" => {
-            if host.is_busy() {
-                host.info(busy_guard("retry"));
-                return true;
-            }
-            // Optional model switch for this retry (and subsequent turns).
-            if !arg.is_empty() {
-                switch_model(host, arg.clone());
-                host.info(format!("model → {arg}"));
-            }
-            match host.rewind_last_turn() {
-                Some(text) => host.send_prompt(text, true),
-                None => host.info("nothing to retry".to_string()),
-            }
-        }
-        "undo" => {
-            if host.is_busy() {
-                host.info(busy_guard("undo"));
-                return true;
-            }
-            match host.rewind_last_turn() {
-                Some(text) => {
-                    host.set_input(text);
-                    host.autosave();
-                    host.info("undid last turn — edit and resend".to_string());
-                }
-                None => host.info("nothing to undo".to_string()),
             }
         }
         "compact" => {
@@ -807,9 +705,6 @@ mod tests {
         }
         fn set_tool_expansion(&mut self, _mode: ExpandMode) -> String {
             String::new()
-        }
-        fn rewind_last_turn(&mut self) -> Option<String> {
-            None
         }
         fn start_compaction(&mut self, _instructions: Option<String>) {}
     }

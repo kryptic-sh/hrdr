@@ -176,26 +176,6 @@ impl super::App {
         self.apply_config_reload(true);
         self.skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.current_cwd()));
     }
-    /// Rewind the last user turn out of the agent history + transcript,
-    /// returning the user's text (shared `/undo` and `/retry` core).
-    pub(super) fn rewind_last_turn(&mut self) -> Option<String> {
-        let text = self
-            .agent
-            .try_lock()
-            .ok()
-            .and_then(|mut a| a.rewind_last_user())?;
-        if let Some(idx) = self
-            .panes
-            .main()
-            .transcript()
-            .iter()
-            .rposition(|e| matches!(e.kind, EntryKind::User(_)))
-        {
-            self.truncate_transcript(idx);
-        }
-        self.scroll_offset = 0;
-        Some(text)
-    }
     /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
     /// number, to the message nearest a relative time ago, or to top/bottom
     /// (shared [`hrdr_app::goto_action`] core; only the scrolling is local).
@@ -446,9 +426,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn set_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
         self.app.apply_tool_expansion(mode)
     }
-    fn rewind_last_turn(&mut self) -> Option<String> {
-        self.app.rewind_last_turn()
-    }
     fn start_compaction(&mut self, instructions: Option<String>) {
         self.app.spawn_compaction(instructions);
     }
@@ -489,9 +466,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
         self.app.skills = hrdr_app::discover_skills(new);
-    }
-    fn files_changed(&mut self) {
-        self.app.file_index_cwd = None;
     }
     fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
         self.app.timestamp_style

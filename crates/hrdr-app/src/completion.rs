@@ -307,7 +307,7 @@ mod tests {
             );
         }
         // A canonical name still outranks an alias on the same prefix:
-        // "/re" prefix-matches /rename, /resume, /retry, /reload (rank 0)
+        // "/re" prefix-matches /rename, /resume, /reload (rank 0)
         // before /new via its "reset" alias (rank 1).
         let re = names("/re");
         let new_pos = re.iter().position(|n| *n == "/new");

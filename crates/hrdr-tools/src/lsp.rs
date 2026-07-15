@@ -1260,7 +1260,7 @@ mod tests {
 
     /// The navigation tools end-to-end against the scripted server:
     /// definition + references resolve `symbol` on a 1-based line, and rename
-    /// applies the server's WorkspaceEdit through the checkpointed write path.
+    /// applies the server's WorkspaceEdit through the normal write path.
     #[cfg(unix)]
     #[tokio::test]
     async fn nav_tools_ride_the_language_server() {

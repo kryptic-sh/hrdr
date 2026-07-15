@@ -1,7 +1,7 @@
 //! A test can never touch the developer's real files — and no test has to ask.
 //!
-//! hrdr's user state lives under `$HOME` and the XDG roots: sessions, checkpoints
-//! and the input history in `$XDG_DATA_HOME/hrdr`, `config.toml` / `auth.toml` /
+//! hrdr's user state lives under `$HOME` and the XDG roots: sessions and the
+//! input history in `$XDG_DATA_HOME/hrdr`, `config.toml` / `auth.toml` /
 //! `oauth.json` in `$XDG_CONFIG_HOME/hrdr`, the models.dev catalog in
 //! `$XDG_CACHE_HOME/hrdr`. The code that writes them is the code under test: run an
 //! agent, submit a message, pick a model, and the *developer's* store is what moves.

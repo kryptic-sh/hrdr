@@ -125,12 +125,12 @@ pub trait CommandHost {
     }
 
     /// Whether a turn is currently running — the busy-guard for commands that
-    /// mutate turn-coupled state (`/retry`, `/undo`, `/compact`, `/cwd`, …).
+    /// mutate turn-coupled state (`/compact`, `/cwd`, …).
     fn is_busy(&self) -> bool;
     /// Launch a model turn with `prompt`. `show_as_user` displays it as a user
-    /// message (`/retry`); `false` keeps it out of the transcript (`/init`).
+    /// message; `false` keeps it out of the transcript (`/init`).
     fn send_prompt(&mut self, prompt: String, show_as_user: bool);
-    /// Replace the input buffer (`/undo` puts the rewound message back).
+    /// Replace the input buffer.
     fn set_input(&mut self, text: String);
     /// Prepend text to the input buffer (`/add` attaches a file block).
     fn prepend_input(&mut self, text: String);
@@ -143,10 +143,6 @@ pub trait CommandHost {
     /// Apply an `/expand` mode to the tool-output display, returning the
     /// status line to show (the expansion state lives in the frontend).
     fn set_tool_expansion(&mut self, mode: ExpandMode) -> String;
-    /// Rewind the last user turn: pop it (and the reply) from the agent
-    /// history *and* the display transcript, returning the user's text.
-    /// `None` when there's nothing to rewind (or the agent is locked).
-    fn rewind_last_turn(&mut self) -> Option<String>;
 
     /// Persist one setting to the user config file. Default writes directly;
     /// the TUI overrides to also suppress its config hot-reload.
@@ -187,10 +183,6 @@ pub trait CommandHost {
     fn cwd_changed(&mut self, new: &Path) {
         let _ = new;
     }
-    /// Called when files changed on disk outside a turn (`/revert`), so the
-    /// `@file` completion index can be invalidated.
-    fn files_changed(&mut self) {}
-
     /// Kick off a compaction pass on a background task (runs like a turn:
     /// input queues behind it, cancel aborts it). When it lands the frontend
     /// shows [`compaction_message`], resets stale context usage, autosaves on

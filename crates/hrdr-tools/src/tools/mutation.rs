@@ -19,7 +19,6 @@ pub async fn apply_file_change(
     content: &str,
 ) -> Result<FileChange> {
     ctx.ensure_writable_ext(path)?;
-    ctx.checkpoint(path);
     // Re-check immediately before the pathname operation. This portable guard
     // cannot make arbitrary filesystems transactional, but closes the long
     // validation/planning window and refuses any symlink inserted meanwhile.

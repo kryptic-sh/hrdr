@@ -639,7 +639,6 @@ mod tests {
 
     fn entry(key: u64) -> LiveSubagent {
         let agent = Agent::new(AgentConfig {
-            checkpoints: Some("off".to_string()),
             ..Default::default()
         })
         .unwrap();
