@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-16
+
 ### Security
 
 - **External tool output is now wrapped as untrusted data.** A fetched web page,
