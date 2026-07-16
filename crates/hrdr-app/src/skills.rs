@@ -1,8 +1,9 @@
 //! Custom skills: reusable prompt templates invoked with a `:` prefix
 //! (`:name args…`), shared by hrdr's frontends.
 //!
-//! A skill is a Markdown file — optional `name:` / `description:` frontmatter,
-//! body = the prompt. On invocation the body is sent to the model with
+//! A skill is a Markdown file — optional YAML frontmatter (`name:`,
+//! `description:`, `args:`), body = the prompt. On invocation the body is
+//! sent to the model with
 //! `$ARGUMENTS` replaced by everything after the skill name (or, when the
 //! placeholder is absent and arguments were given, with them appended on their
 //! own line). Discovery mirrors the sub-agent files: project dirs first, then
@@ -122,33 +123,15 @@ pub fn builtin_skills() -> Vec<Skill> {
     skills
 }
 
-/// Parse one skill file: optional flat `name:`/`description:` frontmatter
-/// (a leading `---` … `---` fence), body = the prompt. `None` when the body
-/// is empty.
+/// Parse one skill file: optional YAML frontmatter (a leading `---` … `---`
+/// fence containing `name:` / `description:` / `args:`), body = the prompt.
+/// `None` when the body is empty.
 pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option<Skill> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let (name, description, args, body) = match hrdr_agent::split_fence(text) {
         Some((fm, body)) => {
-            let field = |key: &str| {
-                fm.lines().find_map(|l| {
-                    l.strip_prefix(key)
-                        .and_then(|r| r.strip_prefix(':'))
-                        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
-                        .filter(|v| !v.is_empty())
-                })
-            };
-            // `args: staging, production` or `args: [staging, production]` —
-            // candidate values the completion popup offers after `:name `.
-            let args = field("args")
-                .map(|v| {
-                    v.trim_matches(['[', ']'])
-                        .split(',')
-                        .map(|a| a.trim().trim_matches(['"', '\'']).to_string())
-                        .filter(|a| !a.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            (field("name"), field("description"), args, body)
+            let (name, description, args) = parse_frontmatter(fm);
+            (name, description, args, body)
         }
         None => (None, None, Vec::new(), text),
     };
@@ -163,6 +146,65 @@ pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option
         source: source.to_string(),
         args,
     })
+}
+
+/// Extract `(name, description, args)` from a fence's frontmatter text via
+/// real YAML parsing (`serde_yaml_ng`), rather than the old line-by-line
+/// `key: value` scan — which silently dropped anything YAML-legal but not on
+/// a single line: prettier wraps a long `description:` onto a continuation
+/// line, and block scalars (`description: >` / `|`) or list-form `args:`
+/// (`args:\n  - low\n  - high`) never matched at all.
+///
+/// Malformed YAML (not parseable, or not a mapping — e.g. the frontmatter is
+/// a bare scalar or list) degrades gracefully to "no frontmatter" instead of
+/// failing the whole skill: `split_fence` has already stripped the fence off
+/// the body, so the raw frontmatter text never leaks into the prompt either
+/// way, and the caller falls back to a stem-derived name with empty
+/// description/args.
+fn parse_frontmatter(fm: &str) -> (Option<String>, Option<String>, Vec<String>) {
+    let Ok(serde_yaml_ng::Value::Mapping(map)) = serde_yaml_ng::from_str(fm) else {
+        return (None, None, Vec::new());
+    };
+    let scalar = |key: &str| -> Option<String> {
+        map.get(key)
+            .and_then(scalar_to_string)
+            .filter(|v| !v.is_empty())
+    };
+    let name = scalar("name");
+    let description = scalar("description");
+    // `args: [staging, production]` (already a YAML sequence) or list form
+    // (`args:\n  - low\n  - high`) — stringify each element. A bare string
+    // (`args: staging, production`) instead splits on commas, matching the
+    // old flat-parser's comma-separated form.
+    let args = match map.get("args") {
+        Some(serde_yaml_ng::Value::Sequence(seq)) => seq
+            .iter()
+            .filter_map(scalar_to_string)
+            .filter(|v| !v.is_empty())
+            .collect(),
+        Some(v) => scalar_to_string(v)
+            .map(|s| {
+                s.split(',')
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    (name, description, args)
+}
+
+/// Stringify a YAML scalar (string/number/bool), trimmed. `None` for `Null`
+/// or a non-scalar (sequence/mapping/tagged) — those aren't valid values for
+/// `name`/`description`/a single `args` element.
+fn scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
+    match v {
+        serde_yaml_ng::Value::String(s) => Some(s.trim().to_string()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
+        serde_yaml_ng::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// If `input` invokes a skill (`:name args…`, matched case-insensitively),
@@ -274,6 +316,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.args, vec!["staging", "production"]);
+    }
+
+    /// Regression test for the bug this module was rewritten to fix: prettier
+    /// wraps a `description:` past 80 cols onto a plain continuation line,
+    /// which is still valid YAML (folded into one space-joined string) but
+    /// was invisible to the old line-by-line `key: value` scan.
+    #[test]
+    fn plain_continuation_scalar_description_is_not_lost() {
+        let s = parse_skill_file(
+            "---\nname: commit\ndescription:\n  stage and commit the working changes with a Conventional Commit message\n---\nDo it.",
+            "commit",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(
+            s.description,
+            "stage and commit the working changes with a Conventional Commit message"
+        );
+    }
+
+    /// Block scalars — folded (`>`) and literal (`|`) — are real YAML that the
+    /// old flat parser never understood; `serde_yaml_ng` handles them for
+    /// free.
+    #[test]
+    fn block_scalar_descriptions_parse() {
+        let folded = parse_skill_file(
+            "---\ndescription: >\n  line one\n  line two\n---\nBody.",
+            "stem",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(folded.description, "line one line two");
+
+        let literal = parse_skill_file(
+            "---\ndescription: |\n  line one\n  line two\n---\nBody.",
+            "stem",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(literal.description, "line one\nline two");
+    }
+
+    /// `args:` as a YAML list (block sequence), the natural way to write
+    /// multiple candidates across lines — distinct from the inline
+    /// `[a, b]` / comma-string forms already covered elsewhere.
+    #[test]
+    fn args_as_yaml_list_parses() {
+        let s = parse_skill_file(
+            "---\nargs:\n  - low\n  - high\n---\nReview $ARGUMENTS",
+            "review",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.args, vec!["low", "high"]);
+    }
+
+    /// `args: staging, production` (bare comma string, no brackets) still
+    /// splits into candidates — compat with the old flat parser's form.
+    #[test]
+    fn args_as_comma_string_parses() {
+        let s = parse_skill_file(
+            "---\nargs: staging, production\n---\nDeploy $ARGUMENTS",
+            "deploy",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.args, vec!["staging", "production"]);
+    }
+
+    /// Frontmatter that isn't valid YAML (a tab-indented line — tabs are
+    /// illegal for YAML indentation) degrades gracefully: the skill still
+    /// loads with a stem-derived name and the body intact, and — crucially —
+    /// none of the raw frontmatter text leaks into the body sent to the
+    /// model.
+    #[test]
+    fn invalid_yaml_frontmatter_degrades_without_leaking_into_body() {
+        let s = parse_skill_file(
+            "---\nname: x\n\tbad: tab-indented\n---\nDo the thing.",
+            "stem",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.name, "stem");
+        assert_eq!(s.description, "");
+        assert!(s.args.is_empty());
+        assert_eq!(s.body, "Do the thing.");
+        assert!(!s.body.contains("bad"));
+        assert!(!s.body.contains("---"));
+    }
+
+    /// `description: has: colons` — an unquoted value containing `: ` is
+    /// ambiguous plain-scalar syntax that YAML rejects as a parse error, not
+    /// silently misparsed. Degrades the same way as any other invalid YAML.
+    #[test]
+    fn unquoted_colon_in_value_degrades_gracefully() {
+        let s = parse_skill_file(
+            "---\nname: x\ndescription: has: colons\n---\nBody text.",
+            "stem",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.name, "stem");
+        assert_eq!(s.description, "");
+        assert_eq!(s.body, "Body text.");
+        assert!(!s.body.contains("colons"));
+    }
+
+    /// Frontmatter that parses as YAML but not as a mapping (e.g. a value
+    /// containing an unquoted colon that YAML reads as a nested-mapping-like
+    /// scalar ambiguity) also degrades gracefully rather than panicking or
+    /// misparsing a field.
+    #[test]
+    fn non_mapping_frontmatter_degrades_gracefully() {
+        let s =
+            parse_skill_file("---\njust a plain string\n---\nBody text.", "stem", "src").unwrap();
+        assert_eq!(s.name, "stem");
+        assert_eq!(s.description, "");
+        assert!(s.args.is_empty());
+        assert_eq!(s.body, "Body text.");
     }
 
     /// Security regression: a CRLF-authored skill file (`---\r\n`) must still
