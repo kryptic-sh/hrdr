@@ -2,10 +2,21 @@
 //! Claude Code (`.claude/agents/`) and opencode (`.opencode/agent/`) layouts as
 //! well as hrdr's own (`.hrdr/agents/`).
 //!
-//! Each file is Markdown with a YAML-ish frontmatter block; the body is the
-//! agent's system prompt. We parse the flat frontmatter fields we understand
-//! (name/description/model/tools/knobs) and ignore anything nested — enough to
-//! load real agent files from any of the three ecosystems without a YAML dep.
+//! Each file is Markdown with a YAML frontmatter block, parsed via
+//! `serde_yaml_ng` (matching `hrdr-app`'s skill parser); the body is the
+//! agent's system prompt. We map the flat frontmatter fields we understand
+//! (name/description/model/tools/knobs) into [`FmValue`]s; a nested mapping
+//! (e.g. opencode's per-tool boolean `tools:` map) has no representation
+//! there, so that key is simply omitted — the rest of the file still loads.
+//!
+//! Frontmatter that fails to parse as YAML, or that parses to something other
+//! than a mapping, fails that ONE file CLOSED: it is skipped rather than
+//! loaded with defaults, because a frontmatter we can't read might carry
+//! `read_only: true` or a `tools:` allow-list, and guessing "no frontmatter"
+//! could silently drop those restrictions. `read_dir_profiles` reports this
+//! with an `eprintln!` naming the file and keeps discovering the rest of the
+//! directory — distinct from the legacy `provider:` key (see
+//! [`parse_agent_file`]), which still hard-errors the whole discovery.
 //!
 //! Files are collected across all locations and **deduped by name** (case
 //! -insensitive): the first source in precedence order wins (project before
@@ -72,7 +83,16 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 /// Parse every `*.md` file in `dir` (non-recursive) into a profile. Missing or
 /// unreadable directories yield nothing; a file with no usable content is skipped.
-/// A file carrying the dead `provider:` key is an error, named by path.
+///
+/// Two kinds of per-file parse failure are handled differently:
+/// - Invalid/non-mapping YAML frontmatter ([`InvalidYamlFrontmatter`]) fails
+///   CLOSED but only for that one file: it's skipped, with an `eprintln!`
+///   naming the file and the YAML error, and discovery continues with the
+///   rest of the directory.
+/// - The dead `provider:` key (or any other parse error) is a hard error,
+///   named by path, that fails the whole directory — that behavior is
+///   intentional and covered by
+///   [`a_provider_key_in_an_agent_file_is_an_error_naming_the_fix`](tests::a_provider_key_in_an_agent_file_is_an_error_naming_the_fix).
 fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -90,8 +110,16 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        if let Some(p) = parse_agent_file(&text, stem).map_err(|e| legacy_error(&path, &e))? {
-            profiles.push(p);
+        match parse_agent_file(&text, stem) {
+            Ok(Some(p)) => profiles.push(p),
+            Ok(None) => {}
+            Err(e) if e.is::<InvalidYamlFrontmatter>() => {
+                eprintln!(
+                    "hrdr: skipping agent file {} — invalid frontmatter: {e:#}",
+                    path.display()
+                );
+            }
+            Err(e) => return Err(legacy_error(&path, &e)),
         }
     }
     // Stable order within a directory (read_dir order is unspecified).
@@ -112,7 +140,7 @@ fn legacy_error(path: &Path, err: &anyhow::Error) -> anyhow::Error {
 /// (`model: provider://model`), and a file naming a provider beside a model can
 /// name a pair that never agreed. The message says exactly what to write instead.
 pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<SubagentProfile>> {
-    let (fm, body) = split_frontmatter(text);
+    let (fm, body) = split_frontmatter(text)?;
     let body = body.trim();
 
     let name = fm
@@ -206,8 +234,9 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
     }))
 }
 
-/// A frontmatter value: a scalar, or a list (inline `[a, b]`, CSV, or `- item`
-/// block). Nested maps aren't represented (their indented lines are ignored).
+/// A frontmatter value, converted from a parsed [`serde_yaml_ng::Value`]: a
+/// scalar, or a list. A YAML mapping value (e.g. opencode's per-tool boolean
+/// `tools:` map) has no representation here — see [`fm_value_from_yaml`].
 #[derive(Debug, Clone)]
 enum FmValue {
     Scalar(String),
@@ -225,10 +254,11 @@ impl FmValue {
         match self {
             FmValue::List(l) => l.clone(),
             FmValue::Scalar(s) if s.is_empty() => Vec::new(),
-            // A scalar in list position may be CSV (`Read, Grep`) or one item.
+            // A scalar in list position may be CSV (`Read, Grep`, a plain YAML
+            // scalar — commas are legal outside flow syntax) or one item.
             FmValue::Scalar(s) => s
                 .split(',')
-                .map(|p| dequote(p.trim()))
+                .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
                 .collect(),
         }
@@ -244,10 +274,10 @@ impl FmValue {
 /// input as the whole body.
 ///
 /// Shared by `hrdr-agent`'s agent-file frontmatter (which further parses the
-/// returned frontmatter text into typed fields via [`parse_frontmatter`])
-/// and `hrdr-app`'s skill files (which parse it as flat `key: value` lines)
-/// — the fence-splitting itself, including two independently-fixed CRLF
-/// bugs, used to be duplicated between the two.
+/// returned frontmatter text as YAML via [`split_frontmatter`]) and
+/// `hrdr-app`'s skill files (which parse it as YAML too, via its own
+/// `serde_yaml_ng` call) — the fence-splitting itself, including two
+/// independently-fixed CRLF bugs, used to be duplicated between the two.
 pub fn split_fence(text: &str) -> Option<(&str, &str)> {
     let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rest = trimmed.strip_prefix("---")?;
@@ -288,139 +318,93 @@ fn find_closing_fence(s: &str) -> Option<usize> {
 }
 
 /// Split `text` into (frontmatter map, body). A leading `---` … `---` fence is
-/// the frontmatter; without one, the whole text is the body.
-fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>, &str) {
-    let mut map = std::collections::HashMap::new();
+/// the frontmatter, parsed as real YAML via `serde_yaml_ng`; without a fence
+/// at all, the whole text is the body and the frontmatter is empty — that's
+/// `split_fence` returning `None`, not a YAML error, so a plain prompt file
+/// with no frontmatter still loads exactly as before.
+///
+/// Fails CLOSED on a fence that's present but broken: if the fence text isn't
+/// valid YAML, or parses to something other than a mapping (a bare scalar or
+/// list frontmatter isn't sensible either), this returns
+/// `Err(InvalidYamlFrontmatter)` instead of silently treating the file as
+/// having no frontmatter — a frontmatter we can't read might carry
+/// `read_only: true` or a `tools:` allow-list, and loading with defaults
+/// would drop those restrictions. Callers decide what "closed" means (see
+/// [`read_dir_profiles`], which skips just this one file).
+fn split_frontmatter(text: &str) -> Result<(std::collections::HashMap<String, FmValue>, &str)> {
     let Some((fm_text, body)) = split_fence(text) else {
-        return (map, text);
+        return Ok((std::collections::HashMap::new(), text));
     };
-    parse_frontmatter(fm_text, &mut map);
-    (map, body)
-}
-
-/// A YAML block scalar's chomping style: `|` keeps interior newlines
-/// (literal), `>` folds them into spaces (folded).
-enum BlockStyle {
-    Literal,
-    Folded,
-}
-
-/// Whether `val` is a YAML block scalar indicator (`|`, `>`, and their
-/// chomping/indentation modifiers like `|-`, `>+`, `|2`) rather than literal
-/// punctuation. `description: |` and `prompt: >` must not become the literal
-/// string `"|"` / `">"` with the indented block that follows silently dropped.
-fn block_scalar_style(val: &str) -> Option<BlockStyle> {
-    let mut chars = val.chars();
-    let style = match chars.next()? {
-        '|' => BlockStyle::Literal,
-        '>' => BlockStyle::Folded,
-        _ => return None,
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(fm_text)
+        .map_err(|e| InvalidYamlFrontmatter(format!("invalid YAML: {e}")))?;
+    let serde_yaml_ng::Value::Mapping(mapping) = value else {
+        return Err(InvalidYamlFrontmatter("frontmatter is not a YAML mapping".to_string()).into());
     };
-    chars
-        .clone()
-        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
-        .then_some(style)
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in mapping {
+        // A non-string key can't name a frontmatter field we understand.
+        if let (Some(key), Some(value)) = (k.as_str(), fm_value_from_yaml(v)) {
+            map.insert(key.to_string(), value);
+        }
+    }
+    Ok((map, body))
 }
 
-/// Parse flat `key: value` frontmatter lines into `map`. Indented lines are
-/// treated as belonging to the preceding key: `- item` lines build a list, a
-/// block-scalar indicator (`|`/`>`) consumes the following more-indented
-/// lines as its value, anything else (nested map entries) is ignored.
-fn parse_frontmatter(fm: &str, map: &mut std::collections::HashMap<String, FmValue>) {
-    let lines: Vec<&str> = fm.lines().collect();
-    let mut last_key: Option<String> = None;
-    let mut i = 0;
-    while i < lines.len() {
-        let raw = lines[i];
-        let indent = raw.len() - raw.trim_start().len();
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            i += 1;
-            continue;
-        }
-        // A list item under the previous key.
-        if let Some(item) = line.strip_prefix("- ") {
-            if let Some(k) = &last_key {
-                let entry = map
-                    .entry(k.clone())
-                    .or_insert_with(|| FmValue::List(Vec::new()));
-                if let FmValue::List(l) = entry {
-                    l.push(dequote(item.trim()));
-                } else {
-                    *entry = FmValue::List(vec![dequote(item.trim())]);
-                }
-            }
-            i += 1;
-            continue;
-        }
-        // Indented non-list line → part of a nested map: ignore, but keep the
-        // current key so a following `- item` still attaches correctly.
-        if indent > 0 {
-            i += 1;
-            continue;
-        }
-        // A top-level `key: value`.
-        let Some((k, v)) = line.split_once(':') else {
-            i += 1;
-            continue;
-        };
-        let key = k.trim().to_string();
-        let val = v.trim();
-        last_key = Some(key.clone());
-        if let Some(style) = block_scalar_style(val) {
-            // Consume the following more-indented (or blank) lines as the
-            // block's value instead of leaving the literal `|`/`>` marker.
-            let mut block_lines: Vec<&str> = Vec::new();
-            i += 1;
-            while i < lines.len() {
-                let next = lines[i];
-                if next.trim().is_empty() {
-                    block_lines.push("");
-                    i += 1;
-                    continue;
-                }
-                if next.len() - next.trim_start().len() == 0 {
-                    break;
-                }
-                block_lines.push(next.trim_start());
-                i += 1;
-            }
-            // YAML's default "clip" chomping: drop trailing blank lines.
-            while block_lines.last().is_some_and(|l| l.is_empty()) {
-                block_lines.pop();
-            }
-            let value = match style {
-                BlockStyle::Literal => block_lines.join("\n"),
-                BlockStyle::Folded => block_lines.join(" "),
-            };
-            map.insert(key, FmValue::Scalar(value));
-            continue;
-        }
-        if val.is_empty() {
-            // Value continues on following `- item` lines (or a nested map).
-            map.entry(key).or_insert_with(|| FmValue::List(Vec::new()));
-        } else if let Some(inner) = val.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            // Inline list `[a, b]`.
-            let items = inner
-                .split(',')
-                .map(|p| dequote(p.trim()))
-                .filter(|p| !p.is_empty())
-                .collect();
-            map.insert(key, FmValue::List(items));
-        } else {
-            map.insert(key, FmValue::Scalar(dequote(val)));
-        }
-        i += 1;
+/// The fence's text parsed as something other than valid YAML, or valid YAML
+/// that isn't a mapping. Distinguished (via `anyhow::Error::is`) from every
+/// other [`parse_agent_file`] failure — chiefly the legacy `provider:` bail —
+/// so [`read_dir_profiles`] can fail CLOSED on just the one file (skip +
+/// `eprintln!`) while still hard-erroring the whole discovery for everything
+/// else.
+#[derive(Debug)]
+struct InvalidYamlFrontmatter(String);
+
+impl std::fmt::Display for InvalidYamlFrontmatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
-/// Strip matching surrounding quotes from a scalar.
-fn dequote(s: &str) -> String {
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+impl std::error::Error for InvalidYamlFrontmatter {}
+
+/// Convert one YAML mapping value into an [`FmValue`], matching what a
+/// hand-authored frontmatter field means:
+/// - A string scalar → `Scalar`, trimmed.
+/// - A number/bool → `Scalar` of its string form (`read_only: true` → `"true"`,
+///   still matched by the `is_true` check downstream; `temperature: 0.7`
+///   still parses downstream).
+/// - `key:` with nothing (YAML null) → `Scalar("")`, which the field mapping
+///   in `parse_agent_file` filters out via `.filter(|s| !s.is_empty())`, same
+///   as today.
+/// - A sequence → `List` of its scalar elements, stringified the same way;
+///   non-scalar elements (nested sequences/mappings) are skipped.
+/// - A mapping (e.g. opencode's nested boolean `tools:` map) → `None`, so the
+///   key is omitted entirely — nested maps aren't represented, matching
+///   today's behavior. The file still loads; only that one key is dropped.
+fn fm_value_from_yaml(v: serde_yaml_ng::Value) -> Option<FmValue> {
+    match v {
+        serde_yaml_ng::Value::String(s) => Some(FmValue::Scalar(s.trim().to_string())),
+        serde_yaml_ng::Value::Number(n) => Some(FmValue::Scalar(n.to_string())),
+        serde_yaml_ng::Value::Bool(b) => Some(FmValue::Scalar(b.to_string())),
+        serde_yaml_ng::Value::Null => Some(FmValue::Scalar(String::new())),
+        serde_yaml_ng::Value::Sequence(seq) => Some(FmValue::List(
+            seq.iter().filter_map(scalar_element_to_string).collect(),
+        )),
+        serde_yaml_ng::Value::Mapping(_) => None,
+        _ => None,
+    }
+}
+
+/// Stringify one element of a YAML sequence for [`FmValue::List`]: only
+/// string/number/bool scalars are meaningful list items (a `tools:` or
+/// `write_ext:` list is always these); anything else — including a bare
+/// `null` item — is skipped rather than stringified into a meaningless entry.
+fn scalar_element_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
+    match v {
+        serde_yaml_ng::Value::String(s) => Some(s.trim().to_string()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
+        serde_yaml_ng::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -664,9 +648,10 @@ mod tests {
         );
         // The body is non-empty, so `prompt:` (frontmatter) is not surfaced as
         // the profile's prompt — but it must still parse to the folded value
-        // rather than the literal ">", which we check via the raw parser.
-        let mut map = std::collections::HashMap::new();
-        parse_frontmatter("prompt: >\n \x20Folded one.\n \x20Folded two.\n", &mut map);
+        // rather than the literal ">", which we check via the parsing seam
+        // directly (real YAML, via `serde_yaml_ng`, handles this for free).
+        let (map, _) =
+            split_frontmatter("---\nprompt: >\n  Folded one.\n  Folded two.\n---\nbody\n").unwrap();
         assert_eq!(
             map.get("prompt").map(FmValue::scalar).as_deref(),
             Some("Folded one. Folded two."),
@@ -676,8 +661,10 @@ mod tests {
 
     #[test]
     fn lone_block_scalar_marker_with_no_continuation_is_empty() {
-        let mut map = std::collections::HashMap::new();
-        parse_frontmatter("description: |\nname: x\n", &mut map);
+        // A literal block scalar immediately followed by a same-indent key has
+        // no content lines — valid YAML, value is the empty string, not the
+        // literal `|` marker.
+        let (map, _) = split_frontmatter("---\ndescription: |\nname: x\n---\nbody\n").unwrap();
         assert_eq!(
             map.get("description").map(FmValue::scalar).as_deref(),
             Some(""),
@@ -705,5 +692,52 @@ mod tests {
 
         // Opening fence with no closing fence → None (unterminated).
         assert!(split_fence("---\nname: x\nno closing fence\n").is_none());
+    }
+
+    /// The prettier form: `description:` with nothing on that line, followed
+    /// by an indented continuation line — valid YAML (folded into one plain
+    /// string) that the old flat `key: value` scanner never noticed at all,
+    /// since it only matched an inline value.
+    #[test]
+    fn plain_continuation_scalar_description_parses() {
+        let text =
+            "---\nname: x\ndescription:\n  a longer description on its own line\n---\nbody\n";
+        let p = parse(text, "fallback");
+        assert_eq!(
+            p.description.as_deref(),
+            Some("a longer description on its own line")
+        );
+    }
+
+    /// Fail-closed: an agent file whose frontmatter carries `read_only: true`
+    /// and a `tools:` allow-list, but also a tab-indented line (illegal YAML
+    /// indentation, so the fence fails to parse), must NOT produce a profile
+    /// at all — loading it with defaults instead of skipping it would
+    /// silently drop the very restrictions it was trying to set. A
+    /// well-formed sibling file in the same directory still loads: one
+    /// broken file doesn't take down the whole directory.
+    #[test]
+    fn fail_closed_on_invalid_yaml_frontmatter_skips_just_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".hrdr").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("broken.md"),
+            "---\nname: broken\nread_only: true\ntools: Read, Grep\n\tbad: tab-indented\n---\nBe careful.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("fine.md"),
+            "---\nname: fine\ndescription: a working agent\n---\nDo the thing.\n",
+        )
+        .unwrap();
+
+        let found = discover_agent_profiles(dir.path()).unwrap();
+        assert!(
+            !found.iter().any(|p| p.name == "broken"),
+            "invalid YAML frontmatter must not produce a profile, even with read_only/tools set"
+        );
+        let fine = found.iter().find(|p| p.name == "fine").unwrap();
+        assert_eq!(fine.description.as_deref(), Some("a working agent"));
     }
 }
