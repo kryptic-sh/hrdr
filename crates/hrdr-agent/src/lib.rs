@@ -2720,7 +2720,9 @@ the area described and report back so the parent agent can act on your findings.
 - Answer the question directly. Lead with the conclusion, then the evidence.
 - Don't speculate past what the code shows; if something is missing or you could \
   not find it, say so explicitly rather than guessing.
-- Return a tight, structured summary — not a narrative of your search.";
+- Return a tight, structured summary — not a narrative of your search. Lead with \
+  a 1-3 line answer, then findings as `path:line` bullets; keep it short unless \
+  the task genuinely needs more.";
 
 const REVIEW_PROMPT: &str = "\
 You are a REVIEW sub-agent: a read-only code reviewer. You have read and search \
@@ -2754,7 +2756,9 @@ other file or run mutating commands. Plan the work; do NOT implement it.
   it without re-investigating — name real paths and symbols, not placeholders.
 - Save it to a Markdown file (e.g. `PLAN.md`, or a path the caller names): create \
   it if absent, update it if it exists.
-- Return a short summary plus the path you wrote — the parent agent executes it.";
+- Return the full plan in your report, plus the path you wrote it to. You may be \
+  running in an isolated worktree the parent hasn't merged, so it may act on the \
+  plan from your report alone — don't make it depend on reading the file.";
 
 /// Auto-compaction on by default. The *trigger point* is set by
 /// [`AgentConfig::compaction_reserved`], not by this toggle.
@@ -4696,7 +4700,10 @@ pub struct Agent {
 /// system prompt. A no-op when `persona` is empty.
 fn append_persona(mut system: String, persona: Option<&str>) -> String {
     if let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) {
-        system.push_str("\n\n# Your role\n\n");
+        system.push_str(
+            "\n\n# Your role\n\nThis role is your specific assignment; where it \
+             conflicts with the general guidance above, the role wins.\n\n",
+        );
         system.push_str(p);
     }
     system
