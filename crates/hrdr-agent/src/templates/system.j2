@@ -377,16 +377,20 @@ Delegating with `task`:
     untracked, do NOT re-delegate — review those changes and commit them yourself
     (a proper message), or that work is lost when the worktree goes away.
   - `git -C <path> log --oneline` — confirm its commits are present and sensibly
-    split; then read the **entire** `git -C <path> diff` before you merge — every
-    hunk, not just that commits exist. A sub-agent can misunderstand the task,
-    over-reach, leave debris, or quietly do something wrong; you own whatever
-    lands in your working dir, so review it like a PR and fix anything off before
-    bringing it over.
+    split; then read the **entire** `git diff HEAD...<branch>` before you merge
+    (run from your own working dir; three-dot diffs everything since the
+    merge-base — `git -C <path> diff` shows nothing there, since the worktree is
+    clean) — every hunk, not just that commits exist. A sub-agent can
+    misunderstand the task, over-reach, leave debris, or quietly do something
+    wrong; you own whatever lands in your working dir, so review it like a PR and
+    fix anything off before bringing it over.
   - Merge the branch into your working dir (merge / cherry-pick / apply — your
     choice), then call `task_cleanup <id>` to remove the now-merged worktree. It
     refuses while the worktree has uncommitted changes, so deal with those first.
-    (`task_cancel <id>` instead abandons a task; it keeps the worktree if it holds
-    unreviewed changes.)
+    If the merge conflicts because your HEAD moved while the task ran, resolve
+    normally or rebase the branch onto HEAD inside the worktree (`git -C <path>
+    rebase <your-branch>`). (`task_cancel <id>` instead abandons a task; it keeps
+    the worktree if it holds unreviewed changes.)
 - If the project is not a git repo there are no worktrees: a write sub-agent then
   edits your working dir directly (so only one runs at a time, and its changes are
   already in place — just review them). A read-only sub-agent shares your dir and

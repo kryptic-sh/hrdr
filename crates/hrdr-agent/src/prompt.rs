@@ -793,7 +793,7 @@ mod tests {
         assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
         // Read the ENTIRE diff before merging, review it like a PR.
         assert!(
-            p.contains("read the **entire** `git -C <path> diff` before you merge"),
+            p.contains("read the **entire** `git diff HEAD...<branch>` before you merge"),
             "{p}"
         );
         assert!(p.contains("review it like a PR"), "{p}");

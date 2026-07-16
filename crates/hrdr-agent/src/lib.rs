@@ -5988,8 +5988,11 @@ impl Agent {
                          re-delegate to another sub-agent, just handle it — or that work is \
                          lost.\n  2. `git -C {p} \
                          log --oneline` — check its commits are present and sensibly split.\n  \
-                         3. `git -C {p} diff` — review the actual changes; fix any issues.\nThen \
-                         merge the branch into your working dir, and once its work is in, call \
+                         3. `git diff HEAD...{branch}` from your own working dir — review the \
+                         actual changes (`git -C {p} diff` is empty; the worktree itself is \
+                         clean) and fix any issues.\nThen merge the branch into your working dir \
+                         (rebase it onto HEAD in the worktree first if that'd conflict — `git -C \
+                         {p} rebase <your-branch>`), and once its work is in, call \
                          `task_cleanup` with id {id} to remove the worktree. Its report:]\n{result}"
                     )
                 }
