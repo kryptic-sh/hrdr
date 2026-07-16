@@ -14,6 +14,16 @@
 //! split across two `push` calls is buffered whole inside `line_buf` and decoded
 //! only when the terminating `\n` arrives.  No bytes are lost or corrupted.
 
+/// Hard cap on how large `line_buf` (one partial line) or `cur_data` (one
+/// event's folded `data:` value) may grow before the decoder stops
+/// accumulating further bytes for the offending line/event. Bounds memory
+/// against a broken or hostile server that never sends a terminating newline
+/// (or blank line) — without this, [`SseDecoder::push`] would grow these
+/// buffers without limit for as long as bytes keep arriving. Tens of MB is
+/// far beyond any legitimate SSE line or event payload (chat deltas run
+/// bytes to low KB).
+const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
 /// One complete SSE event, yielded by [`SseDecoder`] after its blank-line
 /// terminator is received.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,6 +60,9 @@ pub struct SseDecoder {
     cur_data_started: bool,
     /// Complete events ready for the next [`Self::drain`] call.
     ready: Vec<SseEvent>,
+    /// Set once [`MAX_BUFFER_BYTES`] has been hit and excess bytes were
+    /// discarded rather than buffered. See [`Self::overflowed`].
+    overflowed: bool,
 }
 
 impl SseDecoder {
@@ -61,19 +74,36 @@ impl SseDecoder {
             cur_data: String::new(),
             cur_data_started: false,
             ready: Vec::new(),
+            overflowed: false,
         }
     }
 
     /// Feed a raw byte chunk.  Call [`Self::drain`] after each push to retrieve
     /// any complete events that these bytes completed.
+    ///
+    /// Bytes belonging to a single unterminated line beyond [`MAX_BUFFER_BYTES`]
+    /// are discarded rather than buffered — a broken or hostile server that
+    /// never sends a newline must not grow memory without bound. See
+    /// [`Self::overflowed`].
     pub fn push(&mut self, bytes: &[u8]) {
         for &b in bytes {
             if b == b'\n' {
                 self.flush_line();
-            } else {
+            } else if self.line_buf.len() < MAX_BUFFER_BYTES {
                 self.line_buf.push(b);
+            } else {
+                self.overflowed = true;
             }
         }
+    }
+
+    /// Whether the decoder has ever hit [`MAX_BUFFER_BYTES`] and discarded
+    /// excess bytes for a line or an event's folded `data:` value. The decoder
+    /// keeps running (memory stays bounded either way) — this is a signal for
+    /// callers that want to treat a stream this misbehaved as an error rather
+    /// than silently accept truncated data.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Flush the current line buffer: decode, classify the field, and on a
@@ -107,10 +137,31 @@ impl SseDecoder {
         if let Some(rest) = line.strip_prefix("data:") {
             // Strip exactly one leading space per spec §9.2.6.
             let value = rest.strip_prefix(' ').unwrap_or(rest);
-            if self.cur_data_started {
-                self.cur_data.push('\n');
+            // Cap the folded `data:` value at MAX_BUFFER_BYTES: an event whose
+            // blank-line terminator never arrives could otherwise accumulate
+            // `data:` lines forever. Account for the folding '\n' up front so
+            // the total never exceeds the cap even after appending it.
+            let sep_len = if self.cur_data_started { 1 } else { 0 };
+            let remaining = MAX_BUFFER_BYTES.saturating_sub(self.cur_data.len() + sep_len);
+            if remaining == 0 {
+                self.overflowed = true;
+            } else {
+                if self.cur_data_started {
+                    self.cur_data.push('\n');
+                }
+                if value.len() <= remaining {
+                    self.cur_data.push_str(value);
+                } else {
+                    // Truncate at a char boundary so we never split a UTF-8
+                    // sequence and produce an invalid `String`.
+                    let mut cut = remaining;
+                    while cut > 0 && !value.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    self.cur_data.push_str(&value[..cut]);
+                    self.overflowed = true;
+                }
             }
-            self.cur_data.push_str(value);
             self.cur_data_started = true;
         } else if let Some(rest) = line.strip_prefix("event:") {
             let value = rest.strip_prefix(' ').unwrap_or(rest);
@@ -373,5 +424,48 @@ mod tests {
         dec.push(b"data: x\n\n");
         assert_eq!(dec.drain().len(), 1);
         assert!(dec.finish().is_empty());
+    }
+
+    // ── unbounded-buffer DoS guard ────────────────────────────────────────────
+
+    #[test]
+    fn line_buffer_is_capped_and_flagged_overflowed() {
+        // A hostile/broken server that never sends a newline at all: line_buf
+        // must not grow past MAX_BUFFER_BYTES no matter how many bytes arrive.
+        let mut dec = SseDecoder::new();
+        let chunk = vec![b'x'; MAX_BUFFER_BYTES + 1024];
+        dec.push(&chunk);
+        assert!(dec.overflowed(), "cap should have been hit");
+        assert_eq!(
+            dec.line_buf.len(),
+            MAX_BUFFER_BYTES,
+            "buffer stays capped, not grown further"
+        );
+
+        // Feeding still more bytes (still no newline) must not grow it either.
+        dec.push(&[b'y'; 1024]);
+        assert_eq!(dec.line_buf.len(), MAX_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn cur_data_is_capped_without_corrupting_utf8() {
+        // An event whose blank-line terminator never arrives, fed `data:`
+        // lines that together would otherwise grow cur_data without bound.
+        let mut dec = SseDecoder::new();
+        let big = "a".repeat(MAX_BUFFER_BYTES - 10);
+        dec.push(format!("data: {big}\n").as_bytes());
+        assert!(!dec.overflowed(), "not over the cap yet");
+
+        // Push another data line that would push cur_data past the cap.
+        dec.push(b"data: this-line-does-not-fit-in-the-remaining-room\n");
+        assert!(dec.overflowed(), "cap should now be flagged");
+        assert!(dec.cur_data.len() <= MAX_BUFFER_BYTES);
+
+        // Terminate the event and confirm the folded value is valid UTF-8 and
+        // bounded — no panic, no corrupted string.
+        dec.push(b"\n");
+        let events = dec.drain();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].data.len() <= MAX_BUFFER_BYTES);
     }
 }

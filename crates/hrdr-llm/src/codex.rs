@@ -414,7 +414,11 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             state.terminal_seen = true;
             let response = ev.get("response");
             let usage = map_usage(response.and_then(|r| r.get("usage")));
-            let finish = map_finish_reason(response, state.saw_function_call);
+            let finish = map_finish_reason(
+                response,
+                state.saw_function_call,
+                kind == "response.incomplete",
+            );
             Ok(Some(ChatChunk {
                 choices: vec![ChunkChoice {
                     delta: Delta::default(),
@@ -504,7 +508,21 @@ fn classify_codex_error(code: Option<&str>) -> crate::client::ChatErrorKind {
 /// `incomplete_details.reason == "max_output_tokens"` → `length` (so truncation
 /// is detected); a plain completion → `tool_calls` when a function call was
 /// emitted, else `stop`.
-fn map_finish_reason(response: Option<&Value>, saw_function_call: bool) -> String {
+///
+/// `is_incomplete` is whether the source event was `response.incomplete`
+/// (rather than `response.completed`) — the server explicitly said this reply
+/// is not the whole story. Any `response.incomplete` whose reason isn't one of
+/// the two recognized values (a future/unrecognized reason, or the field
+/// missing) must still map to a truncation-signalling finish reason rather
+/// than falling through to a clean `stop`/`tool_calls`:
+/// [`crate::Accumulator::truncated`] only checks `finish_reason` for
+/// `"length"`/`"max_tokens"`, so a clean mapping here would make it wrongly
+/// report `false` for a reply the server itself flagged as cut short.
+fn map_finish_reason(
+    response: Option<&Value>,
+    saw_function_call: bool,
+    is_incomplete: bool,
+) -> String {
     let reason = response
         .and_then(|r| r.get("incomplete_details"))
         .and_then(|d| d.get("reason"))
@@ -512,6 +530,7 @@ fn map_finish_reason(response: Option<&Value>, saw_function_call: bool) -> Strin
     match reason {
         Some("max_output_tokens") => "length".to_string(),
         Some("content_filter") => "content_filter".to_string(),
+        _ if is_incomplete => "length".to_string(),
         _ if saw_function_call => "tool_calls".to_string(),
         _ => "stop".to_string(),
     }
@@ -811,6 +830,41 @@ mod tests {
         let chunk = map_event(&mut state, &ev).unwrap().unwrap();
         assert!(state.terminal_seen);
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn incomplete_with_unrecognized_reason_still_signals_truncation() {
+        // A `response.incomplete` whose `incomplete_details.reason` is neither
+        // of the two recognized values (a reason a future Responses API
+        // version might add) must still flag truncation, not fall through to a
+        // clean `stop` — the server explicitly said this reply is incomplete.
+        let ev = json!({"type": "response.incomplete", "response": {
+            "incomplete_details": {"reason": "some_future_reason"},
+            "usage": {"input_tokens": 5, "output_tokens": 5}
+        }});
+        let mut state = StreamState::default();
+        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        assert!(state.terminal_seen);
+        let mut acc = Accumulator::new();
+        acc.push(&chunk);
+        assert!(
+            acc.truncated(),
+            "unrecognized incomplete reason must signal truncation, got {:?}",
+            chunk.choices[0].finish_reason
+        );
+
+        // Same for a `response.incomplete` with no `incomplete_details` at all.
+        let ev_no_details = json!({"type": "response.incomplete", "response": {
+            "usage": {"input_tokens": 5, "output_tokens": 5}
+        }});
+        let mut state2 = StreamState::default();
+        let chunk2 = map_event(&mut state2, &ev_no_details).unwrap().unwrap();
+        let mut acc2 = Accumulator::new();
+        acc2.push(&chunk2);
+        assert!(
+            acc2.truncated(),
+            "missing incomplete_details must still signal truncation"
+        );
     }
 
     #[test]

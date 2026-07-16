@@ -295,6 +295,22 @@ async fn fetch() -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// Process-wide counter giving each cache-write temp file a unique name
+/// (paired with the PID). Two concurrent hrdr processes both refreshing a
+/// stale catalog would otherwise share the fixed `models.json.tmp` name — one
+/// truncating the other's in-flight write, and their renames racing to
+/// publish a partially-written file. Same pattern as `hrdr-tools`'
+/// `atomic_write`/`staging_path` (commit 5db9712): no random/time API, so
+/// names stay deterministic.
+static CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A unique temp path for a cache write to `path` — see [`CACHE_TMP_SEQ`].
+fn cache_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let seq = CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.hrdr-tmp-{}-{seq}", std::process::id()))
+}
+
 /// Write the catalog to `path` via a temporary file in the same directory, so a
 /// crash or a concurrent hrdr can't leave a half-written cache behind. Failure
 /// is ignored: the caller already has the value in hand.
@@ -303,7 +319,7 @@ fn write_cache(path: &std::path::Path, v: &Value) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = cache_tmp_path(path);
     if serde_json::to_string(v)
         .ok()
         .and_then(|s| std::fs::write(&tmp, s).ok())
@@ -505,7 +521,7 @@ mod tests {
         assert!(!is_fresh(&p, Duration::ZERO));
     }
 
-    /// The cache lands atomically and leaves no `.tmp` behind.
+    /// The cache lands atomically and leaves no temp file behind.
     #[test]
     fn writing_the_cache_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,9 +533,29 @@ mod tests {
             lookup(&back, Some("opencode-go"), "deepseek-v4-flash"),
             Some(1_000_000)
         );
+        // No stray temp file left in the directory (either naming scheme).
+        let leftovers: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != p.file_name().unwrap())
+            .collect();
+        assert!(leftovers.is_empty(), "temp file cleaned up: {leftovers:?}");
+    }
+
+    /// Two concurrent writers must never be handed the same temp path — that's
+    /// exactly the race that can publish a half-written cache file.
+    #[test]
+    fn cache_tmp_path_is_unique_per_call() {
+        let p = std::path::PathBuf::from("/tmp/hrdr-catalog-test/models.json");
+        let a = cache_tmp_path(&p);
+        let b = cache_tmp_path(&p);
+        assert_ne!(a, b, "concurrent writers must not share a temp name");
         assert!(
-            !p.with_extension("json.tmp").exists(),
-            "temp file cleaned up"
+            a.to_string_lossy()
+                .contains(&std::process::id().to_string())
         );
+        // Both still target the same directory as the real cache file.
+        assert_eq!(a.parent(), p.parent());
+        assert_eq!(b.parent(), p.parent());
     }
 }

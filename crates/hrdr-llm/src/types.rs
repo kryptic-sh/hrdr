@@ -4,7 +4,7 @@
 //! (e.g. `infr`) owns chat-template application and tool-call parsing. We do
 //! not render model prompt formats here.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Message author role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,11 +369,28 @@ impl Usage {
 
 // ---- streaming ----
 
+/// Deserialize a field that tolerates an explicit JSON `null` the same as an
+/// absent key, falling back to `T::default()`. Plain `#[serde(default)]` only
+/// supplies the default when the *key* is missing — some OpenAI-compatible
+/// proxies instead emit an explicit `"choices": null` or `"delta": null`,
+/// which `Vec`'s / a struct's own `Deserialize` impl rejects (`null` isn't a
+/// sequence or a map), turning what should be an empty/no-op chunk into a
+/// terminal stream failure.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// One `chat.completion.chunk` SSE event. The final chunk (when `include_usage`
 /// is set) carries `usage` with empty `choices`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatChunk {
-    #[serde(default)]
+    /// `null_as_default`: some proxies send `"choices": null` instead of
+    /// omitting the key; treat it the same as absent (empty chunk).
+    #[serde(default, deserialize_with = "null_as_default")]
     pub choices: Vec<ChunkChoice>,
     #[serde(default)]
     pub usage: Option<Usage>,
@@ -387,7 +404,10 @@ pub struct ChatChunk {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChunkChoice {
-    #[serde(default)]
+    /// `null_as_default`: some proxies send `"delta": null` on a choice that
+    /// carries nothing new (e.g. alongside `finish_reason`); treat it the same
+    /// as absent (an empty delta).
+    #[serde(default, deserialize_with = "null_as_default")]
     pub delta: Delta,
     #[serde(default)]
     pub finish_reason: Option<String>,
@@ -438,11 +458,25 @@ pub struct Accumulator {
     /// Anthropic thinking blocks (with signature) for re-emission in the native
     /// Messages API request. Never serialized — same invariant as reasoning_content.
     anthropic_thinking_blocks: Vec<serde_json::Value>,
+    /// Per-accumulator draw from [`NEXT_ACCUMULATOR_NONCE`], mixed into
+    /// synthesized tool-call ids in [`Self::into_message`] so they're unique
+    /// across turns, not just within one (see that method's doc comment).
+    nonce: u64,
 }
+
+/// Process-wide monotonic counter, one draw per [`Accumulator::new`]. Backs the
+/// `nonce` field: synthesized tool-call ids (`call_{nonce}_{i}`) must not
+/// collide across turns, and a plain per-turn index (`call_{i}`) alone repeats
+/// every turn. A counter (not a random id) keeps ids deterministic — this
+/// crate has no RNG handy, and doesn't need one just for this.
+static NEXT_ACCUMULATOR_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Accumulator {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            nonce: NEXT_ACCUMULATOR_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ..Self::default()
+        }
     }
 
     /// Merge one chunk. Returns the freshly-appended text delta (for live
@@ -534,10 +568,14 @@ impl Accumulator {
     pub fn into_message(mut self) -> ChatMessage {
         // Some servers omit tool-call ids. Synthesize a stable one per call so
         // the assistant message and its `role:"tool"` results correlate — and so
-        // multiple calls in one turn don't collide on an empty id.
+        // multiple calls in one turn don't collide on an empty id. The index
+        // alone is only unique *within* this turn; mix in this accumulator's
+        // nonce so replaying two id-less tool turns to the native Anthropic
+        // backend never sends the same `tool_use` id twice (Anthropic rejects
+        // duplicates).
         for (i, call) in self.calls.iter_mut().enumerate() {
             if call.id.is_empty() {
-                call.id = format!("call_{i}");
+                call.id = format!("call_{}_{i}", self.nonce);
             }
         }
         ChatMessage {
@@ -574,6 +612,23 @@ mod tests {
             serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5}"#).unwrap();
         assert_eq!(plain.cached_tokens(), None);
         assert_eq!(plain.reasoning_tokens(), None);
+    }
+
+    #[test]
+    fn chat_chunk_tolerates_explicit_null_choices_and_null_delta() {
+        // Some OpenAI-compatible proxies emit an explicit `null` instead of
+        // omitting the field entirely — plain `#[serde(default)]` doesn't cover
+        // that case (only a missing key), so without `null_as_default` this
+        // would be a terminal deserialization error instead of a no-op chunk.
+        let c: ChatChunk = serde_json::from_str(r#"{"choices": null}"#).unwrap();
+        assert!(c.choices.is_empty());
+
+        let c2: ChatChunk =
+            serde_json::from_str(r#"{"choices": [{"delta": null, "finish_reason": "stop"}]}"#)
+                .unwrap();
+        assert_eq!(c2.choices.len(), 1);
+        assert!(c2.choices[0].delta.content.is_none());
+        assert_eq!(c2.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -851,9 +906,39 @@ mod tests {
         ));
         let calls = acc.into_message().tool_calls.expect("has tool calls");
         // Synthesized, non-empty, and distinct so results can be correlated.
-        assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[1].id, "call_1");
+        assert!(!calls[0].id.is_empty());
+        assert!(!calls[1].id.is_empty());
         assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn synthesized_tool_call_ids_are_unique_across_turns() {
+        // Two separate turns (two Accumulators), each with one id-less tool
+        // call at index 0. A session replaying both turns to the native
+        // Anthropic backend must not send the same `tool_use` id twice —
+        // Anthropic rejects duplicate ids. A per-turn index alone (`call_0`)
+        // would collide here.
+        let make_call_0 = || {
+            let mut acc = Accumulator::new();
+            acc.push(&chunk(
+                None,
+                Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    function: Some(FunctionDelta {
+                        name: Some("tool_a".to_string()),
+                        arguments: Some("{}".to_string()),
+                    }),
+                }]),
+            ));
+            acc.into_message().tool_calls.unwrap()[0].id.clone()
+        };
+        let id_turn1 = make_call_0();
+        let id_turn2 = make_call_0();
+        assert_ne!(
+            id_turn1, id_turn2,
+            "the same tool-call index in two different turns must not collide"
+        );
     }
 
     fn usage_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatChunk {
