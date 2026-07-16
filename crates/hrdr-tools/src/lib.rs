@@ -47,7 +47,7 @@ pub use patch::PatchTool;
 pub use tools::{
     BashTool, CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool,
     MoveTool, PowerShellTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, TodoTool,
-    TreeTool, WatchTool, WriteTool, available_shell_tools, user_shell,
+    TreeTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs, user_shell,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 

@@ -412,7 +412,12 @@ fn unquote_c_style(s: &str) -> String {
 /// store, keeping the section header so the model still sees *that* the file
 /// changed — just not its content. Covers `diff`, `show`, and `log -p` output;
 /// a no-op on plain `status`/`log`/`branch` output (no diff headers).
-fn redact_secret_diffs(output: &str) -> String {
+///
+/// `pub` (re-exported from the crate root) so callers outside this module —
+/// `task_diff` in `hrdr-agent`, which composes its own `git diff HEAD...<branch>`
+/// rather than going through [`GitTool`] — can run the same redaction over a
+/// diff they captured themselves.
+pub fn redact_secret_diffs(output: &str) -> String {
     let mut out = String::with_capacity(output.len());
     let mut lines = output.lines().peekable();
     while let Some(line) = lines.next() {

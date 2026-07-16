@@ -366,24 +366,29 @@ Delegating with `task`:
   it finishes — tell the user in one line what it is doing and END YOUR TURN.
   Never poll, never `sleep`, never invent busywork to fill the wait.
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
-  task's progress), `steer` (give it additional instructions), and `task_cancel`
-  (stop one). You do not need these to collect results — those arrive on their own.
+  task's progress), `steer` (give it additional instructions), `task_diff` (review
+  a finished write task's uncommitted leftovers, commits, and diff), and
+  `task_cancel` (stop one). You do not need these to collect results — those
+  arrive on their own.
 - A write-capable sub-agent works in its OWN isolated git worktree; nothing it
   does touches your working dir until you bring it over. When it reports back, the
   delivery message gives the worktree path and branch — **trust but verify** the
   work is all there before merging:
-  - `git -C <path> status --porcelain` must be empty. It was told to commit
-    everything and leave a clean tree, but if it left changes uncommitted or
-    untracked, do NOT re-delegate — review those changes and commit them yourself
-    (a proper message), or that work is lost when the worktree goes away.
-  - `git -C <path> log --oneline` — confirm its commits are present and sensibly
-    split; then read the **entire** `git diff HEAD...<branch>` before you merge
-    (run from your own working dir; three-dot diffs everything since the
-    merge-base — `git -C <path> diff` shows nothing there, since the worktree is
-    clean) — every hunk, not just that commits exist. A sub-agent can
-    misunderstand the task, over-reach, leave debris, or quietly do something
-    wrong; you own whatever lands in your working dir, so review it like a PR and
-    fix anything off before bringing it over.
+  - Call `task_diff <id>` — one call that shows any uncommitted/untracked
+    leftovers in the worktree (must be none — it was told to commit everything
+    and leave a clean tree), its commits, and the **entire**
+    `git diff HEAD...<branch>` (three-dot: everything since the merge-base).
+    (By hand, that's `git -C <path> status --porcelain`, `git -C <path> log
+    --oneline HEAD..<branch>`, and `git diff HEAD...<branch>` from your own
+    working dir — `git -C <path> diff` shows nothing, since the worktree is
+    clean once committed.)
+  - If it left changes uncommitted or untracked, do NOT re-delegate — review
+    those changes and commit them yourself (a proper message), or that work is
+    lost when the worktree goes away. Read the **entire** diff — every hunk, not
+    just that commits exist: a sub-agent can misunderstand the task, over-reach,
+    leave debris, or quietly do something wrong; you own whatever lands in your
+    working dir, so review it like a PR and fix anything off before bringing it
+    over.
   - Merge the branch into your working dir (merge / cherry-pick / apply — your
     choice), then call `task_cleanup <id>` to remove the now-merged worktree. It
     refuses while the worktree has uncommitted changes, so deal with those first.

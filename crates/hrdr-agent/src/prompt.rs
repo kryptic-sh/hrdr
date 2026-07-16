@@ -791,11 +791,12 @@ mod tests {
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");
         assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
-        // Read the ENTIRE diff before merging, review it like a PR.
-        assert!(
-            p.contains("read the **entire** `git diff HEAD...<branch>` before you merge"),
-            "{p}"
-        );
+        // Points at `task_diff`, which reads the ENTIRE diff before merging, and
+        // still tells the parent to review it like a PR.
+        assert!(p.contains("Call `task_diff <id>`"), "{p}");
+        assert!(p.contains("its commits, and the **entire**"), "{p}");
+        assert!(p.contains("`git diff HEAD...<branch>`"), "{p}");
+        assert!(p.contains("Read the **entire** diff"), "{p}");
         assert!(p.contains("review it like a PR"), "{p}");
         // Trust but verify the findings of read-only agents, too.
         assert!(p.contains("Trust but verify the **findings**"), "{p}");

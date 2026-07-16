@@ -152,7 +152,7 @@ pub(crate) async fn run_capped_output(
 pub use edit::EditTool;
 pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
-pub use git::GitTool;
+pub use git::{GitTool, redact_secret_diffs};
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use lsp_nav::{DefinitionTool, ReferencesTool, RenameTool};

@@ -2304,6 +2304,131 @@ impl hrdr_tools::Tool for TaskCleanupTool {
     }
 }
 
+/// `task_diff`: review a finished write sub-agent's work in one call, instead of
+/// the parent hand-rolling the 3-command git recipe (`status --porcelain`,
+/// `log --oneline HEAD..<branch>`, `diff HEAD...<branch>`) every time.
+struct TaskDiffTool;
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskDiffTool {
+    fn name(&self) -> &'static str {
+        "task_diff"
+    }
+    fn description(&self) -> &'static str {
+        "Review a finished write sub-agent's work in one call: any uncommitted/untracked \
+         leftovers in its worktree, its commits, and the full merge-base diff (`git diff \
+         HEAD...<branch>`). Use it when a write task reports back, before you merge its work \
+         into your own working dir. Pass the task `id` (from `task_list` or the delivery \
+         message)."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("task_diff needs an integer `id` (see `task_list`)"))?;
+        // Same lookup as `task_cleanup`: the entry persists after delivery, so
+        // this is addressable by id whether or not the task has been reviewed yet.
+        let worktree = {
+            let v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match v.iter().find(|t| t.id == id) {
+                Some(t) => t.worktree.clone().zip(t.branch.clone()),
+                None => anyhow::bail!("no background task #{id} (see `task_list`)"),
+            }
+        };
+        let Some((path, branch)) = worktree else {
+            anyhow::bail!(
+                "task #{id} has no changes to diff — it was read-only or shared your working \
+                 dir, so nothing landed in an isolated worktree."
+            );
+        };
+
+        // 1. Uncommitted/untracked leftovers in the worktree itself.
+        let status_out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .context("running `git status` in the task's worktree")?;
+        let dirty = String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .to_string();
+
+        // 2. The commits under review, run against the PARENT's cwd (the branch
+        // is visible there too — worktrees share one object store).
+        let log_out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&ctx.cwd)
+            .args(["log", "--oneline", &format!("HEAD..{branch}")])
+            .output()
+            .await
+            .context("running `git log` for the task's branch")?;
+        let commits = String::from_utf8_lossy(&log_out.stdout).trim().to_string();
+
+        // 3. The full merge-base diff, also from the parent's cwd (three-dot:
+        // everything since the merge-base, not just what's uncommitted in the
+        // worktree — which is clean once the sub-agent has committed).
+        let diff_out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&ctx.cwd)
+            .args(["diff", &format!("HEAD...{branch}")])
+            .output()
+            .await
+            .context("running `git diff` against the task's branch")?;
+        let diff = hrdr_tools::redact_secret_diffs(&String::from_utf8_lossy(&diff_out.stdout));
+
+        let mut report = String::new();
+        if !dirty.is_empty() {
+            report.push_str(&format!(
+                "WARNING: the sub-agent left uncommitted/untracked changes in its worktree — \
+                 these are NOT included in the diff below and must be handled (reviewed and \
+                 committed, or discarded) before you merge or run `task_cleanup`:\n{dirty}\n\n"
+            ));
+        }
+        if commits.is_empty() {
+            report.push_str(&format!(
+                "Commits: branch `{branch}` has no commits beyond your HEAD — nothing to \
+                 merge.\n\n"
+            ));
+        } else {
+            report.push_str(&format!("Commits:\n{commits}\n\n"));
+        }
+        report.push_str(&format!("Diff (git diff HEAD...{branch}):\n"));
+        report.push_str(if diff.trim().is_empty() {
+            "(no diff)\n"
+        } else {
+            &diff
+        });
+
+        Ok(hrdr_tools::truncate_saved(
+            &report,
+            ctx.max_output,
+            ctx.max_output_lines,
+            hrdr_tools::TruncateSide::Head,
+            "task_diff",
+        ))
+    }
+}
+
 /// Agent configuration.
 ///
 /// The model identity — WHICH model at WHICH provider — is the single
@@ -5041,6 +5166,7 @@ impl Agent {
                 bg_handles: Arc::clone(&bg_handles),
                 live: live_subagents.clone(),
             }));
+            tools.register(Arc::new(TaskDiffTool));
             tools.register(Arc::new(TaskCleanupTool {
                 live: live_subagents.clone(),
             }));
@@ -6090,19 +6216,18 @@ impl Agent {
                          `{branch}` in an isolated git worktree — NOTHING has landed in your \
                          working dir yet.\n  worktree: {p}\n  branch:   {branch}\n\nTrust but \
                          verify before you merge. The sub-agent was told to commit all its work \
-                         and leave a clean tree, but confirm it actually did:\n  1. `git -C {p} \
-                         status --porcelain` — MUST be empty. If it is not, the sub-agent left \
-                         changes uncommitted or untracked; review those changes and commit them \
-                         YOURSELF (a proper Conventional Commits message) before merging — do not \
-                         re-delegate to another sub-agent, just handle it — or that work is \
-                         lost.\n  2. `git -C {p} \
-                         log --oneline` — check its commits are present and sensibly split.\n  \
-                         3. `git diff HEAD...{branch}` from your own working dir — review the \
-                         actual changes (`git -C {p} diff` is empty; the worktree itself is \
-                         clean) and fix any issues.\nThen merge the branch into your working dir \
-                         (rebase it onto HEAD in the worktree first if that'd conflict — `git -C \
-                         {p} rebase <your-branch>`), and once its work is in, call \
-                         `task_cleanup` with id {id} to remove the worktree. Its report:]\n{result}"
+                         and leave a clean tree, but confirm it actually did:\n  1. Call \
+                         `task_diff {id}` — shows any uncommitted/untracked leftovers (must be \
+                         none), its commits, and the full diff (`git diff \
+                         HEAD...{branch}`).\n  2. If it flags uncommitted/untracked changes, do \
+                         not re-delegate to another sub-agent — review those changes and commit \
+                         them YOURSELF (a proper Conventional Commits message) before merging, or \
+                         that work is lost. Then review the diff like a PR — every hunk, not just \
+                         that commits exist — and fix anything off before bringing it \
+                         over.\nThen merge the branch into your working dir (rebase it onto HEAD \
+                         in the worktree first if that'd conflict — `git -C {p} rebase \
+                         <your-branch>`), and once its work is in, call `task_cleanup` with id \
+                         {id} to remove the worktree. Its report:]\n{result}"
                     )
                 }
                 None => {
@@ -10050,10 +10175,11 @@ mod tests {
             last.contains("/tmp/wt-x"),
             "gives the worktree path: {last}"
         );
-        // Trust-but-verify handoff: check the branch is clean/committed before merge.
+        // Trust-but-verify handoff: points at `task_diff` and still tells the
+        // parent to commit any leftovers itself.
         assert!(
             last.contains("Trust but verify")
-                && last.contains("status --porcelain")
+                && last.contains("task_diff 1")
                 && last.contains("commit them YOURSELF"),
             "handoff tells the parent to verify + commit leftovers itself: {last}"
         );
@@ -10671,6 +10797,131 @@ mod tests {
                 .iter()
                 .any(|t| t.id == 2),
             "the entry is kept"
+        );
+    }
+
+    /// `task_diff` composes the review the delivery message used to spell out as
+    /// three manual commands: a clean, committed task's worktree yields no
+    /// warning but shows the commit and the diff hunk; a dirty worktree's
+    /// leftovers are called out; an unknown id and a worktree-less (read-only)
+    /// task both error clearly.
+    #[tokio::test]
+    async fn task_diff_reports_commits_diff_and_uncommitted_leftovers() {
+        use super::{TaskDiffTool, Worktree};
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let ctx = hrdr_tools::ToolContext::new(repo);
+        let diff_tool = TaskDiffTool;
+
+        // (a) a write task with one committed change: the report names the
+        // commit and shows the diff hunk, with no dirty-worktree warning.
+        let wt = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt.path.join("work.txt"), "sub-agent change\n").unwrap();
+        for a in [vec!["add", "."], vec!["commit", "-qm", "add work.txt"]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt.path)
+                .args(&a)
+                .output()
+                .unwrap();
+        }
+        let kept = wt.keep();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 1,
+                delivered: true,
+                worktree: Some(kept.path.clone()),
+                branch: Some(kept.branch.clone()),
+                ..Default::default()
+            });
+        let out = diff_tool
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("add work.txt"), "shows the commit: {out}");
+        assert!(
+            out.contains("+sub-agent change"),
+            "shows the diff hunk: {out}"
+        );
+        assert!(
+            !out.contains("WARNING"),
+            "a clean, committed worktree has no leftovers warning: {out}"
+        );
+
+        // (b) a dirty worktree (uncommitted + untracked): the warning is
+        // prepended and the diff still runs.
+        let wt_dirty = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt_dirty.path.join("wip.txt"), "not committed").unwrap();
+        let dirty = wt_dirty.keep();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 2,
+                delivered: true,
+                worktree: Some(dirty.path.clone()),
+                branch: Some(dirty.branch.clone()),
+                ..Default::default()
+            });
+        let out_dirty = diff_tool
+            .execute(serde_json::json!({"id": 2}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out_dirty.contains("WARNING") && out_dirty.contains("wip.txt"),
+            "flags the uncommitted/untracked leftovers: {out_dirty}"
+        );
+        assert!(
+            out_dirty.contains("no commits beyond your HEAD"),
+            "a worktree with no commits says so: {out_dirty}"
+        );
+
+        // (c) an unknown id is an error.
+        let err = diff_tool
+            .execute(serde_json::json!({"id": 999}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no background task"), "{err}");
+
+        // (d) a read-only task (no worktree) errors with the no-changes message.
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 3,
+                delivered: true,
+                worktree: None,
+                branch: None,
+                ..Default::default()
+            });
+        let err = diff_tool
+            .execute(serde_json::json!({"id": 3}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no changes to diff"),
+            "read-only task explains there's nothing to diff: {err}"
         );
     }
 
