@@ -5232,6 +5232,10 @@ impl Agent {
         self.reset_read_files();
         self.reset_session_cost();
         self.refresh_system();
+        // A fresh conversation deserves a fresh chance at proactive compaction —
+        // whatever made the summarizer fail belonged to the old history (or was
+        // transient), not to this agent for the rest of the session.
+        self.self_compact_failed = false;
     }
 
     /// Abort all running background sub-agent tasks and remove every background
@@ -5804,6 +5808,14 @@ impl Agent {
                 1 => elide_tool_results(&full),
                 n => tail_window(&elide_tool_results(&full), 1 << (n - 1)),
             };
+            // The summarizer is sent no `tools` (it must answer in prose), but
+            // `history` still carries tool_use/tool_result blocks from the
+            // conversation being summarized — including, if a `/compact` lands
+            // right after an Esc-cancelled tool round, a dangling `tool_calls`
+            // message with no matching result. The native Anthropic backend
+            // 400s on either shape unless `tools` is defined, so flatten the
+            // protocol out of the request entirely rather than repairing it.
+            let history = flatten_tool_protocol(&history);
             let mut req = Vec::with_capacity(history.len() + 2);
             req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
             req.extend(history);
@@ -5843,6 +5855,12 @@ impl Agent {
         // Most file contents the model had read live only in the summary now;
         // require fresh reads before further edits.
         self.reset_read_files();
+        // A summarization call just succeeded — whatever previously made
+        // `maybe_self_compact` latch itself off no longer holds, so let
+        // proactive compaction try again instead of staying silently disabled
+        // for the rest of the session (only `invalidate_context_window`, on a
+        // model switch, used to clear this).
+        self.self_compact_failed = false;
         Ok((before, self.messages.len()))
     }
 
@@ -6122,7 +6140,8 @@ impl Agent {
                 ));
             }
 
-            let assistant = acc.into_message();
+            let mut assistant = acc.into_message();
+            ensure_assistant_has_content(&mut assistant);
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
             self.messages.push(assistant);
 
@@ -6194,10 +6213,23 @@ impl Agent {
              calls. Summarize what you accomplished and what remains to be done.]"
                 .to_string(),
         ));
+        // No `tools` are sent for this round (the model must answer in text),
+        // but the turn's history is full of tool_use/tool_result blocks from
+        // the rounds that already ran — the native Anthropic backend 400s any
+        // request carrying those without a `tools` definition. Flatten the
+        // protocol out for this request only; the real history (with the tool
+        // protocol intact) is restored right after, so later turns still see
+        // accurate tool-call pairing.
+        let flattened = flatten_tool_protocol(&self.messages);
+        let real_messages = std::mem::replace(&mut self.messages, flattened);
         let acc = self
             .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
-            .await?;
-        self.messages.push(acc.into_message());
+            .await;
+        self.messages = real_messages;
+        let acc = acc?;
+        let mut wrap_up_reply = acc.into_message();
+        ensure_assistant_has_content(&mut wrap_up_reply);
+        self.messages.push(wrap_up_reply);
         self.fire_turn_end_hooks(&mut on_event).await;
         self.release_finished_subagents();
         self.age_todos();
@@ -7045,6 +7077,78 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
     }
 }
 
+/// Downgrade `messages` out of the tool-call protocol entirely — no
+/// `Role::Tool` message and no assistant `tool_calls` survive.
+///
+/// The compaction summarizer and the max-steps wrap-up round both send a
+/// request with `tools` omitted (they want prose back, not more tool calls),
+/// but the native Anthropic Messages API 400s any request whose history still
+/// carries tool_use/tool_result blocks unless `tools` is also defined. Neither
+/// caller can supply `tools` — the summarizer isn't offered any, and the
+/// wrap-up round omits them on purpose to force a text answer — so the fix is
+/// to strip the protocol from the messages before they're sent:
+///
+/// - a `Role::Tool` result becomes a plain `Role::User` text message, prefixed
+///   so it still reads as a tool result to the model.
+/// - an assistant message's `tool_calls` are dropped. Its text, if any, is
+///   kept verbatim; if it had *only* tool_calls (no text), it is replaced with
+///   a short note naming the calls so that turn isn't silently erased.
+///
+/// This also neutralizes a dangling tool_calls message (e.g. history left by
+/// an Esc-cancelled tool round, when `repair_dangling_tool_calls` hasn't run):
+/// with every `tool_calls` field stripped, there is nothing left to dangle.
+fn flatten_tool_protocol(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .map(|m| match m.role {
+            Role::Tool => {
+                let body = m.content.as_deref().unwrap_or_default();
+                ChatMessage::user(format!("[tool result] {body}"))
+            }
+            Role::Assistant if m.tool_calls.is_some() => {
+                let names: Vec<&str> = m
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|c| c.function.name.as_str())
+                    .collect();
+                let text = match m.content.as_deref() {
+                    Some(t) if !t.trim().is_empty() => t.to_string(),
+                    _ => format!("[called tools: {}]", names.join(", ")),
+                };
+                ChatMessage {
+                    content: Some(text),
+                    tool_calls: None,
+                    ..m.clone()
+                }
+            }
+            _ => m.clone(),
+        })
+        .collect()
+}
+
+/// Guard against an assistant turn carrying neither text nor a tool call.
+///
+/// `Accumulator::into_message` leaves both `content` and `tool_calls` unset
+/// when the model's reply was genuinely empty (e.g. a `stop` with no delta
+/// and no tool call), which serializes as a bare `{"role":"assistant"}` on
+/// the wire. Some strict OpenAI-compatible servers 400 on *any* request whose
+/// history contains one of those, wedging every later request in the
+/// session. A short placeholder keeps the message round-trippable; nothing
+/// else about it (in particular, no `tool_calls`) changes, so no
+/// tool-call/result pairing invariant is affected.
+fn ensure_assistant_has_content(msg: &mut ChatMessage) {
+    let empty_text = msg
+        .content
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    if empty_text && msg.tool_calls.is_none() {
+        msg.content = Some("(no response)".to_string());
+    }
+}
+
 /// Very rough token estimate (~4 characters per token) for `text`. Used only as
 /// a fallback when the server reports no usage — good enough for the context bar
 /// + auto-compaction, not for billing.
@@ -7148,11 +7252,12 @@ mod tests {
         DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
         LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots,
         ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
-        estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
-        is_transient, legacy_config_error, parse_env_bool, provider_alias_collision_error,
-        prune_tool_messages, repair_dangling_tool_calls, resolve, resolve_subagent_dir,
-        retry_after_hint, steering_queue, subagent_base_config, subagent_event_for,
-        subagent_transcript_id, tail_window,
+        ensure_assistant_has_content, estimate_tokens, estimate_tokens_in_messages,
+        flatten_tool_protocol, in_git_repo, is_context_overflow, is_transient, legacy_config_error,
+        parse_env_bool, provider_alias_collision_error, prune_tool_messages,
+        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
+        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
+        tail_window,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -8040,6 +8145,22 @@ mod tests {
                 true
             ),
             "so the agent does not immediately re-compact"
+        );
+    }
+
+    /// `clear()` (a `/new` conversation) must reset the `self_compact_failed`
+    /// latch — otherwise a summarizer failure in one conversation silently
+    /// disables proactive compaction in every conversation that follows it in
+    /// the same session, even though `clear()` starts from a blank history that
+    /// has nothing to do with why the summarizer failed.
+    #[test]
+    fn clear_resets_the_self_compact_failed_latch() {
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        agent.self_compact_failed = true;
+        agent.clear();
+        assert!(
+            !agent.self_compact_failed,
+            "a fresh conversation gets a fresh chance at proactive compaction"
         );
     }
 
@@ -11758,6 +11879,123 @@ mod tests {
         assert!(tail_start > 1, "something before the tail to summarize");
     }
 
+    // ---- flatten_tool_protocol ----
+
+    /// The compaction summarizer and the max-steps wrap-up round both send a
+    /// request with no `tools`, so the native Anthropic backend 400s if any
+    /// tool_use/tool_result block survives in the history. `flatten_tool_protocol`
+    /// must remove every trace of the protocol: no `Role::Tool` message, and no
+    /// assistant message with `tool_calls` set.
+    #[test]
+    fn flatten_tool_protocol_strips_every_tool_protocol_message() {
+        let msgs = vec![
+            ChatMessage::user("do the thing"),
+            assistant_with_calls(&["a"]), // tool_calls only, no text
+            ChatMessage::tool_result("a", "42"),
+            ChatMessage::assistant("the answer is 42"), // plain text, untouched
+        ];
+        let flat = flatten_tool_protocol(&msgs);
+
+        assert_eq!(flat.len(), msgs.len(), "message count is preserved");
+        assert!(
+            flat.iter().all(|m| m.role != Role::Tool),
+            "no Role::Tool message may survive"
+        );
+        assert!(
+            flat.iter().all(|m| m.tool_calls.is_none()),
+            "no message may carry tool_calls"
+        );
+
+        // The tool-calls-only assistant turn becomes a text note naming the call.
+        assert_eq!(flat[1].role, Role::Assistant);
+        assert_eq!(flat[1].content.as_deref(), Some("[called tools: t]"));
+
+        // The tool result becomes a plain user message carrying the same content.
+        assert_eq!(flat[2].role, Role::User);
+        assert_eq!(flat[2].content.as_deref(), Some("[tool result] 42"));
+        assert_eq!(flat[2].tool_call_id, None, "no longer bound to a call id");
+
+        // An ordinary text turn is passed through unchanged.
+        assert_eq!(flat[3].content.as_deref(), Some("the answer is 42"));
+    }
+
+    /// An assistant message that has *both* text and tool_calls keeps its text
+    /// verbatim — only the `tool_calls` field is dropped, no note is invented.
+    #[test]
+    fn flatten_tool_protocol_keeps_existing_text_over_the_call_note() {
+        let mut with_text = assistant_with_calls(&["a"]);
+        with_text.content = Some("let me check that".to_string());
+        let flat = flatten_tool_protocol(std::slice::from_ref(&with_text));
+        assert_eq!(flat[0].content.as_deref(), Some("let me check that"));
+        assert!(flat[0].tool_calls.is_none());
+    }
+
+    /// Regression for the Esc-cancelled-tool-round case (`/compact` right after
+    /// a turn was cancelled mid tool-call): the last assistant message has
+    /// `tool_calls` with no matching `Role::Tool` result at all — a dangling
+    /// tool_use that a native Anthropic request would reject outright. Since
+    /// `flatten_tool_protocol` strips `tool_calls` unconditionally, it resolves
+    /// this case too, without needing `repair_dangling_tool_calls` to run first.
+    #[test]
+    fn flatten_tool_protocol_resolves_a_dangling_cancelled_tool_round() {
+        let msgs = vec![
+            ChatMessage::user("go"),
+            assistant_with_calls(&["a", "b"]), // cancelled before any result landed
+        ];
+        let flat = flatten_tool_protocol(&msgs);
+
+        assert!(
+            flat.iter().all(|m| m.tool_calls.is_none()),
+            "the dangling tool_calls must not survive flattening"
+        );
+        assert!(flat.iter().all(|m| m.role != Role::Tool));
+        assert_eq!(flat.last().unwrap().role, Role::Assistant);
+        assert!(
+            flat.last().unwrap().content.is_some(),
+            "the dangling turn becomes a plain text note instead of vanishing"
+        );
+    }
+
+    // ---- ensure_assistant_has_content ----
+
+    /// An assistant reply with neither text nor a tool call serializes as a bare
+    /// `{"role":"assistant"}` on the wire, which some strict OpenAI-compatible
+    /// servers reject on every later request. The guard must give it placeholder
+    /// text so the message round-trips.
+    #[test]
+    fn ensure_assistant_has_content_fills_a_genuinely_empty_reply() {
+        let mut empty = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        ensure_assistant_has_content(&mut empty);
+        assert_eq!(empty.content.as_deref(), Some("(no response)"));
+        assert!(empty.tool_calls.is_none());
+    }
+
+    /// A reply with actual text, or one that only called tools, is left
+    /// untouched — the guard only fires when there is truly nothing at all.
+    #[test]
+    fn ensure_assistant_has_content_leaves_text_or_tool_calls_alone() {
+        let mut with_text = ChatMessage::assistant("hi");
+        ensure_assistant_has_content(&mut with_text);
+        assert_eq!(with_text.content.as_deref(), Some("hi"));
+
+        let mut with_calls = assistant_with_calls(&["a"]);
+        ensure_assistant_has_content(&mut with_calls);
+        assert_eq!(
+            with_calls.content, None,
+            "a tool-calls-only reply is not the empty case this guards against"
+        );
+        assert!(with_calls.tool_calls.is_some());
+    }
+
     // ---- estimate_tokens ----
 
     #[test]
@@ -12079,6 +12317,35 @@ mod tests {
                 events.iter().any(|e| matches!(e, AgentEvent::TurnDone)),
                 "TurnDone must fire"
             );
+        }
+
+        /// A reply with no text delta and no tool call (just an immediate `stop`)
+        /// must not be pushed to history as a bare `{"role":"assistant"}` —
+        /// `Accumulator::into_message` leaves both `content` and `tool_calls`
+        /// unset in that case, and some strict OpenAI-compatible servers 400 on
+        /// any request whose history contains one, wedging every later turn.
+        #[tokio::test]
+        async fn agent_run_empty_reply_gets_placeholder_content() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            agent.run("hi", steering_queue(), |_| {}).await.unwrap();
+
+            let last = agent.messages().last().expect("assistant reply pushed");
+            assert_eq!(last.role, hrdr_llm::Role::Assistant);
+            assert!(
+                last.content
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()),
+                "an empty reply must not serialize as a bare {{\"role\":\"assistant\"}}, got {:?}",
+                last.content
+            );
+            assert!(last.tool_calls.is_none());
         }
 
         /// `max_cost` stops the turn before the first model call once the
@@ -12613,6 +12880,42 @@ mod tests {
                 .expect("compaction must survive a transient error on the summarization call");
             assert_eq!(b, before);
             assert!(after < before, "history should shrink after compaction");
+        }
+
+        // ── self_compact_failed latch is reset by a later successful compact ──
+
+        /// `maybe_self_compact` latches `self_compact_failed` on any summarizer
+        /// failure so it doesn't retry (and pay for) a broken summarizer every
+        /// round. Before this fix, only a model switch
+        /// (`invalidate_context_window`) ever cleared it back — a later
+        /// successful `compact()` (e.g. a manual `/compact` once the transient
+        /// issue passed) left proactive compaction silently disabled for the
+        /// rest of the session. It must clear the latch on success.
+        #[tokio::test]
+        async fn a_successful_compact_clears_the_self_compact_failed_latch() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the conversation so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            // Simulate an earlier self-compaction failure that latched the flag.
+            agent.self_compact_failed = true;
+
+            agent.compact(None).await.expect("this compaction succeeds");
+            assert!(
+                !agent.self_compact_failed,
+                "a successful compact() must clear the latch"
+            );
         }
 
         // ── incomplete stream (truncated without [DONE]) ──────────────────────
