@@ -6,6 +6,85 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-16
+
+### Added
+
+- **Per-turn user-message timestamps.** Each real user turn now carries an
+  immutable local-time stamp (in its content, set once, never re-rendered — so
+  the prompt cache stays warm and it persists to the session file) so the model
+  can track wall-clock time and date across a long session. Human-facing
+  surfaces (session names) strip it via `hrdr_agent::strip_user_timestamp`;
+  `/copy` and `/export` keep it.
+- **Tool-call durations.** Every tool call records the wall-clock time it took
+  in its result for the model, in a magnitude-relative format (`53ms`,
+  `5s 12ms`, `1m 31s`, `1h 32m`).
+
+### Fixed
+
+- **Provider streaming and error classification.** Empty tool-call arguments
+  serialize as `{}` instead of an empty string (a zero-argument tool call no
+  longer permanently 400s and poisons an Anthropic session). Mid-stream
+  transport errors on all three backends are typed transient and retried;
+  OpenAI-path mid-stream error objects are classified by type/code
+  (rate-limit/overload → transient) and an explicit `"error": null` no longer
+  aborts a healthy stream; `408` and Cloudflare `522`/`524` are treated
+  transient. SSE line/data buffers are bounded (32 MiB), `"choices": null` /
+  `"delta": null` are tolerated, the streaming accumulator caps the
+  server-supplied tool-call index, synthesized tool-call ids are unique across
+  turns, a signed empty thinking block is retained, and a Codex
+  `response.incomplete` with an unknown/missing reason reports truncation
+  correctly.
+- **Context-overflow recovery for single-user-turn histories** (the shape of
+  every delegated sub-agent): compaction now splits inside the one mega-turn at
+  a safe boundary, and the overflow-retry path fails with a clear error instead
+  of re-sending the identical too-big request until the budget is spent.
+- **Provider-safe compaction.** The compaction summarizer and the max-steps
+  wrap-up round no longer send `tool_use`/`tool_result` history without a
+  `tools` definition (an Anthropic 400); an empty assistant reply gets
+  placeholder content instead of a bare `{"role":"assistant"}`; the
+  self-compaction latch resets on `/new` and on a successful compaction.
+- **Tool data-loss and secret leaks.** A single line over the output cap is
+  byte-bounded; `git` large output flows through the overflow file instead of
+  being reported as a failure; `copy` refuses a secret source; git secret-diff
+  redaction is closed against quoted paths, `--no-prefix`/`--*-prefix`, and
+  pathspec magic; shell output is re-trimmed to the display cap; and LSP paths
+  with non-ASCII characters no longer corrupt (`file_uri` percent-encodes,
+  `uri_to_path` decodes as UTF-8). LSP JSON-RPC errors are forwarded instead of
+  surfacing as an empty result.
+- **OAuth and config.** Token HTTP requests use a bounded-timeout client (a
+  black-holed refresh no longer wedges the app). CRLF-authored agent and skill
+  files (`---\r\n`) no longer bypass frontmatter parsing — which had loaded an
+  agent with no `read_only`/`tools` restrictions and the raw YAML as its prompt.
+- **MCP.** A server-initiated request/notification whose id collides with a
+  pending client call is no longer misrouted as that call's response; the
+  initialized-notification POST is bounded by the handshake timeout; string ids
+  are accepted; and read-state tracking recovers a poisoned lock.
+- **TUI and app.** A `!command` caps its in-memory buffer while streaming;
+  session save no longer re-parses the previous file for its `created` time and
+  `list_sessions` caches metadata by mtime (no more per-keystroke re-parse while
+  typing `/resume`); `/copy msg N-M` no longer freezes on a huge range; an
+  `@agent` mention no longer flattens the message's newlines/code fences; and a
+  Windows OAuth URL is caret-escaped so `cmd` doesn't truncate it at `&`.
+
+### Changed
+
+- **System prompt.** Read-only sub-agents are no longer told to commit or
+  pointed at a Git section that doesn't render; the current date is injected;
+  the formatter/linter step is scoped to changed files (with `--allow-dirty`
+  noted); added "answer questions without editing until asked" and "report a
+  pre-existing failure rather than folding it in"; the plan/explore personas
+  return their full result and bound their output; and a persona now states it
+  wins over the base prompt on conflict.
+- **Internal deduplication** (no behavior change except where noted): hrdr-agent
+  now calls `hrdr_llm::url_host`/`wire_protocol` (fixing an IPv6 endpoint
+  cache-mode misclassification) instead of its own copies; one
+  `hrdr_llm::unique_sibling_path` replaces four temp-name schemes;
+  `collect_lines`, `split_fence`, `align_past_tool_results`,
+  `McpClient::build_http`, and the `ChatChunk` constructors are each shared
+  rather than duplicated; and every user-role turn enters history through one
+  `push_user_message`.
+
 ## [0.4.2] - 2026-07-16
 
 ### Changed
