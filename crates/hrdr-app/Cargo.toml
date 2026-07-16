@@ -1,6 +1,6 @@
 [package]
 name = "hrdr-app"
-description = "hrdr shared application core — UI-agnostic logic (slash-command registry, aliases, quit detection) shared by the TUI and GUI frontends."
+description = "hrdr shared application core — UI-agnostic logic (slash-command registry, aliases, quit detection) shared by the TUI and headless runner frontends."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
