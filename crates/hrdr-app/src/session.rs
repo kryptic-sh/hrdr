@@ -449,6 +449,14 @@ impl Session {
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
         hrdr_agent::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
+        // Two writes can land within the filesystem's mtime granularity
+        // (Windows timestamps tick coarsely), and `meta_cache` trusts an
+        // unchanged mtime — so a listing right after e.g. a rename could
+        // serve the pre-rename entry. This process just changed the file:
+        // drop its cached meta so the next listing re-reads it.
+        if let Ok(mut cache) = meta_cache().lock() {
+            cache.remove(&path);
+        }
         Ok(path)
     }
 
