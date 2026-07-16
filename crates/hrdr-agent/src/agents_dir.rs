@@ -236,28 +236,31 @@ impl FmValue {
     }
 }
 
-/// Split `text` into (frontmatter map, body). A leading `---` … `---` fence is
-/// the frontmatter; without one, the whole text is the body.
-fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>, &str) {
-    let mut map = std::collections::HashMap::new();
+/// Split a leading `---` … `---` frontmatter fence off `text`, returning
+/// `(frontmatter_text, body)`. Strips an optional leading BOM before looking
+/// for the opening fence, and tolerates a CRLF line ending on the opening
+/// fence (`---\r\n`) as well as a closing fence with trailing whitespace
+/// (`--- `) and/or a CRLF ending. Returns `None` when there's no (properly
+/// opened and terminated) fence — the caller then treats the *original*
+/// input as the whole body.
+///
+/// Shared by `hrdr-agent`'s agent-file frontmatter (which further parses the
+/// returned frontmatter text into typed fields via [`parse_frontmatter`])
+/// and `hrdr-app`'s skill files (which parse it as flat `key: value` lines)
+/// — the fence-splitting itself, including two independently-fixed CRLF
+/// bugs, used to be duplicated between the two.
+pub fn split_fence(text: &str) -> Option<(&str, &str)> {
     let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let Some(rest) = trimmed.strip_prefix("---") else {
-        return (map, text);
-    };
+    let rest = trimmed.strip_prefix("---")?;
     // The opening fence must be its own line. Tolerate a CRLF line ending
-    // (`---\r\n`): without this, a CRLF-authored agent file fails the `\n`
-    // match and the ENTIRE file — including a `read_only: true` / `tools:`
+    // (`---\r\n`): without this, a CRLF-authored file fails the `\n` match
+    // and the ENTIRE file — including a `read_only: true` / `tools:`
     // allow-list — is returned as the body, loading the agent with no
     // restrictions and the raw YAML as its system prompt.
     let rest = rest.strip_prefix('\r').unwrap_or(rest);
-    let rest = match rest.strip_prefix('\n') {
-        Some(r) => r,
-        None => return (map, text),
-    };
+    let rest = rest.strip_prefix('\n')?;
     // Find the closing fence line (`---` on its own line).
-    let Some(end) = find_closing_fence(rest) else {
-        return (map, text);
-    };
+    let end = find_closing_fence(rest)?;
     let (fm_text, after) = rest.split_at(end);
     // Skip past the END of the closing fence LINE, not a literal `---\n`
     // prefix: a fence with trailing whitespace (`--- `) or a `\r` (`---\r\n`)
@@ -269,9 +272,7 @@ fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>,
         Some(nl) => &after[nl + 1..],
         None => "",
     };
-
-    parse_frontmatter(fm_text, &mut map);
-    (map, body)
+    Some((fm_text, body))
 }
 
 /// Byte offset of the closing `---` fence line within `s` (the start of that
@@ -285,6 +286,17 @@ fn find_closing_fence(s: &str) -> Option<usize> {
         offset += line.len();
     }
     None
+}
+
+/// Split `text` into (frontmatter map, body). A leading `---` … `---` fence is
+/// the frontmatter; without one, the whole text is the body.
+fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>, &str) {
+    let mut map = std::collections::HashMap::new();
+    let Some((fm_text, body)) = split_fence(text) else {
+        return (map, text);
+    };
+    parse_frontmatter(fm_text, &mut map);
+    (map, body)
 }
 
 /// A YAML block scalar's chomping style: `|` keeps interior newlines
@@ -669,5 +681,27 @@ mod tests {
             Some(""),
             "a block scalar with no indented continuation is empty, not '|'"
         );
+    }
+
+    /// `split_fence` is the shared helper `hrdr-app`'s skill parser also
+    /// calls: exercise its CRLF opening fence, trailing-whitespace closing
+    /// fence, body extraction, and no-fence `None` directly.
+    #[test]
+    fn split_fence_extracts_frontmatter_and_body() {
+        // CRLF opening fence.
+        let (fm, body) = split_fence("---\r\nname: x\r\n---\r\nbody text\r\n").unwrap();
+        assert_eq!(fm, "name: x\r\n");
+        assert_eq!(body, "body text\r\n");
+
+        // Closing fence with trailing whitespace.
+        let (fm, body) = split_fence("---\nname: x\n--- \nbody text\n").unwrap();
+        assert_eq!(fm, "name: x\n");
+        assert_eq!(body, "body text\n");
+
+        // No opening fence at all → None.
+        assert!(split_fence("no fence here").is_none());
+
+        // Opening fence with no closing fence → None (unterminated).
+        assert!(split_fence("---\nname: x\nno closing fence\n").is_none());
     }
 }

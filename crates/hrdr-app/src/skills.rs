@@ -88,7 +88,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
 /// is empty.
 pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option<Skill> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let (name, description, args, body) = match fenced_frontmatter(text) {
+    let (name, description, args, body) = match hrdr_agent::split_fence(text) {
         Some((fm, body)) => {
             let field = |key: &str| {
                 fm.lines().find_map(|l| {
@@ -124,26 +124,6 @@ pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option
         source: source.to_string(),
         args,
     })
-}
-
-/// Split a leading `---` … `---` fence off `text`: `(frontmatter, body)`.
-/// `None` when there is no (terminated) fence.
-fn fenced_frontmatter(text: &str) -> Option<(&str, &str)> {
-    // Tolerate a CRLF opening fence (`---\r\n`): without this, a CRLF-authored
-    // skill file fails the `\n` match and the whole file — including the YAML
-    // frontmatter — becomes the prompt body (same bug as `agents_dir.rs`'s
-    // `split_frontmatter`).
-    let rest = text.strip_prefix("---")?;
-    let rest = rest.strip_prefix('\r').unwrap_or(rest);
-    let rest = rest.strip_prefix('\n')?;
-    let mut offset = 0;
-    for line in rest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
-            return Some((&rest[..offset], &rest[offset + line.len()..]));
-        }
-        offset += line.len();
-    }
-    None
 }
 
 /// If `input` invokes a skill (`:name args…`, matched case-insensitively),
@@ -260,8 +240,8 @@ mod tests {
     /// Security regression: a CRLF-authored skill file (`---\r\n`) must still
     /// have its frontmatter parsed rather than falling through to "no fence",
     /// which would make the raw YAML (`name:`, `description:`, …) part of the
-    /// prompt body sent to the model — same bug as `agents_dir.rs`'s
-    /// `split_frontmatter`.
+    /// prompt body sent to the model — covered by `hrdr_agent::split_fence`'s
+    /// own CRLF handling, shared with `agents_dir.rs`'s `split_frontmatter`.
     #[test]
     fn crlf_frontmatter_is_still_parsed() {
         let s = parse_skill_file(

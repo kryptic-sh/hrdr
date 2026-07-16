@@ -16,7 +16,7 @@ mod agents_dir;
 mod auth;
 mod prompt;
 
-pub use agents_dir::discover_agent_profiles;
+pub use agents_dir::{discover_agent_profiles, split_fence};
 
 pub use auth::{
     auth_file_path, auth_key, auth_token, load_auth_tokens, save_auth_token, write_atomic,
