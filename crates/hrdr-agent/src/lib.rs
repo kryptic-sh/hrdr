@@ -6918,6 +6918,17 @@ fn compaction_tail_start(msgs: &[ChatMessage], tail_turns: usize, preserve_token
     tail_start.max(1)
 }
 
+/// Advance `start` forward past any leading `role:"tool"` messages, so a window
+/// beginning at the returned index never starts on a tool result orphaned from
+/// its assistant `tool_calls` message (strict servers reject that). Returns
+/// `msgs.len()` when everything from `start` on is tool results.
+fn align_past_tool_results(msgs: &[ChatMessage], mut start: usize) -> usize {
+    while start < msgs.len() && msgs[start].role == Role::Tool {
+        start += 1;
+    }
+    start
+}
+
 /// Index where a verbatim tail can safely begin *inside a single mega-turn* —
 /// used when [`compaction_tail_start`] found no earlier turn boundary to fall
 /// back to (the whole history beyond the system prompt is one `role:"user"`
@@ -6954,10 +6965,7 @@ fn mega_turn_tail_start(msgs: &[ChatMessage], turn_start: usize, preserve_tokens
         tokens += msg_tokens;
         tail_start = i;
     }
-    while tail_start < msgs.len() && msgs[tail_start].role == Role::Tool {
-        tail_start += 1;
-    }
-    tail_start.max(turn_start)
+    align_past_tool_results(msgs, tail_start).max(turn_start)
 }
 
 /// Copy of `msgs` with bulky tool-result bodies truncated — tool output is the
@@ -7045,10 +7053,7 @@ fn prune_tool_messages(
 /// assistant `tool_calls` message (strict servers reject that).
 fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
     let keep = (msgs.len() / div.max(1)).clamp(2, msgs.len());
-    let mut start = msgs.len() - keep;
-    while start < msgs.len() && msgs[start].role == Role::Tool {
-        start += 1;
-    }
+    let start = align_past_tool_results(msgs, msgs.len() - keep);
     msgs[start..].to_vec()
 }
 
