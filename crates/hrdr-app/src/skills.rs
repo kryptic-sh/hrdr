@@ -6,10 +6,22 @@
 //! `$ARGUMENTS` replaced by everything after the skill name (or, when the
 //! placeholder is absent and arguments were given, with them appended on their
 //! own line). Discovery mirrors the sub-agent files: project dirs first, then
-//! user dirs, hrdr → Claude Code → opencode conventions, deduped by name
-//! (first source wins).
+//! user dirs, hrdr → Claude Code → opencode conventions, then hrdr's own
+//! built-in skills (`:commit`, `:release`, `:review`) last — deduped by name
+//! (first source wins), so a user or project file always overrides a
+//! built-in of the same name.
 
 use std::path::{Path, PathBuf};
+
+// The skills hrdr ships with, baked into the binary via `include_str!` — the
+// same convention `hrdr_agent::prompt` uses for `system.j2` — so a fresh
+// install has a working `:commit`, `:release`, `:review` with no setup.
+// Content lives in `templates/skills/*.md`, not here: keep the prompt text in
+// Markdown (reviewable, diffable, editable without touching Rust) and this
+// file to parsing/wiring only.
+const BUILTIN_COMMIT: &str = include_str!("templates/skills/commit.md");
+const BUILTIN_RELEASE: &str = include_str!("templates/skills/release.md");
+const BUILTIN_REVIEW: &str = include_str!("templates/skills/review.md");
 
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +64,11 @@ fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Discover skill files across the hrdr/Claude/opencode locations, relative to
-/// `cwd` for project scopes. One skill per unique name (case-insensitive);
-/// the first source in precedence order wins.
+/// `cwd` for project scopes, plus hrdr's built-in skills. One skill per unique
+/// name (case-insensitive); the first source in precedence order wins — the
+/// built-ins are appended last, so any user or project file of the same name
+/// (e.g. a project's own `.hrdr/skills/commit.md`) is discovered first and
+/// shadows it.
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
     for dir in skill_dirs(cwd) {
@@ -80,7 +95,31 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
             }
         }
     }
+    for skill in builtin_skills() {
+        if !out.iter().any(|s| s.name.eq_ignore_ascii_case(&skill.name)) {
+            out.push(skill);
+        }
+    }
     out
+}
+
+/// hrdr's built-in skills — `:commit`, `:release`, `:review` — parsed from the
+/// Markdown templates baked into the binary at compile time. Always three
+/// entries (each template is a checked-in, non-empty file, so parsing cannot
+/// fail); sorted by name like a scanned directory's entries are, so their
+/// relative order matches wherever they'd sit if they were plain files on
+/// disk.
+pub fn builtin_skills() -> Vec<Skill> {
+    let mut skills: Vec<Skill> = [
+        (BUILTIN_COMMIT, "commit"),
+        (BUILTIN_RELEASE, "release"),
+        (BUILTIN_REVIEW, "review"),
+    ]
+    .into_iter()
+    .filter_map(|(text, stem)| parse_skill_file(text, stem, "built-in"))
+    .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
 }
 
 /// Parse one skill file: optional flat `name:`/`description:` frontmatter
@@ -299,6 +338,84 @@ mod tests {
         assert_eq!(ship.body, "hrdr wins", "project .hrdr dir outranks .claude");
         assert!(skills.iter().any(|s| s.name == "review"));
         assert!(!skills.iter().any(|s| s.name == "notes"));
+    }
+
+    /// The three built-in templates each parse into a usable skill: a name,
+    /// a non-empty description and body, and — for `release`/`review`, whose
+    /// templates declare `args:` — the completion candidates the popup should
+    /// offer after `:name `. `commit` declares none, so its list is empty.
+    #[test]
+    fn builtins_parse_with_names_descriptions_bodies_and_args() {
+        let skills = builtin_skills();
+        assert_eq!(skills.len(), 3, "commit, release, review");
+
+        for name in ["commit", "release", "review"] {
+            let s = skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing built-in {name}"));
+            assert!(!s.description.is_empty(), "{name} description");
+            assert!(!s.body.is_empty(), "{name} body");
+            assert_eq!(s.source, "built-in");
+        }
+
+        assert!(
+            skills
+                .iter()
+                .find(|s| s.name == "commit")
+                .unwrap()
+                .args
+                .is_empty(),
+            "commit declares no args"
+        );
+        assert_eq!(
+            skills.iter().find(|s| s.name == "release").unwrap().args,
+            vec!["patch", "minor", "major"]
+        );
+        assert_eq!(
+            skills.iter().find(|s| s.name == "review").unwrap().args,
+            vec!["low", "high"]
+        );
+    }
+
+    /// `discover_skills` on a cwd with no skill directories at all still
+    /// returns the three built-ins — the whole point of shipping them is that
+    /// `:commit`/`:release`/`:review` work with zero setup.
+    #[test]
+    fn discover_skills_on_empty_cwd_returns_only_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = discover_skills(dir.path());
+        let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["commit", "release", "review"]);
+        assert!(skills.iter().all(|s| s.source == "built-in"));
+    }
+
+    /// A project's own `.hrdr/skills/commit.md` shadows the built-in `commit`
+    /// — built-ins are appended last in `discover_skills`, so they only fill
+    /// gaps the dedup (first source wins, case-insensitive) leaves open.
+    #[test]
+    fn project_skill_overrides_the_builtin_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let hrdr = dir.path().join(".hrdr/skills");
+        std::fs::create_dir_all(&hrdr).unwrap();
+        std::fs::write(hrdr.join("commit.md"), "project commit wins").unwrap();
+
+        let skills = discover_skills(dir.path());
+        let commit = skills.iter().find(|s| s.name == "commit").unwrap();
+        assert_eq!(commit.body, "project commit wins");
+        assert_ne!(commit.source, "built-in");
+        // The other two built-ins are still present, unshadowed.
+        assert!(
+            skills
+                .iter()
+                .any(|s| s.name == "release" && s.source == "built-in")
+        );
+        assert!(
+            skills
+                .iter()
+                .any(|s| s.name == "review" && s.source == "built-in")
+        );
     }
 
     #[test]

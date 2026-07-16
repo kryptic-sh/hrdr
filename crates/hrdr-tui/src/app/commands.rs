@@ -509,16 +509,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         ));
     }
     fn begin_skill_selector(&mut self) {
+        // `discover_skills` always returns hrdr's built-ins (`:commit`,
+        // `:release`, `:review`) even in a cwd with no skill files of its own,
+        // so the list is never empty — no "no skills yet" fallback needed here.
         let skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.app.current_cwd()));
-        if skills.is_empty() {
-            self.info(
-                "no skills yet — put Markdown prompt templates in .hrdr/skills/ (or \
-                 .claude/commands/, ~/.config/hrdr/skills/), then invoke one with \
-                 :name [arguments]"
-                    .to_string(),
-            );
-            return;
-        }
         self.app.skill_selector = Some(super::skill_selector(skills));
     }
     fn begin_model_selector(&mut self) {
