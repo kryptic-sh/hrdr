@@ -5769,14 +5769,32 @@ impl Agent {
         // Keep the most recent messages verbatim — compaction usually fires
         // mid-task, and the summary alone loses exactly the detail the model
         // is working with. Only the head (everything older) is summarized.
-        let tail_start = compaction_tail_start(
+        let mut tail_start = compaction_tail_start(
             &self.messages,
             self.compaction_tail_turns,
             self.preserve_recent_tokens,
         );
         if tail_start <= 2 {
-            // Nothing meaningful before the tail; compacting would only churn.
-            return Ok((before, before));
+            // No earlier turn boundary exists before the tail: the newest (and
+            // only) turn *is* the whole history beyond the system prompt. That
+            // still may be worth shrinking — a single turn balloons through many
+            // tool round-trips without ever adding a second `role:"user"`
+            // message (every delegated sub-agent's history is exactly this
+            // shape), and can itself bust the context window. Simply no-op'ing
+            // here used to let context-overflow recovery retry an identical,
+            // still-too-big request until the retry budget was exhausted. Split
+            // *inside* the turn instead: walk it the same way
+            // `compaction_tail_start` walks whole turns, but at message
+            // granularity (the turn itself is the only unit available), landing
+            // only on a non-`Role::Tool` boundary so no tool_use/tool_result
+            // pair is torn apart.
+            tail_start = mega_turn_tail_start(&self.messages, 1, self.preserve_recent_tokens);
+            if tail_start <= 1 {
+                // Splitting bought nothing — the lone turn already fits the
+                // tail budget, or there's truly nothing beyond the system
+                // prompt to summarize.
+                return Ok((before, before));
+            }
         }
 
         // Build a one-off summarization request: a dedicated summarizer system
@@ -6690,8 +6708,22 @@ impl Agent {
                         on_event(AgentEvent::Notice(
                             "context window exceeded — compacting and retrying".to_string(),
                         ));
-                        self.compact(None).await?;
+                        let (before, after) = self.compact(None).await?;
                         *overflow_compacted = true;
+                        // `compact` reports `before == after` on every no-op path
+                        // (nothing to summarize, or splitting the mega-turn bought
+                        // nothing). Retrying then would resend the exact request
+                        // that just failed and hit the same overflow again, having
+                        // burned the single retry this branch allows — so fail
+                        // clearly now instead of falling through to a generic
+                        // "background task failed" once the caller gives up.
+                        if after >= before {
+                            bail!(
+                                "context window exceeded and the current turn is too \
+                                 large to compact ({after} messages, nothing left to \
+                                 shrink) — {e}"
+                            );
+                        }
                         continue;
                     }
                     // Transient network/server error → backoff and retry. Honor a
@@ -6871,6 +6903,48 @@ fn compaction_tail_start(msgs: &[ChatMessage], tail_turns: usize, preserve_token
         tail_start = start;
     }
     tail_start.max(1)
+}
+
+/// Index where a verbatim tail can safely begin *inside a single mega-turn* —
+/// used when [`compaction_tail_start`] found no earlier turn boundary to fall
+/// back to (the whole history beyond the system prompt is one `role:"user"`
+/// turn that grew huge through many tool round-trips; every delegated
+/// sub-agent's history is exactly this shape). Same walk as
+/// `compaction_tail_start` — newest → oldest, budgeted by `preserve_tokens`,
+/// always keeping at least the newest message — but at MESSAGE granularity
+/// rather than whole-turn granularity, since the turn itself is the only unit
+/// left to split.
+///
+/// Never lands on a `Role::Tool` message: walks forward past one so a tool
+/// result is never torn from its assistant `tool_calls` message (mirrors
+/// [`tail_window`]'s alignment). That forward walk can consume the entire
+/// budgeted window (e.g. the newest message is a lone tool result whose
+/// call is now the oldest thing that fits) — in which case this returns
+/// `msgs.len()`, meaning: keep nothing verbatim, summarize the whole turn.
+/// That is still a valid, useful result (`compact` ends up with just
+/// `[system, continuation]`), and never invalid: an empty tail can't orphan
+/// anything. Returns `turn_start` when nothing is worth summarizing (the
+/// turn already fits the budget, or `turn_start >= msgs.len()`).
+fn mega_turn_tail_start(msgs: &[ChatMessage], turn_start: usize, preserve_tokens: u32) -> usize {
+    if turn_start >= msgs.len() {
+        return turn_start;
+    }
+    let mut tail_start = msgs.len();
+    let mut tokens = 0u32;
+    for i in (turn_start..msgs.len()).rev() {
+        let msg_tokens = estimate_tokens_in_messages(&msgs[i..=i]);
+        // Always keep the newest message; stop before an older one that busts
+        // the budget.
+        if tail_start != msgs.len() && tokens + msg_tokens > preserve_tokens {
+            break;
+        }
+        tokens += msg_tokens;
+        tail_start = i;
+    }
+    while tail_start < msgs.len() && msgs[tail_start].role == Role::Tool {
+        tail_start += 1;
+    }
+    tail_start.max(turn_start)
 }
 
 /// Copy of `msgs` with bulky tool-result bodies truncated — tool output is the
@@ -7249,15 +7323,15 @@ mod tests {
     use super::SubagentDirCell;
     use super::{
         Agent, AgentConfig, AgentEvent, DEFAULT_BASE_URL, DEFAULT_MAX_READONLY_SUBAGENTS,
-        DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
-        LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots,
-        ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
-        ensure_assistant_has_content, estimate_tokens, estimate_tokens_in_messages,
-        flatten_tool_protocol, in_git_repo, is_context_overflow, is_transient, legacy_config_error,
-        parse_env_bool, provider_alias_collision_error, prune_tool_messages,
-        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
-        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
-        tail_window,
+        DEFAULT_MAX_WRITE_SUBAGENTS, DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS,
+        ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, LspFileConfig, LspServerEntry,
+        PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
+        compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
+        estimate_tokens_in_messages, flatten_tool_protocol, in_git_repo, is_context_overflow,
+        is_transient, legacy_config_error, mega_turn_tail_start, parse_env_bool,
+        provider_alias_collision_error, prune_tool_messages, repair_dangling_tool_calls, resolve,
+        resolve_subagent_dir, retry_after_hint, steering_queue, subagent_base_config,
+        subagent_event_for, subagent_transcript_id, tail_window,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -11687,6 +11761,74 @@ mod tests {
     }
 
     #[test]
+    fn mega_turn_tail_start_shrinks_a_single_oversized_turn() {
+        // Sub-agent-shaped history: exactly one `role:"user"` message overall
+        // (index 1), followed by many tool round-trips — `compaction_tail_start`
+        // can never find an earlier turn boundary here (there isn't one), so it
+        // always returns 1. Before the fix this meant `compact()` no-op'd no
+        // matter how huge the turn grew.
+        let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+        let msgs = vec![
+            ChatMessage::system("sys"),                 // 0
+            ChatMessage::user("do the big task"),       // 1 — the only user turn
+            assistant_with_calls(&["a"]),               // 2
+            ChatMessage::tool_result("a", big.clone()), // 3
+            ChatMessage::assistant(big.clone()),        // 4
+            assistant_with_calls(&["b"]),               // 5
+            ChatMessage::tool_result("b", big.clone()), // 6
+            ChatMessage::assistant("final answer"),     // 7
+        ];
+        assert_eq!(
+            compaction_tail_start(&msgs, DEFAULT_TAIL_TURNS, DEFAULT_PRESERVE_RECENT_TOKENS),
+            1,
+            "only one user turn exists — compaction_tail_start can't split further"
+        );
+
+        // A tight budget forces a real split inside the turn.
+        let split = mega_turn_tail_start(&msgs, 1, 8_000);
+        assert!(split > 1, "must find something to summarize, got {split}");
+        assert!(
+            split < msgs.len(),
+            "must keep something verbatim, got {split}"
+        );
+        // Never lands on a tool result — that would orphan it from its call.
+        assert_ne!(
+            msgs[split].role,
+            Role::Tool,
+            "must not start the tail on a tool result"
+        );
+
+        // A generous budget covering the whole turn is a genuine no-op (nothing
+        // to gain by summarizing).
+        assert_eq!(mega_turn_tail_start(&msgs, 1, 1_000_000), 1);
+
+        // turn_start at/after the end of the slice: nothing to split.
+        assert_eq!(mega_turn_tail_start(&msgs, msgs.len(), 8_000), msgs.len());
+    }
+
+    #[test]
+    fn mega_turn_tail_start_walks_past_a_trailing_tool_result() {
+        // The very last message is a lone tool result awaiting the next
+        // assistant turn (exactly the shape compact() sees when
+        // context-overflow strikes mid tool-round). A tight budget that would
+        // otherwise keep only that one message must instead walk forward past
+        // it — landing on `msgs.len()` (summarize the whole turn, keep nothing
+        // verbatim) rather than orphaning the result from its `tool_calls` call.
+        let msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("go"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", "x".repeat(80_000)), // ~20k tokens alone
+        ];
+        let split = mega_turn_tail_start(&msgs, 1, 1_000);
+        assert_eq!(
+            split,
+            msgs.len(),
+            "must not start the tail on the trailing tool result"
+        );
+    }
+
+    #[test]
     fn repeat_guard_blocks_verbatim_loops_only() {
         let mut g = super::RepeatGuard::default();
         // First failure: no nudge, no refusal.
@@ -12880,6 +13022,112 @@ mod tests {
                 .expect("compaction must survive a transient error on the summarization call");
             assert_eq!(b, before);
             assert!(after < before, "history should shrink after compaction");
+        }
+
+        // ── overflow recovery for a single oversized turn (Part A) ────────────
+
+        /// REGRESSION: a sub-agent-shaped history — exactly one `role:"user"`
+        /// message overall, followed by many tool round-trips — used to make
+        /// `compact()` a silent no-op: `compaction_tail_start` always returns 1
+        /// here (there is no earlier turn boundary to summarize), and the old
+        /// code treated `tail_start <= 2` as "nothing to do" unconditionally.
+        /// Every delegated sub-agent's history has exactly this shape, so
+        /// context-overflow recovery was dead for all of them. The fix splits
+        /// *inside* the single turn when there's no earlier one to fall back to
+        /// — this asserts `compact()` actually shrinks such a history end to
+        /// end (through the real summarization call, not just the pure
+        /// `mega_turn_tail_start` helper).
+        #[tokio::test]
+        async fn compact_shrinks_a_single_oversized_turn_subagent_shaped_history() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the tool work so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // agent.messages starts as [system]. Build the sub-agent shape: one
+            // user turn, then many tool round-trips with bulky results — never a
+            // second `role:"user"` message.
+            agent.messages.push(ChatMessage::user("do the big task"));
+            let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+            for i in 0..6 {
+                let id = format!("call{i}");
+                agent.messages.push(super::assistant_with_calls(&[&id]));
+                agent
+                    .messages
+                    .push(ChatMessage::tool_result(&id, big.clone()));
+            }
+            let before = agent.message_count();
+
+            // Confirm this is exactly the previously-broken shape: only one user
+            // turn, so `compaction_tail_start` can't find an earlier boundary.
+            assert_eq!(
+                super::compaction_tail_start(
+                    agent.messages(),
+                    super::DEFAULT_TAIL_TURNS,
+                    super::DEFAULT_PRESERVE_RECENT_TOKENS,
+                ),
+                1
+            );
+
+            let (b, after) = agent
+                .compact(None)
+                .await
+                .expect("compacting a single oversized turn must succeed");
+            assert_eq!(b, before);
+            assert!(
+                after < before,
+                "a single oversized turn must actually shrink, not no-op \
+                 (before={before}, after={after})"
+            );
+            // The system prompt must survive, and the tail (if any) must never
+            // start on an orphaned tool result.
+            assert_eq!(agent.messages()[0].role, super::Role::System);
+            if agent.message_count() > 2 {
+                assert_ne!(agent.messages()[2].role, super::Role::Tool);
+            }
+        }
+
+        // ── overflow retry fails clearly instead of looping (Part B) ──────────
+
+        /// REGRESSION: when compaction cannot shrink the history at all (nothing
+        /// left to compact — the whole turn already fits the tail budget, so
+        /// even the Part-A mega-turn split is a no-op), the old code retried the
+        /// identical request anyway, burning the turn's one overflow-retry
+        /// allowance on a request that was certain to fail the same way again —
+        /// surfacing only as a generic "(background task failed: …)" once the
+        /// caller gave up. The fix detects the no-op (`compact`'s `before ==
+        /// after`) and fails immediately with an honest, specific error instead.
+        #[tokio::test]
+        async fn overflow_retry_fails_clearly_when_compaction_cannot_shrink() {
+            // Only ONE response queued: the fix must not issue a second request
+            // (no summarization call, no repeated chat_stream call) once it
+            // sees compaction couldn't help.
+            let server = MockServer::start(vec![MockResp::HttpError(413)]).await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // A small tool round-trip — comfortably inside the default 8k-token
+            // tail budget, so compaction has nothing to gain from splitting it.
+            // The server reports overflow anyway (413), simulating a real
+            // context window smaller than this — still — modest history, or any
+            // other case where nothing is left to shrink.
+            agent.messages.push(ChatMessage::user("go"));
+            agent.messages.push(super::assistant_with_calls(&["a"]));
+            agent.messages.push(ChatMessage::tool_result("a", "ok"));
+
+            let err = agent
+                .run("", steering_queue(), |_| {})
+                .await
+                .expect_err("must fail, not silently loop on an unshrinkable overflow");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("too large to compact"),
+                "expected a clear compaction-exhausted message, got: {msg}"
+            );
         }
 
         // ── self_compact_failed latch is reset by a later successful compact ──
