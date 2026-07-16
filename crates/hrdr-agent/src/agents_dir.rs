@@ -177,7 +177,11 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
         .and_then(|v| v.scalar().parse().ok());
 
     let is_true = |v: &FmValue| matches!(v.scalar().as_str(), "true" | "yes" | "1");
-    let read_only = fm.get("read_only").map(is_true).unwrap_or(false);
+    // `None` when the file doesn't mention the key at all — distinct from an
+    // explicit `false` — so an `[[subagent]]` config overlay onto a same-named
+    // discovered profile can tell "unset" from "set false" (see
+    // `SubagentProfile::read_only`).
+    let read_only = fm.get("read_only").map(is_true);
     let write_ext = fm
         .get("write_ext")
         .map(|v| v.list())
@@ -185,7 +189,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
     // Only an allow-list form is honored (Claude/hrdr). opencode's boolean
     // `tools:` map is nested, so it parses to an empty list here and is ignored.
     let tools = fm.get("tools").map(|v| v.list()).filter(|l| !l.is_empty());
-    let proactive = fm.get("proactive").map(is_true).unwrap_or(false);
+    let proactive = fm.get("proactive").map(is_true);
     let isolation = fm
         .get("isolation")
         .map(|v| v.scalar())
@@ -512,9 +516,12 @@ mod tests {
     #[test]
     fn parses_proactive_flag() {
         let text = "---\nname: reviewer\nproactive: true\n---\nreview stuff\n";
-        assert!(parse(text, "x").proactive);
+        assert!(parse(text, "x").is_proactive());
         let text = "---\nname: reviewer\n---\nreview stuff\n";
-        assert!(!parse(text, "x").proactive);
+        assert!(!parse(text, "x").is_proactive());
+        // Unmentioned means unset, not "explicitly false" — significant for the
+        // field-level merge in `resolve_agent_profiles`.
+        assert_eq!(parse(text, "x").proactive, None);
     }
 
     #[test]
@@ -610,7 +617,7 @@ mod tests {
         let text = "---\r\nname: locked-down\r\nread_only: true\r\ntools: Read, Grep\r\n---\r\nBe careful.\r\n";
         let p = parse(text, "fallback");
         assert_eq!(p.name, "locked-down");
-        assert!(p.read_only, "read_only must survive CRLF frontmatter");
+        assert!(p.is_read_only(), "read_only must survive CRLF frontmatter");
         assert_eq!(
             p.tools.as_deref(),
             Some(&["Read".into(), "Grep".into()][..]),

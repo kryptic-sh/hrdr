@@ -632,7 +632,10 @@ belongs to the provider you are leaving, and never follows you. An explicit
 
 A profile can also carry a **custom system prompt** and a **scoped tool set** —
 this is how the built-in `explore`/`review` agents are defined, and a user
-profile of the same name overrides the built-in:
+profile of the same name overlays the built-in **field by field**: whatever the
+profile sets wins, and whatever it leaves out (e.g. pinning just `model`) still
+inherits the built-in's prompt, `read_only` scope, and description rather than
+losing them:
 
 ```toml
 [[subagent]]

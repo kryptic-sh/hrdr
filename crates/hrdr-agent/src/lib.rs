@@ -1445,7 +1445,7 @@ pub fn config_for_agent_profile(
     // (resolved to the read-only tool set in `Agent::new`, which has the registry).
     cfg.agent_prompt = profile.prompt.clone();
     cfg.allowed_tools = profile.tools.clone();
-    cfg.read_only = profile.read_only;
+    cfg.read_only = profile.is_read_only();
     cfg.write_ext = profile.write_ext.clone();
     // Per-agent runtime knobs, each inheriting the main agent's when omitted.
     if profile.temperature.is_some() {
@@ -1548,7 +1548,7 @@ impl SubagentTool {
                     Some(ModelSpec::ProviderOnly(p)) => p.to_string(),
                     None => "main provider".to_string(),
                 };
-                if p.read_only {
+                if p.is_read_only() {
                     tags.push_str(" · read-only");
                 } else if let Some(exts) = &p.write_ext {
                     let list = exts
@@ -1561,7 +1561,7 @@ impl SubagentTool {
                 if p.isolation.as_deref() == Some("worktree") {
                     tags.push_str(" · isolated worktree");
                 }
-                let star = if p.proactive { "★ " } else { "" };
+                let star = if p.is_proactive() { "★ " } else { "" };
                 desc.push_str(&format!("- {star}{} ({tags})", p.name));
                 if let Some(d) = &p.description {
                     desc.push_str(&format!(" — {d}"));
@@ -2537,8 +2537,12 @@ pub struct SubagentProfile {
     pub prompt: Option<String>,
     /// Restrict this sub-agent to the read-only tool set (read/grep/find/ls/web
     /// — no write/edit/patch/shell). Ignored when `tools` is set explicitly.
+    /// `None` means "not specified by this profile" — distinct from `Some(false)`
+    /// — so overlaying a profile onto a built-in (e.g. pinning `review`'s model)
+    /// doesn't silently clear a built-in's `read_only = true`. Use
+    /// [`is_read_only`](Self::is_read_only) to read the effective value.
     #[serde(default)]
-    pub read_only: bool,
+    pub read_only: Option<bool>,
     /// Explicit tool allow-list for this sub-agent (overrides `read_only`).
     /// Omit for the full default tool set.
     #[serde(default)]
@@ -2562,14 +2566,26 @@ pub struct SubagentProfile {
     /// Nudge the main agent to **delegate matching work here on its own** (rather
     /// than only when told). The `task` tool lists proactive agents with a
     /// stronger call-to-action so the model reaches for them when a sub-task fits
-    /// their `description`.
+    /// their `description`. `None` means "not specified" — see
+    /// [`is_proactive`](Self::is_proactive) for the effective value.
     #[serde(default)]
-    pub proactive: bool,
+    pub proactive: Option<bool>,
     /// Run this sub-agent in an isolated environment. `"worktree"` runs it in a
     /// fresh git worktree on a scratch branch (auto-removed if it made no
     /// changes; kept with a pointer otherwise). Omit for no isolation.
     #[serde(default)]
     pub isolation: Option<String>,
+}
+
+impl SubagentProfile {
+    /// The effective read-only-ness: unset (`None`) means not restricted.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.unwrap_or(false)
+    }
+    /// The effective proactive-ness: unset (`None`) means opt-in only.
+    pub fn is_proactive(&self) -> bool {
+        self.proactive.unwrap_or(false)
+    }
 }
 
 /// The full agent-profile set for `config`, layered by precedence — each source
@@ -2592,12 +2608,65 @@ pub struct SubagentProfile {
 ///   a non-colliding name, since prompting the model to reach for
 ///   attacker-controlled instructions without being asked is itself the risk.
 pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfile>> {
+    // Field-level merge: when `incoming` names an existing profile, each field it
+    // leaves unset (`None`) inherits the one already in the slot, so pinning e.g.
+    // just `model` on a built-in doesn't blow away its prompt/read_only/description.
+    // A non-matching name is pushed whole, as a brand-new profile. `name` keeps the
+    // existing slot's casing.
     fn overlay(profiles: &mut Vec<SubagentProfile>, incoming: SubagentProfile) {
         match profiles
             .iter_mut()
             .find(|p| p.name.eq_ignore_ascii_case(&incoming.name))
         {
-            Some(slot) => *slot = incoming,
+            Some(slot) => {
+                let SubagentProfile {
+                    name: _,
+                    model,
+                    description,
+                    prompt,
+                    read_only,
+                    tools,
+                    write_ext,
+                    temperature,
+                    effort,
+                    max_steps,
+                    proactive,
+                    isolation,
+                } = incoming;
+                if model.is_some() {
+                    slot.model = model;
+                }
+                if description.is_some() {
+                    slot.description = description;
+                }
+                if prompt.is_some() {
+                    slot.prompt = prompt;
+                }
+                if read_only.is_some() {
+                    slot.read_only = read_only;
+                }
+                if tools.is_some() {
+                    slot.tools = tools;
+                }
+                if write_ext.is_some() {
+                    slot.write_ext = write_ext;
+                }
+                if temperature.is_some() {
+                    slot.temperature = temperature;
+                }
+                if effort.is_some() {
+                    slot.effort = effort;
+                }
+                if max_steps.is_some() {
+                    slot.max_steps = max_steps;
+                }
+                if proactive.is_some() {
+                    slot.proactive = proactive;
+                }
+                if isolation.is_some() {
+                    slot.isolation = isolation;
+                }
+            }
             None => profiles.push(incoming),
         }
     }
@@ -2615,7 +2684,7 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
             );
             continue;
         }
-        p.proactive = false;
+        p.proactive = Some(false);
         overlay(&mut profiles, p);
     }
     for up in config.subagent_profiles.clone() {
@@ -2639,13 +2708,13 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
                     .to_string(),
             ),
             prompt: Some(EXPLORE_PROMPT.to_string()),
-            read_only: true,
+            read_only: Some(true),
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: true,
+            proactive: Some(true),
             isolation: None,
         },
         SubagentProfile {
@@ -2658,13 +2727,14 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
                     .to_string(),
             ),
             prompt: Some(REVIEW_PROMPT.to_string()),
-            read_only: true,
+            read_only: Some(true),
             tools: None,
             write_ext: None,
             temperature: None,
-            effort: None,
+            // A careful reviewer default: think harder before flagging.
+            effort: Some("high".to_string()),
             max_steps: None,
-            proactive: true,
+            proactive: Some(true),
             isolation: None,
         },
         SubagentProfile {
@@ -2677,13 +2747,13 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
                     .to_string(),
             ),
             prompt: Some(PLAN_PROMPT.to_string()),
-            read_only: false,
+            read_only: Some(false),
             tools: None,
             write_ext: Some(vec!["md".to_string(), "markdown".to_string()]),
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: Some(false),
             isolation: None,
         },
         SubagentProfile {
@@ -2696,13 +2766,13 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
                     .to_string(),
             ),
             prompt: None,
-            read_only: false,
+            read_only: Some(false),
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: Some(false),
             isolation: None,
         },
     ]
@@ -8658,13 +8728,13 @@ mod tests {
             model: Some(spec("openrouter://moonshotai/kimi-k2")),
             description: None,
             prompt: Some("Implement precisely.".to_string()),
-            read_only: false,
+            read_only: None,
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
@@ -8685,13 +8755,13 @@ mod tests {
                 model: Some(spec("claude-haiku")),
                 description: None,
                 prompt: None,
-                read_only: false,
+                read_only: None,
                 tools: None,
                 write_ext: None,
                 temperature: None,
                 effort: None,
                 max_steps: None,
-                proactive: false,
+                proactive: None,
                 isolation: None,
             },
         )
@@ -8710,13 +8780,13 @@ mod tests {
                     model: Some(spec("nope://m")),
                     description: None,
                     prompt: None,
-                    read_only: false,
+                    read_only: None,
                     tools: None,
                     write_ext: None,
                     temperature: None,
                     effort: None,
                     max_steps: None,
-                    proactive: false,
+                    proactive: None,
                     isolation: None,
                 },
             )
@@ -8899,13 +8969,13 @@ mod tests {
             model: Some(spec("claude-sonnet")),
             description: None,
             prompt: Some("Review only.".to_string()),
-            read_only: true,
+            read_only: Some(true),
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
         let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
@@ -8966,13 +9036,13 @@ mod tests {
             model: Some(spec("test-profile-b://profile-b-model")),
             description: None,
             prompt: Some("Preserve this persona.".to_string()),
-            read_only: true,
+            read_only: Some(true),
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
 
@@ -9100,13 +9170,13 @@ mod tests {
             // Read-only so the sub-agent shares the cwd (no git worktree needed):
             // this test exercises the auth gate, which runs before the spawn
             // regardless of capability.
-            read_only: true,
+            read_only: Some(true),
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
 
@@ -9299,17 +9369,19 @@ mod tests {
         assert_eq!(names, vec!["explore", "review", "plan", "general"]);
         // explore/review are read-only; plan writes Markdown; general is full.
         let by = |n: &str| ps.iter().find(|p| p.name == n).unwrap();
-        assert!(by("explore").read_only);
-        assert!(by("review").read_only);
-        assert!(!by("plan").read_only);
+        assert!(by("explore").is_read_only());
+        assert!(by("review").is_read_only());
+        assert!(!by("plan").is_read_only());
         assert_eq!(
             by("plan").write_ext.as_deref(),
             Some(&["md".to_string(), "markdown".to_string()][..])
         );
-        assert!(!by("general").read_only && by("general").write_ext.is_none());
+        assert!(!by("general").is_read_only() && by("general").write_ext.is_none());
         // explore/review are proactive; plan/general are opt-in.
-        assert!(by("explore").proactive && by("review").proactive);
-        assert!(!by("plan").proactive && !by("general").proactive);
+        assert!(by("explore").is_proactive() && by("review").is_proactive());
+        assert!(!by("plan").is_proactive() && !by("general").is_proactive());
+        // `review` gets a stronger reasoning-effort default — a careful reviewer.
+        assert_eq!(by("review").effort.as_deref(), Some("high"));
 
         // The personas carry the enriched daily-driver guidance.
         let prompt = |n: &str| by(n).prompt.as_deref().unwrap_or("");
@@ -9396,13 +9468,13 @@ mod tests {
             model: None,
             description: None,
             prompt: None,
-            read_only: false,
+            read_only: None,
             tools: None,
             write_ext: None,
             temperature: t,
             effort: e.map(str::to_string),
             max_steps: s,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
         // Set knobs override the inherited ones.
@@ -9490,8 +9562,101 @@ mod tests {
 
         let helper = profiles.iter().find(|p| p.name == "helper").unwrap();
         assert!(
-            !helper.proactive,
+            !helper.is_proactive(),
             "a discovered (repo-local) profile must never be able to set `proactive`"
+        );
+        assert_eq!(
+            helper.proactive,
+            Some(false),
+            "forced off explicitly, not merely left unset"
+        );
+    }
+
+    /// Field-level merge: an `[[subagent]]` profile that pins ONLY `model` on a
+    /// built-in name inherits everything else — prompt, read-only scoping,
+    /// description — rather than the old whole-profile replacement silently
+    /// dropping them.
+    #[test]
+    fn overlaying_a_builtin_with_only_model_keeps_its_other_fields() {
+        use super::{SubagentProfile, resolve_agent_profiles};
+        let cfg = AgentConfig {
+            subagent_profiles: vec![SubagentProfile {
+                name: "review".to_string(),
+                model: Some(spec("claude-opus")),
+                description: None,
+                prompt: None,
+                read_only: None,
+                tools: None,
+                write_ext: None,
+                temperature: None,
+                effort: None,
+                max_steps: None,
+                proactive: None,
+                isolation: None,
+            }],
+            ..Default::default()
+        };
+        let profiles = resolve_agent_profiles(&cfg).unwrap();
+        let review = profiles.iter().find(|p| p.name == "review").unwrap();
+        assert_eq!(review.model, Some(spec("claude-opus")), "the pinned model");
+        assert_eq!(
+            review.prompt.as_deref(),
+            Some(super::REVIEW_PROMPT),
+            "the built-in persona survives a model-only overlay"
+        );
+        assert!(
+            review.is_read_only(),
+            "the built-in's read-only scoping survives"
+        );
+        assert!(
+            review
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("Read-only code reviewer"),
+            "the built-in description survives"
+        );
+        assert_eq!(
+            review.effort.as_deref(),
+            Some("high"),
+            "the built-in's effort default survives too"
+        );
+    }
+
+    /// …and a field the overlay DOES set (`prompt`) still wins over the
+    /// built-in's, proving the merge is field-level, not "ignore the overlay
+    /// entirely".
+    #[test]
+    fn overlaying_a_builtin_with_a_prompt_replaces_just_the_prompt() {
+        use super::{SubagentProfile, resolve_agent_profiles};
+        let cfg = AgentConfig {
+            subagent_profiles: vec![SubagentProfile {
+                name: "review".to_string(),
+                model: None,
+                description: None,
+                prompt: Some("Custom review persona.".to_string()),
+                read_only: None,
+                tools: None,
+                write_ext: None,
+                temperature: None,
+                effort: None,
+                max_steps: None,
+                proactive: None,
+                isolation: None,
+            }],
+            ..Default::default()
+        };
+        let profiles = resolve_agent_profiles(&cfg).unwrap();
+        let review = profiles.iter().find(|p| p.name == "review").unwrap();
+        assert_eq!(review.prompt.as_deref(), Some("Custom review persona."));
+        // Everything else not set by the overlay still inherits the built-in.
+        assert!(review.is_read_only());
+        assert!(
+            review
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("Read-only code reviewer")
         );
     }
 
@@ -14314,13 +14479,13 @@ mod provider_only_policy_tests {
             model: Some(spec("chatgpt://")),
             description: None,
             prompt: Some("Implement.".to_string()),
-            read_only: false,
+            read_only: None,
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
         let sub = config_for_agent_profile(&base, &profile).unwrap();
@@ -14364,13 +14529,13 @@ mod provider_only_policy_tests {
             model: Some(spec("openai://")),
             description: None,
             prompt: None,
-            read_only: false,
+            read_only: None,
             tools: None,
             write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
-            proactive: false,
+            proactive: None,
             isolation: None,
         };
         let err = config_for_agent_profile(&base, &profile)
