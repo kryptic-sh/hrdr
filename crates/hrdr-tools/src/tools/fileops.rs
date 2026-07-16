@@ -167,23 +167,17 @@ async fn validate_copy_tree(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Process-wide counter making each staging name unique (paired with the PID),
+/// A unique sibling staging path for `to` (see [`hrdr_llm::unique_sibling_path`]),
 /// so two concurrent copies to the *same* destination never collide on one
 /// staging path and clobber each other's in-flight tree.
-static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn staging_path(to: &std::path::Path) -> std::path::PathBuf {
-    let name = to.file_name().unwrap_or_default().to_string_lossy();
-    let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    to.with_file_name(format!(".{name}.hrdr-stage-{}-{seq}", std::process::id()))
+    hrdr_llm::unique_sibling_path(to, "hrdr-stage")
 }
 
 /// A second sibling staging name, for holding the *existing* destination aside
 /// while the replacement is swapped in — so `to` is never a missing path.
 fn aside_path(to: &std::path::Path) -> std::path::PathBuf {
-    let name = to.file_name().unwrap_or_default().to_string_lossy();
-    let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    to.with_file_name(format!(".{name}.hrdr-aside-{}-{seq}", std::process::id()))
+    hrdr_llm::unique_sibling_path(to, "hrdr-aside")
 }
 
 /// Remove a path whether it is a file or a directory.

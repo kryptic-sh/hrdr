@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -88,10 +87,10 @@ fn load_tokens_at(path: &Path) -> HashMap<String, String> {
 /// The parent directory must already exist. A rename failure removes the temp
 /// so no stray file is left behind.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
     // Write to a temp file in the same directory, then rename atomically.
-    // tempfile is a dev-dependency only, so we build the temp name manually.
-    let tmp = tmp_path(path, parent);
+    // tempfile is a dev-dependency only, so the temp name comes from the
+    // shared sibling-temp scheme instead.
+    let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
 
     #[cfg(unix)]
     let create_file = || -> std::io::Result<std::fs::File> {
@@ -151,23 +150,6 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let content = doc.to_string();
     write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
-}
-
-/// A unique temp-file path inside `parent` (same filesystem as `path`, so the
-/// subsequent rename is atomic). The name includes a timestamp and PID so
-/// concurrent writes don't collide.
-pub(crate) fn tmp_path(path: &Path, parent: &Path) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    // Keep the original file stem so temp files are recognisable.
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy())
-        .unwrap_or(std::borrow::Cow::Borrowed("auth"));
-    parent.join(format!(".{stem}.{stamp}.{pid}.tmp"))
 }
 
 #[cfg(test)]

@@ -16,10 +16,12 @@ mod anthropic;
 pub mod catalog;
 mod client;
 mod codex;
+pub mod fs;
 pub mod sse;
 mod types;
 
 pub use client::{ChatError, ChatErrorKind, ChatStream, Client, url_host, wire_protocol};
+pub use fs::unique_sibling_path;
 pub use sse::{SseDecoder, SseEvent};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
