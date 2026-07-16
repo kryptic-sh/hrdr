@@ -302,25 +302,24 @@ mod tests {
             "pre-1.0 has its own rule and this project is 0.2.x"
         );
 
-        // Each ecosystem keeps the version somewhere different — and the lockfile
-        // that records it has to move with it.
-        for manifest in [
-            "`Cargo.toml`",
-            "`package.json`",
-            "`pyproject.toml`",
-            "`composer.json`",
-            "`mix.exs`",
-            "`pubspec.yaml`",
-        ] {
-            assert!(
-                p.contains(manifest),
-                "the prompt must know about {manifest}"
-            );
-        }
-        assert!(p.contains("cargo generate-lockfile"), "lockfiles follow");
+        // The manifest is wherever this ecosystem keeps it — a manifest, a
+        // gemspec, a `VERSION` file — not an itemized per-language table; and
+        // the lockfile that records it has to move with it.
+        assert!(
+            p.contains("a manifest, a gemspec, a\n  `VERSION` file"),
+            "the version lives wherever this ecosystem keeps it"
+        );
+        assert!(
+            p.contains("regenerate the lockfile with the project's own package"),
+            "lockfiles follow"
+        );
         assert!(
             p.contains("the tag *is* the version"),
             "Go has no manifest to bump"
+        );
+        assert!(
+            p.contains("No version field\n  anywhere is a question for the user"),
+            "an invented version is worse than asking"
         );
 
         // The changelog is updated, not invented; and it says something.

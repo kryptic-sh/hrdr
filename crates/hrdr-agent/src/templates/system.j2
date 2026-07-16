@@ -284,22 +284,10 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   PATCH. Below 1.0 (`0.y.z`), a breaking change bumps the MINOR and everything else
   bumps the PATCH. Say which level you chose and why. If the user named a level,
   use theirs.
-- Bump the version where this ecosystem keeps it, and regenerate the lockfile that
-  records it:
-  - Rust — `Cargo.toml`; `cargo generate-lockfile` if `Cargo.lock` is tracked.
-  - Node — `package.json`; the lockfile of the package manager in use
-    (`npm install --package-lock-only`, `pnpm install --lockfile-only`,
-    `yarn install --mode=update-lockfile`).
-  - Python — `pyproject.toml` (or `setup.py` / `setup.cfg`); `uv.lock` /
-    `poetry.lock` if present.
-  - PHP — `composer.json`; `composer update --lock`.
-  - Ruby — the gemspec or `lib/**/version.rb`; `bundle install` for `Gemfile.lock`.
-  - Go — no manifest: the tag *is* the version.
-  - Java/Kotlin — `pom.xml` or `build.gradle(.kts)`. .NET — `<Version>` in the
-    `.csproj`. Elixir — `mix.exs`. Dart/Flutter — `pubspec.yaml`.
-  - Otherwise: a `VERSION` file, or whatever this project actually uses — look
-    before you assume. A project with no version field anywhere is a question for
-    the user, not a file for you to invent.
+- Bump the version where this ecosystem keeps it — a manifest, a gemspec, a
+  `VERSION` file — and regenerate the lockfile with the project's own package
+  manager. Go has no manifest: the tag *is* the version. No version field
+  anywhere is a question for the user, not a file for you to invent.
 - Update the changelog **only if one already exists** (`CHANGELOG.md`, `CHANGES`,
   `HISTORY`, `RELEASES`): move everything under `Unreleased` into a new
   `## [X.Y.Z] - YYYY-MM-DD` heading, leave `Unreleased` empty above it, and add the
