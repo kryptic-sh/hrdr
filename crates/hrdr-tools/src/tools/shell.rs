@@ -343,11 +343,75 @@ async fn run_streamed_command(
         None => format!("… [output truncated — {total_lines} lines, {total_bytes} bytes total] …"),
     };
     let head_trimmed = head.trim_end();
+
+    // `head`/`tail` above are only bounded by the roomy 5x in-memory ring
+    // (`mem_budget`) — that headroom exists so nothing is dropped before we
+    // know whether the run will overflow, not so the *returned* text can be
+    // that big. Without a final trim here, one call could hand back
+    // ~1x (head) + ~4x (tail) = ~5x max_output, silently blowing the same
+    // budget `truncate_saved` enforces for every other tool. Re-trim head and
+    // tail to their share of the real display budget (same ~1/5 head, ~4/5
+    // tail split truncate_saved's `Middle` side uses) before returning.
+    let disp_head_bytes = ctx.max_output / 5;
+    let disp_tail_bytes = ctx.max_output.saturating_sub(disp_head_bytes);
+    let disp_head_lines = (ctx.max_output_lines / 5).max(1);
+    let disp_tail_lines = ctx.max_output_lines.saturating_sub(disp_head_lines);
+    let head_trimmed = cap_display(head_trimmed, disp_head_bytes, disp_head_lines, false);
+    let tail_str = cap_display(tail_str, disp_tail_bytes, disp_tail_lines, true);
+
     if tail_str.is_empty() {
         Ok(format!("{head_trimmed}\n\n{hint}"))
     } else {
         Ok(format!("{head_trimmed}\n\n{hint}\n\n{tail_str}"))
     }
+}
+
+/// Trim already-bounded display text down to `max_bytes` and `max_lines`,
+/// keeping whole lines from the front (`from_tail = false`, for `head`) or the
+/// back (`from_tail = true`, for `tail`) — the same head/tail line-collection
+/// truncate_saved's `Middle` side does, reimplemented here (rather than
+/// reaching into `lib.rs`'s private helper) since `head`/`tail` are already
+/// in-memory strings, not something worth round-tripping through
+/// `save_overflow` again. A single line wider than `max_bytes` is byte-capped
+/// rather than dropped, so the preview is never empty when there's anything
+/// to show.
+fn cap_display(text: &str, max_bytes: usize, max_lines: usize, from_tail: bool) -> String {
+    if text.is_empty() || max_lines == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let ordered: Vec<&&str> = if from_tail {
+        lines.iter().rev().collect()
+    } else {
+        lines.iter().collect()
+    };
+    let mut taken: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    for line in ordered {
+        if taken.len() >= max_lines {
+            break;
+        }
+        let add = line.len() + usize::from(!taken.is_empty());
+        if bytes + add > max_bytes {
+            if taken.is_empty() {
+                let budget = max_bytes.max(1);
+                let slice = if from_tail {
+                    let cut = line.len().saturating_sub(budget);
+                    &line[crate::floor_char_boundary(line, cut)..]
+                } else {
+                    &line[..crate::floor_char_boundary(line, budget)]
+                };
+                taken.push(slice);
+            }
+            break;
+        }
+        taken.push(line);
+        bytes += add;
+    }
+    if from_tail {
+        taken.reverse();
+    }
+    taken.join("\n")
 }
 
 /// The available shell tools for this machine (bash and/or PowerShell), only
@@ -611,5 +675,68 @@ mod tests {
             !marker.exists(),
             "the grandchild's sleep completed — it was never actually killed"
         );
+    }
+
+    /// Regression (MAJOR): head + hint + tail must be re-trimmed to the
+    /// `max_output`/`max_output_lines` budget before returning, not just kept
+    /// under the roomy 5x in-memory ring. Before the fix, a 200-byte cap could
+    /// come back with a ~200-byte head *and* a ~800-byte tail (the ring's
+    /// untrimmed 1x/4x split) plus the hint — up to ~5x the cap, the same
+    /// contract every other tool (`truncate_saved`) honours. This pins the
+    /// returned size to a tight multiple of the cap, not merely "under 2000
+    /// bytes for a 200-byte cap" (10x — loose enough to pass even the bug).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_output_is_trimmed_to_the_display_budget_not_the_5x_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ToolContext::new(dir.path());
+        c.max_output = 200;
+        c.max_output_lines = 10;
+
+        // 50 lines of ~33 chars each (~1650 bytes total) — comfortably over
+        // both caps, and small enough to stay under the 5x in-memory ring too
+        // (so this exercises the final display trim, not the ring cap).
+        let result = BashTool
+            .execute(
+                serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
+                &c,
+            )
+            .await
+            .unwrap();
+
+        // A generous but real bound: head (<= max_output/5) + tail
+        // (<= max_output - max_output/5) + a hint line that includes an
+        // overflow file path. 3x the cap is nowhere near the ~5x (1000+ byte)
+        // ring the bug could return, but has headroom for the hint/path text.
+        assert!(
+            result.len() <= c.max_output * 3,
+            "output must be trimmed to the display budget, not the 5x ring: \
+             {} bytes for a {}-byte cap:\n{result}",
+            result.len(),
+            c.max_output
+        );
+        assert!(
+            result.contains("full output") || result.contains("truncated"),
+            "truncation marker missing: {result}"
+        );
+        assert!(result.contains("line 1"), "head not preserved: {result}");
+    }
+
+    /// `cap_display` keeps whole lines within both a byte and a line budget,
+    /// taking from the front for `head` and the back for `tail`, and never
+    /// panics or produces something absurd when a single line alone exceeds
+    /// the byte budget.
+    #[test]
+    fn cap_display_bounds_bytes_and_lines_from_either_end() {
+        let text = "one\ntwo\nthree\nfour\nfive";
+        let head = cap_display(text, 100, 2, false);
+        assert_eq!(head, "one\ntwo");
+        let tail = cap_display(text, 100, 2, true);
+        assert_eq!(tail, "four\nfive");
+
+        // A single line wider than the byte budget is capped, not dropped.
+        let one_long_line = "a".repeat(50);
+        let capped = cap_display(&one_long_line, 10, 5, false);
+        assert_eq!(capped.len(), 10);
     }
 }

@@ -42,6 +42,12 @@ const FORBIDDEN_ANY: &[&str] = &[
     "--receive-pack",
 ];
 
+/// Flags refused for `diff`/`show`/`log` (anything that can emit a `diff --git
+/// a/<p> b/<p>` header): these strip or rename the `a/`/`b/` prefix that
+/// [`diff_section_path`] relies on to recover the file path, which would let a
+/// secret's diff hunk slip past [`redact_secret_diffs`] unredacted.
+const FORBIDDEN_DIFF_HEADER: &[&str] = &["--no-prefix", "--src-prefix", "--dst-prefix"];
+
 /// Flags refused for `diff`/`blame` specifically: `--no-index` turns `diff`
 /// into a generic two-arbitrary-paths file comparator (reads anything on
 /// disk, not just tracked repo content); `--contents` feeds `blame` a file
@@ -102,10 +108,18 @@ fn forbidden_flag<'a>(sub: &str, args: &'a [String]) -> Option<&'a str> {
         "diff" | "blame" => FORBIDDEN_DIFF_BLAME,
         _ => &[],
     };
+    // `log` also emits `diff --git` headers under `-p`/`--patch`, so it needs
+    // the header-prefix ban too, alongside `diff` and `show`.
+    let diff_header: &[&str] = if matches!(sub, "diff" | "show" | "log") {
+        FORBIDDEN_DIFF_HEADER
+    } else {
+        &[]
+    };
     args.iter().map(String::as_str).find(|arg| {
         FORBIDDEN_ANY
             .iter()
             .chain(extra)
+            .chain(diff_header)
             .any(|f| matches_flag(arg, f))
             || (sub == "branch" && bundled_short_flag_contains(arg, FORBIDDEN_BRANCH_SHORT_CHARS))
     })
@@ -198,17 +212,31 @@ fn secret_content_operand<'a>(sub: &str, args: &'a [String]) -> Option<(&'a str,
         if arg.starts_with('-') {
             continue;
         }
+        // A bare pathspec naming a secret file directly, once its magic
+        // signature (`:(top)`, `:/`) is stripped: `git show ':(top).env'` or
+        // `git show ':/.env'` are pathspecs, not `<tree-ish>:<path>` — without
+        // this, the deny-list below sees the filename as `(top).env` and its
+        // exact `.env` match misses.
+        let stripped = strip_pathspec_magic(arg);
+        if stripped != arg.as_str()
+            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(stripped))
+        {
+            return Some((arg, reason));
+        }
         // `<tree-ish>:<path>` — the part after the last `:` names a path in the
         // tree (`rsplit` so a stage prefix like `:0:.env` still resolves to
         // `.env`). `git show HEAD:.env` dumps that file's content verbatim.
+        // The path half is itself stripped of pathspec magic for the same
+        // reason as above (e.g. `HEAD:./:(top).env`).
         if let Some((_, path)) = arg.rsplit_once(':')
-            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(path))
+            && let Some(reason) =
+                crate::secret_file_reason(std::path::Path::new(strip_pathspec_magic(path)))
         {
             return Some((arg, reason));
         }
         // `git blame <path>` prints every line of the file, annotated.
         if sub == "blame"
-            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(arg))
+            && let Some(reason) = crate::secret_file_reason(std::path::Path::new(stripped))
         {
             return Some((arg, reason));
         }
@@ -216,11 +244,45 @@ fn secret_content_operand<'a>(sub: &str, args: &'a [String]) -> Option<(&'a str,
     None
 }
 
+/// Strip a leading git pathspec "magic" signature so the deny-list checks
+/// match the real filename git resolves, not the magic wrapper: `:(top)secret`
+/// and `:/secret` both name plain `secret` to git. Returns `s` unchanged if it
+/// carries no such prefix.
+fn strip_pathspec_magic(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix(":(")
+        && let Some(idx) = rest.find(')')
+    {
+        return &rest[idx + 1..];
+    }
+    if let Some(rest) = s.strip_prefix(":/") {
+        return rest;
+    }
+    s
+}
+
 /// The file path a diff-section header names, if `line` starts one:
 /// `diff --git a/<p> b/<p>` (prefer the `b/` destination), or a merge diff's
 /// `diff --cc <p>` / `diff --combined <p>`. `None` for any other line.
+///
+/// Under the default `core.quotePath`, git C-style-quotes a path that has a
+/// space, a double quote, a backslash, or a non-ASCII byte —
+/// `diff --git "a/my dir/.env" "b/my dir/.env"` — so this can't just scan for
+/// literal `" b/"`; it tokenizes the two (possibly quoted) paths and unquotes
+/// whichever one is quoted. [`forbidden_flag`] separately refuses
+/// `--no-prefix`/`--src-prefix`/`--dst-prefix`, which would otherwise strip the
+/// `a/`/`b/` markers this still relies on to tell the two tokens apart.
 fn diff_section_path(line: &str) -> Option<String> {
     if let Some(rest) = line.strip_prefix("diff --git ") {
+        if let Some((_a, remainder)) = take_diff_header_token(rest)
+            && let Some((b, _)) = take_diff_header_token(remainder)
+        {
+            // The token is the whole `b/<path>` destination spelling
+            // (unquoted) — strip the `b/` marker to get the bare path, same
+            // as the old `" b/"`-scan fallback below did.
+            return Some(b.strip_prefix("b/").map(str::to_string).unwrap_or(b));
+        }
+        // Fall back to the old best-effort scan for a header this tokenizer
+        // can't make sense of, rather than silently losing the path.
         if let Some(idx) = rest.rfind(" b/") {
             return Some(rest[idx + 3..].to_string());
         }
@@ -230,10 +292,120 @@ fn diff_section_path(line: &str) -> Option<String> {
     }
     for pre in ["diff --cc ", "diff --combined "] {
         if let Some(rest) = line.strip_prefix(pre) {
-            return Some(rest.to_string());
+            return Some(unquote_c_style(rest));
         }
     }
     None
+}
+
+/// Consume one whitespace-delimited `diff --git` header token from the start
+/// of `s`, which may be a bare path (`a/foo`) or a C-style-quoted one
+/// (`"a/my dir/.env"`), returning the unquoted token and whatever follows the
+/// single separating space. `None` if `s` is empty or a quoted token's closing
+/// quote is missing (malformed input — let the caller fall back).
+fn take_diff_header_token(s: &str) -> Option<(String, &str)> {
+    if let Some(inner) = s.strip_prefix('"') {
+        let bytes = inner.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => i += 2,
+                b'"' => {
+                    let token = &inner[..i];
+                    let remainder = inner[i + 1..].strip_prefix(' ').unwrap_or(&inner[i + 1..]);
+                    return Some((unquote_c_style(&format!("\"{token}\"")), remainder));
+                }
+                _ => i += 1,
+            }
+        }
+        None
+    } else if s.is_empty() {
+        None
+    } else {
+        let (token, remainder) = s.split_once(' ').unwrap_or((s, ""));
+        Some((token.to_string(), remainder))
+    }
+}
+
+/// Unquote a C-style quoted string as git emits under `core.quotePath`
+/// (default on): a double-quoted token where `\\`, `\"`, `\t`, `\n`, `\r`, and
+/// `\NNN` (octal byte — how a non-ASCII UTF-8 byte is spelled) stand for the
+/// literal byte. Returns `s` unchanged if it isn't a quoted token — git only
+/// quotes a path that needs it.
+fn unquote_c_style(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push(b'"');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'a' => {
+                    out.push(0x07);
+                    i += 2;
+                }
+                b'b' => {
+                    out.push(0x08);
+                    i += 2;
+                }
+                b'f' => {
+                    out.push(0x0c);
+                    i += 2;
+                }
+                b'v' => {
+                    out.push(0x0b);
+                    i += 2;
+                }
+                d1 @ b'0'..=b'7'
+                    if i + 3 < bytes.len()
+                        && (b'0'..=b'7').contains(&bytes[i + 2])
+                        && (b'0'..=b'7').contains(&bytes[i + 3]) =>
+                {
+                    // Widen to u32 before combining digits: a byte's worth of
+                    // octal digits (each 0-7) can sum past 255 for malformed
+                    // input, which would overflow a `u8` multiply/add.
+                    let d1 = u32::from(d1 - b'0');
+                    let d2 = u32::from(bytes[i + 2] - b'0');
+                    let d3 = u32::from(bytes[i + 3] - b'0');
+                    out.push((d1 * 64 + d2 * 8 + d3) as u8);
+                    i += 4;
+                }
+                other => {
+                    // Unrecognised escape: keep both characters verbatim
+                    // rather than dropping the backslash.
+                    out.push(b'\\');
+                    out.push(other);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Redact the hunk body of any diff section whose file is a credential/secret
@@ -798,5 +970,112 @@ mod tests {
         assert!(out.contains("saved to"), "big output must be saved: {out}");
         assert!(out.contains("grep"), "{out}");
         assert!(out.len() < big.len(), "the inline output is bounded: {out}");
+    }
+
+    /// Regression: `diff_section_path` must recover the path from a
+    /// C-style-quoted `diff --git` header (what `core.quotePath` — on by
+    /// default — produces for a path with a space or non-ASCII byte), not
+    /// just the unquoted `a/foo b/foo` form.
+    #[test]
+    fn diff_section_path_unquotes_c_style_headers() {
+        assert_eq!(
+            diff_section_path(r#"diff --git "a/my dir/.env" "b/my dir/.env""#),
+            Some("my dir/.env".to_string())
+        );
+        // Non-ASCII byte spelled as a `\NNN` octal escape: café.rs, UTF-8
+        // `é` = 0xC3 0xA9 = octal \303\251.
+        assert_eq!(
+            diff_section_path(r#"diff --git "a/caf\303\251.rs" "b/caf\303\251.rs""#),
+            Some("café.rs".to_string())
+        );
+        // The plain unquoted form still works.
+        assert_eq!(
+            diff_section_path("diff --git a/foo.rs b/foo.rs"),
+            Some("foo.rs".to_string())
+        );
+    }
+
+    /// Regression (MAJOR/security): a secret file under a directory whose name
+    /// has a space gets C-style-quoted by `git diff`'s default
+    /// `core.quotePath`, and the old `rfind(" b/")` parser couldn't recover
+    /// the path — so the redaction never triggered and the secret's content
+    /// rode unredacted to the model. It must be redacted regardless of the
+    /// space in the directory name.
+    #[tokio::test]
+    async fn diff_redacts_a_secret_file_under_a_dir_with_a_space() {
+        let dir = repo().await;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap()
+        };
+        std::fs::create_dir(dir.path().join("my dir")).unwrap();
+        std::fs::write(dir.path().join("my dir/.env"), "API_KEY=first\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add secret in spaced dir"]);
+        std::fs::write(dir.path().join("my dir/.env"), "API_KEY=rotated_leak_789\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path());
+        let out = GitTool
+            .execute(json!({"subcommand": "diff", "args": []}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("rotated_leak_789"),
+            "the secret content must not leak through a quoted diff header: {out}"
+        );
+        assert!(out.contains("redacted"), "{out}");
+    }
+
+    /// Regression (MAJOR/security): `--no-prefix`/`--src-prefix`/
+    /// `--dst-prefix` strip or rename the `a/`/`b/` markers the redaction
+    /// parser keys on — refuse them on the diff-producing subcommands rather
+    /// than let a secret's diff slip through unredacted.
+    #[tokio::test]
+    async fn no_prefix_and_custom_prefix_flags_are_refused() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        for args in [
+            vec!["--no-prefix".to_string()],
+            vec!["--src-prefix=x/".to_string()],
+            vec!["--dst-prefix=y/".to_string()],
+        ] {
+            let err = GitTool
+                .execute(json!({"subcommand": "diff", "args": args.clone()}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not allowed"), "{args:?}: {err}");
+            let err = GitTool
+                .execute(json!({"subcommand": "log", "args": args.clone()}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not allowed"), "{args:?}: {err}");
+        }
+    }
+
+    /// Regression (MAJOR/security): pathspec magic (`:(top)`, `:/`) must not
+    /// let a secret-file operand evade the deny-list by changing the
+    /// filename's literal spelling.
+    #[tokio::test]
+    async fn pathspec_magic_does_not_evade_the_secret_deny_list() {
+        let dir = repo_with_secret().await;
+        let ctx = ToolContext::new(dir.path());
+        for arg in [":(top).env", ":/.env"] {
+            let err = GitTool
+                .execute(json!({"subcommand": "show", "args": [arg]}), &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("credential") || err.contains("secret"),
+                "{arg}: {err}"
+            );
+        }
     }
 }

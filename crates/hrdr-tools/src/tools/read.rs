@@ -93,6 +93,13 @@ impl Tool for ReadTool {
         // wasn't byte-truncated below. A partial read is recorded as such so a
         // later `write` (full overwrite) is refused rather than dropping the
         // unseen remainder.
+        //
+        // Note: a file with any line over `MAX_LINE` is *permanently* partial
+        // — no offset/limit combination ever sees that line whole, so this
+        // never flips to `complete` no matter how many times it's re-read.
+        // `write`'s refusal message says as much and points at `edit`/`bash`
+        // instead, so the model doesn't loop on read-then-write retries that
+        // can never succeed.
         let byte_truncated = out.len() > ctx.max_output;
         let complete = start == 1
             && start - 1 + limit >= total_lines

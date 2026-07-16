@@ -85,17 +85,24 @@ fn language_id(ext: &str) -> &str {
 }
 
 /// A `file://` URI for `path` (absolute), with the few characters that break
-/// URIs percent-encoded.
+/// URIs percent-encoded — including, per RFC 3986 (URIs are ASCII-only), every
+/// non-ASCII byte of a multi-byte UTF-8 character. Without that, a filename
+/// like `café.rs` would ride into the URI as raw UTF-8 bytes rather than
+/// `%C3%A9`, which doesn't match the percent-encoded spelling a language
+/// server hands back in its own URIs — so a diagnostics lookup keyed by this
+/// URI (see `check_file`) would miss, and [`uri_to_path`] round-tripping ours
+/// would have nothing to decode.
 fn file_uri(path: &Path) -> String {
     let p = path.display().to_string().replace('\\', "/");
     let mut escaped = String::with_capacity(p.len());
-    for c in p.chars() {
-        match c {
-            ' ' => escaped.push_str("%20"),
-            '%' => escaped.push_str("%25"),
-            '#' => escaped.push_str("%23"),
-            '?' => escaped.push_str("%3F"),
-            _ => escaped.push(c),
+    for byte in p.bytes() {
+        match byte {
+            b' ' => escaped.push_str("%20"),
+            b'%' => escaped.push_str("%25"),
+            b'#' => escaped.push_str("%23"),
+            b'?' => escaped.push_str("%3F"),
+            0x80..=0xFF => escaped.push_str(&format!("%{byte:02X}")),
+            _ => escaped.push(byte as char),
         }
     }
     if escaped.starts_with('/') {
@@ -366,8 +373,10 @@ type DiagnosticsByUri = HashMap<String, (Option<i64>, Vec<Value>)>;
 struct LspClient {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     next_id: AtomicI64,
-    /// In-flight requests awaiting a response, by id.
-    pending: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
+    /// In-flight requests awaiting a response, by id. `Err(message)` carries a
+    /// JSON-RPC `error.message` through to the waiter (see [`Self::request`])
+    /// instead of the response being silently treated as an empty success.
+    pending: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     diags: std::sync::Mutex<DiagnosticsByUri>,
     /// Pinged by the reader on every publish, so waiters wake immediately.
     diag_notify: tokio::sync::Notify,
@@ -480,11 +489,23 @@ impl LspClient {
             let id = msg.get("id").and_then(Value::as_i64);
             let method = msg.get("method").and_then(Value::as_str);
             match (id, method) {
-                // A response to one of our requests.
+                // A response to one of our requests: forward its `error`
+                // (e.g. "cannot rename this symbol") rather than discarding
+                // it and leaving only `result` (absent on an error response),
+                // which used to surface as a misleading empty "no edits" /
+                // "no definition" instead of the server's actual reason.
                 (Some(id), None) => {
                     let waiter = client.pending.lock().ok().and_then(|mut p| p.remove(&id));
                     if let Some(tx) = waiter {
-                        let _ = tx.send(msg.get("result").cloned().unwrap_or(Value::Null));
+                        let outcome = match msg.get("error") {
+                            Some(err) => Err(err
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown error")
+                                .to_string()),
+                            None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                        };
+                        let _ = tx.send(outcome);
                     }
                 }
                 // A server→client request: answer minimally so it proceeds.
@@ -628,7 +649,12 @@ impl LspClient {
             return Err(e);
         }
         match tokio::time::timeout(timeout, rx).await {
-            Ok(res) => res.map_err(|_| anyhow::anyhow!("{method}: server closed")),
+            // The timeout's `Ok` wraps the channel recv, whose own `Ok` wraps
+            // what `read_loop` sent: `Ok(value)` for a normal response,
+            // `Err(message)` for a JSON-RPC `error` response.
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(message))) => anyhow::bail!("{method} failed: {message}"),
+            Ok(Err(_)) => Err(anyhow::anyhow!("{method}: server closed")),
             // Timed out waiting for the response: remove the pending entry so it
             // doesn't leak (a late response finds no waiter and is dropped).
             // Mirrors `mcp::transport::request_via_pending`'s cleanup.
@@ -718,6 +744,19 @@ pub struct LspFileEdits {
 }
 
 /// A `file://` URI back to a path (reverses [`file_uri`]'s escaping).
+///
+/// Percent-decodes into a single raw byte buffer for the *whole* string, then
+/// UTF-8-decodes that buffer once at the end — rather than decoding
+/// byte-by-byte and widening each raw byte straight to a `char`
+/// (`bytes[i] as char`), which is a Latin-1 mapping, not UTF-8 decoding: for a
+/// non-ASCII filename it split a multi-byte UTF-8 character (whether it
+/// arrived percent-encoded, as `file_uri` now always sends it, or — from a
+/// server that doesn't bother escaping — as literal UTF-8 bytes already in
+/// the string) into separate mis-mapped codepoints, e.g. `file:///proj/café.rs`
+/// decoding to `/proj/cafÃ©.rs`. Falls back to a lossy decode (replacement
+/// characters, never `None`) if the reconstructed bytes still aren't valid
+/// UTF-8, matching this function's previous never-fails-on-a-`file://`-prefix
+/// contract.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // Windows drive form `file:///C:/…` keeps the path after the third slash.
@@ -726,10 +765,9 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     } else {
         rest
     };
-    let mut out = String::with_capacity(rest.len());
     let bytes = rest.as_bytes();
+    let mut raw: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    let mut raw = Vec::new();
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
@@ -739,17 +777,10 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
             i += 3;
             continue;
         }
-        if !raw.is_empty() {
-            out.push_str(&String::from_utf8_lossy(&raw));
-            raw.clear();
-        }
-        out.push(bytes[i] as char);
+        raw.push(bytes[i]);
         i += 1;
     }
-    if !raw.is_empty() {
-        out.push_str(&String::from_utf8_lossy(&raw));
-    }
-    Some(PathBuf::from(out))
+    Some(PathBuf::from(String::from_utf8_lossy(&raw).into_owned()))
 }
 
 /// The UTF-16 column of byte offset `byte_col` within `line` (for building a
@@ -1207,6 +1238,52 @@ mod tests {
         );
     }
 
+    /// Regression (MINOR): a JSON-RPC `error` response (e.g. `rename`'s
+    /// "cannot rename this symbol") must reach the caller as that message —
+    /// not be silently discarded so it surfaces as an empty, misleading "no
+    /// edits"/"no definition" instead. The fake server here answers every
+    /// navigation request with an `error`, never a `result`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_rpc_error_responses_are_forwarded_not_discarded() {
+        if which::which("python3").is_err() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("fake_lsp_error.py");
+        std::fs::write(&server, FAKE_LSP_ERROR_PY).unwrap();
+        let file = dir.path().join("main.xyz");
+        std::fs::write(&file, "fn boom() {}\n").unwrap();
+
+        let registry = LspRegistry::new(
+            dir.path().to_path_buf(),
+            vec![LspServerConfig {
+                command: "python3".to_string(),
+                args: vec![server.display().to_string()],
+                extensions: vec!["xyz".to_string()],
+            }],
+            Some(5_000),
+        );
+
+        let err = registry
+            .nav_request(
+                "textDocument/rename",
+                "renameProvider",
+                &file,
+                "fn boom() {}\n",
+                (0, 3),
+                json!({"newName": "blast"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot rename this symbol"),
+            "the server's error.message must reach the caller, not just an \
+             empty/generic failure: {err}"
+        );
+    }
+
     #[test]
     fn uris_round_trip_and_utf16_columns_convert() {
         let p = Path::new("/proj/src/a b.rs");
@@ -1217,6 +1294,39 @@ mod tests {
         let utf16 = byte_to_utf16_col(line, byte);
         assert_eq!(utf16, 9, "4 ascii + surrogate pair (2) + 3 ascii");
         assert_eq!(utf16_to_byte_col(line, utf16), byte);
+    }
+
+    /// Regression (MAJOR): a non-ASCII filename must round-trip through
+    /// `file_uri`/`uri_to_path` intact. `uri_to_path` used to widen each raw
+    /// UTF-8 byte to a `char` one at a time (`bytes[i] as char`, a Latin-1
+    /// mapping, not UTF-8 decoding), so a multi-byte character split across
+    /// that per-byte loop came out as mojibake. `file_uri` also now
+    /// percent-encodes non-ASCII bytes (RFC 3986 — a URI is ASCII-only), so
+    /// this also pins that the encoded form contains no raw UTF-8 bytes.
+    #[test]
+    fn non_ascii_filenames_round_trip_through_uris() {
+        let p = Path::new("/proj/café.rs");
+        let uri = file_uri(p);
+        assert!(
+            uri.is_ascii(),
+            "a `file://` URI must be percent-encoded, not raw UTF-8: {uri}"
+        );
+        assert_eq!(uri, "file:///proj/caf%C3%A9.rs");
+        assert_eq!(
+            uri_to_path(&uri).unwrap(),
+            p,
+            "must decode back to the exact original path, not mojibake"
+        );
+
+        // A server that doesn't bother percent-encoding and sends the raw
+        // UTF-8 bytes directly in the URI string must still decode correctly
+        // — the bug produced `/proj/cafÃ©.rs` for exactly this input.
+        let raw_uri = "file:///proj/café.rs";
+        assert_eq!(uri_to_path(raw_uri).unwrap(), p);
+
+        // A directory name with a space *and* a non-ASCII character together.
+        let p2 = Path::new("/proj/my café/lib.rs");
+        assert_eq!(uri_to_path(&file_uri(p2)).unwrap(), p2);
     }
 
     #[test]
@@ -1495,6 +1605,51 @@ while True:
                  for (l, c) in occurrences(uri)]
         send({"jsonrpc": "2.0", "id": msg["id"],
               "result": {"changes": {uri: edits}}})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+"#;
+
+    /// A server that answers `initialize` (advertising the navigation
+    /// capabilities so the request isn't refused before it's even sent) and
+    /// then answers every navigation request with a JSON-RPC `error` instead
+    /// of a `result` — modelling a server refusing e.g. an unrenameable
+    /// symbol, to exercise error-message forwarding.
+    #[cfg(unix)]
+    const FAKE_LSP_ERROR_PY: &str = r#"
+import json, sys
+
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline().decode()
+        if not line or line == "\r\n":
+            break
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":")[1].strip())
+    if length is None:
+        sys.exit(0)
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read()
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+            "definitionProvider": True,
+            "referencesProvider": True,
+            "renameProvider": True,
+        }}})
+    elif method in ("textDocument/didOpen", "textDocument/didChange"):
+        pass
+    elif method in ("textDocument/definition", "textDocument/references",
+                     "textDocument/rename"):
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "error": {"code": -32602, "message": "cannot rename this symbol"}})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
 "#;

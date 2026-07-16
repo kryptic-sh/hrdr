@@ -5,6 +5,8 @@ use serde_json::json;
 
 use crate::{Tool, ToolContext, truncate};
 
+use super::MAX_LINE;
+
 // ---- write ----
 
 pub struct WriteTool;
@@ -53,7 +55,11 @@ impl Tool for WriteTool {
                 crate::ReadState::Partial => bail!(
                     "you've only read part of {} — a write replaces the whole file, so read \
                      it in full first (no offset/limit, or page to the end) or the unread \
-                     lines will be lost; use edit for a partial change",
+                     lines will be lost; use edit for a partial change. Note: if this file \
+                     has a line over {MAX_LINE} bytes, `read` clips that line every time no \
+                     matter how it's paged, so it can never be marked fully read — retrying \
+                     read then write will loop forever; use `edit` (targets known text, not \
+                     the whole file) or `bash` instead",
                     path.display()
                 ),
                 crate::ReadState::Stale => bail!(
@@ -112,4 +118,49 @@ pub(crate) fn unified_diff(path: &str, old: &str, new: &str) -> String {
         .context_radius(3)
         .header(&format!("a/{path}"), &format!("b/{path}"))
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (MINOR): a file with a line over `MAX_LINE` bytes is
+    /// *permanently* `Partial` (`read` clips that line every time, no matter
+    /// how it's paged — see `read.rs`), so the generic "read it in full"
+    /// advice can never be satisfied and the model would loop forever on
+    /// read-then-write. The refusal must instead point at `edit`/`bash`.
+    #[tokio::test]
+    async fn write_refusal_on_an_over_long_line_points_at_edit_not_a_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big_line.txt");
+        // One line comfortably over MAX_LINE, so `read` always clips it.
+        let long_line = "x".repeat(MAX_LINE + 500);
+        std::fs::write(&path, format!("{long_line}\n")).unwrap();
+
+        let ctx = ToolContext::new(dir.path());
+        // A full read (default offset/limit reaches EOF) still can't see the
+        // over-long line whole, so it's recorded as partial, not complete.
+        crate::ReadTool
+            .execute(serde_json::json!({"path": "big_line.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+
+        let err = WriteTool
+            .execute(
+                serde_json::json!({"path": "big_line.txt", "content": "replacement\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("edit") && err.contains("bash"),
+            "the refusal must point at a workaround that can actually succeed: {err}"
+        );
+        assert!(
+            err.contains("never"),
+            "and explain why re-reading won't help: {err}"
+        );
+    }
 }
