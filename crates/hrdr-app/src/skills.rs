@@ -129,7 +129,13 @@ pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option
 /// Split a leading `---` … `---` fence off `text`: `(frontmatter, body)`.
 /// `None` when there is no (terminated) fence.
 fn fenced_frontmatter(text: &str) -> Option<(&str, &str)> {
-    let rest = text.strip_prefix("---")?.strip_prefix('\n')?;
+    // Tolerate a CRLF opening fence (`---\r\n`): without this, a CRLF-authored
+    // skill file fails the `\n` match and the whole file — including the YAML
+    // frontmatter — becomes the prompt body (same bug as `agents_dir.rs`'s
+    // `split_frontmatter`).
+    let rest = text.strip_prefix("---")?;
+    let rest = rest.strip_prefix('\r').unwrap_or(rest);
+    let rest = rest.strip_prefix('\n')?;
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
         if line.trim_end() == "---" {
@@ -249,6 +255,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.args, vec!["staging", "production"]);
+    }
+
+    /// Security regression: a CRLF-authored skill file (`---\r\n`) must still
+    /// have its frontmatter parsed rather than falling through to "no fence",
+    /// which would make the raw YAML (`name:`, `description:`, …) part of the
+    /// prompt body sent to the model — same bug as `agents_dir.rs`'s
+    /// `split_frontmatter`.
+    #[test]
+    fn crlf_frontmatter_is_still_parsed() {
+        let s = parse_skill_file(
+            "---\r\nname: ship\r\ndescription: release checklist\r\n---\r\nDo the release.\r\n",
+            "stem",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.name, "ship");
+        assert_eq!(s.description, "release checklist");
+        assert_eq!(s.body, "Do the release.");
     }
 
     #[test]

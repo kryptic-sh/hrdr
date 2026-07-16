@@ -244,7 +244,12 @@ fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>,
     let Some(rest) = trimmed.strip_prefix("---") else {
         return (map, text);
     };
-    // The opening fence must be its own line.
+    // The opening fence must be its own line. Tolerate a CRLF line ending
+    // (`---\r\n`): without this, a CRLF-authored agent file fails the `\n`
+    // match and the ENTIRE file — including a `read_only: true` / `tools:`
+    // allow-list — is returned as the body, loading the agent with no
+    // restrictions and the raw YAML as its system prompt.
+    let rest = rest.strip_prefix('\r').unwrap_or(rest);
     let rest = match rest.strip_prefix('\n') {
         Some(r) => r,
         None => return (map, text),
@@ -254,10 +259,16 @@ fn split_frontmatter(text: &str) -> (std::collections::HashMap<String, FmValue>,
         return (map, text);
     };
     let (fm_text, after) = rest.split_at(end);
-    let body = after
-        .trim_start_matches("---")
-        .strip_prefix('\n')
-        .unwrap_or("");
+    // Skip past the END of the closing fence LINE, not a literal `---\n`
+    // prefix: a fence with trailing whitespace (`--- `) or a `\r` (`---\r\n`)
+    // doesn't match `trim_start_matches("---").strip_prefix('\n')` exactly,
+    // which silently discarded the whole body. `find_closing_fence` already
+    // matched this line via `trim_end() == "---"`, so anything up to and
+    // including its newline is the fence; everything after is the body.
+    let body = match after.find('\n') {
+        Some(nl) => &after[nl + 1..],
+        None => "",
+    };
 
     parse_frontmatter(fm_text, &mut map);
     (map, body)
@@ -276,15 +287,44 @@ fn find_closing_fence(s: &str) -> Option<usize> {
     None
 }
 
+/// A YAML block scalar's chomping style: `|` keeps interior newlines
+/// (literal), `>` folds them into spaces (folded).
+enum BlockStyle {
+    Literal,
+    Folded,
+}
+
+/// Whether `val` is a YAML block scalar indicator (`|`, `>`, and their
+/// chomping/indentation modifiers like `|-`, `>+`, `|2`) rather than literal
+/// punctuation. `description: |` and `prompt: >` must not become the literal
+/// string `"|"` / `">"` with the indented block that follows silently dropped.
+fn block_scalar_style(val: &str) -> Option<BlockStyle> {
+    let mut chars = val.chars();
+    let style = match chars.next()? {
+        '|' => BlockStyle::Literal,
+        '>' => BlockStyle::Folded,
+        _ => return None,
+    };
+    chars
+        .clone()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
+        .then_some(style)
+}
+
 /// Parse flat `key: value` frontmatter lines into `map`. Indented lines are
-/// treated as belonging to the preceding key: `- item` lines build a list,
-/// anything else (nested map entries) is ignored.
+/// treated as belonging to the preceding key: `- item` lines build a list, a
+/// block-scalar indicator (`|`/`>`) consumes the following more-indented
+/// lines as its value, anything else (nested map entries) is ignored.
 fn parse_frontmatter(fm: &str, map: &mut std::collections::HashMap<String, FmValue>) {
+    let lines: Vec<&str> = fm.lines().collect();
     let mut last_key: Option<String> = None;
-    for raw in fm.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
         let indent = raw.len() - raw.trim_start().len();
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
+            i += 1;
             continue;
         }
         // A list item under the previous key.
@@ -299,20 +339,52 @@ fn parse_frontmatter(fm: &str, map: &mut std::collections::HashMap<String, FmVal
                     *entry = FmValue::List(vec![dequote(item.trim())]);
                 }
             }
+            i += 1;
             continue;
         }
         // Indented non-list line → part of a nested map: ignore, but keep the
         // current key so a following `- item` still attaches correctly.
         if indent > 0 {
+            i += 1;
             continue;
         }
         // A top-level `key: value`.
         let Some((k, v)) = line.split_once(':') else {
+            i += 1;
             continue;
         };
         let key = k.trim().to_string();
         let val = v.trim();
         last_key = Some(key.clone());
+        if let Some(style) = block_scalar_style(val) {
+            // Consume the following more-indented (or blank) lines as the
+            // block's value instead of leaving the literal `|`/`>` marker.
+            let mut block_lines: Vec<&str> = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let next = lines[i];
+                if next.trim().is_empty() {
+                    block_lines.push("");
+                    i += 1;
+                    continue;
+                }
+                if next.len() - next.trim_start().len() == 0 {
+                    break;
+                }
+                block_lines.push(next.trim_start());
+                i += 1;
+            }
+            // YAML's default "clip" chomping: drop trailing blank lines.
+            while block_lines.last().is_some_and(|l| l.is_empty()) {
+                block_lines.pop();
+            }
+            let value = match style {
+                BlockStyle::Literal => block_lines.join("\n"),
+                BlockStyle::Folded => block_lines.join(" "),
+            };
+            map.insert(key, FmValue::Scalar(value));
+            continue;
+        }
         if val.is_empty() {
             // Value continues on following `- item` lines (or a nested map).
             map.entry(key).or_insert_with(|| FmValue::List(Vec::new()));
@@ -327,6 +399,7 @@ fn parse_frontmatter(fm: &str, map: &mut std::collections::HashMap<String, FmVal
         } else {
             map.insert(key, FmValue::Scalar(dequote(val)));
         }
+        i += 1;
     }
 }
 
@@ -512,5 +585,89 @@ mod tests {
         let p = parse("---\nname: x\nmodel: zen://kimi-k2\n---\nbody\n", "x");
         assert_eq!(p.model, Some(spec("zen://kimi-k2")));
         assert!(matches!(p.model, Some(crate::ModelSpec::Full(_))));
+    }
+
+    /// Security regression: a CRLF-authored agent file (`---\r\n`) must still
+    /// have its frontmatter parsed — including `read_only` and the `tools`
+    /// allow-list. Before the fix, `split_frontmatter` required `\n`
+    /// immediately after the opening `---`, so a `\r` there made the whole
+    /// file (raw YAML included) fall through as an unrestricted body, loading
+    /// the agent with NO tool restrictions.
+    #[test]
+    fn crlf_frontmatter_still_restricts_the_agent() {
+        let text = "---\r\nname: locked-down\r\nread_only: true\r\ntools: Read, Grep\r\n---\r\nBe careful.\r\n";
+        let p = parse(text, "fallback");
+        assert_eq!(p.name, "locked-down");
+        assert!(p.read_only, "read_only must survive CRLF frontmatter");
+        assert_eq!(
+            p.tools.as_deref(),
+            Some(&["Read".into(), "Grep".into()][..]),
+            "the tools allow-list must survive CRLF frontmatter"
+        );
+        assert_eq!(p.prompt.as_deref(), Some("Be careful."));
+    }
+
+    /// A closing fence with trailing whitespace (`--- `) must not silently
+    /// discard the body: extraction skips to the end of the fence LINE rather
+    /// than prefix-stripping the exact bytes `---\n`.
+    #[test]
+    fn closing_fence_trailing_whitespace_keeps_the_body() {
+        let text = "---\nname: x\n--- \nThe system prompt.\n";
+        let p = parse(text, "fallback");
+        assert_eq!(p.prompt.as_deref(), Some("The system prompt."));
+    }
+
+    /// A closing fence written as `---\r\n` (CRLF) must not silently discard
+    /// the body either — same body-extraction fix as the trailing-whitespace
+    /// case above.
+    #[test]
+    fn closing_fence_crlf_keeps_the_body() {
+        let text = "---\r\nname: x\r\n---\r\nThe system prompt.\r\n";
+        let p = parse(text, "fallback");
+        assert_eq!(p.prompt.as_deref(), Some("The system prompt."));
+    }
+
+    /// YAML block scalars (`description: |`, `prompt: >`) must not collapse
+    /// to the literal punctuation `"|"` / `">"` with the indented block that
+    /// follows silently dropped.
+    #[test]
+    fn block_scalars_are_not_literal_punctuation() {
+        let text = "---\n\
+            description: |\n\
+            \x20 Line one.\n\
+            \x20 Line two.\n\
+            prompt: >\n\
+            \x20 Folded one.\n\
+            \x20 Folded two.\n\
+            name: x\n\
+            ---\n\
+            body\n";
+        let p = parse(text, "fallback");
+        assert_eq!(
+            p.description.as_deref(),
+            Some("Line one.\nLine two."),
+            "literal block scalar keeps its newlines"
+        );
+        // The body is non-empty, so `prompt:` (frontmatter) is not surfaced as
+        // the profile's prompt — but it must still parse to the folded value
+        // rather than the literal ">", which we check via the raw parser.
+        let mut map = std::collections::HashMap::new();
+        parse_frontmatter("prompt: >\n \x20Folded one.\n \x20Folded two.\n", &mut map);
+        assert_eq!(
+            map.get("prompt").map(FmValue::scalar).as_deref(),
+            Some("Folded one. Folded two."),
+            "folded block scalar joins lines with spaces, not literal '>'"
+        );
+    }
+
+    #[test]
+    fn lone_block_scalar_marker_with_no_continuation_is_empty() {
+        let mut map = std::collections::HashMap::new();
+        parse_frontmatter("description: |\nname: x\n", &mut map);
+        assert_eq!(
+            map.get("description").map(FmValue::scalar).as_deref(),
+            Some(""),
+            "a block scalar with no indented continuation is empty, not '|'"
+        );
     }
 }

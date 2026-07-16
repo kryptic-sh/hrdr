@@ -52,6 +52,24 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// user who abandons the browser doesn't leave a listener + task alive forever.
 pub const CHATGPT_LOGIN_BACKSTOP: Duration = Duration::from_secs(60 * 60);
 
+/// Total-request timeout for token HTTP requests (OpenRouter key exchange,
+/// OpenAI token exchange/refresh). Without this a black-holed network mid-
+/// refresh wedges the single-flight refresher forever, parking every caller
+/// (see [`coordinated_oauth_access`]). Mirrors `chatgpt_models.rs`'s
+/// `CATALOG_HTTP_TIMEOUT`.
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build the shared `reqwest::Client` used for token HTTP requests, with
+/// [`OAUTH_HTTP_TIMEOUT`] applied. `Client::builder().build()` can fail (e.g.
+/// TLS backend init), so this returns a recoverable error rather than
+/// `.unwrap()`-ing a panic where `Client::new()` used to be infallible.
+fn oauth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(OAUTH_HTTP_TIMEOUT)
+        .build()
+        .context("building the OAuth HTTP client")
+}
+
 // ── PKCE ────────────────────────────────────────────────────────────────────
 
 /// Generate a PKCE `(verifier, challenge)` pair.
@@ -244,7 +262,7 @@ pub async fn openrouter_exchange(code: &str, verifier: &str) -> Result<String> {
         "code_verifier": verifier,
         "code_challenge_method": "S256",
     });
-    let resp = reqwest::Client::new()
+    let resp = oauth_http_client()?
         .post("https://openrouter.ai/api/v1/auth/keys")
         .json(&body)
         .send()
@@ -325,7 +343,7 @@ pub async fn openai_refresh(refresh_token: &str) -> Result<OpenAiTokens> {
 /// POST a form-encoded body to the OpenAI token endpoint and parse the tokens.
 async fn post_token(params: &[(&str, &str)]) -> Result<OpenAiTokens> {
     let url = format!("{OPENAI_ISSUER}/oauth/token");
-    let resp = reqwest::Client::new()
+    let resp = oauth_http_client()?
         .post(&url)
         .form(params)
         .send()
@@ -1285,6 +1303,39 @@ mod tests {
         let res = await_oauth_code_within(port, "state", Duration::from_millis(120)).await;
         assert!(res.is_err(), "expired deadline yields a timeout error");
         assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn oauth_http_client_has_a_bounded_timeout() {
+        // Regression: `post_token`/`openrouter_exchange` used to build clients
+        // via `reqwest::Client::new()`, which has NO total-request timeout — a
+        // black-holed network mid-refresh would wedge the single-flight
+        // coordinator (`coordinated_oauth_access`) forever, parking every
+        // caller. Pin the constant and confirm the fallible builder succeeds.
+        assert_eq!(OAUTH_HTTP_TIMEOUT, Duration::from_secs(30));
+        oauth_http_client().expect("the OAuth HTTP client builds");
+
+        // Prove the underlying mechanism (`.timeout(...)` on the client) really
+        // bounds a hung request rather than hanging forever: a listener that
+        // accepts the connection but never responds must still fail fast.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept and hold the connection open without ever responding.
+            if let Ok((stream, _)) = listener.accept() {
+                std::mem::forget(stream);
+            }
+        });
+        let short_timeout_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let res = short_timeout_client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        let err = res.expect_err("a black-holed server must time out, not hang forever");
+        assert!(err.is_timeout(), "got: {err}");
     }
 
     #[test]
