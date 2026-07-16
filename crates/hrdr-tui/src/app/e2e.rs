@@ -5269,7 +5269,12 @@ Run the release checklist for $ARGUMENTS",
         .find(|m| m.role == hrdr_agent::MessageRole::User)
         .and_then(|m| m.content.clone())
         .unwrap_or_default();
-    assert_eq!(user, "Run the release checklist for v0.3");
+    // The user turn carries an immutable timestamp prefix; strip it to compare
+    // the expanded template the model received.
+    assert_eq!(
+        hrdr_agent::strip_user_timestamp(&user),
+        "Run the release checklist for v0.3"
+    );
 }
 
 /// `/effort` opens a picker of the model's own levels, "Default" on top,

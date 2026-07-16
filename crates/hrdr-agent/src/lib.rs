@@ -6437,10 +6437,6 @@ impl Agent {
         if let Some(nudge) = repeat.record(&call.function.name, &call.function.arguments, ok) {
             body.push_str(&nudge);
         }
-        // Trusted, harness-measured wall-clock cost of the call — appended after
-        // (outside) any untrusted-content wrapper the tool added, since this is
-        // our metadata, not tool output. Present on failures too.
-        body.push_str(&format!("\n\n(took {})", format_duration(elapsed)));
         on_event(AgentEvent::ToolEnd {
             id: call.id.clone(),
             name: call.function.name.clone(),
@@ -6458,8 +6454,14 @@ impl Agent {
                 .clone();
             on_event(AgentEvent::TodoUpdated(todos));
         }
+        // Record the call's wall-clock cost for the MODEL, appended after
+        // (outside) any untrusted-content wrapper the tool added — trusted
+        // harness metadata, present on failures too. Kept out of the ToolEnd
+        // display event above: `(took 0ms)` on every instant tool is just noise
+        // in the transcript, and the model is what asked for the timing.
+        let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
         self.messages
-            .push(ChatMessage::tool_result(call.id.clone(), body));
+            .push(ChatMessage::tool_result(call.id.clone(), recorded));
     }
 
     /// Run a batch of tool calls, forwarding each call's streamed output as
@@ -7244,9 +7246,35 @@ fn ensure_assistant_has_content(msg: &mut ChatMessage) {
 /// cache prefix is never invalidated, and it persists verbatim in the session
 /// file. Only genuine user turns are stamped (not synthetic steering /
 /// background / tool-result messages).
+/// strftime format for the per-turn user timestamp (`2026-07-16 14:30:05
+/// +08:00`). Shared by the stamp and [`strip_user_timestamp`] so they can't
+/// drift apart.
+const USER_TIMESTAMP_FMT: &str = "%Y-%m-%d %H:%M:%S %:z";
+
 fn timestamped_user_message(text: impl Into<String>) -> ChatMessage {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
+    let now = chrono::Local::now().format(USER_TIMESTAMP_FMT);
     ChatMessage::user(format!("[{now}] {}", text.into()))
+}
+
+/// Strip the leading `[timestamp] ` prefix that [`timestamped_user_message`]
+/// adds. The stamp is for the model; anything that shows a user turn's text to
+/// a human (deriving a session name, a picker label) should strip it first.
+///
+/// Only strips a `[...]` group that actually parses as [`USER_TIMESTAMP_FMT`],
+/// so a user message that genuinely begins with its own bracketed text is left
+/// untouched.
+pub fn strip_user_timestamp(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix('[') else {
+        return content;
+    };
+    let Some(close) = rest.find("] ") else {
+        return content;
+    };
+    if chrono::DateTime::parse_from_str(&rest[..close], USER_TIMESTAMP_FMT).is_ok() {
+        &rest[close + 2..]
+    } else {
+        content
+    }
 }
 
 /// Human-readable elapsed time, magnitude-relative: the two largest adjacent
@@ -7375,8 +7403,8 @@ mod tests {
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
         parse_env_bool, provider_alias_collision_error, prune_tool_messages,
         repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
-        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
-        tail_window, timestamped_user_message,
+        steering_queue, strip_user_timestamp, subagent_base_config, subagent_event_for,
+        subagent_transcript_id, tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -12133,6 +12161,28 @@ mod tests {
         );
     }
 
+    /// `strip_user_timestamp` reverses the stamp for human-facing text (session
+    /// names, labels) and is a no-op on anything that isn't actually stamped.
+    #[test]
+    fn strip_user_timestamp_reverses_the_stamp_only_when_present() {
+        // Round-trips the real stamp.
+        let stamped = timestamped_user_message("first message").content.unwrap();
+        assert_eq!(strip_user_timestamp(&stamped), "first message");
+        // A message that merely starts with a bracket group that ISN'T a
+        // timestamp is left untouched.
+        assert_eq!(
+            strip_user_timestamp("[TODO] refactor this"),
+            "[TODO] refactor this"
+        );
+        // No bracket at all: unchanged.
+        assert_eq!(strip_user_timestamp("plain message"), "plain message");
+        // A bracketed but malformed timestamp: unchanged.
+        assert_eq!(
+            strip_user_timestamp("[2026-13-99] nope"),
+            "[2026-13-99] nope"
+        );
+    }
+
     // ---- flatten_tool_protocol ----
 
     /// The compaction summarizer and the max-steps wrap-up round both send a
@@ -12726,8 +12776,9 @@ mod tests {
                 "user turn carries a timestamp prefix: {user:?}"
             );
 
-            // The committed tool result records the call's duration, and the
-            // ToolEnd event surfaces the same for display.
+            // The committed tool result records the call's duration for the
+            // model; the ToolEnd display event deliberately does NOT (keeps
+            // `(took 0ms)` out of the transcript).
             let tool_result = hist.last().and_then(|m| m.content.as_deref()).unwrap();
             assert!(
                 tool_result.contains("(took "),
@@ -12736,9 +12787,9 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    AgentEvent::ToolEnd { result, .. } if result.contains("(took ")
+                    AgentEvent::ToolEnd { result, .. } if !result.contains("(took ")
                 )),
-                "ToolEnd surfaces the duration for display"
+                "ToolEnd display event stays free of the duration line"
             );
         }
 

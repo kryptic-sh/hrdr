@@ -42,6 +42,9 @@ pub fn session_name_from(msgs: &[Message]) -> String {
     msgs.iter()
         .find(|m| m.role == MessageRole::User)
         .and_then(|m| m.content.as_deref())
+        // The user turn's content carries an immutable model-facing timestamp
+        // prefix; a session name is for humans, so strip it first.
+        .map(hrdr_agent::strip_user_timestamp)
         .map(|c| {
             c.lines()
                 .next()
