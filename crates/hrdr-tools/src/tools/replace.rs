@@ -57,11 +57,13 @@ impl Tool for ReplaceTool {
         "replace"
     }
     fn description(&self) -> &'static str {
-        "Replace text across many files at once — the safe way to do a project-wide rename. \
-         `find` is a literal string unless `regex` is true. Narrow the sweep with `glob` \
-         (e.g. \"src/**/*.rs\") and/or `path`. Returns a unified diff of every file changed. \
-         Use `dry_run: true` to preview first. Prefer this over `bash sed -i`: it shows you \
-         exactly what it changed."
+        "Replace text across many files at once — a project-wide textual substitution. To \
+         rename a *code symbol*, prefer the `rename` tool instead: it's scope-aware via the \
+         language server, where a textual replace also hits comments, strings, and \
+         substrings of unrelated names. `find` is a literal string unless `regex` is true. \
+         Narrow the sweep with `glob` (e.g. \"src/**/*.rs\") and/or `path`. Files over 2 MiB \
+         are skipped. Returns a unified diff of every file changed. Use `dry_run: true` to \
+         preview first. Prefer this over `bash sed -i`: it shows you exactly what it changed."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -99,7 +101,7 @@ impl Tool for ReplaceTool {
             .map(|g| glob::Pattern::new(g).with_context(|| format!("invalid glob: {g}")))
             .transpose()?;
 
-        let candidates = collect_files(&root, pattern.as_ref(), ctx)?;
+        let (candidates, oversized) = collect_files(&root, pattern.as_ref(), ctx)?;
 
         // Phase 1 — plan. Every file the sweep would rewrite is checked before
         // any of them is written, so a file this agent may not touch aborts the
@@ -186,8 +188,22 @@ impl Tool for ReplaceTool {
             changed.push(rel);
         }
 
+        let skip_note = (!oversized.is_empty()).then(|| {
+            format!(
+                "{} file{} over 2 MiB skipped: {}",
+                oversized.len(),
+                if oversized.len() == 1 { "" } else { "s" },
+                oversized.join(", ")
+            )
+        });
+
         if changed.is_empty() {
-            return Ok(format!("No file contains {:?} — nothing changed.", a.find));
+            let mut out = format!("No file contains {:?} — nothing changed.", a.find);
+            if let Some(note) = &skip_note {
+                out.push('\n');
+                out.push_str(note);
+            }
+            return Ok(out);
         }
         let verb = if a.dry_run {
             "Would replace"
@@ -208,6 +224,14 @@ impl Tool for ReplaceTool {
             header.push('\n');
             header.push_str(notes.trim_end_matches('\n'));
         }
+        // A file over MAX_FILE_BYTES is silently absent from every count above
+        // (it never became a candidate) — call that out explicitly, or a
+        // sweep that missed a large file looks identical to one that found
+        // no match in it.
+        if let Some(note) = &skip_note {
+            header.push('\n');
+            header.push_str(note);
+        }
         Ok(truncate(&format!("{header}\n\n{diffs}"), ctx.max_output))
     }
 }
@@ -218,12 +242,18 @@ impl Tool for ReplaceTool {
 /// content is inspected — [`MAX_FILES`] is enforced against files that
 /// actually match `find` (see the caller), not against how many candidates
 /// this turns up, so a large repo with few hits still succeeds.
+///
+/// The second element is the project-relative paths of files that were
+/// skipped for being over [`MAX_FILE_BYTES`] — never inspected, so a
+/// substitution that should have landed there is silently absent unless the
+/// caller reports this list back.
 fn collect_files(
     root: &std::path::Path,
     pattern: Option<&glob::Pattern>,
     ctx: &ToolContext,
-) -> Result<Vec<std::path::PathBuf>> {
+) -> Result<(Vec<std::path::PathBuf>, Vec<String>)> {
     let mut out = Vec::new();
+    let mut oversized = Vec::new();
     for entry in ignore::WalkBuilder::new(root).hidden(false).build() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -244,12 +274,15 @@ fn collect_files(
             }
         }
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(&path);
+            oversized.push(rel.display().to_string());
             continue;
         }
         out.push(path);
     }
     out.sort();
-    Ok(out)
+    oversized.sort();
+    Ok((out, oversized))
 }
 
 #[cfg(test)]
@@ -470,6 +503,66 @@ mod tests {
             "the secret file must be untouched"
         );
         assert_eq!(read(&dir.path().join("a.txt")).await, "new_name\n");
+    }
+
+    /// A file over `MAX_FILE_BYTES` is never inspected, so a sweep that would
+    /// otherwise have matched inside it must say so — not just silently
+    /// report success on the files it did touch.
+    #[tokio::test]
+    async fn oversized_files_are_skipped_and_named_in_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        // Over MAX_FILE_BYTES (2 MiB), and it contains the pattern — but must
+        // never be touched or counted.
+        let mut big = String::with_capacity(3 * 1024 * 1024);
+        big.push_str("needle\n");
+        while big.len() < 3 * 1024 * 1024 {
+            big.push_str("filler filler filler filler filler filler filler filler\n");
+        }
+        write(&dir.path().join("big.txt"), &big).await;
+        write(&dir.path().join("small.txt"), "needle\n").await;
+
+        let out = ReplaceTool
+            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.contains("across 1 file"), "{out}");
+        assert!(
+            out.contains("1 file over 2 MiB skipped: big.txt"),
+            "the skip note names the file:\n{out}"
+        );
+        assert_eq!(read(&dir.path().join("small.txt")).await, "found\n");
+        assert!(
+            read(&dir.path().join("big.txt"))
+                .await
+                .starts_with("needle\n"),
+            "the oversized file must be untouched"
+        );
+    }
+
+    /// The same skip note appears even when nothing else matched — otherwise
+    /// "no match" looks identical to "the only match was in a skipped file".
+    #[tokio::test]
+    async fn oversized_skip_note_appears_even_with_no_other_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        let mut big = String::with_capacity(3 * 1024 * 1024);
+        big.push_str("needle\n");
+        while big.len() < 3 * 1024 * 1024 {
+            big.push_str("filler filler filler filler filler filler filler filler\n");
+        }
+        write(&dir.path().join("big.txt"), &big).await;
+
+        let out = ReplaceTool
+            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.starts_with("No file contains"), "{out}");
+        assert!(out.contains("1 file over 2 MiB skipped: big.txt"), "{out}");
     }
 
     /// `MAX_FILES` bounds the files that actually *match* `find`, not every

@@ -446,7 +446,10 @@ impl Tool for PowerShellTool {
     fn description(&self) -> &'static str {
         "Run a command via PowerShell (`pwsh`/`powershell`) in the working \
          directory. Use for build, test, and anything without a dedicated tool, \
-         especially on Windows. Output is captured and length-bounded."
+         especially on Windows. Output is captured and length-bounded; large \
+         output is saved whole to a file and you get its path. Each call starts \
+         fresh in the working directory — `cd` does NOT persist between calls; \
+         chain it in one command or use paths from the cwd."
     }
     fn parameters(&self) -> serde_json::Value {
         shell_parameters("PowerShell command to run.")

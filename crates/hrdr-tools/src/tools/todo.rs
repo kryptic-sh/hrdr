@@ -23,11 +23,12 @@ impl Tool for TodoTool {
             "properties": {
                 "todos": {
                     "type": "array",
+                    "description": "The full task list, replacing whatever was there before.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": {"type": "string"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                            "content": {"type": "string", "description": "The task, in a few words."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done."}
                         },
                         "required": ["content", "status"]
                     }

@@ -368,7 +368,9 @@ impl Tool for CopyTool {
     }
     fn description(&self) -> &'static str {
         "Copy a file or directory. Parent directories of the destination are created as \
-         needed. Refuses to clobber an existing destination unless `overwrite` is true."
+         needed. Refuses to clobber an existing destination unless `overwrite` is true. \
+         Refuses to copy a credential/secret file (`.env`, keys, etc.). Prefer this over \
+         `bash cp`."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

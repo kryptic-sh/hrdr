@@ -205,7 +205,8 @@ impl Tool for WebFetchTool {
                 "url": { "type": "string", "description": "Absolute http(s) URL to fetch." },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Optional cap on returned characters."
+                    "description": "Cap on returned characters. Defaults to this tool's output \
+                                    cap; a page longer than the cap is truncated."
                 }
             },
             "required": ["url"]

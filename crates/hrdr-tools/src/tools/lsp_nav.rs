@@ -221,8 +221,10 @@ impl Tool for RenameTool {
     fn description(&self) -> &'static str {
         "Rename a symbol across the workspace via the language server: give the file, the \
          1-based line, the current symbol text on that line, and the new name. The server \
-         computes every edit; hrdr applies them through the normal write path. Requires a \
-         language server for the file type."
+         computes every edit; hrdr applies them through the normal write path. Prefer this \
+         over the textual `replace` tool for renaming a code symbol — it's scope-aware, so \
+         it won't also rewrite comments, strings, or substrings of unrelated names. \
+         Requires a language server for the file type."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

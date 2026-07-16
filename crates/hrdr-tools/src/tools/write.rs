@@ -24,8 +24,10 @@ impl Tool for WriteTool {
     }
     fn description(&self) -> &'static str {
         "Create a new file or fully rewrite an existing one with `content`. Parent \
-         directories are created as needed. Overwriting an existing file requires reading \
-         it first. Prefer `edit` for changing part of an existing file."
+         directories are created as needed. Overwriting an existing file requires a \
+         complete, fresh read first — a partial read (paged, or clipped by a long line) or \
+         a stale one (the file changed on disk since) is refused; re-read after any \
+         external change. Prefer `edit` for changing part of an existing file."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

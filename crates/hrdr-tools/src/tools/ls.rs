@@ -25,7 +25,9 @@ impl Tool for LsTool {
     }
     fn description(&self) -> &'static str {
         "List the entries of one directory (defaults to cwd). Directories get a trailing `/`, \
-         symlinks a trailing `@`. Use `find` to search a whole tree by glob."
+         symlinks a trailing `@`. Unlike `find`/`tree`/`grep`, this lists everything in the \
+         directory — dotfiles and `.gitignore`'d entries are not hidden. Use `find` to search \
+         a whole tree by glob."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
