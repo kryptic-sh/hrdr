@@ -2757,6 +2757,27 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             isolation: None,
         },
         SubagentProfile {
+            name: "coder".to_string(),
+            model: None,
+            description: Some(
+                "Write-capable implementer — hand it a precise, self-contained \
+                 spec (exact files, symbols, before→after) and it implements \
+                 exactly that, verifies, and commits. Use proactively for \
+                 well-scoped implementation and mechanical changes; scope the \
+                 work first."
+                    .to_string(),
+            ),
+            prompt: Some(CODER_PROMPT.to_string()),
+            read_only: Some(false),
+            tools: None,
+            write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: Some(true),
+            isolation: None,
+        },
+        SubagentProfile {
             name: "general".to_string(),
             model: None,
             description: Some(
@@ -2829,6 +2850,24 @@ other file or run mutating commands. Plan the work; do NOT implement it.
 - Return the full plan in your report, plus the path you wrote it to. You may be \
   running in an isolated worktree the parent hasn't merged, so it may act on the \
   plan from your report alone — don't make it depend on reading the file.";
+
+const CODER_PROMPT: &str = "\
+You are a CODER sub-agent: implement the task you were given, exactly and \
+narrowly. The spec is your contract: build what it says, all of it, nothing \
+beyond it.
+
+- No drive-by refactors, renames, or reformatting beyond the task; no new \
+  files/docs/helpers the task didn't call for; don't over-engineer (no \
+  flexibility nothing uses).
+- Follow the codebase's existing patterns — find how it already does this kind \
+  of thing and match it.
+- Verify before reporting: build/test/lint scoped to what you touched; fix what \
+  your change broke. Never weaken a test to get green.
+- You cannot ask questions. If part of the spec is ambiguous or turns out wrong \
+  against the real code, do the unambiguous part, and report exactly what you \
+  skipped or adapted and why — an honest partial beats an improvised whole.
+- Commit each coherent unit as you go (Conventional Commits) and leave a clean \
+  tree; your commits and report are the entire hand-off.";
 
 /// Auto-compaction on by default. The *trigger point* is set by
 /// [`AgentConfig::compaction_reserved`], not by this toggle.
@@ -9366,8 +9405,8 @@ mod tests {
         // The four built-ins ship even with no user config.
         let ps = builtin_subagent_profiles();
         let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["explore", "review", "plan", "general"]);
-        // explore/review are read-only; plan writes Markdown; general is full.
+        assert_eq!(names, vec!["explore", "review", "plan", "coder", "general"]);
+        // explore/review are read-only; plan writes Markdown; coder/general are full.
         let by = |n: &str| ps.iter().find(|p| p.name == n).unwrap();
         assert!(by("explore").is_read_only());
         assert!(by("review").is_read_only());
@@ -9376,9 +9415,11 @@ mod tests {
             by("plan").write_ext.as_deref(),
             Some(&["md".to_string(), "markdown".to_string()][..])
         );
+        assert!(!by("coder").is_read_only() && by("coder").write_ext.is_none());
         assert!(!by("general").is_read_only() && by("general").write_ext.is_none());
-        // explore/review are proactive; plan/general are opt-in.
+        // explore/review/coder are proactive; plan/general are opt-in.
         assert!(by("explore").is_proactive() && by("review").is_proactive());
+        assert!(by("coder").is_proactive());
         assert!(!by("plan").is_proactive() && !by("general").is_proactive());
         // `review` gets a stronger reasoning-effort default — a careful reviewer.
         assert_eq!(by("review").effort.as_deref(), Some("high"));
@@ -9397,6 +9438,10 @@ mod tests {
         assert!(
             prompt("plan").contains("do NOT implement it"),
             "plan plans, doesn't build"
+        );
+        assert!(
+            prompt("coder").contains("exactly and narrowly"),
+            "coder implements the spec narrowly"
         );
         // general inherits the full system prompt — no persona of its own.
         assert!(by("general").prompt.is_none());
@@ -9758,6 +9803,15 @@ mod tests {
             "no nested delegation"
         );
 
+        // `coder` is write-capable like `general` — same full set, shell included.
+        let coder = tools("coder");
+        for t in [
+            "bash", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+        ] {
+            assert!(coder.contains(&t.to_string()), "coder should have {t}");
+        }
+        assert!(!coder.contains(&"task".to_string()), "no nested delegation");
+
         // No sub-agent gets `bash` unless it is write-capable in the first place.
         for ro in ["explore", "review", "plan"] {
             let t = tools(ro);
@@ -9795,6 +9849,7 @@ mod tests {
         assert_eq!(pool("explore"), "read-only");
         assert_eq!(pool("review"), "read-only");
         assert_eq!(pool("general"), "write");
+        assert_eq!(pool("coder"), "write");
         // Writes markdown only, but still writes: the stricter cap applies.
         assert_eq!(pool("plan"), "write");
 

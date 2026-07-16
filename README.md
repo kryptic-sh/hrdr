@@ -546,7 +546,7 @@ its next step — the call then blocks and the result comes back inline.
 Sub-agents running in an isolated worktree (`isolation = "worktree"`) always
 block; they can't detach yet.
 
-Four **built-in agents** ship out of the box, selected with the `task` tool's
+Five **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
 
 - **`explore`** — a read-only code investigator (read/search tools only, no
@@ -556,12 +556,15 @@ Four **built-in agents** ship out of the box, selected with the `task` tool's
 - **`plan`** — a planner. Investigates read-only, then writes a step-by-step
   plan to disk as a **Markdown file** — it can create/edit `.md` files only, no
   other file changes.
+- **`coder`** — a write-capable implementer. Hand it a precise, self-contained
+  spec (exact files, symbols, before→after) and it implements exactly that,
+  verifies, and commits — no drive-by refactors or scope creep.
 - **`general`** — full tool access for open-ended, multi-step tasks (explore and
   modify). The same agent you get from `task` with no `agent` argument.
 
 Each runs on the main provider (respecting `subagent_model`) with a specialized
 system prompt and a scoped tool set — `explore`/`review` are read-only, `plan`
-adds Markdown-only writes, `general` gets everything. Without an explicit
+adds Markdown-only writes, `coder`/`general` get everything. Without an explicit
 `subagent_model`, later delegations inherit the main agent's current provider,
 model, and effort, including changes made through `/model` or `/effort`.
 
@@ -579,11 +582,12 @@ doesn't offer the model, in which case it names the other one
 (`provider://model`) and tells you. Availability is best-effort and does not
 guarantee account authorization; hrdr does not rank models by price.
 
-`explore` and `review` are **proactive** — the main agent reaches for them on
-its own (explore for broad investigation, review after non-trivial changes)
-without being asked. You can also **`@name`-mention** an agent in a message
-(`@explore find the auth flow`) to route that turn to it; an `@token` that isn't
-a known agent stays a normal `@file` mention.
+`explore`, `review`, and `coder` are **proactive** — the main agent reaches for
+them on its own (explore for broad investigation, review after non-trivial
+changes, coder for well-scoped implementation work) without being asked. You can
+also **`@name`-mention** an agent in a message (`@explore find the auth flow`)
+to route that turn to it; an `@token` that isn't a known agent stays a normal
+`@file` mention.
 
 A sub-agent can run on a **different model on the same provider** — e.g. an Opus
 main agent delegating implementation to a cheaper/faster Sonnet:
