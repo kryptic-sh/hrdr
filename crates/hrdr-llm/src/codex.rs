@@ -240,7 +240,19 @@ pub(crate) async fn chat_stream(
             // isn't lost (which would falsely look like a cut stream).
             let (events, at_eof) = match bytes.next().await {
                 Some(chunk) => {
-                    decoder.push(&chunk.context("reading stream chunk")?);
+                    // Type a mid-body transport error as Transient (safe to
+                    // retry); an untyped error would slip past the agent's
+                    // retry classifier.
+                    let chunk = chunk.map_err(|e| crate::client::ChatError {
+                        status: None,
+                        retry_after: None,
+                        kind: crate::client::ChatErrorKind::Transient,
+                        message: format!(
+                            "incomplete stream: transport error mid-response \
+                             ({e}) (partial response, safe to retry)"
+                        ),
+                    })?;
+                    decoder.push(&chunk);
                     (decoder.drain(), false)
                 }
                 None => (decoder.finish(), true),

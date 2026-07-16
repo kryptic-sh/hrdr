@@ -99,7 +99,10 @@ impl std::error::Error for ChatError {}
 pub(crate) fn classify_status(status: u16) -> ChatErrorKind {
     match status {
         413 => ChatErrorKind::Overflow,
-        429 | 500 | 502 | 503 | 504 | 529 => ChatErrorKind::Transient,
+        // 408 request timeout and Cloudflare's origin-timeout family (522/524)
+        // are transient — gateways in front of OpenAI-compatible providers emit
+        // these under load, and the request is safe to retry.
+        408 | 429 | 500 | 502 | 503 | 504 | 522 | 524 | 529 => ChatErrorKind::Transient,
         _ => ChatErrorKind::Other,
     }
 }
@@ -560,7 +563,21 @@ impl Client {
                 // rather than a spec `\n\n`), so the sentinel isn't lost.
                 let (events, at_eof) = match bytes.next().await {
                     Some(chunk) => {
-                        decoder.push(&chunk.context("reading stream chunk")?);
+                        // A transport error mid-body (connection reset, WiFi blip)
+                        // is safe to retry — the reply was partial. Type it as
+                        // Transient so the agent retry loop catches it; an untyped
+                        // anyhow error would print only "reading stream chunk" and
+                        // slip past the classifier.
+                        let bytes = chunk.map_err(|e| ChatError {
+                            status: None,
+                            retry_after: None,
+                            kind: ChatErrorKind::Transient,
+                            message: format!(
+                                "incomplete stream: transport error mid-response \
+                                 ({e}) (partial response, safe to retry)"
+                            ),
+                        })?;
+                        decoder.push(&bytes);
                         (decoder.drain(), false)
                     }
                     None => (decoder.finish(), true),
@@ -584,15 +601,41 @@ impl Client {
                     // here instead, as a terminal (non-retryable) error carrying the
                     // server's message — mirrors the native Anthropic `"error"` event
                     // handling in `anthropic::map_event`.
-                    if let Some(err_obj) = value.get("error") {
+                    if let Some(err_obj) = value.get("error").filter(|e| !e.is_null()) {
                         let msg = err_obj
                             .get("message")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown error");
+                        // Gateways (OpenRouter, LiteLLM, …) deliver rate-limit and
+                        // overload conditions as mid-stream error objects. Classify
+                        // them Transient by code/type so the retry loop catches
+                        // them, matching the native Anthropic path.
+                        let code = err_obj
+                            .get("code")
+                            .and_then(|c| c.as_u64())
+                            .map(|c| c as u16)
+                            .or_else(|| {
+                                err_obj.get("status").and_then(|c| c.as_u64()).map(|c| c as u16)
+                            });
+                        let type_str = err_obj
+                            .get("type")
+                            .or_else(|| err_obj.get("code"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let transient = code.map(classify_status)
+                            == Some(ChatErrorKind::Transient)
+                            || type_str.contains("rate_limit")
+                            || type_str.contains("overloaded")
+                            || type_str.contains("server_error");
+                        let kind = if transient {
+                            ChatErrorKind::Transient
+                        } else {
+                            ChatErrorKind::Other
+                        };
                         Err(ChatError {
                             status: None,
                             retry_after: None,
-                            kind: ChatErrorKind::Other,
+                            kind,
                             message: format!("mid-stream error: {msg}"),
                         })?;
                     }
@@ -881,13 +924,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mid_stream_error_object_is_terminal_not_transient() {
+    async fn mid_stream_error_object_without_a_type_is_terminal() {
         // A server that sends a well-formed error object mid-stream, with no
         // [DONE] sentinel. Before the fix this deserialized as an empty
         // `ChatChunk` (every field `#[serde(default)]`) and the stream fell
         // through to the generic "incomplete stream" transient error,
-        // swallowing the real message.
-        let body = "data: {\"error\":{\"message\":\"rate limited by upstream\"}}\n\n";
+        // swallowing the real message. An untyped error stays terminal.
+        let body = "data: {\"error\":{\"message\":\"something broke\"}}\n\n";
         let base_url = serve_once(body).await;
 
         let client = Client::new(base_url, None, "test-model");
@@ -903,13 +946,50 @@ mod tests {
         assert_eq!(
             chat_err.kind,
             ChatErrorKind::Other,
-            "a server-reported mid-stream error must not be classified transient"
+            "an untyped mid-stream error must not be classified transient"
         );
         assert!(
-            chat_err.message.contains("rate limited by upstream"),
+            chat_err.message.contains("something broke"),
             "message must carry the server's text: {}",
             chat_err.message
         );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_rate_limit_error_is_transient() {
+        // Gateways (OpenRouter, LiteLLM) deliver overload as a typed mid-stream
+        // error object. It must retry, matching the native Anthropic path.
+        let body =
+            "data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}\n\n";
+        let base_url = serve_once(body).await;
+
+        let client = Client::new(base_url, None, "test-model");
+        let mut stream = client.chat_stream(&[], &[]).await.unwrap();
+        let err = stream
+            .next()
+            .await
+            .expect("stream must yield the error")
+            .expect_err("typed error must surface as Err");
+        let chat_err = err.downcast_ref::<ChatError>().expect("typed ChatError");
+        assert_eq!(chat_err.kind, ChatErrorKind::Transient);
+    }
+
+    #[tokio::test]
+    async fn explicit_null_error_field_does_not_abort_the_stream() {
+        // Some proxies emit `"error": null` on healthy chunks. That must not be
+        // read as an error.
+        let body = "data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                    data: [DONE]\n\n";
+        let base_url = serve_once(body).await;
+
+        let client = Client::new(base_url, None, "test-model");
+        let mut stream = client.chat_stream(&[], &[]).await.unwrap();
+        let chunk = stream
+            .next()
+            .await
+            .expect("stream must yield the content chunk")
+            .expect("null error field must not be treated as an error");
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
     }
 
     #[test]

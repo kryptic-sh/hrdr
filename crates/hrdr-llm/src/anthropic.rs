@@ -220,17 +220,22 @@ fn assistant_blocks(m: &ChatMessage) -> Vec<Value> {
         blocks.push(json!({ "type": "text", "text": t }));
     }
     for call in m.tool_calls.iter().flatten() {
-        // Normally `arguments` is JSON produced by a prior tool_use block (ours
-        // or a round-tripped OpenAI-backend call), so this parses cleanly. If it
-        // doesn't — a malformed/non-JSON args string — silently rewriting the
-        // call to `{}` would erase the model's original (if broken) intent from
-        // history and could look like the tool was called with no arguments at
-        // all. Preserve the original text instead, as a JSON *string* value:
-        // Anthropic's schema expects `input` to be an object, so this will
-        // likely still fail validation on resend, but that failure is honest
-        // and visible rather than a silent, confusing rewrite.
-        let input: Value = serde_json::from_str(&call.function.arguments)
-            .unwrap_or_else(|_| json!(call.function.arguments));
+        // A zero-argument tool call streams no `input_json_delta`, so `arguments`
+        // is empty. Anthropic's schema needs `input` to be an object, and the
+        // execution layer already treats empty args as `{}` — so an empty string
+        // here is a no-arg call, not lost intent: send `{}`.
+        //
+        // A non-empty string that fails to parse is a genuinely malformed args
+        // string. Preserve it as a JSON *string* value rather than silently
+        // rewriting to `{}`: that erases the model's original intent from history
+        // and hides the problem. It will likely still fail validation on resend,
+        // but that failure is honest and visible.
+        let input: Value = if call.function.arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&call.function.arguments)
+                .unwrap_or_else(|_| json!(call.function.arguments))
+        };
         blocks.push(json!({
             "type": "tool_use",
             "id": call.id,
@@ -351,7 +356,19 @@ pub(crate) async fn chat_stream(
             // event isn't lost (which would falsely look like a cut stream).
             let (events, at_eof) = match bytes.next().await {
                 Some(chunk) => {
-                    decoder.push(&chunk.context("reading stream chunk")?);
+                    // Type a mid-body transport error as Transient (safe to
+                    // retry); an untyped error would slip past the agent's
+                    // retry classifier.
+                    let chunk = chunk.map_err(|e| crate::client::ChatError {
+                        status: None,
+                        retry_after: None,
+                        kind: crate::client::ChatErrorKind::Transient,
+                        message: format!(
+                            "incomplete stream: transport error mid-response \
+                             ({e}) (partial response, safe to retry)"
+                        ),
+                    })?;
+                    decoder.push(&chunk);
                     (decoder.drain(), false)
                 }
                 None => (decoder.finish(), true),
@@ -379,7 +396,10 @@ pub(crate) async fn chat_stream(
         // so the Accumulator can store them for the next request.
         let mut all_thinking: Vec<(u64, Value)> = thinking_slot
             .into_iter()
-            .filter(|(_, (text, _))| !text.is_empty())
+            // Keep a block that carries either text or a signature. A signed
+            // block with empty text still MUST be replayed on the follow-up
+            // request — dropping it makes Anthropic 400 the tool_use turn.
+            .filter(|(_, (text, sig))| !text.is_empty() || !sig.is_empty())
             .map(|(idx, (text, sig))| {
                 (idx, json!({"type": "thinking", "thinking": text, "signature": sig}))
             })
@@ -744,6 +764,47 @@ mod tests {
         assert_eq!(m[2]["content"][0]["type"], "tool_result");
         assert_eq!(m[2]["content"][0]["tool_use_id"], "toolu_1");
         assert_eq!(m[2]["content"][0]["content"], "file body");
+    }
+
+    #[test]
+    fn empty_tool_args_serialize_as_an_object_not_a_string() {
+        // A zero-argument tool call streams no input_json_delta, so `arguments`
+        // is "". Anthropic rejects `"input": ""` (string) — it must be `{}`.
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            origin: MessageOrigin::User,
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "list_agents".into(),
+                    arguments: String::new(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let body = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            &[user("go"), assistant],
+            &[],
+        );
+        let input = &body["messages"][1]["content"][0]["input"];
+        assert!(
+            input.is_object(),
+            "empty args must be an object, got {input}"
+        );
+        assert_eq!(input.as_object().unwrap().len(), 0);
     }
 
     #[test]

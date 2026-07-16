@@ -484,6 +484,14 @@ impl Accumulator {
             self.reasoning.push_str(r);
         }
         for tc in choice.delta.tool_calls.iter().flatten() {
+            // `index` is server-supplied. A garbage value (billions, or
+            // usize::MAX which overflows `+ 1`) would OOM or panic on the resize,
+            // so cap it. No real provider emits more than a handful of parallel
+            // calls per turn.
+            const MAX_TOOL_CALLS: usize = 1024;
+            if tc.index >= MAX_TOOL_CALLS {
+                continue;
+            }
             if self.calls.len() <= tc.index {
                 self.calls.resize_with(tc.index + 1, || ToolCall {
                     id: String::new(),
