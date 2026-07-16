@@ -4007,8 +4007,7 @@ pub fn resolve_cache_mode(setting: Option<&str>, base_url: &str) -> hrdr_llm::Ca
 /// API there, so `cache_control` breakpoints actually cache (unlike the
 /// OpenAI-compat endpoint, which drops them).
 fn is_anthropic_native(base_url: &str) -> bool {
-    let host = url_host(base_url);
-    host == "api.anthropic.com" || host.ends_with(".anthropic.com")
+    hrdr_llm::wire_protocol(base_url) == "Anthropic"
 }
 
 /// Whether `base_url` points at a server on this machine (or an explicitly
@@ -4018,27 +4017,10 @@ fn is_anthropic_native(base_url: &str) -> bool {
 /// A *remote* endpoint with no credential is the opposite: the request is
 /// guaranteed to 401, and the 401 says nothing about whether the endpoint is up.
 pub fn is_local_endpoint(base_url: &str) -> bool {
-    let host = url_host(base_url);
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
-    ) || host.ends_with(".local")
+    let host = hrdr_llm::url_host(base_url);
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+        || host.ends_with(".local")
         || host.is_empty()
-}
-
-/// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
-fn url_host(base_url: &str) -> &str {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("");
-    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
 /// Whether `base_url` points at OpenRouter — the one endpoint hrdr enables
@@ -4046,7 +4028,7 @@ fn url_host(base_url: &str) -> &str {
 /// benefit and strips it for the rest). Also matches a custom provider pointed
 /// at OpenRouter.
 fn is_openrouter(base_url: &str) -> bool {
-    let host = url_host(base_url);
+    let host = hrdr_llm::url_host(base_url);
     host == "openrouter.ai" || host.ends_with(".openrouter.ai")
 }
 
@@ -11454,6 +11436,32 @@ mod tests {
             resolve_cache_mode(None, "https://openrouter.ai.evil.com/v1"),
             CacheMode::Off
         );
+    }
+
+    #[test]
+    fn is_local_endpoint_handles_bracketed_and_bare_ipv6() {
+        use super::is_local_endpoint;
+        // Bracketed IPv6 loopback: hrdr_llm::url_host strips the brackets, so
+        // this must match without any bracketed special-casing here.
+        assert!(is_local_endpoint("http://[::1]:1234/v1"));
+        // A non-loopback IPv6 literal is remote, bracketed or not.
+        assert!(!is_local_endpoint("http://[2001:db8::1]/v1"));
+        assert!(!is_local_endpoint("http://2001:db8::1/v1"));
+        // Existing local-endpoint forms keep working.
+        assert!(is_local_endpoint("http://localhost:8080/v1"));
+        assert!(is_local_endpoint("http://127.0.0.1:8080/v1"));
+        assert!(is_local_endpoint("http://myhost.local/v1"));
+        assert!(is_local_endpoint(""));
+        assert!(!is_local_endpoint("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn is_anthropic_native_defers_to_hrdr_llm_wire_protocol() {
+        use super::is_anthropic_native;
+        assert!(is_anthropic_native("https://api.anthropic.com/v1"));
+        assert!(is_anthropic_native("https://eu.anthropic.com/v1"));
+        assert!(!is_anthropic_native("https://api.openai.com/v1"));
+        assert!(!is_anthropic_native("https://notanthropic.com/v1"));
     }
 
     #[test]
