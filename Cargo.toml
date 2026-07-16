@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/hrdr"
@@ -20,12 +20,12 @@ authors = ["mxaddict <mxaddict@kryptic.sh>"]
 
 [workspace.dependencies]
 # internal
-hrdr-llm = { path = "crates/hrdr-llm", version = "0.4.0" }
-hrdr-tools = { path = "crates/hrdr-tools", version = "0.4.0" }
-hrdr-agent = { path = "crates/hrdr-agent", version = "0.4.0" }
-hrdr-editor = { path = "crates/hrdr-editor", version = "0.4.0" }
-hrdr-app = { path = "crates/hrdr-app", version = "0.4.0" }
-hrdr-tui = { path = "crates/hrdr-tui", version = "0.4.0" }
+hrdr-llm = { path = "crates/hrdr-llm", version = "0.5.0" }
+hrdr-tools = { path = "crates/hrdr-tools", version = "0.5.0" }
+hrdr-agent = { path = "crates/hrdr-agent", version = "0.5.0" }
+hrdr-editor = { path = "crates/hrdr-editor", version = "0.5.0" }
+hrdr-app = { path = "crates/hrdr-app", version = "0.5.0" }
+hrdr-tui = { path = "crates/hrdr-tui", version = "0.5.0" }
 # Dev-only, never published: the ctor that sandboxes $HOME/XDG before any test runs.
 # Path-only on purpose — cargo strips a versionless path dev-dependency on publish.
 hrdr-test-support = { path = "crates/hrdr-test-support" }

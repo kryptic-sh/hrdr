@@ -6,6 +6,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-17
+
+### Added
+
+- **`coder` built-in sub-agent.** A write-capable, proactive footwork persona
+  for delegated implementation: build exactly the spec (no scope creep, no
+  drive-by refactors), follow the codebase's patterns, verify scoped to the
+  touched files, report skips honestly, and commit each coherent unit for the
+  parent to review and merge. Previously the only write-capable built-in was
+  `general`, which carries no persona.
+- **`task_diff` tool.** Reviews a finished write sub-agent in one call: flags
+  uncommitted/untracked leftovers in its worktree, lists the commits under
+  review (`HEAD..branch`), and returns the full merge-base diff
+  (`HEAD...branch`), run through the same secret-diff redaction as the `git`
+  tool and saved to an overflow file when large. The delivery message and system
+  prompt route the review flow through it; `redact_secret_diffs` is now a public
+  `hrdr-tools` export.
+- **Search-tool visibility flags.** `grep` gains `hidden`, `no_ignore`,
+  `literal`, and `case_insensitive` (wired through the ripgrep, POSIX-grep, and
+  built-in backends); `find` gains `hidden`/`no_ignore`; `tree` gains `hidden`.
+  All three previously skipped dotfiles and `.gitignore`'d paths silently, with
+  no override and no mention in their descriptions — the descriptions now state
+  the default exclusions, and `grep`'s states its match caps (200, or 50 with
+  `context`). Secret-file skipping stays unconditional.
+- **Merge-target guardrails.** `git branch -D`/`--delete --force`,
+  `git worktree remove --force`/`-f`, and `git stash drop`/`clear` are blocked
+  at the shell, so `task_cleanup`'s unmerged-work check can't be bypassed with
+  raw git. Safe spellings (`branch -d`, plain `worktree remove`,
+  `stash pop`/`list`/`push`) stay allowed.
+
+### Changed
+
+- **`[[subagent]]` profiles overlay built-ins field by field.** Pinning just
+  `model` on `review` now keeps `REVIEW_PROMPT`, the read-only scoping, and the
+  description instead of silently replacing the whole profile — so "strong
+  reviewer, cheap coder" is expressible per built-in. The `review` built-in
+  defaults to `effort = "high"`.
+- **Tool descriptions disclose their failure modes.** `read`/`write` state the
+  partial-read-blocks-overwrite rule and the 50 MB cap; `replace` and the LSP
+  `rename` cross-link each other (symbol renames belong to the scope-aware
+  `rename`) and `replace` now reports files over 2 MiB it skipped instead of
+  hiding them; `ls` documents that it does not hide dotfiles or ignored entries;
+  `powershell` gains bash parity (`cd` non-persistence, saved-overflow path);
+  `copy` notes the secret-file refusal; `todo` and `fetch` document their schema
+  and `max_chars` default; `edit`'s `path` param is described.
+- **Delegation guidance deduplicated.** Background-execution mechanics live only
+  in the `task` tool description; the system prompt keeps the workflow (scope
+  before delegating, trust-but-verify, merge + cleanup). Both previously shipped
+  the same text with every request.
+
+### Fixed
+
+- **The review-before-merge instructions reviewed nothing.** Both the system
+  prompt and the task-completion delivery message said to review a finished
+  write sub-agent with `git -C <worktree> diff` — empty by construction, since
+  the same recipe requires the worktree to be clean. The review step now uses
+  the merge-base form `git diff HEAD...<branch>`, with rebase-onto-HEAD guidance
+  for merges that conflict because HEAD moved while the task ran.
+- **README drift.** Removed the `background: false` parameter and the "worktree
+  sub-agents always block" claim — every `task` runs detached; a foreground mode
+  no longer exists.
+
+### Removed
+
+- **`SubagentProfile.isolation`.** Dead since worktree isolation became
+  capability-based (every write-capable sub-agent gets one); the field, its
+  frontmatter parsing, and the per-profile "isolated worktree" tag are gone.
+  Existing config files still load — the key is ignored.
+
+### Breaking
+
+- **`SubagentProfile` (library API).** `read_only` and `proactive` are now
+  `Option<bool>` (use `is_read_only()`/`is_proactive()` for the effective
+  values) and `isolation` was removed. Config files are unaffected: unset keys
+  inherit and unknown keys are ignored.
+
 ## [0.4.3] - 2026-07-16
 
 ### Added
@@ -2776,7 +2852,12 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/kryptic-sh/hrdr/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/kryptic-sh/hrdr/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/kryptic-sh/hrdr/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/kryptic-sh/hrdr/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/kryptic-sh/hrdr/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/kryptic-sh/hrdr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/kryptic-sh/hrdr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/hrdr/compare/v0.2.12...v0.3.0
