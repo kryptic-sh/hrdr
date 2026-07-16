@@ -6,11 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-17
+
+v0.5.1's tag run failed on windows-latest — the new grep hidden-flag tests
+asserted `/`-separated paths against output that prints native separators — so
+it, too, was never published. 0.5.2 is the first released build of the 0.5.x
+line.
+
+### Fixed
+
+- **Windows-only test failures in the grep hidden-flag tests.** Assertions now
+  normalize `\` to `/` before matching paths; the same latent mismatch was fixed
+  in the `rg` end-to-end test.
+
 ## [0.5.1] - 2026-07-17
 
 v0.5.0 was tagged but never published: its tag run failed CI on a POSIX-grep
-backend regression (below), so every publish job was skipped. 0.5.1 is the first
-released build of the 0.5.x line.
+backend regression (below), so every publish job was skipped.
 
 ### Fixed
 
@@ -2872,7 +2884,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/kryptic-sh/hrdr/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/kryptic-sh/hrdr/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/kryptic-sh/hrdr/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/kryptic-sh/hrdr/compare/v0.4.2...v0.4.3
