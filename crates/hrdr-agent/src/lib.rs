@@ -6056,7 +6056,7 @@ impl Agent {
                     user_input.push_str(&out.context.join("\n"));
                 }
             }
-            self.messages.push(ChatMessage::user(user_input));
+            self.messages.push(timestamped_user_message(user_input));
         }
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
@@ -6432,6 +6432,7 @@ impl Agent {
     fn finish_tool_call<F: FnMut(AgentEvent)>(
         &mut self,
         call: &hrdr_llm::ToolCall,
+        elapsed: std::time::Duration,
         result: Result<String>,
         repeat: &mut RepeatGuard,
         on_event: &mut F,
@@ -6443,6 +6444,10 @@ impl Agent {
         if let Some(nudge) = repeat.record(&call.function.name, &call.function.arguments, ok) {
             body.push_str(&nudge);
         }
+        // Trusted, harness-measured wall-clock cost of the call — appended after
+        // (outside) any untrusted-content wrapper the tool added, since this is
+        // our metadata, not tool output. Present on failures too.
+        body.push_str(&format!("\n\n(took {})", format_duration(elapsed)));
         on_event(AgentEvent::ToolEnd {
             id: call.id.clone(),
             name: call.function.name.clone(),
@@ -6515,87 +6520,100 @@ impl Agent {
             let hooks = Arc::clone(&self.event_hooks);
             // A refused call (repeat breaker) resolves immediately instead of
             // executing; boxing keeps the join order == call order.
-            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> =
+            type TimedResult = (std::time::Duration, Result<String>);
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = TimedResult> + Send>> =
                 match repeat.refusal(&name, &raw_args) {
-                    Some(msg) => Box::pin(async move { Err(anyhow::anyhow!(msg)) }),
+                    // A refused call never ran, so its cost is zero.
+                    Some(msg) => {
+                        Box::pin(
+                            async move { (std::time::Duration::ZERO, Err(anyhow::anyhow!(msg))) },
+                        )
+                    }
                     None => Box::pin(async move {
-                        let args: serde_json::Value = if raw_args.trim().is_empty() {
-                            serde_json::json!({})
-                        } else {
-                            match serde_json::from_str(&raw_args) {
-                                Ok(v) => v,
-                                Err(e) => {
+                        let start = std::time::Instant::now();
+                        let res: Result<String> = async move {
+                            let args: serde_json::Value = if raw_args.trim().is_empty() {
+                                serde_json::json!({})
+                            } else {
+                                match serde_json::from_str(&raw_args) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
+                                            "invalid tool arguments JSON: {e}"
+                                        ));
+                                    }
+                                }
+                            };
+                            // `pre_tool` hooks can veto the call (exit 2): the
+                            // model sees the hook's reason as the tool error.
+                            if hooks
+                                .iter()
+                                .any(|h| h.event == hrdr_tools::HookEvent::PreTool)
+                            {
+                                let payload = serde_json::json!({
+                                    "event": "pre_tool",
+                                    "tool": name,
+                                    "args": args,
+                                    "cwd": ctx.cwd.display().to_string(),
+                                });
+                                let out = hrdr_tools::run_event_hooks(
+                                    &hooks,
+                                    hrdr_tools::HookEvent::PreTool,
+                                    Some(&name),
+                                    &payload,
+                                    &ctx.cwd,
+                                )
+                                .await;
+                                if let Some(reason) = out.block {
                                     return Err(anyhow::anyhow!(
-                                        "invalid tool arguments JSON: {e}"
+                                        "blocked by pre_tool hook: {reason}"
                                     ));
                                 }
+                                for note in out.notes {
+                                    ctx.emit(format!("{note}\n"));
+                                }
                             }
-                        };
-                        // `pre_tool` hooks can veto the call (exit 2): the
-                        // model sees the hook's reason as the tool error.
-                        if hooks
-                            .iter()
-                            .any(|h| h.event == hrdr_tools::HookEvent::PreTool)
-                        {
-                            let payload = serde_json::json!({
-                                "event": "pre_tool",
-                                "tool": name,
-                                "args": args,
-                                "cwd": ctx.cwd.display().to_string(),
-                            });
-                            let out = hrdr_tools::run_event_hooks(
-                                &hooks,
-                                hrdr_tools::HookEvent::PreTool,
-                                Some(&name),
-                                &payload,
-                                &ctx.cwd,
-                            )
-                            .await;
-                            if let Some(reason) = out.block {
-                                return Err(anyhow::anyhow!("blocked by pre_tool hook: {reason}"));
-                            }
-                            for note in out.notes {
-                                ctx.emit(format!("{note}\n"));
-                            }
-                        }
-                        let mut res = tools.execute(&name, args.clone(), &ctx).await;
-                        // `post_tool` hooks see the (bounded) result; their
-                        // complaints ride back to the model with it.
-                        if hooks
-                            .iter()
-                            .any(|h| h.event == hrdr_tools::HookEvent::PostTool)
-                        {
-                            let (ok, result_text) = match &res {
-                                Ok(r) => (true, hrdr_tools::truncate_inline(r, 30_000)),
-                                Err(e) => (false, e.to_string()),
-                            };
-                            let payload = serde_json::json!({
-                                "event": "post_tool",
-                                "tool": name,
-                                "args": args,
-                                "ok": ok,
-                                "result": result_text,
-                                "cwd": ctx.cwd.display().to_string(),
-                            });
-                            let out = hrdr_tools::run_event_hooks(
-                                &hooks,
-                                hrdr_tools::HookEvent::PostTool,
-                                Some(&name),
-                                &payload,
-                                &ctx.cwd,
-                            )
-                            .await;
-                            let notes: Vec<String> =
-                                out.notes.into_iter().chain(out.block).collect();
-                            if !notes.is_empty() {
-                                let joined = notes.join("\n");
-                                res = match res {
-                                    Ok(r) => Ok(format!("{r}\n{joined}")),
-                                    Err(e) => Err(anyhow::anyhow!("{e}\n{joined}")),
+                            let mut res = tools.execute(&name, args.clone(), &ctx).await;
+                            // `post_tool` hooks see the (bounded) result; their
+                            // complaints ride back to the model with it.
+                            if hooks
+                                .iter()
+                                .any(|h| h.event == hrdr_tools::HookEvent::PostTool)
+                            {
+                                let (ok, result_text) = match &res {
+                                    Ok(r) => (true, hrdr_tools::truncate_inline(r, 30_000)),
+                                    Err(e) => (false, e.to_string()),
                                 };
+                                let payload = serde_json::json!({
+                                    "event": "post_tool",
+                                    "tool": name,
+                                    "args": args,
+                                    "ok": ok,
+                                    "result": result_text,
+                                    "cwd": ctx.cwd.display().to_string(),
+                                });
+                                let out = hrdr_tools::run_event_hooks(
+                                    &hooks,
+                                    hrdr_tools::HookEvent::PostTool,
+                                    Some(&name),
+                                    &payload,
+                                    &ctx.cwd,
+                                )
+                                .await;
+                                let notes: Vec<String> =
+                                    out.notes.into_iter().chain(out.block).collect();
+                                if !notes.is_empty() {
+                                    let joined = notes.join("\n");
+                                    res = match res {
+                                        Ok(r) => Ok(format!("{r}\n{joined}")),
+                                        Err(e) => Err(anyhow::anyhow!("{e}\n{joined}")),
+                                    };
+                                }
                             }
+                            res
                         }
-                        res
+                        .await;
+                        (start.elapsed(), res)
                     }),
                 };
             futs.push(fut);
@@ -6616,8 +6634,8 @@ impl Agent {
         while let Ok((id, chunk)) = shared_rx.try_recv() {
             on_event(AgentEvent::ToolOutput { id, chunk });
         }
-        for (call, result) in batch.iter().zip(results) {
-            self.finish_tool_call(call, result, repeat, on_event);
+        for (call, (elapsed, result)) in batch.iter().zip(results) {
+            self.finish_tool_call(call, elapsed, result, repeat, on_event);
         }
     }
 
@@ -7223,6 +7241,39 @@ fn ensure_assistant_has_content(msg: &mut ChatMessage) {
     }
 }
 
+/// A real user turn, prefixed with an immutable local-time stamp so the model
+/// can track wall-clock time and date across a long session (the system
+/// prompt's `Date:` line is fixed at session start and goes stale after
+/// midnight; a per-turn stamp doesn't).
+///
+/// The stamp is baked into the message content once, at creation, and never
+/// re-rendered — so historical messages stay byte-identical and the prompt
+/// cache prefix is never invalidated, and it persists verbatim in the session
+/// file. Only genuine user turns are stamped (not synthetic steering /
+/// background / tool-result messages).
+fn timestamped_user_message(text: impl Into<String>) -> ChatMessage {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
+    ChatMessage::user(format!("[{now}] {}", text.into()))
+}
+
+/// Human-readable elapsed time, magnitude-relative: the two largest adjacent
+/// units — hours+minutes, minutes+seconds, or seconds+milliseconds — or just
+/// milliseconds under one second. Examples: `53ms`, `5s 12ms`, `1m 31s`,
+/// `1h 32m`. The coarse unit gives the magnitude; the finer one keeps
+/// precision without a wall of units.
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms >= 3_600_000 {
+        format!("{}h {}m", ms / 3_600_000, (ms % 3_600_000) / 60_000)
+    } else if ms >= 60_000 {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
+    } else if ms >= 1_000 {
+        format!("{}s {}ms", ms / 1_000, ms % 1_000)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 /// Very rough token estimate (~4 characters per token) for `text`. Used only as
 /// a fallback when the server reports no usage — good enough for the context bar
 /// + auto-compaction, not for billing.
@@ -7327,11 +7378,12 @@ mod tests {
         ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, LspFileConfig, LspServerEntry,
         PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
         compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
-        estimate_tokens_in_messages, flatten_tool_protocol, in_git_repo, is_context_overflow,
-        is_transient, legacy_config_error, mega_turn_tail_start, parse_env_bool,
-        provider_alias_collision_error, prune_tool_messages, repair_dangling_tool_calls, resolve,
-        resolve_subagent_dir, retry_after_hint, steering_queue, subagent_base_config,
-        subagent_event_for, subagent_transcript_id, tail_window,
+        estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
+        is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
+        parse_env_bool, provider_alias_collision_error, prune_tool_messages,
+        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
+        steering_queue, subagent_base_config, subagent_event_for, subagent_transcript_id,
+        tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -12021,6 +12073,47 @@ mod tests {
         assert!(tail_start > 1, "something before the tail to summarize");
     }
 
+    // ---- timestamps + durations ----
+
+    /// `format_duration` shows the two largest adjacent units (or just ms under
+    /// a second), matching the requested magnitude-relative shape.
+    #[test]
+    fn format_duration_is_magnitude_relative() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(53)), "53ms");
+        assert_eq!(format_duration(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_duration(Duration::from_millis(5_012)), "5s 12ms");
+        assert_eq!(format_duration(Duration::from_millis(91_000)), "1m 31s");
+        assert_eq!(format_duration(Duration::from_millis(5_460_000)), "1h 31m");
+        // Exactly on a boundary keeps both units (the finer one is zero).
+        assert_eq!(format_duration(Duration::from_secs(2)), "2s 0ms");
+        assert_eq!(format_duration(Duration::from_secs(7_200)), "2h 0m");
+    }
+
+    /// A real user turn is prefixed with an immutable local-time stamp, in the
+    /// content itself, so it reaches the model, persists to the session file,
+    /// and never re-renders (cache-stable). It's a `Role::User` message.
+    #[test]
+    fn timestamped_user_message_stamps_the_content_immutably() {
+        let m = timestamped_user_message("fix the bug");
+        assert_eq!(m.role, Role::User);
+        let body = m.content.as_deref().unwrap();
+        assert!(body.ends_with("fix the bug"), "{body}");
+        // Leads with a bracketed timestamp: `[YYYY-MM-DD HH:MM:SS ±HH:MM] `.
+        assert!(body.starts_with('['), "{body}");
+        let stamp = &body[1..body.find(']').unwrap()];
+        assert_eq!(stamp.len(), "2026-07-16 14:30:05 +08:00".len(), "{stamp}");
+        // Same input twice: the STAMP may differ (time moved) but each is fixed
+        // once created — this just proves the payload is preserved verbatim.
+        assert!(
+            timestamped_user_message("hi")
+                .content
+                .unwrap()
+                .ends_with("hi")
+        );
+    }
+
     // ---- flatten_tool_protocol ----
 
     /// The compaction summarizer and the max-steps wrap-up round both send a
@@ -12601,6 +12694,32 @@ mod tests {
             assert!(
                 hist.iter().any(|m| m.role == hrdr_llm::Role::User),
                 "snapshot carries the whole conversation"
+            );
+
+            // The real user turn is stamped with an immutable timestamp prefix.
+            let user = hist
+                .iter()
+                .find(|m| m.role == hrdr_llm::Role::User)
+                .and_then(|m| m.content.as_deref())
+                .unwrap();
+            assert!(
+                user.starts_with('[') && user.contains("] read the file"),
+                "user turn carries a timestamp prefix: {user:?}"
+            );
+
+            // The committed tool result records the call's duration, and the
+            // ToolEnd event surfaces the same for display.
+            let tool_result = hist.last().and_then(|m| m.content.as_deref()).unwrap();
+            assert!(
+                tool_result.contains("(took "),
+                "tool result records its duration: {tool_result:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::ToolEnd { result, .. } if result.contains("(took ")
+                )),
+                "ToolEnd surfaces the duration for display"
             );
         }
 
