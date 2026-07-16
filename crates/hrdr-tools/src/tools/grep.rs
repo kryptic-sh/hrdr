@@ -715,7 +715,8 @@ mod tests {
         assert_eq!(out, "(no matches)", "{out}");
         let mut a = plain_args("dotneedle");
         a.hidden = true;
-        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        // Windows paths print with `\` — normalize before asserting.
+        let out = grep_ripgrep(&a, &ctx).await.unwrap().replace('\\', "/");
         assert!(out.contains(".hidden-dir/file:1:dotneedle"), "{out}");
     }
 
@@ -868,7 +869,8 @@ mod tests {
 
         let mut hidden_args = plain_args("needle");
         hidden_args.hidden = true;
-        let out = grep_builtin(&hidden_args, &ctx).unwrap();
+        // Windows paths print with `\` — normalize before asserting.
+        let out = grep_builtin(&hidden_args, &ctx).unwrap().replace('\\', "/");
         assert!(out.contains(".hidden-dir/file.txt:1:needle"), "{out}");
     }
 
