@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-17
+
+v0.5.0 was tagged but never published: its tag run failed CI on a POSIX-grep
+backend regression (below), so every publish job was skipped. 0.5.1 is the first
+released build of the 0.5.x line.
+
+### Fixed
+
+- **POSIX `grep` backend (the no-`rg` fallback).** The dotfile-skip emulation
+  (`--exclude-dir=.*`) also excluded a dot-named command-line root, so any
+  search scoped at a dot-named directory silently matched nothing; and `literal`
+  stacked `-F` onto `-E` ("conflicting matchers specified"). The emulation is
+  removed (`hidden`/`no_ignore` are documented no-ops on this backend) and the
+  matcher is chosen, not stacked.
+- **Session listing could serve a stale name after a rename.** `meta_cache`
+  trusts an unchanged mtime, but two saves can land within one filesystem
+  timestamp tick (Windows ticks coarsely) — a save now invalidates its own cache
+  entry. The same flake sank the v0.4.3 tag run, so v0.4.3 was also never
+  published.
+
 ## [0.5.0] - 2026-07-17
 
 ### Added
@@ -2852,7 +2872,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/kryptic-sh/hrdr/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/kryptic-sh/hrdr/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/kryptic-sh/hrdr/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/kryptic-sh/hrdr/compare/v0.4.1...v0.4.2
