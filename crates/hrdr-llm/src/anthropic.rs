@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use crate::sse::SseDecoder;
 
 use crate::types::{
-    CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, FunctionDelta, Role, ToolCallDelta,
-    ToolDef, Usage,
+    CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, Role, ToolDef, Usage, reasoning_chunk,
+    text_chunk, tool_call_chunk,
 };
 
 /// Anthropic API version pinned in the `anthropic-version` header.
@@ -637,47 +637,6 @@ fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
     ChatChunk {
         choices: vec![],
         usage: Some(u),
-        anthropic_thinking_blocks: vec![],
-    }
-}
-
-fn text_chunk(text: String) -> ChatChunk {
-    delta_chunk(Delta {
-        content: Some(text),
-        ..Delta::default()
-    })
-}
-
-fn reasoning_chunk(text: String) -> ChatChunk {
-    delta_chunk(Delta {
-        reasoning_content: Some(text),
-        ..Delta::default()
-    })
-}
-
-fn tool_call_chunk(
-    index: usize,
-    id: Option<String>,
-    name: Option<String>,
-    arguments: Option<String>,
-) -> ChatChunk {
-    delta_chunk(Delta {
-        tool_calls: Some(vec![ToolCallDelta {
-            index,
-            id,
-            function: Some(FunctionDelta { name, arguments }),
-        }]),
-        ..Delta::default()
-    })
-}
-
-fn delta_chunk(delta: Delta) -> ChatChunk {
-    ChatChunk {
-        choices: vec![ChunkChoice {
-            delta,
-            finish_reason: None,
-        }],
-        usage: None,
         anthropic_thinking_blocks: vec![],
     }
 }

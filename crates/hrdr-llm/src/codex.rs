@@ -31,7 +31,8 @@ use serde_json::{Value, json};
 
 use crate::sse::SseDecoder;
 use crate::types::{
-    ChatChunk, ChatMessage, ChunkChoice, Delta, FunctionDelta, Role, ToolCallDelta, ToolDef, Usage,
+    ChatChunk, ChatMessage, ChunkChoice, Delta, Role, ToolDef, Usage, reasoning_chunk, text_chunk,
+    tool_call_chunk,
 };
 
 /// Build the Responses API request body from hrdr's chat-completions-shaped
@@ -565,47 +566,6 @@ fn map_usage(usage: Option<&Value>) -> Option<Usage> {
     u.prompt_tokens_details.cached_tokens = cached;
     u.completion_tokens_details.reasoning_tokens = reasoning;
     Some(u)
-}
-
-fn text_chunk(text: String) -> ChatChunk {
-    delta_chunk(Delta {
-        content: Some(text),
-        ..Delta::default()
-    })
-}
-
-fn reasoning_chunk(text: String) -> ChatChunk {
-    delta_chunk(Delta {
-        reasoning_content: Some(text),
-        ..Delta::default()
-    })
-}
-
-fn tool_call_chunk(
-    index: usize,
-    id: Option<String>,
-    name: Option<String>,
-    arguments: Option<String>,
-) -> ChatChunk {
-    delta_chunk(Delta {
-        tool_calls: Some(vec![ToolCallDelta {
-            index,
-            id,
-            function: Some(FunctionDelta { name, arguments }),
-        }]),
-        ..Delta::default()
-    })
-}
-
-fn delta_chunk(delta: Delta) -> ChatChunk {
-    ChatChunk {
-        choices: vec![ChunkChoice {
-            delta,
-            finish_reason: None,
-        }],
-        usage: None,
-        anthropic_thinking_blocks: vec![],
-    }
 }
 
 #[cfg(test)]
