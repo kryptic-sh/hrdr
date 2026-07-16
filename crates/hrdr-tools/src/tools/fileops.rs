@@ -392,7 +392,17 @@ impl Tool for CopyTool {
         let from = ctx.resolve(&a.from);
         let to = ctx.resolve(&a.to);
         // The source survives a copy, so it needs confinement but not the
-        // read-before-destroy gate.
+        // read-before-destroy gate. It does need the secret guard, though:
+        // otherwise `copy .env notes.txt` then `read notes.txt` launders a
+        // credential past the read deny-list (the copy's name matches no
+        // pattern).
+        if let Some(reason) = crate::secret_file_reason(&crate::canonicalize_nearest(&from)) {
+            bail!(
+                "refusing to copy {}: {reason} — copying it would place its \
+                 contents at a name the read deny-list can't recognize",
+                from.display()
+            );
+        }
         ctx.ensure_writable_ext(&from)?;
         if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
             bail!(
@@ -449,6 +459,21 @@ mod tests {
             tokio::fs::create_dir_all(p).await.unwrap();
         }
         tokio::fs::write(path, body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_a_secret_source() {
+        // copy .env x.txt would launder the credential past the read deny-list.
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        write(&dir.path().join(".env"), "SECRET=1").await;
+
+        let err = CopyTool
+            .execute(json!({"from": ".env", "to": "notes.txt"}), &c)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to copy"), "{err}");
+        assert!(!dir.path().join("notes.txt").exists());
     }
 
     #[tokio::test]

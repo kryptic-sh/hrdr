@@ -1203,9 +1203,12 @@ fn truncate_saved_in(
 
 /// Join whole lines from the head (or tail, when `from_tail`) of `lines`, up to
 /// `max_lines` lines and `max_bytes` bytes — whichever caps first. At least one
-/// line is always kept so the preview is never empty.
+/// line is always kept so the preview is never empty, but a single line longer
+/// than `max_bytes` is byte-truncated to fit: without that, one giant line (a
+/// minified bundle, a single-line JSON log) would be returned whole and blow the
+/// context the cap exists to protect.
 fn collect_lines(lines: &[&str], max_lines: usize, max_bytes: usize, from_tail: bool) -> String {
-    let mut taken: Vec<&str> = Vec::new();
+    let mut taken: Vec<String> = Vec::new();
     let mut bytes = 0usize;
     let ordered: Vec<&&str> = if from_tail {
         lines.iter().rev().collect()
@@ -1217,10 +1220,23 @@ fn collect_lines(lines: &[&str], max_lines: usize, max_bytes: usize, from_tail: 
             break;
         }
         let add = line.len() + usize::from(!taken.is_empty()); // + the newline
-        if bytes + add > max_bytes && !taken.is_empty() {
+        if bytes + add > max_bytes {
+            if taken.is_empty() {
+                // The first line alone overshoots. Keep a byte-capped slice of it
+                // (from the tail end when collecting the tail) rather than the
+                // whole line.
+                let budget = max_bytes.max(1);
+                let slice = if from_tail {
+                    let cut = line.len().saturating_sub(budget);
+                    &line[floor_char_boundary(line, cut)..]
+                } else {
+                    &line[..floor_char_boundary(line, budget)]
+                };
+                taken.push(slice.to_string());
+            }
             break;
         }
-        taken.push(line);
+        taken.push((*line).to_string());
         bytes += add;
     }
     if from_tail {
@@ -1783,6 +1799,35 @@ TAIL-ERROR-LINE",
         assert!(out.contains("5000 lines"));
         assert!(out.lines().count() <= 2000 + 3); // preview + hint lines
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn truncate_saved_bounds_a_single_giant_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // One 500 KB line, no newlines (minified bundle / single-line JSON log).
+        let text = "x".repeat(500_000);
+        let out = truncate_saved_in(&text, 10_000, 2000, TruncateSide::Head, "bash", dir.path());
+        // The preview must be bounded, not the whole half-megabyte line.
+        assert!(
+            out.len() < 20_000,
+            "single-line preview must be bounded, got {} bytes",
+            out.len()
+        );
+        assert!(out.contains("full output"));
+        // Middle mode (bash) must also stay bounded and not duplicate the line.
+        let mid = truncate_saved_in(
+            &text,
+            10_000,
+            2000,
+            TruncateSide::Middle,
+            "bash",
+            dir.path(),
+        );
+        assert!(
+            mid.len() < 20_000,
+            "single-line middle preview must be bounded, got {} bytes",
+            mid.len()
+        );
     }
 
     #[test]

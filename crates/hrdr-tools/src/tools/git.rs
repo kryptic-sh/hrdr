@@ -362,19 +362,28 @@ impl Tool for GitTool {
         // the byte cap below ran. 5× the display budget is generous headroom;
         // anything that fits is identical to what `output()` returned.
         let cap = ctx.max_output.saturating_mul(5).max(ctx.max_output);
-        let (status, stdout_bytes, stderr_bytes) = super::run_capped_output(cmd, cap, cap)
-            .await
-            .context("running git (is it installed?)")?;
+        let (status, stdout_bytes, stderr_bytes, over_cap) =
+            super::run_capped_output(cmd, cap, cap)
+                .await
+                .context("running git (is it installed?)")?;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
         let stderr = String::from_utf8_lossy(&stderr_bytes);
-        if !status.success() {
+        // When output overflowed the cap the child was killed, so its exit
+        // status is a signal death, not a git error. Treat it as a valid (large)
+        // result — it flows through the redaction + overflow-file path below,
+        // exactly like a diff that fit. Only a genuine non-success (real git
+        // failure) becomes an error.
+        if !over_cap && !status.success() {
             let msg = if stderr.trim().is_empty() {
                 stdout.trim()
             } else {
                 stderr.trim()
             };
-            bail!("git {sub} failed: {msg}");
+            // Cap the error text so a failure that still printed a lot of stdout
+            // can't itself blow the model's context.
+            let capped = crate::truncate(msg, ctx.max_output);
+            bail!("git {sub} failed: {capped}");
         }
         if stdout.trim().is_empty() {
             return Ok("(no output)".to_string());

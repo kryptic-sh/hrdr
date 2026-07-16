@@ -70,11 +70,15 @@ pub(crate) const WATCH_CHECK_TIMEOUT_SECS: u64 = 120;
 /// pipe; when stdout hits its cap we stop accumulating and kill the child so it
 /// can't block writing the rest. For any output that fits under the caps this is
 /// byte-for-byte identical to `output()`.
+///
+/// The fourth return value is `over_cap`: true when stdout hit its cap and the
+/// child was killed. Callers must not read the (signal-death) exit status as a
+/// failure in that case — the output is a valid truncation, not an error.
 pub(crate) async fn run_capped_output(
     mut cmd: tokio::process::Command,
     stdout_cap: usize,
     stderr_cap: usize,
-) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)> {
     use tokio::io::AsyncReadExt;
 
     cmd.stdin(std::process::Stdio::null())
@@ -142,7 +146,7 @@ pub(crate) async fn run_capped_output(
     }
     let status = child.wait().await?;
     let stderr_buf = stderr_task.await.unwrap_or_default();
-    Ok((status, stdout_buf, stderr_buf))
+    Ok((status, stdout_buf, stderr_buf, over_cap))
 }
 
 pub use edit::EditTool;

@@ -181,7 +181,7 @@ async fn run_search_cmd(
     // shell tool keeps in memory) so a 10 GB output is cut early. Anything that
     // fits under the ceiling is byte-for-byte what `output()` produced.
     let cap = ctx.max_output.saturating_mul(5).max(ctx.max_output);
-    let (_status, stdout_bytes, stderr_bytes) = super::run_capped_output(cmd, cap, cap)
+    let (_status, stdout_bytes, stderr_bytes, _over_cap) = super::run_capped_output(cmd, cap, cap)
         .await
         .with_context(|| format!("running {tool}"))?;
     let raw = String::from_utf8_lossy(&stdout_bytes);
