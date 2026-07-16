@@ -166,24 +166,30 @@ impl McpClient {
 
     /// Connect over Streamable HTTP to `url`, sending `headers` (e.g. auth) with
     /// every request.
+    /// Build the `reqwest::Client` for an HTTP/SSE MCP transport.
+    ///
+    /// Fallible builder, not `reqwest::Client::new()` — the latter panics if
+    /// the TLS backend fails to initialize, turning an environment
+    /// misconfiguration into a process abort instead of a recoverable error. No
+    /// client-wide `.timeout()`: `request()` already races each send against
+    /// the caller-chosen deadline (HANDSHAKE_TIMEOUT vs. the much longer
+    /// CALL_TIMEOUT for tool calls), and a client-wide timeout would clobber
+    /// that distinction.
+    fn build_http(server: &str) -> Result<reqwest::Client> {
+        reqwest::Client::builder().build().map_err(|e| {
+            anyhow!(
+                "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
+            )
+        })
+    }
+
     pub async fn connect_http(
         server: &str,
         url: &str,
         headers: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
         let map = build_headers(headers)?;
-        // Fallible builder, not `reqwest::Client::new()` — the latter panics
-        // if the TLS backend fails to initialize, which turns an environment
-        // misconfiguration into a process abort instead of a recoverable
-        // error. No client-wide `.timeout()` here: `request()` already races
-        // each send against the caller-chosen deadline (HANDSHAKE_TIMEOUT vs.
-        // the much longer CALL_TIMEOUT for tool calls), and a client-wide
-        // timeout would clobber that distinction.
-        let http = reqwest::Client::builder().build().map_err(|e| {
-            anyhow!(
-                "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
-            )
-        })?;
+        let http = Self::build_http(server)?;
         let client = Arc::new(Self {
             server: server.to_string(),
             next_id: AtomicU64::new(1),
@@ -205,14 +211,7 @@ impl McpClient {
         sse_url: &str,
         headers: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
-        // Fallible builder, not `reqwest::Client::new()` — see the comment in
-        // `connect_http` on why that panics-on-TLS-failure and why no
-        // client-wide `.timeout()` is set here either.
-        let http = reqwest::Client::builder().build().map_err(|e| {
-            anyhow!(
-                "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
-            )
-        })?;
+        let http = Self::build_http(server)?;
         let map = build_headers(headers)?;
         let base =
             reqwest::Url::parse(sse_url).with_context(|| format!("bad MCP url '{sse_url}'"))?;
