@@ -4813,6 +4813,61 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     );
 }
 
+/// A `!command` that dumps far more than the streaming cap (256 KiB) must not
+/// grow the in-memory buffer to match: the bytes actually forwarded over the
+/// channel for display stay bounded well below what the command wrote, and
+/// the process still runs to completion — the pipes are drained the whole
+/// time regardless of the cap, so nothing backs up and deadlocks. Unix-only,
+/// like the other `!command` tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    // ~2 MB of output — comfortably past the 256 KiB streaming cap and the
+    // 50_000-char final display cap alike.
+    h.type_str("!yes 0123456789abcdef0123456789abcdef0123456789abcdef | head -c 2000000");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "the shell task is tracked");
+
+    let mut forwarded_bytes = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived — the pipes may have backed up and deadlocked"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(10), h.rx.recv()).await {
+            Ok(Some(msg)) => {
+                if let TurnMsg::UserShell(hrdr_agent::AgentEvent::ToolOutput { chunk, .. }, _) =
+                    &msg
+                {
+                    forwarded_bytes += chunk.len();
+                }
+                h.app.on_turn_msg(msg);
+            }
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+
+    assert!(
+        forwarded_bytes < 512 * 1024,
+        "streaming forwarded {forwarded_bytes} bytes for a 2MB command — the \
+         in-memory cap did not stop growth while the process was running"
+    );
+    let done = h.app.transcript().iter().any(|e| {
+        matches!(&e.kind, EntryKind::Tool { done: true, ok: true, result, .. }
+            if result.len() < 60_000)
+    });
+    assert!(done, "the command finished cleanly with a bounded result");
+}
+
 /// Esc cancels a running `!command`: the child is killed, the tool block
 /// closes as "(cancelled)", the cancellation note commits to history + disk
 /// like any other transcript entry, and the slot frees for the next command.

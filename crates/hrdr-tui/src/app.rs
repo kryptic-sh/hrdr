@@ -1010,6 +1010,18 @@ impl App {
             };
             // Stream stdout and stderr as they arrive, accumulating a bounded
             // copy for the result + the model's history note.
+            //
+            // The in-memory buffer is capped independently of the pipes: a
+            // runaway command (`!cat huge.bin`) must not grow `out` without
+            // bound while the process is still running — the final display
+            // cap (`truncate_inline`, 50_000 chars) only kicks in after exit,
+            // by which point an uncapped `out` could already have pushed
+            // memory toward OOM. Once `out` reaches `MAX_BUFFERED` (well above
+            // the 50_000-char display cap, so nothing visible is lost), stop
+            // growing it and stop forwarding further chunks for display — but
+            // keep reading from the child's pipes so they don't back up and
+            // deadlock the process.
+            const MAX_BUFFERED: usize = 256 * 1024;
             let mut out = String::new();
             let mut stdout = child.stdout.take();
             let mut stderr = child.stderr.take();
@@ -1023,15 +1035,17 @@ impl App {
                         match r {
                             Ok(0) | Err(_) => open_out = false,
                             Ok(n) => {
-                                let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
-                                out.push_str(&chunk);
-                                let _ = tx.send(TurnMsg::UserShell(
-                                    AgentEvent::ToolOutput {
-                                        id: task_id.clone(),
-                                        chunk,
-                                    },
-                                    None,
-                                ));
+                                if out.len() < MAX_BUFFERED {
+                                    let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
+                                    out.push_str(&chunk);
+                                    let _ = tx.send(TurnMsg::UserShell(
+                                        AgentEvent::ToolOutput {
+                                            id: task_id.clone(),
+                                            chunk,
+                                        },
+                                        None,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1039,15 +1053,17 @@ impl App {
                         match r {
                             Ok(0) | Err(_) => open_err = false,
                             Ok(n) => {
-                                let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
-                                out.push_str(&chunk);
-                                let _ = tx.send(TurnMsg::UserShell(
-                                    AgentEvent::ToolOutput {
-                                        id: task_id.clone(),
-                                        chunk,
-                                    },
-                                    None,
-                                ));
+                                if out.len() < MAX_BUFFERED {
+                                    let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
+                                    out.push_str(&chunk);
+                                    let _ = tx.send(TurnMsg::UserShell(
+                                        AgentEvent::ToolOutput {
+                                            id: task_id.clone(),
+                                            chunk,
+                                        },
+                                        None,
+                                    ));
+                                }
                             }
                         }
                     }

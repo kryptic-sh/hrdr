@@ -6,7 +6,10 @@
 //! directory: each lives at `sessions/<cwd-slug>/<name-slug>.json`, so the
 //! files are easy to manage by hand and startup auto-resume scopes to a project.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::Entry;
 use anyhow::{Context, Result};
@@ -399,6 +402,21 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// In-process cache of each session file's `created` timestamp, keyed by its
+/// absolute path.
+///
+/// `created` is fixed at a file's first write and never changes again, so it
+/// only ever needs to be *learned* once per path — either from a load, or (on
+/// a cache miss) the one fallback read in [`Session::save`] below. Every
+/// subsequent save for the same path is then a hash-map lookup instead of a
+/// full read + JSON parse of the previous file — which otherwise carries the
+/// entire message history, and autosave runs synchronously on the UI thread
+/// after every turn, `!command`, cancel and rename.
+fn created_cache() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl Session {
     /// Save as `<cwd-slug>/<id>.json` (the cwd comes from `self.cwd`); returns
     /// the written path.
@@ -407,11 +425,27 @@ impl Session {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.json", sanitize_name(id)));
         // Autosave rebuilds a fresh `Session` per write; keep the original
-        // creation time from the file being overwritten.
+        // creation time from the file being overwritten — from the in-process
+        // cache when known (see `created_cache`), so this doesn't cost a
+        // read + parse of the previous file on every save. A cache miss (the
+        // first save this process makes to this path) falls back to reading
+        // it once, exactly as before, and remembers the result.
+        let cached = created_cache()
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&path).copied());
+        let created = match cached {
+            Some(c) => c,
+            None => {
+                let c = Self::load_path(&path).map_or(self.created, |prev| prev.created);
+                if let Ok(mut cache) = created_cache().lock() {
+                    cache.entry(path.clone()).or_insert(c);
+                }
+                c
+            }
+        };
         let mut snap = self.clone();
-        if let Ok(prev) = Self::load_path(&path) {
-            snap.created = prev.created;
-        }
+        snap.created = created;
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
         hrdr_agent::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
@@ -434,6 +468,12 @@ impl Session {
             .file_stem()
             .and_then(|s| s.to_str())
             .map(str::to_string);
+        // A load always knows the true `created` for this path — remember it,
+        // so a later `save` (an autosave, a rename, …) doesn't have to re-read
+        // the file just to preserve it.
+        if let Ok(mut cache) = created_cache().lock() {
+            cache.insert(path.to_path_buf(), session.created);
+        }
         Ok(session)
     }
 }
@@ -476,6 +516,20 @@ pub fn unique_session_id(cwd: &str, name: &str) -> String {
     slug
 }
 
+/// In-process cache of each session file's [`SessionMeta`], keyed by its
+/// absolute path and guarded by the file's mtime.
+///
+/// [`list_sessions`] is called from `arg_completions` for `/resume`, which
+/// runs on every keystroke while that argument is being typed — and a full
+/// [`Session::load_path`] deserializes the WHOLE session (message history and
+/// transcript included) just to read three metadata fields. Checking a file's
+/// mtime is a cheap stat; a file whose mtime hasn't moved since it was last
+/// read need not be re-read (or re-parsed) at all.
+fn meta_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, SessionMeta)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, SessionMeta)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Collect session files from one directory into `out`.
 fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -486,19 +540,35 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+        if let Some(mtime) = mtime {
+            let cached = meta_cache()
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&path).cloned())
+                .filter(|(cached_mtime, _)| *cached_mtime == mtime);
+            if let Some((_, meta)) = cached {
+                out.push(meta);
+                continue;
+            }
+        }
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
         if let Ok(s) = Session::load_path(&path) {
-            out.push(SessionMeta {
+            let meta = SessionMeta {
                 id,
                 name: s.state.name,
                 cwd: s.state.cwd,
                 updated: s.updated,
-                path,
-            });
+                path: path.clone(),
+            };
+            if let (Some(mtime), Ok(mut cache)) = (mtime, meta_cache().lock()) {
+                cache.insert(path, (mtime, meta.clone()));
+            }
+            out.push(meta);
         }
     }
 }
@@ -696,6 +766,57 @@ mod tests {
         });
     }
 
+    /// `Session::save` preserves the original `created` across repeated
+    /// autosaves via the in-process cache (`created_cache`) rather than by
+    /// re-reading the previous file on every write. Proven by deleting the
+    /// file between saves: a save that fell back to reading it would find
+    /// nothing there and mint a fresh timestamp instead of the original one —
+    /// the cache must supply it regardless.
+    #[test]
+    fn save_preserves_created_via_cache_without_rereading_the_file() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let st = state("Cache Created", &cwd);
+            let original = Session {
+                version: SESSION_VERSION,
+                created: 1_700_000_000,
+                updated: 1_700_000_000,
+                state: st.clone(),
+            };
+            let path = original.save("cache-created").unwrap();
+            assert_eq!(
+                Session::load_path(&path).unwrap().created,
+                1_700_000_000,
+                "first save wrote the given created time"
+            );
+
+            // Remove the file: a save that fell back to re-reading the
+            // previous file to preserve `created` would find nothing and
+            // mint a fresh timestamp instead.
+            std::fs::remove_file(&path).unwrap();
+
+            // A brand-new `Session` (as every autosave builds via
+            // `Session::new`) for the same state/id — its own `created` is
+            // whatever `Session::new` mints; `save` must still recover the
+            // ORIGINAL time from the cache, not the fresh one.
+            let fresh = Session::new(st);
+            assert_ne!(
+                fresh.created, 1_700_000_000,
+                "sanity: Session::new did not coincidentally mint the same time"
+            );
+            fresh.save("cache-created").unwrap();
+
+            let back = Session::load_path(&path).unwrap();
+            assert_eq!(
+                back.created, 1_700_000_000,
+                "the cached creation time survived even with the file gone"
+            );
+        });
+    }
+
     /// A restored entry gets its render hash rebuilt. It is derived state, so it is
     /// not persisted — and a zeroed one makes the renderer's cache key
     /// `(index, content_hash, …)` degenerate: the content half becomes a constant
@@ -803,6 +924,49 @@ mod tests {
             assert_eq!(unique_session_id(&cwd, "chat"), "chat");
             Session::new(state("chat", &cwd)).save("chat").unwrap();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
+        });
+    }
+
+    // ── list_sessions ─────────────────────────────────────────────────────────
+
+    /// `list_sessions` (via `collect_sessions`) caches parsed metadata per file
+    /// path, keyed by mtime — it backs `arg_completions` for `/resume`, which
+    /// runs on every keystroke, so re-parsing every session file's full
+    /// message history each time would be a per-key freeze. A listing right
+    /// after a rename (a fresh write, so the mtime moves) must still show the
+    /// new name, not a stale cached one from before the write.
+    #[test]
+    fn list_sessions_reflects_a_rename_despite_the_mtime_cache() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            Session::new(state("Before Rename", &cwd))
+                .save("renamed")
+                .unwrap();
+
+            let first = list_sessions();
+            assert!(
+                first.iter().any(|m| m.name == "Before Rename"),
+                "first listing sees the session: {first:?}"
+            );
+
+            // Overwrite the same file with a different name: a fresh write,
+            // so its mtime moves and the cached entry must not be reused.
+            Session::new(state("After Rename", &cwd))
+                .save("renamed")
+                .unwrap();
+
+            let second = list_sessions();
+            assert!(
+                second.iter().any(|m| m.name == "After Rename"),
+                "second listing sees the rename, not a stale cached entry: {second:?}"
+            );
+            assert!(
+                !second.iter().any(|m| m.name == "Before Rename"),
+                "the stale name is gone: {second:?}"
+            );
         });
     }
 
