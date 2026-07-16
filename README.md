@@ -534,17 +534,14 @@ explore several areas of the codebase at once. While they run, the TUI shows a
 output streams. Finished sub-agents drop from the panel and their result lands
 in the transcript.
 
-Sub-agents run **detached by default**: the `task` call returns immediately with
-a task id, so a sub-agent never blocks the main conversation — the model keeps
+Every sub-agent runs **detached**: the `task` call returns immediately with a
+task id, so a sub-agent never blocks the main conversation — the model keeps
 working, and you keep talking to it. The sub-agent's result is **delivered back
 into the conversation automatically** when it finishes; if the agent is idle at
 that moment, the result wakes it so it reacts without you typing anything.
-Detached sub-agents show live in the same panel (with a ✓ on completion).
-
-Pass **`background: false`** when the model needs the sub-agent's answer before
-its next step — the call then blocks and the result comes back inline.
-Sub-agents running in an isolated worktree (`isolation = "worktree"`) always
-block; they can't detach yet.
+Detached sub-agents show live in the same panel (with a ✓ on completion). There
+is no foreground mode — if the model needs the answer before its next step, it
+says so and ends its turn, and the delivered result wakes it.
 
 Five **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
@@ -654,9 +651,10 @@ prompt = "You are a security reviewer. Focus on authn, injection, and secrets…
 scopes it to the read-only tools; `write_ext` grants the read-only tools plus
 file writes limited to those extensions (e.g. `write_ext = ["md"]`, how `plan`
 is built); `tools` is an explicit allow-list that takes precedence over both.
-`isolation = "worktree"` runs the sub-agent in a fresh git worktree on a scratch
-branch — auto-removed if it made no changes, otherwise kept with a pointer to
-the branch to review and merge.
+Every write-capable sub-agent automatically runs in a fresh git worktree on a
+scratch branch — auto-removed if it made no changes, otherwise kept with a
+pointer to the branch to review and merge; there's no per-profile setting for
+this.
 
 A profile can also tune the sub-agent's runtime knobs, each inheriting the main
 agent's when omitted: `temperature`, `effort` (`minimal`/`low`/`medium`/`high`),

@@ -1523,10 +1523,7 @@ impl SubagentTool {
              review its changes and merge them before they affect your working dir (if the \
              project is not a git repo it instead edits your dir directly, and only one write \
              sub-agent runs at a time); a read-only sub-agent shares your dir and changes \
-             nothing. Run cheaper/faster work on another \
-             `model` — a bare id (`gpt-5.5-mini`) is that model on the provider you are already \
-             on, and `provider://model` (`openrouter://deepseek/deepseek-chat`) delegates to a \
-             different, already-configured provider",
+             nothing. Run cheaper/faster work on another `model` (see the `model` parameter)",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -1557,9 +1554,6 @@ impl SubagentTool {
                         .collect::<Vec<_>>()
                         .join("/");
                     tags.push_str(&format!(" · read-only + writes {list}"));
-                }
-                if p.isolation.as_deref() == Some("worktree") {
-                    tags.push_str(" · isolated worktree");
                 }
                 let star = if p.is_proactive() { "★ " } else { "" };
                 desc.push_str(&format!("- {star}{} ({tags})", p.name));
@@ -1708,9 +1702,8 @@ impl hrdr_tools::Tool for SubagentTool {
             // never from the interactive last-used store, which would make the same
             // sub-agent run a different model for each developer.
             //
-            // A profile's `isolation` field is now informational: worktree
-            // isolation is applied to *every* write-capable sub-agent below,
-            // whether or not the profile asked for it.
+            // Worktree isolation is applied to *every* write-capable sub-agent
+            // below, by capability — there is no per-profile opt-in/out.
             cfg = config_for_agent_profile(&cfg, profile)
                 .map_err(|e| anyhow::anyhow!("subagent '{}': {e:#}", profile.name))?;
         }
@@ -2695,11 +2688,6 @@ pub struct SubagentProfile {
     /// [`is_proactive`](Self::is_proactive) for the effective value.
     #[serde(default)]
     pub proactive: Option<bool>,
-    /// Run this sub-agent in an isolated environment. `"worktree"` runs it in a
-    /// fresh git worktree on a scratch branch (auto-removed if it made no
-    /// changes; kept with a pointer otherwise). Omit for no isolation.
-    #[serde(default)]
-    pub isolation: Option<String>,
 }
 
 impl SubagentProfile {
@@ -2756,7 +2744,6 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
                     effort,
                     max_steps,
                     proactive,
-                    isolation,
                 } = incoming;
                 if model.is_some() {
                     slot.model = model;
@@ -2787,9 +2774,6 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
                 }
                 if proactive.is_some() {
                     slot.proactive = proactive;
-                }
-                if isolation.is_some() {
-                    slot.isolation = isolation;
                 }
             }
             None => profiles.push(incoming),
@@ -2840,7 +2824,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: Some(true),
-            isolation: None,
         },
         SubagentProfile {
             name: "review".to_string(),
@@ -2860,7 +2843,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: Some("high".to_string()),
             max_steps: None,
             proactive: Some(true),
-            isolation: None,
         },
         SubagentProfile {
             name: "plan".to_string(),
@@ -2879,7 +2861,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: Some(false),
-            isolation: None,
         },
         SubagentProfile {
             name: "coder".to_string(),
@@ -2900,7 +2881,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: Some(true),
-            isolation: None,
         },
         SubagentProfile {
             name: "general".to_string(),
@@ -2919,7 +2899,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             effort: None,
             max_steps: None,
             proactive: Some(false),
-            isolation: None,
         },
     ]
 }
@@ -4306,8 +4285,9 @@ pub fn in_git_repo(cwd: &std::path::Path) -> bool {
     cwd.ancestors().any(|d| d.join(".git").exists())
 }
 
-/// A throwaway git worktree for an isolated sub-agent (`isolation = "worktree"`).
-/// Created on a scratch branch off the current `HEAD`; [`finish`](Self::finish)
+/// A throwaway git worktree for an isolated sub-agent (every write-capable
+/// sub-agent, when the project is a git repo). Created on a scratch branch off
+/// the current `HEAD`; [`finish`](Self::finish)
 /// removes it if the sub-agent made no changes, else leaves it with a pointer.
 ///
 /// Implements [`Drop`] for best-effort cleanup when the owning future is
@@ -4341,7 +4321,7 @@ impl Worktree {
     /// repository (or git isn't available).
     async fn create(repo: &std::path::Path) -> Result<Self> {
         if !in_git_repo(repo) {
-            bail!("isolation = \"worktree\" requires a git repository");
+            bail!("worktree isolation requires a git repository");
         }
         // Best-effort prune of any stale worktrees from previously aborted runs.
         prune_stale_worktrees(repo).await;
@@ -8899,7 +8879,6 @@ mod tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
@@ -8926,7 +8905,6 @@ mod tests {
                 effort: None,
                 max_steps: None,
                 proactive: None,
-                isolation: None,
             },
         )
         .unwrap();
@@ -8951,7 +8929,6 @@ mod tests {
                     effort: None,
                     max_steps: None,
                     proactive: None,
-                    isolation: None,
                 },
             )
             .is_err()
@@ -9140,7 +9117,6 @@ mod tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
         let mut cfg = config_for_agent_profile(&subagent_base_config(&parent), &prof).unwrap();
         // Ad-hoc override to a different provider + model.
@@ -9207,7 +9183,6 @@ mod tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
 
         let base = subagent_base_config(&parent);
@@ -9341,7 +9316,6 @@ mod tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
 
         let base = subagent_base_config(&parent);
@@ -9645,7 +9619,6 @@ mod tests {
             effort: e.map(str::to_string),
             max_steps: s,
             proactive: None,
-            isolation: None,
         };
         // Set knobs override the inherited ones.
         let over =
@@ -9762,7 +9735,6 @@ mod tests {
                 effort: None,
                 max_steps: None,
                 proactive: None,
-                isolation: None,
             }],
             ..Default::default()
         };
@@ -9812,7 +9784,6 @@ mod tests {
                 effort: None,
                 max_steps: None,
                 proactive: None,
-                isolation: None,
             }],
             ..Default::default()
         };
@@ -14792,7 +14763,6 @@ mod provider_only_policy_tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
         let sub = config_for_agent_profile(&base, &profile).unwrap();
         assert_eq!(
@@ -14842,7 +14812,6 @@ mod provider_only_policy_tests {
             effort: None,
             max_steps: None,
             proactive: None,
-            isolation: None,
         };
         let err = config_for_agent_profile(&base, &profile)
             .unwrap_err()

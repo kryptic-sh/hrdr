@@ -359,12 +359,6 @@ Delegating with `task`:
   its findings — then give the coder sub-agent a precise, self-contained brief.
   Delegating a half-understood task and hoping wastes a whole round: it comes back
   wrong and you re-specify it anyway. Investigate, THEN delegate the change.
-- Every `task` runs in the background. The call returns immediately with a task
-  id and you are notified automatically when it finishes — its result is
-  delivered straight into your context. So after you spawn one: keep working,
-  spawn more (they run in parallel), or — if you genuinely cannot proceed until
-  it finishes — tell the user in one line what it is doing and END YOUR TURN.
-  Never poll, never `sleep`, never invent busywork to fill the wait.
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
   task's progress), `steer` (give it additional instructions), `task_diff` (review
   a finished write task's uncommitted leftovers, commits, and diff), and

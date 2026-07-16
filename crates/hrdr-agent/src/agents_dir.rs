@@ -190,10 +190,6 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
     // `tools:` map is nested, so it parses to an empty list here and is ignored.
     let tools = fm.get("tools").map(|v| v.list()).filter(|l| !l.is_empty());
     let proactive = fm.get("proactive").map(is_true);
-    let isolation = fm
-        .get("isolation")
-        .map(|v| v.scalar())
-        .filter(|s| !s.is_empty());
 
     Ok(Some(SubagentProfile {
         name,
@@ -207,7 +203,6 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
         effort,
         max_steps,
         proactive,
-        isolation,
     }))
 }
 
