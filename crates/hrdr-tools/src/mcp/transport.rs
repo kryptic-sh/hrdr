@@ -11,7 +11,7 @@ use hrdr_llm::SseDecoder;
 use crate::truncate;
 
 use super::types::Pending;
-use super::{HttpTransport, PROTOCOL_VERSION, SseTransport, StdioTransport};
+use super::{HttpTransport, PROTOCOL_VERSION, SseTransport, StdioTransport, response_id};
 
 /// Shared plumbing for stdio + SSE: register an id in `pending`, execute
 /// `send_fn` (which should fire off the request), then race `rx` against
@@ -195,12 +195,19 @@ pub(crate) fn http_post(t: &HttpTransport, body: &Value) -> reqwest::RequestBuil
     req
 }
 
-/// Find the JSON-RPC message with `id` in an SSE stream body.
+/// Find the JSON-RPC *response* message for `id` in an SSE stream body.
 ///
 /// Uses [`SseDecoder`] for correct blank-line-terminated event grouping and
 /// multi-line `data:` folding (mirrors the Streamable-HTTP inline SSE path).
 /// A trailing `\n\n` is pushed after the body to flush any event that was not
 /// terminated in the buffer (some servers omit the final blank line).
+///
+/// Matching goes through [`response_id`], not a raw `id` comparison: a
+/// server-initiated request/notification (has a `method` field) must never
+/// be mistaken for the response to our own request, even if its `id`
+/// collides — id spaces are per-sender, so collisions are expected, not
+/// exceptional. A response whose `id` was echoed back as a string is also
+/// accepted, as long as it parses as this `u64`.
 pub(crate) fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
     let mut dec = SseDecoder::new();
     dec.push(body.as_bytes());
@@ -208,7 +215,7 @@ pub(crate) fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
     dec.push(b"\n\n");
     for ev in dec.drain() {
         if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
-            && v.get("id").and_then(Value::as_u64) == Some(id)
+            && response_id(&v) == Some(id)
         {
             return Ok(v);
         }
@@ -233,5 +240,32 @@ mod tests {
         assert!(err.to_string().contains("exceeded"), "{err}");
         // The buffer isn't left half-mutated by the refused push.
         assert_eq!(buf, b"helloworld");
+    }
+
+    // Regression for a MAJOR bug: id spaces are per-sender, so a
+    // server-initiated request can legitimately reuse an id we're waiting on
+    // for our own request. `parse_sse_for_id` must not hand that request back
+    // as if it were the response — it has to keep scanning for the real one.
+    #[test]
+    fn parse_sse_for_id_ignores_server_initiated_message_with_colliding_id() {
+        let body = "\
+event: message
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{}}
+
+event: message
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}
+
+";
+        let v = parse_sse_for_id(body, 1).unwrap();
+        assert_eq!(v["result"]["ok"], true, "{v}");
+    }
+
+    // A server that echoes the id back as a JSON string, not a number, must
+    // still be matched (id "1" answers request 1).
+    #[test]
+    fn parse_sse_for_id_accepts_a_string_id() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":\"3\",\"result\":{\"ok\":true}}\n\n";
+        let v = parse_sse_for_id(body, 3).unwrap();
+        assert_eq!(v["result"]["ok"], true, "{v}");
     }
 }

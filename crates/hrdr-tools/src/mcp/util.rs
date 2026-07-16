@@ -29,6 +29,30 @@ pub(crate) fn extract_content_text(result: &Value) -> String {
     out
 }
 
+/// The response id an incoming JSON-RPC message should be routed by, or
+/// `None` if it isn't a response to one of our own requests at all.
+///
+/// JSON-RPC id spaces are per-sender, and both client and server typically
+/// start numbering near 1 — so a SERVER-INITIATED request (MCP servers may
+/// legitimately send `ping` or `sampling/createMessage`) can carry an `id`
+/// that collides with one of our pending client call ids. A message carrying
+/// a `method` field is always a request or notification, *never* a response
+/// to something we sent, regardless of what its `id` says — so it must never
+/// be matched against the pending-calls map.
+///
+/// Some servers also echo the id back as a JSON string (`"id":"1"`) rather
+/// than a number; that's accepted too, as long as it parses as a `u64`.
+pub(crate) fn response_id(msg: &Value) -> Option<u64> {
+    if msg.get("method").is_some() {
+        return None;
+    }
+    match msg.get("id")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 /// Human-readable message from a JSON-RPC `error` object.
 pub(crate) fn rpc_error_message(err: &Value) -> String {
     let msg = err

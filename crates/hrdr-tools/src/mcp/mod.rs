@@ -56,7 +56,7 @@ pub(crate) use transport::parse_sse_for_id;
 pub(crate) use types::{
     Discovered, HttpTransport, Pending, SseTransport, StdioTransport, Transport,
 };
-pub(crate) use util::{extract_content_text, rpc_error_message, sanitize_tool_name};
+pub(crate) use util::{extract_content_text, response_id, rpc_error_message, sanitize_tool_name};
 
 #[cfg(test)]
 mod tests {
@@ -118,6 +118,50 @@ mod tests {
             "line one\nline two\n[image content omitted]"
         );
         assert_eq!(extract_content_text(&json!({})), "");
+    }
+
+    // Regression for a MAJOR bug: response routing used to key only on a
+    // numeric `id`, with no check that the message lacked a `method` field.
+    // JSON-RPC id spaces are per-sender and both sides typically start
+    // numbering near 1, so a server-initiated request (MCP servers may
+    // legitimately send `ping` or `sampling/createMessage`) whose `id`
+    // collided with a pending client id got delivered as that call's
+    // response, corrupting it. `response_id` is the shared predicate behind
+    // the fix in both the stdio/SSE reader loops and `parse_sse_for_id`.
+    #[test]
+    fn response_id_ignores_messages_with_a_method_field() {
+        // A real response: no `method`, numeric id.
+        assert_eq!(
+            response_id(&json!({"jsonrpc":"2.0","id":1,"result":{}})),
+            Some(1)
+        );
+        // A server-initiated request reusing id 1 must NOT be treated as a
+        // response, even though its `id` matches a pending call.
+        assert_eq!(
+            response_id(&json!({"jsonrpc":"2.0","id":1,"method":"ping"})),
+            None
+        );
+        // A notification (no id at all, but a method).
+        assert_eq!(
+            response_id(&json!({"jsonrpc":"2.0","method":"notifications/progress"})),
+            None
+        );
+    }
+
+    // Regression for a MINOR bug: response ids were matched with
+    // `Value::as_u64` only, so a server that echoed the id back as a JSON
+    // string (`"id":"1"`) never matched and the call died as a bare timeout.
+    #[test]
+    fn response_id_accepts_a_string_id_that_parses_as_u64() {
+        assert_eq!(
+            response_id(&json!({"jsonrpc":"2.0","id":"42","result":{}})),
+            Some(42)
+        );
+        // A non-numeric string id still doesn't match anything.
+        assert_eq!(
+            response_id(&json!({"jsonrpc":"2.0","id":"abc","result":{}})),
+            None
+        );
     }
 
     #[test]

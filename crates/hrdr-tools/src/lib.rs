@@ -275,9 +275,13 @@ impl ToolContext {
     fn record_read(&self, path: &std::path::Path, complete: bool) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let sig = file_sig(&canon);
-        if let Ok(mut map) = self.read_files.lock() {
-            map.insert(canon, ReadRecord { complete, sig });
-        }
+        // Recover a poisoned lock, mirroring the readers (`was_read`,
+        // `read_state`) below: the map itself isn't corrupted by an unrelated
+        // panic, so honor it rather than silently dropping this insert. If we
+        // instead skipped on poison, a single panic-while-locked would make
+        // every read-before-mutate check fail forever after.
+        let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(canon, ReadRecord { complete, sig });
     }
 
     /// Guard for [`write_allow_ext`](Self::write_allow_ext): `Err` when a
@@ -1606,6 +1610,50 @@ mod tests {
             !ctx.was_read(&unseen),
             "poison must not make every file look read (that disables the guardrail)"
         );
+    }
+
+    #[test]
+    fn record_read_recovers_poisoned_lock() {
+        // `record_read` used to fail open (`if let Ok(..) = lock()`), silently
+        // dropping the insert on a poisoned lock — asymmetric with the readers
+        // (`was_read`/`read_state`), which both recover. After any unrelated
+        // panic-while-locked, that meant no new read was ever recorded again,
+        // so every later edit/write on a freshly-read file would still fail
+        // "read it before…".
+        let dir = tempfile::tempdir().unwrap();
+        let before = dir.path().join("before.txt");
+        std::fs::write(&before, "x").unwrap();
+        let after = dir.path().join("after.txt");
+        std::fs::write(&after, "y").unwrap();
+
+        let ctx = ToolContext::new(dir.path());
+
+        // Poison the read_files lock.
+        let rf = ctx.read_files.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = rf.lock().unwrap();
+            panic!("poison the read_files lock");
+        }));
+        assert!(
+            ctx.read_files.is_poisoned(),
+            "precondition: lock is poisoned"
+        );
+
+        // A read recorded *after* the poison must still land: `record_read`
+        // has to recover the lock, not skip the insert.
+        ctx.mark_read(&after);
+        assert!(
+            ctx.was_read(&after),
+            "record_read must recover a poisoned lock instead of silently \
+             dropping the insert"
+        );
+        assert_eq!(
+            ctx.read_state(&after),
+            ReadState::Fresh,
+            "the recovered insert must carry through to read_state too"
+        );
+        // Unrelated file, never read: still correctly unread.
+        assert!(!ctx.was_read(&before));
     }
 
     // ---- ToolContext::emit / stream backpressure ----

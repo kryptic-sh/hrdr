@@ -21,7 +21,7 @@ use super::{
     Pending, SseTransport, StdioTransport, Transport, build_headers, http_request, http_send,
     sse_request, stdio_request,
 };
-use super::{extract_content_text, rpc_error_message, sanitize_tool_name};
+use super::{extract_content_text, response_id, rpc_error_message, sanitize_tool_name};
 
 /// Read one newline-delimited stdio message without ever buffering more than
 /// the protocol cap. Oversized lines are drained through their newline so the
@@ -105,6 +105,10 @@ impl McpClient {
         let pending: Pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
         {
             let pending = pending.clone();
+            // A clone so the reader task can answer server-initiated `ping`
+            // requests without needing anything from `StdioTransport` (which
+            // isn't built yet, and shouldn't be raced against from here).
+            let stdin_tx = stdin_tx.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 loop {
@@ -119,12 +123,27 @@ impl McpClient {
                             let Ok(msg) = serde_json::from_str::<Value>(line.trim_end()) else {
                                 continue; // skip non-JSON (some servers emit banners)
                             };
-                            if let Some(id) = msg.get("id").and_then(Value::as_u64)
-                                && let Some(tx) = pending.lock().await.remove(&id)
+                            // A message with a `method` field is a
+                            // server-initiated request/notification, never a
+                            // response — id spaces are per-sender, so its id
+                            // can legitimately collide with one of ours. Only
+                            // route messages that aren't requests.
+                            if let Some(id) = response_id(&msg) {
+                                if let Some(tx) = pending.lock().await.remove(&id) {
+                                    let _ = tx.send(msg);
+                                }
+                                // else: response to an id we're no longer
+                                // waiting on (already timed out) — drop it.
+                            } else if msg.get("method").and_then(Value::as_str) == Some("ping")
+                                && let Some(id) = msg.get("id").cloned()
                             {
-                                let _ = tx.send(msg);
+                                // Cheap best-effort answer so a conformant
+                                // server doesn't consider us unresponsive.
+                                let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                                let _ = stdin_tx.send(reply.to_string());
                             }
-                            // notifications + server-initiated requests are ignored (v1).
+                            // other notifications / server-initiated requests
+                            // are otherwise ignored (v1).
                         }
                     }
                 }
@@ -153,11 +172,23 @@ impl McpClient {
         headers: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
         let map = build_headers(headers)?;
+        // Fallible builder, not `reqwest::Client::new()` — the latter panics
+        // if the TLS backend fails to initialize, which turns an environment
+        // misconfiguration into a process abort instead of a recoverable
+        // error. No client-wide `.timeout()` here: `request()` already races
+        // each send against the caller-chosen deadline (HANDSHAKE_TIMEOUT vs.
+        // the much longer CALL_TIMEOUT for tool calls), and a client-wide
+        // timeout would clobber that distinction.
+        let http = reqwest::Client::builder().build().map_err(|e| {
+            anyhow!(
+                "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
+            )
+        })?;
         let client = Arc::new(Self {
             server: server.to_string(),
             next_id: AtomicU64::new(1),
             transport: Transport::Http(HttpTransport {
-                http: reqwest::Client::new(),
+                http,
                 url: url.to_string(),
                 headers: map,
                 session: std::sync::Mutex::new(None),
@@ -174,7 +205,14 @@ impl McpClient {
         sse_url: &str,
         headers: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
-        let http = reqwest::Client::new();
+        // Fallible builder, not `reqwest::Client::new()` — see the comment in
+        // `connect_http` on why that panics-on-TLS-failure and why no
+        // client-wide `.timeout()` is set here either.
+        let http = reqwest::Client::builder().build().map_err(|e| {
+            anyhow!(
+                "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
+            )
+        })?;
         let map = build_headers(headers)?;
         let base =
             reqwest::Url::parse(sse_url).with_context(|| format!("bad MCP url '{sse_url}'"))?;
@@ -222,9 +260,14 @@ impl McpClient {
                                 let _ = ep_tx.send(Some(u.to_string()));
                             }
                         } else if let Ok(msg) = serde_json::from_str::<Value>(&ev.data)
-                            && let Some(id) = msg.get("id").and_then(Value::as_u64)
+                            && let Some(id) = response_id(&msg)
                             && let Some(tx) = pending.lock().await.remove(&id)
                         {
+                            // A message with a `method` field (server-initiated
+                            // request/notification) is filtered out by
+                            // `response_id` before we ever get here — id
+                            // spaces are per-sender, so such a message's id
+                            // can legitimately collide with one of ours.
                             let _ = tx.send(msg);
                         }
                     }
@@ -352,6 +395,12 @@ impl McpClient {
     }
 
     /// Send a JSON-RPC notification (best-effort; no response expected).
+    ///
+    /// `initialize()` awaits this for `notifications/initialized`, so the
+    /// HTTP/SSE sends are bounded by `HANDSHAKE_TIMEOUT`: without a deadline,
+    /// a server that accepts the POST but never responds would wedge
+    /// `connect_http`/`connect_sse` forever (stdio's send is a non-blocking
+    /// channel enqueue, so it needs no timeout).
     pub(crate) async fn notify(&self, method: &str, params: Value) {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         match &self.transport {
@@ -359,19 +408,21 @@ impl McpClient {
                 let _ = t.stdin_tx.send(msg.to_string());
             }
             Transport::Http(t) => {
-                let _ = http_send(t, &msg).await;
+                let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, http_send(t, &msg)).await;
             }
             Transport::Sse(t) => {
                 // Clone out of the watch guard before the await (guard isn't Send).
                 let url = t.post_url.borrow().clone();
                 if let Some(url) = url {
-                    let _ = t
-                        .http
-                        .post(&url)
-                        .headers(t.headers.clone())
-                        .json(&msg)
-                        .send()
-                        .await;
+                    let _ = tokio::time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        t.http
+                            .post(&url)
+                            .headers(t.headers.clone())
+                            .json(&msg)
+                            .send(),
+                    )
+                    .await;
                 }
             }
         }
@@ -583,5 +634,58 @@ mod tests {
         assert!(read_stdio_line_capped(&mut reader).await.unwrap().is_none());
         let next = read_stdio_line_capped(&mut reader).await.unwrap().unwrap();
         assert_eq!(next, b"{\"ok\":true}\n");
+    }
+
+    // Regression for a MAJOR bug: `initialize()` awaits `notify()` for
+    // `notifications/initialized`, and the HTTP notify path used to POST with
+    // no deadline of any kind (`reqwest::Client::new()` has no timeout, and
+    // `http_send` wasn't wrapped either). A server that accepts the POST but
+    // never responds would wedge `connect_http` forever.
+    //
+    // This runs against the real clock (the crate's dev-deps don't enable
+    // tokio's `test-util` feature, so `start_paused` virtual-time isn't
+    // available) — it really waits out `HANDSHAKE_TIMEOUT` before asserting.
+    // The outer `tokio::time::timeout` is a safety net set comfortably
+    // longer: if the internal timeout regressed to "none", the assertion
+    // below fails with a clear message instead of hanging the suite forever.
+    #[tokio::test]
+    async fn http_notify_is_bounded_by_handshake_timeout_not_unbounded() {
+        // A TCP listener that accepts connections but never writes a
+        // response or closes them, simulating a server that silently swallows
+        // the notification POST.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Hold the connection open forever; never respond.
+                std::mem::forget(stream);
+            }
+        });
+
+        let http = reqwest::Client::builder()
+            .build()
+            .expect("building a plain client must not fail in tests");
+        let client = McpClient {
+            server: "hung".to_string(),
+            next_id: AtomicU64::new(1),
+            transport: Transport::Http(HttpTransport {
+                http,
+                url: format!("http://{addr}/mcp"),
+                headers: reqwest::header::HeaderMap::new(),
+                session: std::sync::Mutex::new(None),
+            }),
+        };
+
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT + Duration::from_secs(30),
+            client.notify("notifications/initialized", json!({})),
+        )
+        .await
+        .expect(
+            "notify() must return once its own HANDSHAKE_TIMEOUT elapses, \
+             not hang until this test's much longer outer bound",
+        );
     }
 }
