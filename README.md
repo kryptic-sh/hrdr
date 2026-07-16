@@ -140,8 +140,9 @@ line), and the template's own `@file` / `@agent` mentions expand as usual. Files
 are discovered from `.hrdr/skills/`, `.claude/commands/`, and
 `.opencode/command/` in the project, then `~/.config/hrdr/skills/`,
 `~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
-wins. Optional `name:` / `description:` frontmatter (plus `args: [a, b]` —
-candidate argument values the completion popup offers after `:name `); the file
+wins. Optional YAML frontmatter — `name:`, `description:` (multi-line and block
+scalars both work), and `args:` (a YAML list or a comma-separated string) —
+candidate argument values the completion popup offers after `:name `; the file
 stem names it otherwise. `/skills` opens a picker over what's loaded (Enter
 inserts `:name ` into the input); the transcript shows the raw `:name args` you
 typed while the model receives the expanded prompt.
