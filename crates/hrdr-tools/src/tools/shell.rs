@@ -369,49 +369,15 @@ async fn run_streamed_command(
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,
 /// keeping whole lines from the front (`from_tail = false`, for `head`) or the
 /// back (`from_tail = true`, for `tail`) — the same head/tail line-collection
-/// truncate_saved's `Middle` side does, reimplemented here (rather than
-/// reaching into `lib.rs`'s private helper) since `head`/`tail` are already
-/// in-memory strings, not something worth round-tripping through
-/// `save_overflow` again. A single line wider than `max_bytes` is byte-capped
-/// rather than dropped, so the preview is never empty when there's anything
-/// to show.
+/// `truncate_saved`'s `Middle` side does. `head`/`tail` are already in-memory
+/// strings rather than something worth round-tripping through
+/// `save_overflow` again, so this just splits on `'\n'` and defers to
+/// `lib.rs`'s shared `collect_lines`, which byte-caps a single line wider
+/// than `max_bytes` rather than dropping it, so the preview is never empty
+/// when there's anything to show.
 fn cap_display(text: &str, max_bytes: usize, max_lines: usize, from_tail: bool) -> String {
-    if text.is_empty() || max_lines == 0 {
-        return String::new();
-    }
     let lines: Vec<&str> = text.split('\n').collect();
-    let ordered: Vec<&&str> = if from_tail {
-        lines.iter().rev().collect()
-    } else {
-        lines.iter().collect()
-    };
-    let mut taken: Vec<&str> = Vec::new();
-    let mut bytes = 0usize;
-    for line in ordered {
-        if taken.len() >= max_lines {
-            break;
-        }
-        let add = line.len() + usize::from(!taken.is_empty());
-        if bytes + add > max_bytes {
-            if taken.is_empty() {
-                let budget = max_bytes.max(1);
-                let slice = if from_tail {
-                    let cut = line.len().saturating_sub(budget);
-                    &line[crate::floor_char_boundary(line, cut)..]
-                } else {
-                    &line[..crate::floor_char_boundary(line, budget)]
-                };
-                taken.push(slice);
-            }
-            break;
-        }
-        taken.push(line);
-        bytes += add;
-    }
-    if from_tail {
-        taken.reverse();
-    }
-    taken.join("\n")
+    crate::collect_lines(&lines, max_lines, max_bytes, from_tail)
 }
 
 /// The available shell tools for this machine (bash and/or PowerShell), only

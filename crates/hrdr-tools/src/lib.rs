@@ -1211,7 +1211,12 @@ fn truncate_saved_in(
 /// than `max_bytes` is byte-truncated to fit: without that, one giant line (a
 /// minified bundle, a single-line JSON log) would be returned whole and blow the
 /// context the cap exists to protect.
-fn collect_lines(lines: &[&str], max_lines: usize, max_bytes: usize, from_tail: bool) -> String {
+pub(crate) fn collect_lines(
+    lines: &[&str],
+    max_lines: usize,
+    max_bytes: usize,
+    from_tail: bool,
+) -> String {
     let mut taken: Vec<String> = Vec::new();
     let mut bytes = 0usize;
     let ordered: Vec<&&str> = if from_tail {
