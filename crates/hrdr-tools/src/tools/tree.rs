@@ -22,6 +22,9 @@ struct TreeArgs {
     /// Max entries to return per directory before summarizing the rest (default 200).
     #[serde(default = "default_max_entries")]
     max_entries: usize,
+    /// Also show hidden files/dirs (dotfiles). Skipped by default.
+    #[serde(default)]
+    hidden: bool,
 }
 
 fn default_max_depth() -> usize {
@@ -50,7 +53,9 @@ impl Tool for TreeTool {
         "tree"
     }
     fn description(&self) -> &'static str {
-        "Show a directory tree (respects .gitignore). Directories get a trailing `/`, \
+        "Show a directory tree. By default, hidden files/dirs (dotfiles, e.g. `.github/`) \
+         are hidden and .gitignore'd paths (e.g. `target/`, `node_modules/`) are honored \
+         (excluded); set `hidden` to include dotfiles. Directories get a trailing `/`, \
          symlinks a trailing `@`. Use `max_depth` to limit recursion (default 3, max 10) \
          and `max_entries` to cap per-directory entries (default 200)."
     }
@@ -69,6 +74,10 @@ impl Tool for TreeTool {
                 "max_entries": {
                     "type": "integer",
                     "description": "Max entries shown per directory before summarizing the rest (default 200)."
+                },
+                "hidden": {
+                    "type": "boolean",
+                    "description": "Also show hidden files/dirs (dotfiles). Skipped by default (default false)."
                 }
             }
         })
@@ -81,7 +90,7 @@ impl Tool for TreeTool {
         let root = ctx.resolve(a.path.as_deref().unwrap_or("."));
 
         // Collect entries from the ignore walker.
-        let entries = collect_entries(&root, depth, max_entries)?;
+        let entries = collect_entries(&root, depth, max_entries, a.hidden)?;
 
         // Render to a string.
         let root_label = if a.path.as_deref().is_none_or(|p| p == ".") {
@@ -97,16 +106,22 @@ impl Tool for TreeTool {
     }
 }
 
-/// Walk `root` with `ignore::WalkBuilder` (honours `.gitignore`/`.ignore`),
-/// returning a sorted list of entries capped per-directory at `max_entries`.
-fn collect_entries(root: &Path, max_depth: usize, max_entries: usize) -> Result<Vec<Collected>> {
+/// Walk `root` with `ignore::WalkBuilder` (honours `.gitignore`/`.ignore`, and
+/// hides dotfiles unless `hidden` is set), returning a sorted list of entries
+/// capped per-directory at `max_entries`.
+fn collect_entries(
+    root: &Path,
+    max_depth: usize,
+    max_entries: usize,
+    hidden: bool,
+) -> Result<Vec<Collected>> {
     if max_depth == 0 {
         return Ok(Vec::new());
     }
 
     let walker = ignore::WalkBuilder::new(root)
         .max_depth(Some(max_depth))
-        .hidden(true)
+        .hidden(!hidden)
         .build();
 
     // Group entries by their parent directory path for capping.
@@ -645,6 +660,42 @@ mod tests {
             .await
             .expect("walking a tree outside cwd is allowed");
         assert!(out.contains("a.txt"), "got: {out}");
+    }
+
+    /// Hidden dotdirs are hidden by default and only shown when `hidden:
+    /// true` is set — the undocumented default this change documents and
+    /// makes overridable.
+    #[tokio::test]
+    async fn tree_hides_dotdir_by_default_and_shows_it_with_hidden_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".dotdir")).unwrap();
+        std::fs::write(dir.path().join(".dotdir/inside.txt"), "").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+
+        let c = ToolContext::new(dir.path().to_path_buf());
+        let out = TreeTool
+            .execute(
+                serde_json::json!({"path": dir.path().to_str().unwrap(), "max_depth": 2}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("visible.txt"), "{out}");
+        assert!(!out.contains(".dotdir"), "{out}");
+
+        let out = TreeTool
+            .execute(
+                serde_json::json!({
+                    "path": dir.path().to_str().unwrap(),
+                    "max_depth": 2,
+                    "hidden": true
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains(".dotdir/"), "{out}");
+        assert!(out.contains("inside.txt"), "{out}");
     }
 
     #[tokio::test]

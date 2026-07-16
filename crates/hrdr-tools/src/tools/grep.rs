@@ -47,6 +47,18 @@ pub(crate) struct GrepArgs {
     pub(crate) context: Option<usize>,
     #[serde(default)]
     pub(crate) multiline: bool,
+    /// Also search hidden files/dirs (dotfiles). Skipped by default.
+    #[serde(default)]
+    pub(crate) hidden: bool,
+    /// Also search .gitignore'd files. Skipped by default.
+    #[serde(default)]
+    pub(crate) no_ignore: bool,
+    /// Treat `pattern` as a fixed string rather than a regex.
+    #[serde(default)]
+    pub(crate) literal: bool,
+    /// Case-insensitive match.
+    #[serde(default)]
+    pub(crate) case_insensitive: bool,
 }
 
 impl GrepArgs {
@@ -84,20 +96,28 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &'static str {
         "Search file contents (via ripgrep, grep, or a built-in walker — whichever is available). \
-         Returns `path:line:match`. Optionally scope to a `path` and/or filter files with a \
-         `glob` (e.g. '*.rs'). Set `context` to 2–3 to see the lines around each match \
-         instead of making a follow-up read call. Set `multiline` to true for patterns that \
+         Returns `path:line:match`, capped at 200 matches (50 when `context` is set) — scope with \
+         `path`/`glob` or narrow `pattern` proactively rather than relying on the cap. By default \
+         hidden files/dirs (dotfiles) and .gitignore'd paths are skipped; set `hidden` and/or \
+         `no_ignore` to include them (e.g. to search `.github/` or build output). Optionally scope \
+         to a `path` and/or filter files with a `glob` (e.g. '*.rs'). Set `context` to lines of \
+         surrounding context per match, 0-10 (2-3 is usually enough) to see the lines around each \
+         match instead of making a follow-up read call. Set `multiline` to true for patterns that \
          span line boundaries."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Regex pattern to search for."},
+                "pattern": {"type": "string", "description": "Pattern to search for — a regex by default, or a fixed string when `literal` is set."},
                 "path": {"type": "string", "description": "File or directory to search (default cwd)."},
                 "glob": {"type": "string", "description": "Glob to filter files, e.g. '*.rs'."},
-                "context": {"type": "integer", "description": "Lines of context around each match (0-10, default 0)."},
-                "multiline": {"type": "boolean", "description": "Allow regex matches to span line boundaries (default false)."}
+                "context": {"type": "integer", "description": "Lines of surrounding context per match, 0-10 (default 0; 2-3 is usually enough)."},
+                "multiline": {"type": "boolean", "description": "Allow regex matches to span line boundaries (default false)."},
+                "hidden": {"type": "boolean", "description": "Also search hidden files/dirs (dotfiles). Skipped by default (default false)."},
+                "no_ignore": {"type": "boolean", "description": "Also search .gitignore'd files. Skipped by default (default false)."},
+                "literal": {"type": "boolean", "description": "Treat `pattern` as a fixed string, not a regex — use for patterns like 'foo(bar)', 'a.b', '$var' (default false)."},
+                "case_insensitive": {"type": "boolean", "description": "Case-insensitive match (default false)."}
             },
             "required": ["pattern"]
         })
@@ -130,6 +150,18 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if a.multiline {
         cmd.arg("--multiline");
     }
+    if a.hidden {
+        cmd.arg("--hidden");
+    }
+    if a.no_ignore {
+        cmd.arg("--no-ignore");
+    }
+    if a.literal {
+        cmd.arg("-F");
+    }
+    if a.case_insensitive {
+        cmd.arg("-i");
+    }
     if a.context() > 0 {
         cmd.arg("-C").arg(a.context().to_string());
     }
@@ -153,6 +185,20 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     }
     let mut cmd = tokio::process::Command::new("grep");
     cmd.arg("-rnE").arg("--color=never").current_dir(&ctx.cwd);
+    if a.literal {
+        cmd.arg("-F");
+    }
+    if a.case_insensitive {
+        cmd.arg("-i");
+    }
+    if !a.hidden {
+        // GNU grep has no notion of "hidden": emulate rg/the built-in walker's
+        // default dotfile skip by excluding dot-prefixed dirs and files.
+        cmd.arg("--exclude-dir=.*").arg("--exclude=.*");
+    }
+    // NB: `no_ignore` has no effect on this backend — GNU grep has no
+    // `.gitignore` engine, so gitignored files were never excluded here to
+    // begin with. Only the ripgrep and built-in walker backends honor it.
     if a.context() > 0 {
         cmd.arg("-C").arg(a.context().to_string());
     }
@@ -214,14 +260,43 @@ async fn run_search_cmd(
     ))
 }
 
+/// Compile `a.pattern` into a `Regex`, honoring `literal` (escape to a fixed
+/// string, e.g. for `foo(bar)`, `a.b`, `$var`) and `case_insensitive`.
+fn compile_pattern(a: &GrepArgs) -> Result<regex::Regex> {
+    let pattern = if a.literal {
+        regex::escape(&a.pattern)
+    } else {
+        a.pattern.clone()
+    };
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(a.case_insensitive)
+        .build()
+        .with_context(|| format!("invalid regex: {}", a.pattern))
+}
+
+/// Build the shared `ignore::WalkBuilder` used by both built-in walker
+/// variants, honoring `hidden` (dotfiles) and `no_ignore` (`.gitignore`,
+/// `.ignore`, git global/local excludes). Both default to skipping — matching
+/// ripgrep's defaults — and are overridable per call.
+fn ignore_walker(root: &std::path::Path, a: &GrepArgs) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .max_depth(Some(20))
+        .hidden(!a.hidden)
+        .ignore(!a.no_ignore)
+        .git_ignore(!a.no_ignore)
+        .git_global(!a.no_ignore)
+        .git_exclude(!a.no_ignore)
+        .parents(!a.no_ignore)
+        .build()
+}
+
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
 /// each line with a regex. Used when neither ripgrep nor grep is installed.
 pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if a.multiline {
         return grep_builtin_multiline(a, ctx);
     }
-    let re =
-        regex::Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
+    let re = compile_pattern(a)?;
     let root = a
         .path
         .as_ref()
@@ -236,10 +311,7 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 
     let mut out = String::new();
     let mut matches = 0usize;
-    let walker = ignore::WalkBuilder::new(&root)
-        .max_depth(Some(20))
-        .hidden(true)
-        .build();
+    let walker = ignore_walker(&root, a);
     'walk: for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -322,8 +394,7 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 /// emitted as a match line. POSIX grep uses this path too because its executable
 /// has no portable cross-record matching mode.
 fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
-    let re =
-        regex::Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
+    let re = compile_pattern(a)?;
     let root = a
         .path
         .as_ref()
@@ -338,12 +409,7 @@ fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let mut out = String::new();
     let mut matches = 0usize;
 
-    'walk: for entry in ignore::WalkBuilder::new(&root)
-        .max_depth(Some(20))
-        .hidden(true)
-        .build()
-        .flatten()
-    {
+    'walk: for entry in ignore_walker(&root, a).flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -472,6 +538,25 @@ mod tests {
             glob: None,
             context: None,
             multiline: true,
+            hidden: false,
+            no_ignore: false,
+            literal: false,
+            case_insensitive: false,
+        }
+    }
+
+    /// Default (non-multiline, unscoped) args for a single-line pattern.
+    fn plain_args(pattern: &str) -> GrepArgs {
+        GrepArgs {
+            pattern: pattern.to_string(),
+            path: None,
+            glob: None,
+            context: None,
+            multiline: false,
+            hidden: false,
+            no_ignore: false,
+            literal: false,
+            case_insensitive: false,
         }
     }
 
@@ -548,6 +633,10 @@ mod tests {
             glob: None,
             context: None,
             multiline: false,
+            hidden: false,
+            no_ignore: false,
+            literal: false,
+            case_insensitive: false,
         };
         let out = grep_ripgrep(&a, &ctx).await.unwrap();
         assert!(out.contains("code.rs:1:fn needle"), "{out}");
@@ -578,6 +667,56 @@ mod tests {
             .unwrap();
         assert!(out.contains("sample.txt:2:foo"), "{out}");
         assert!(out.contains("sample.txt:3:bar"), "{out}");
+    }
+
+    /// The new flags must reach the real `rg` binary too, not just the
+    /// built-in fallback — `rg` is the default backend whenever it's
+    /// installed (`GrepTool::detect()` prefers it), so this is the path most
+    /// real invocations take.
+    #[tokio::test]
+    async fn ripgrep_hidden_no_ignore_literal_case_insensitive_flags_wired() {
+        if which::which("rg").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "NEEDLE(x) here\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        // Skipped by default: gitignored.
+        let out = grep_ripgrep(&plain_args("NEEDLE(x)"), &ctx).await.unwrap();
+        assert_eq!(out, "(no matches)", "{out}");
+
+        // `no_ignore` finds it, but as a regex "NEEDLE(x)" doesn't match the
+        // literal "(x)" text (parens are a capture group, not literal chars).
+        let mut a = plain_args("NEEDLE(x)");
+        a.no_ignore = true;
+        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        assert_eq!(out, "(no matches)", "{out}");
+
+        // `literal` matches the parens verbatim.
+        a.literal = true;
+        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        assert!(out.contains("ignored.txt:1:NEEDLE(x) here"), "{out}");
+
+        // `case_insensitive` matches lowercase against the uppercase text.
+        let mut a = plain_args("needle(x)");
+        a.no_ignore = true;
+        a.literal = true;
+        a.case_insensitive = true;
+        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        assert!(out.contains("ignored.txt:1:NEEDLE(x) here"), "{out}");
+
+        // `hidden` finds a match under a dotdir.
+        std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
+        std::fs::write(dir.path().join(".hidden-dir/file"), "dotneedle\n").unwrap();
+        let out = grep_ripgrep(&plain_args("dotneedle"), &ctx).await.unwrap();
+        assert_eq!(out, "(no matches)", "{out}");
+        let mut a = plain_args("dotneedle");
+        a.hidden = true;
+        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        assert!(out.contains(".hidden-dir/file:1:dotneedle"), "{out}");
     }
 
     #[test]
@@ -642,6 +781,10 @@ mod tests {
             glob: None,
             context: Some(2),
             multiline: false,
+            hidden: false,
+            no_ignore: false,
+            literal: false,
+            case_insensitive: false,
         };
         let out = grep_posix(&a, &ctx).await.unwrap();
         assert!(!out.contains("supersecret"), "{out}");
@@ -666,9 +809,91 @@ mod tests {
             glob: None,
             context: Some(2),
             multiline: false,
+            hidden: false,
+            no_ignore: false,
+            literal: false,
+            case_insensitive: false,
         };
         let out = grep_builtin(&a, &ctx).unwrap();
         assert!(!out.contains("supersecret"), "{out}");
         assert_eq!(out, "(no matches)");
+    }
+
+    /// Hidden files/dirs (dotfiles) are skipped by default and only searched
+    /// when `hidden: true` is set — the undocumented behavior this change
+    /// documents and makes overridable.
+    #[test]
+    fn builtin_hidden_files_skipped_by_default_and_found_with_hidden_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
+        std::fs::write(dir.path().join(".hidden-dir/file.txt"), "needle here\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        let args = plain_args("needle");
+        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+
+        let mut hidden_args = plain_args("needle");
+        hidden_args.hidden = true;
+        let out = grep_builtin(&hidden_args, &ctx).unwrap();
+        assert!(out.contains(".hidden-dir/file.txt:1:needle"), "{out}");
+    }
+
+    /// `.gitignore`'d files are skipped by default and only searched when
+    /// `no_ignore: true` is set. Requires a `.git` dir in the fixture: the
+    /// `ignore` crate only applies git-related ignore rules (including
+    /// `.gitignore`) inside a discovered git repository by default — same
+    /// setup `tree_respects_gitignore` uses.
+    #[test]
+    fn builtin_gitignored_files_skipped_by_default_and_found_with_no_ignore_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "needle here\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        let args = plain_args("needle");
+        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+
+        let mut no_ignore_args = plain_args("needle");
+        no_ignore_args.no_ignore = true;
+        let out = grep_builtin(&no_ignore_args, &ctx).unwrap();
+        assert!(out.contains("ignored.txt:1:needle"), "{out}");
+    }
+
+    /// `literal: true` treats `pattern` as a fixed string rather than a
+    /// regex. As a regex, `foo(bar)` means "foo" followed by a group matching
+    /// "bar" — it does NOT match the literal text `foo(bar)` because the
+    /// parens themselves aren't part of the match. Only `literal: true`
+    /// (which escapes the pattern) finds the verbatim text, and it must not
+    /// error doing so.
+    #[test]
+    fn builtin_literal_matches_fixed_string_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "call foo(bar) here\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        let regex_args = plain_args("foo(bar)");
+        assert_eq!(grep_builtin(&regex_args, &ctx).unwrap(), "(no matches)");
+
+        let mut literal_args = plain_args("foo(bar)");
+        literal_args.literal = true;
+        let out = grep_builtin(&literal_args, &ctx).unwrap();
+        assert!(out.contains("sample.txt:1:call foo(bar) here"), "{out}");
+    }
+
+    /// `case_insensitive: true` matches regardless of case.
+    #[test]
+    fn builtin_case_insensitive_matches_across_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "NEEDLE here\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        let args = plain_args("needle");
+        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+
+        let mut ci_args = plain_args("needle");
+        ci_args.case_insensitive = true;
+        let out = grep_builtin(&ci_args, &ctx).unwrap();
+        assert!(out.contains("sample.txt:1:NEEDLE here"), "{out}");
     }
 }
