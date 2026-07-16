@@ -184,21 +184,21 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         return grep_builtin(a, ctx);
     }
     let mut cmd = tokio::process::Command::new("grep");
-    cmd.arg("-rnE").arg("--color=never").current_dir(&ctx.cwd);
-    if a.literal {
-        cmd.arg("-F");
-    }
+    // `-E` and `-F` are conflicting matchers (`grep: conflicting matchers
+    // specified`, exit 2) — pass exactly one.
+    cmd.arg("-rn")
+        .arg(if a.literal { "-F" } else { "-E" })
+        .arg("--color=never")
+        .current_dir(&ctx.cwd);
     if a.case_insensitive {
         cmd.arg("-i");
     }
-    if !a.hidden {
-        // GNU grep has no notion of "hidden": emulate rg/the built-in walker's
-        // default dotfile skip by excluding dot-prefixed dirs and files.
-        cmd.arg("--exclude-dir=.*").arg("--exclude=.*");
-    }
-    // NB: `no_ignore` has no effect on this backend — GNU grep has no
-    // `.gitignore` engine, so gitignored files were never excluded here to
-    // begin with. Only the ripgrep and built-in walker backends honor it.
+    // NB: `hidden` and `no_ignore` have no effect on this backend. POSIX grep
+    // has no `.gitignore` engine and no notion of "hidden", so neither was
+    // ever excluded here. Emulating the dotfile skip with `--exclude-dir=.*`
+    // is a trap: grep applies it to the command-line root too, so scoping the
+    // search at a dot-named directory (e.g. a `/tmp/.tmpXYZ` tempdir) silently
+    // matched nothing. Only the ripgrep and built-in walker backends filter.
     if a.context() > 0 {
         cmd.arg("-C").arg(a.context().to_string());
     }
@@ -756,6 +756,40 @@ mod tests {
             .await
             .expect("grepping outside cwd is allowed");
         assert!(out.contains("needle"), "got: {out}");
+    }
+
+    /// The POSIX backend must find matches under a dot-named root and honor
+    /// `literal` without a matcher conflict.
+    ///
+    /// Regression, and a CI-only one (dev machines have `rg`, runners don't,
+    /// so only CI exercised this backend): emulating the dotfile skip with
+    /// `--exclude-dir=.*` also excluded a dot-named command-line root — every
+    /// tempdir-scoped search (`/tmp/.tmpXYZ`) matched nothing, which sank the
+    /// v0.5.0 tag run on all three platforms. And `literal` appended `-F`
+    /// after `-E`: "conflicting matchers specified", exit 2.
+    #[tokio::test]
+    async fn posix_grep_searches_dot_named_roots_and_honors_literal() {
+        if which::which("grep").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dot_root = dir.path().join(".dotdir");
+        std::fs::create_dir(&dot_root).unwrap();
+        std::fs::write(dot_root.join("a.txt"), "foo(bar) needle\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        // A dot-named root passed explicitly is searched, not excluded.
+        let mut a = plain_args("needle");
+        a.path = Some(dot_root.to_string_lossy().to_string());
+        let out = grep_posix(&a, &ctx).await.unwrap();
+        assert!(out.contains("needle"), "dot-named root is searched: {out}");
+
+        // `literal` swaps the matcher instead of stacking `-F` onto `-E`.
+        let mut a = plain_args("foo(bar)");
+        a.path = Some(dot_root.to_string_lossy().to_string());
+        a.literal = true;
+        let out = grep_posix(&a, &ctx).await.unwrap();
+        assert!(out.contains("foo(bar)"), "literal matches verbatim: {out}");
     }
 
     /// With `context > 0`, a `.env` line adjacent to a match must not leak via
