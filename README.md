@@ -146,6 +146,13 @@ stem names it otherwise. `/skills` opens a picker over what's loaded (Enter
 inserts `:name ` into the input); the transcript shows the raw `:name args` you
 typed while the model receives the expanded prompt.
 
+hrdr ships three built-in skills that work with zero setup — `:commit` (stage
+and commit with a Conventional Commit message), `:review [low|high]` (verify-
+before-report bug review of the pending diff), and
+`:release [patch|minor|major]` (bump, changelog, commit, tag, push). They sit
+last in the discovery order, so a project or user skill file with the same name
+overrides them.
+
 ```markdown
 ## <!-- .hrdr/skills/review.md -->
 
