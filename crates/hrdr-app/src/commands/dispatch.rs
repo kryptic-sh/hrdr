@@ -130,8 +130,20 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                         host.info("usage: /copy msg <N> or <N-M>".to_string());
                         return true;
                     };
-                    let parts: Vec<String> =
-                        (a..=b).filter_map(|n| host.nth_message_text(n)).collect();
+                    // `b` comes straight from user input and isn't bounded against
+                    // the transcript (`/copy msg 1-99999999999999`), so don't walk
+                    // the whole `a..=b` range: `nth_message_text` scans the
+                    // transcript per call, and a huge upper bound would freeze the
+                    // UI thread doing that once per (mostly out-of-range) number.
+                    // Stop at the first miss instead — message numbers are dense,
+                    // so the first `None` means every later `n` would miss too.
+                    let mut parts: Vec<String> = Vec::new();
+                    for n in a..=b {
+                        match host.nth_message_text(n) {
+                            Some(t) => parts.push(t),
+                            None => break,
+                        }
+                    }
                     let label = if a == b {
                         format!("message #{a}")
                     } else {
@@ -562,7 +574,14 @@ pub fn open_system_handler(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     let mut cmd = {
         let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(path);
+        // `cmd.exe` treats `&` as a command separator regardless of the
+        // caller's own argument quoting (`std::process::Command` only quotes
+        // for embedded whitespace/quotes, which doesn't help here), so an
+        // OAuth authorize URL's `...&state=...` query string would get
+        // silently truncated at the first `&` by `start`. Caret-escape it so
+        // `cmd` sees a literal character instead of an operator.
+        let target = windows_escape_for_cmd_start(&path.to_string_lossy());
+        c.args(["/C", "start", ""]).arg(target);
         c
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -575,6 +594,20 @@ pub fn open_system_handler(path: &Path) -> std::io::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Escape a string for use as the target argument to `cmd /C start ""` on
+/// Windows. `cmd.exe` parses `&` as a command separator even inside an
+/// argument that `std::process::Command` didn't feel the need to quote
+/// (it only quotes for embedded whitespace/quotes) — so a URL like
+/// `https://…/authorize?client_id=…&state=…` gets truncated at the first
+/// `&`, silently dropping the rest of the query string (breaking OAuth
+/// callbacks that carry `state`/`code` after it). `^` is `cmd`'s own escape
+/// character; caret-escaping `&` makes `cmd` treat it as a literal character
+/// instead of an operator. Pure string transform — kept testable off Windows.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_escape_for_cmd_start(s: &str) -> String {
+    s.replace('&', "^&")
 }
 
 /// Instruction sent to the model by `/init` to author an `AGENTS.md`.
@@ -621,6 +654,13 @@ mod tests {
         busy: bool,
         model: hrdr_agent::ModelRef,
         input: String,
+        /// Fake transcript for `nth_message_text` (1-based, like the real thing).
+        messages: Vec<String>,
+        /// Counts `nth_message_text` calls — used to prove `/copy msg` bounds
+        /// its scan instead of walking the whole requested range.
+        nth_calls: std::cell::Cell<usize>,
+        /// What the last `copy_to_clipboard` call was asked to copy.
+        clipboard: Option<String>,
     }
 
     impl TestHost {
@@ -641,6 +681,9 @@ mod tests {
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
+                messages: Vec::new(),
+                nth_calls: std::cell::Cell::new(0),
+                clipboard: None,
             }
         }
     }
@@ -675,8 +718,9 @@ mod tests {
         fn set_session_label(&mut self, _name: String) {}
         fn autosave(&mut self) {}
         fn resume(&mut self, _id: String, _session: Session) {}
-        fn copy_to_clipboard(&mut self, _text: &str, _label: &str) -> String {
-            String::new()
+        fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
+            self.clipboard = Some(text.to_string());
+            format!("copied {label}")
         }
         fn last_reply(&self) -> Option<String> {
             None
@@ -684,8 +728,12 @@ mod tests {
         fn transcript_text(&self) -> String {
             String::new()
         }
-        fn nth_message_text(&self, _n: usize) -> Option<String> {
-            None
+        fn nth_message_text(&self, n: usize) -> Option<String> {
+            self.nth_calls.set(self.nth_calls.get() + 1);
+            if n == 0 {
+                return None;
+            }
+            self.messages.get(n - 1).cloned()
         }
         fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send> {
             Box::new(|_, _| {})
@@ -822,5 +870,58 @@ mod tests {
 
         assert!(dispatch(&mut host, "/add sub/nested.txt"));
         assert!(host.input.contains("nested content"), "{:?}", host.input);
+    }
+
+    /// A normal `/copy msg` range is unaffected by the bounded-scan fix.
+    #[tokio::test]
+    async fn copy_msg_range_valid_returns_expected_text() {
+        let mut host = TestHost::new(std::env::temp_dir());
+        host.messages = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+
+        assert!(dispatch(&mut host, "/copy msg 1-2"));
+        assert_eq!(host.clipboard.as_deref(), Some("one\n\ntwo"));
+    }
+
+    /// `/copy msg N-M` with an upper bound far past the transcript must not
+    /// call `nth_message_text` once per number in the requested range — each
+    /// call scans the transcript, and a huge range (`/copy msg
+    /// 1-99999999999999`) used to do that once per number, freezing the UI
+    /// thread. It must stop scanning at the first miss instead, so the total
+    /// work stays bounded by the real message count.
+    #[tokio::test]
+    async fn copy_msg_huge_upper_bound_does_not_scan_unbounded_range() {
+        let mut host = TestHost::new(std::env::temp_dir());
+        host.messages = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+
+        assert!(dispatch(&mut host, "/copy msg 1-99999999999999"));
+
+        assert_eq!(host.clipboard.as_deref(), Some("one\n\ntwo\n\nthree"));
+        assert!(
+            host.nth_calls.get() <= host.messages.len() + 1,
+            "nth_message_text was called {} times for a 3-message transcript \
+             with an absurd upper bound — the scan must stop at the first miss",
+            host.nth_calls.get()
+        );
+    }
+
+    /// `cmd.exe` treats `&` as a command separator even when the argument
+    /// itself isn't shell-quoted, so an OAuth URL's query string
+    /// (`...&state=...`) would get truncated by `cmd /C start "" <url>` on
+    /// Windows. Caret-escaping `&` makes `cmd` treat it as a literal
+    /// character instead of an operator, so `start` receives the whole URL.
+    #[test]
+    fn windows_cmd_start_escapes_ampersand_in_oauth_url() {
+        let url = "https://example.com/authorize?client_id=abc&state=xyz&scope=read+write";
+        assert_eq!(
+            windows_escape_for_cmd_start(url),
+            "https://example.com/authorize?client_id=abc^&state=xyz^&scope=read+write"
+        );
+    }
+
+    /// A URL/path with no `&` is passed through unchanged.
+    #[test]
+    fn windows_cmd_start_leaves_url_without_ampersand_untouched() {
+        let url = "https://example.com/callback?code=abc123";
+        assert_eq!(windows_escape_for_cmd_start(url), url);
     }
 }

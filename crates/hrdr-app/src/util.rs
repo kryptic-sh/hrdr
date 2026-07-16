@@ -77,9 +77,32 @@ pub fn extract_agent_mention(input: &str, names: &[String]) -> Option<(String, S
         }
         if let Some(canon) = names.iter().find(|n| n.eq_ignore_ascii_case(tok)) {
             // Drop the first occurrence of the whole `@name` token, then tidy
-            // the doubled/edge whitespace it leaves behind.
-            let cleaned = input.replacen(raw, "", 1);
-            let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+            // only the doubled/edge horizontal whitespace it leaves behind at
+            // the splice point. Collapsing whitespace over the *whole* body
+            // (as a blanket `split_whitespace().join(" ")` would) flattens
+            // every newline and fenced code block in the message, not just
+            // the token's own spacing — so only the splice site is touched,
+            // and only spaces/tabs there, leaving newlines elsewhere intact.
+            let Some(start) = input.find(raw) else {
+                return Some((canon.clone(), input.to_string()));
+            };
+            let end = start + raw.len();
+            let before = &input[..start];
+            let after = &input[end..];
+            let before_trimmed = before.trim_end_matches([' ', '\t']);
+            let after_trimmed = after.trim_start_matches([' ', '\t']);
+            // Only re-insert a single space when *both* sides actually had
+            // horizontal whitespace trimmed off (the "doubled space"
+            // scenario). When a side borders a newline instead, that newline
+            // is already the separator — don't add a stray space next to it.
+            let both_sides_had_space =
+                before_trimmed.len() != before.len() && after_trimmed.len() != after.len();
+            let mut cleaned = String::with_capacity(before_trimmed.len() + after_trimmed.len() + 1);
+            cleaned.push_str(before_trimmed);
+            if both_sides_had_space {
+                cleaned.push(' ');
+            }
+            cleaned.push_str(after_trimmed);
             return Some((canon.clone(), cleaned));
         }
     }
@@ -608,6 +631,25 @@ mod tests {
         // The directive names the agent and carries the body.
         let msg = agent_mention_message("explore", "find X");
         assert!(msg.contains("`explore`") && msg.ends_with("find X"));
+    }
+
+    /// Stripping the `@name` token must only tidy the whitespace it leaves
+    /// behind at its own splice point — not collapse the whole message onto
+    /// one line. A blanket `split_whitespace().join(" ")` cleanup used to
+    /// flatten newlines and fenced code blocks anywhere in the body.
+    #[test]
+    fn extract_agent_mention_preserves_newlines_and_code_fences() {
+        let names = vec!["bot".to_string()];
+        let input = "@bot fix this:\n```\nfn main(){}\n```";
+        let (a, body) = extract_agent_mention(input, &names).unwrap();
+        assert_eq!(a, "bot");
+        assert_eq!(body, "fix this:\n```\nfn main(){}\n```");
+
+        // A mention in the middle of a line still collapses just its own
+        // doubled space, not anything else in the message.
+        let input = "hello @bot world\nsecond line stays intact";
+        let (_, body) = extract_agent_mention(input, &names).unwrap();
+        assert_eq!(body, "hello world\nsecond line stays intact");
     }
 
     #[test]
