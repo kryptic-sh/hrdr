@@ -5893,6 +5893,23 @@ impl Agent {
     /// Drain any steering messages submitted since the last request into the
     /// conversation as user messages, emitting [`AgentEvent::Steered`] for each
     /// so the frontend can display it at delivery time.
+    /// Add a user-role message to history — the single place a user-role turn
+    /// enters the conversation. Stamps it with an immutable entry-time timestamp
+    /// (see [`timestamped_user_message`]) and tags its `origin`, so the
+    /// turn-initiating message, a mid-turn steering correction, and a folded-in
+    /// background result all get the same treatment. On the wire these are all
+    /// just `Role::User` messages; what differs is *when and how they arrive*
+    /// (a `run` argument vs. a mid-turn queue drain), not what they are — so the
+    /// construction lives in one place and nothing that applies to "a user
+    /// message entering history" can be applied to one arrival path but not
+    /// another.
+    fn push_user_message(&mut self, text: impl Into<String>, origin: MessageOrigin) {
+        self.messages.push(ChatMessage {
+            origin,
+            ..timestamped_user_message(text)
+        });
+    }
+
     fn drain_steering<F: FnMut(AgentEvent)>(&mut self, steering: &SteeringQueue, on_event: &mut F) {
         let pending: Vec<Steer> = steering
             .lock()
@@ -5901,10 +5918,7 @@ impl Agent {
         for msg in pending {
             // The model reads the expanded form; the transcript shows what was typed.
             on_event(AgentEvent::Steered(msg.display));
-            self.messages.push(ChatMessage {
-                origin: MessageOrigin::Steering,
-                ..ChatMessage::user(msg.sent)
-            });
+            self.push_user_message(msg.sent, MessageOrigin::Steering);
         }
     }
 
@@ -6001,10 +6015,7 @@ impl Agent {
                     format!("[Background task #{id} ({label}) finished — its result:]\n{result}")
                 }
             };
-            self.messages.push(ChatMessage {
-                origin: MessageOrigin::BackgroundResult,
-                ..ChatMessage::user(body)
-            });
+            self.push_user_message(body, MessageOrigin::BackgroundResult);
         }
     }
 
@@ -6056,7 +6067,7 @@ impl Agent {
                     user_input.push_str(&out.context.join("\n"));
                 }
             }
-            self.messages.push(timestamped_user_message(user_input));
+            self.push_user_message(user_input, MessageOrigin::User);
         }
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
@@ -10626,18 +10637,18 @@ mod tests {
         let mut events = Vec::new();
         agent.drain_steering(&steering, &mut |e| events.push(e));
 
-        // Both messages are appended verbatim as user turns…
+        // Both messages are appended as user turns — stamped with an entry-time
+        // timestamp like every user-role turn (they go through the same
+        // `push_user_message` chokepoint), tagged as steering…
         let msgs = agent.messages();
-        assert_eq!(
-            msgs[msgs.len() - 2].content.as_deref(),
-            Some("use ripgrep instead")
-        );
-        assert_eq!(
-            msgs[msgs.len() - 1].content.as_deref(),
-            Some("and skip the tests")
-        );
+        let second_last = msgs[msgs.len() - 2].content.as_deref().unwrap();
+        assert!(second_last.starts_with('[') && second_last.ends_with("] use ripgrep instead"));
+        let last = msgs[msgs.len() - 1].content.as_deref().unwrap();
+        assert!(last.starts_with('[') && last.ends_with("] and skip the tests"));
         assert!(msgs[msgs.len() - 1].role == Role::User);
-        // …a Steered event fires for each (frontends display at delivery)…
+        assert_eq!(msgs[msgs.len() - 1].origin, MessageOrigin::Steering);
+        // …a Steered event fires for each carrying the raw (unstamped) text the
+        // frontend displays…
         let steered: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -12987,7 +12998,12 @@ mod tests {
             let steer_at = msgs
                 .iter()
                 .position(|m| {
-                    m.role == hrdr_llm::Role::User && m.content.as_deref() == Some("use ripgrep")
+                    // Steering turns are timestamp-stamped like every user turn,
+                    // so match on the trailing text rather than an exact string.
+                    m.role == hrdr_llm::Role::User
+                        && m.content
+                            .as_deref()
+                            .is_some_and(|c| c.ends_with("use ripgrep"))
                 })
                 .unwrap();
             assert!(
