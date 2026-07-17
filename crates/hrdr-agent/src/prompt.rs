@@ -343,13 +343,44 @@ mod tests {
 
         // The changelog is updated, not invented; and it says something.
         assert!(p.contains("**only if one already exists**"));
-        assert!(p.contains("Name the APIs, files and\n  behaviours that changed"));
+        assert!(p.contains("Name the APIs, files and behaviours that changed"));
 
         // The irreversible step, guarded.
         assert!(p.contains("Make sure the tree is green"));
         assert!(p.contains("Never move or reuse a tag"));
         // Staging stays explicit here too — a release commit is still a commit.
         assert!(p.contains("**by name**"));
+    }
+
+    /// A write-capable agent is told to log notable changes in `[Unreleased]` as
+    /// it works, so a release is an audit of an already-complete changelog rather
+    /// than the moment it gets written. A read-only agent — which commits
+    /// nothing — is not.
+    #[test]
+    fn the_prompt_says_keep_the_changelog_current_as_you_work() {
+        let tools = ToolRegistry::with_defaults();
+        let write = render_system(&tools, Path::new("/tmp/x"), None, false).unwrap();
+        assert!(
+            write.contains("Keep the changelog current as you work"),
+            "{write}"
+        );
+        assert!(
+            write.contains("in the SAME commit as the change"),
+            "the entry ships with the change, not at release time"
+        );
+        assert!(
+            write.contains("cutting a release is just an audit"),
+            "release audits an already-complete changelog"
+        );
+
+        let mut ro = ToolRegistry::with_defaults();
+        let names = ro.read_only_names();
+        ro.retain_only(&names);
+        let read = render_system(&ro, Path::new("/tmp/x"), None, false).unwrap();
+        assert!(
+            !read.contains("Keep the changelog current as you work"),
+            "a read-only agent commits nothing, so it gets no changelog discipline"
+        );
     }
 
     /// The prompt tells the model to run slow/noisy commands raw and let the

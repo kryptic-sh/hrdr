@@ -18,6 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shell commands run from it and relative paths resolve against it, so it never
   needs to `cd` into it or repeat its absolute path — while keeping the rule to
   stay inside the worktree and never touch the parent checkout.
+- **Changelog-as-you-work prompt guidance.** The system prompt now tells a
+  write-capable agent to add a `[Unreleased]` changelog entry in the same commit
+  as each notable, user-facing change (skipping purely internal churn), so
+  cutting a release becomes an audit of an already-complete changelog rather
+  than the point where it is written. The release step is reworded to match.
 
 ### Added
 
