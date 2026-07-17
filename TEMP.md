@@ -58,6 +58,9 @@ Completed and verified (with review fixes folded in):
   age, bounded ~5s retry) held across the whole read-modify-write in
   `save_token_at` and `save_oauth_at`; concurrency tests for different- and
   same-provider writers on both stores.
+- **P3 wire-log rotation** — at the cap the log rotates to `<name>.1` (newest
+  window kept, ≤2× cap on disk, 0600 preserved on both files); rotation failure
+  falls back to stop-at-cap with a one-shot warning; README documents the bound.
 - **P2 `$EDITOR` quoting** — hand-rolled zero-dep shell-word splitter
   (`split_shell_words`) replaces `split_whitespace()`; quotes, escapes, and
   unterminated-quote recovery covered by 12 unit tests.
@@ -75,7 +78,6 @@ Completed and verified (with review fixes folded in):
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
 | P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
 | P3       | `--max-cost` unusable with unpriced/local models       | Capped local runs impossible           |
-| P3       | Wire log stops at cap instead of rotating              | Long-session diagnostics lost          |
 | P3       | Windows ACL hardening for credential/log files         | Weaker confidentiality on Windows      |
 
 ---
@@ -225,23 +227,6 @@ could still be capped. They must drop the cap entirely.
 Add `--allow-unpriced` (or `max_cost_partial = true`): unpriced calls proceed
 uncounted, the cap applies to priced usage, and reported totals say
 "partial/unknown", never a complete-looking `$0.00`.
-
----
-
-## P3: Wire log stops at cap instead of rotating
-
-(New finding from the implementation review — the audit asked for "cap plus
-rotation, or stop with warning"; the stop-with-warning branch was chosen.)
-
-### Impact
-
-Fine for short debugging sessions; on a long session the tail — usually the
-interesting part — is what gets dropped.
-
-### Recommendation
-
-Optional single-file rotation (`.1` suffix) keeping the newest window, or
-document the stop-at-cap behavior in the README next to `HRDR_LOG_REQUESTS`.
 
 ---
 
