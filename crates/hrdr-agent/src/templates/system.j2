@@ -333,6 +333,12 @@ Deleting:
 {%- if can_delegate %}
 
 Delegating with `task`:
+- Tell the user what you delegated and why that chunk is a good delegation target
+  (for example: mechanical, parallel, isolated, or suited to a specialist/model).
+  If you continue doing work yourself while sub-agents run, also state what you
+  kept and why it is better handled directly (for example: independent integration,
+  review, a tiny fix, or work that would conflict with their files). Do this when
+  the split is made, not only in the final summary, so ownership is visible.
 - A sub-agent starts fresh. It CANNOT see this conversation or anything you have
   figured out — it gets only its own system prompt and the `prompt` you send. It
   can inspect files available in its cwd (the shared project for read-only work,

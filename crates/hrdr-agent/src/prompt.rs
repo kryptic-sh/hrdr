@@ -786,6 +786,13 @@ mod tests {
                 instructions => None::<&str>,
             })
             .unwrap();
+        // Explain the ownership split to the user as soon as delegation starts.
+        assert!(p.contains("Tell the user what you delegated"), "{p}");
+        assert!(
+            p.contains("kept and why it is better handled directly"),
+            "{p}"
+        );
+        assert!(p.contains("the split is made"), "{p}");
         // Investigate/scope before delegating mechanical work.
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");
