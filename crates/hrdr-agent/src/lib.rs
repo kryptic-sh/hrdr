@@ -688,7 +688,7 @@ fn spawn_background(
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
     let usage_for_live = subagent_usage(&cfg);
-    // Build and register synchronously so `steer` can address the id as soon as
+    // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
     // The parent's cwd, captured before `keep()` below discards it — needed at
@@ -2092,7 +2092,7 @@ impl hrdr_tools::Tool for TaskOutputTool {
     }
 }
 
-/// `steer`: add instructions to a background sub-agent's in-flight turn.
+/// `task_steer`: add instructions to a background sub-agent's in-flight turn.
 struct SteerTool {
     live: LiveSubagents,
 }
@@ -2100,7 +2100,7 @@ struct SteerTool {
 #[async_trait::async_trait]
 impl hrdr_tools::Tool for SteerTool {
     fn name(&self) -> &'static str {
-        "steer"
+        "task_steer"
     }
     fn description(&self) -> &'static str {
         "Give additional instructions to a running background sub-agent. The message is queued \
@@ -2129,12 +2129,12 @@ impl hrdr_tools::Tool for SteerTool {
         let id = args
             .get("id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("steer needs an integer `id` (see `task_list`)"))?;
+            .ok_or_else(|| anyhow::anyhow!("task_steer needs an integer `id` (see `task_list`)"))?;
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
             .filter(|p| !p.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("steer needs a non-empty `prompt`"))?;
+            .ok_or_else(|| anyhow::anyhow!("task_steer needs a non-empty `prompt`"))?;
         let queued = self.live.with(|entries| {
             let entry = entries.iter().find(|e| e.bg_id == Some(id))?;
             if !entry.running {
@@ -10497,7 +10497,7 @@ mod tests {
         assert!(v[0].delivered && v[0].worktree.is_some());
     }
 
-    /// `task_list` reports id, status and worktree; `steer` queues additional
+    /// `task_list` reports id, status and worktree; `task_steer` queues additional
     /// instructions; `task_cancel` aborts the worker and clears its live row.
     #[tokio::test]
     async fn task_list_and_cancel_manage_background_tasks() {
