@@ -34,7 +34,17 @@ fn request_log() -> Option<&'static Mutex<std::fs::File>> {
             // users cannot read API request/response data from the log.
             #[cfg(unix)]
             opts.mode(0o600);
-            opts.open(&path).ok().map(Mutex::new)
+            let file = opts.open(&path).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if !file.metadata().ok()?.file_type().is_file() {
+                    return None;
+                }
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .ok()?;
+            }
+            Some(Mutex::new(file))
         })
         .as_ref()
 }
@@ -55,10 +65,12 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
         }
     }
     if let Ok(mut file) = file.lock() {
-        // Cap the log file at MAX_LOG_FILE_BYTES to prevent unbounded disk
-        // growth. Once the file exceeds the limit, new entries are dropped
-        // after one warning — the cap is documented on MAX_LOG_FILE_BYTES.
-        if file.metadata().map(|m| m.len()).unwrap_or(0) >= MAX_LOG_FILE_BYTES {
+        let current = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let mut line = obj.to_string();
+        line.push('\n');
+        if current >= MAX_LOG_FILE_BYTES
+            || line.len() as u64 > MAX_LOG_FILE_BYTES.saturating_sub(current)
+        {
             if !REQUEST_LOG_FULL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[hrdr] request logging stopped after reaching {} MiB",
@@ -67,7 +79,7 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
             }
             return;
         }
-        let _ = writeln!(file, "{obj}");
+        let _ = file.write_all(line.as_bytes());
     }
 }
 

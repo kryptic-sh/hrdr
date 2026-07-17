@@ -146,7 +146,11 @@ async fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result
             .accept()
             .await
             .context("accepting an OAuth callback connection")?;
-        let line = read_request_line(&mut stream).await.unwrap_or_default();
+        let line = tokio::time::timeout(Duration::from_secs(2), read_request_line(&mut stream))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         let query = request_target(&line)
             .and_then(|t| t.split_once('?').map(|(_, q)| q))
             .unwrap_or("");
@@ -188,13 +192,22 @@ fn request_target(request_line: &str) -> Option<&str> {
     request_line.split_whitespace().nth(1)
 }
 
-/// Read (best effort) the first line of the HTTP request. The request line is
-/// the first thing on the wire and always fits in the first packet, so a single
-/// read suffices here.
+/// Read the first HTTP request line, tolerating TCP fragmentation. The fixed
+/// buffer bounds local memory and the caller supplies a short socket deadline.
 async fn read_request_line(stream: &mut TcpStream) -> Result<String> {
     let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    let text = String::from_utf8_lossy(&buf[..n]);
+    let mut used = 0;
+    while used < buf.len() {
+        let n = stream.read(&mut buf[used..]).await?;
+        if n == 0 {
+            break;
+        }
+        used += n;
+        if buf[..used].windows(2).any(|bytes| bytes == b"\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf[..used]);
     Ok(text.lines().next().unwrap_or("").to_string())
 }
 
