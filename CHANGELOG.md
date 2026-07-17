@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Moved shell guidance to the tail of the write block.** Because a shell tool
+  is itself a mutating tool, `has_shell` implies `can_write` — the shell gate
+  only ever splits write agents into shelled and shell-less (a write agent on a
+  machine with no shell on `PATH`, or an extension-scoped `write_ext`
+  sub-agent). The `Verifying` and `Shell` sections now sit at the end of the
+  `can_write` block instead of before/among the coding guidance, so every write
+  agent shares Scope → Editing → Tests → Debugging → Git → Releasing → Deleting
+  before diverging only at the shell tail.
 - **Unified the shell prompt gate.** The system prompt's two shell flags
   (`has_bash` / `has_powershell`) collapse into one `has_shell`, and the
   PowerShell pipeline note now renders whenever a shell is present rather than

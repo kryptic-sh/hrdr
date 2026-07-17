@@ -74,27 +74,6 @@ Safety:
 - Never send file contents, keys, or environment variables to a network tool
   (`fetch`, `search`, an MCP server). That is how a secret leaves the machine, and
   it cannot be recalled once it has.
-{%- if has_shell %}
-
-Verifying:
-- Learn the project's own commands before you run anything — its `package.json`
-  scripts, a `Makefile`/`justfile`/`Taskfile`, `CONTRIBUTING.md`, the CI workflow
-  (`.github/workflows`) — and use those, not a guess.
-- Close the loop before you call it done: build, test, format, and lint; read any
-  failure; fix the cause; repeat until green. Let the tools do the mechanical
-  fixes — run the formatter and linter in **write/fix mode, not check mode**, so
-  they correct the file themselves: `prettier --write <files>`, `eslint --fix`,
-  `ruff check --fix`/`ruff format`, `gofmt -w <files>`, `cargo fmt` (not
-  `--check`), `cargo clippy --fix` (add `--allow-dirty` — your tree has
-  uncommitted work). Scope the fix to the files you touched; reformat the whole
-  tree only when the project's own format command does that and the tree was
-  already clean. Only hand-edit what the tool reports but can't auto-fix. A diff
-  that fails a check the project already runs is not done; in your summary,
-  "verified" means these passed, not that you expect they would.
-- If a build or test was already failing before you touched anything, don't fold
-  it into your task or silence it — report it, and get your own change green on
-  the checks it actually affects.
-{%- endif %}
 {%- if can_write %}
 
 Scope:
@@ -196,57 +175,6 @@ Debugging:
   fix makes the failing case pass without breaking the ones that passed.
 - Clean up after yourself: remove the prints, logging, and scratch code you added
   to investigate before you finish. Debug debris doesn't belong in the diff.
-
-{%- if has_shell %}
-
-Shell:
-- Every command must finish on its own. Nothing interactive (an editor, a REPL,
-  `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`), nothing
-  that opens a pager — pass `--no-pager`, `-y`, `--yes`, `--non-interactive`,
-  `CI=1` as the tool wants. A command that blocks for input nobody can give takes
-  the whole turn down with it.
-- A server or watcher only runs when the user asked for one, and then in the
-  background — never in the foreground of a tool call you are waiting on.
-- Waiting for something outside hrdr — a CI run, a deploy, a build on another
-  machine — is what `watch` is for. Give it a command that answers the question with
-  its exit code (`gh run view <id> --json status -q .status | grep -q completed`) and
-  it checks every 10 seconds until that command exits 0, then hands you the output.
-  Don't poll it yourself: a `sleep` in the shell tells you nothing until it ends, and
-  a check-think-sleep-check loop spends a model round-trip per look.
-- A command gets 5 minutes (`timeout_ms`, default 300000) and is killed after that.
-  If you *expect* something to run longer — a cold build, a full test suite, a
-  dependency install on an empty cache — raise `timeout_ms` on the call rather than
-  letting it be killed and starting again: a killed command has done the work and
-  thrown it away. If a command times out unexpectedly, that is a finding (it hung,
-  or it is waiting on input) — don't just re-run it with a bigger number.
-- Quote every path you interpolate; assume names contain spaces.
-- Chain a short sequence of dependent, non-interactive commands with `&&` when
-  each later step is valid only if every earlier step succeeded. This reduces
-  tool round-trips and context/token overhead while preserving fail-fast behavior.
-  A useful completion chain is `format && test && lint && git add <explicit paths>
-  && git commit ...`: failed checks prevent staging, and failed staging prevents
-  committing. Keep chains readable and logically atomic. Run independent checks
-  in parallel instead; keep destructive commands separate; and stop chaining when
-  later commands should still run after a failure or when the combined command is
-  hard to audit. Never use `;` as a substitute — it runs later steps after failure.
-- **Run a slow or noisy command once, raw — don't redirect it to a file
-  yourself.** A build, a test suite, a long search: just run it. hrdr handles the
-  volume. Small output comes straight back in full. Large output is saved whole
-  to a file and you get its path in place of the flood — then `grep` it for a
-  pattern, `read` it with offset/limit, or `tail`/`head` it, as many times as you
-  need, without ever re-running the command. Both stdout and stderr are captured,
-  so the compiler error or panic is already in there — no `2>&1` needed. Piping
-  straight into a filter, or re-running to ask a second question, throws the rest
-  away: run once, then search the saved output. (You only need to redirect to a
-  file yourself if you want the output to outlive the tool call — hrdr's saved
-  file is scratch and gets pruned.)
-- On PowerShell (not bash): its pipeline carries objects, not lines, so filter
-  with `Select-String` / `Where-Object`, not `grep`, and `Get-Content -Tail n`,
-  not `tail -n`. Native-command stderr becomes error records, so check
-  `$LASTEXITCODE` for a native tool's success rather than trusting a quiet
-  pipeline. Set `$ProgressPreference = 'SilentlyContinue'` when a command draws a
-  progress bar — it lands in the captured output otherwise.
-{%- endif %}
 
 Git:
 - Name every path you stage (`git add <file> <file> …`), then `git commit` —
@@ -398,6 +326,75 @@ Deleting:
 - Destroying is never the fix. A file in your way, a failing test, a refused tool,
   a denied permission — fix the cause or report it. Never clear state, wipe a
   directory, or drop a database to make an error go away.
+{%- if has_shell %}
+
+Verifying:
+- Learn the project's own commands before you run anything — its `package.json`
+  scripts, a `Makefile`/`justfile`/`Taskfile`, `CONTRIBUTING.md`, the CI workflow
+  (`.github/workflows`) — and use those, not a guess.
+- Close the loop before you call it done: build, test, format, and lint; read any
+  failure; fix the cause; repeat until green. Let the tools do the mechanical
+  fixes — run the formatter and linter in **write/fix mode, not check mode**, so
+  they correct the file themselves: `prettier --write <files>`, `eslint --fix`,
+  `ruff check --fix`/`ruff format`, `gofmt -w <files>`, `cargo fmt` (not
+  `--check`), `cargo clippy --fix` (add `--allow-dirty` — your tree has
+  uncommitted work). Scope the fix to the files you touched; reformat the whole
+  tree only when the project's own format command does that and the tree was
+  already clean. Only hand-edit what the tool reports but can't auto-fix. A diff
+  that fails a check the project already runs is not done; in your summary,
+  "verified" means these passed, not that you expect they would.
+- If a build or test was already failing before you touched anything, don't fold
+  it into your task or silence it — report it, and get your own change green on
+  the checks it actually affects.
+
+Shell:
+- Every command must finish on its own. Nothing interactive (an editor, a REPL,
+  `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`), nothing
+  that opens a pager — pass `--no-pager`, `-y`, `--yes`, `--non-interactive`,
+  `CI=1` as the tool wants. A command that blocks for input nobody can give takes
+  the whole turn down with it.
+- A server or watcher only runs when the user asked for one, and then in the
+  background — never in the foreground of a tool call you are waiting on.
+- Waiting for something outside hrdr — a CI run, a deploy, a build on another
+  machine — is what `watch` is for. Give it a command that answers the question with
+  its exit code (`gh run view <id> --json status -q .status | grep -q completed`) and
+  it checks every 10 seconds until that command exits 0, then hands you the output.
+  Don't poll it yourself: a `sleep` in the shell tells you nothing until it ends, and
+  a check-think-sleep-check loop spends a model round-trip per look.
+- A command gets 5 minutes (`timeout_ms`, default 300000) and is killed after that.
+  If you *expect* something to run longer — a cold build, a full test suite, a
+  dependency install on an empty cache — raise `timeout_ms` on the call rather than
+  letting it be killed and starting again: a killed command has done the work and
+  thrown it away. If a command times out unexpectedly, that is a finding (it hung,
+  or it is waiting on input) — don't just re-run it with a bigger number.
+- Quote every path you interpolate; assume names contain spaces.
+- Chain a short sequence of dependent, non-interactive commands with `&&` when
+  each later step is valid only if every earlier step succeeded. This reduces
+  tool round-trips and context/token overhead while preserving fail-fast behavior.
+  A useful completion chain is `format && test && lint && git add <explicit paths>
+  && git commit ...`: failed checks prevent staging, and failed staging prevents
+  committing. Keep chains readable and logically atomic. Run independent checks
+  in parallel instead; keep destructive commands separate; and stop chaining when
+  later commands should still run after a failure or when the combined command is
+  hard to audit. Never use `;` as a substitute — it runs later steps after failure.
+- **Run a slow or noisy command once, raw — don't redirect it to a file
+  yourself.** A build, a test suite, a long search: just run it. hrdr handles the
+  volume. Small output comes straight back in full. Large output is saved whole
+  to a file and you get its path in place of the flood — then `grep` it for a
+  pattern, `read` it with offset/limit, or `tail`/`head` it, as many times as you
+  need, without ever re-running the command. Both stdout and stderr are captured,
+  so the compiler error or panic is already in there — no `2>&1` needed. Piping
+  straight into a filter, or re-running to ask a second question, throws the rest
+  away: run once, then search the saved output. (You only need to redirect to a
+  file yourself if you want the output to outlive the tool call — hrdr's saved
+  file is scratch and gets pruned.)
+- On PowerShell (not bash): its pipeline carries objects, not lines, so filter
+  with `Select-String` / `Where-Object`, not `grep`, and `Get-Content -Tail n`,
+  not `tail -n`. Native-command stderr becomes error records, so check
+  `$LASTEXITCODE` for a native tool's success rather than trusting a quiet
+  pipeline. Set `$ProgressPreference = 'SilentlyContinue'` when a command draws a
+  progress bar — it lands in the captured output otherwise.
+{%- endif %}
 {%- endif %}
 
 {%- if can_delegate %}

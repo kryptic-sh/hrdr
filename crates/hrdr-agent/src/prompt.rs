@@ -401,6 +401,60 @@ mod tests {
         );
     }
 
+    /// The shell gate is a strict sub-case of `can_write` (the shell tools are
+    /// mutating, so `has_shell ⇒ can_write`), which means its only effect is to
+    /// split write agents into shelled and shell-less (a normal write sub-agent vs
+    /// a `write_ext` one, or any write agent on a machine with no shell on PATH).
+    /// All shell-gated guidance therefore sits at the tail of the `can_write`
+    /// block, so those two share every non-shell write section — Scope through
+    /// Deleting — before diverging only at the shell tail. Moving the shell
+    /// sections back up among the coding guidance would shorten that shared prefix.
+    #[test]
+    fn write_agents_with_and_without_a_shell_share_everything_but_the_shell_tail() {
+        let mut env = Environment::new();
+        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
+        let render = |has_shell: bool| {
+            env.get_template("system")
+                .unwrap()
+                .render(context! {
+                    cwd => "/tmp/x", os => "test", tool_names => "read, write",
+                    can_write => true, can_delegate => false, is_subagent => false,
+                    has_shell => has_shell,
+                    instructions => None::<&str>,
+                })
+                .unwrap()
+        };
+        let with_shell = render(true);
+        let without_shell = render(false);
+
+        let common = with_shell
+            .as_bytes()
+            .iter()
+            .zip(without_shell.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // Deleting is the last non-shell section in `can_write`; its final line
+        // must lie wholly inside the shared prefix, or a shell section crept up.
+        let deleting_tail = "drop a database to make an error go away.";
+        let deleting_end = with_shell
+            .find(deleting_tail)
+            .expect("Deleting section present in the write prompt")
+            + deleting_tail.len();
+        assert!(
+            deleting_end <= common,
+            "write agents with and without a shell must share every non-shell \
+             write section; they diverge at byte {common}, before Deleting ends \
+             at {deleting_end}:\n--- shared prefix ---\n{}",
+            &with_shell[..common]
+        );
+
+        // And the divergence really is the shell tail: only the shelled prompt has
+        // the Verifying and Shell sections.
+        assert!(with_shell.contains("Verifying:") && with_shell.contains("Shell:"));
+        assert!(!without_shell.contains("Verifying:") && !without_shell.contains("Shell:"));
+    }
+
     /// "cut a release" is a whole workflow, and the prompt spells it out.
     ///
     /// Left to itself a model does part of it — bumps the manifest and stops, or
@@ -728,25 +782,42 @@ mod tests {
         );
     }
 
-    /// The verify loop is gated on having a shell: a read-only agent (no shell)
-    /// can't build/lint, so it must not be told to.
+    /// The verify loop lives inside the `can_write` block's shell tail: it needs a
+    /// shell to build/lint, and a shell only exists on a write-capable agent
+    /// (`has_shell ⇒ can_write` — the shell tools are themselves mutating). So the
+    /// loop renders exactly when `has_shell` is set, and a read-only agent (no
+    /// shell, no write) never sees it.
     #[test]
     fn the_verify_loop_needs_a_shell() {
         let mut env = Environment::new();
         env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        let render = |has_shell: bool| {
+        // A write agent with/without a shell: the loop follows `has_shell`.
+        let write = |has_shell: bool| {
             env.get_template("system")
                 .unwrap()
                 .render(context! {
                     cwd => "/tmp/x", os => "test", tool_names => "read",
-                    can_write => false, can_delegate => false,
+                    can_write => true, can_delegate => false,
                     has_shell => has_shell,
                     instructions => None::<&str>,
                 })
                 .unwrap()
         };
-        assert!(render(true).contains("Close the loop before you call it done"));
-        assert!(!render(false).contains("Close the loop before you call it done"));
+        assert!(write(true).contains("Close the loop before you call it done"));
+        assert!(!write(false).contains("Close the loop before you call it done"));
+
+        // A read-only agent has neither write tools nor a shell, so no verify loop.
+        let read_only = env
+            .get_template("system")
+            .unwrap()
+            .render(context! {
+                cwd => "/tmp/x", os => "test", tool_names => "read",
+                can_write => false, can_delegate => false,
+                has_shell => false,
+                instructions => None::<&str>,
+            })
+            .unwrap();
+        assert!(!read_only.contains("Close the loop before you call it done"));
     }
 
     /// Scope keeps the agent from spraying files and from leaving stub/half-done
