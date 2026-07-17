@@ -83,6 +83,12 @@ Completed and verified (with review fixes folded in):
   writer bounded at 64 with `send().await` backpressure; shutdown drops
   receivers so blocked senders error instead of deadlocking. Also deflaked the
   session-reservation tests (env-lock race on `XDG_DATA_HOME`).
+- **P2 config validation** — accumulated named diagnostics instead of silent
+  fallbacks: config-file boundary/semantic errors (zero caps and limits,
+  malformed file, `context_window` < compaction reserve) refuse startup with
+  every problem reported together; invalid `HRDR_*` env values warn and keep the
+  current value; unknown UI enum values warn naming valid options (surfaced via
+  startup notice in the TUI, stderr headless).
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
   lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
   (`turn_state.rs`, 155 lines), and turn execution (`turn_loop.rs`, ~1.1k lines)
@@ -94,7 +100,6 @@ Completed and verified (with review fixes folded in):
 | -------- | ------------------------------------------------------ | ------------------------------------ |
 | P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing |
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests        |
-| P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration              |
 
 ---
 
@@ -155,36 +160,6 @@ lifecycle notices). Extend the PTY harness with prompt-submit, Escape-cancel,
 - Every stdout line in JSON mode parses as JSON; ordering and required fields
   stable; defined stderr behavior; errors produce a JSON error event and nonzero
   exit.
-
----
-
-## P2: Configuration validation is permissive and fragmented
-
-### Evidence
-
-- File application and env parsing (now in `crates/hrdr-agent/src/config.rs`)
-  copy many raw values directly and often ignore invalid values.
-- Edge values: zero sub-agent limits, zero timeout, zero output limits,
-  compaction reserves incompatible with context windows.
-- UI enum-like settings fall back silently in `crates/hrdr-app/src/config.rs`.
-
-### Impact
-
-Typos and nonsensical boundary values silently alter behavior or disable
-features; users get defaults rather than diagnostics.
-
-### Recommendation
-
-Deserialize into `RawConfig`, validate into runtime config with typed values
-(`NonZeroUsize`, bounded durations). Accumulate diagnostics so users fix all
-invalid fields at once. The `config.rs` extraction makes this a natural
-follow-up in the isolated module.
-
-### Required tests
-
-- Zero/max boundary values, invalid env strings, unknown enum values, context
-  window smaller than compaction reserve, conflicting provider/global settings,
-  multiple simultaneous errors reported together.
 
 ---
 
