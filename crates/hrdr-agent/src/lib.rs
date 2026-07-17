@@ -3794,14 +3794,14 @@ pub struct Agent {
     /// Estimated USD spent this session: every model call of this agent plus
     /// every delegated sub-agent's (the `task` tool hands each sub-agent this
     /// same counter). Std mutex — held only long enough to add.
-    pub(crate) cost_total: Arc<std::sync::Mutex<f64>>,
+    cost_total: Arc<std::sync::Mutex<f64>>,
     /// Price-card memo for the current identity, so the catalog isn't re-read on
     /// every usage event. The inner `None` remembers an unpriced model (e.g. a
     /// local server).
-    pub(crate) cost_rates: Option<(ModelRef, Option<hrdr_llm::catalog::ModelCost>)>,
+    cost_rates: Option<(ModelRef, Option<hrdr_llm::catalog::ModelCost>)>,
     /// Abort the turn before the next model call once `cost_total` reaches
     /// this many USD ([`AgentConfig::max_cost`]).
-    pub(crate) max_cost: Option<f64>,
+    max_cost: Option<f64>,
     /// Lifecycle hooks from `[[hooks]]` entries with an `event` (the
     /// event-less entries become the post-edit file hooks in `ctx.hooks`).
     /// Arc: cloned into each tool call's future for the pre/post tool events.
@@ -6578,14 +6578,14 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Very rough token estimate (~4 characters per token) for `text`. Used only as
 /// a fallback when the server reports no usage — good enough for the context bar
 /// + auto-compaction, not for billing.
-pub(crate) fn estimate_tokens(text: &str) -> u32 {
+fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 4) as u32
 }
 
 /// Estimate the prompt tokens of a whole request: each message's content and any
 /// tool-call names/arguments, plus a small per-message overhead for the role and
 /// structural tokens the chat template adds.
-pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
+fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()
         .map(|m| {
