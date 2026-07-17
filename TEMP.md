@@ -58,6 +58,13 @@ Completed and verified (with review fixes folded in):
   age, bounded ~5s retry) held across the whole read-modify-write in
   `save_token_at` and `save_oauth_at`; concurrency tests for different- and
   same-provider writers on both stores.
+- **P3 Windows file confidentiality** — documented honestly (README, module
+  docs, `write_atomic`/`open_wire_log` comments): Unix enforces 0600 every
+  write; Windows relies on default ACLs of the per-user profile dir
+  (`~/.config/hrdr` under `%USERPROFILE%`, not `%APPDATA%`); plus an
+  any-platform warning that a world-readable `HRDR_LOG_REQUESTS` target leaks
+  request data. Per-user Win32 ACL code would need a new dependency and was
+  deliberately not added.
 - **P3 wire-log rotation** — at the cap the log rotates to `<name>.1` (newest
   window kept, ≤2× cap on disk, 0600 preserved on both files); rotation failure
   falls back to stop-at-cap with a one-shot warning; README documents the bound.
@@ -78,7 +85,6 @@ Completed and verified (with review fixes folded in):
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
 | P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
 | P3       | `--max-cost` unusable with unpriced/local models       | Capped local runs impossible           |
-| P3       | Windows ACL hardening for credential/log files         | Weaker confidentiality on Windows      |
 
 ---
 
@@ -227,18 +233,6 @@ could still be capped. They must drop the cap entirely.
 Add `--allow-unpriced` (or `max_cost_partial = true`): unpriced calls proceed
 uncounted, the cap applies to priced usage, and reported totals say
 "partial/unknown", never a complete-looking `$0.00`.
-
----
-
-## P3: Windows ACL hardening for credential and log files
-
-(Carried from code comments — `write_atomic` and the request log apply `0600` on
-Unix and explicitly defer Windows.)
-
-### Recommendation
-
-Per-user ACLs on Windows for `auth.toml`, OAuth stores, and `HRDR_LOG_REQUESTS`
-files, or a documented statement of the weaker guarantee.
 
 ---
 
