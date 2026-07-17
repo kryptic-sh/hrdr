@@ -491,6 +491,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn set_theme(&mut self, path: Option<String>) {
         self.app.theme = Theme::load(path.as_deref());
+        crate::ui::clear_transcript_cache();
     }
     fn unpersist_setting(&mut self, key: &str) {
         // The TUI version also suppresses the config hot-reload it would cause.
@@ -1144,6 +1145,7 @@ impl super::App {
             && let Some(orig) = self.theme_original.take()
         {
             self.theme = orig;
+            crate::ui::clear_transcript_cache();
         }
     }
 
@@ -1157,6 +1159,7 @@ impl super::App {
             Some(c) => crate::theme::Theme::load(Some(&c.spec)),
             None => self.theme_original.clone().unwrap_or_default(),
         };
+        crate::ui::clear_transcript_cache();
     }
 
     /// Apply the highlighted theme from the `/theme` picker, persist it as the
@@ -1169,10 +1172,12 @@ impl super::App {
         let Some(c) = sel.current().cloned() else {
             if let Some(orig) = original {
                 self.theme = orig;
+                crate::ui::clear_transcript_cache();
             }
             return;
         };
         self.theme = crate::theme::Theme::load(Some(&c.spec));
+        crate::ui::clear_transcript_cache();
         self.persist_setting("theme", hrdr_agent::ConfigValue::Str(&c.spec));
         self.system(format!("theme → {} ({})", c.name, c.source));
     }

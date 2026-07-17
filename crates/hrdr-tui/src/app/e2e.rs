@@ -5030,6 +5030,72 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
     }
 }
 
+/// A `/theme` switch invalidates every cached block and the next render
+/// rebuilds them with the new theme's colors — the bug that made old colors
+/// persist in cached rows.
+#[tokio::test]
+async fn a_theme_switch_invalidates_transcript_cache() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.push_entry(Entry::user("hello"));
+    h.app.push_entry(Entry::assistant("hi there"));
+
+    // First render populates the block cache. Indices 2=user, 3=assistant
+    // (0=header, 1=notice are the initial entries; the header is never cached).
+    h.render();
+    let before: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    assert!(
+        before.iter().all(Option::is_some),
+        "every entry should be cached after one render"
+    );
+
+    // Change theme via `/theme <name>` — goes through TuiHost::set_theme,
+    // which now calls clear_transcript_cache().
+    h.app.submit_input("/theme catppuccin-mocha".to_string());
+
+    // Cache is now empty — old pointers should be gone.
+    let after_cmd: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    assert!(
+        after_cmd.iter().all(Option::is_none),
+        "theme switch must clear the render cache: {after_cmd:?}"
+    );
+
+    // Re-render builds rows with the new theme.
+    h.render();
+    let after_render: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    assert!(
+        after_render.iter().all(Option::is_some),
+        "re-render after theme switch must repopulate the cache"
+    );
+    // The new rows are fresh allocations, not reused from the old cache.
+    for i in 0..2 {
+        assert_ne!(
+            after_render[i], before[i],
+            "entry {} must be rebuilt (different pointer) after theme switch", i + 2
+        );
+    }
+
+    // Verify the rendered output actually shows the new theme's colors.
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let theme = &h.app.theme;
+    let row_text = |y: u16| -> String {
+        (0..59)
+            .filter_map(|x| buf.cell(Position::new(x, y)).map(|c| c.symbol()))
+            .collect()
+    };
+    let reply_y = (0..20)
+        .find(|&y| row_text(y).contains("hi there"))
+        .expect("assistant text visible after theme switch");
+    // The assistant block has no background (Reset), but its text foreground
+    // must be the new theme's assistant color.
+    let cell = buf.cell(Position::new(2, reply_y)).unwrap();
+    assert_eq!(
+        cell.fg, theme.assistant,
+        "assistant text should wear the new theme's assistant color after re-render"
+    );
+}
+
 /// A command handed to hrdr on the command line does exactly what typing it does.
 ///
 /// `hrdr /new`, `hrdr /model`, `hrdr '!git status'`, `hrdr ':skill …'` — all of it
