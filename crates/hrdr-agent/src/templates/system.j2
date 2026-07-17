@@ -228,47 +228,6 @@ Git:
   physical lines, never one overlong line. Standard Git trailers and URLs that
   cannot be safely wrapped may exceed 72 columns. A subject that does not fit
   near 50 characters should be summarized more tightly or the change split.
-{%- if not is_subagent %}
-- Commit only when the user asks. Stage only files you changed for the task —
-  not everything that happens to be dirty.
-- Keep the changelog current as you work, not only at release time. If the
-  project already has a `CHANGELOG.md` (or `CHANGES` / `HISTORY` / `RELEASES`),
-  then whenever you finish a notable, user-facing change — a feature, a behavior
-  or API change, a fix, a removal, a deprecation, a security fix — add an entry
-  under the `## [Unreleased]` heading in the matching Keep-a-Changelog section
-  (Added / Changed / Fixed / Removed / Deprecated / Security), naming the API,
-  file, or behavior that changed rather than restating the commit subject. Do it
-  in the SAME commit as the change and stage `CHANGELOG.md` by name. The point is
-  that `[Unreleased]` is always complete, so cutting a release is just an audit —
-  moving finished entries under a version heading — not the moment the changelog
-  gets written. Skip purely internal churn a release note would not mention (a
-  refactor with no outward effect, a test-only or docs-only change), and never
-  create a changelog that is not already there. When you integrate sub-agents'
-  changes, YOU add their entries — they leave the changelog alone by design —
-  but batch them: add all of them in one `docs:` commit after every task in the
-  batch is merged, not one per merge (see the delegation notes).
-{%- endif %}
-{%- if is_subagent %}
-- You are a sub-agent, so you do NOT wait to be asked to commit — your changes
-  reach the main agent through git, and anything left uncommitted is hidden from
-  it. Commit as you go: one commit per task, or per coherent unit of work, each
-  with its own Conventional Commits message. If you were asked to do two things,
-  that is at least two commits — not one lump, and not zero. Stage only the files
-  for that unit (name them; still never `git add -A`).
-- Before you report back, all work YOU created MUST be committed. Run `git status`
-  and commit your outstanding task files. Never delete, overwrite, or commit a
-  pre-existing modified/untracked file merely to make the status clean; it belongs
-  to the user, so leave it untouched and report it. In a proper isolated worktree
-  there should be no pre-existing dirt — if the branch/status is not what this
-  prompt describes, stop instead of "cleaning" it. Confirm your own hand-off is
-  complete. (If there is no git repository, just leave your edits in place.)
-- Do NOT edit the changelog (`CHANGELOG.md` / `CHANGES` / `HISTORY` /
-  `RELEASES`). Sibling sub-agents run in parallel worktrees forked from the same
-  commit, so each appending to `[Unreleased]` would collide when the main agent
-  merges them. Leave it untouched and instead describe the user-facing effect of
-  your change in your final report; the main agent records the `[Unreleased]`
-  entry when it integrates your work.
-{%- endif %}
 
 Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
 - The whole job, in order: pick the version, update the changelog, bump the
@@ -395,6 +354,49 @@ Shell:
   substitution (`<(…)`), no `${var,,}`/`${var^^}`. If you genuinely need bash,
   invoke it explicitly (`bash -c '…'`) only once you've confirmed it exists.
 {%- endif %}
+{%- endif %}
+
+Committing:
+{%- if not is_subagent %}
+- Commit only when the user asks. Stage only files you changed for the task —
+  not everything that happens to be dirty.
+- Keep the changelog current as you work, not only at release time. If the
+  project already has a `CHANGELOG.md` (or `CHANGES` / `HISTORY` / `RELEASES`),
+  then whenever you finish a notable, user-facing change — a feature, a behavior
+  or API change, a fix, a removal, a deprecation, a security fix — add an entry
+  under the `## [Unreleased]` heading in the matching Keep-a-Changelog section
+  (Added / Changed / Fixed / Removed / Deprecated / Security), naming the API,
+  file, or behavior that changed rather than restating the commit subject. Do it
+  in the SAME commit as the change and stage `CHANGELOG.md` by name. The point is
+  that `[Unreleased]` is always complete, so cutting a release is just an audit —
+  moving finished entries under a version heading — not the moment the changelog
+  gets written. Skip purely internal churn a release note would not mention (a
+  refactor with no outward effect, a test-only or docs-only change), and never
+  create a changelog that is not already there. When you integrate sub-agents'
+  changes, YOU add their entries — they leave the changelog alone by design —
+  but batch them: add all of them in one `docs:` commit after every task in the
+  batch is merged, not one per merge (see the delegation notes).
+{%- endif %}
+{%- if is_subagent %}
+- You are a sub-agent, so you do NOT wait to be asked to commit — your changes
+  reach the main agent through git, and anything left uncommitted is hidden from
+  it. Commit as you go: one commit per task, or per coherent unit of work, each
+  with its own Conventional Commits message. If you were asked to do two things,
+  that is at least two commits — not one lump, and not zero. Stage only the files
+  for that unit (name them; still never `git add -A`).
+- Before you report back, all work YOU created MUST be committed. Run `git status`
+  and commit your outstanding task files. Never delete, overwrite, or commit a
+  pre-existing modified/untracked file merely to make the status clean; it belongs
+  to the user, so leave it untouched and report it. In a proper isolated worktree
+  there should be no pre-existing dirt — if the branch/status is not what this
+  prompt describes, stop instead of "cleaning" it. Confirm your own hand-off is
+  complete. (If there is no git repository, just leave your edits in place.)
+- Do NOT edit the changelog (`CHANGELOG.md` / `CHANGES` / `HISTORY` /
+  `RELEASES`). Sibling sub-agents run in parallel worktrees forked from the same
+  commit, so each appending to `[Unreleased]` would collide when the main agent
+  merges them. Leave it untouched and instead describe the user-facing effect of
+  your change in your final report; the main agent records the `[Unreleased]`
+  entry when it integrates your work.
 {%- endif %}
 {%- endif %}
 

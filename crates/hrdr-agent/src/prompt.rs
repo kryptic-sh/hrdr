@@ -376,15 +376,15 @@ mod tests {
         );
     }
 
-    /// The same prefix-cache invariant, one gate deeper: within the `can_write`
-    /// block the Git section groups all its unconditional bullets ahead of the
-    /// `is_subagent`-gated commit-timing ones. So a main agent and a write
-    /// sub-agent — identical up to that gate — share every unconditional Git bullet
-    /// (through the 50/72 convention) before diverging. A conditional interleaved
-    /// back among those bullets would move the divergence up and shorten the prefix
-    /// a spawned sub-agent reuses from the main agent's cached prompt.
+    /// The same prefix-cache invariant, one gate deeper: the `is_subagent`-gated
+    /// commit guidance sits in a `Committing:` section at the very END of the
+    /// `can_write` block, past every section identical for a main agent and a
+    /// write sub-agent (Scope → … → Git → Releasing → Deleting → Shell). So the
+    /// two share all of that before diverging only at `Committing:`. Moving the
+    /// `is_subagent` gate back up among the shared sections would shorten the
+    /// prefix a spawned sub-agent reuses from the main agent's cached prompt.
     #[test]
-    fn main_and_subagent_prompts_share_all_unconditional_git_guidance() {
+    fn main_and_subagent_prompts_share_all_of_the_write_block_but_committing() {
         let tools = ToolRegistry::with_defaults();
         let main = render_system(&tools, None, false).unwrap();
         let sub = render_system(&tools, None, true).unwrap();
@@ -396,19 +396,34 @@ mod tests {
             .take_while(|(a, b)| a == b)
             .count();
 
-        // The 50/72 bullet is the last unconditional line in Git before the
-        // commit-timing gate; it must lie wholly inside the shared prefix.
-        let git_tail = "summarized more tightly or the change split.";
-        let git_end = main
-            .find(git_tail)
-            .expect("50/72 commit-message bullet present in the main prompt")
-            + git_tail.len();
+        // `Deleting` is the last section before the shell tail and the
+        // `Committing:` gate; its final line must lie wholly inside the shared
+        // prefix, proving the divergence moved past all of it.
+        let deleting_tail = "drop a database to make an error go away.";
+        let deleting_end = main
+            .find(deleting_tail)
+            .expect("Deleting section present in the main prompt")
+            + deleting_tail.len();
         assert!(
-            git_end <= common,
-            "main and sub-agent prompts must share every unconditional Git bullet; \
-             they diverge at byte {common}, before the Git preamble ends at \
-             {git_end}:\n--- shared prefix ---\n{}",
+            deleting_end <= common,
+            "main and sub-agent prompts must share every section through Deleting; \
+             they diverge at byte {common}, before Deleting ends at \
+             {deleting_end}:\n--- shared prefix ---\n{}",
             &main[..common]
+        );
+        // The shared prefix reaches the `Committing:` header (the two share it
+        // and its shell tail); they then diverge inside it, where the gated
+        // bullets differ (main: commit-when-asked; sub: commit-as-you-go).
+        let committing = main
+            .find("Committing:")
+            .expect("Committing section present");
+        assert!(
+            common >= committing,
+            "the prefix must extend to the Committing: section, not stop before it"
+        );
+        assert!(
+            main.len() != sub.len() || main != sub,
+            "main and sub must differ"
         );
     }
 
