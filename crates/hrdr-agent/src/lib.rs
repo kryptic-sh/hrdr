@@ -2946,9 +2946,13 @@ other file or run mutating commands. Plan the work; do NOT implement it.
 - First understand the task: trace the relevant code with your read/search tools, \
   and note how the project already does similar things so the plan fits in.
 - Write the plan with: the goal in one line; the approach and why; the exact \
-  files/functions/types to change; ordered steps; edge cases and risks; and how \
-  to verify (build/test/lint). Be concrete enough that another agent can execute \
-  it without re-investigating — name real paths and symbols, not placeholders.
+  files/functions/types to change; ordered steps, each sized as an independently \
+  implementable — and independently reviewable — chunk: a step names the \
+  files/functions it changes, its constraints, and a done-criterion, so the \
+  caller can hand any single step to a coder sub-agent as a self-contained \
+  brief; edge cases and risks; and how to verify (build/test/lint). Be concrete \
+  enough that another agent can execute it without re-investigating — name real \
+  paths and symbols, not placeholders.
 - Save it to a Markdown file (e.g. `PLAN.md`, or a path the caller names): create \
   it if absent, update it if it exists.
 - Return the full plan in your report, plus the path you wrote it to. You may be \
@@ -2970,6 +2974,10 @@ beyond it.
 - You cannot ask questions. If part of the spec is ambiguous or turns out wrong \
   against the real code, do the unambiguous part, and report exactly what you \
   skipped or adapted and why — an honest partial beats an improvised whole.
+- If faithful implementation balloons far past what the spec implies — many more \
+  files or far more churn than the brief names — stop rather than deliver a \
+  monster: implement the coherent core, commit it, and report the remainder as \
+  proposed follow-up chunks. A reviewable partial beats an unreviewable whole.
 - Commit each coherent unit as you go (Conventional Commits) and leave a clean \
   tree; your commits and report are the entire hand-off.";
 

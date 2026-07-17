@@ -790,6 +790,15 @@ mod tests {
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");
         assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
+        // Decompose into small, reviewable chunks, sequenced when they overlap.
+        assert!(
+            p.contains("Break big work into small, self-contained chunks"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Parallelize only chunks that touch disjoint files"),
+            "{p}"
+        );
         // Points at `task_diff`, which reads the ENTIRE diff before merging, and
         // still tells the parent to review it like a PR.
         assert!(p.contains("Call `task_diff <id>`"), "{p}");
