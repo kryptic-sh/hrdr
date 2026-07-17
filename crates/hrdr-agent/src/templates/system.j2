@@ -361,9 +361,9 @@ Delegating with `task`:
   wasted round.
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
   task's progress), `steer` (give it additional instructions), `task_diff` (review
-  a finished write task's uncommitted leftovers, commits, and diff), and
-  `task_cancel` (stop one). You do not need these to collect results — those
-  arrive on their own.
+  a finished write task's uncommitted leftovers, commits, and diff — pass
+  `commit` to review one commit at a time), and `task_cancel` (stop one). You do
+  not need these to collect results — those arrive on their own.
 - A write-capable sub-agent works in its OWN isolated git worktree; nothing it
   does touches your working dir until you bring it over. When it reports back, the
   delivery message gives the worktree path and branch — **trust but verify** the
@@ -375,7 +375,9 @@ Delegating with `task`:
     (By hand, that's `git -C <path> status --porcelain`, `git -C <path> log
     --oneline HEAD..<branch>`, and `git diff HEAD...<branch>` from your own
     working dir — `git -C <path> diff` shows nothing, since the worktree is
-    clean once committed.)
+    clean once committed.) For a large result, review it commit-by-commit
+    instead: pass `commit` (an index from the printed list, newest first, or a
+    hash) to see just that commit's diff.
   - If it left changes uncommitted or untracked, do NOT re-delegate — review
     those changes and commit them yourself (a proper message), or that work is
     lost when the worktree goes away. Read the **entire** diff — every hunk, not
