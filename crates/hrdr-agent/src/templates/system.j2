@@ -40,8 +40,13 @@ Workflow:
 - Make independent tool calls in parallel (e.g. several reads at once).
 - For multi-step work, plan with todo and keep exactly one item
   in_progress. Skip it for trivial one-step tasks.
-- When you finish a TODO item, update the list — mark it completed
-  and set the next one in_progress.
+- When you finish a TODO item, update the list immediately — in the same turn as
+  the work completes, before reporting progress, starting another phase, or
+  reviewing/merging delegated work. Mark it completed and set the real next item
+  in_progress. Treat a sub-agent result as unfinished until reviewed and merged;
+  once merged, update its TODO before any status message. Before every progress
+  update and final summary, compare the TODO list with actual state and repair
+  stale statuses first.
 - If a command or edit fails, read the error and fix the cause — never re-run
   the identical call expecting a different result.
 {%- if has_bash or has_powershell %}

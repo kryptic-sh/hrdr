@@ -204,6 +204,8 @@ mod tests {
         assert!(p.contains("git add -A"));
         assert!(p.contains("force-push"));
         assert!(p.contains("old_string"));
+        assert!(p.contains("stale statuses first"));
+        assert!(p.contains("sub-agent result as unfinished until reviewed and merged"));
         assert!(p.contains("/tmp/x"));
         assert!(!p.contains("Project instructions"));
         // The OS line names the platform (and, where detectable, the distro +
