@@ -53,6 +53,9 @@ Completed and verified (with review fixes folded in):
 - **P2 endpoint host classification** — `hrdr-agent` now consumes the public
   `hrdr_llm::url_host` helper instead of maintaining a duplicate classifier.
 - **P3 README stale release line** — removed.
+- **P2 `$EDITOR` quoting** — hand-rolled zero-dep shell-word splitter
+  (`split_shell_words`) replaces `split_whitespace()`; quotes, escapes, and
+  unterminated-quote recovery covered by 12 unit tests.
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
   lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
   (`turn_state.rs`, 155 lines), and turn execution (`turn_loop.rs`, ~1.1k lines)
@@ -65,7 +68,6 @@ Completed and verified (with review fixes folded in):
 | P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing   |
 | P2       | Credential read-modify-write lacks cross-process lock  | Concurrent credential loss             |
 | P2       | Unbounded internal channels                            | Memory growth under sustained overload |
-| P2       | `$EDITOR` parsing ignores quoting                      | Broken editor invocation               |
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
 | P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
 | P3       | `--max-cost` unusable with unpriced/local models       | Capped local runs impossible           |
@@ -165,39 +167,6 @@ or a stalled MCP child.
 - Text coalescing preserves exact visible content and ordering.
 - Cancellation/shutdown cannot deadlock while a producer awaits capacity.
 - MCP child exit releases blocked senders.
-
----
-
-## P2: `$EDITOR` parsing breaks quoted arguments and paths
-
-### Evidence
-
-- `crates/hrdr-tui/src/app/util.rs` parses editor strings with
-  `split_whitespace()`.
-
-Examples that break:
-
-```text
-EDITOR='code --profile "Work Profile" -w'
-EDITOR='"/path with spaces/editor" --wait'
-```
-
-### Impact
-
-Quoted arguments are split incorrectly; executables or profiles containing
-spaces cannot be represented, causing launch failures or changed argument
-meaning.
-
-### Recommendation
-
-Platform-appropriate shell-word parsing or explicit executable+args config. A
-shell-word parser likely means a new dependency — requires approval first. Avoid
-invoking a shell to parse/launch (injection and quoting complexity).
-
-### Required tests
-
-- Simple `code -w`; quoted argument with spaces; escaped spaces; executable path
-  with spaces; empty variable fallback; Windows quoting.
 
 ---
 
