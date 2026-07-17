@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Unified the shell prompt gate.** The system prompt's two shell flags
+  (`has_bash` / `has_powershell`) collapse into one `has_shell`, and the
+  PowerShell pipeline note now renders whenever a shell is present rather than
+  only when the shell _is_ PowerShell. Trades a few lines of dead advice on a
+  bash-only box for one fewer conditional (and one fewer divergence axis) in the
+  template.
 - **System prompt reordered for prefix-cache reuse.** The prompt template
   (`system.j2`) now leads with the sections common to every agent (identity,
   workflow, reporting, untrusted-content, safety) and pushes the

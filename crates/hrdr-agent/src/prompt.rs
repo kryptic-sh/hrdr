@@ -59,14 +59,13 @@ pub fn render_system(
             // an isolated worktree and must hand back a clean, properly-committed
             // git history (see the sub-agent commit section).
             is_subagent => is_subagent,
-            // The shell section only renders when a shell exists, and the
-            // PowerShell-specific note (its pipeline carries objects, not lines)
-            // only when `powershell` is the shell — `bash` and `powershell` are
-            // registered only when their interpreter is on PATH, so this asks the
-            // same question the tool set already answered. Advice for a shell the
-            // machine doesn't have is worse than none.
-            has_bash => has("bash"),
-            has_powershell => has("powershell"),
+            // The shell section only renders when a shell exists — `bash` and
+            // `powershell` are registered only when their interpreter is on PATH,
+            // so this asks the same question the tool set already answered. We
+            // don't split bash from PowerShell: the PowerShell-specific note is a
+            // handful of lines and rides along whenever a shell is present, which
+            // keeps one fewer gate in the prompt and one fewer divergence axis.
+            has_shell => has("bash") || has("powershell"),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -527,7 +526,7 @@ mod tests {
             .render(context! {
                 cwd => "/tmp/x", os => "test", tool_names => "task, models",
                 can_write => true, can_delegate => true, is_subagent => false,
-                has_bash => true, has_powershell => false,
+                has_shell => true,
                 instructions => None::<&str>,
             })
             .unwrap();
@@ -577,21 +576,21 @@ mod tests {
         assert!(!p.contains(".log` 2>&1"), "no manual redirect syntax: {p}");
     }
 
-    /// The Shell section renders only when a shell exists, and the
-    /// PowerShell-specific note only when `powershell` is the shell.
+    /// The Shell section — including the PowerShell note — renders exactly when a
+    /// shell exists, under one `has_shell` gate.
     ///
     /// `bash` and `powershell` are registered only when their interpreter is on
-    /// PATH, so the prompt keys off the tool set. PowerShell's pipeline carries
-    /// objects, not lines, so the model needs `Select-String`/`$LASTEXITCODE`
-    /// advice a bash-only machine must not see (and vice versa). The run-raw rule
-    /// itself is shell-agnostic and stated once whenever a shell is present.
+    /// PATH, so the prompt keys off the tool set. We deliberately do NOT split
+    /// bash from PowerShell: the PowerShell-specific note is a few lines and rides
+    /// along whenever any shell is present, trading a little dead advice on a
+    /// bash-only box for one fewer gate (and one fewer divergence axis).
     #[test]
     fn the_shell_rules_match_the_shell_the_machine_has() {
-        // Drive the template's gates directly: which shell tools exist depends on
-        // the machine running the test (there is no PowerShell on a stock Linux CI
-        // box, and no way to register a tool whose interpreter isn't on PATH), and
-        // the point of the gates is exactly that they are *not* the same everywhere.
-        let render = |has_bash: bool, has_powershell: bool| -> String {
+        // Drive the single gate directly: which shell tool exists depends on the
+        // machine (there is no PowerShell on a stock Linux CI box, and no way to
+        // register a tool whose interpreter isn't on PATH), so the test asserts the
+        // gate's effect rather than a particular machine's shell.
+        let render = |has_shell: bool| -> String {
             let mut env = Environment::new();
             env.add_template("system", SYSTEM_TEMPLATE).unwrap();
             env.get_template("system")
@@ -602,47 +601,35 @@ mod tests {
                     tool_names => "read, write",
                     can_write => true,
                     can_delegate => false,
-                    has_bash => has_bash,
-                    has_powershell => has_powershell,
+                    has_shell => has_shell,
                     instructions => None::<&str>,
                 })
                 .unwrap()
         };
 
-        // bash only: the Shell section + the run-raw rule, and NOT a word about
-        // PowerShell's object pipeline.
-        let p = render(true, false);
+        // A shell exists: the Shell section, the run-raw rule (once), and the
+        // PowerShell note all render.
+        let p = render(true);
         assert!(p.contains("Shell:"), "{p}");
-        assert!(p.contains("Run a slow or noisy command once, raw"), "{p}");
-        assert!(!p.contains("PowerShell is not bash"), "{p}");
-
-        // PowerShell only: the Shell section + the run-raw rule + the PowerShell
-        // note.
-        let p = render(false, true);
-        assert!(p.contains("Shell:"), "{p}");
-        assert!(p.contains("Run a slow or noisy command once, raw"), "{p}");
-        assert!(p.contains("PowerShell is not bash"), "{p}");
-
-        // Both (a machine with `pwsh` on PATH beside bash): the shared rule once,
-        // plus the PowerShell note.
-        let p = render(true, true);
-        assert!(p.contains("PowerShell is not bash"), "{p}");
+        assert!(p.contains("On PowerShell (not bash)"), "{p}");
         assert_eq!(
             p.matches("Run a slow or noisy command once, raw").count(),
             1,
             "the run-raw rule is stated once, shell-agnostic"
         );
 
-        // Neither: no shell, no shell rules.
-        let p = render(false, false);
+        // No shell: no Shell section, and so no PowerShell note either.
+        let p = render(false);
         assert!(!p.contains("Shell:"), "{p}");
+        assert!(!p.contains("On PowerShell (not bash)"), "{p}");
     }
 
-    /// The gates are wired to the tool set, not to a guess about the platform.
+    /// The gate is wired to the tool set, not to a guess about the platform.
     ///
     /// `bash` and `powershell` are registered only when their interpreter is on
     /// PATH, so "does this agent have a shell" is a question the registry has
-    /// already answered. Whatever this machine has, the prompt must agree with it.
+    /// already answered. The Shell section — PowerShell note included — appears
+    /// exactly when a shell tool does.
     #[test]
     fn the_shell_gates_follow_the_registered_tools() {
         let tools = ToolRegistry::with_defaults();
@@ -656,9 +643,9 @@ mod tests {
             "the Shell section appears exactly when a shell tool does"
         );
         assert_eq!(
-            names.iter().any(|n| n == "powershell"),
-            p.contains("PowerShell is not bash"),
-            "the PowerShell-specific note appears exactly when the powershell tool does"
+            has_shell,
+            p.contains("On PowerShell (not bash)"),
+            "the PowerShell note rides along with the Shell section, under one gate"
         );
     }
 
@@ -747,13 +734,13 @@ mod tests {
     fn the_verify_loop_needs_a_shell() {
         let mut env = Environment::new();
         env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        let render = |has_bash: bool| {
+        let render = |has_shell: bool| {
             env.get_template("system")
                 .unwrap()
                 .render(context! {
                     cwd => "/tmp/x", os => "test", tool_names => "read",
                     can_write => false, can_delegate => false,
-                    has_bash => has_bash, has_powershell => false,
+                    has_shell => has_shell,
                     instructions => None::<&str>,
                 })
                 .unwrap()
@@ -1002,7 +989,7 @@ mod tests {
             .render(context! {
                 cwd => "/tmp/x", os => "test", tool_names => "task, models",
                 can_write => true, can_delegate => true, is_subagent => false,
-                has_bash => true, has_powershell => false,
+                has_shell => true,
                 instructions => None::<&str>,
             })
             .unwrap();
@@ -1127,7 +1114,7 @@ mod tests {
                 cwd => "/tmp/x", os => "test", date => "2026-07-16",
                 tool_names => "read, grep",
                 can_write => false, can_delegate => false, is_subagent => true,
-                has_bash => false, has_powershell => false,
+                has_shell => false,
                 instructions => None::<&str>,
             })
             .unwrap();
