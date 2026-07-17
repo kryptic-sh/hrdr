@@ -631,6 +631,13 @@ jobs:
     name: tag-release status
     needs:
       [
+        fmt,
+        clippy,
+        machete,
+        deny,
+        test,
+        leak-guard,
+        smoke,
         build,
         publish-github-release,
         publish-crates,
@@ -639,14 +646,16 @@ jobs:
         scoop-bucket,
         alpine,
       ]
-    if: always()
+    if:
+      always() && github.event_name == 'push' && startsWith(github.ref,
+      'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - run: |
-          RESULT=$(echo '${{ toJSON(needs.*.result) }}')
+          RESULT='${{ toJSON(needs.*.result) }}'
           echo "Release job results: $RESULT"
-          if echo "$RESULT" | grep -qE '"failure"|"cancelled"'; then
-            echo "❌ A required release job failed or was cancelled"
+          if ! echo "$RESULT" | jq -e 'all(. == "success")' >/dev/null; then
+            echo "❌ Every required check and publish job must succeed on a release tag"
             exit 1
           fi
-          echo "✅ All release jobs completed successfully or were intentionally skipped"
+          echo "✅ All release checks and publish jobs completed successfully"
