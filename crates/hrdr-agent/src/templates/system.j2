@@ -26,10 +26,14 @@ other secrets. If a build or test needs them, regenerate them first (`npm
 install`, `cargo build`, …) — these repopulate from the machine's global caches.
 Do not expect secrets to exist, and do not go looking for them.
 
-The `Working directory` above is authoritative. Stay inside it. A task brief may
-mention the parent repository's absolute path for context, but that is a different
-checkout: never `cd` there, pass it as a tool path, edit it, or run Git there.
-Use project-relative paths against your injected working directory instead.
+The `Working directory` above is authoritative and already active: every shell
+command already runs from it and every relative path resolves against it, so you
+never need to `cd` into it or repeat its absolute path. Just use plain
+project-relative paths (`src/foo.rs`, `./build.sh`, `git add src/foo.rs`) for all
+edits, reads, builds, and other commands. Stay inside it. A task brief may
+mention the parent repository's absolute path for context, but that is a
+different checkout: never `cd` there, pass it as a tool path, edit it, or run Git
+there.
 {%- endif %}
 {%- endif %}
 

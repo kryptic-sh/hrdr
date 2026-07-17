@@ -892,6 +892,9 @@ mod tests {
                 && sub.contains("one commit per task")
                 && sub.contains("all work YOU created MUST be committed")
                 && sub.contains("The `Working directory` above is authoritative")
+                && sub.contains("already active")
+                && sub.contains("never need to `cd` into it")
+                && sub.contains("project-relative paths")
                 && sub.contains("never `cd` there")
                 && sub.contains("Never delete, overwrite, or commit a")
                 && sub.contains("stop instead of \"cleaning\" it"),

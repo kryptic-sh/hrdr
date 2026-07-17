@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Smaller default tool-output threshold.** A single tool call's output now
+  stays inline up to **50 lines or 5 KiB** (was 1,500 lines / 24 KiB); larger
+  output is saved whole to a file and the model gets its path to `grep`/`read`.
+  Keeps far less transient command output in context per call. Overridable via
+  `tool_output.max_lines` / `tool_output.max_bytes` in config.
+- **Clearer worktree guidance for write sub-agents.** The system prompt now
+  tells a write-capable sub-agent that its working directory is already active —
+  shell commands run from it and relative paths resolve against it, so it never
+  needs to `cd` into it or repeat its absolute path — while keeping the rule to
+  stay inside the worktree and never touch the parent checkout.
+
 ### Added
 
 - **`allow_unpriced` cost-cap escape hatch.** `allow_unpriced` (config.toml) /
