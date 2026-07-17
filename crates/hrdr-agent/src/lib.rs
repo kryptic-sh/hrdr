@@ -5290,10 +5290,11 @@ impl Agent {
             if tool_calls.is_empty() {
                 // A degraded high-context model sometimes ends its turn on a
                 // promise instead of doing the work — "I'll implement now",
-                // zero tool calls, TODO items left dangling. Give it exactly
-                // one chance per turn to either finish the list or explicitly
-                // defer it, instead of silently accepting the promise as done.
-                if !nudged_this_turn {
+                // zero tool calls, TODO items left dangling, and no background
+                // sub-agent still doing that work. Give it exactly one chance
+                // per turn to either finish the list or explicitly defer it,
+                // instead of silently accepting the promise as done.
+                if !nudged_this_turn && self.bg_handle_count() == 0 {
                     let unfinished: Vec<TodoItem> = self
                         .ctx
                         .todos
@@ -12953,6 +12954,51 @@ mod tests {
                     .iter()
                     .any(|m| m.origin == MessageOrigin::Nudge),
                 "no nudge when every TODO is completed"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unfinished TODOs"))),
+                "no nudge Notice: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// Pending TODOs may describe work delegated to a background sub-agent.
+        /// While one is running, a text-only response ends normally instead of
+        /// injecting a false "continue now" nudge.
+        #[tokio::test]
+        async fn agent_run_no_nudge_while_a_background_subagent_is_running() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "The review agent is still running."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![TodoItem {
+                content: "review the change".to_string(),
+                status: "in_progress".to_string(),
+            }];
+            let handle = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+            agent.bg_handles.lock().unwrap().push((1, handle));
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("review it", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.origin == MessageOrigin::Nudge),
+                "no nudge while delegated work is running"
             );
             assert!(
                 !events
