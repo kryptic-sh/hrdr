@@ -29,7 +29,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   build/test/lint verify loop moves to a new `Verifying` section after `Safety`,
   so every unconditional section now precedes the first `{% if %}` and a
   read-only agent and a write agent share the whole common preamble before
-  diverging.
+  diverging. Inside the `can_write` block the `Git` section likewise groups all
+  its unconditional bullets (staging, force-push, reverting, discarding, the
+  commit-message form, heredoc, and 50/72 rules) ahead of the
+  `is_subagent`-gated commit-timing bullets, so a main agent and a write
+  sub-agent share every unconditional Git bullet before diverging — extending
+  the prefix a spawned sub-agent reuses from the main agent's cached prompt.
 - **Smaller default tool-output threshold.** A single tool call's output now
   stays inline up to **50 lines or 5 KiB** (was 1,500 lines / 24 KiB); larger
   output is saved whole to a file and the model gets its path to `grep`/`read`.

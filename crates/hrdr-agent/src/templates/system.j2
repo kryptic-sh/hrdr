@@ -271,10 +271,6 @@ Git:
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
   `restore .`, `clean -f`, `stash drop` and `branch -D` destroy changes that may
   be the user's, not yours. Ask first, every time.
-{%- if not is_subagent %}
-- Commit only when the user asks. Stage only files you changed for the task —
-  not everything that happens to be dirty.
-{%- endif %}
 - Write the commit message as a single-line subject in Conventional Commits form
   — `type(scope): message`, e.g. `fix(parser): handle empty input` or
   `feat(auth): add token refresh`. The scope is optional; the types are `feat`,
@@ -307,6 +303,8 @@ Git:
   cannot be safely wrapped may exceed 72 columns. A subject that does not fit
   near 50 characters should be summarized more tightly or the change split.
 {%- if not is_subagent %}
+- Commit only when the user asks. Stage only files you changed for the task —
+  not everything that happens to be dirty.
 - Keep the changelog current as you work, not only at release time. If the
   project already has a `CHANGELOG.md` (or `CHANGES` / `HISTORY` / `RELEASES`),
   then whenever you finish a notable, user-facing change — a feature, a behavior

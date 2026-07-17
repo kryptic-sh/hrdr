@@ -366,6 +366,42 @@ mod tests {
         );
     }
 
+    /// The same prefix-cache invariant, one gate deeper: within the `can_write`
+    /// block the Git section groups all its unconditional bullets ahead of the
+    /// `is_subagent`-gated commit-timing ones. So a main agent and a write
+    /// sub-agent — identical up to that gate — share every unconditional Git bullet
+    /// (through the 50/72 convention) before diverging. A conditional interleaved
+    /// back among those bullets would move the divergence up and shorten the prefix
+    /// a spawned sub-agent reuses from the main agent's cached prompt.
+    #[test]
+    fn main_and_subagent_prompts_share_all_unconditional_git_guidance() {
+        let tools = ToolRegistry::with_defaults();
+        let main = render_system(&tools, None, false).unwrap();
+        let sub = render_system(&tools, None, true).unwrap();
+
+        let common = main
+            .as_bytes()
+            .iter()
+            .zip(sub.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // The 50/72 bullet is the last unconditional line in Git before the
+        // commit-timing gate; it must lie wholly inside the shared prefix.
+        let git_tail = "summarized more tightly or the change split.";
+        let git_end = main
+            .find(git_tail)
+            .expect("50/72 commit-message bullet present in the main prompt")
+            + git_tail.len();
+        assert!(
+            git_end <= common,
+            "main and sub-agent prompts must share every unconditional Git bullet; \
+             they diverge at byte {common}, before the Git preamble ends at \
+             {git_end}:\n--- shared prefix ---\n{}",
+            &main[..common]
+        );
+    }
+
     /// "cut a release" is a whole workflow, and the prompt spells it out.
     ///
     /// Left to itself a model does part of it — bumps the manifest and stops, or
