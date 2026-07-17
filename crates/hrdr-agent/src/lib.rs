@@ -657,6 +657,13 @@ fn tool_error_text(e: &anyhow::Error) -> String {
     format!("Error: {e:#}")
 }
 
+/// The most of a background sub-agent's final report delivered verbatim into
+/// the parent's context, in bytes. The parent needs the answer, not a full
+/// re-read of a long run — the durable transcript keeps everything, and an
+/// oversized report is middle-truncated (`hrdr_tools::truncate_middle`) with
+/// a pointer at the transcript for the rest.
+const BACKGROUND_REPORT_MAX_BYTES: usize = 24_000;
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_background(
     cfg: AgentConfig,
@@ -771,7 +778,7 @@ fn spawn_background(
             size_summary: None,
             model: model_for_live.clone(),
             started: Some(std::time::Instant::now()),
-            transcript: transcript_path,
+            transcript: transcript_path.clone(),
         });
     }
     let ts_inner = transcript.clone();
@@ -795,6 +802,15 @@ fn spawn_background(
         // live-subagent store.
         let result = AssertUnwindSafe(async move {
             let mut out = String::new();
+            // The contiguous assistant text since the last tool call — reset on
+            // every `ToolStart`, appended on every `Text`. At the end of the run
+            // this is the sub-agent's final report (its system prompt already
+            // tells it that's the hand-off), as opposed to `out`, which is the
+            // whole prose stream across every turn including interim narration
+            // between tool calls. Only the report belongs in the parent's
+            // context; `out` (and the durable transcript) still exist so a
+            // run that ends mid-tool-call with no closing text has a fallback.
+            let mut final_segment = String::new();
             let result: anyhow::Result<()> = async {
                 // Open its record with the task it was given, so its transcript shows
                 // the question and not just the answer.
@@ -820,9 +836,15 @@ fn spawn_background(
                         let chunk = match ev {
                             AgentEvent::Text(t) => {
                                 out.push_str(&t);
+                                final_segment.push_str(&t);
                                 Some(t)
                             }
-                            AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
+                            AgentEvent::ToolStart { name, .. } => {
+                                // A new tool call starts a fresh segment — whatever
+                                // text preceded it was narration, not the report.
+                                final_segment.clear();
+                                Some(format!("\n· {name}"))
+                            }
                             _ => None,
                         };
                         if let Some(c) = chunk
@@ -849,15 +871,36 @@ fn spawn_background(
                     if let Ok(mut g) = ts_inner.lock()
                         && let Some(t) = g.as_mut()
                     {
+                        // The transcript is the durable full record — its byte
+                        // count is the whole run, not the (possibly narrower)
+                        // report delivered to the parent below.
                         t.write(&subagent_transcript::Event::End {
                             status: subagent_transcript::EndStatus::Ok,
                             bytes: o.len(),
                         });
                     }
-                    if o.is_empty() {
+                    // Prefer the final segment (the report) over the full prose
+                    // stream; fall back to `out` if the run ended mid-tool-call
+                    // with no closing text (rare, but the segment would be empty).
+                    let segment = final_segment.trim();
+                    let report = if segment.is_empty() {
+                        o.as_str()
+                    } else {
+                        segment
+                    };
+                    if report.is_empty() {
                         "(no text output)".to_string()
                     } else {
-                        o
+                        let over_budget = report.len() > BACKGROUND_REPORT_MAX_BYTES;
+                        let mut text =
+                            hrdr_tools::truncate_middle(report, BACKGROUND_REPORT_MAX_BYTES);
+                        if over_budget && let Some(p) = &transcript_path {
+                            text.push_str(&format!(
+                                "\n\n(full transcript: {} — `read` it for the complete run)",
+                                p.display()
+                            ));
+                        }
+                        text
                     }
                 }
                 Err(e) => {
@@ -2059,7 +2102,11 @@ impl hrdr_tools::Tool for TaskOutputTool {
             })
         });
         if let Some(text) = peek.filter(|t| !t.is_empty()) {
-            return Ok(hrdr_tools::truncate(&text, ctx.max_output));
+            // Middle-truncate, not head-truncate: this is a *peek at a
+            // still-running* task, so the newest output (the tail) is exactly
+            // its current progress — head-only truncation would cut that and
+            // keep only stale narration from the start of the run.
+            return Ok(hrdr_tools::truncate_middle(&text, ctx.max_output));
         }
         let done = {
             let v = ctx
@@ -2076,7 +2123,8 @@ impl hrdr_tools::Tool for TaskOutputTool {
         };
         match done {
             Some((text, transcript)) => {
-                let mut out = hrdr_tools::truncate(&text, ctx.max_output);
+                // Same reasoning as the live-peek branch above: keep the tail.
+                let mut out = hrdr_tools::truncate_middle(&text, ctx.max_output);
                 // Point at the durable transcript for the full run — richer than
                 // the stored summary, and it outlives the live event log.
                 if let Some(p) = transcript {
@@ -2569,9 +2617,16 @@ impl hrdr_tools::Tool for TaskDiffTool {
 /// within task `id`'s own commits — never arbitrary repo history. `commits` is
 /// the trimmed `git log --oneline HEAD..<branch>` output already computed by
 /// the caller (newest first), so a numeric `selector` indexes into exactly the
-/// list the tool just printed. A non-numeric `selector` is a git rev, verified
-/// to actually be one of `HEAD..<branch>` via `git rev-list` before use — this
+/// list the tool just printed. Anything else is a git rev, verified to
+/// actually be one of `HEAD..<branch>` via `git rev-list` before use — this
 /// is what stops the model from pulling up a diff from outside the task.
+///
+/// A selector can be BOTH: an abbreviated git hash may be all digits
+/// (`1234567`). Only a number that fits the printed list (`1..=total`) is an
+/// index — anything larger falls through to rev resolution, so an all-digit
+/// hash resolves as the hash it is instead of erroring as an out-of-range
+/// index. (An all-digit hash abbreviation short enough to also be a valid
+/// index reads as the index — same as what the model just saw printed.)
 async fn resolve_task_commit(
     ctx: &hrdr_tools::ToolContext,
     id: u64,
@@ -2581,14 +2636,8 @@ async fn resolve_task_commit(
 ) -> anyhow::Result<(String, usize, usize)> {
     let lines: Vec<&str> = commits.lines().collect();
     let total = lines.len();
-    if let Ok(n) = selector.parse::<usize>() {
-        if n == 0 || n > total {
-            anyhow::bail!(
-                "task #{id} commit index {n} is out of range — its commit list has {total} \
-                 commit(s) (see the `Commits:` list `task_diff` just printed; it's 1-based, \
-                 newest first)"
-            );
-        }
+    let as_index = selector.parse::<usize>().ok();
+    if let Some(n) = as_index.filter(|n| (1..=total).contains(n)) {
         let hash = lines[n - 1]
             .split_whitespace()
             .next()
@@ -2596,8 +2645,9 @@ async fn resolve_task_commit(
             .to_string();
         return Ok((hash, n, total));
     }
-    // Not an index — a git rev. Resolve it to a full hash, then require it
-    // actually be reachable as one of the task's own commits before showing it.
+    // Not a usable index — a git rev. Resolve it to a full hash, then require
+    // it actually be reachable as one of the task's own commits before showing
+    // it.
     let rev_parse = tokio::process::Command::new("git")
         .arg("-C")
         .arg(&ctx.cwd)
@@ -2606,6 +2656,15 @@ async fn resolve_task_commit(
         .await
         .context("resolving `commit` as a git rev")?;
     if !rev_parse.status.success() {
+        // A short number that isn't a rev either was almost certainly meant as
+        // an index into the printed list — say so instead of "not a rev".
+        if as_index.is_some() && selector.len() < 4 {
+            anyhow::bail!(
+                "task #{id} commit index {selector} is out of range — its commit list has \
+                 {total} commit(s) (see the `Commits:` list `task_diff` just printed; it's \
+                 1-based, newest first)"
+            );
+        }
         anyhow::bail!("`{selector}` is not a valid git commit rev");
     }
     let hash = String::from_utf8_lossy(&rev_parse.stdout)
@@ -10664,6 +10723,46 @@ mod tests {
         );
     }
 
+    /// `task_output`'s peek shows a still-running task's CURRENT progress, so
+    /// an oversized stored result must be truncated in the **middle**
+    /// (`hrdr_tools::truncate_middle`), keeping the tail — head-only
+    /// `truncate` would cut exactly the newest output and keep only stale
+    /// narration from the start of the run.
+    #[tokio::test]
+    async fn task_output_peek_keeps_the_tail() {
+        use super::{LiveSubagents, TaskOutputTool};
+        use hrdr_tools::Tool;
+        let mut ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+        ctx.max_output = 200;
+        let stale_head = "STALE-HEAD-".repeat(50);
+        let fresh_tail = "FRESH-TAIL-MARKER";
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 9,
+                label: "long-run".to_string(),
+                done: true,
+                delivered: true,
+                result: Some(format!("{stale_head}{fresh_tail}")),
+                ..Default::default()
+            });
+        let out = TaskOutputTool {
+            live: LiveSubagents::new(),
+        }
+        .execute(serde_json::json!({"id": 9}), &ctx)
+        .await
+        .unwrap();
+        assert!(
+            out.contains("bytes omitted from the middle"),
+            "truncate_middle's marker, not truncate's head-only one: {out}"
+        );
+        assert!(
+            out.contains(fresh_tail),
+            "the tail — the run's current progress — survives truncation: {out}"
+        );
+    }
+
     /// A background write sub-agent's worktree must OUTLIVE its run so the parent
     /// can review it: `keep()` detaches the automatic `Drop` cleanup, and only an
     /// explicit `remove_worktree` tears it down. An un-kept worktree (a cancelled
@@ -14636,6 +14735,139 @@ mod tests {
                     }
                 ),
                 "ends ok: {events:?}"
+            );
+        }
+
+        /// The delivered result is the sub-agent's FINAL REPORT — the contiguous
+        /// assistant text after its last tool call — not the whole prose stream.
+        /// Narration between tool calls ("thinking…", "more…") must not reach
+        /// the parent's context; only the durable transcript keeps that.
+        #[tokio::test]
+        async fn background_task_delivers_final_segment_not_full_stream() {
+            use hrdr_tools::Tool;
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let file_path = test_file.to_string_lossy().to_string();
+            let args_json = serde_json::to_string(&json!({"path": file_path})).unwrap();
+
+            let server = MockServer::start(vec![
+                // Turn 1: narration, then a tool call.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "thinking…"),
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 2: more narration, another tool call.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "more…"),
+                    tool_start_chunk("c2", "call_2", "read"),
+                    tool_args_chunk("c2", &args_json),
+                    tool_calls_stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 3: the final report, no further tool call.
+                MockResp::Sse(vec![
+                    text_chunk("c3", "the report"),
+                    stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), dir.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(dir.path());
+            let args = json!({"prompt": "explore the file", "description": "probe"});
+
+            tool.execute(args, &ctx).await.unwrap();
+            let result = await_background(&tool, &ctx).await;
+
+            assert_eq!(
+                result, "the report",
+                "only the text after the last tool call is delivered"
+            );
+        }
+
+        /// When the run ends ON a tool call — no assistant text follows the last
+        /// tool result — the final-segment buffer is empty, so delivery falls back
+        /// to the full accumulated stream rather than delivering nothing.
+        #[tokio::test]
+        async fn background_task_falls_back_to_accumulated_text_with_no_trailing_report() {
+            use hrdr_tools::Tool;
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let file_path = test_file.to_string_lossy().to_string();
+            let args_json = serde_json::to_string(&json!({"path": file_path})).unwrap();
+
+            let server = MockServer::start(vec![
+                // Turn 1: narration, then a tool call.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "gathering context"),
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 2: no text at all — an immediate stop right after the tool
+                // result, so the final segment stays empty.
+                MockResp::Sse(vec![stop_chunk("c2"), "[DONE]".to_string()]),
+            ])
+            .await;
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), dir.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(dir.path());
+            let args = json!({"prompt": "explore the file", "description": "probe"});
+
+            tool.execute(args, &ctx).await.unwrap();
+            let result = await_background(&tool, &ctx).await;
+
+            assert_eq!(
+                result, "gathering context",
+                "the final segment was empty, so the full accumulated stream is the fallback"
+            );
+        }
+
+        /// An oversized report is middle-truncated to
+        /// [`super::super::BACKGROUND_REPORT_MAX_BYTES`] and, since it actually
+        /// got cut, carries a pointer at the durable transcript for the rest.
+        #[tokio::test]
+        async fn background_task_oversized_report_is_middle_truncated_with_transcript_pointer() {
+            use super::super::BACKGROUND_REPORT_MAX_BYTES;
+            use hrdr_tools::Tool;
+            let big = "y".repeat(BACKGROUND_REPORT_MAX_BYTES + 5_000);
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", &big),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            let args = json!({"prompt": "big task", "description": "probe"});
+
+            tool.execute(args, &ctx).await.unwrap();
+            let result = await_background(&tool, &ctx).await;
+
+            let expected_body = hrdr_tools::truncate_middle(&big, BACKGROUND_REPORT_MAX_BYTES);
+            assert!(
+                result.starts_with(&expected_body),
+                "middle-truncated to the byte budget: {}",
+                &result[..result.len().min(200)]
+            );
+            assert!(
+                result.contains("bytes omitted from the middle"),
+                "carries truncate_middle's marker: {}",
+                &result[..result.len().min(200)]
+            );
+            assert!(
+                result.contains("full transcript:") && result.contains("for the complete run"),
+                "points at the transcript for the full run: {}",
+                &result[result.len().saturating_sub(200)..]
             );
         }
 
