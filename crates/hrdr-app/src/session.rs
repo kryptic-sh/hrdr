@@ -1357,69 +1357,81 @@ mod tests {
     /// `unique_session_id` so the candidate can be claimed.
     #[test]
     fn stale_lock_is_reaped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("p");
-        std::fs::create_dir(&dir).unwrap();
-        let cwd = dir.to_str().unwrap().to_string();
+        // Under the env lock: `session_dir` is evaluated twice (here and inside
+        // `unique_session_id`) and resolves through `XDG_DATA_HOME`, which a
+        // parallel `with_test_env` test mutates.
+        with_test_env(|tmp| {
+            let dir = tmp.path().join("p");
+            std::fs::create_dir(&dir).unwrap();
+            let cwd = dir.to_str().unwrap().to_string();
 
-        let sdir = session_dir(&cwd);
-        let _ = std::fs::create_dir_all(&sdir);
-        let lock_path = sdir.join(".stale-cand.lock");
+            let sdir = session_dir(&cwd);
+            let _ = std::fs::create_dir_all(&sdir);
+            let lock_path = sdir.join(".stale-cand.lock");
 
-        // Create a lock with an old timestamp and a PID that (almost
-        // certainly) does not exist.
-        let old_ts = hrdr_tools::unix_now().saturating_sub(STALE_LOCK_AGE_SECS + 60);
-        std::fs::write(&lock_path, format!("4294967294 {old_ts}")).unwrap();
+            // Create a lock with an old timestamp and a PID that (almost
+            // certainly) does not exist.
+            let old_ts = hrdr_tools::unix_now().saturating_sub(STALE_LOCK_AGE_SECS + 60);
+            std::fs::write(&lock_path, format!("4294967294 {old_ts}")).unwrap();
 
-        let (id, _res) = unique_session_id(&cwd, "stale-cand");
-        assert_eq!(id, "stale-cand", "stale lock was reaped");
+            let (id, _res) = unique_session_id(&cwd, "stale-cand");
+            assert_eq!(id, "stale-cand", "stale lock was reaped");
+        });
     }
 
     /// The [`Reservation`] guard releases the lock on drop, so a failed
     /// save never leaves a permanent lock behind.
     #[test]
     fn reservation_cleans_up_lock_on_drop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("p");
-        std::fs::create_dir(&dir).unwrap();
-        let cwd = dir.to_str().unwrap().to_string();
-        let sdir = session_dir(&cwd);
-        let _ = std::fs::create_dir_all(&sdir);
-        let lock_path = sdir.join(".reservation-drop.lock");
+        // `session_dir` resolves through `XDG_DATA_HOME`; run under the env
+        // lock so a parallel `with_test_env` test can't flip the base dir
+        // between the two `session_dir` evaluations here.
+        with_test_env(|tmp| {
+            let dir = tmp.path().join("p");
+            std::fs::create_dir(&dir).unwrap();
+            let cwd = dir.to_str().unwrap().to_string();
+            let sdir = session_dir(&cwd);
+            let _ = std::fs::create_dir_all(&sdir);
+            let lock_path = sdir.join(".reservation-drop.lock");
 
-        {
-            let (id, _res) = unique_session_id(&cwd, "reservation-drop");
-            assert_eq!(id, "reservation-drop");
-            assert!(lock_path.exists(), "lock exists during reservation");
-            // _res dropped here
-        }
-        assert!(!lock_path.exists(), "lock removed after Reservation::drop");
+            {
+                let (id, _res) = unique_session_id(&cwd, "reservation-drop");
+                assert_eq!(id, "reservation-drop");
+                assert!(lock_path.exists(), "lock exists during reservation");
+                // _res dropped here
+            }
+            assert!(!lock_path.exists(), "lock removed after Reservation::drop");
+        });
     }
 
     /// Two concurrent reservations for the same name get different ids.
     #[test]
     fn concurrent_unique_session_ids_are_different() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("con");
-        std::fs::create_dir(&dir).unwrap();
-        let cwd = std::sync::Arc::new(dir.to_str().unwrap().to_string());
+        // Under the env lock: both threads must resolve the SAME sessions base
+        // dir, and a parallel `with_test_env` test mutating `XDG_DATA_HOME`
+        // could otherwise flip it under one of them (giving both the plain id).
+        with_test_env(|tmp| {
+            let dir = tmp.path().join("con");
+            std::fs::create_dir(&dir).unwrap();
+            let cwd = std::sync::Arc::new(dir.to_str().unwrap().to_string());
 
-        let cwd1 = cwd.clone();
-        let cwd2 = cwd.clone();
-        let t1 = std::thread::spawn(move || {
-            let sdir = session_dir(&cwd1);
-            let _ = std::fs::create_dir_all(&sdir);
-            unique_session_id(&cwd1, "concurrent")
-        });
-        let t2 = std::thread::spawn(move || {
-            let sdir = session_dir(&cwd2);
-            let _ = std::fs::create_dir_all(&sdir);
-            unique_session_id(&cwd2, "concurrent")
-        });
+            let cwd1 = cwd.clone();
+            let cwd2 = cwd.clone();
+            let t1 = std::thread::spawn(move || {
+                let sdir = session_dir(&cwd1);
+                let _ = std::fs::create_dir_all(&sdir);
+                unique_session_id(&cwd1, "concurrent")
+            });
+            let t2 = std::thread::spawn(move || {
+                let sdir = session_dir(&cwd2);
+                let _ = std::fs::create_dir_all(&sdir);
+                unique_session_id(&cwd2, "concurrent")
+            });
 
-        let (id1, _r1) = t1.join().unwrap();
-        let (id2, _r2) = t2.join().unwrap();
-        assert_ne!(id1, id2, "concurrent reservations get different ids");
+            let (id1, _r1) = t1.join().unwrap();
+            let (id2, _r2) = t2.join().unwrap();
+            assert_ne!(id1, id2, "concurrent reservations get different ids");
+        });
     }
 
     // ── corrupt session listing ───────────────────────────────────────────────
