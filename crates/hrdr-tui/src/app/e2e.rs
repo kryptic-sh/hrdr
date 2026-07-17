@@ -3569,8 +3569,10 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     );
 
     // The rule, then the rest of the left padding, then the content.
+    // The in_progress marker is a braille SPINNER frame (first frame at t≈0).
+    let first_frame = "⠋";
     assert!(
-        row(text_y).starts_with(&format!("{} [~] ship it", crate::ui::BORDER_BAR)),
+        row(text_y).starts_with(&format!("{} {first_frame} ship it", crate::ui::BORDER_BAR)),
         "{screen}"
     );
     // Green, where the input pane's is the prompt's mauve.
@@ -5069,8 +5071,10 @@ async fn a_theme_switch_invalidates_transcript_cache() {
     // The new rows are fresh allocations, not reused from the old cache.
     for i in 0..2 {
         assert_ne!(
-            after_render[i], before[i],
-            "entry {} must be rebuilt (different pointer) after theme switch", i + 2
+            after_render[i],
+            before[i],
+            "entry {} must be rebuilt (different pointer) after theme switch",
+            i + 2
         );
     }
 

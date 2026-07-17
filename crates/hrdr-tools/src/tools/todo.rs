@@ -15,7 +15,8 @@ impl Tool for TodoTool {
     }
     fn description(&self) -> &'static str {
         "Replace the task list for the current work. Use it to plan and track multi-step \
-         coding tasks: mark exactly one item `in_progress`, the rest `pending`/`completed`."
+         coding tasks: mark exactly one item `in_progress`, the rest \
+         `pending`/`completed`/`cancelled`."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -28,7 +29,7 @@ impl Tool for TodoTool {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string", "description": "The task, in a few words."},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done."}
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done. cancelled: abandoned."}
                         },
                         "required": ["content", "status"]
                     }
@@ -106,7 +107,7 @@ fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
     Ok(TodoItem { content, status })
 }
 
-/// Map a free-form status string onto one of `pending | in_progress | completed`.
+/// Map a free-form status string onto one of `pending | in_progress | completed | cancelled`.
 /// Unknown values fall back to `pending`, so a bad status never fails the call.
 fn normalize_status(s: &str) -> String {
     match s
@@ -118,6 +119,8 @@ fn normalize_status(s: &str) -> String {
         "completed" | "complete" | "done" | "finished" | "x" | "[x]" => "completed",
         "in_progress" | "inprogress" | "doing" | "active" | "current" | "wip" | "started"
         | "ongoing" => "in_progress",
+        "cancelled" | "canceled" | "canceling" | "cancelling" | "abandoned" | "skipped"
+        | "removed" | "stale" => "cancelled",
         _ => "pending",
     }
     .to_string()
@@ -130,11 +133,12 @@ fn render_todos(todos: &[TodoItem]) -> String {
     let mut out = String::new();
     for t in todos {
         let mark = match t.status.as_str() {
-            "completed" => "x",
+            "completed" => "✓",
+            "cancelled" => "✗",
             "in_progress" => "~",
             _ => " ",
         };
-        out.push_str(&format!("[{mark}] {}\n", t.content));
+        out.push_str(&format!("{mark} {}\n", t.content));
     }
     out
 }

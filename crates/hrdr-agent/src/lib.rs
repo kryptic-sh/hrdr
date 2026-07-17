@@ -8487,6 +8487,51 @@ mod tests {
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }
 
+        /// No nudge when every TODO is either completed or cancelled.
+        #[tokio::test]
+        async fn agent_run_no_nudge_when_todos_completed_or_cancelled() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "All done."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![
+                TodoItem {
+                    content: "write the fix".to_string(),
+                    status: "completed".to_string(),
+                },
+                TodoItem {
+                    content: "skip the other".to_string(),
+                    status: "cancelled".to_string(),
+                },
+            ];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.origin == MessageOrigin::Nudge),
+                "no nudge when every TODO is completed or cancelled"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unfinished TODOs"))),
+                "no nudge Notice: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
         /// Pending TODOs may describe work delegated to a background sub-agent.
         /// While one is running, a text-only response ends normally instead of
         /// injecting a false "continue now" nudge.

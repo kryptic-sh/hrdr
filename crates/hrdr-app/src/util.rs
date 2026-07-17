@@ -7,11 +7,11 @@ use hrdr_agent::{Message, MessageRole, Todo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Age out finished TODO items in place. Stamps each completed item with the
-/// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
-/// any completed item that has been finished for `ttl` turns. Stamps for items
-/// no longer present as completed are forgotten, so a re-completed item ages
-/// from scratch. Pending / in-progress items are kept.
+/// Age out finished/cancelled TODO items in place. Stamps each completed or
+/// cancelled item with the `turn` it was first seen finished (in `stamps`,
+/// keyed by content), then drops any terminal item that has been finished for
+/// `ttl` turns. Stamps for items no longer present as terminal are forgotten,
+/// so a re-finished item ages from scratch. Pending / in-progress items are kept.
 pub fn age_completed_todos(
     todos: &mut Vec<Todo>,
     stamps: &mut HashMap<String, u64>,
@@ -19,12 +19,12 @@ pub fn age_completed_todos(
     ttl: u64,
 ) {
     for t in todos.iter() {
-        if t.status == "completed" {
+        if t.status == "completed" || t.status == "cancelled" {
             stamps.entry(t.content.clone()).or_insert(turn);
         }
     }
     todos.retain(|t| {
-        t.status != "completed"
+        (t.status != "completed" && t.status != "cancelled")
             || stamps
                 .get(&t.content)
                 .is_none_or(|&done| turn.saturating_sub(done) < ttl)
@@ -32,7 +32,7 @@ pub fn age_completed_todos(
     stamps.retain(|content, _| {
         todos
             .iter()
-            .any(|t| t.status == "completed" && &t.content == content)
+            .any(|t| (t.status == "completed" || t.status == "cancelled") && &t.content == content)
     });
 }
 
@@ -546,21 +546,30 @@ mod tests {
     }
 
     #[test]
-    fn completed_todos_age_out_after_ttl() {
+    fn completed_or_cancelled_todos_age_out_after_ttl() {
         const TTL: u64 = 5;
         let mut stamps = HashMap::new();
-        let mut todos = vec![todo("a", "completed"), todo("b", "in_progress")];
-        // Turn it completes and the next TTL-1 turns: still shown.
+        let mut todos = vec![
+            todo("a", "completed"),
+            todo("c", "cancelled"),
+            todo("b", "in_progress"),
+        ];
+        // Turn they finish and the next TTL-1 turns: still shown.
         for turn in 0..TTL {
             age_completed_todos(&mut todos, &mut stamps, turn, TTL);
             assert!(
                 todos.iter().any(|t| t.content == "a"),
                 "completed item should survive turn {turn}"
             );
+            assert!(
+                todos.iter().any(|t| t.content == "c"),
+                "cancelled item should survive turn {turn}"
+            );
         }
         // TTL turns after completion: pruned. The in-progress item stays.
         age_completed_todos(&mut todos, &mut stamps, TTL, TTL);
         assert!(!todos.iter().any(|t| t.content == "a"));
+        assert!(!todos.iter().any(|t| t.content == "c"));
         assert!(todos.iter().any(|t| t.content == "b"));
         assert!(stamps.is_empty(), "stamp forgotten once the item is gone");
     }
@@ -578,11 +587,11 @@ mod tests {
     }
 
     #[test]
-    fn recompleted_item_ages_from_scratch() {
+    fn terminal_item_ages_from_scratch() {
         const TTL: u64 = 5;
         let mut stamps = HashMap::new();
-        // Completed at turn 0.
-        let mut todos = vec![todo("x", "completed")];
+        // Cancelled at turn 0.
+        let mut todos = vec![todo("x", "cancelled")];
         age_completed_todos(&mut todos, &mut stamps, 0, TTL);
         // Model flips it back to in_progress at turn 2 → stamp forgotten.
         todos[0].status = "in_progress".to_string();

@@ -73,7 +73,7 @@ pub const DEFAULT_MAX_OUTPUT_LINES: usize = 1_500;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub content: String,
-    /// `pending` | `in_progress` | `completed`.
+    /// `pending` | `in_progress` | `completed` | `cancelled`.
     #[serde(default = "default_status")]
     pub status: String,
 }

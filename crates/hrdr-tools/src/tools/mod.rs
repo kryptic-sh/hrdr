@@ -981,9 +981,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("[ ] pending task"), "pending: {out}");
-        assert!(out.contains("[~] active task"), "in_progress: {out}");
-        assert!(out.contains("[x] done task"), "completed: {out}");
+        assert!(out.contains("  pending task"), "pending: {out}");
+        assert!(out.contains("~ active task"), "in_progress: {out}");
+        assert!(out.contains("✓ done task"), "completed: {out}");
     }
 
     #[test]
@@ -1017,10 +1017,11 @@ mod tests {
                 {"task": "y", "state": "doing"},   // `task` alias, `state` alias
                 {"text": "z"},                       // no status → pending
                 {"title": "w", "status": "wat"},    // unknown status → pending
+                {"content": "v", "status": "canceled"}, // US spelling → cancelled
             ]
         }))
         .unwrap();
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         assert_eq!(
             (items[0].content.as_str(), items[0].status.as_str()),
             ("x", "completed")
@@ -1036,6 +1037,10 @@ mod tests {
         assert_eq!(
             (items[3].content.as_str(), items[3].status.as_str()),
             ("w", "pending")
+        );
+        assert_eq!(
+            (items[4].content.as_str(), items[4].status.as_str()),
+            ("v", "cancelled")
         );
     }
 

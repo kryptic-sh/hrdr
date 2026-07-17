@@ -569,15 +569,15 @@ impl LiveSubagents {
     }
 }
 
-/// Age out finished TODO items in place. Stamps each completed item with the
-/// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
-/// any completed item that has been finished for `ttl` turns. Stamps for items no
-/// longer present as completed are forgotten, so a re-completed item ages from
-/// scratch. Pending / in-progress items are kept.
+/// Age out finished/cancelled TODO items in place. Stamps each completed or
+/// cancelled item with the `turn` it was first seen finished (in `stamps`,
+/// keyed by content), then drops any terminal item that has been finished for
+/// `ttl` turns. Stamps for items no longer present as terminal are forgotten,
+/// so a re-finished item ages from scratch. Pending / in-progress items are kept.
 ///
 /// This lives beside the agent, not in a frontend, because the TODO list is the
 /// agent's own state: the model reads it every turn. Ageing it only in the TUI
-/// meant a headless run — and every delegated sub-agent — accumulated completed
+/// meant a headless run — and every delegated sub-agent — accumulated terminal
 /// items forever, growing the context they read from.
 pub fn age_completed_todos(
     todos: &mut Vec<hrdr_tools::TodoItem>,
@@ -586,12 +586,12 @@ pub fn age_completed_todos(
     ttl: u64,
 ) {
     for t in todos.iter() {
-        if t.status == "completed" {
+        if t.status == "completed" || t.status == "cancelled" {
             stamps.entry(t.content.clone()).or_insert(turn);
         }
     }
     todos.retain(|t| {
-        t.status != "completed"
+        (t.status != "completed" && t.status != "cancelled")
             || stamps
                 .get(&t.content)
                 .is_none_or(|&done| turn.saturating_sub(done) < ttl)
@@ -599,7 +599,7 @@ pub fn age_completed_todos(
     stamps.retain(|content, _| {
         todos
             .iter()
-            .any(|t| t.status == "completed" && &t.content == content)
+            .any(|t| (t.status == "completed" || t.status == "cancelled") && &t.content == content)
     });
 }
 
@@ -727,23 +727,24 @@ mod tests {
         };
         let mut todos = vec![
             todo("done thing", "completed"),
+            todo("cancelled thing", "cancelled"),
             todo("still going", "in_progress"),
         ];
         let mut stamps = std::collections::HashMap::new();
 
-        // First seen finished on turn 1, with a 2-turn lifetime.
+        // Both completed and cancelled are terminal — aged out together.
         age_completed_todos(&mut todos, &mut stamps, 1, 2);
-        assert_eq!(todos.len(), 2, "a freshly finished item still shows");
+        assert_eq!(todos.len(), 3, "freshly terminal items still show");
 
         age_completed_todos(&mut todos, &mut stamps, 2, 2);
-        assert_eq!(todos.len(), 2, "and lingers for its ttl");
+        assert_eq!(todos.len(), 3, "and linger for their ttl");
 
         age_completed_todos(&mut todos, &mut stamps, 3, 2);
-        assert_eq!(todos.len(), 1, "then it is aged out");
+        assert_eq!(todos.len(), 1, "both aged out together");
         assert_eq!(todos[0].content, "still going");
         assert!(
             stamps.is_empty(),
-            "and its stamp is forgotten, so a re-completed item ages from scratch"
+            "stamps forgotten, so re-finished items age from scratch"
         );
 
         // Unfinished work is never aged out, however long it takes.
