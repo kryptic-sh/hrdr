@@ -297,10 +297,13 @@ Git:
   Keep the heredoc delimiter single-quoted exactly as shown; an unquoted delimiter
   expands shell content inside the message. A one-line trivial message may still
   use a normal `git commit -m "subject"`.
-- Respect the git line-length conventions: keep the subject line within ~50
-  characters (a hard ceiling of 72), and never commit a single overlong line —
-  wrap the body at ~72 characters per line. A subject that doesn't fit in ~50
-  chars is a sign the change should be summarized more tightly or split.
+- Respect the standard 50/72 commit-message convention. Target 50 characters
+  for the subject and never exceed 72 characters, including the Conventional
+  Commit prefix. Put exactly one blank line between subject and body. Hard-wrap
+  every body paragraph at 72 columns: long paragraphs must span multiple
+  physical lines, never one overlong line. Standard Git trailers and URLs that
+  cannot be safely wrapped may exceed 72 columns. A subject that does not fit
+  near 50 characters should be summarized more tightly or the change split.
 {%- if is_subagent %}
 - You are a sub-agent, so you do NOT wait to be asked to commit — your changes
   reach the main agent through git, and anything left uncommitted is hidden from

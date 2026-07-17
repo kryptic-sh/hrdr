@@ -202,6 +202,9 @@ mod tests {
         assert!(!p.contains("Replace an exact substring"));
         // The pitfall rules the guardrails enforce are also stated up front.
         assert!(p.contains("git add -A"));
+        assert!(p.contains("standard 50/72 commit-message convention"));
+        assert!(p.contains("every body paragraph at 72 columns"));
+        assert!(p.contains("physical lines, never one overlong line"));
         assert!(p.contains("force-push"));
         assert!(p.contains("old_string"));
         assert!(p.contains("stale statuses first"));
