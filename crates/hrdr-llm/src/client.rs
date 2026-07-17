@@ -23,6 +23,17 @@ use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 static REQUEST_LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 static REQUEST_LOG_FULL_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static REQUEST_LOG_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Take the one-shot wire-log warning for delivery through the caller's normal
+/// event channel. This avoids writing stderr while a TUI owns the terminal.
+pub fn take_request_log_warning() -> Option<String> {
+    REQUEST_LOG_WARNING
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut warning| warning.take())
+}
 
 fn request_log() -> Option<&'static Mutex<std::fs::File>> {
     REQUEST_LOG
@@ -72,10 +83,14 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
             || line.len() as u64 > MAX_LOG_FILE_BYTES.saturating_sub(current)
         {
             if !REQUEST_LOG_FULL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[hrdr] request logging stopped after reaching {} MiB",
+                let warning = format!(
+                    "request logging stopped after reaching {} MiB",
                     MAX_LOG_FILE_BYTES / (1024 * 1024)
                 );
+                if let Ok(mut pending) = REQUEST_LOG_WARNING.get_or_init(|| Mutex::new(None)).lock()
+                {
+                    *pending = Some(warning);
+                }
             }
             return;
         }

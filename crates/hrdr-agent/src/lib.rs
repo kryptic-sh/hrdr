@@ -5334,6 +5334,9 @@ impl Agent {
             let acc = self
                 .connect_and_drain(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
+            if let Some(warning) = hrdr_llm::take_request_log_warning() {
+                on_event(AgentEvent::Notice(warning));
+            }
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server

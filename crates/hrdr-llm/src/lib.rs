@@ -21,7 +21,9 @@ pub mod fs;
 pub mod sse;
 mod types;
 
-pub use client::{ChatError, ChatErrorKind, ChatStream, Client, url_host, wire_protocol};
+pub use client::{
+    ChatError, ChatErrorKind, ChatStream, Client, take_request_log_warning, url_host, wire_protocol,
+};
 pub use fs::unique_sibling_path;
 pub use sse::{SseDecoder, SseEvent};
 pub use types::{
