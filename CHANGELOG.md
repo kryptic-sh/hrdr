@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`models` tool drops `current` flag on truncated output.** When the
+  available-model list exceeds the tool-output budget, `fit_models_to_budget`
+  rebuilds rows without the `current: true/false` flag, so the truncation path
+  silently strips the flag from every kept row. The truncation loop now
+  re-attaches `current` by matching each kept row's `provider`/`model` back
+  against the active identity.
+- **Active model missing from `models` list without a catalog.** When the cached
+  models.dev catalog is absent (a fresh install, a CI sentinel HOME) and the
+  built-in provider carries no configured model, `available_models` had zero
+  rows for the active provider. A `models available` call would not flag any row
+  `current: true`, breaking `models_flags_the_row_the_agent_is_running_on`.
+  `available_models` now inserts the session's actual model when it is otherwise
+  absent, so the flag always has a row to attach to.
+
+### Changed
+
+- **`watch`-tool CI guidance now covers failure states.** The Shell section's
+  `watch` bullet explains that the check condition must cover BOTH success and
+  failure — `grep -q completed` exits 0 whether CI passed or failed, so `watch`
+  reports any terminal state rather than polling forever on a red run.
+
 ## [0.6.0] - 2026-07-18
 
 ### Changed

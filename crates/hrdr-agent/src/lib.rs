@@ -421,7 +421,19 @@ impl hrdr_tools::Tool for ModelsTool {
                 let warnings = value["warnings"].as_array_mut().expect("array");
                 warnings.pop();
                 warnings.push(truncation_warning(dropped));
-                value["available_models"] = serde_json::Value::Array(kept);
+                // fit_models_to_budget builds bare rows — re-attach `current`
+                // by matching each kept row back to its source AvailableModel.
+                let mut kept_with_current: Vec<serde_json::Value> = Vec::with_capacity(kept.len());
+                for mut r in kept {
+                    if let (Some(provider), Some(model)) =
+                        (r["provider"].as_str(), r["model"].as_str())
+                    {
+                        let is_current = active_provider == provider && active_model == model;
+                        r["current"] = serde_json::Value::Bool(is_current);
+                    }
+                    kept_with_current.push(r);
+                }
+                value["available_models"] = serde_json::Value::Array(kept_with_current);
                 out = serde_json::to_string_pretty(&value)?;
                 if out.len() <= ctx.max_output {
                     break;
