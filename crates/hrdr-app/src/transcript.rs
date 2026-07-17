@@ -342,6 +342,24 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
         // Rendering the input too duplicates every item and can disagree with
         // normalization performed by the tool.
         "todo" => plain(String::new()),
+        // Git: show the subcommand and its args inline, like `git status --short`,
+        // rather than rendering each field as a separate details row.
+        "git" => {
+            let sub = arg_str(&v, "subcommand").unwrap_or_default();
+            let args_str: String = v
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default();
+            plain(format!("{sub}{args_str}"))
+        }
         // `task` and every MCP tool: their arguments, one per row.
         _ => ToolDisplay {
             headline: String::new(),
@@ -868,6 +886,44 @@ mod tool_display_tests {
             "todo",
             r#"{"todos":[{"content":"first","status":"completed"}]}"#,
         );
+        assert_eq!(d.headline, "");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    #[test]
+    fn git_shows_subcommand_and_args_inline() {
+        let d = tool_display(
+            "git",
+            r#"{"subcommand":"status","args":["--short","--branch"]}"#,
+        );
+        assert_eq!(d.headline, "status --short --branch");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    #[test]
+    fn git_without_args_shows_only_subcommand() {
+        let d = tool_display("git", r#"{"subcommand":"log"}"#);
+        assert_eq!(d.headline, "log");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    #[test]
+    fn git_with_empty_args_array_shows_only_subcommand() {
+        let d = tool_display("git", r#"{"subcommand":"status","args":[]}"#);
+        assert_eq!(d.headline, "status");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    #[test]
+    fn git_malformed_args_falls_back_to_empty_headline() {
+        let d = tool_display("git", "not json");
+        assert_eq!(d.headline, "");
+        assert_eq!(d.body, ToolBody::Text);
+    }
+
+    #[test]
+    fn git_no_args_falls_back_to_empty_headline() {
+        let d = tool_display("git", "{}");
         assert_eq!(d.headline, "");
         assert_eq!(d.body, ToolBody::Text);
     }
