@@ -1,6 +1,6 @@
 # hrdr Audit Findings
 
-Date: 2026-07-17 (audit) · Last updated: 2026-07-17 (OAuth store hardening and
+Date: 2026-07-17 (audit) · Last updated: 2026-07-18 (turn-loop extraction and
 verification refresh)
 
 Scope: read-only inspection of the Rust workspace, concentrating on correctness,
@@ -54,14 +54,15 @@ Completed and verified (with review fixes folded in):
   `hrdr_llm::url_host` helper instead of maintaining a duplicate classifier.
 - **P3 README stale release line** — removed.
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
-  lines), lifecycle `hooks.rs` (54 lines), and turn input/delivery state
-  (`turn_state.rs`, 155 lines) extracted with API preserved.
+  lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
+  (`turn_state.rs`, 155 lines), and turn execution (`turn_loop.rs`, ~1.1k lines)
+  extracted with API preserved.
 
 ## Priority map (open items)
 
 | Priority | Finding                                                | Main impact                            |
 | -------- | ------------------------------------------------------ | -------------------------------------- |
-| P1       | `hrdr-agent/src/lib.rs` remains a ~14.8k-line monolith | High change cost and coupled testing   |
+| P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing   |
 | P2       | Credential read-modify-write lacks cross-process lock  | Concurrent credential loss             |
 | P2       | Unbounded internal channels                            | Memory growth under sustained overload |
 | P2       | `$EDITOR` parsing ignores quoting                      | Broken editor invocation               |
@@ -78,14 +79,13 @@ Completed and verified (with review fixes folded in):
 (Promoted from P2 on review: in practice every change to the agent — prompts,
 delegation, pruning, tools — routes through this one file, so its cost is paid
 on every task, not occasionally. `config.rs`, `budget.rs`, lifecycle `hooks.rs`,
-and the turn input/delivery slice are extracted; ~14.6k lines remain.)
+turn input/delivery, and turn execution slices are extracted; ~13.6k lines
+remain.)
 
 ### Remaining extractions, in order
 
-1. `turn` remainder (the run loop, tool execution, streaming, retries, and turn
-   cleanup; distinct from the existing turn-statistics module)
-2. `compaction` and context management (pruning, elision, tail windows)
-3. `delegation` and `worktree` (the `task*` tool family, spawn paths,
+1. `compaction` and context management (pruning, elision, tail windows)
+2. `delegation` and `worktree` (the `task*` tool family, spawn paths,
    transcripts)
 
 ### Verification strategy
