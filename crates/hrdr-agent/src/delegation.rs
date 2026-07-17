@@ -660,13 +660,12 @@ pub(crate) fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.agent_prompt = None;
     base.allowed_tools = None;
     base.read_only = false;
-    base.write_ext = None;
     // Sub-agents never spawn sub-agents, so they never write transcripts.
     base.subagent_transcript_dir = None;
     // ── The session/sub-agent seam ──────────────────────────────────────────
     // A sub-agent is an agent. It keeps every capability the main agent has;
     // what it may *do* is bounded by its type and permissions (`read_only`,
-    // `allowed_tools`, `write_ext`), never by the mere fact that it was
+    // `allowed_tools`), never by the mere fact that it was
     // delegated. Only genuinely structural limits live here:
     //   - it cannot delegate (recursion is bounded to one level), and so
     //   - it writes no sub-agent transcripts of its own.
@@ -920,7 +919,6 @@ pub fn config_for_agent_profile(
     cfg.agent_prompt = profile.prompt.clone();
     cfg.allowed_tools = profile.tools.clone();
     cfg.read_only = profile.is_read_only();
-    cfg.write_ext = profile.write_ext.clone();
     // Per-agent runtime knobs, each inheriting the main agent's when omitted.
     if profile.temperature.is_some() {
         cfg.temperature = profile.temperature;
@@ -1026,13 +1024,6 @@ impl SubagentTool {
                 };
                 if p.is_read_only() {
                     tags.push_str(" · read-only");
-                } else if let Some(exts) = &p.write_ext {
-                    let list = exts
-                        .iter()
-                        .map(|e| format!(".{e}"))
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    tags.push_str(&format!(" · read-only + writes {list}"));
                 }
                 let star = if p.is_proactive() { "★ " } else { "" };
                 desc.push_str(&format!("- {star}{} ({tags})", p.name));
@@ -2065,7 +2056,6 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
                     prompt,
                     read_only,
                     tools,
-                    write_ext,
                     temperature,
                     effort,
                     max_steps,
@@ -2085,9 +2075,6 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
                 }
                 if tools.is_some() {
                     slot.tools = tools;
-                }
-                if write_ext.is_some() {
-                    slot.write_ext = write_ext;
                 }
                 if temperature.is_some() {
                     slot.temperature = temperature;
@@ -2145,7 +2132,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(EXPLORE_PROMPT.to_string()),
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -2163,7 +2149,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(REVIEW_PROMPT.to_string()),
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             // A careful reviewer default: think harder before flagging.
             effort: Some("high".to_string()),
@@ -2182,7 +2167,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(PLAN_PROMPT.to_string()),
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -2202,7 +2186,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(CODER_PROMPT.to_string()),
             read_only: Some(false),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -2220,7 +2203,6 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: None,
             read_only: Some(false),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,

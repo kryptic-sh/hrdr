@@ -210,10 +210,6 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
     // discovered profile can tell "unset" from "set false" (see
     // `SubagentProfile::read_only`).
     let read_only = fm.get("read_only").map(is_true);
-    let write_ext = fm
-        .get("write_ext")
-        .map(|v| v.list())
-        .filter(|l| !l.is_empty());
     // Only an allow-list form is honored (Claude/hrdr). opencode's boolean
     // `tools:` map is nested, so it parses to an empty list here and is ignored.
     let tools = fm.get("tools").map(|v| v.list()).filter(|l| !l.is_empty());
@@ -226,7 +222,6 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
         prompt,
         read_only,
         tools,
-        write_ext,
         temperature,
         effort,
         max_steps,
@@ -396,9 +391,9 @@ fn fm_value_from_yaml(v: serde_yaml_ng::Value) -> Option<FmValue> {
 }
 
 /// Stringify one element of a YAML sequence for [`FmValue::List`]: only
-/// string/number/bool scalars are meaningful list items (a `tools:` or
-/// `write_ext:` list is always these); anything else — including a bare
-/// `null` item — is skipped rather than stringified into a meaningless entry.
+/// string/number/bool scalars are meaningful list items (a `tools:` list is
+/// always these); anything else — including a bare `null` item — is skipped
+/// rather than stringified into a meaningless entry.
 fn scalar_element_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
     match v {
         serde_yaml_ng::Value::String(s) => Some(s.trim().to_string()),

@@ -1,9 +1,8 @@
 //! `replace`: one substitution applied across many files, under the guards.
 //!
 //! The alternative a model reaches for is `bash sed -i`, which is the single
-//! worst mutation path available to it: not held to the `write_ext` allow-list,
-//! and silent about what it changed — a bad regex corrupts the tree and the
-//! model reports success.
+//! worst mutation path available to it: silent about what it changed — a bad
+//! regex corrupts the tree and the model reports success.
 //!
 //! This tool walks the project respecting `.gitignore`, matches a **literal**
 //! string by default (a regex only when asked), and returns a unified diff per
@@ -130,7 +129,6 @@ impl Tool for ReplaceTool {
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
-            ctx.ensure_writable_ext(&path)?;
             // A literal substitution's output size is exactly computable from the
             // hit count, so bound it before allocating: `find="e"`, `replace=50KB`
             // could expand even a single sub-2 MB file into gigabytes. (A regex
@@ -409,42 +407,6 @@ mod tests {
             "x\n",
             "outside the glob"
         );
-    }
-
-    /// The `write_ext` allow-list applies to each file the sweep would rewrite —
-    /// a `plan` sub-agent cannot rename a symbol across `.rs` files.
-    #[tokio::test]
-    async fn the_write_ext_allow_list_applies_to_every_file_touched() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.write_allow_ext = Some(vec!["md".into()]);
-        write(&dir.path().join("a.md"), "old\n").await;
-        write(&dir.path().join("b.rs"), "old\n").await;
-
-        let err = ReplaceTool
-            .execute(json!({"find": "old", "replace": "new"}), &ctx)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("only modify"), "{err}");
-        // Refused before *anything* was written — the allowed `.md` included.
-        // The sweep is all-or-nothing: phase 1 checks every target, phase 2
-        // writes. A half-applied rename across a project is worse than none.
-        assert_eq!(
-            read(&dir.path().join("a.md")).await,
-            "old\n",
-            "the allowed file must not be half-applied"
-        );
-        assert_eq!(read(&dir.path().join("b.rs")).await, "old\n");
-
-        // Scoped to what it may touch, it succeeds.
-        ReplaceTool
-            .execute(
-                json!({"find": "old", "replace": "new", "glob": "*.md"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(read(&dir.path().join("a.md")).await, "new\n");
     }
 
     #[tokio::test]

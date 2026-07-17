@@ -403,8 +403,8 @@ mod tests {
 
     /// The shell gate is a strict sub-case of `can_write` (the shell tools are
     /// mutating, so `has_shell ⇒ can_write`), which means its only effect is to
-    /// split write agents into shelled and shell-less (a normal write sub-agent vs
-    /// a `write_ext` one, or any write agent on a machine with no shell on PATH).
+    /// split write agents into shelled and shell-less (any write agent on a
+    /// machine with no shell on PATH — e.g. an Alpine container without `bash`).
     /// All shell-gated guidance therefore sits at the tail of the `can_write`
     /// block, so those two share every non-shell write section — Scope through
     /// Deleting — before diverging only at the shell tail. Moving the shell

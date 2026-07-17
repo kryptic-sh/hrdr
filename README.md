@@ -686,13 +686,11 @@ prompt = "You are a security reviewer. Focus on authn, injection, and secrets…
 ```
 
 `prompt` is appended to the sub-agent's system prompt (its role); `read_only`
-scopes it to the read-only tools; `write_ext` grants the read-only tools plus
-file writes limited to those extensions (e.g. `write_ext = ["md"]` for a
-doc-only writer); `tools` is an explicit allow-list that takes precedence over
-both. Every write-capable sub-agent automatically runs in a fresh git worktree
-on a scratch branch — auto-removed if it made no changes, otherwise kept with a
-pointer to the branch to review and merge; there's no per-profile setting for
-this.
+scopes it to the read-only tools; `tools` is an explicit allow-list that takes
+precedence over `read_only`. Every write-capable sub-agent automatically runs in
+a fresh git worktree on a scratch branch — auto-removed if it made no changes,
+otherwise kept with a pointer to the branch to review and merge; there's no
+per-profile setting for this.
 
 A profile can also tune the sub-agent's runtime knobs, each inheriting the main
 agent's when omitted: `temperature`, `effort` (`minimal`/`low`/`medium`/`high`),
@@ -716,11 +714,11 @@ don't spawn MCP servers.
 Beyond inline `[[subagent]]` config, hrdr discovers agents from **Markdown
 files** — one agent per file, the body is its system prompt, the frontmatter
 carries the fields above (`description`, `model`, `read_only`, `tools`,
-`write_ext`, `temperature`, `effort`, `max_steps`; the `name` defaults to the
-filename). `model:` is the same one key (`model: zen://grok-code`, or a bare id
-for the main provider; Claude's `model: inherit` means the main agent's
-identity). It reads both the **Claude Code** and **opencode** locations so
-existing agents work as-is:
+`temperature`, `effort`, `max_steps`; the `name` defaults to the filename).
+`model:` is the same one key (`model: zen://grok-code`, or a bare id for the
+main provider; Claude's `model: inherit` means the main agent's identity). It
+reads both the **Claude Code** and **opencode** locations so existing agents
+work as-is:
 
 | Scope   | hrdr                     | Claude Code         | opencode                    |
 | ------- | ------------------------ | ------------------- | --------------------------- |
@@ -804,15 +802,13 @@ an otherwise-blocked command.
 
 The file tools have full filesystem access — hrdr is meant to run in a codebase
 you trust, and a working directory that also let the model reach a sibling repo
-or a generated file just upstream removes a whole class of needless friction.
-`write`-scoped sub-agents (like `plan`) are still held to their extension
-allow-list. On top of that, the read tools refuse known **credential/secret
-files** — SSH and other private keys, `.env`, cloud credentials
-(AWS/GCP/kube/Docker), `.netrc`/`.npmrc`/ `.pypirc`/`.git-credentials`,
-keystores, and the like — so prompt-injected content can't have the agent read
-them out. And `fetch` blocks internal/loopback/private and cloud-metadata hosts
-(SSRF), re-checking on every redirect hop and at connect time so a DNS rebind
-can't slip through.
+or a generated file just upstream removes a whole class of needless friction. On
+top of that, the read tools refuse known **credential/secret files** — SSH and
+other private keys, `.env`, cloud credentials (AWS/GCP/kube/Docker),
+`.netrc`/`.npmrc`/ `.pypirc`/`.git-credentials`, keystores, and the like — so
+prompt-injected content can't have the agent read them out. And `fetch` blocks
+internal/loopback/private and cloud-metadata hosts (SSRF), re-checking on every
+redirect hop and at connect time so a DNS rebind can't slip through.
 
 Add project- or workflow-specific rules in config; they apply on top of the
 built-ins:

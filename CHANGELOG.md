@@ -6,8 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **Extension-scoped writes (`write_ext`) removed.** The `write_ext` field on
+  sub-agent profiles (config `[[subagent]]`, agent-file frontmatter) and on
+  `AgentConfig`, plus `ToolContext::write_allow_ext` and
+  `ToolContext::ensure_writable_ext`, are gone. The only built-in that used it
+  was the `plan` agent, now fully read-only, so the whole extension-gating path
+  (and its checks in `write`/`edit`/`patch`/`replace`/`move`/`delete`/`copy` and
+  the LSP `rename`) served nothing. A `write_ext` key in existing config or
+  frontmatter is now silently ignored; a profile that relied on it for scoped
+  writes should use `read_only` or an explicit `tools` allow-list instead.
+
 ### Changed
 
+- **Made the `plan` sub-agent fully read-only.** It investigates with the
+  read/search tools and returns its implementation plan in its report, rather
+  than persisting a Markdown file. It moves into the read-only sub-agent pool
+  alongside `explore`/`review`.
 - **Moved shell guidance to the tail of the write block.** Because a shell tool
   is itself a mutating tool, `has_shell` implies `can_write` — the shell gate
   only ever splits write agents into shelled and shell-less (a write agent on a

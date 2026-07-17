@@ -201,11 +201,6 @@ pub struct ToolContext {
     /// drops the unseen tail, and a `write` over a file that changed on disk
     /// silently clobbers the change.
     pub read_files: Arc<Mutex<std::collections::HashMap<PathBuf, ReadRecord>>>,
-    /// When set, file-mutating tools (`write`/`edit`/`patch`) may only touch
-    /// files with one of these extensions (case-insensitive, no dot — e.g.
-    /// `["md", "markdown"]`). `None` = any extension. Used to scope a sub-agent
-    /// to writing only certain file types (e.g. a planner that persists Markdown).
-    pub write_allow_ext: Option<Vec<String>>,
     /// Storage root for **project-scoped** [`MemoryTool`] notes (this cwd).
     /// `None` disables project memory.
     pub memory_project: Option<PathBuf>,
@@ -235,7 +230,6 @@ impl ToolContext {
             call_id: None,
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            write_allow_ext: None,
             memory_project: None,
             memory_global: None,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -290,31 +284,6 @@ impl ToolContext {
         // every read-before-mutate check fail forever after.
         let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(canon, ReadRecord { complete, sig });
-    }
-
-    /// Guard for [`write_allow_ext`](Self::write_allow_ext): `Err` when a
-    /// mutating tool targets a file whose extension isn't in the allow-list.
-    /// A no-op when no list is set.
-    pub fn ensure_writable_ext(&self, path: &std::path::Path) -> Result<()> {
-        let Some(allowed) = &self.write_allow_ext else {
-            return Ok(());
-        };
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default();
-        if allowed.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
-            return Ok(());
-        }
-        Err(anyhow!(
-            "this agent may only modify {} files — {} is not allowed",
-            allowed
-                .iter()
-                .map(|e| format!(".{e}"))
-                .collect::<Vec<_>>()
-                .join("/"),
-            path.display()
-        ))
     }
 
     /// Whether the model has read `path` at all this session (any read, partial
@@ -2037,35 +2006,6 @@ b:2:y"
             edit_distance("grep", "write"),
             4,
             "unrelated names are far apart"
-        );
-    }
-
-    #[test]
-    fn write_allow_ext_confines_mutations_to_listed_extensions() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.write_allow_ext = Some(vec!["md".into(), "markdown".into()]);
-        // Listed extensions pass (case-insensitive)…
-        assert!(ctx.ensure_writable_ext(&dir.path().join("PLAN.md")).is_ok());
-        assert!(
-            ctx.ensure_writable_ext(&dir.path().join("a.MARKDOWN"))
-                .is_ok()
-        );
-        // …anything else is refused.
-        let err = ctx
-            .ensure_writable_ext(&dir.path().join("src/main.rs"))
-            .unwrap_err();
-        assert!(err.to_string().contains("only modify"), "{err}");
-        // Extensionless paths aren't in the list → refused.
-        assert!(
-            ctx.ensure_writable_ext(&dir.path().join("Makefile"))
-                .is_err()
-        );
-        // No list → no restriction.
-        ctx.write_allow_ext = None;
-        assert!(
-            ctx.ensure_writable_ext(&dir.path().join("src/main.rs"))
-                .is_ok()
         );
     }
 

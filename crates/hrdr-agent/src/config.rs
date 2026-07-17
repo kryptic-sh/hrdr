@@ -385,10 +385,6 @@ pub struct AgentConfig {
     /// Scope this (sub-)agent to the read-only tools (see
     /// [`ToolRegistry::read_only_names`]). Ignored when `allowed_tools` is set.
     pub read_only: bool,
-    /// Grant this (sub-)agent the read-only tools **plus** file writes limited to
-    /// these extensions (see [`ToolContext::write_allow_ext`]). Takes precedence
-    /// over [`read_only`](Self::read_only); ignored when `allowed_tools` is set.
-    pub write_ext: Option<Vec<String>>,
     /// Shared cell holding the parent session's sub-agent transcript directory
     /// (`sessions/<slug>/subagents/<id>/`), resolved lazily because the session
     /// id is assigned on first autosave, not at construction. The `task` tool
@@ -436,11 +432,6 @@ pub struct SubagentProfile {
     /// Omit for the full default tool set.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
-    /// Grant read-only tools **plus** file writes restricted to these
-    /// extensions (no dot — e.g. `["md"]` for a planner that persists Markdown).
-    /// Takes precedence over `read_only`; ignored when `tools` is set.
-    #[serde(default)]
-    pub write_ext: Option<Vec<String>>,
     /// Sampling temperature for this sub-agent. Omit to inherit the main agent's.
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -842,7 +833,6 @@ impl Default for AgentConfig {
             agent_prompt: None,
             allowed_tools: None,
             read_only: false,
-            write_ext: None,
             subagent_transcript_dir: None,
             lsp: true,
             lsp_wait_ms: None,

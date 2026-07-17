@@ -1125,21 +1125,9 @@ impl Agent {
             tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
-        // wins; else `write_ext` grants the read-only tools plus the writers
-        // (writes are extension-gated below); else the plain read-only set.
+        // wins; else, for a read-only agent, the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
             tools.retain_only(allow);
-        } else if config.write_ext.is_some() {
-            let mut allow = tools.read_only_names();
-            // The mutating tools, all of which gate on `ensure_writable_ext` and
-            // so inherit the extension allow-list. No shell: that would bypass it.
-            allow.extend(
-                [
-                    "write", "edit", "patch", "move", "delete", "copy", "replace",
-                ]
-                .map(String::from),
-            );
-            tools.retain_only(&allow);
         } else if config.read_only {
             let ro = tools.read_only_names();
             tools.retain_only(&ro);
@@ -1152,9 +1140,6 @@ impl Agent {
         ctx.lsp = lsp;
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
-        // An extension-scoped write sub-agent may only touch these extensions
-        // (a user `write_ext` profile — e.g. `["md"]` for a doc-only writer).
-        ctx.write_allow_ext = config.write_ext.clone();
         if let Some((proj, glob)) = &mem_dirs {
             ctx.memory_project = Some(proj.clone());
             ctx.memory_global = Some(glob.clone());
@@ -3256,7 +3241,6 @@ mod tests {
             prompt: Some("Implement precisely.".to_string()),
             read_only: None,
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -3282,7 +3266,6 @@ mod tests {
                 prompt: None,
                 read_only: None,
                 tools: None,
-                write_ext: None,
                 temperature: None,
                 effort: None,
                 max_steps: None,
@@ -3306,7 +3289,6 @@ mod tests {
                     prompt: None,
                     read_only: None,
                     tools: None,
-                    write_ext: None,
                     temperature: None,
                     effort: None,
                     max_steps: None,
@@ -3494,7 +3476,6 @@ mod tests {
             prompt: Some("Review only.".to_string()),
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -3560,7 +3541,6 @@ mod tests {
             prompt: Some("Preserve this persona.".to_string()),
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -3693,7 +3673,6 @@ mod tests {
             // regardless of capability.
             read_only: Some(true),
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -3892,9 +3871,9 @@ mod tests {
         let by = |n: &str| ps.iter().find(|p| p.name == n).unwrap();
         assert!(by("explore").is_read_only());
         assert!(by("review").is_read_only());
-        assert!(by("plan").is_read_only() && by("plan").write_ext.is_none());
-        assert!(!by("coder").is_read_only() && by("coder").write_ext.is_none());
-        assert!(!by("general").is_read_only() && by("general").write_ext.is_none());
+        assert!(by("plan").is_read_only());
+        assert!(!by("coder").is_read_only());
+        assert!(!by("general").is_read_only());
         // explore/review/coder are proactive; plan/general are opt-in.
         assert!(by("explore").is_proactive() && by("review").is_proactive());
         assert!(by("coder").is_proactive());
@@ -3960,10 +3939,8 @@ mod tests {
             .find(|p| p.name == "plan")
             .unwrap();
         let cfg = config_for_agent_profile(&subagent_base_config(&base), &plan).unwrap();
-        // Fully read-only now: no write scoping at all (a dedicated plan-file
-        // capability is future work).
+        // Fully read-only now (a dedicated plan-file capability is future work).
         assert!(cfg.read_only);
-        assert!(cfg.write_ext.is_none());
         let agent = Agent::new(cfg).unwrap();
         let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
         // Read/search tools only — no writers, no shell.
@@ -3991,7 +3968,6 @@ mod tests {
             prompt: None,
             read_only: None,
             tools: None,
-            write_ext: None,
             temperature: t,
             effort: e.map(str::to_string),
             max_steps: s,
@@ -4107,7 +4083,6 @@ mod tests {
                 prompt: None,
                 read_only: None,
                 tools: None,
-                write_ext: None,
                 temperature: None,
                 effort: None,
                 max_steps: None,
@@ -4156,7 +4131,6 @@ mod tests {
                 prompt: Some("Custom review persona.".to_string()),
                 read_only: None,
                 tools: None,
-                write_ext: None,
                 temperature: None,
                 effort: None,
                 max_steps: None,
@@ -10272,7 +10246,6 @@ mod provider_only_policy_tests {
             prompt: Some("Implement.".to_string()),
             read_only: None,
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -10321,7 +10294,6 @@ mod provider_only_policy_tests {
             prompt: None,
             read_only: None,
             tools: None,
-            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,

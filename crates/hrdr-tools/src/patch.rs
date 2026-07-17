@@ -224,7 +224,6 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
             .as_ref()
             .ok_or_else(|| anyhow!("patch section has no file path"))?;
         let path = ctx.resolve(old);
-        ctx.ensure_writable_ext(&path)?;
         match ctx.read_state(&path) {
             crate::ReadState::Unread => {
                 bail!("{}: read it before deleting it via patch", path.display())
@@ -263,7 +262,6 @@ async fn plan_file(fd: &FileDiff, ctx: &ToolContext) -> Result<FileOp> {
     }
 
     let path = ctx.resolve(fd.new_path.as_ref().unwrap());
-    ctx.ensure_writable_ext(&path)?;
     let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
     let base = if exists {
         match ctx.read_state(&path) {

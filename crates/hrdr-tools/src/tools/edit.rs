@@ -102,7 +102,6 @@ impl Tool for EditTool {
             );
         }
         let path = ctx.resolve(&a.path);
-        ctx.ensure_writable_ext(&path)?;
         // `edit` matches `old_string` against the file's live on-disk content, so
         // a partial read is fine — but the model must have read it at all, and its
         // view must not be stale (a change on disk since could move or erase the

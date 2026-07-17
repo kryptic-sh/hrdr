@@ -38,13 +38,6 @@ struct RenameArgs {
 
 /// Resolve (path, line, symbol) to the request inputs: the file's current
 /// content and the 0-based UTF-16 position of the symbol on that line.
-///
-/// Deliberately does **not** call [`ToolContext::ensure_writable_ext`] — this
-/// is shared by the read-only `definition`/`references` tools too, and that
-/// check exists to scope a sub-agent's *writes* (e.g. `write_allow_ext =
-/// ["md"]`). Applying it here rejected a plain navigation of a `.rs` file
-/// with a misleading "may only modify .md files", even though nothing was
-/// being modified. `RenameTool`, which does write, checks it itself instead.
 async fn locate(
     ctx: &ToolContext,
     path: &str,
@@ -251,7 +244,6 @@ impl Tool for RenameTool {
         // write-scoped sub-agent's allowed extensions for the file the
         // symbol was found in, not just the (already separately checked)
         // files the server's edit ends up touching.
-        ctx.ensure_writable_ext(&path)?;
         let result = registry(ctx)?
             .nav_request(
                 "textDocument/rename",
@@ -275,7 +267,6 @@ impl Tool for RenameTool {
         // confinement plus a clean application of every file's edits.
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {
-            ctx.ensure_writable_ext(&file.path)?;
             let before = tokio::fs::read_to_string(&file.path)
                 .await
                 .with_context(|| format!("reading {}", file.path.display()))?;
@@ -307,81 +298,5 @@ impl Tool for RenameTool {
             ),
             ctx.max_output,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression (MINOR): `locate` is shared by the read-only
-    /// `definition`/`references` tools and the writing `rename` tool. Before
-    /// the fix it ran `ctx.ensure_writable_ext` unconditionally, so a
-    /// sub-agent scoped to e.g. `write_allow_ext = ["md"]` got "may only
-    /// modify .md files" when merely navigating a `.rs` file — even though
-    /// nothing was being modified. With LSP left disabled (the
-    /// `ToolContext::new` default), the call now fails for the *next* reason
-    /// in the pipeline instead — "LSP support is disabled" — proving the
-    /// write-ext gate no longer runs first for a read-only nav tool.
-    #[tokio::test]
-    async fn definition_is_not_blocked_by_write_allow_ext() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.write_allow_ext = Some(vec!["md".to_string()]);
-
-        let err = DefinitionTool
-            .execute(json!({"path": "a.rs", "line": 1, "symbol": "main"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            !err.contains("may only modify"),
-            "a read-only nav tool must not be blocked by write_allow_ext: {err}"
-        );
-        assert!(err.contains("LSP support is disabled"), "{err}");
-    }
-
-    /// The same scenario for `references` — also read-only, also shares
-    /// `locate`.
-    #[tokio::test]
-    async fn references_is_not_blocked_by_write_allow_ext() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.write_allow_ext = Some(vec!["md".to_string()]);
-
-        let err = ReferencesTool
-            .execute(json!({"path": "a.rs", "line": 1, "symbol": "main"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            !err.contains("may only modify"),
-            "a read-only nav tool must not be blocked by write_allow_ext: {err}"
-        );
-        assert!(err.contains("LSP support is disabled"), "{err}");
-    }
-
-    /// `rename` **does** write, so — unlike `definition`/`references` — it
-    /// must still honour `write_allow_ext` for the file the symbol was found
-    /// in; that check just moved from the shared `locate` into `RenameTool`
-    /// itself.
-    #[tokio::test]
-    async fn rename_is_still_blocked_by_write_allow_ext() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-        let mut ctx = ToolContext::new(dir.path());
-        ctx.write_allow_ext = Some(vec!["md".to_string()]);
-
-        let err = RenameTool
-            .execute(
-                json!({"path": "a.rs", "line": 1, "symbol": "main", "new_name": "run"}),
-                &ctx,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("may only modify"), "{err}");
     }
 }

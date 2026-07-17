@@ -1,11 +1,10 @@
 //! Guarded file operations: `move`, `delete`, `copy`.
 //!
 //! The shells can already do all three, but a shell mutation escapes the safety
-//! net the file tools sit behind: it is not held to a sub-agent's `write_ext`
-//! allow-list. These tools route the same operations through
-//! [`ToolContext::ensure_writable_ext`], which also makes them available to
-//! extension-scoped sub-agents that have no shell at all (e.g. a `write_ext =
-//! ["md"]` profile can create, rename, and delete markdown, and nothing else).
+//! net the file tools sit behind — most notably the read-before-mutate gate
+//! ([`guard_victim`]): the model must have seen a file before it destroys it.
+//! These tools also make the operations available to sub-agents that have no
+//! shell at all.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,18 +13,10 @@ use serde_json::json;
 
 use crate::{Tool, ToolContext};
 
-/// Guard a path that is about to be created or overwritten: inside the working
-/// directory, and of a permitted extension for this agent.
-fn guard_dest(ctx: &ToolContext, path: &std::path::Path) -> Result<()> {
-    ctx.ensure_writable_ext(path)
-}
-
 /// Guard a path whose current contents are about to disappear (the source of a
-/// move, or the target of a delete). Same confinement, plus the read-before-
-/// mutate gate the other tools apply: the model must have seen what it's about
-/// to destroy.
+/// move, or the target of a delete): the read-before-mutate gate the other
+/// tools apply — the model must have seen what it's about to destroy.
 async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> Result<()> {
-    ctx.ensure_writable_ext(path)?;
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         bail!(
             "{} does not exist — relative paths resolve against the project root ({}); \
@@ -94,7 +85,6 @@ impl Tool for MoveTool {
         let from = ctx.resolve(&a.from);
         let to = ctx.resolve(&a.to);
         guard_victim(ctx, &from, "move").await?;
-        guard_dest(ctx, &to)?;
         if from.is_dir() {
             reject_descendant_destination(&from, &to)?;
         }
@@ -112,7 +102,6 @@ impl Tool for MoveTool {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         guard_victim(ctx, &from, "move").await?;
-        guard_dest(ctx, &to)?;
         rename_or_copy(&from, &to)
             .await
             .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
@@ -399,7 +388,6 @@ impl Tool for CopyTool {
                 from.display()
             );
         }
-        ctx.ensure_writable_ext(&from)?;
         if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
             bail!(
                 "{} does not exist — relative paths resolve against the project root ({}); \
@@ -408,7 +396,6 @@ impl Tool for CopyTool {
                 ctx.cwd.display()
             );
         }
-        guard_dest(ctx, &to)?;
         if from.is_dir() {
             reject_descendant_destination(&from, &to)?;
         }
@@ -425,8 +412,6 @@ impl Tool for CopyTool {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        ctx.ensure_writable_ext(&from)?;
-        guard_dest(ctx, &to)?;
         if from.is_dir() {
             staged_copy_dir(&from, &to).await?;
             Ok(format!("Copied {}/ → {}/", from.display(), to.display()))
@@ -588,39 +573,6 @@ mod tests {
                 .unwrap(),
             "a"
         );
-    }
-
-    /// The `write_ext` gate (an extension-scoped write sub-agent) applies to the
-    /// destination *and* the source: neither renaming a `.rs` away nor renaming a
-    /// `.md` into one.
-    #[tokio::test]
-    async fn move_honors_the_write_ext_allow_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = ctx(dir.path());
-        c.write_allow_ext = Some(vec!["md".into()]);
-        write(&dir.path().join("a.md"), "x").await;
-        write(&dir.path().join("code.rs"), "x").await;
-        c.mark_read(&dir.path().join("a.md"));
-        c.mark_read(&dir.path().join("code.rs"));
-
-        // md → rs: the destination is not writable.
-        let err = MoveTool
-            .execute(json!({"from": "a.md", "to": "a.rs"}), &c)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("only modify"), "{err}");
-        // rs → md: the source is not the agent's to remove.
-        let err = MoveTool
-            .execute(json!({"from": "code.rs", "to": "code.md"}), &c)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("only modify"), "{err}");
-        // md → md is fine.
-        MoveTool
-            .execute(json!({"from": "a.md", "to": "b.md"}), &c)
-            .await
-            .unwrap();
-        assert!(dir.path().join("b.md").exists());
     }
 
     #[tokio::test]
