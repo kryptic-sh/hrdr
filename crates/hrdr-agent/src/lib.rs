@@ -5403,6 +5403,11 @@ fn new_delegation_runtime(
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
+        if let Some(cap) = config.max_cost
+            && (!cap.is_finite() || cap < 0.0)
+        {
+            bail!("max_cost must be finite and non-negative");
+        }
         let mut tools = ToolRegistry::with_defaults();
         // The identity's endpoint is ADOPTED from the config, not re-derived: those
         // fields are what an earlier `resolve()` produced for this identity — at the
@@ -6402,6 +6407,7 @@ impl Agent {
             req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
             req.extend(history);
             req.push(ChatMessage::user(trigger.clone()));
+            self.budget_preflight().await?;
             match self.plain_completion(req).await {
                 Ok(s) => break s,
                 Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
@@ -6446,11 +6452,60 @@ impl Agent {
         Ok((before, self.messages.len()))
     }
 
+    async fn budget_preflight(&mut self) -> Result<()> {
+        let Some(cap) = self.max_cost else {
+            return Ok(());
+        };
+        let spent = *self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
+        if spent >= cap {
+            bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
+        }
+        if self.current_cost_rates().await.is_none() {
+            let model = self.resolved.reference();
+            bail!(
+                "cost budget cannot be enforced for unpriced model {model}; \
+                 remove max_cost or choose a priced model"
+            );
+        }
+        Ok(())
+    }
+
+    async fn account_usage(
+        &mut self,
+        acc: &Accumulator,
+    ) -> (u32, u32, Option<u32>, Option<f64>, Option<f64>) {
+        let (prompt_tokens, completion_tokens) = match &acc.usage {
+            Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
+            None => (
+                estimate_tokens_in_messages(&self.messages),
+                estimate_tokens(&acc.content),
+            ),
+        };
+        let cached_prompt_tokens = acc.usage.as_ref().and_then(|usage| usage.cached_tokens());
+        let cost_usd = self
+            .current_cost_rates()
+            .await
+            .map(|rates| rates.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
+        let session_cost_usd = {
+            let mut total = self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
+            *total += cost_usd.unwrap_or(0.0);
+            (*total > 0.0).then_some(*total)
+        };
+        (
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens,
+            cost_usd,
+            session_cost_usd,
+        )
+    }
+
     /// Run one no-tools request to completion, returning the streamed text.
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
-    async fn plain_completion(&self, req: Vec<ChatMessage>) -> Result<String> {
+    async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
         let mut stream = self.client.chat_stream(&req, &[]).await?;
         let acc = drain_stream(&mut stream, &mut |_| {}).await?;
+        self.account_usage(&acc).await;
         Ok(acc.into_message().content.unwrap_or_default())
     }
 
@@ -6715,24 +6770,9 @@ impl Agent {
             self.maybe_self_compact(&mut on_event).await;
             // Cost budget: stop before issuing another model call once the
             // session's estimated spend (incl. sub-agents) reaches the cap.
-            if let Some(cap) = self.max_cost {
-                let spent = *self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
-                if spent >= cap {
-                    on_event(AgentEvent::Notice(format!(
-                        "cost budget exhausted (est. ${spent:.2} of ${cap:.2}) — stopping"
-                    )));
-                    bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
-                }
-                if self.current_cost_rates().await.is_none() {
-                    let model = self.resolved.reference();
-                    on_event(AgentEvent::Notice(format!(
-                        "cost budget cannot be enforced: {model} has no catalog price"
-                    )));
-                    bail!(
-                        "cost budget cannot be enforced for unpriced model {model}; \
-                         remove max_cost or choose a priced model"
-                    );
-                }
+            if let Err(error) = self.budget_preflight().await {
+                on_event(AgentEvent::Notice(error.to_string()));
+                return Err(error);
             }
             // Stream one assistant turn, accumulating text + tool calls. The
             // connect is retried on transient errors and auto-compacted once on
@@ -6748,25 +6788,13 @@ impl Agent {
             // estimate so the context bar and compaction still work — an estimate
             // beats a stale/zero reading, and the overflow-retry path covers any
             // under-estimate.
-            let (prompt_tokens, completion_tokens) = match &acc.usage {
-                Some(u) => (u.prompt_tokens, u.completion_tokens),
-                None => (
-                    estimate_tokens_in_messages(&self.messages),
-                    estimate_tokens(&acc.content),
-                ),
-            };
-            let cached_prompt_tokens = acc.usage.as_ref().and_then(|u| u.cached_tokens());
-            // Price the call with the current model's catalog card and add it
-            // to the session counter (shared with delegated sub-agents).
-            let cost_usd = self
-                .current_cost_rates()
-                .await
-                .map(|r| r.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
-            let session_cost_usd = {
-                let mut t = self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
-                *t += cost_usd.unwrap_or(0.0);
-                (*t > 0.0).then_some(*t)
-            };
+            let (
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+                cost_usd,
+                session_cost_usd,
+            ) = self.account_usage(&acc).await;
             self.last_prompt_tokens = Some(prompt_tokens);
             on_event(AgentEvent::Usage {
                 prompt_tokens,
@@ -6869,12 +6897,29 @@ impl Agent {
         // protocol intact) is restored right after, so later turns still see
         // accurate tool-call pairing.
         let flattened = flatten_tool_protocol(&self.messages);
+        if let Err(error) = self.budget_preflight().await {
+            on_event(AgentEvent::Notice(error.to_string()));
+            return Err(error);
+        }
         let real_messages = std::mem::replace(&mut self.messages, flattened);
         let acc = self
             .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
             .await;
         self.messages = real_messages;
         let acc = acc?;
+        let (prompt_tokens, completion_tokens, cached_prompt_tokens, cost_usd, session_cost_usd) =
+            self.account_usage(&acc).await;
+        on_event(AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens,
+            reasoning_tokens: acc
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.reasoning_tokens()),
+            cost_usd,
+            session_cost_usd,
+        });
         let mut wrap_up_reply = acc.into_message();
         ensure_assistant_has_content(&mut wrap_up_reply);
         self.messages.push(wrap_up_reply);

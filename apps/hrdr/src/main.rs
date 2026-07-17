@@ -557,6 +557,11 @@ async fn main() -> Result<()> {
             max_cost,
             prompt,
         }) => {
+            if let Some(cost) = max_cost
+                && (!cost.is_finite() || cost < 0.0)
+            {
+                anyhow::bail!("--max-cost must be a finite, non-negative number");
+            }
             if let Some(n) = max_steps {
                 config.max_steps = n;
             }
