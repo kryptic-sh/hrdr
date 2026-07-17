@@ -959,8 +959,13 @@ fn build_system_prompt(
     persona: Option<&str>,
     is_subagent: bool,
 ) -> Result<String> {
-    let system = render_system(tools, cwd, docs, is_subagent)?;
-    Ok(append_persona(append_memory(system, memory), persona))
+    let system = render_system(tools, docs, is_subagent)?;
+    let system = append_memory(system, memory);
+    // Environment (incl. the working directory) goes out last — after memory —
+    // so the volatile `cwd` line is the tail of the prompt and everything before
+    // it stays a cache-shareable prefix across sibling sub-agents.
+    let system = prompt::append_environment(system, cwd, tools);
+    Ok(append_persona(system, persona))
 }
 
 /// The initial delegation-runtime projection for `config`. The single place the

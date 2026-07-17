@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **System prompt reordered for prefix-cache reuse.** The prompt template
+  (`system.j2`) now leads with the sections common to every agent (identity,
+  workflow, reporting, untrusted-content, safety) and pushes the
+  capability-gated sections (`can_write`, `can_delegate`, `is_subagent`) after
+  them, with the AGENTS.md project instructions last in the body. The volatile
+  environment block — tool list, OS, date, and **working directory** — no longer
+  sits at the top; `render_system` returns just the shared body, and a new
+  `prompt::append_environment` appends that block at the very end, after the
+  memory block. Because the working directory (the one line that differs between
+  sibling write sub-agents in their separate worktrees) is now the tail of the
+  prompt, six sub-agents spawned from one batch share a byte-identical prefix
+  through the base prompt, AGENTS.md, and memory — so a prefix cache covers all
+  of it. `render_system` drops its `cwd` argument; the instructions-source line
+  of the untrusted-content section is now unconditional (identical bytes for
+  main and sub-agents) and the sub-agent worktree note refers to the working
+  directory in the trailing Environment section rather than "above".
 - **Smaller default tool-output threshold.** A single tool call's output now
   stays inline up to **50 lines or 5 KiB** (was 1,500 lines / 24 KiB); larger
   output is saved whole to a file and the model gets its path to `grep`/`read`.
