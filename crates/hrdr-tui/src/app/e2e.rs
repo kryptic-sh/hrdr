@@ -3310,6 +3310,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
             last_completion_tokens: Some(120),
             context_window: Some(64_000),
             cost_usd: 0.0,
+            cost_partial: false,
         },
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),

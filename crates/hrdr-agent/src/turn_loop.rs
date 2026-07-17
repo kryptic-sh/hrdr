@@ -530,6 +530,7 @@ impl Agent {
                 reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
                 cost_usd,
                 session_cost_usd,
+                cost_partial: self.session_cost_partial(),
             });
 
             // The reply hit the output cap — warn so a silently-truncated answer
@@ -682,6 +683,7 @@ impl Agent {
                 .and_then(|usage| usage.reasoning_tokens()),
             cost_usd,
             session_cost_usd,
+            cost_partial: self.session_cost_partial(),
         });
         let mut wrap_up_reply = acc.into_message();
         ensure_assistant_has_content(&mut wrap_up_reply);

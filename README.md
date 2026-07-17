@@ -463,6 +463,12 @@ max_write_subagents = 2        # HRDR_MAX_WRITE_SUBAGENTS, --max-write-subagents
 # spend (USD, priced from the models.dev catalog, sub-agents included) reaches
 # the cap. `hrdr run --max-cost <USD>` overrides per run. Unset = unlimited.
 max_cost = 5.0
+
+# By default a capped run refuses an unpriced model (a local server the catalog
+# can't price), since its ceiling can't be enforced. Set this (or pass
+# `hrdr run --allow-unpriced`) to let those calls run UNCOUNTED while priced
+# usage is still capped — the reported total is then a floor ("≥ $X").
+allow_unpriced = false
 ```
 
 `auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.

@@ -23,6 +23,19 @@ pub fn fmt_cost(usd: f64) -> String {
     }
 }
 
+/// [`fmt_cost`], flagged when the figure is only a floor because unpriced
+/// (local/uncatalogued) usage was left out of it. A truthful total never
+/// silently omits calls: `$1.24` when complete, `≥ $1.24 (excludes unpriced
+/// usage)` when some calls this session couldn't be priced (only possible under
+/// `allow_unpriced`).
+pub fn fmt_cost_maybe_partial(usd: f64, partial: bool) -> String {
+    if partial {
+        format!("≥ {} (excludes unpriced usage)", fmt_cost(usd))
+    } else {
+        fmt_cost(usd)
+    }
+}
+
 /// Human-friendly elapsed time since `then`, with compound units for the larger
 /// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 pub fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
@@ -103,6 +116,18 @@ mod tests {
         assert_eq!(fmt_cost(0.0042), "$0.0042");
         assert_eq!(fmt_cost(0.0), "$0.00");
         assert_eq!(fmt_cost(1.237), "$1.24");
+    }
+
+    #[test]
+    fn fmt_cost_partial_marks_an_incomplete_total() {
+        // Complete total is shown bare.
+        assert_eq!(fmt_cost_maybe_partial(1.237, false), "$1.24");
+        // A total that excluded unpriced usage is a floor, and says so — never a
+        // bare figure that looks complete.
+        assert_eq!(
+            fmt_cost_maybe_partial(1.237, true),
+            "≥ $1.24 (excludes unpriced usage)"
+        );
     }
 
     #[test]

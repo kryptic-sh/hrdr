@@ -118,6 +118,14 @@ pub struct AgentConfig {
     /// unlimited. Estimates come from the models.dev catalog; a capped run
     /// refuses an unpriced model because its ceiling cannot be enforced.
     pub max_cost: Option<f64>,
+    /// Opt-in escape hatch for [`max_cost`](Self::max_cost) on an unpriced model
+    /// (a local server the catalog can't price). Default `false` keeps the
+    /// fail-closed behavior: a capped run refuses an unpriced model. When
+    /// `true`, calls on an unpriced model proceed and are simply *not counted*
+    /// toward the cap — priced usage still counts and the cap still enforces on
+    /// it. Any run that skipped unpriced calls this way reports its cost total
+    /// as a floor ("≥ $X"), never a complete-looking figure.
+    pub allow_unpriced: bool,
     /// The USER-CONFIGURED context window (`context_window` in config.toml, or a
     /// `[providers.<name>].context_window`), in tokens — for the status bar's
     /// "X of Y" and the auto-compaction trigger.
@@ -569,6 +577,7 @@ pub(crate) struct FileConfig {
     pub(crate) request_timeout: Option<u64>,
     pub(crate) prompt_cache_ttl: Option<String>,
     pub(crate) max_cost: Option<f64>,
+    pub(crate) allow_unpriced: Option<bool>,
     pub(crate) subagents: Option<bool>,
     pub(crate) memory: Option<bool>,
     pub(crate) memory_dir: Option<String>,
@@ -656,6 +665,7 @@ impl Default for AgentConfig {
             temperature: None,
             max_steps: 300,
             max_cost: None,
+            allow_unpriced: false,
             context_window: None,
             max_tokens: None,
             top_p: None,
@@ -1192,6 +1202,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.max_cost {
             self.max_cost = Some(v);
+        }
+        if let Some(v) = fc.allow_unpriced {
+            self.allow_unpriced = v;
         }
         if let Some(v) = fc.subagents {
             self.subagents = v;

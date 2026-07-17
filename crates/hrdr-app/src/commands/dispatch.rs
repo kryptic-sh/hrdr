@@ -94,7 +94,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let (tokens_in, tokens_out) = host.session_tokens();
             let cost = host.session_cost();
             let cost_line = if cost > 0.0 {
-                format!("\ncost: {} (est.)", crate::fmt_cost(cost))
+                let s = crate::fmt_cost_maybe_partial(cost, host.session_cost_partial());
+                format!("\ncost: {s} (est.)")
             } else {
                 String::new()
             };
@@ -493,7 +494,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let mut line = format!("session tokens: ↑{tokens_in} input · ↓{tokens_out} output");
             let cost = host.session_cost();
             if cost > 0.0 {
-                line.push_str(&format!(" · est. {}", crate::fmt_cost(cost)));
+                let s = crate::fmt_cost_maybe_partial(cost, host.session_cost_partial());
+                line.push_str(&format!(" · est. {s}"));
             }
             host.info(line);
         }

@@ -553,6 +553,11 @@ pub enum AgentEvent {
         /// every delegated sub-agent's (they share the counter). `None` until
         /// any call has been priced.
         session_cost_usd: Option<f64>,
+        /// `true` once some call this session ran on an unpriced model and was
+        /// excluded from `session_cost_usd` (only under `allow_unpriced`). A
+        /// frontend showing the total must then flag it a floor (`≥ $X`), never
+        /// a complete-looking figure.
+        cost_partial: bool,
     },
     /// The durable chat history right after a completed tool round — every
     /// result committed, no dangling `tool_calls`. Emitted so a frontend can
@@ -726,6 +731,7 @@ fn spawn_background(
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     handles: &BgHandles,
     cost_total: Arc<std::sync::Mutex<f64>>,
+    cost_partial: Arc<std::sync::atomic::AtomicBool>,
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     transcript_dir: SubagentDirCell,
     live: LiveSubagents,
@@ -766,6 +772,7 @@ fn spawn_background(
         .zip(repo_cwd)
         .map(|(w, repo)| (repo, w.branch.clone()));
     sub.cost_total = cost_total;
+    sub.cost_partial = cost_partial;
     sub.attach_live(live.clone(), live_key);
     sub.ctx.lsp = lsp;
     let steering = steering_queue();
@@ -1702,6 +1709,10 @@ struct SubagentTool {
     /// adds its spend to it, so `/cost` and the `max_cost` budget see the
     /// whole tree, not just the main loop.
     cost_total: Arc<std::sync::Mutex<f64>>,
+    /// The owning agent's "cost total is a floor" flag — a sub-agent that runs
+    /// an unpriced call (with `allow_unpriced`) sets it, so the whole tree's
+    /// reported total admits it excludes unpriced usage.
+    cost_partial: Arc<std::sync::atomic::AtomicBool>,
     /// The owning agent's language servers, shared with every sub-agent (the
     /// base config has `lsp = false`, so none builds a registry of its own).
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
@@ -1721,6 +1732,7 @@ impl SubagentTool {
         profiles: Vec<SubagentProfile>,
         bg_handles: BgHandles,
         cost_total: Arc<std::sync::Mutex<f64>>,
+        cost_partial: Arc<std::sync::atomic::AtomicBool>,
         lsp: Option<Arc<hrdr_tools::LspRegistry>>,
         transcript_dir: SubagentDirCell,
         live: LiveSubagents,
@@ -1790,6 +1802,7 @@ impl SubagentTool {
             caps,
             slots: Arc::new(SubagentSlots::default()),
             cost_total,
+            cost_partial,
             lsp,
             transcript_dir,
             live,
@@ -2033,6 +2046,7 @@ impl hrdr_tools::Tool for SubagentTool {
             &ctx.background_tasks,
             &self.bg_handles,
             Arc::clone(&self.cost_total),
+            Arc::clone(&self.cost_partial),
             self.lsp.clone(),
             self.transcript_dir.clone(),
             self.live.clone(),
@@ -3713,6 +3727,12 @@ pub struct Agent {
     /// every delegated sub-agent's (the `task` tool hands each sub-agent this
     /// same counter). Std mutex — held only long enough to add.
     cost_total: Arc<std::sync::Mutex<f64>>,
+    /// Set once any call in this session ran on an unpriced model and was
+    /// therefore excluded from `cost_total` (only reachable with
+    /// [`AgentConfig::allow_unpriced`]). Shared across the whole sub-agent tree
+    /// like `cost_total`, so a single unpriced call anywhere makes the reported
+    /// session total a floor ("≥ $X"), not a complete figure.
+    cost_partial: Arc<std::sync::atomic::AtomicBool>,
     /// Price-card memo for the current identity, so the catalog isn't re-read on
     /// every usage event. The inner `None` remembers an unpriced model (e.g. a
     /// local server).
@@ -3720,6 +3740,9 @@ pub struct Agent {
     /// Abort the turn before the next model call once `cost_total` reaches
     /// this many USD ([`AgentConfig::max_cost`]).
     max_cost: Option<f64>,
+    /// Let a capped run proceed on an unpriced model, excluding those calls from
+    /// the cap ([`AgentConfig::allow_unpriced`]). `false` = fail closed.
+    allow_unpriced: bool,
     /// Lifecycle hooks from `[[hooks]]` entries with an `event` (the
     /// event-less entries become the post-edit file hooks in `ctx.hooks`).
     /// Arc: cloned into each tool call's future for the pre/post tool events.
@@ -3902,6 +3925,8 @@ impl Agent {
         let mut agent_names: Vec<String> = Vec::new();
         let bg_handles: BgHandles = bg_handles();
         let cost_total: Arc<std::sync::Mutex<f64>> = Arc::new(std::sync::Mutex::new(0.0));
+        let cost_partial: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Post-edit diagnostics: the session's language servers. Custom
         // `[[lsp.servers]]` are consulted before the built-ins so they win for
         // their extensions. Built before the `task` tool so sub-agents share
@@ -3966,6 +3991,7 @@ impl Agent {
                 profiles,
                 Arc::clone(&bg_handles),
                 Arc::clone(&cost_total),
+                Arc::clone(&cost_partial),
                 lsp.clone(),
                 config.subagent_transcript_dir.clone(),
                 live_subagents.clone(),
@@ -4163,8 +4189,10 @@ impl Agent {
             agent_names,
             bg_handles,
             cost_total,
+            cost_partial,
             cost_rates: None,
             max_cost: config.max_cost,
+            allow_unpriced: config.allow_unpriced,
             event_hooks,
         })
     }
@@ -7167,6 +7195,7 @@ mod tests {
             vec![profile],
             Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(0.0f64)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             None,
             super::LiveSubagents::new(),
@@ -9876,6 +9905,7 @@ mod tests {
             max_readonly_subagents: None,
             max_write_subagents: None,
             max_cost: Some(2.5),
+            allow_unpriced: Some(true),
             api_key: Some("key123".to_string()),
             model: Some(spec("zen://gpt-4")),
             temperature: Some(0.5),
@@ -9942,6 +9972,7 @@ mod tests {
         assert_eq!(cfg.request_timeout, Some(30));
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
         assert_eq!(cfg.max_cost, Some(2.5));
+        assert!(cfg.allow_unpriced);
         assert!(!cfg.subagents);
         assert!(!cfg.memory);
         assert_eq!(
@@ -11476,6 +11507,93 @@ mod tests {
             );
         }
 
+        /// Default (fail-closed): a `max_cost` run refuses an unpriced model at
+        /// preflight, before any model call. The model is pinned unpriced via the
+        /// price memo so the check is deterministic and never reads the catalog.
+        #[tokio::test]
+        async fn max_cost_refuses_unpriced_model_by_default() {
+            let server = MockServer::start(vec![]).await; // must never be hit
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_cost = Some(5.0); // allow_unpriced defaults false
+            let mut agent = Agent::new(cfg).unwrap();
+            let key = agent.resolved.reference().clone();
+            agent.cost_rates = Some((key, None)); // unpriced
+            let mut events: Vec<AgentEvent> = Vec::new();
+            let err = agent
+                .run("hi", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("unpriced model"),
+                "unpriced refusal: {err}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unpriced model"))),
+                "a Notice explains the refusal: {events:?}"
+            );
+        }
+
+        /// `allow_unpriced` lets the same capped run proceed on the unpriced
+        /// model; the call is excluded from the counter, so the session total is
+        /// reported as a floor (partial) and the `Usage` event admits it.
+        #[tokio::test]
+        async fn allow_unpriced_lets_a_capped_run_proceed_and_marks_it_partial() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "hi back"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_cost = Some(5.0);
+            cfg.allow_unpriced = true;
+            let mut agent = Agent::new(cfg).unwrap();
+            let key = agent.resolved.reference().clone();
+            agent.cost_rates = Some((key, None)); // unpriced, deterministic
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("hi", steering_queue(), |ev| events.push(ev))
+                .await
+                .expect("the unpriced call proceeds under allow_unpriced");
+            assert!(
+                agent.session_cost_partial(),
+                "an excluded unpriced call makes the total a floor"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Usage {
+                        cost_partial: true,
+                        ..
+                    }
+                )),
+                "the usage event admits it excludes unpriced usage: {events:?}"
+            );
+        }
+
+        /// `allow_unpriced` does NOT disable the cap: once counted (priced) spend
+        /// reaches it, the run still stops. Seeding the counter past the cap
+        /// stands in for that priced spend (the counter is the enforcement point).
+        #[tokio::test]
+        async fn allow_unpriced_still_enforces_the_cap_on_counted_spend() {
+            let server = MockServer::start(vec![]).await; // must never be hit
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_cost = Some(1.0);
+            cfg.allow_unpriced = true;
+            let mut agent = Agent::new(cfg).unwrap();
+            agent.set_session_cost(2.0); // priced spend already past the cap
+            let err = agent.run("hi", steering_queue(), |_| {}).await.unwrap_err();
+            assert!(
+                err.to_string().contains("exhausted"),
+                "cap still bites: {err}"
+            );
+        }
+
         // ── (b) tool call then final answer ───────────────────────────────────
 
         /// Agent::run: mock server emits a tool_call for `read`, agent executes
@@ -12477,6 +12595,7 @@ mod tests {
                 Vec::new(),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 cell,
                 super::super::LiveSubagents::new(),
@@ -12548,6 +12667,7 @@ mod tests {
                 Vec::new(),
                 bg_handles.clone(),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 None,
                 live.clone(),
@@ -12923,6 +13043,7 @@ mod tests {
                 Vec::new(),
                 bg_handles.clone(),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 None,
                 super::super::LiveSubagents::new(),
@@ -13010,6 +13131,7 @@ mod tests {
                 Vec::new(),
                 bg_handles.clone(),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 None,
                 live.clone(),

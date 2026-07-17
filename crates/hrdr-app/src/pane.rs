@@ -769,6 +769,7 @@ mod tests {
                 last_completion_tokens: Some(40),
                 context_window: Some(64_000),
                 cost_usd: 0.01,
+                cost_partial: false,
             };
         });
 

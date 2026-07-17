@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`allow_unpriced` cost-cap escape hatch.** `allow_unpriced` (config.toml) /
+  `--allow-unpriced` (`hrdr run`) lets a `max_cost` run proceed on an unpriced
+  model (a local server the catalog can't price) instead of refusing it at
+  preflight. Those calls run **uncounted**; priced usage still counts and the
+  cap still enforces on it. When any unpriced call was excluded, cost totals are
+  reported as a floor — `≥ $X (excludes unpriced usage)` in the `/status`,
+  `/cost`, and `hrdr run` usage lines, plus a `cost_partial` field on the
+  `usage` NDJSON event. Default (`false`) keeps the fail-closed behavior.
+  `--allow-unpriced` without `--max-cost` is a harmless no-op.
+
 ## [0.5.2] - 2026-07-17
 
 v0.5.1's tag run failed on windows-latest — the new grep hidden-flag tests

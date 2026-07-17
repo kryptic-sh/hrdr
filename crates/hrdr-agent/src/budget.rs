@@ -36,6 +36,15 @@ impl Agent {
         *self.cost_total.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Whether [`session_cost`](Self::session_cost) is only a floor: some call
+    /// this session (this agent's or a sub-agent's) ran on an unpriced model
+    /// and was excluded from the total. Only ever true under
+    /// [`AgentConfig::allow_unpriced`](crate::AgentConfig::allow_unpriced); a
+    /// frontend that shows the total must flag it (`≥ $X`) when this is set.
+    pub fn session_cost_partial(&self) -> bool {
+        self.cost_partial.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Zero the session cost counter (session reset — the counter tracks the
     /// *session*, not the process).
     pub fn reset_session_cost(&self) {
@@ -57,7 +66,12 @@ impl Agent {
     /// Returns an error when:
     /// - The cap has been reached (`cost_total ≥ max_cost`).
     /// - The cap is set but the current model has no price in the catalog
-    ///   (the budget cannot be enforced for an unpriced model).
+    ///   (the budget cannot be enforced for an unpriced model) — UNLESS
+    ///   [`AgentConfig::allow_unpriced`](crate::AgentConfig::allow_unpriced) is
+    ///   set, in which case the unpriced call proceeds uncounted.
+    ///
+    /// The cap-exhausted check runs first and is model-agnostic: once priced
+    /// usage reaches the cap, the run stops whatever model is next in force.
     pub(crate) async fn budget_preflight(&mut self) -> Result<()> {
         let Some(cap) = self.max_cost else {
             return Ok(());
@@ -66,11 +80,11 @@ impl Agent {
         if spent >= cap {
             bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
         }
-        if self.current_cost_rates().await.is_none() {
+        if !self.allow_unpriced && self.current_cost_rates().await.is_none() {
             let model = self.resolved.reference();
             bail!(
                 "cost budget cannot be enforced for unpriced model {model}; \
-                 remove max_cost or choose a priced model"
+                 remove max_cost, pass --allow-unpriced, or choose a priced model"
             );
         }
         Ok(())
@@ -98,6 +112,14 @@ impl Agent {
             .current_cost_rates()
             .await
             .map(|rates| rates.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
+        // An unpriced call just happened and its cost is unknown, so it is not in
+        // the running total: mark the total a floor. `session_cost_usd` stays
+        // `None` until a priced call gives a figure to floor, so a purely local
+        // session shows no cost at all (unchanged) rather than "≥ $0.00".
+        if cost_usd.is_none() {
+            self.cost_partial
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let session_cost_usd = {
             let mut total = self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
             *total += cost_usd.unwrap_or(0.0);

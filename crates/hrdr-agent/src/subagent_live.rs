@@ -931,6 +931,7 @@ mod tests {
                 reasoning_tokens: None,
                 cost_usd: None,
                 session_cost_usd: Some(0.02),
+                cost_partial: false,
             },
         );
         // Everything else in the stream leaves the counters alone.

@@ -31,6 +31,11 @@ pub struct AgentUsage {
     /// when nothing was priceable.
     #[serde(default)]
     pub cost_usd: f64,
+    /// `true` when [`cost_usd`](Self::cost_usd) is only a floor: some call ran on
+    /// an unpriced model and was excluded from it (only under `allow_unpriced`).
+    /// A cost display must then be flagged (`≥ $X`), never shown bare.
+    #[serde(default)]
+    pub cost_partial: bool,
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
     #[serde(default)]
@@ -68,6 +73,7 @@ impl AgentUsage {
             prompt_tokens,
             completion_tokens,
             session_cost_usd,
+            cost_partial,
             ..
         } = ev
         {
@@ -75,6 +81,9 @@ impl AgentUsage {
             if let Some(total) = session_cost_usd {
                 self.cost_usd = *total;
             }
+            // Latches: a session that ever excluded an unpriced call stays
+            // partial even when later events carry a fresh priced total.
+            self.cost_partial |= *cost_partial;
         }
     }
 
@@ -114,12 +123,44 @@ mod tests {
             reasoning_tokens: None,
             cost_usd: None,
             session_cost_usd: Some(0.5),
+            cost_partial: false,
         });
         assert_eq!(u.tokens_in, 10);
         assert_eq!(u.tokens_out, 4);
         assert_eq!(u.cost_usd, 0.5);
+        assert!(!u.cost_partial, "a fully-priced total is complete");
         // Anything else leaves them alone.
         u.record_event(&crate::AgentEvent::TurnDone);
         assert_eq!(u.tokens_in, 10);
+    }
+
+    /// A mixed run — priced usage plus an excluded unpriced call — folds into a
+    /// total marked partial, and the mark latches even if a later priced event
+    /// carries `cost_partial: false`.
+    #[test]
+    fn an_excluded_unpriced_call_marks_the_total_partial() {
+        let mut u = AgentUsage::default();
+        u.record_event(&crate::AgentEvent::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            cached_prompt_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: Some(0.25),
+            session_cost_usd: Some(0.25),
+            cost_partial: true,
+        });
+        assert_eq!(u.cost_usd, 0.25, "priced usage still counts");
+        assert!(u.cost_partial, "the excluded unpriced call is admitted");
+        // A later purely-priced event must not clear the mark.
+        u.record_event(&crate::AgentEvent::Usage {
+            prompt_tokens: 5,
+            completion_tokens: 2,
+            cached_prompt_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: Some(0.1),
+            session_cost_usd: Some(0.35),
+            cost_partial: false,
+        });
+        assert!(u.cost_partial, "partial latches for the whole session");
     }
 }

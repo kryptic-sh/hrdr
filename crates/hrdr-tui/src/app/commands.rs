@@ -454,6 +454,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn session_cost(&self) -> f64 {
         self.app.panes.active_pane().state.usage.cost_usd
     }
+    fn session_cost_partial(&self) -> bool {
+        self.app.panes.active_pane().state.usage.cost_partial
+    }
     fn set_effort(&mut self, label: String) {
         // Effort is the agent's; it publishes the change back into the chrome.
         let agent = self.app.active_agent();

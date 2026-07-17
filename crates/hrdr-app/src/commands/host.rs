@@ -173,6 +173,12 @@ pub trait CommandHost {
     fn session_cost(&self) -> f64 {
         0.0
     }
+    /// Whether [`session_cost`](Self::session_cost) is only a floor because some
+    /// unpriced call was excluded from it (`allow_unpriced`). When `true`, the
+    /// cost must be shown flagged (`≥ $X`), never as a complete figure.
+    fn session_cost_partial(&self) -> bool {
+        false
+    }
     /// Update the effort label (persistence is dispatch's job).
     fn set_effort(&mut self, label: String) {
         let _ = label;

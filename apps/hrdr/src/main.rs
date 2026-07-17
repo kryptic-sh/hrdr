@@ -210,6 +210,12 @@ enum Command {
         /// reaches this cap.
         #[arg(long, value_name = "USD")]
         max_cost: Option<f64>,
+        /// Let a `--max-cost` run proceed on an unpriced (local/uncatalogued)
+        /// model: those calls run uncounted while priced usage is still capped.
+        /// The reported total is then a floor ("≥ $X"). A harmless no-op without
+        /// `--max-cost`.
+        #[arg(long)]
+        allow_unpriced: bool,
         /// The task prompt (all trailing words are joined).
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
@@ -555,6 +561,7 @@ async fn main() -> Result<()> {
             quiet,
             max_steps,
             max_cost,
+            allow_unpriced,
             prompt,
         }) => {
             if let Some(cost) = max_cost
@@ -567,6 +574,11 @@ async fn main() -> Result<()> {
             }
             if max_cost.is_some() {
                 config.max_cost = max_cost;
+            }
+            // Accepted with or without `--max-cost` (a harmless no-op without a
+            // cap); the flag only overrides config when actually passed.
+            if allow_unpriced {
+                config.allow_unpriced = true;
             }
             run_headless(config, prompt.join(" "), json, quiet).await
         }
@@ -644,6 +656,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                     cached_prompt_tokens,
                     reasoning_tokens,
                     session_cost_usd,
+                    cost_partial,
                     ..
                 } if !quiet => {
                     let cached = cached_prompt_tokens
@@ -653,7 +666,12 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                         .map(|r| format!(" · reasoning {r}"))
                         .unwrap_or_default();
                     let cost = session_cost_usd
-                        .map(|c| format!(" · est. {}", hrdr_app::fmt_cost(c)))
+                        .map(|c| {
+                            format!(
+                                " · est. {}",
+                                hrdr_app::fmt_cost_maybe_partial(c, cost_partial)
+                            )
+                        })
                         .unwrap_or_default();
                     eprintln!(
                         "\x1b[90m[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}\x1b[0m"
@@ -715,6 +733,7 @@ fn event_json(ev: &AgentEvent) -> String {
             reasoning_tokens,
             cost_usd,
             session_cost_usd,
+            cost_partial,
         } => {
             json!({
                 "type": "usage",
@@ -724,6 +743,7 @@ fn event_json(ev: &AgentEvent) -> String {
                 "reasoning_tokens": reasoning_tokens,
                 "cost_usd": cost_usd,
                 "session_cost_usd": session_cost_usd,
+                "cost_partial": cost_partial,
             })
         }
         AgentEvent::TurnDone => json!({"type": "done"}),
@@ -767,6 +787,32 @@ mod cli_tests {
             assert!(cli.command.is_none(), "{argv:?} is not a subcommand");
             assert_eq!(cli.input.join(" "), want, "{argv:?}");
         }
+    }
+
+    /// `--allow-unpriced` is accepted on `run` both with and without
+    /// `--max-cost` — without a cap it is a harmless no-op, not a parse error.
+    #[test]
+    fn allow_unpriced_parses_with_and_without_max_cost() {
+        let run = |argv: &[&str]| match Cli::parse_from(argv).command {
+            Some(Command::Run {
+                allow_unpriced,
+                max_cost,
+                ..
+            }) => (allow_unpriced, max_cost),
+            _ => panic!("expected a Run command"),
+        };
+        // With a cap.
+        assert_eq!(
+            run(&["hrdr", "run", "--allow-unpriced", "--max-cost", "1.5", "hi"]),
+            (true, Some(1.5))
+        );
+        // Without a cap: still parses, cap is None.
+        assert_eq!(
+            run(&["hrdr", "run", "--allow-unpriced", "hi"]),
+            (true, None)
+        );
+        // Absent: defaults to false.
+        assert_eq!(run(&["hrdr", "run", "hi"]), (false, None));
     }
 
     /// Flags still bind to hrdr, not to the command — as long as they come first.
