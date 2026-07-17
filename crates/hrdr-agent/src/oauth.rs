@@ -545,7 +545,16 @@ fn has_oauth_credentials_at(path: &Path, kind: crate::ResolvedProviderKind, name
 
 /// Path-based core of [`save_oauth`].
 fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> {
-    let mut map = load_all(path);
+    let mut map = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).with_context(|| {
+            format!("parsing existing OAuth credential store {}", path.display())
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading OAuth credential store {}", path.display()));
+        }
+    };
     map.insert(provider.to_string(), creds.clone());
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -1050,6 +1059,51 @@ mod tests {
     fn oauth_store_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_oauth_at(&dir.path().join("nope.json"), "openai"), None);
+    }
+
+    #[test]
+    fn oauth_store_save_refuses_to_replace_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        let original = b"{ not valid json\n";
+        std::fs::write(&path, original).unwrap();
+        let creds = OAuthCreds {
+            access: "new-access".to_string(),
+            refresh: "new-refresh".to_string(),
+            expires_ms: 123,
+            account_id: None,
+        };
+
+        let err = save_oauth_at(&path, "chatgpt", &creds)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("parsing existing OAuth credential store"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn oauth_store_save_refuses_to_replace_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        let original = b"\xff\xfe\xfd";
+        std::fs::write(&path, original).unwrap();
+        let creds = OAuthCreds {
+            access: "new-access".to_string(),
+            refresh: "new-refresh".to_string(),
+            expires_ms: 123,
+            account_id: None,
+        };
+
+        let err = save_oauth_at(&path, "chatgpt", &creds)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("reading OAuth credential store"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     // ── Kind-gated key + readiness ───────────────────────────────────────────
