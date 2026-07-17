@@ -5069,8 +5069,10 @@ async fn a_theme_switch_invalidates_transcript_cache() {
     // The new rows are fresh allocations, not reused from the old cache.
     for i in 0..2 {
         assert_ne!(
-            after_render[i], before[i],
-            "entry {} must be rebuilt (different pointer) after theme switch", i + 2
+            after_render[i],
+            before[i],
+            "entry {} must be rebuilt (different pointer) after theme switch",
+            i + 2
         );
     }
 
