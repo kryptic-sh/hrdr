@@ -523,6 +523,27 @@ pub fn available_models(config: &AgentConfig, active: Option<&str>) -> Vec<Avail
     }
     rows.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
     rows.dedup_by(|a, b| a.provider == b.provider && a.model == b.model);
+    // The active provider is always in `providers`, but its model may have no
+    // row when the catalog is missing and the built-in provider carries no
+    // configured model — a bare `[providers.openai]` entry, a keyless CI
+    // runner.  Without a row, the `models` tool's `current: true` flag has
+    // nothing to attach to.  Insert the session's actual model so the agent
+    // can always identify the row it is running on.
+    if let Some(active_provider) = active {
+        let active_model = config.model.model();
+        if !rows
+            .iter()
+            .any(|r| r.provider == active_provider && r.model == active_model)
+        {
+            rows.push(AvailableModel {
+                provider: active_provider.to_string(),
+                model: active_model.to_string(),
+                label: active_model.to_string(),
+                source: ModelSource::Configured,
+            });
+            rows.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+        }
+    }
     rows
 }
 
