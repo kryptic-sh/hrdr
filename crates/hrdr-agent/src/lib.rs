@@ -1222,6 +1222,34 @@ pub fn should_auto_compact(
     window > 0 && prompt >= compaction_trigger(window, reserved)
 }
 
+/// Whether tool-output pruning should even be attempted this round: usage is
+/// within `PRUNE_PRESSURE_TOKENS` of the same compaction trigger
+/// [`should_auto_compact`] uses ([`compaction_trigger`]). Below that, pruning
+/// isn't considered at all — a byte-stable prompt prefix is what keeps the
+/// provider cache hitting, and there's no pressure yet to justify spending a
+/// prune's one-time invalidation of it.
+///
+/// Cheap and mutation-free on purpose: the caller gates the (O(n) over the
+/// history) [`plan_prune`] scan behind this, so a conversation nowhere near
+/// its trigger never pays for the scan either.
+pub fn prune_under_pressure(usage: u32, context_window: u32, reserved: u32) -> bool {
+    usage >= compaction_trigger(context_window, reserved).saturating_sub(PRUNE_PRESSURE_TOKENS)
+}
+
+/// Whether a prune plan is worth applying, given what [`plan_prune`] found.
+///
+/// A prune is only worth its one-time prompt-cache invalidation if it buys
+/// real runway: reclaiming `reclaimable` tokens must land usage at least
+/// `PRUNE_ROI_TOKENS` below the compaction trigger — several tool-rounds'
+/// worth. A plan that can't clear that bar is skipped entirely (no mutation),
+/// and compaction is left to fire naturally at the trigger — pruning first
+/// and then compacting two turns later anyway would be the worst of both
+/// worlds.
+pub fn prune_meets_roi(usage: u32, context_window: u32, reserved: u32, reclaimable: u32) -> bool {
+    let target = compaction_trigger(context_window, reserved).saturating_sub(PRUNE_ROI_TOKENS);
+    usage.saturating_sub(reclaimable) <= target
+}
+
 /// Marks an agent as compacting for as long as it is, and clears the flag on every
 /// exit — a summarization that fails or is cancelled must not leave its pane
 /// spinning "compacting…" forever.
@@ -2771,19 +2799,28 @@ pub struct AgentConfig {
     /// `--max-write-subagents`). Lower than the read-only cap: they share the
     /// main agent's working tree.
     pub max_write_subagents: usize,
-    /// Prune old tool-call *output* from the model history before each request:
-    /// bodies older than the recent protected window are replaced with a short
-    /// placeholder (the tool call + args stay). Only the model-facing history is
-    /// touched; the UI transcript keeps the full output.
+    /// Prune old tool-call *output* from the model history when context is
+    /// under pressure and it's worth it: bodies older than the recent
+    /// protected window are replaced with a short placeholder (the tool call +
+    /// args stay). Only the model-facing history is touched; the UI transcript
+    /// keeps the full output.
     ///
     /// **Default `false`.** Rewriting history invalidates the prompt cache from
     /// the first changed message onward, and a cached input token costs a
-    /// fraction of a fresh one — so pruning to shave context usually *raises* the
-    /// bill, re-charging the whole tail at the uncached rate. With per-call output
-    /// already capped (large results go to a file, not into context) and
-    /// compaction as the real overflow backstop, leaving history verbatim keeps
-    /// the cache warm and is cheaper. Turn it on only when context size matters
-    /// more than cache hits.
+    /// fraction of a fresh one — so pruning to shave context usually *raises*
+    /// the bill, re-charging the whole tail at the uncached rate. That's true
+    /// even with the pressure/ROI gating below: this only turns a *continuous*
+    /// net loss into an occasional, justified one, it doesn't turn pruning into
+    /// a net win. With per-call output already capped (large results go to a
+    /// file, not into context) and compaction as the real overflow backstop,
+    /// leaving history verbatim keeps the cache warm and is usually cheaper.
+    /// Turn it on only when context size matters more than cache hits.
+    ///
+    /// When on, pruning is gated, not continuous: it's only even attempted once
+    /// usage nears the compaction trigger, and only applied when the reclaim
+    /// buys enough runway to be worth the invalidation — otherwise compaction
+    /// (the costlier but bounded fallback) handles it instead. See
+    /// `PRUNE_PRESSURE_TOKENS` / `PRUNE_ROI_TOKENS`.
     pub auto_prune: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
@@ -3255,13 +3292,38 @@ pub const DEFAULT_AUTO_COMPACT: bool = true;
 /// leaving room for the next turn's output. Matches pi's `reserveTokens` default.
 pub const DEFAULT_COMPACTION_RESERVED: u32 = 16_384;
 
-/// Tool-output pruning keeps the most recent this-many estimated tokens of tool
-/// output verbatim; older bodies are cleared. Matches opencode's `PRUNE_PROTECT`.
+/// Tool-output pruning: pressure-gated and ROI-checked, not continuous.
+///
+/// Pruning rewrites OLD messages — deep in the prompt prefix — so every prune
+/// event invalidates the provider's prompt cache for nearly the whole
+/// conversation (Anthropic prompt caching, llama.cpp prefix reuse). Pruning
+/// continuously (clearing stale tool output every ~20k tokens, the old
+/// behavior) re-pays that invalidation over and over and never amortizes —
+/// net negative on a cached backend. But pruning still beats *compaction* (a
+/// full cache nuke, a summarizer model call, and permanent information loss)
+/// when it genuinely averts one. So: prune only when compaction is imminent
+/// (`PRUNE_PRESSURE_TOKENS`), and only when the reclaimable amount buys real
+/// runway (`PRUNE_ROI_TOKENS`) — pruning and then compacting a couple of
+/// turns later anyway would be the worst of both worlds. See
+/// [`prune_under_pressure`] and [`prune_meets_roi`] for the gate,
+/// [`plan_prune`]/[`apply_prune`] for the mechanism.
+///
+/// This constant is the size of the protected window itself: the most recent
+/// this-many estimated tokens of tool output stay verbatim; older bodies (once
+/// a prune is actually triggered) are cleared. Matches opencode's
+/// `PRUNE_PROTECT`.
 const PRUNE_PROTECT_TOKENS: u32 = 40_000;
-/// Only prune when at least this many tokens would actually be reclaimed —
-/// clearing a few small results isn't worth the lost detail. Matches opencode's
-/// `PRUNE_MINIMUM`.
-const PRUNE_MINIMUM_TOKENS: u32 = 20_000;
+/// Pruning is only even *considered* once estimated usage is within this many
+/// tokens of the compaction trigger (`context_window − compaction_reserved`,
+/// [`compaction_trigger`] — the same trigger [`should_auto_compact`] uses).
+/// Below that, never touch history: a byte-stable prefix is what keeps the
+/// provider cache hitting.
+const PRUNE_PRESSURE_TOKENS: u32 = 16_384;
+/// A prune is only *worth* the one-time cache invalidation if it lands usage
+/// at least this far below the compaction trigger — several tool-rounds of
+/// runway. If the plan can't buy that, skip it and let compaction fire
+/// naturally at the trigger instead.
+const PRUNE_ROI_TOKENS: u32 = 32_768;
 /// The most recent this-many turns (user messages) are never pruned, so the
 /// model always keeps the tool output it's actively working with.
 const PRUNE_KEEP_TURNS: usize = 2;
@@ -5090,8 +5152,8 @@ pub struct Agent {
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
     max_steps: usize,
-    /// Prune old tool output from the history before each request (see
-    /// [`AgentConfig::auto_prune`]).
+    /// Prune stale tool output from the history when pressure and ROI justify
+    /// it (see [`AgentConfig::auto_prune`]).
     auto_prune: bool,
     /// Compact proactively when the context fills ([`AgentConfig::auto_compact`]).
     auto_compact: bool,
@@ -6565,29 +6627,60 @@ impl Agent {
             self.drain_steering(&steering, &mut on_event);
             // Fold in any detached background sub-agent results that have landed.
             self.drain_background(&mut on_event);
-            // Compact before the next request if this agent manages its own
-            // context and is close to filling it (a small local model reading a
-            // lot of files gets there fast). Cheap pruning below runs first on
-            // the next pass; this is the expensive fallback, so it only fires
-            // once usage actually reaches the trigger.
-            self.maybe_self_compact(&mut on_event).await;
-            // Reclaim stale tool output before building the request — the cheap,
-            // no-model-call first line of defence against context ballooning
-            // (compaction is the expensive fallback). No-op until there's enough
-            // old output to matter.
-            if self.auto_prune {
-                let reclaimed = prune_tool_messages(
-                    &mut self.messages,
-                    PRUNE_PROTECT_TOKENS,
-                    PRUNE_MINIMUM_TOKENS,
-                    PRUNE_KEEP_TURNS,
-                );
-                if reclaimed > 0 {
-                    on_event(AgentEvent::Notice(format!(
-                        "pruned ~{reclaimed} tokens of old tool output"
-                    )));
+            // Reclaim stale tool output before compacting or building the next
+            // request — the cheap, no-model-call first line of defence against
+            // context ballooning (compaction below is the expensive fallback).
+            // Pressure-gated and ROI-checked, not continuous: rewriting old
+            // messages invalidates the provider's prompt cache for nearly the
+            // whole conversation, so this is only even attempted once usage
+            // nears the compaction trigger, and only applied when the reclaim
+            // buys real runway (see the doc comment above `PRUNE_PROTECT_TOKENS`
+            // for the full reasoning).
+            if self.auto_prune
+                && let Some(usage) = self.last_prompt_tokens
+            {
+                // Same inputs `maybe_self_compact` uses below — one trigger, so
+                // the two decisions can't drift apart.
+                self.ensure_context_window();
+                if let Some(window) = self.context_window
+                    && prune_under_pressure(usage, window, self.compaction_reserved)
+                {
+                    let (victims, reclaimable) =
+                        plan_prune(&self.messages, PRUNE_PROTECT_TOKENS, PRUNE_KEEP_TURNS);
+                    if !victims.is_empty()
+                        && prune_meets_roi(usage, window, self.compaction_reserved, reclaimable)
+                    {
+                        apply_prune(&mut self.messages, &victims);
+                        on_event(AgentEvent::Notice(format!(
+                            "context filling — pruned ~{reclaimable} tokens of old tool \
+                             output, deferring compaction"
+                        )));
+                        // `last_prompt_tokens` describes the *previous* request — it
+                        // doesn't know about the prune we just applied. Left as-is,
+                        // `maybe_self_compact` right below would read that stale,
+                        // pre-prune figure and compact anyway on this very round,
+                        // making the prune pure loss (cache invalidated for nothing).
+                        // Both numbers are estimates (`estimate_tokens` here vs
+                        // whatever tokenizer produced the original reading), which is
+                        // fine for a threshold heuristic — this only needs to be
+                        // roughly right.
+                        self.last_prompt_tokens = Some(usage.saturating_sub(reclaimable));
+                    }
+                    // Else: the plan doesn't clear the ROI bar — no mutation, and
+                    // deliberately no notice. Pressure builds gradually, so this
+                    // branch would otherwise fire (silently) every round while
+                    // pressure is on but ROI isn't met; compaction is left to
+                    // handle it once usage actually reaches the trigger.
                 }
             }
+            // Compact before the next request if this agent manages its own
+            // context and is close to filling it (a small local model reading a
+            // lot of files gets there fast). Pruning above gets first shot at
+            // relieving pressure — cheap, no model call — so this expensive
+            // fallback (a summarizer call plus a full cache nuke) only fires
+            // when pruning couldn't buy enough runway, or usage is already past
+            // what pruning alone can save.
+            self.maybe_self_compact(&mut on_event).await;
             // Cost budget: stop before issuing another model call once the
             // session's estimated spend (incl. sub-agents) reaches the cap.
             if let Some(cap) = self.max_cost {
@@ -7492,24 +7585,21 @@ fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
-/// Clear the bodies of *old* tool-result messages, keeping the most recent
-/// [`PRUNE_PROTECT_TOKENS`] of tool output — plus the last [`PRUNE_KEEP_TURNS`]
-/// turns — verbatim. Only `role:"tool"` bodies are replaced (with
-/// [`PRUNE_PLACEHOLDER`]); the assistant `tool_calls` metadata and every message
-/// stays, so the tool-call ↔ result pairing strict servers require is intact.
+/// Work out which *old* tool-result messages a prune would clear, keeping the
+/// most recent [`PRUNE_PROTECT_TOKENS`] of tool output — plus the last
+/// [`PRUNE_KEEP_TURNS`] turns — verbatim. Pure: does not touch `messages`, so
+/// the caller can weigh the reclaim against the cost of pruning (see
+/// [`prune_meets_roi`]) before committing to [`apply_prune`].
 ///
-/// Returns the estimated tokens reclaimed, or `0` when that would be below
-/// `minimum_tokens` (in which case nothing is changed — small reclaims aren't
-/// worth the lost detail). `protect_tokens` is the recent tool-output window
-/// kept verbatim; `keep_turns` the recent turns never touched. Cheap and
-/// model-only: the UI transcript keeps the full output; this just bounds what
-/// gets re-sent every request.
-fn prune_tool_messages(
-    messages: &mut [ChatMessage],
+/// Returns the victim indices (oldest tool results past the protected window)
+/// and their total estimated token size. `protect_tokens` is the recent
+/// tool-output window kept verbatim; `keep_turns` the recent turns never
+/// touched.
+fn plan_prune(
+    messages: &[ChatMessage],
     protect_tokens: u32,
-    minimum_tokens: u32,
     keep_turns: usize,
-) -> u32 {
+) -> (Vec<usize>, u32) {
     let mut turns = 0usize;
     // Cumulative tool-output tokens seen scanning newest → oldest.
     let mut seen_tokens = 0u32;
@@ -7541,13 +7631,19 @@ fn prune_tool_messages(
         reclaimable += est;
         victims.push(i);
     }
-    if reclaimable < minimum_tokens {
-        return 0;
-    }
-    for i in victims {
+    (victims, reclaimable)
+}
+
+/// Apply a plan from [`plan_prune`]: clear each victim's body to
+/// [`PRUNE_PLACEHOLDER`]. The assistant `tool_calls` metadata and every
+/// message stays, so the tool-call ↔ result pairing strict servers require is
+/// intact. Split from planning so the caller only pays for this — and the
+/// prompt-cache invalidation it causes — once the plan is known to be worth
+/// it.
+fn apply_prune(messages: &mut [ChatMessage], victims: &[usize]) {
+    for &i in victims {
         messages[i].content = Some(PRUNE_PLACEHOLDER.to_string());
     }
-    reclaimable
 }
 
 /// The most recent `1/div` of `msgs` (at least two messages), aligned forward
@@ -7908,10 +8004,10 @@ mod tests {
         compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
-        parse_env_bool, provider_alias_collision_error, prune_tool_messages,
-        repair_dangling_tool_calls, resolve, resolve_subagent_dir, retry_after_hint,
-        steering_queue, strip_user_timestamp, subagent_base_config, subagent_event_for,
-        subagent_transcript_id, tail_window, timestamped_user_message,
+        parse_env_bool, provider_alias_collision_error, repair_dangling_tool_calls, resolve,
+        resolve_subagent_dir, retry_after_hint, steering_queue, strip_user_timestamp,
+        subagent_base_config, subagent_event_for, subagent_transcript_id, tail_window,
+        timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -12783,7 +12879,8 @@ mod tests {
     }
 
     #[test]
-    fn prune_clears_old_tool_output_beyond_protected_window() {
+    fn plan_prune_targets_old_tool_output_beyond_protected_window() {
+        use super::{apply_prune, plan_prune};
         // Four turns, each with one big tool result (~10k tokens: len/4).
         let big = "x".repeat(40_000);
         assert_eq!(estimate_tokens(&big), 10_000);
@@ -12801,12 +12898,16 @@ mod tests {
             assistant_with_calls(&["d"]),
             ChatMessage::tool_result("d", big.clone()), // 11 — current turn protected
         ];
-        // Protect window 16k tokens, minimum 8k, keep 2 turns: turn-3/4 output
-        // is shielded by the last-2-turns rule, turn-2's 10k fills the window,
-        // so only turn-1's 10k (the oldest) is cleared.
-        let reclaimed = prune_tool_messages(&mut msgs, 16_000, 8_000, 2);
-        assert!(reclaimed >= 8_000);
-        assert_eq!(reclaimed, estimate_tokens(&big));
+        // Protect window 16k tokens, keep 2 turns: turn-3/4 output is shielded
+        // by the last-2-turns rule, turn-2's 10k fills the window, so only
+        // turn-1's 10k (the oldest) is a prune target.
+        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
+        assert_eq!(victims, vec![2]);
+        assert_eq!(reclaimable, estimate_tokens(&big));
+        // Planning is pure — nothing changes until `apply_prune` runs.
+        assert_eq!(msgs[2].content.as_deref(), Some(big.as_str()));
+
+        apply_prune(&mut msgs, &victims);
         assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
         for kept in [5, 8, 11] {
             assert_eq!(msgs[kept].content.as_deref(), Some(big.as_str()));
@@ -12814,34 +12915,118 @@ mod tests {
         // The assistant tool_calls metadata is never touched.
         assert!(msgs[1].tool_calls.is_some());
 
-        // Idempotent: a second pass finds only the placeholder + kept window.
-        assert_eq!(prune_tool_messages(&mut msgs, 16_000, 8_000, 2), 0);
+        // Idempotent: a second plan finds only the placeholder + kept window.
+        let (victims2, reclaimable2) = plan_prune(&msgs, 16_000, 2);
+        assert!(victims2.is_empty());
+        assert_eq!(reclaimable2, 0);
     }
 
+    /// Below `PRUNE_PRESSURE_TOKENS` of the compaction trigger, pruning isn't
+    /// even attempted — a stale prefix is fine as long as the cache is still
+    /// worth keeping warm. This holds regardless of how much stale tool output
+    /// is sitting there to reclaim: `plan_prune` never even gets called by the
+    /// run loop in this zone.
     #[test]
-    fn prune_is_a_noop_below_the_minimum() {
-        // Protect window (16k) is filled by one 14k result; the only prunable
-        // result is 3k tokens — below the 8k minimum, so nothing changes.
-        let within = "x".repeat(56_000); // 14k tokens
-        let tiny = "x".repeat(12_000); // 3k tokens
-        let mut msgs = vec![
+    fn below_pressure_nothing_is_pruned() {
+        use super::{plan_prune, prune_under_pressure};
+        let window = 100_000;
+        let reserved = 16_384;
+        // A conversation with plenty of stale, prunable tool output — one big
+        // old result, old enough to be past both the protect window and the
+        // last-2-turns rule.
+        let big = "x".repeat(400_000); // 100k tokens of it
+        let msgs = vec![
             ChatMessage::user("u1"),
             assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", tiny.clone()), // 2 — 3k prunable
+            ChatMessage::tool_result("a", big), // old → prunable
             ChatMessage::user("u2"),
             assistant_with_calls(&["b"]),
-            ChatMessage::tool_result("b", within.clone()), // 5 — fills the window
+            ChatMessage::tool_result("b", "recent".to_string()), // protected
+            ChatMessage::user("u3"),
+            assistant_with_calls(&["c"]),
+            ChatMessage::tool_result("c", "recent".to_string()), // protected
+            ChatMessage::user("u4"),
+        ];
+        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
+        assert!(!victims.is_empty() && reclaimable > 0, "plenty to reclaim");
+
+        // But usage is far below the trigger, so the gate says don't bother.
+        let usage = 50_000;
+        assert!(usage < super::compaction_trigger(window, reserved));
+        assert!(!prune_under_pressure(usage, window, reserved));
+    }
+
+    /// At pressure with a big reclaim, the plan clears the ROI bar and gets
+    /// applied — and critically, the usage estimate the run loop adjusts
+    /// afterward no longer trips `should_auto_compact` on the very same round.
+    /// Without that adjustment, `maybe_self_compact` would read the stale
+    /// pre-prune figure and compact anyway, making the prune pure loss.
+    #[test]
+    fn at_pressure_big_reclaim_meets_roi_and_defers_compaction() {
+        use super::{prune_meets_roi, prune_under_pressure, should_auto_compact};
+        let window = 100_000;
+        let reserved = 16_384;
+        let trigger = super::compaction_trigger(window, reserved);
+        // Usage is already past the trigger — `should_auto_compact` would fire
+        // on this reading.
+        let usage = trigger + 1_384;
+        assert!(should_auto_compact(
+            Some(usage),
+            Some(window),
+            reserved,
+            true
+        ));
+        assert!(prune_under_pressure(usage, window, reserved));
+
+        // A plan that reclaims well over `PRUNE_ROI_TOKENS`.
+        let reclaimable = 40_000;
+        assert!(prune_meets_roi(usage, window, reserved, reclaimable));
+
+        // The run loop's adjustment: subtract the reclaim from the usage
+        // estimate before `maybe_self_compact` runs this same round.
+        let adjusted = usage.saturating_sub(reclaimable);
+        assert!(
+            !should_auto_compact(Some(adjusted), Some(window), reserved, true),
+            "the prune bought enough runway to defer compaction this round"
+        );
+    }
+
+    /// At pressure but with only a small reclaim, the ROI bar isn't cleared —
+    /// the plan exists (this is not the below-pressure case) but is left
+    /// unapplied, so history stays byte-identical and compaction stays
+    /// responsible for relieving the pressure.
+    #[test]
+    fn at_pressure_small_reclaim_is_left_unapplied() {
+        use super::{plan_prune, prune_meets_roi, prune_under_pressure};
+        let window = 100_000;
+        let reserved = 16_384;
+        // Protect window (16k) is filled by one 14k result; the only prune
+        // target is 3k tokens.
+        let within = "x".repeat(56_000); // 14k tokens
+        let tiny = "x".repeat(12_000); // 3k tokens
+        let msgs = vec![
+            ChatMessage::user("u1"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", tiny.clone()), // 2 — 3k prune target
+            ChatMessage::user("u2"),
+            assistant_with_calls(&["b"]),
+            ChatMessage::tool_result("b", within), // 5 — fills the window
             ChatMessage::user("u3"),
             assistant_with_calls(&["c"]),
             ChatMessage::tool_result("c", "recent".to_string()), // 8 — protected
             ChatMessage::user("u4"),
         ];
-        // protect 16k, minimum 8k: `within` fills the window, `tiny` (3k) is the
-        // only prunable — below the minimum, so nothing changes.
-        assert!(estimate_tokens(&tiny) < 8_000);
-        let reclaimed = prune_tool_messages(&mut msgs, 16_000, 8_000, 2);
-        assert_eq!(reclaimed, 0);
-        assert_eq!(msgs[2].content.as_deref(), Some(tiny.as_str())); // untouched
+        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
+        assert_eq!(reclaimable, estimate_tokens(&tiny));
+        assert!(!victims.is_empty());
+
+        // Usage sits right at the trigger — under pressure — but 3k of reclaim
+        // doesn't land it `PRUNE_ROI_TOKENS` below it.
+        let usage = super::compaction_trigger(window, reserved);
+        assert!(prune_under_pressure(usage, window, reserved));
+        assert!(!prune_meets_roi(usage, window, reserved, reclaimable));
+        // So the run loop never calls `apply_prune` — history is untouched.
+        assert_eq!(msgs[2].content.as_deref(), Some(tiny.as_str()));
     }
 
     #[test]

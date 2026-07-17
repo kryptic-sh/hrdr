@@ -416,11 +416,13 @@ tunable in `config.toml`:
 max_lines = 1500
 max_bytes = 24576
 
-# Prune: clear old tool-output bodies from the model context before each request
-# (keeps a recent window; the UI transcript keeps everything). OFF by default —
-# rewriting history invalidates the prompt cache, and cached tokens are far
-# cheaper than the fresh tokens a prune re-charges, so it usually costs more than
-# it saves. Turn on only when context size matters more than cache hits.
+# Prune: when context nears the compaction trigger, clear old tool-output
+# bodies from the model context (keeps a recent window + the last 2 turns; the
+# UI transcript keeps everything) — but only when the reclaim buys enough
+# runway to be worth it. OFF by default — rewriting history invalidates the
+# prompt cache, and cached tokens are far cheaper than the fresh tokens a
+# prune re-charges, so even gated, pruning usually costs more than it saves.
+# Turn on only when context size matters more than cache hits.
 auto_prune = false
 
 # Compaction: when context fills, summarize the old head and keep the recent tail.
@@ -967,10 +969,12 @@ The shell and search tools adapt to the host:
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
       instructions
 - [x] Network retry + auto-compact on overflow
-- [x] Tool-output pruning: old tool results can be cleared from the model
-      context (recent window + last 2 turns kept) before compaction — cheap, no
-      model call (`auto_prune`, **off by default**: it invalidates the prompt
-      cache, which usually costs more than the context it saves)
+- [x] Tool-output pruning: pressure-gated and ROI-checked — old tool results are
+      cleared from the model context (recent window + last 2 turns kept) only
+      once compaction is imminent and the reclaim is worth it, deferring the
+      costlier compaction fallback (`auto_prune`, **off by default**: it
+      invalidates the prompt cache, which usually costs more than the context it
+      saves)
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom
