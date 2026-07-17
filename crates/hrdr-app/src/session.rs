@@ -431,23 +431,36 @@ fn is_stale_lock(path: &Path) -> bool {
     if now < ts || now.saturating_sub(ts) < STALE_LOCK_AGE_SECS {
         return false;
     }
-    // Linux: check `/proc` for the owning process (zero-dependency).
+    // Old enough: reap only if the owning process is really gone.
+    !owner_process_alive(pid)
+}
+
+/// Best-effort, zero-dependency check for whether process `pid` is still alive.
+/// Errs toward "alive" when the probe is unavailable so a live writer's lock is
+/// never stolen on a platform without a cheap liveness check.
+fn owner_process_alive(pid: u32) -> bool {
+    // Linux: `/proc/<pid>` exists iff the process exists — no syscall crate.
     #[cfg(target_os = "linux")]
-    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-        return false; // process is still alive
-    }
-    // macOS / other Unix: try `kill -0` to check process existence.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    if std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
     {
-        return false; // process is still alive
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
-    // Old enough and no sign of the owning process → stale.
-    true
+    // macOS / other Unix: `kill -0` probes existence without sending a signal.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
+    }
+    // No cheap dependency-free probe on Windows. The caller only reaches here
+    // once the lock is already older than STALE_LOCK_AGE_SECS, so assume the
+    // owner is gone — a crashed writer's lock can still be reaped.
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Atomically claim `cand` via `O_EXCL` lock file (after reaping any stale

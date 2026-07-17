@@ -298,13 +298,14 @@ mod tests {
 
     #[cfg(unix)]
     fn set_mtime(path: &Path, when: std::time::SystemTime) {
-        // Use `touch -d @<epoch>` to backdate; portable across Linux/macOS.
-        let secs = when
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // `touch -t [[CC]YY]MMDDhhmm[.SS]` is portable across GNU and BSD
+        // `touch`; macOS's BSD `touch` rejects GNU's `-d @<epoch>` form (it
+        // silently no-ops, leaving the lock fresh and wedging the test). The
+        // `-t` argument is interpreted in local time, so format `when` locally.
+        let when: chrono::DateTime<chrono::Local> = when.into();
+        let stamp = when.format("%Y%m%d%H%M.%S").to_string();
         let _ = std::process::Command::new("touch")
-            .args(["-d", &format!("@{secs}"), &path.to_string_lossy()])
+            .args(["-t", &stamp, &path.to_string_lossy()])
             .status();
     }
 
