@@ -113,6 +113,22 @@ impl StoreLock {
                     }
                     std::thread::sleep(LOCK_RETRY_DELAY);
                 }
+                Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Windows only: a lock file in the "delete pending" state —
+                    // a concurrent holder's `Drop` is still removing it while a
+                    // handle lingers — rejects `CreateFile` with
+                    // ERROR_ACCESS_DENIED (os error 5) until the last handle
+                    // closes. That is transient contention, not a real
+                    // permission fault, so treat it like `AlreadyExists`: reap a
+                    // stale lock, else wait and retry (bounded). A genuinely
+                    // unwritable directory still terminates — via the timeout
+                    // below rather than an immediate error.
+                    if is_stale_lock(&lock_path) {
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    std::thread::sleep(LOCK_RETRY_DELAY);
+                }
                 Err(e) => {
                     // A non-contention error (e.g. an unwritable directory) will
                     // not fix itself by retrying — surface it right away.
@@ -260,6 +276,12 @@ mod tests {
         assert!(lock.exists(), "our fresh lock replaced the stale one");
     }
 
+    // Unix-only: exercising mtime-based reaping needs to backdate the lock's
+    // mtime, which we do with `touch` (see `set_mtime`). Windows has no
+    // dependency-free mtime setter here, so `set_mtime` is a no-op there and the
+    // lock would never age out — the reaping path itself is unix/Windows-agnostic
+    // and covered on unix CI.
+    #[cfg(unix)]
     #[test]
     fn unparseable_old_lock_is_reaped_by_mtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -287,11 +309,10 @@ mod tests {
         assert!(err.contains("timed out acquiring"), "{err}");
     }
 
-    // Small mtime helpers (no external crate): set a file's mtime via a
-    // best-effort platform touch. On unix we use `utimensat` through std by
-    // reopening; to stay dependency-free we shell out to `touch -d` where
-    // available, and otherwise skip the backdating (the test still constructs a
-    // valid scenario).
+    // Small mtime helper (no external crate): backdate a file's mtime by
+    // shelling out to `touch`. Unix-only — the sole caller
+    // (`unparseable_old_lock_is_reaped_by_mtime`) is `#[cfg(unix)]` too.
+    #[cfg(unix)]
     fn filetime_from(t: std::time::SystemTime) -> std::time::SystemTime {
         t
     }
@@ -307,11 +328,5 @@ mod tests {
         let _ = std::process::Command::new("touch")
             .args(["-t", &stamp, &path.to_string_lossy()])
             .status();
-    }
-
-    #[cfg(not(unix))]
-    fn set_mtime(_path: &Path, _when: std::time::SystemTime) {
-        // No dependency-free mtime setter on Windows in this test; the
-        // unparseable-lock reaping is still covered on unix CI.
     }
 }
