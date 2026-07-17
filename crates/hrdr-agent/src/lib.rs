@@ -2747,8 +2747,8 @@ pub struct AgentConfig {
     pub max_steps: usize,
     /// Cost budget in USD: the turn loop stops before the next model call once
     /// the session's estimated spend (incl. sub-agents) reaches it. `None` =
-    /// unlimited. Estimates come from the models.dev catalog; calls on an
-    /// unpriced model count as $0.
+    /// unlimited. Estimates come from the models.dev catalog; a capped run
+    /// refuses an unpriced model because its ceiling cannot be enforced.
     pub max_cost: Option<f64>,
     /// The USER-CONFIGURED context window (`context_window` in config.toml, or a
     /// `[providers.<name>].context_window`), in tokens — for the status bar's
@@ -6722,6 +6722,16 @@ impl Agent {
                         "cost budget exhausted (est. ${spent:.2} of ${cap:.2}) — stopping"
                     )));
                     bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
+                }
+                if self.current_cost_rates().await.is_none() {
+                    let model = self.resolved.reference();
+                    on_event(AgentEvent::Notice(format!(
+                        "cost budget cannot be enforced: {model} has no catalog price"
+                    )));
+                    bail!(
+                        "cost budget cannot be enforced for unpriced model {model}; \
+                         remove max_cost or choose a priced model"
+                    );
                 }
             }
             // Stream one assistant turn, accumulating text + tool calls. The
