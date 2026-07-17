@@ -76,6 +76,13 @@ Completed and verified (with review fixes folded in):
 - **P2 `$EDITOR` quoting** — hand-rolled zero-dep shell-word splitter
   (`split_shell_words`) replaces `split_whitespace()`; quotes, escapes, and
   unterminated-quote recovery covered by 12 unit tests.
+- **P2 unbounded internal channels** — TUI event channel bounded at
+  `TUI_EVENT_CAP = 1024` behind a coalescing `EventSender` (adjacent
+  text/reasoning/tool-output deltas merge into the backlog tail; control events
+  queue losslessly; turn-end `drain().await` flushes before `Done`); MCP stdio
+  writer bounded at 64 with `send().await` backpressure; shutdown drops
+  receivers so blocked senders error instead of deadlocking. Also deflaked the
+  session-reservation tests (env-lock race on `XDG_DATA_HOME`).
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
   lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
   (`turn_state.rs`, 155 lines), and turn execution (`turn_loop.rs`, ~1.1k lines)
@@ -83,12 +90,11 @@ Completed and verified (with review fixes folded in):
 
 ## Priority map (open items)
 
-| Priority | Finding                                                | Main impact                            |
-| -------- | ------------------------------------------------------ | -------------------------------------- |
-| P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing   |
-| P2       | Unbounded internal channels                            | Memory growth under sustained overload |
-| P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
-| P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
+| Priority | Finding                                                | Main impact                          |
+| -------- | ------------------------------------------------------ | ------------------------------------ |
+| P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing |
+| P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests        |
+| P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration              |
 
 ---
 
@@ -115,40 +121,6 @@ For each extraction:
 - Public API preserved via an explicit re-export list where exports move
   (`config.rs` is the template).
 - Follow-up behavior changes target the newly isolated module.
-
----
-
-## P2: Internal unbounded channels can grow memory indefinitely
-
-### Evidence
-
-- TUI event channel: `crates/hrdr-tui/src/app.rs` uses
-  `mpsc::unbounded_channel()`.
-- MCP stdio writer: `crates/hrdr-tools/src/mcp/client.rs` uses an unbounded
-  string channel.
-- Other core tool streaming paths already use bounded channels, demonstrating
-  the available pattern.
-
-### Impact
-
-A sustained producer faster than the UI or subprocess consumer can allocate
-without bound: token-by-token events from fast local models, paused terminals,
-or a stalled MCP child.
-
-### Recommendation
-
-- Bounded channels; coalesce adjacent text/reasoning chunks before enqueue where
-  ordering permits.
-- Backpressure MCP requests rather than buffering unlimited serialized JSON.
-- Define which low-value display events may be dropped or merged; never drop
-  tool completion, error, or state-transition events.
-
-### Required tests
-
-- Fast producer / slow consumer stays within bounded capacity.
-- Text coalescing preserves exact visible content and ordering.
-- Cancellation/shutdown cannot deadlock while a producer awaits capacity.
-- MCP child exit releases blocked senders.
 
 ---
 
