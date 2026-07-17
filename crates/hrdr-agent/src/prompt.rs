@@ -26,6 +26,13 @@ const SYSTEM_TEMPLATE: &str = include_str!("templates/system.j2");
 /// block). Six write sub-agents spawned from the same batch then share a
 /// byte-identical prompt prefix right up to their `cwd`, so a prefix cache covers
 /// all of it. Reorder these blocks only with that in mind.
+///
+/// The invariant that makes it work: every *unconditional* section (identity,
+/// workflow, reporting, untrusted-content, safety) precedes the first `{% if %}`
+/// in the template. So a read-only agent and a write agent — which differ only in
+/// the gated sections — share that whole preamble as a common prefix, diverging
+/// only when the first capability gate opens. Keep new shared guidance above the
+/// gates, and put anything a gate could suppress inside one.
 pub fn render_system(
     tools: &ToolRegistry,
     instructions: Option<&str>,
@@ -315,6 +322,48 @@ mod tests {
         // them), and still reads web pages and files that may try to instruct it.
         assert!(p.contains("Reporting:"), "{p}");
         assert!(p.contains("Untrusted content:"), "{p}");
+    }
+
+    /// The prefix-cache invariant: every unconditional section precedes the first
+    /// capability gate, so a read-only agent and a write agent share the entire
+    /// common preamble (identity → workflow → reporting → untrusted → safety) as a
+    /// byte-identical prefix, diverging only where the first gate opens. This is
+    /// the whole point of the template ordering — a stray `{% if %}` interleaved
+    /// among the shared bullets would silently shorten that prefix and cost cache
+    /// hits across sibling sub-agents, and only a positional test catches it (the
+    /// substring tests are order-blind).
+    #[test]
+    fn read_only_and_write_prompts_share_the_whole_preamble() {
+        let write_tools = ToolRegistry::with_defaults();
+        let write = render_system(&write_tools, None, false).unwrap();
+
+        let mut ro_tools = ToolRegistry::with_defaults();
+        let ro_names = ro_tools.read_only_names();
+        ro_tools.retain_only(&ro_names);
+        let ro = render_system(&ro_tools, None, false).unwrap();
+
+        // Longest common byte prefix of the two prompts.
+        let common = ro
+            .as_bytes()
+            .iter()
+            .zip(write.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // The Safety section is the last unconditional one; its final line must lie
+        // wholly inside the shared prefix, or a gate crept in above it.
+        let safety_tail = "it cannot be recalled once it has.";
+        let safety_end = write
+            .find(safety_tail)
+            .expect("safety section present in the write prompt")
+            + safety_tail.len();
+        assert!(
+            safety_end <= common,
+            "read-only and write prompts must share the whole preamble through \
+             Safety; they diverge at byte {common}, before Safety ends at \
+             {safety_end}:\n--- shared prefix ---\n{}",
+            &write[..common]
+        );
     }
 
     /// "cut a release" is a whole workflow, and the prompt spells it out.

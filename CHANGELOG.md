@@ -23,7 +23,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of it. `render_system` drops its `cwd` argument; the instructions-source line
   of the untrusted-content section is now unconditional (identical bytes for
   main and sub-agents) and the sub-agent worktree note refers to the working
-  directory in the trailing Environment section rather than "above".
+  directory in the trailing Environment section rather than "above". The
+  `Workflow` section no longer interleaves `can_write` and shell-gated bullets
+  between its shared ones: the edit-tool bullet moves into `Editing` and the
+  build/test/lint verify loop moves to a new `Verifying` section after `Safety`,
+  so every unconditional section now precedes the first `{% if %}` and a
+  read-only agent and a write agent share the whole common preamble before
+  diverging.
 - **Smaller default tool-output threshold.** A single tool call's output now
   stays inline up to **50 lines or 5 KiB** (was 1,500 lines / 24 KiB); larger
   output is saved whole to a file and the model gets its path to `grep`/`read`.
