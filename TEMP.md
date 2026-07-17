@@ -53,6 +53,11 @@ Completed and verified (with review fixes folded in):
 - **P2 endpoint host classification** — `hrdr-agent` now consumes the public
   `hrdr_llm::url_host` helper instead of maintaining a duplicate classifier.
 - **P3 README stale release line** — removed.
+- **P2 credential write races** — `store_lock.rs` cross-process `O_EXCL`
+  advisory lock (PID+timestamp, RAII release, stale reaping by dead PID or 60s
+  age, bounded ~5s retry) held across the whole read-modify-write in
+  `save_token_at` and `save_oauth_at`; concurrency tests for different- and
+  same-provider writers on both stores.
 - **P2 `$EDITOR` quoting** — hand-rolled zero-dep shell-word splitter
   (`split_shell_words`) replaces `split_whitespace()`; quotes, escapes, and
   unterminated-quote recovery covered by 12 unit tests.
@@ -66,7 +71,6 @@ Completed and verified (with review fixes folded in):
 | Priority | Finding                                                | Main impact                            |
 | -------- | ------------------------------------------------------ | -------------------------------------- |
 | P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing   |
-| P2       | Credential read-modify-write lacks cross-process lock  | Concurrent credential loss             |
 | P2       | Unbounded internal channels                            | Memory growth under sustained overload |
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
 | P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
@@ -99,40 +103,6 @@ For each extraction:
 - Public API preserved via an explicit re-export list where exports move
   (`config.rs` is the template).
 - Follow-up behavior changes target the newly isolated module.
-
----
-
-## P2: Credential updates can lose concurrent writes
-
-### Evidence
-
-- API-key update reads, edits, and atomically replaces in
-  `crates/hrdr-agent/src/auth.rs` (`save_token_at`).
-- OAuth credential update performs a similar read-modify-write in
-  `crates/hrdr-agent/src/oauth.rs`.
-- Atomic rename protects readers from partial files but does not serialize
-  writers. Existing OAuth-refresh coordination is in-process only.
-
-### Impact
-
-Two processes can both read the same old credential store, add different keys,
-and replace it. The last rename wins and removes the other process's update.
-
-### Recommendation
-
-Cross-process advisory lock around the whole read-modify-write: acquire,
-re-read, parse strictly (the fail-closed parse already exists for `auth.toml`),
-apply, replace atomically, release. Adding a locking dependency requires
-explicit approval; the session-reservation `O_EXCL` + PID/timestamp pattern from
-`session.rs` is a zero-dependency template that could be reused here.
-
-### Required tests
-
-- Two concurrent writers adding different providers preserve both.
-- Same-provider concurrent writers follow a documented winner policy.
-- Lock-holder crash does not leave permanent unusable state (stale-lock reaping,
-  as sessions now do).
-- Windows and Unix behavior covered in CI.
 
 ---
 
