@@ -17,7 +17,8 @@ pub enum Role {
 }
 
 /// Internal origin of a message — distinguishes a real user turn from synthetic
-/// user-role context injected by the agent (steering, background results, …).
+/// user-role context injected by the agent (steering, background results,
+/// turn-end nudges, …).
 ///
 /// Lets the agent tell a real user turn apart from synthetic `Role::User`
 /// context it injected. Defaults to [`User`](MessageOrigin::User) so that
@@ -32,6 +33,10 @@ pub enum MessageOrigin {
     User,
     Steering,
     BackgroundResult,
+    /// A synthetic prompt the harness injects when the model ends its turn
+    /// with no tool calls while the shared TODO list still has unfinished
+    /// items — never a real user turn. See `Agent::run`'s turn loop.
+    Nudge,
 }
 
 /// A single chat message. Used for both request and response — `content` is
