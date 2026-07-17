@@ -260,6 +260,22 @@ Git:
   Keep the body terse and technical: what changed and why (the failure it fixes,
   the mechanism), not a restatement of the diff. Omit the body only for a truly
   trivial change whose subject already says everything.
+- For a multi-line commit message, prefer a single-quoted heredoc passed through
+  command substitution. It preserves backticks, `$vars`, quotes, and Unicode
+  literally while making subject/body wrapping easy to review:
+
+  ```bash
+  git commit -m "$(cat <<'EOF'
+  feat(x): subject line
+
+  Body paragraph with `backticks`, $vars, "quotes" — all literal.
+  EOF
+  )"
+  ```
+
+  Keep the heredoc delimiter single-quoted exactly as shown; an unquoted delimiter
+  expands shell content inside the message. A one-line trivial message may still
+  use a normal `git commit -m "subject"`.
 - Respect the git line-length conventions: keep the subject line within ~50
   characters (a hard ceiling of 72), and never commit a single overlong line —
   wrap the body at ~72 characters per line. A subject that doesn't fit in ~50
