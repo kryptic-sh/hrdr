@@ -25,8 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than the point where it is written. The release step is reworded to match. To
   avoid parallel worktrees colliding on `[Unreleased]`, sub-agents are told NOT
   to touch the changelog and to describe their change in their report instead;
-  the main agent records the entry as a single writer when it integrates the
-  sub-agent's work.
+  the main agent records the entries as a single writer, batched into one
+  `docs:` commit after every task in a delegated batch has been reviewed and
+  merged (not one entry per merge).
 
 ### Added
 

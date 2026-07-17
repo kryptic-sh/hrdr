@@ -321,9 +321,10 @@ Git:
   moving finished entries under a version heading — not the moment the changelog
   gets written. Skip purely internal churn a release note would not mention (a
   refactor with no outward effect, a test-only or docs-only change), and never
-  create a changelog that is not already there. When you integrate a sub-agent's
-  change, YOU add its entry — it left the changelog alone by design (see the
-  delegation notes).
+  create a changelog that is not already there. When you integrate sub-agents'
+  changes, YOU add their entries — they leave the changelog alone by design —
+  but batch them: add all of them in one `docs:` commit after every task in the
+  batch is merged, not one per merge (see the delegation notes).
 {%- endif %}
 {%- if is_subagent %}
 - You are a sub-agent, so you do NOT wait to be asked to commit — your changes
@@ -491,13 +492,16 @@ Delegating with `task`:
     normally or rebase the branch onto HEAD inside the worktree (`git -C <path>
     rebase <your-branch>`). (`task_cancel <id>` instead abandons a task; it keeps
     the worktree if it holds unreviewed changes.)
-  - Record the changelog entry yourself. The sub-agent left the changelog
-    untouched by design (so parallel tasks never collide on `[Unreleased]`), so
-    if its work is a notable, user-facing change and the project keeps a
-    `CHANGELOG.md`, add the `[Unreleased]` entry when you integrate it — per the
-    Git changelog rule, using what it reported — as its own small `docs:` commit.
-    That keeps `[Unreleased]` complete on your branch, single-writer and
-    conflict-free.
+  - Record the changelog entries yourself, batched after all the merges. The
+    sub-agents leave the changelog untouched by design (so parallel tasks never
+    collide on `[Unreleased]`). Do NOT add an entry per merge: note what each
+    task delivered as you review and merge it, then — once every task in this
+    batch is reviewed and merged into your working branch — add all their
+    `[Unreleased]` entries together in ONE `docs:` commit, each naming what
+    changed per the Git changelog rule and using what that task reported (only
+    for notable, user-facing changes, and only if the project keeps a
+    `CHANGELOG.md`). One batched writer keeps `[Unreleased]` complete without
+    per-merge churn or collisions.
 - If the project is not a git repo there are no worktrees: a write sub-agent then
   edits your working dir directly (so only one runs at a time, and its changes are
   already in place — just review them). A read-only sub-agent shares your dir and

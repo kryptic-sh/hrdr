@@ -420,8 +420,12 @@ mod tests {
             })
             .unwrap();
         assert!(
-            main.contains("Record the changelog entry yourself"),
-            "the integrating agent adds the entry the sub-agent skipped"
+            main.contains("Record the changelog entries yourself, batched"),
+            "the integrating agent adds the entries the sub-agents skipped"
+        );
+        assert!(
+            main.contains("Do NOT add an entry per merge"),
+            "entries are batched after all merges, not written one per merge"
         );
         assert!(
             main.contains("Keep the changelog current as you work"),
