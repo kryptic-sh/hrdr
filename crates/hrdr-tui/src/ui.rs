@@ -1387,25 +1387,24 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
             Color::White,
             app.theme.error,
         );
-        app.follow_button = None;
+        app.end_button = None;
+        app.home_button = None;
     } else if app.scroll_offset > 0 {
-        // The arrows point at the output the banner returns to.
-        let rect = banner(
-            f,
-            area,
-            "↓",
-            "Press END to follow output",
-            Color::Black,
-            app.theme.warn,
-        );
-        app.follow_button = Some(crate::app::HitRect {
+        // Two buttons, same color, side by side: END jumps back to the newest
+        // output (down), HOME to the top of the session (up) — each arrow points
+        // where its button goes.
+        let (end, home) = scroll_banners(f, area, Color::Black, app.theme.warn);
+        let hit = |rect: Rect| crate::app::HitRect {
             x: rect.x,
             y: rect.y,
             w: rect.width,
             h: rect.height,
-        });
+        };
+        app.end_button = Some(hit(end));
+        app.home_button = Some(hit(home));
     } else {
-        app.follow_button = None;
+        app.end_button = None;
+        app.home_button = None;
     }
 }
 
@@ -1430,6 +1429,44 @@ fn banner(f: &mut Frame, input: Rect, icon: &str, label: &str, fg: Color, bg: Co
     let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
     f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), rect);
     rect
+}
+
+/// Render the two scroll buttons side by side on the banner row, just above the
+/// input pane: "↓ Press END ↓" (jump to the newest output) and "↑ Press HOME ↑"
+/// (jump to the top), sharing one color. Centered as a pair with a one-column
+/// gap; returns `(end_rect, home_rect)` for click hit-testing.
+fn scroll_banners(f: &mut Frame, input: Rect, fg: Color, bg: Color) -> (Rect, Rect) {
+    let end_text = " ↓ Press END ↓ ";
+    let home_text = " ↑ Press HOME ↑ ";
+    const GAP: u16 = 1;
+    let end_w = end_text.width() as u16;
+    let home_w = home_text.width() as u16;
+    let total = (end_w + GAP + home_w).min(input.width);
+    let start_x = input.x + input.width.saturating_sub(total) / 2;
+    let y = input.y.saturating_sub(BANNER_LIFT);
+    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+
+    let end_rect = Rect {
+        x: start_x,
+        y,
+        width: end_w,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(end_text, style))),
+        end_rect,
+    );
+    let home_rect = Rect {
+        x: start_x + end_w + GAP,
+        y,
+        width: home_w,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(home_text, style))),
+        home_rect,
+    );
+    (end_rect, home_rect)
 }
 
 /// One status-bar section: `(priority, spans)`. Lower priority is kept longer;

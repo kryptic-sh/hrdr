@@ -20,6 +20,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Two scroll buttons instead of one.** When scrolled up in the TUI, the single
+  "Press END to follow output" banner is replaced by two side-by-side buttons in
+  the same color — "↓ Press END ↓" (jump to the newest output) and "↑ Press HOME
+  ↑" (jump to the top of the session) — each clickable. Both stay hidden while
+  following the transcript. The `App::follow_button` hit-rect is renamed
+  `end_button`, joined by a new `home_button`.
 - **Made the `plan` sub-agent fully read-only.** It investigates with the
   read/search tools and returns its implementation plan in its report, rather
   than persisting a Markdown file. It moves into the read-only sub-agent pool

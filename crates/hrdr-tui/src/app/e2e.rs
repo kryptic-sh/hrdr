@@ -3755,10 +3755,11 @@ async fn one_blank_row_separates_the_scrollback_from_the_input() {
     }
 }
 
-/// The "follow output" button floats two rows above the input pane, with an
-/// arrow at each end, and clicking it returns to following the newest output.
+/// Two scroll buttons — "↓ Press END ↓" and "↑ Press HOME ↑" — float side by
+/// side two rows above the input pane when scrolled up, and click to the newest
+/// output / the top of the session respectively.
 #[tokio::test]
-async fn the_follow_button_floats_above_the_input_and_is_clickable() {
+async fn the_scroll_buttons_float_above_the_input_and_are_clickable() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     let mut h = Harness::new(vec![]).await;
@@ -3767,49 +3768,74 @@ async fn the_follow_button_floats_above_the_input_and_is_clickable() {
     }
     h.type_str("draft");
 
-    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    assert!(h.app.follow_button.is_none(), "no button while following");
+    assert!(
+        h.app.end_button.is_none() && h.app.home_button.is_none(),
+        "no buttons while following"
+    );
 
-    // Scroll up: the button appears.
+    // Scroll up: both buttons appear.
     h.app.scroll_offset = 5;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let rect = h.app.follow_button.expect("the follow button is drawn");
+    let end = h.app.end_button.expect("the END button is drawn");
+    let home = h.app.home_button.expect("the HOME button is drawn");
     let buf = term.backend().buffer();
     let screen = buffer_to_string(buf);
 
-    // An arrow at each end of the label. Read only the button's own columns —
-    // the rest of the row is still transcript.
-    let label: String = (rect.x..rect.x + rect.w)
-        .filter_map(|x| {
-            buf.cell(Position::new(x, rect.y))
-                .map(|c| c.symbol().to_string())
-        })
-        .collect();
-    let trimmed = label.trim();
-    assert!(trimmed.starts_with('↓'), "left arrow: {label:?}\n{screen}");
-    assert!(trimmed.ends_with('↓'), "right arrow: {label:?}\n{screen}");
-    assert!(trimmed.contains("Press END to follow output"), "{screen}");
+    // Read only a button's own columns — the rest of the row is transcript.
+    let label = |rect: crate::app::HitRect| -> String {
+        (rect.x..rect.x + rect.w)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, rect.y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let end_label = label(end);
+    let end_trimmed = end_label.trim();
+    assert!(
+        end_trimmed.starts_with('↓') && end_trimmed.ends_with('↓'),
+        "END arrows: {end_label:?}\n{screen}"
+    );
+    assert!(end_trimmed.contains("Press END"), "{screen}");
+    let home_label = label(home);
+    let home_trimmed = home_label.trim();
+    assert!(
+        home_trimmed.starts_with('↑') && home_trimmed.ends_with('↑'),
+        "HOME arrows: {home_label:?}\n{screen}"
+    );
+    assert!(home_trimmed.contains("Press HOME"), "{screen}");
+    // Side by side: HOME sits to the right of END, on the same row.
+    assert_eq!(end.y, home.y, "same row:\n{screen}");
+    assert!(home.x >= end.x + end.w, "HOME right of END:\n{screen}");
 
-    // Two rows above the input pane, so it doesn't sit on the pane itself.
+    // Two rows above the input pane, so they don't sit on the pane itself.
     let pane_top = (0..20)
         .find(|&y| buf.cell(Position::new(2, y)).unwrap().bg == h.app.theme.user_bg)
         .expect("the input pane renders");
-    assert_eq!(rect.y + 2, pane_top, "two rows above the pane:\n{screen}");
-    assert_ne!(
-        buf.cell(Position::new(2, rect.y)).unwrap().bg,
-        h.app.theme.user_bg,
-        "the button is clear of the pane:\n{screen}"
-    );
+    assert_eq!(end.y + 2, pane_top, "two rows above the pane:\n{screen}");
 
-    // Clicking it resumes following.
+    // Clicking HOME jumps to the top of the session.
     h.app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: rect.x + 1,
-        row: rect.y,
+        column: home.x + 1,
+        row: home.y,
         modifiers: crossterm::event::KeyModifiers::empty(),
     });
-    assert_eq!(h.app.scroll_offset, 0, "the click resumed following");
+    assert_eq!(
+        h.app.scroll_offset, h.app.max_scroll,
+        "the HOME click jumped to the top"
+    );
+
+    // Clicking END resumes following the newest output.
+    h.app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: end.x + 1,
+        row: end.y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    assert_eq!(h.app.scroll_offset, 0, "the END click resumed following");
 }
 
 /// The loader tracks the *model*, not the turn: it hides while the model's tool
@@ -4200,11 +4226,11 @@ async fn both_banners_render_through_the_same_path() {
             .collect()
     };
 
-    // Scrolled up: the follow banner, in the warn colors.
+    // Scrolled up: the END banner, in the warn colors.
     h.app.scroll_offset = 5;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let follow = h.app.follow_button.expect("the follow banner is drawn");
-    assert!(label(&term, follow).contains("follow output"));
+    let follow = h.app.end_button.expect("the END banner is drawn");
+    assert!(label(&term, follow).contains("Press END"));
     let (fg, bg, m) = cell(&term, follow.x + 1, follow.y);
     assert_eq!((fg, bg), (Color::Black, h.app.theme.warn));
     assert!(m.contains(ratatui::style::Modifier::BOLD), "bold");
@@ -4214,7 +4240,7 @@ async fn both_banners_render_through_the_same_path() {
     h.app.quit_armed = true;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert!(
-        h.app.follow_button.is_none(),
+        h.app.end_button.is_none(),
         "the quit banner isn't clickable"
     );
     let screen = buffer_to_string(term.backend().buffer());

@@ -456,9 +456,14 @@ pub(crate) struct App {
     /// request — i.e. right after a round's tool results — so a queued message
     /// rides in with them. Empty when no turn is running.
     steering: hrdr_agent::SteeringQueue,
-    /// Screen rect of the "follow output" button, set during draw while scrolled
-    /// up so mouse clicks can hit-test against it. `None` when following.
-    pub(crate) follow_button: Option<HitRect>,
+    /// Screen rect of the "↓ Press END ↓" button (jump to newest output), set
+    /// during draw while scrolled up so mouse clicks can hit-test against it.
+    /// `None` when following.
+    pub(crate) end_button: Option<HitRect>,
+    /// Screen rect of the "↑ Press HOME ↑" button (jump to the top of the
+    /// session), the sibling of [`end_button`](Self::end_button). `None`
+    /// when following.
+    pub(crate) home_button: Option<HitRect>,
     /// Clickable screen rects for each visible tool block → its transcript index,
     /// set during draw. A left click toggles that tool's `expanded` (like a
     /// per-entry `/expand`).
@@ -622,6 +627,7 @@ impl App {
             turn_handle: None,
             quit_reap: None,
             scroll_offset: 0,
+            home_button: None,
             transcript_height: 24,
             scrollback,
             max_scroll: 0,
@@ -630,7 +636,7 @@ impl App {
             todo_completed_at: HashMap::new(),
             todo_ttl,
             steering: hrdr_agent::steering_queue(),
-            follow_button: None,
+            end_button: None,
             tool_hits: Vec::new(),
             background_tasks,
             subagent_hits: Vec::new(),
@@ -1385,10 +1391,16 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(rect) = self.follow_button
+                if let Some(rect) = self.end_button
                     && rect.contains(m.column, m.row)
                 {
-                    self.scroll_offset = 0;
+                    self.scroll_offset = 0; // jump to the newest output
+                    return;
+                }
+                if let Some(rect) = self.home_button
+                    && rect.contains(m.column, m.row)
+                {
+                    self.scroll_offset = self.max_scroll; // jump to the top
                     return;
                 }
                 // Click a row in the agent list to *switch to that agent*: the
