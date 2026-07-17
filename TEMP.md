@@ -58,6 +58,11 @@ Completed and verified (with review fixes folded in):
   age, bounded ~5s retry) held across the whole read-modify-write in
   `save_token_at` and `save_oauth_at`; concurrency tests for different- and
   same-provider writers on both stores.
+- **P3 `--max-cost` with unpriced models** — opt-in `allow_unpriced` config +
+  `--allow-unpriced` CLI flag: unpriced calls proceed uncounted, the cap still
+  enforces on priced usage, and any total that excluded unpriced usage renders
+  as `≥ $X.XX (excludes unpriced usage)` (bare figure only when complete);
+  NDJSON usage events carry `cost_partial`.
 - **P3 Windows file confidentiality** — documented honestly (README, module
   docs, `write_atomic`/`open_wire_log` comments): Unix enforces 0600 every
   write; Windows relies on default ACLs of the per-user profile dir
@@ -84,7 +89,6 @@ Completed and verified (with review fixes folded in):
 | P2       | Unbounded internal channels                            | Memory growth under sustained overload |
 | P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests          |
 | P2       | Configuration validation is permissive and fragmented  | Silent misconfiguration                |
-| P3       | `--max-cost` unusable with unpriced/local models       | Capped local runs impossible           |
 
 ---
 
@@ -209,30 +213,6 @@ follow-up in the isolated module.
 - Zero/max boundary values, invalid env strings, unknown enum values, context
   window smaller than compaction reserve, conflicting provider/global settings,
   multiple simultaneous errors reported together.
-
----
-
-## P3: `--max-cost` is unusable with unpriced/local models
-
-(New finding from the implementation review.)
-
-### Evidence
-
-- The cost cap is now fail-closed: `budget_preflight` errors on any unpriced
-  model when `max_cost` is set. The audit's suggested `--allow-unpriced` escape
-  hatch was not implemented.
-
-### Impact
-
-Strictly safe, but a user running a local model (never in the pricing catalog)
-cannot use `--max-cost` at all — even though sub-agent calls on priced providers
-could still be capped. They must drop the cap entirely.
-
-### Recommendation
-
-Add `--allow-unpriced` (or `max_cost_partial = true`): unpriced calls proceed
-uncounted, the cap applies to priced usage, and reported totals say
-"partial/unknown", never a complete-looking `$0.00`.
 
 ---
 
