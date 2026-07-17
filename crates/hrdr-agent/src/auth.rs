@@ -1,8 +1,10 @@
 //! Dedicated credential store, kept out of `config.toml` so API keys never land
 //! in a file users commit or share. Plaintext TOML at
-//! `$XDG_CONFIG_HOME/hrdr/auth.toml` (`0600` on unix), a flat map of provider
-//! name → API key. Written by the `/login` wizard, read at startup and on a
-//! live provider switch (the `/model` picker or `/login`).
+//! `$XDG_CONFIG_HOME/hrdr/auth.toml` (`0600` on unix; on Windows no explicit
+//! ACL — hrdr relies on the default ACLs of the containing per-user profile
+//! directory, which is user-scoped by default), a flat map of provider name →
+//! API key. Written by the `/login` wizard, read at startup and on a live
+//! provider switch (the `/model` picker or `/login`).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -84,6 +86,15 @@ fn load_tokens_at(path: &Path) -> HashMap<String, String> {
 /// permissions from the start so there is no window where it exists with
 /// broader permissions.
 ///
+/// Confidentiality guarantee, stated honestly: on Unix the file is owner-only
+/// (`0600`), enforced on every write. On Windows hrdr sets **no** explicit ACL
+/// — it relies on the default ACLs of the containing directory. In practice the
+/// credential files land under `~/.config/hrdr` (see [`crate::config_dir`]),
+/// which on Windows resolves to the per-user profile (`%USERPROFILE%`, not
+/// `%APPDATA%`) and is user-scoped by default. hrdr does not add per-user ACLs
+/// itself, so the guarantee is the platform default, not something enforced
+/// here.
+///
 /// The parent directory is fsynced after a successful rename so that the
 /// rename is crash-durable (the directory entry change is flushed to media).
 /// A directory sync failure is **not** reported as an error: the rename
@@ -148,8 +159,12 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     // No non-unix permission tightening: the Windows read-only *attribute*
     // doesn't restrict reads (access is by ACL) and would make the file
-    // un-replaceable by the next atomic rename. Unix already got 0600 above;
-    // proper Windows hardening (per-user ACL) is a follow-up.
+    // un-replaceable by the next atomic rename. Unix already got 0600 above.
+    // On Windows we deliberately set no explicit ACL and rely on the default
+    // ACLs of the containing per-user profile directory (~/.config/hrdr under
+    // %USERPROFILE%), which is user-scoped by default. Setting a per-user ACL
+    // would need the `windows`/`winapi` crate (a new dependency); the honest
+    // documented guarantee is the platform default (see the doc comment above).
     Ok(())
 }
 

@@ -66,6 +66,14 @@ fn request_log() -> Option<&'static WireLog> {
 /// regular file or the permissions cannot be applied. Used both for the
 /// initial open and for the fresh active file created on rotation, so both
 /// share the same 0600 discipline.
+///
+/// Confidentiality is platform-dependent and stated honestly: on Unix the file
+/// is forced to `0600` (owner-only). On Windows hrdr sets **no** explicit ACL —
+/// the file inherits the ACLs of whatever directory `HRDR_LOG_REQUESTS` points
+/// at. Because that path is caller-chosen (unlike the credential store, which
+/// lives under the user profile), pointing it at a world-readable directory
+/// leaks the logged request/response data on **any** platform; callers should
+/// keep it under a directory only they can read.
 fn open_wire_log(path: &Path) -> Option<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);

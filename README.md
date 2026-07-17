@@ -117,11 +117,16 @@ hrdr run --max-cost 0.50 "audit the error handling"
 
 For debugging harness ⇄ server disagreements, `HRDR_LOG_REQUESTS=<path>` appends
 every chat request body, raw SSE line, and non-2xx response to the file as
-JSON-per-line. On Unix the file is created 0600 (owner-only). When it reaches
-10 MiB it rotates: the active file is renamed to `<path>.1` (replacing any
-previous `.1`) and a fresh active file is started, so the newest entries are
-always captured rather than dropped and on-disk use stays bounded at 2× the cap
-(≈20 MiB).
+JSON-per-line. On Unix the file is created 0600 (owner-only). On Windows no
+explicit ACL is set — the file inherits the ACLs of the directory you point it
+at, so choose a user-scoped location. The log contains raw request/response data
+including anything sent to or returned by the provider; pointing
+`HRDR_LOG_REQUESTS` at a world-readable directory leaks that data on **any**
+platform, so keep it under a directory only you can read. When it reaches 10 MiB
+it rotates: the active file is renamed to `<path>.1` (replacing any previous
+`.1`) and a fresh active file is started, so the newest entries are always
+captured rather than dropped and on-disk use stays bounded at 2× the cap (≈20
+MiB).
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
@@ -324,6 +329,17 @@ Credentials are stored **separately from `config.toml`**, in a dedicated
 wizard prints the exact path and a plaintext-storage warning before it saves.
 Keeping keys out of `config.toml` means you can share or version that file
 without leaking secrets.
+
+**File confidentiality.** `auth.toml`, the OAuth token store (`oauth.json`), and
+the request log all live under `~/.config/hrdr` on every platform — hrdr does
+not use `%APPDATA%`; on Windows `~` resolves to your user profile
+(`%USERPROFILE%`, e.g. `C:\Users\you`). On Unix these files are created 0600
+(owner-only) and hrdr enforces that mode on every write. On Windows hrdr sets no
+explicit ACL: it relies on the default ACLs of the containing per-user profile
+directory, which is user-scoped by default. That is the platform default rather
+than an hrdr-enforced guarantee, so if you have loosened the ACLs on your
+profile directory (or override `XDG_CONFIG_HOME` to a shared location) these
+files are only as private as that directory.
 
 #### Custom providers
 
