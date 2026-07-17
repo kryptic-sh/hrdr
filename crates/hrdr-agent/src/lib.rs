@@ -5260,6 +5260,9 @@ impl Agent {
         let mut overflow_compacted = false;
         // Anti-loop breaker for verbatim retries of a failing call.
         let mut repeat = RepeatGuard::default();
+        // At most one turn-end nudge (see below) per turn — a genuinely blocked
+        // or deferring model must still be able to stop.
+        let mut nudged_this_turn = false;
 
         for step in 0..self.max_steps {
             // Deliver any steering messages submitted since the last request — a
@@ -5378,6 +5381,41 @@ impl Agent {
             self.messages.push(assistant);
 
             if tool_calls.is_empty() {
+                // A degraded high-context model sometimes ends its turn on a
+                // promise instead of doing the work — "I'll implement now",
+                // zero tool calls, TODO items left dangling. Give it exactly
+                // one chance per turn to either finish the list or explicitly
+                // defer it, instead of silently accepting the promise as done.
+                if !nudged_this_turn {
+                    let unfinished: Vec<TodoItem> = self
+                        .ctx
+                        .todos
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .filter(|t| t.status.as_str() != "completed")
+                        .cloned()
+                        .collect();
+                    if !unfinished.is_empty() {
+                        nudged_this_turn = true;
+                        on_event(AgentEvent::Notice(format!(
+                            "turn ended with {} unfinished TODOs — nudging the model to \
+                             finish or defer explicitly",
+                            unfinished.len()
+                        )));
+                        self.push_user_message(
+                            format!(
+                                "[Your turn was about to end, but these TODO items are not \
+                                 finished:\n{}\nEither continue now and complete them, or \
+                                 update the list — mark items done or remove them — and tell \
+                                 the user plainly why you decided to defer that work.]",
+                                render_unfinished_todos(&unfinished)
+                            ),
+                            MessageOrigin::Nudge,
+                        );
+                        continue;
+                    }
+                }
                 // The model answered without calling a tool: the turn is over,
                 // even if a steering message is pending. It has no tool result to
                 // ride in on, so the frontend sends it as a turn of its own —
@@ -6234,15 +6272,21 @@ fn is_prune_placeholder(body: &str) -> bool {
 }
 
 /// Whether `m` is prunable *content* — bulky non-conversation material that
-/// isn't the real user↔agent exchange: a tool-call result, or a detached
-/// background sub-agent's delivery report (`Role::User` on the wire, since
-/// that's how it's folded into history, but `MessageOrigin::BackgroundResult`
-/// marks it as tool product rather than the user speaking). Never a genuine
-/// user message (`origin` `User`/`Steering`), an assistant message (its
+/// isn't the real user↔agent exchange: a tool-call result, a detached
+/// background sub-agent's delivery report, or a harness turn-end nudge
+/// (`Role::User` on the wire, since that's how each is folded into history,
+/// but `MessageOrigin::BackgroundResult`/`MessageOrigin::Nudge` mark them as
+/// harness/tool product rather than the user speaking). Never a genuine user
+/// message (`origin` `User`/`Steering`), an assistant message (its
 /// `tool_calls` metadata must stay so the tool-call ↔ result pairing strict
 /// servers require stays intact), or a system message.
 fn is_prunable(m: &ChatMessage) -> bool {
-    m.role == Role::Tool || (m.role == Role::User && m.origin == MessageOrigin::BackgroundResult)
+    m.role == Role::Tool
+        || (m.role == Role::User
+            && matches!(
+                m.origin,
+                MessageOrigin::BackgroundResult | MessageOrigin::Nudge
+            ))
 }
 
 /// Work out which *old* non-conversation messages a prune would clear —
@@ -6521,6 +6565,26 @@ fn flatten_tool_protocol(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             _ => m.clone(),
         })
         .collect()
+}
+
+/// Render the not-yet-`completed` TODO items as `[ ] content` / `[~] content`
+/// lines, one per item — mirrors the checkbox rendering `todo`'s own tool
+/// produces (see `render_todos` in `hrdr-tools::tools::todo`), minus the
+/// completed items, since those are exactly what a turn-end nudge needs to
+/// call out.
+fn render_unfinished_todos(todos: &[TodoItem]) -> String {
+    todos
+        .iter()
+        .map(|t| {
+            let mark = if t.status.as_str() == "in_progress" {
+                "~"
+            } else {
+                " "
+            };
+            format!("[{mark}] {}", t.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Guard against an assistant turn carrying neither text nor a tool call.
@@ -12473,7 +12537,10 @@ mod tests {
         use tokio::net::TcpListener;
         use tokio::sync::Mutex;
 
-        use super::super::{Agent, AgentConfig, AgentEvent, ChatMessage, steering_queue};
+        use super::super::{
+            Agent, AgentConfig, AgentEvent, ChatMessage, MessageOrigin, Role, TodoItem,
+            steering_queue,
+        };
 
         // ── helpers ──────────────────────────────────────────────────────────
 
@@ -12854,6 +12921,200 @@ mod tests {
                 )),
                 "ToolEnd display event stays free of the duration line"
             );
+        }
+
+        // ── (c) turn-end nudge for unfinished TODOs ─────────────────────────────
+
+        /// A degraded model ends its turn with no tool calls while the TODO list
+        /// still has unfinished items — the harness nudges it once: a synthetic
+        /// message naming the unfinished items is injected, a Notice explains why,
+        /// and one more model round runs. That round is also text-only (a model
+        /// still blocked/deferring after the nudge), so the turn then ends
+        /// normally — no second nudge.
+        #[tokio::test]
+        async fn agent_run_nudges_once_then_ends_on_pending_todos() {
+            let server = MockServer::start(vec![
+                // Round 1: the promise-then-stop pattern — text, no tool calls.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "I'll implement this now."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 2 (post-nudge): still text-only — a genuinely blocked or
+                // deferring model must be able to stop after its one nudge.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Still blocked, deferring."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![
+                TodoItem {
+                    content: "write the fix".to_string(),
+                    status: "in_progress".to_string(),
+                },
+                TodoItem {
+                    content: "add a test".to_string(),
+                    status: "pending".to_string(),
+                },
+            ];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // Exactly one nudge message, naming both unfinished items and
+            // carrying the defer instruction.
+            let nudges: Vec<&ChatMessage> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.origin == MessageOrigin::Nudge)
+                .collect();
+            assert_eq!(nudges.len(), 1, "exactly one nudge injected: {nudges:?}");
+            let body = nudges[0].content.as_deref().unwrap();
+            assert!(body.contains("write the fix"), "{body}");
+            assert!(body.contains("add a test"), "{body}");
+            assert!(
+                body.contains("not finished"),
+                "states the turn was about to end early: {body}"
+            );
+            assert!(
+                body.contains("mark items done or remove them"),
+                "carries the defer instruction: {body}"
+            );
+            assert_eq!(nudges[0].role, Role::User);
+            // Not a genuine user turn.
+            assert_ne!(nudges[0].origin, MessageOrigin::User);
+            assert_ne!(nudges[0].origin, MessageOrigin::Steering);
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unfinished TODOs"))),
+                "a Notice explains the nudge: {events:?}"
+            );
+
+            // Both rounds actually ran, and the turn ended normally afterward.
+            let texts: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(texts.iter().any(|t| t.contains("implement")), "{texts:?}");
+            assert!(texts.iter().any(|t| t.contains("deferring")), "{texts:?}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// No pending TODOs (empty list, or every item already `completed`) means
+        /// nothing to nudge about — the turn ends on the first text-only reply,
+        /// same as before this defense existed. The mock server has only one
+        /// response queued, so a second round (were one wrongly triggered) would
+        /// hang the request and fail the `.unwrap()` below.
+        #[tokio::test]
+        async fn agent_run_no_nudge_when_todos_all_completed() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "All done."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![TodoItem {
+                content: "write the fix".to_string(),
+                status: "completed".to_string(),
+            }];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.origin == MessageOrigin::Nudge),
+                "no nudge when every TODO is completed"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unfinished TODOs"))),
+                "no nudge Notice: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// The max-steps wrap-up round — the final, tools-stripped round the
+        /// harness itself forces once the tool-round budget is exhausted — must
+        /// never be mistaken for the promise-then-stop failure mode: it is
+        /// structurally outside the `for step in 0..self.max_steps` loop the
+        /// nudge lives in, so it can't trigger one even with pending TODOs.
+        #[tokio::test]
+        async fn agent_run_wrap_up_round_never_nudges() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let server = MockServer::start(vec![
+                // The single tool round the 1-step budget allows.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // The forced wrap-up round: no tools sent, model answers in text.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Ran out of rounds."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 1;
+            let mut agent = Agent::new(cfg).unwrap();
+            *agent.todos().lock().unwrap() = vec![TodoItem {
+                content: "unfinished work".to_string(),
+                status: "pending".to_string(),
+            }];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.origin == MessageOrigin::Nudge),
+                "the wrap-up round must never trigger a turn-end nudge"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Notice(n) if n.contains("tool-round limit reached")
+                )),
+                "the wrap-up Notice fires instead: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }
 
         /// One `[[hooks]]` entry with an `event`, for the lifecycle tests.

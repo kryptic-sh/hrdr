@@ -206,8 +206,20 @@ mod tests {
         assert!(p.contains("old_string"));
         assert!(p.contains("stale statuses first"));
         assert!(p.contains("sub-agent result as unfinished until reviewed and merged"));
+        // A degraded high-context model ends its turn on a promise instead of
+        // doing the work — the prompt names that pattern and forbids stopping there.
+        assert!(p.contains("Before ending your turn, check your last paragraph"));
+        assert!(
+            p.contains("that\n  work is not done: do it now, with tool calls, in this same turn")
+        );
+        assert!(p.contains("genuinely blocked on\n  input only the user can give"));
+        // Economy applies to prose, not to leaving work unfinished.
+        assert!(p.contains("stopping before the task is done saves\nno one anything"));
         assert!(p.contains("git commit -m \"$(cat <<'EOF'"));
         assert!(p.contains("Keep the heredoc delimiter single-quoted"));
+        assert!(p.contains("dependent, non-interactive commands with `&&`"));
+        assert!(p.contains("failed checks prevent staging"));
+        assert!(p.contains("Never use `;` as a substitute"));
         assert!(p.contains("/tmp/x"));
         assert!(!p.contains("Project instructions"));
         // The OS line names the platform (and, where detectable, the distro +
