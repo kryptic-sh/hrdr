@@ -91,8 +91,9 @@ Completed and verified (with review fixes folded in):
   startup notice in the TUI, stderr headless).
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
   lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
-  (`turn_state.rs`, 155 lines), and turn execution (`turn_loop.rs`, ~1.1k lines)
-  extracted with API preserved.
+  (`turn_state.rs`, 155 lines), turn execution (`turn_loop.rs`, ~1.1k lines),
+  and compaction/context management (`compaction.rs`, 691 lines) extracted with
+  API preserved.
 
 ## Priority map (open items)
 
@@ -113,8 +114,7 @@ remain.)
 
 ### Remaining extractions, in order
 
-1. `compaction` and context management (pruning, elision, tail windows)
-2. `delegation` and `worktree` (the `task*` tool family, spawn paths,
+1. `delegation` and `worktree` (the `task*` tool family, spawn paths,
    transcripts)
 
 ### Verification strategy
