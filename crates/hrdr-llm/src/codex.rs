@@ -472,8 +472,21 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             }))
         }
         "error" => {
-            let code = ev.get("code").and_then(Value::as_str);
-            let msg = error_message(ev).unwrap_or_else(|| "unknown error".to_string());
+            // The payload shape varies by backend build: flat
+            // (`{"type":"error","code":…,"message":…}`) or nested
+            // (`{"type":"error","error":{…}}`, like `response.failed`). Read
+            // whichever is present — reading only the top level turned a
+            // nested `server_error` (transient, retryable) into a terminal
+            // "unknown error" that killed the turn.
+            let err_obj = ev.get("error").filter(|e| e.is_object()).unwrap_or(ev);
+            let code = err_obj.get("code").and_then(Value::as_str);
+            let msg = error_message(err_obj).unwrap_or_else(|| {
+                // Nothing recognizable at either level: carry the raw event
+                // (bounded) so the failure stays diagnosable instead of the
+                // dead-end "unknown error".
+                let raw: String = ev.to_string().chars().take(300).collect();
+                format!("unrecognized error event: {raw}")
+            });
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
                 retry_after: None,
@@ -894,6 +907,44 @@ mod tests {
             chat_err.message
         );
         assert!(chat_err.message.contains("boom"), "{}", chat_err.message);
+    }
+
+    /// An `error` event may nest its payload (`{"type":"error","error":{…}}`),
+    /// like `response.failed` does. Reading only the top level turned a nested
+    /// `server_error` — transient, retryable — into a terminal "unknown error"
+    /// that killed the turn instead of retrying.
+    #[test]
+    fn nested_error_event_is_parsed_and_classified() {
+        let mut state = StreamState::default();
+        let nested = json!({"type": "error", "error": {
+            "code": "server_error", "message": "overloaded"
+        }});
+        let err = map_event(&mut state, &nested).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+        assert!(
+            chat_err.message.contains("server_error") && chat_err.message.contains("overloaded"),
+            "{}",
+            chat_err.message
+        );
+    }
+
+    /// An `error` event with no recognizable `code`/`message` at either level
+    /// must carry the raw event (bounded) in its message — a bare
+    /// "unknown error" is undiagnosable.
+    #[test]
+    fn unrecognized_error_event_carries_the_raw_payload() {
+        let mut state = StreamState::default();
+        let opaque = json!({"type": "error", "detail": {"reason": "socket reset"}});
+        let err = map_event(&mut state, &opaque).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("unrecognized error event")
+                && chat_err.message.contains("socket reset"),
+            "{}",
+            chat_err.message
+        );
     }
 
     #[test]
