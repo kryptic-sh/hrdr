@@ -352,8 +352,8 @@ mod tests {
         assert!(p.contains("**by name**"));
     }
 
-    /// A write-capable agent is told to log notable changes in `[Unreleased]` as
-    /// it works, so a release is an audit of an already-complete changelog rather
+    /// The main agent is told to log notable changes in `[Unreleased]` as it
+    /// works, so a release is an audit of an already-complete changelog rather
     /// than the moment it gets written. A read-only agent — which commits
     /// nothing — is not.
     #[test]
@@ -380,6 +380,56 @@ mod tests {
         assert!(
             !read.contains("Keep the changelog current as you work"),
             "a read-only agent commits nothing, so it gets no changelog discipline"
+        );
+    }
+
+    /// Sub-agents run in parallel worktrees, so each appending to `[Unreleased]`
+    /// would collide on merge. A sub-agent is therefore told NOT to touch the
+    /// changelog — it does not get the "log as you work" rule — and the main
+    /// agent records the entry when it integrates the sub-agent's work.
+    #[test]
+    fn a_subagent_does_not_touch_the_changelog() {
+        let tools = ToolRegistry::with_defaults();
+        let sub = render_system(&tools, Path::new("/tmp/x"), None, true).unwrap();
+
+        // The sub-agent is told to leave the changelog alone, and does NOT get
+        // the main agent's log-as-you-work rule.
+        assert!(
+            sub.contains("Do NOT edit the changelog"),
+            "sub-agent is told to leave the changelog untouched"
+        );
+        assert!(
+            !sub.contains("Keep the changelog current as you work"),
+            "sub-agent must not get the append-as-you-work rule (it would collide)"
+        );
+
+        // A delegating main agent (render directly with can_delegate — the
+        // default registry has no `task`/`models` tools) is told to record the
+        // entry itself at integration, and does NOT get the sub-agent's
+        // don't-touch rule.
+        let mut env = Environment::new();
+        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
+        let main = env
+            .get_template("system")
+            .unwrap()
+            .render(context! {
+                cwd => "/tmp/x", os => "test", tool_names => "task, models",
+                can_write => true, can_delegate => true, is_subagent => false,
+                has_bash => true, has_powershell => false,
+                instructions => None::<&str>,
+            })
+            .unwrap();
+        assert!(
+            main.contains("Record the changelog entry yourself"),
+            "the integrating agent adds the entry the sub-agent skipped"
+        );
+        assert!(
+            main.contains("Keep the changelog current as you work"),
+            "the main agent still logs its own direct changes as it works"
+        );
+        assert!(
+            !main.contains("Do NOT edit the changelog"),
+            "the don't-touch rule is sub-agent-only"
         );
     }
 

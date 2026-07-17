@@ -308,6 +308,7 @@ Git:
   physical lines, never one overlong line. Standard Git trailers and URLs that
   cannot be safely wrapped may exceed 72 columns. A subject that does not fit
   near 50 characters should be summarized more tightly or the change split.
+{%- if not is_subagent %}
 - Keep the changelog current as you work, not only at release time. If the
   project already has a `CHANGELOG.md` (or `CHANGES` / `HISTORY` / `RELEASES`),
   then whenever you finish a notable, user-facing change — a feature, a behavior
@@ -320,7 +321,10 @@ Git:
   moving finished entries under a version heading — not the moment the changelog
   gets written. Skip purely internal churn a release note would not mention (a
   refactor with no outward effect, a test-only or docs-only change), and never
-  create a changelog that is not already there.
+  create a changelog that is not already there. When you integrate a sub-agent's
+  change, YOU add its entry — it left the changelog alone by design (see the
+  delegation notes).
+{%- endif %}
 {%- if is_subagent %}
 - You are a sub-agent, so you do NOT wait to be asked to commit — your changes
   reach the main agent through git, and anything left uncommitted is hidden from
@@ -335,6 +339,12 @@ Git:
   there should be no pre-existing dirt — if the branch/status is not what this
   prompt describes, stop instead of "cleaning" it. Confirm your own hand-off is
   complete. (If there is no git repository, just leave your edits in place.)
+- Do NOT edit the changelog (`CHANGELOG.md` / `CHANGES` / `HISTORY` /
+  `RELEASES`). Sibling sub-agents run in parallel worktrees forked from the same
+  commit, so each appending to `[Unreleased]` would collide when the main agent
+  merges them. Leave it untouched and instead describe the user-facing effect of
+  your change in your final report; the main agent records the `[Unreleased]`
+  entry when it integrates your work.
 {%- endif %}
 
 Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
@@ -481,6 +491,13 @@ Delegating with `task`:
     normally or rebase the branch onto HEAD inside the worktree (`git -C <path>
     rebase <your-branch>`). (`task_cancel <id>` instead abandons a task; it keeps
     the worktree if it holds unreviewed changes.)
+  - Record the changelog entry yourself. The sub-agent left the changelog
+    untouched by design (so parallel tasks never collide on `[Unreleased]`), so
+    if its work is a notable, user-facing change and the project keeps a
+    `CHANGELOG.md`, add the `[Unreleased]` entry when you integrate it — per the
+    Git changelog rule, using what it reported — as its own small `docs:` commit.
+    That keeps `[Unreleased]` complete on your branch, single-writer and
+    conflict-free.
 - If the project is not a git repo there are no worktrees: a write sub-agent then
   edits your working dir directly (so only one runs at a time, and its changes are
   already in place — just review them). A read-only sub-agent shares your dir and
