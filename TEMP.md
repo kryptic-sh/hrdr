@@ -89,6 +89,13 @@ Completed and verified (with review fixes folded in):
   every problem reported together; invalid `HRDR_*` env values warn and keep the
   current value; unknown UI enum values warn naming valid options (surfaced via
   startup notice in the TUI, stderr headless).
+- **P2 headless/PTY integration coverage** — real-binary tests against a
+  std-only mock endpoint (`apps/hrdr/tests/{common,headless}.rs`): streamed text
+  turn, tool round trip, full NDJSON contract (every stdout line JSON, one final
+  `done`, error event + nonzero exit), network failure, max-cost stop; PTY
+  harness extended with prompt-submit/streamed reply, Esc-cancel, resize, and
+  Ctrl+D clean exit. The stdout/stderr/exit contract is documented in the
+  `headless.rs` module header.
 - **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
   lines), lifecycle `hooks.rs` (54 lines), turn input/delivery state
   (`turn_state.rs`, 155 lines), turn execution (`turn_loop.rs`, ~1.1k lines),
@@ -100,7 +107,6 @@ Completed and verified (with review fixes folded in):
 | Priority | Finding                                                | Main impact                          |
 | -------- | ------------------------------------------------------ | ------------------------------------ |
 | P1       | `hrdr-agent/src/lib.rs` remains a ~13.6k-line monolith | High change cost and coupled testing |
-| P2       | Headless/PTY integration coverage is narrow            | Regressions escape unit tests        |
 
 ---
 
@@ -126,40 +132,6 @@ For each extraction:
 - Public API preserved via an explicit re-export list where exports move
   (`config.rs` is the template).
 - Follow-up behavior changes target the newly isolated module.
-
----
-
-## P2: Headless process-level coverage is incomplete
-
-### Evidence
-
-- `apps/hrdr/tests/smoke.rs` checks version/help/missing-prompt, not a complete
-  headless model turn.
-- `apps/hrdr/src/main.rs` headless behavior (prompt prep, MCP setup, lifecycle
-  hooks, NDJSON, usage, exit codes) is tested below the process boundary.
-- PTY tests (`apps/hrdr/tests/tui_pty.rs`) cover launch/quit and
-  unreachable-endpoint resilience only.
-
-### Impact
-
-Regressions in CLI wiring, stdout/stderr policy, event serialization, exit
-codes, terminal restoration, and resume flows can pass unit tests.
-
-### Recommendation
-
-Run the real binary against a scripted local HTTP server: plain streamed text,
-tool round trip, NDJSON stream, timeout/network failure, max-step wrap-up,
-max-cost enforcement, hook/MCP notices. Define the `--json` contract explicitly
-(today MCP/hook notices go decorated to stderr while events are NDJSON on stdout
-— automation must consume two formats; prefer JSON events for successful
-lifecycle notices). Extend the PTY harness with prompt-submit, Escape-cancel,
-`/new`, save/exit/resume, resize, and EOF/panic restoration.
-
-### Required assertions
-
-- Every stdout line in JSON mode parses as JSON; ordering and required fields
-  stable; defined stderr behavior; errors produce a JSON error event and nonzero
-  exit.
 
 ---
 
