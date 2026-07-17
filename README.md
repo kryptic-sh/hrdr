@@ -416,14 +416,16 @@ tunable in `config.toml`:
 max_lines = 1500
 max_bytes = 24576
 
-# Prune: when context nears the compaction trigger, clear old tool-output
-# bodies from the model context (keeps a recent window + the last 2 turns; the
-# UI transcript keeps everything) — but only when the reclaim buys enough
-# runway to be worth it. OFF by default — rewriting history invalidates the
-# prompt cache, and cached tokens are far cheaper than the fresh tokens a
-# prune re-charges, so even gated, pruning usually costs more than it saves.
-# Turn on only when context size matters more than cache hits.
-auto_prune = false
+# Prune: when context nears the compaction trigger, replace old tool-output
+# bodies and background-task delivery reports with a pointer at a file holding
+# the original (keeps a recent window + the last 2 turns verbatim; the UI
+# transcript keeps everything) — but only when the reclaim buys enough runway
+# to be worth it. ON by default — rewriting history still invalidates the
+# prompt cache, but the gating makes a triggered prune strictly cheaper than
+# the compaction it defers (compaction nukes the same cache, PLUS pays for a
+# summarizer call, PLUS loses the information for good). Turn off to keep
+# history verbatim and lean on compaction alone.
+auto_prune = true
 
 # Compaction: when context fills, summarize the old head and keep the recent tail.
 auto_compact = true            # on/off toggle (legacy 0<x≤1 still enables; 0 disables)
@@ -969,12 +971,12 @@ The shell and search tools adapt to the host:
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
       instructions
 - [x] Network retry + auto-compact on overflow
-- [x] Tool-output pruning: pressure-gated and ROI-checked — old tool results are
-      cleared from the model context (recent window + last 2 turns kept) only
-      once compaction is imminent and the reclaim is worth it, deferring the
-      costlier compaction fallback (`auto_prune`, **off by default**: it
-      invalidates the prompt cache, which usually costs more than the context it
-      saves)
+- [x] Tool-output pruning: pressure-gated and ROI-checked — old tool results and
+      background-task delivery reports are replaced with a file pointer (recent
+      window + last 2 turns kept) only once compaction is imminent and the
+      reclaim is worth it, deferring the costlier compaction fallback
+      (`auto_prune`, **on by default**: a ROI-met prune is strictly cheaper than
+      the compaction it defers)
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom

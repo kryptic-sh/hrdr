@@ -1265,7 +1265,13 @@ pub(crate) fn collect_lines(
 /// Write `text` to a uniquely-named file under `dir` (created if needed),
 /// returning the path. Best-effort prunes files older than 7 days first, so the
 /// scratch dir can't grow without bound.
-fn save_overflow(dir: &std::path::Path, label: &str, text: &str) -> std::io::Result<PathBuf> {
+///
+/// `pub`: [`truncate_saved`] is this crate's own caller, but `hrdr-agent`'s
+/// history-pruning mechanism (clearing old tool results / background-task
+/// deliveries from the model-facing conversation) reuses the exact same
+/// save-to-file-and-point-at-it move rather than reimplementing it — same
+/// overflow dir, same 7-day GC, same naming.
+pub fn save_overflow(dir: &std::path::Path, label: &str, text: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -2799,22 +2799,28 @@ pub struct AgentConfig {
     /// `--max-write-subagents`). Lower than the read-only cap: they share the
     /// main agent's working tree.
     pub max_write_subagents: usize,
-    /// Prune old tool-call *output* from the model history when context is
+    /// Prune old non-conversation content — tool-call *output* and background
+    /// sub-agent delivery reports — from the model history when context is
     /// under pressure and it's worth it: bodies older than the recent
-    /// protected window are replaced with a short placeholder (the tool call +
-    /// args stay). Only the model-facing history is touched; the UI transcript
-    /// keeps the full output.
+    /// protected window are replaced with a short pointer at a file holding
+    /// the original (the tool call + args stay). Only the model-facing
+    /// history is touched; the UI transcript keeps the full output.
     ///
-    /// **Default `false`.** Rewriting history invalidates the prompt cache from
-    /// the first changed message onward, and a cached input token costs a
-    /// fraction of a fresh one — so pruning to shave context usually *raises*
-    /// the bill, re-charging the whole tail at the uncached rate. That's true
-    /// even with the pressure/ROI gating below: this only turns a *continuous*
-    /// net loss into an occasional, justified one, it doesn't turn pruning into
-    /// a net win. With per-call output already capped (large results go to a
-    /// file, not into context) and compaction as the real overflow backstop,
-    /// leaving history verbatim keeps the cache warm and is usually cheaper.
-    /// Turn it on only when context size matters more than cache hits.
+    /// **Default `true`.** Rewriting history still invalidates the prompt
+    /// cache from the first changed message onward — that caveat is real and
+    /// doesn't go away — but the gating below changes the economics enough
+    /// that it's worth eating on by default: pruning is only even *attempted*
+    /// once compaction is imminent, and only *applied* when the reclaim buys
+    /// real runway, so a triggered prune is competing against compaction, not
+    /// against a warm cache that would otherwise have lasted. And a
+    /// ROI-met prune is strictly cheaper than the compaction it defers —
+    /// compaction invalidates the whole cache too, *plus* pays for a
+    /// summarizer model call, *plus* loses information permanently (pruned
+    /// content is at least still on disk, one `read`/`grep` away). Set to
+    /// `false` to keep history verbatim and rely on compaction alone for
+    /// overflow relief — the right call if cache hits matter more to you than
+    /// context headroom, since a stale prefix that's never rewritten is what
+    /// keeps the cache hitting.
     ///
     /// When on, pruning is gated, not continuous: it's only even attempted once
     /// usage nears the compaction trigger, and only applied when the reclaim
@@ -3327,7 +3333,27 @@ const PRUNE_ROI_TOKENS: u32 = 32_768;
 /// The most recent this-many turns (user messages) are never pruned, so the
 /// model always keeps the tool output it's actively working with.
 const PRUNE_KEEP_TURNS: usize = 2;
-/// Replacement body for a pruned tool result (the tool call + args are kept).
+
+/// Stable prefix of a prune placeholder for a cleared `Role::Tool` result body
+/// (see [`apply_prune`]): a short pointer at the file the original body was
+/// saved to, e.g. `"[old tool output pruned to save context — full output
+/// saved to <path>; \`read\` (offset/limit) or \`grep\` it if needed]"`. The
+/// path varies per victim, so [`plan_prune`]'s "already pruned" check matches
+/// on this prefix (`starts_with`) rather than an exact string.
+const PRUNE_TOOL_PLACEHOLDER_PREFIX: &str = "[old tool output pruned";
+/// Same idea as [`PRUNE_TOOL_PLACEHOLDER_PREFIX`], for a pruned
+/// `Role::User`-with-`MessageOrigin::BackgroundResult` delivery (a detached
+/// sub-agent's report — tool product, not the user speaking; see
+/// [`plan_prune`]'s Change C victim selection). Worded as a task report, not
+/// tool output, so a transcript reader isn't confused about what's missing.
+const PRUNE_TASK_PLACEHOLDER_PREFIX: &str = "[old background task report pruned";
+/// Fallback placeholder used when [`apply_prune`] can't save a victim's body
+/// to a file (disk full, permissions, a read-only overflow dir, ...) — the
+/// prune still proceeds (never fail the turn over this): the body still
+/// leaves the model-facing history, and the UI transcript still has the
+/// original untouched. There's no path to point at, so it's a dead marker
+/// rather than a pointer. `plan_prune` recognizes it as already-pruned
+/// alongside the two prefixes above — see [`is_prune_placeholder`].
 const PRUNE_PLACEHOLDER: &str = "[old tool output cleared to save context]";
 
 /// With this many tool rounds left in a turn, the model is told to wrap up
@@ -3439,7 +3465,7 @@ impl Default for AgentConfig {
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
             max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
             max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
-            auto_prune: false,
+            auto_prune: true,
             providers: HashMap::new(),
             guardrails: Vec::new(),
             hooks: Vec::new(),
@@ -7585,29 +7611,65 @@ fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
-/// Work out which *old* tool-result messages a prune would clear, keeping the
-/// most recent [`PRUNE_PROTECT_TOKENS`] of tool output — plus the last
+/// Whether `body` is already some variant of an applied prune placeholder —
+/// a file-linked pointer (either [`PRUNE_TOOL_PLACEHOLDER_PREFIX`] or
+/// [`PRUNE_TASK_PLACEHOLDER_PREFIX`]) or the constant [`PRUNE_PLACEHOLDER`]
+/// fallback used when saving the body failed. [`plan_prune`] uses this so
+/// re-planning never re-targets — and so never re-saves or double-counts — a
+/// body an earlier prune already cleared.
+fn is_prune_placeholder(body: &str) -> bool {
+    body.starts_with(PRUNE_TOOL_PLACEHOLDER_PREFIX)
+        || body.starts_with(PRUNE_TASK_PLACEHOLDER_PREFIX)
+        || body == PRUNE_PLACEHOLDER
+}
+
+/// Whether `m` is prunable *content* — bulky non-conversation material that
+/// isn't the real user↔agent exchange: a tool-call result, or a detached
+/// background sub-agent's delivery report (`Role::User` on the wire, since
+/// that's how it's folded into history, but `MessageOrigin::BackgroundResult`
+/// marks it as tool product rather than the user speaking). Never a genuine
+/// user message (`origin` `User`/`Steering`), an assistant message (its
+/// `tool_calls` metadata must stay so the tool-call ↔ result pairing strict
+/// servers require stays intact), or a system message.
+fn is_prunable(m: &ChatMessage) -> bool {
+    m.role == Role::Tool || (m.role == Role::User && m.origin == MessageOrigin::BackgroundResult)
+}
+
+/// Work out which *old* non-conversation messages a prune would clear —
+/// tool-call results and background-task delivery reports — keeping the most
+/// recent [`PRUNE_PROTECT_TOKENS`] of that content — plus the last
 /// [`PRUNE_KEEP_TURNS`] turns — verbatim. Pure: does not touch `messages`, so
 /// the caller can weigh the reclaim against the cost of pruning (see
 /// [`prune_meets_roi`]) before committing to [`apply_prune`].
 ///
-/// Returns the victim indices (oldest tool results past the protected window)
-/// and their total estimated token size. `protect_tokens` is the recent
-/// tool-output window kept verbatim; `keep_turns` the recent turns never
-/// touched.
+/// Returns the victim indices (oldest prunable messages past the protected
+/// window) and their total estimated token size. `protect_tokens` is the
+/// recent window (tool output + background-task reports combined) kept
+/// verbatim; `keep_turns` the recent turns never touched.
 fn plan_prune(
     messages: &[ChatMessage],
     protect_tokens: u32,
     keep_turns: usize,
 ) -> (Vec<usize>, u32) {
     let mut turns = 0usize;
-    // Cumulative tool-output tokens seen scanning newest → oldest.
+    // Cumulative prunable-content tokens seen scanning newest → oldest (both
+    // tool output and background-task reports count toward the same window).
     let mut seen_tokens = 0u32;
     let mut reclaimable = 0u32;
     let mut victims: Vec<usize> = Vec::new();
     for i in (0..messages.len()).rev() {
         let m = &messages[i];
-        if m.role == Role::User {
+        // Only a genuine user turn (typed input or a mid-turn steering
+        // correction) is a turn boundary. A `BackgroundResult` delivery is
+        // `Role::User` on the wire but isn't the user speaking — counting it
+        // here would let a burst of task deliveries either shield old
+        // content from ever being pruned (each one pushes `keep_turns`
+        // further back) or burn through the protected-turns budget on
+        // messages that were never protected content to begin with. So turn
+        // counting and prunability both key off role *and* origin, not role
+        // alone.
+        if m.role == Role::User && matches!(m.origin, MessageOrigin::User | MessageOrigin::Steering)
+        {
             turns += 1;
         }
         // The last few turns are always kept whole — the model is still working
@@ -7615,11 +7677,11 @@ fn plan_prune(
         if turns < keep_turns {
             continue;
         }
-        if m.role != Role::Tool {
+        if !is_prunable(m) {
             continue;
         }
         let body = m.content.as_deref().unwrap_or_default();
-        if body == PRUNE_PLACEHOLDER {
+        if is_prune_placeholder(body) {
             continue; // already pruned
         }
         let est = estimate_tokens(body);
@@ -7634,15 +7696,49 @@ fn plan_prune(
     (victims, reclaimable)
 }
 
-/// Apply a plan from [`plan_prune`]: clear each victim's body to
-/// [`PRUNE_PLACEHOLDER`]. The assistant `tool_calls` metadata and every
-/// message stays, so the tool-call ↔ result pairing strict servers require is
-/// intact. Split from planning so the caller only pays for this — and the
-/// prompt-cache invalidation it causes — once the plan is known to be worth
-/// it.
+/// Apply a plan from [`plan_prune`]: replace each victim's body with a short
+/// pointer at a file holding the original content, saved via the same
+/// overflow mechanism tool outputs already use
+/// ([`hrdr_tools::save_overflow`] into [`hrdr_tools::tool_output_dir`]) — one
+/// file per victim, so the model can still `read` (offset/limit) or `grep`
+/// it back if it turns out to matter after all. The assistant `tool_calls`
+/// metadata and every message stays, so the tool-call ↔ result pairing
+/// strict servers require is intact. Split from planning so the caller only
+/// pays for this — and the prompt-cache invalidation it causes — once the
+/// plan is known to be worth it.
 fn apply_prune(messages: &mut [ChatMessage], victims: &[usize]) {
+    apply_prune_in(messages, victims, &hrdr_tools::tool_output_dir());
+}
+
+/// [`apply_prune`] with an explicit overflow directory — mirrors
+/// `hrdr_tools::truncate_saved`'s `_in` test seam, so tests can point pruned
+/// bodies at a scratch dir (or an unwritable one, to exercise the
+/// save-failure fallback) instead of the real `tool_output_dir()`.
+fn apply_prune_in(messages: &mut [ChatMessage], victims: &[usize], dir: &std::path::Path) {
     for &i in victims {
-        messages[i].content = Some(PRUNE_PLACEHOLDER.to_string());
+        let m = &mut messages[i];
+        let body = m.content.clone().unwrap_or_default();
+        // Tool results and background-task reports get distinct labels and
+        // wording (see the placeholder-prefix docs) so a transcript reader —
+        // and `is_prune_placeholder` — can tell which kind of content is
+        // missing.
+        let (label, prefix, kind) = if m.role == Role::Tool {
+            ("pruned-tool", PRUNE_TOOL_PLACEHOLDER_PREFIX, "output")
+        } else {
+            ("pruned-task", PRUNE_TASK_PLACEHOLDER_PREFIX, "report")
+        };
+        m.content = Some(match hrdr_tools::save_overflow(dir, label, &body) {
+            Ok(path) => format!(
+                "{prefix} to save context — full {kind} saved to {}; `read` (offset/limit) or \
+                 `grep` it if needed]",
+                path.display()
+            ),
+            // Never fail the turn over a prune: the body still leaves the
+            // model-facing history (the point of pruning at all), and the UI
+            // transcript still has the original untouched — there's just no
+            // file to point at, so it degrades to the dead-marker fallback.
+            Err(_) => PRUNE_PLACEHOLDER.to_string(),
+        });
     }
 }
 
@@ -8000,8 +8096,9 @@ mod tests {
         Agent, AgentConfig, AgentEvent, DEFAULT_BASE_URL, DEFAULT_MAX_READONLY_SUBAGENTS,
         DEFAULT_MAX_WRITE_SUBAGENTS, DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS,
         ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, LspFileConfig, LspServerEntry,
-        PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
-        compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
+        PRUNE_PLACEHOLDER, PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX,
+        ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider, compaction_tail_start,
+        elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
         parse_env_bool, provider_alias_collision_error, repair_dangling_tool_calls, resolve,
@@ -12457,9 +12554,9 @@ mod tests {
             effort: Some("high".to_string()),
             auto_compact: Some(true),
             compaction_reserved: Some(12_345),
-            // Differs from the default (`false`) so this proves the field is
+            // Differs from the default (`true`) so this proves the field is
             // actually applied, not just left at its default.
-            auto_prune: Some(true),
+            auto_prune: Some(false),
             providers: HashMap::new(),
             guardrails: vec![],
             hooks: vec![],
@@ -12514,7 +12611,7 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
-        assert!(cfg.auto_prune);
+        assert!(!cfg.auto_prune);
     }
 
     #[test]
@@ -12878,9 +12975,18 @@ mod tests {
         assert!(!out.is_empty() && out.len() < msgs.len());
     }
 
+    /// Pull the saved-file path out of a file-linked prune placeholder body
+    /// (`"... saved to <path>; \`read\` ..."`).
+    fn placeholder_path(body: &str) -> &str {
+        let (_, after) = body
+            .rsplit_once("saved to ")
+            .expect("file-linked placeholder should name a saved-to path");
+        after.split(';').next().expect("path is terminated by `;`")
+    }
+
     #[test]
     fn plan_prune_targets_old_tool_output_beyond_protected_window() {
-        use super::{apply_prune, plan_prune};
+        use super::{apply_prune_in, plan_prune};
         // Four turns, each with one big tool result (~10k tokens: len/4).
         let big = "x".repeat(40_000);
         assert_eq!(estimate_tokens(&big), 10_000);
@@ -12907,18 +13013,169 @@ mod tests {
         // Planning is pure — nothing changes until `apply_prune` runs.
         assert_eq!(msgs[2].content.as_deref(), Some(big.as_str()));
 
-        apply_prune(&mut msgs, &victims);
-        assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
+        let dir = tempfile::tempdir().unwrap();
+        apply_prune_in(&mut msgs, &victims, dir.path());
+        let body = msgs[2].content.clone().unwrap();
+        assert!(
+            body.starts_with(PRUNE_TOOL_PLACEHOLDER_PREFIX),
+            "placeholder should be the file-linked tool-output variant: {body}"
+        );
+        // The file the placeholder points at holds the original body,
+        // byte-for-byte — one file per victim.
+        let saved = std::fs::read_to_string(placeholder_path(&body)).unwrap();
+        assert_eq!(saved, big);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "one file for the one victim"
+        );
         for kept in [5, 8, 11] {
             assert_eq!(msgs[kept].content.as_deref(), Some(big.as_str()));
         }
         // The assistant tool_calls metadata is never touched.
         assert!(msgs[1].tool_calls.is_some());
 
-        // Idempotent: a second plan finds only the placeholder + kept window.
+        // Idempotent: a second plan finds only the placeholder + kept window,
+        // and applying that (empty) plan writes no new files — double-prune
+        // safety.
         let (victims2, reclaimable2) = plan_prune(&msgs, 16_000, 2);
         assert!(victims2.is_empty());
         assert_eq!(reclaimable2, 0);
+        apply_prune_in(&mut msgs, &victims2, dir.path());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "re-planning + applying after an apply writes no new files"
+        );
+    }
+
+    /// A background sub-agent's delivery report (`Role::User` on the wire,
+    /// `MessageOrigin::BackgroundResult`) is tool product, not the user
+    /// speaking — Change C targets it for pruning just like a tool result,
+    /// with its own label/wording, while a genuine user message old enough to
+    /// be past the protect window is never touched.
+    #[test]
+    fn background_result_deliveries_are_prunable_genuine_user_messages_are_not() {
+        use super::{apply_prune_in, plan_prune};
+        fn background_result(text: &str) -> ChatMessage {
+            ChatMessage {
+                origin: MessageOrigin::BackgroundResult,
+                ..ChatMessage::user(text)
+            }
+        }
+        let old_bg = "x".repeat(400_000); // 100k tokens — well past any window
+        let recent_bg = "x".repeat(400_000);
+        let msgs = vec![
+            ChatMessage::user("real user turn, ancient — must survive"), // 0
+            background_result(&old_bg), // 1 — old background delivery → prunable
+            ChatMessage::user("u2"),    // 2 — turn boundary
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", "recent tool output"), // 4
+            ChatMessage::user("u3"), // 5 — turn boundary (keep_turns=2 stops here)
+            background_result(&recent_bg), // 6 — inside the protect window
+            ChatMessage::user("u4"), // 7 — turn boundary
+        ];
+        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
+        assert_eq!(victims, vec![1], "only the old background delivery");
+        assert_eq!(reclaimable, estimate_tokens(&old_bg));
+        // The genuine, ancient user message is never a candidate no matter how
+        // far back it sits.
+        assert!(!victims.contains(&0));
+
+        let mut msgs = msgs;
+        let dir = tempfile::tempdir().unwrap();
+        apply_prune_in(&mut msgs, &victims, dir.path());
+        let body = msgs[1].content.clone().unwrap();
+        assert!(
+            body.starts_with(PRUNE_TASK_PLACEHOLDER_PREFIX),
+            "background delivery gets the task-report placeholder: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(placeholder_path(&body)).unwrap(),
+            old_bg
+        );
+        // Untouched: the genuine user message and the recent (in-window)
+        // background delivery.
+        assert_eq!(
+            msgs[0].content.as_deref(),
+            Some("real user turn, ancient — must survive")
+        );
+        assert_eq!(msgs[6].content.as_deref(), Some(recent_bg.as_str()));
+    }
+
+    /// `keep_turns` counts genuine turns (`origin` `User`/`Steering`) only —
+    /// a `BackgroundResult` delivery folded in between two real turns must
+    /// not itself count as one. Otherwise a burst of task deliveries would
+    /// let `turns` rack up on wire-level `Role::User` count alone, either
+    /// exposing old content for pruning before the intended number of *real*
+    /// turns has actually passed, or (symmetrically) prematurely stripping
+    /// protection from tool output genuinely tied to a recent turn.
+    #[test]
+    fn background_deliveries_between_turns_do_not_count_as_turns() {
+        use super::plan_prune;
+        fn background_result(text: &str) -> ChatMessage {
+            ChatMessage {
+                origin: MessageOrigin::BackgroundResult,
+                ..ChatMessage::user(text)
+            }
+        }
+        let old = "x".repeat(40_000); // 10k tokens
+        let msgs = vec![
+            ChatMessage::user("u_old"),                 // 0 — genuine turn (older)
+            assistant_with_calls(&["a"]),               // 1
+            ChatMessage::tool_result("a", old.clone()), // 2 — old tool output
+            ChatMessage::user("u_new"),                 // 3 — genuine turn (recent)
+            background_result("bg report 1"),           // 4 — NOT a turn
+            background_result("bg report 2"),           // 5 — NOT a turn
+            background_result("bg report 3"),           // 6 — NOT a turn
+        ];
+        // keep_turns=2 needs two GENUINE turns scanned before anything past
+        // them is even a prune candidate. Only one genuine turn (`u_new`)
+        // follows the old tool result — the three background deliveries
+        // trailing it correctly don't count — so the gate is never
+        // satisfied and the old result stays protected no matter how many
+        // background deliveries pile up after it.
+        let (victims, _) = plan_prune(&msgs, 0, 2);
+        assert!(
+            victims.is_empty(),
+            "only one genuine turn follows — old tool output stays protected"
+        );
+        // Relax to one genuine turn: `u_new` alone now satisfies the gate,
+        // and the old tool result becomes the sole target — proving the
+        // previous assertion wasn't vacuous (e.g. from a bug that protects
+        // everything unconditionally), and that the three background
+        // deliveries themselves were never miscounted as *additional* real
+        // turns that would have satisfied `keep_turns=2` on their own.
+        let (victims, reclaimable) = plan_prune(&msgs, 0, 1);
+        assert_eq!(victims, vec![2]);
+        assert_eq!(reclaimable, estimate_tokens(&old));
+    }
+
+    /// Saving a victim's body to a file can fail (unwritable dir, disk full,
+    /// ...) — the prune must still proceed rather than fail the turn: the
+    /// body still leaves history, just via the constant fallback placeholder
+    /// instead of a pointer.
+    #[test]
+    fn save_failure_falls_back_to_the_constant_placeholder_without_panicking() {
+        use super::{apply_prune_in, plan_prune};
+        let big = "x".repeat(40_000);
+        let mut msgs = vec![
+            ChatMessage::user("u1"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", big),
+            ChatMessage::user("u2"),
+        ];
+        let (victims, _) = plan_prune(&msgs, 0, 1);
+        assert_eq!(victims, vec![2]);
+
+        // A file (not a directory) as the "dir" seam: `save_overflow`'s
+        // `create_dir_all` fails on it, so every save attempt errors out.
+        let dir = tempfile::tempdir().unwrap();
+        let unwritable = dir.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"blocker").unwrap();
+
+        apply_prune_in(&mut msgs, &victims, &unwritable);
+        assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
     }
 
     /// Below `PRUNE_PRESSURE_TOKENS` of the compaction trigger, pruning isn't

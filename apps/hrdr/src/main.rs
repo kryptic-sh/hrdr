@@ -105,7 +105,7 @@ struct Cli {
     max_write_subagents: Option<usize>,
 
     /// Prune old tool output from the model context when nearing the
-    /// compaction trigger and it's worth it (on|off; default off).
+    /// compaction trigger and it's worth it (on|off; default on).
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
     auto_prune: Option<String>,
 
