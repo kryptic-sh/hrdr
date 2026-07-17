@@ -623,13 +623,7 @@ impl Client {
                                  ({e}) (partial response, safe to retry)"
                             ),
                         })?;
-                        decoder.push(&bytes);
-                        // SSE buffer overflow: server sent more data than
-                        // MAX_BUFFER_BYTES per line/event — a broken or hostile
-                        // server, not a transient glitch.  Reject as non-retryable
-                        // (Other) so the agent retry loop does not keep retrying a
-                        // stream that will overflow again.
-                        if decoder.overflowed() {
+                        if decoder.push(&bytes).is_err() {
                             let _ = decoder.drain(); // discard truncated events
                             Err(ChatError {
                                 status: None,
@@ -643,19 +637,19 @@ impl Client {
                         (decoder.drain(), false)
                     }
                     None => {
-                        let events = decoder.finish();
                         // If overflow was flagged during the stream, the final
                         // events may be truncated — never parse them.
-                        if decoder.overflowed() {
-                            Err(ChatError {
+                        let events = match decoder.finish() {
+                            Ok(events) => events,
+                            Err(_) => Err(ChatError {
                                 status: None,
                                 retry_after: None,
                                 kind: ChatErrorKind::Other,
                                 message: "SSE stream overflow: received data exceeding \
                                           32 MiB limit; broken or hostile server"
                                     .to_string(),
-                            })?;
-                        }
+                            })?,
+                        };
                         (events, true)
                     }
                 };

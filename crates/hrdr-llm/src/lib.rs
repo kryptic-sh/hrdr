@@ -25,7 +25,7 @@ pub use client::{
     ChatError, ChatErrorKind, ChatStream, Client, take_request_log_warning, url_host, wire_protocol,
 };
 pub use fs::unique_sibling_path;
-pub use sse::{SseDecoder, SseEvent};
+pub use sse::{SseDecoder, SseEvent, SseOverflow};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
     FunctionDef, MessageOrigin, RequestParams, Role, ToolCall, ToolDef, Usage,

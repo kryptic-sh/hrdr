@@ -255,13 +255,7 @@ pub(crate) async fn chat_stream(
                              ({e}) (partial response, safe to retry)"
                         ),
                     })?;
-                    decoder.push(&chunk);
-                    // SSE buffer overflow: server sent more data than
-                    // MAX_BUFFER_BYTES per line/event — a broken or hostile
-                    // server, not a transient glitch.  Reject as non-retryable
-                    // (Other) so the agent loop does not keep retrying a stream
-                    // that will overflow again.
-                    if decoder.overflowed() {
+                    if decoder.push(&chunk).is_err() {
                         let _ = decoder.drain(); // discard truncated events
                         Err(crate::client::ChatError {
                             status: None,
@@ -275,19 +269,19 @@ pub(crate) async fn chat_stream(
                     (decoder.drain(), false)
                 }
                 None => {
-                    let events = decoder.finish();
                     // If overflow was flagged during the stream, the final
                     // events may be truncated — never parse them.
-                    if decoder.overflowed() {
-                        Err(crate::client::ChatError {
+                    let events = match decoder.finish() {
+                        Ok(events) => events,
+                        Err(_) => Err(crate::client::ChatError {
                             status: None,
                             retry_after: None,
                             kind: crate::client::ChatErrorKind::Other,
                             message: "SSE stream overflow: received data exceeding \
                                       32 MiB limit; broken or hostile server"
                                 .to_string(),
-                        })?;
-                    }
+                        })?,
+                    };
                     (events, true)
                 }
             };

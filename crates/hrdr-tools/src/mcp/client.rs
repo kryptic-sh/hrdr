@@ -248,7 +248,9 @@ impl McpClient {
                     if undecoded_bytes > super::MAX_MCP_MESSAGE_BYTES {
                         break;
                     }
-                    decoder.push(&chunk);
+                    if decoder.push(&chunk).is_err() {
+                        break;
+                    }
                     let events = decoder.drain();
                     if !events.is_empty() {
                         undecoded_bytes = 0;

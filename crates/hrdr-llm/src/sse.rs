@@ -35,6 +35,27 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// Error returned by [`SseDecoder::push`] and [`SseDecoder::finish`] when the
+/// decoder has encountered data exceeding [`MAX_BUFFER_BYTES`] in a single line
+/// or event payload — a broken or hostile server that never terminates a line
+/// or event. The decoder continues to operate (excess bytes are discarded) and
+/// its internal buffers stay bounded; this error signals the caller that the
+/// stream is misbehaved and any events yielded by [`SseDecoder::drain`] since
+/// the last successful call may be truncated and must not be processed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseOverflow;
+
+impl std::fmt::Display for SseOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "SSE stream overflow: received data exceeding 32 MiB limit; \
+             broken or hostile server",
+        )
+    }
+}
+
+impl std::error::Error for SseOverflow {}
+
 /// Incremental SSE decoder.
 ///
 /// Feed raw byte chunks with [`Self::push`]; drain complete events with
@@ -45,7 +66,7 @@ pub struct SseEvent {
 /// ```
 /// # use hrdr_llm::SseDecoder;
 /// let mut dec = SseDecoder::new();
-/// dec.push(b"data: hello\n\n");
+/// dec.push(b"data: hello\n\n").unwrap();
 /// let events = dec.drain();
 /// assert_eq!(events[0].data, "hello");
 /// ```
@@ -61,7 +82,7 @@ pub struct SseDecoder {
     /// Complete events ready for the next [`Self::drain`] call.
     ready: Vec<SseEvent>,
     /// Set once [`MAX_BUFFER_BYTES`] has been hit and excess bytes were
-    /// discarded rather than buffered. See [`Self::overflowed`].
+    /// discarded rather than buffered.
     overflowed: bool,
 }
 
@@ -83,9 +104,17 @@ impl SseDecoder {
     ///
     /// Bytes belonging to a single unterminated line beyond [`MAX_BUFFER_BYTES`]
     /// are discarded rather than buffered — a broken or hostile server that
-    /// never sends a newline must not grow memory without bound. See
-    /// [`Self::overflowed`].
-    pub fn push(&mut self, bytes: &[u8]) {
+    /// never sends a newline must not grow memory without bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SseOverflow`] when this push caused the decoder to exceed
+    /// [`MAX_BUFFER_BYTES`] in a single line or event payload (or when overflow
+    /// was already flagged by an earlier call). The excess bytes are discarded
+    /// and internal buffers stay bounded, but any [`SseEvent`]s from
+    /// [`Self::drain`] since the last successful push may be truncated and must
+    /// not be processed.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), SseOverflow> {
         for &b in bytes {
             if b == b'\n' {
                 self.flush_line();
@@ -95,15 +124,11 @@ impl SseDecoder {
                 self.overflowed = true;
             }
         }
-    }
-
-    /// Whether the decoder has ever hit [`MAX_BUFFER_BYTES`] and discarded
-    /// excess bytes for a line or an event's folded `data:` value. The decoder
-    /// keeps running (memory stays bounded either way) — this is a signal for
-    /// callers that want to treat a stream this misbehaved as an error rather
-    /// than silently accept truncated data.
-    pub fn overflowed(&self) -> bool {
-        self.overflowed
+        if self.overflowed {
+            Err(SseOverflow)
+        } else {
+            Ok(())
+        }
     }
 
     /// Flush the current line buffer: decode, classify the field, and on a
@@ -183,7 +208,16 @@ impl SseDecoder {
     /// trailing newline) rather than a spec `\n\n`, and the final event must not
     /// be silently dropped (which would look like a truncated stream). Returns
     /// the trailing events plus anything still queued.
-    pub fn finish(&mut self) -> Vec<SseEvent> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SseOverflow`] if overflow was flagged by a previous
+    /// [`Self::push`] call — the buffered data may be truncated and must not be
+    /// treated as a complete event stream.
+    pub fn finish(&mut self) -> Result<Vec<SseEvent>, SseOverflow> {
+        if self.overflowed {
+            return Err(SseOverflow);
+        }
         // A trailing line with no terminating `\n` is still a complete line at EOF.
         if !self.line_buf.is_empty() {
             self.flush_line();
@@ -197,7 +231,7 @@ impl SseDecoder {
             });
             self.cur_data_started = false;
         }
-        std::mem::take(&mut self.ready)
+        Ok(std::mem::take(&mut self.ready))
     }
 }
 
@@ -215,7 +249,8 @@ mod tests {
     fn feed(chunks: &[&[u8]]) -> Vec<SseEvent> {
         let mut dec = SseDecoder::new();
         for chunk in chunks {
-            dec.push(chunk);
+            // Ignore unwrap in tests — feed is only used for valid input.
+            dec.push(chunk).unwrap();
         }
         dec.drain()
     }
@@ -313,8 +348,8 @@ mod tests {
         // The \n\n terminator split across two pushes.
         let events_a = {
             let mut dec = SseDecoder::new();
-            dec.push(b"data: x\n");
-            dec.push(b"\n");
+            dec.push(b"data: x\n").unwrap();
+            dec.push(b"\n").unwrap();
             dec.drain()
         };
         assert_eq!(events_a.len(), 1);
@@ -366,7 +401,7 @@ mod tests {
     #[test]
     fn drain_clears_ready_queue() {
         let mut dec = SseDecoder::new();
-        dec.push(b"data: x\n\n");
+        dec.push(b"data: x\n\n").unwrap();
         assert_eq!(dec.drain().len(), 1);
         assert_eq!(dec.drain().len(), 0, "second drain must be empty");
     }
@@ -400,9 +435,9 @@ mod tests {
         // A stream that ends `data: [DONE]\n` (single newline, no blank line) —
         // common with llama.cpp/vLLM/infr — must still yield the final event.
         let mut dec = SseDecoder::new();
-        dec.push(b"data: [DONE]\n");
+        dec.push(b"data: [DONE]\n").unwrap();
         assert!(dec.drain().is_empty(), "no blank line yet, nothing ready");
-        let ev = dec.finish();
+        let ev = dec.finish().unwrap();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].data, "[DONE]");
     }
@@ -411,8 +446,8 @@ mod tests {
     fn finish_flushes_line_without_any_newline() {
         // Stream closes with no trailing newline at all.
         let mut dec = SseDecoder::new();
-        dec.push(b"data: {\"x\":1}");
-        let ev = dec.finish();
+        dec.push(b"data: {\"x\":1}").unwrap();
+        let ev = dec.finish().unwrap();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].data, "{\"x\":1}");
     }
@@ -421,9 +456,9 @@ mod tests {
     fn finish_after_clean_terminator_yields_nothing() {
         // A properly `\n\n`-terminated stream leaves nothing for finish().
         let mut dec = SseDecoder::new();
-        dec.push(b"data: x\n\n");
+        dec.push(b"data: x\n\n").unwrap();
         assert_eq!(dec.drain().len(), 1);
-        assert!(dec.finish().is_empty());
+        assert!(dec.finish().unwrap().is_empty());
     }
 
     // ── unbounded-buffer DoS guard ────────────────────────────────────────────
@@ -434,8 +469,7 @@ mod tests {
         // must not grow past MAX_BUFFER_BYTES no matter how many bytes arrive.
         let mut dec = SseDecoder::new();
         let chunk = vec![b'x'; MAX_BUFFER_BYTES + 1024];
-        dec.push(&chunk);
-        assert!(dec.overflowed(), "cap should have been hit");
+        assert!(dec.push(&chunk).is_err(), "cap should have been hit");
         assert_eq!(
             dec.line_buf.len(),
             MAX_BUFFER_BYTES,
@@ -443,7 +477,7 @@ mod tests {
         );
 
         // Feeding still more bytes (still no newline) must not grow it either.
-        dec.push(&[b'y'; 1024]);
+        assert!(dec.push(&[b'y'; 1024]).is_err());
         assert_eq!(dec.line_buf.len(), MAX_BUFFER_BYTES);
     }
 
@@ -451,52 +485,47 @@ mod tests {
 
     #[test]
     fn overflowed_after_push_must_not_yield_events() {
-        // The pattern production consumers use: push, then check overflowed(),
-        // and if true, discard drain() results and error out — never process
+        // The pattern production consumers use: push returns Err on overflow,
+        // consumer discards drain() results and errors out — never process
         // truncated events.
         let mut dec = SseDecoder::new();
         let big = vec![b'x'; MAX_BUFFER_BYTES + 1];
-        dec.push(&big);
-        assert!(dec.overflowed());
+        assert!(dec.push(&big).is_err(), "overflow must be signalled");
         // Consumer discards the potentially-truncated events by calling
         // drain() and throwing away the result.
         let _ = dec.drain();
-        // After discarding, the decoder must still report overflowed so the
-        // consumer can check the flag at EOF too.
-        assert!(dec.overflowed(), "overflowed must persist across drain");
-        // Re-pushing more data must keep overflowed=true (already set).
-        dec.push(b"\n");
-        assert!(dec.overflowed());
+        // Re-pushing more data must keep returning Err (overflow flag persists).
+        assert!(dec.push(b"\n").is_err());
     }
 
     #[test]
     fn overflowed_at_finish_must_not_yield_events() {
-        // EOF path: finish() flushes buffered data, but overflow must still
-        // be detected and events discarded.
+        // EOF path: finish() returns Err when overflow was flagged, so events
+        // are never retrieved.
         let mut dec = SseDecoder::new();
         let big = vec![b'x'; MAX_BUFFER_BYTES + 1];
-        dec.push(&big);
-        assert!(dec.overflowed());
-        // Consumer discards finish() results if overflowed.
-        let _ = dec.finish();
-        assert!(dec.overflowed(), "overflowed must persist across finish");
+        assert!(dec.push(&big).is_err(), "overflow must be signalled");
+        // finish() must also return Err since the stream is corrupted.
+        assert!(dec.finish().is_err(), "finish must propagate overflow");
+        // A second finish call must also return Err (flag persists).
+        assert!(
+            dec.finish().is_err(),
+            "overflow flag persists across finish"
+        );
     }
 
     #[test]
     fn overflowed_does_not_interfere_with_normal_decoding() {
-        // A decoder that never hit the cap must report overflowed=false and
+        // A decoder that never hit the cap must report Ok from push and
         // decode normally.
         let mut dec = SseDecoder::new();
-        dec.push(b"data: hello\n\n");
-        assert!(!dec.overflowed());
+        assert!(dec.push(b"data: hello\n\n").is_ok());
         let ev = dec.drain();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].data, "hello");
 
-        // finish() on a clean decoder also must not report overflow.
-        assert!(!dec.overflowed());
-        assert!(dec.finish().is_empty());
-        assert!(!dec.overflowed());
+        // finish() on a clean decoder also must return Ok.
+        assert!(dec.finish().unwrap().is_empty());
     }
 
     #[test]
@@ -505,17 +534,20 @@ mod tests {
         // lines that together would otherwise grow cur_data without bound.
         let mut dec = SseDecoder::new();
         let big = "a".repeat(MAX_BUFFER_BYTES - 10);
-        dec.push(format!("data: {big}\n").as_bytes());
-        assert!(!dec.overflowed(), "not over the cap yet");
+        // First push fits within the cap.
+        assert!(dec.push(format!("data: {big}\n").as_bytes()).is_ok());
 
         // Push another data line that would push cur_data past the cap.
-        dec.push(b"data: this-line-does-not-fit-in-the-remaining-room\n");
-        assert!(dec.overflowed(), "cap should now be flagged");
+        assert!(
+            dec.push(b"data: this-line-does-not-fit-in-the-remaining-room\n")
+                .is_err(),
+            "cap should now be exceeded"
+        );
         assert!(dec.cur_data.len() <= MAX_BUFFER_BYTES);
 
         // Terminate the event and confirm the folded value is valid UTF-8 and
         // bounded — no panic, no corrupted string.
-        dec.push(b"\n");
+        assert!(dec.push(b"\n").is_err(), "overflow flag persists");
         let events = dec.drain();
         assert_eq!(events.len(), 1);
         assert!(events[0].data.len() <= MAX_BUFFER_BYTES);
