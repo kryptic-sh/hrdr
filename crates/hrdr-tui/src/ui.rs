@@ -42,11 +42,11 @@ fn subagent_scroll(items: usize, height: u16) -> u16 {
 }
 
 /// TODO-panel sort order by status: the one in progress on top, the not-yet-
-/// started (pending) ones in the middle, the completed ones at the bottom.
+/// started (pending) ones in the middle, the finished/cancelled ones at the bottom.
 fn todo_sort_key(status: &str) -> u8 {
     match status {
         "in_progress" => 0,
-        "completed" => 2,
+        "completed" | "cancelled" => 2,
         _ => 1,
     }
 }
@@ -1193,16 +1193,19 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
     let bg = app.theme.user_bg;
     let inner = draw_pane(f, &app.theme, area, app.theme.success);
 
+    let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
+
     let lines: Vec<Line<'static>> = todos
         .iter()
         .map(|t| {
             let (mark, color) = match t.status.as_str() {
-                "completed" => ("x", app.theme.success),
-                "in_progress" => ("~", app.theme.warn),
+                "completed" => ("✓", app.theme.success),
+                "cancelled" => ("✗", app.theme.dim),
+                "in_progress" => (frame, app.theme.warn),
                 _ => (" ", app.theme.dim),
             };
             Line::from(Span::styled(
-                format!("[{mark}] {}", t.content),
+                format!("{mark} {}", t.content),
                 Style::default().fg(color).bg(bg),
             ))
         })
@@ -2517,15 +2520,19 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // state — so it hashes what it *displays*. Its rows are never cached, but
         // its height is, and a header that grew a row (an effort field appearing, a
         // longer model name wrapping) has to be measured again.
-        let ck: BodyKey = (
-            match entry.kind {
-                EntryKind::Header => header_hash(app),
-                _ => entry_content_hash(entry, app.expand_tools),
-            },
-            width,
-            app.expand_tools,
-            app.show_reasoning,
-        );
+        // For unfinished tool entries the current spinner frame is mixed into the
+        // hash so the cached block invalidates on each tick, animating the marker.
+        let frame_idx = (app.header_anchor.elapsed().as_millis() / 120) as u64;
+        let frame = SPINNER[frame_idx as usize % SPINNER.len()];
+        let base_hash = match entry.kind {
+            EntryKind::Header => header_hash(app),
+            _ => entry_content_hash(entry, app.expand_tools),
+        };
+        let base_hash = match &entry.kind {
+            EntryKind::Tool { done: false, .. } => base_hash ^ frame_idx,
+            _ => base_hash,
+        };
+        let ck: BodyKey = (base_hash, width, app.expand_tools, app.show_reasoning);
         // Every arm produces (kind, header rows, cached body rows, footer rows)
         // and is then funneled through the one `render_block` call below — no
         // entry paints its own chrome.
@@ -2618,6 +2625,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         *ok,
                         *done,
                         *expanded || app.expand_tools,
+                        frame,
                     )
                 });
                 (BlockKind::Tool, BodySource::Cached(body))
@@ -2766,7 +2774,7 @@ fn markdown_lines(
     buf
 }
 
-/// Block body for one tool call: a status header (`… / ✓ / ✗` + tool name +
+/// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +
 /// headline) followed by tool-specific detail — the command and its output for
 /// shell calls, the file contents for `write`, the patch for `edit`/`patch`,
 /// the tail of the file for `read`, plain output otherwise.
@@ -2779,11 +2787,12 @@ fn tool_lines(
     ok: bool,
     done: bool,
     expanded: bool,
+    frame: &'static str,
 ) -> Vec<Line<'static>> {
     let bg = BlockKind::Tool.bg(theme);
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
     let mark = if !done {
-        ("…", theme.warn)
+        (frame, theme.warn)
     } else if ok {
         ("✓", theme.success)
     } else {
@@ -2963,13 +2972,14 @@ mod subagent_tests {
     use hrdr_app::{PaneId, PaneRow, PaneStatus};
 
     /// The TODO panel groups by status: in-progress on top, pending in the
-    /// middle, completed at the bottom — and stable within each group.
+    /// middle, completed/cancelled at the bottom — and stable within each group.
     #[test]
     fn todos_sort_in_progress_then_pending_then_done() {
         let mut rows = [
             ("done a", "completed"),
             ("pending a", "pending"),
             ("active", "in_progress"),
+            ("cancelled c", "cancelled"),
             ("done b", "completed"),
             ("pending b", "pending"),
         ];
@@ -2977,7 +2987,14 @@ mod subagent_tests {
         let order: Vec<&str> = rows.iter().map(|(c, _)| *c).collect();
         assert_eq!(
             order,
-            vec!["active", "pending a", "pending b", "done a", "done b"]
+            vec![
+                "active",
+                "pending a",
+                "pending b",
+                "done a",
+                "cancelled c",
+                "done b"
+            ]
         );
     }
 
@@ -3748,15 +3765,18 @@ mod block_tests {
     }
 
     /// The tool header always leads with a status mark that reflects the call's
-    /// state: running, succeeded, or failed.
+    /// state: running (a SPINNER frame), succeeded, or failed.
     #[test]
     fn tool_header_mark_tracks_call_status() {
         let t = Theme::default();
         let head = |ok, done| {
-            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, false);
+            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, false, "⠋");
             text(&lines[0])
         };
-        assert!(head(false, false).starts_with('…'), "running");
+        assert!(
+            head(false, false).starts_with('⠋'),
+            "running with SPINNER frame"
+        );
         assert!(head(true, true).starts_with('✓'), "succeeded");
         assert!(head(false, true).starts_with('✗'), "failed");
         // The headline follows the tool name on the same row.
@@ -3777,6 +3797,7 @@ mod block_tests {
             true,
             true,
             false,
+            "",
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert_eq!(rows[0].trim(), "✓ bash", "no args preview on the header");
@@ -3793,7 +3814,7 @@ mod block_tests {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {}\n"}"#;
         let diff_result = "--- a/a.rs\n+++ b/a.rs\n+fn main() {}";
-        let rows: Vec<String> = tool_lines(&t, "write", args, diff_result, true, true, false)
+        let rows: Vec<String> = tool_lines(&t, "write", args, diff_result, true, true, false, "")
             .iter()
             .map(text)
             .collect();
@@ -3817,7 +3838,7 @@ mod block_tests {
     fn write_tool_preserves_the_files_own_indentation() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {\n    let x = 1;\n}"}"#;
-        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, false)
+        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, false, "")
             .iter()
             .map(text)
             .collect();
@@ -3834,7 +3855,7 @@ mod block_tests {
     fn a_task_call_shows_aligned_detail_rows_under_its_name() {
         let t = Theme::default();
         let args = r#"{"agent":"explore","description":"Explore hrdr-editor","prompt":"line one\nline two"}"#;
-        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, false)
+        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, false, "")
             .iter()
             .map(text)
             .collect();
@@ -3854,7 +3875,7 @@ mod block_tests {
         let t = Theme::default();
         let prompt = "x".repeat(DETAIL_VALUE_W + 50);
         let args = format!(r#"{{"prompt":"{prompt}"}}"#);
-        let row = |expanded| text(&tool_lines(&t, "task", &args, "", true, true, expanded)[1]);
+        let row = |expanded| text(&tool_lines(&t, "task", &args, "", true, true, expanded, "")[1]);
 
         let collapsed = row(false);
         assert!(collapsed.len() < prompt.len(), "clipped: {collapsed}");
@@ -3866,10 +3887,11 @@ mod block_tests {
     fn failed_write_shows_the_error_result() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"x"}"#;
-        let rows: Vec<String> = tool_lines(&t, "write", args, "Error: denied", false, true, false)
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> =
+            tool_lines(&t, "write", args, "Error: denied", false, true, false, "")
+                .iter()
+                .map(text)
+                .collect();
         assert!(rows.iter().any(|r| r.contains("Error: denied")), "{rows:?}");
     }
 
@@ -3879,7 +3901,16 @@ mod block_tests {
     fn edit_tool_colors_the_patch() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","old_string":"a","new_string":"b"}"#;
-        let lines = tool_lines(&t, "edit", args, "@@ -1 +1 @@\n-a\n+b", true, true, false);
+        let lines = tool_lines(
+            &t,
+            "edit",
+            args,
+            "@@ -1 +1 @@\n-a\n+b",
+            true,
+            true,
+            false,
+            "",
+        );
         assert!(text(&lines[0]).contains("edit a.rs"));
         let color = |i: usize| lines[i].spans[0].style.fg;
         assert_eq!(color(2), Some(t.error), "deletion is red");
@@ -3896,12 +3927,12 @@ mod block_tests {
             .collect();
         let args = r#"{"path":"src"}"#;
 
-        let collapsed = tool_lines(&t, "ls", args, &result, true, true, false);
+        let collapsed = tool_lines(&t, "ls", args, &result, true, true, false, "");
         let rows: Vec<String> = collapsed.iter().map(text).collect();
         assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 1, "{rows:?}");
         assert!(rows.last().unwrap().contains("+5 more lines"), "{rows:?}");
 
-        let expanded = tool_lines(&t, "ls", args, &result, true, true, true);
+        let expanded = tool_lines(&t, "ls", args, &result, true, true, true, "");
         let rows: Vec<String> = expanded.iter().map(text).collect();
         assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 5, "{rows:?}");
         assert!(!rows.last().unwrap().contains("more lines"), "{rows:?}");
@@ -3915,11 +3946,19 @@ mod block_tests {
         let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 3)
             .map(|i| format!("line {i}\n"))
             .collect();
-        let rows: Vec<String> =
-            tool_lines(&t, "read", r#"{"path":"a.rs"}"#, &result, true, true, false)
-                .iter()
-                .map(text)
-                .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "read",
+            r#"{"path":"a.rs"}"#,
+            &result,
+            true,
+            true,
+            false,
+            "",
+        )
+        .iter()
+        .map(text)
+        .collect();
         // 11 result lines, 8 previewed: lines 3..=10, with the hint above them
         // (for `read` the hidden lines are the ones scrolled off the top).
         assert!(rows[1].contains("+3 more lines"), "hint above: {rows:?}");
@@ -3946,6 +3985,7 @@ mod block_tests {
             false,
             false,
             false,
+            "⠋",
         )
         .iter()
         .map(text)

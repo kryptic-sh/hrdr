@@ -312,14 +312,15 @@ pub(crate) fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
     }
 }
 
-/// Render the not-yet-`completed` TODO items as `[ ] content` / `[~] content`
+/// Render the not-yet-`completed`/`cancelled` TODO items as `[ ] content` / `[~] content`
 /// lines, one per item — mirrors the checkbox rendering `todo`'s own tool
 /// produces (see `render_todos` in `hrdr-tools::tools::todo`), minus the
-/// completed items, since those are exactly what a turn-end nudge needs to
+/// completed/cancelled items, since those are exactly what a turn-end nudge needs to
 /// call out.
 pub(crate) fn render_unfinished_todos(todos: &[TodoItem]) -> String {
     todos
         .iter()
+        .filter(|t| !matches!(t.status.as_str(), "completed" | "cancelled"))
         .map(|t| {
             let mark = if t.status.as_str() == "in_progress" {
                 "~"
@@ -563,7 +564,9 @@ impl Agent {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
-                        .filter(|t| t.status.as_str() != "completed")
+                        .filter(|t| {
+                            t.status.as_str() != "completed" && t.status.as_str() != "cancelled"
+                        })
                         .cloned()
                         .collect();
                     if !unfinished.is_empty() {
