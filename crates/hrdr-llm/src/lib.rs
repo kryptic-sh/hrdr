@@ -13,6 +13,7 @@
 extern crate hrdr_test_support;
 
 mod anthropic;
+pub mod capped_read;
 pub mod catalog;
 mod client;
 mod codex;

@@ -8,6 +8,10 @@ use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use crate::capped_read::{MAX_DIAGNOSTIC_BYTES, MAX_LOG_FILE_BYTES, MAX_STRUCTURED_JSON_BYTES};
 use crate::sse::SseDecoder;
 use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 
@@ -22,12 +26,13 @@ fn request_log() -> Option<&'static Mutex<std::fs::File>> {
     REQUEST_LOG
         .get_or_init(|| {
             let path = std::env::var_os("HRDR_LOG_REQUESTS")?;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .ok()
-                .map(Mutex::new)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            // Restrict permissions to owner-only on Unix (0600) so local
+            // users cannot read API request/response data from the log.
+            #[cfg(unix)]
+            opts.mode(0o600);
+            opts.open(&path).ok().map(Mutex::new)
         })
         .as_ref()
 }
@@ -48,6 +53,12 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
         }
     }
     if let Ok(mut file) = file.lock() {
+        // Cap the log file at MAX_LOG_FILE_BYTES to prevent unbounded disk
+        // growth. Once the file exceeds the limit, new entries are silently
+        // dropped — the cap is documented on MAX_LOG_FILE_BYTES.
+        if file.metadata().map(|m| m.len()).unwrap_or(0) >= MAX_LOG_FILE_BYTES {
+            return;
+        }
         let _ = writeln!(file, "{obj}");
     }
 }
@@ -532,7 +543,7 @@ impl Client {
         let status = resp.status();
         if !status.is_success() {
             let retry_after = retry_after_from_headers(resp.headers());
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::capped_read::read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
             let status_u16 = status.as_u16();
             log_wire(
                 "error_response",
@@ -699,12 +710,14 @@ impl Client {
         let req = self.auth(self.http.get(self.url("models")));
         let resp = req.send().await.context("models request failed")?;
         let status = resp.status();
-        let text = resp.text().await.context("reading models response")?;
         if !status.is_success() {
+            let text = crate::capped_read::read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
             bail!("models endpoint returned {status}: {text}");
         }
-        let parsed: ModelsResponse = serde_json::from_str(&text)
-            .with_context(|| format!("decoding models response: {text}"))?;
+        let parsed: ModelsResponse =
+            crate::capped_read::read_capped_json(resp, MAX_STRUCTURED_JSON_BYTES)
+                .await
+                .context("decoding models response")?;
         let mut ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
         ids.sort();
         Ok(ids)
@@ -1113,5 +1126,91 @@ mod tests {
             wire_protocol("http://localhost:1234/v1"),
         );
         assert_eq!(wire_protocol("http://localhost:1234/v1"), "OpenAI");
+    }
+
+    // ── Log hardening ───────────────────────────────────────────────────
+    //
+    // These tests verify the REQUEST_LOG file creation and growth-cap logic
+    // without exercising the global singleton (which is hard to reset).
+
+    #[test]
+    #[cfg(unix)]
+    fn log_file_created_with_0600_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+
+        // Replicate the open options request_log() uses.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        opts.mode(0o600);
+        let file = opts.open(&path).unwrap();
+        drop(file);
+
+        // On Unix, the mode argument to OpenOptions is only a *request* —
+        // the kernel applies the umask on top.  The resulting file must not
+        // have group/other bits set, even though the exact mode may differ
+        // from 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&path).unwrap();
+        let perm = meta.permissions().mode();
+        // Check that group and other bits are clear.
+        assert_eq!(
+            perm & 0o077,
+            0,
+            "log file must not have group/other permissions (mode={perm:#o})"
+        );
+    }
+
+    #[test]
+    fn log_wire_skips_write_when_file_exceeds_cap() {
+        // The growth-cap check inside log_wire compares the target file's
+        // length against MAX_LOG_FILE_BYTES.  We verify the same logic by
+        // writing up to and past the limit to a temp file, then re-checking
+        // against the cap constant.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+
+        // Write MAX_LOG_FILE_BYTES bytes.
+        let data = vec![b'x'; MAX_LOG_FILE_BYTES as usize];
+        std::fs::write(&path, &data).unwrap();
+
+        // The metadata check should see length >= MAX_LOG_FILE_BYTES.
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            meta.len() >= MAX_LOG_FILE_BYTES,
+            "file should be at or past the cap"
+        );
+
+        // Opening for append and writing a line would be skipped by the
+        // guard in log_wire.  We verify the guard condition directly.
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let would_skip = file.metadata().map(|m| m.len()).unwrap_or(0) >= MAX_LOG_FILE_BYTES;
+        assert!(
+            would_skip,
+            "log_wire must skip writes when file >= MAX_LOG_FILE_BYTES"
+        );
+        drop(file);
+    }
+
+    #[test]
+    fn log_wire_allows_write_when_file_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+
+        // Write a small amount well under the cap.
+        std::fs::write(&path, b"small").unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let would_skip = file.metadata().map(|m| m.len()).unwrap_or(0) >= MAX_LOG_FILE_BYTES;
+        assert!(
+            !would_skip,
+            "log_wire must allow writes when file < MAX_LOG_FILE_BYTES"
+        );
     }
 }

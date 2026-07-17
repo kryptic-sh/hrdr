@@ -28,6 +28,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use hrdr_llm::capped_read::{MAX_DIAGNOSTIC_BYTES, read_capped_text};
+
 // ── OpenAI (Codex) constants — mirror codex.ts ──────────────────────────────
 
 /// OpenAI OAuth client id (the Codex CLI app), from `codex.ts`.
@@ -286,16 +288,20 @@ pub async fn openrouter_exchange(code: &str, verifier: &str) -> Result<String> {
         .await
         .context("requesting an OpenRouter API key")?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("OpenRouter key exchange failed ({status}): {text}");
+        // Read capped diagnostic but never include the body in the error
+        // message: the OpenRouter key-exchange response body IS the API key
+        // (`{"key":"sk-or-v1-..."}`), or at minimum contains partial secrets.
+        let _ = read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
+        bail!("OpenRouter key exchange failed ({status})");
     }
     let v: serde_json::Value =
-        serde_json::from_str(&text).context("parsing the OpenRouter key response")?;
+        serde_json::from_str(&read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await)
+            .context("parsing the OpenRouter key response")?;
     v.get("key")
         .and_then(|k| k.as_str())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("OpenRouter response missing `key`: {text}"))
+        .ok_or_else(|| anyhow!("OpenRouter key exchange response missing `key`"))
 }
 
 // ── OpenAI (Codex) flow ─────────────────────────────────────────────────────
@@ -367,7 +373,7 @@ async fn post_token(params: &[(&str, &str)]) -> Result<OpenAiTokens> {
         .await
         .context("requesting OpenAI tokens")?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
     if !status.is_success() {
         bail!("{}", sanitized_token_error(status, &text));
     }

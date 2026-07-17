@@ -317,7 +317,9 @@ pub(crate) async fn chat_stream(
     let status = resp.status();
     if !status.is_success() {
         let retry_after = crate::client::retry_after_from_headers(resp.headers());
-        let text = resp.text().await.unwrap_or_default();
+        let text =
+            crate::capped_read::read_capped_text(resp, crate::capped_read::MAX_DIAGNOSTIC_BYTES)
+                .await;
         let status_u16 = status.as_u16();
         return Err(anyhow::Error::new(crate::client::ChatError {
             status: Some(status_u16),
