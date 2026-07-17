@@ -55,6 +55,7 @@ pub use subagent_live::{
 mod subagent_transcript;
 mod turn;
 pub use turn::TurnStats;
+mod budget;
 mod config;
 mod usage;
 pub use config::{
@@ -3793,14 +3794,14 @@ pub struct Agent {
     /// Estimated USD spent this session: every model call of this agent plus
     /// every delegated sub-agent's (the `task` tool hands each sub-agent this
     /// same counter). Std mutex — held only long enough to add.
-    cost_total: Arc<std::sync::Mutex<f64>>,
+    pub(crate) cost_total: Arc<std::sync::Mutex<f64>>,
     /// Price-card memo for the current identity, so the catalog isn't re-read on
     /// every usage event. The inner `None` remembers an unpriced model (e.g. a
     /// local server).
-    cost_rates: Option<(ModelRef, Option<hrdr_llm::catalog::ModelCost>)>,
+    pub(crate) cost_rates: Option<(ModelRef, Option<hrdr_llm::catalog::ModelCost>)>,
     /// Abort the turn before the next model call once `cost_total` reaches
     /// this many USD ([`AgentConfig::max_cost`]).
-    max_cost: Option<f64>,
+    pub(crate) max_cost: Option<f64>,
     /// Lifecycle hooks from `[[hooks]]` entries with an `event` (the
     /// event-less entries become the post-edit file hooks in `ctx.hooks`).
     /// Arc: cloned into each tool call's future for the pre/post tool events.
@@ -4664,57 +4665,11 @@ impl Agent {
         self.client.clone()
     }
 
-    /// The model's context window: whatever the endpoint advertises (vLLM's
-    /// `max_model_len`, llama.cpp's `n_ctx`, …), else the models.dev catalog.
-    ///
-    /// Most OpenAI-compatible endpoints — opencode zen and OpenAI itself among
-    /// them — publish nothing, so without the catalog the status bar's gauge has
-    /// no "of Y" and auto-compaction has no threshold. `None` when neither knows.
-    /// The current `(provider, model)` price card from the models.dev
-    /// catalog, memoized per pair — the inner `None` remembers an unpriced
-    /// model (a local server) so the catalog isn't re-read every call.
-    async fn current_cost_rates(&mut self) -> Option<hrdr_llm::catalog::ModelCost> {
-        let key = self.resolved.reference().clone();
-        if self.cost_rates.as_ref().map(|(k, _)| k) != Some(&key) {
-            // The catalog's namespace, not the app's — see `catalog_provider_key`.
-            let rates = hrdr_llm::catalog::model_cost(
-                catalog_provider_key(Some(key.provider().as_str())).as_deref(),
-                key.model(),
-            )
-            .await;
-            self.cost_rates = Some((key, rates));
-        }
-        self.cost_rates.as_ref().and_then(|(_, r)| *r)
-    }
-
     /// Append a user-role note to the history without running a turn. The
     /// TUI's `!command` shell escape records the command + its output this
     /// way, so the next model call sees what the user ran.
     pub fn push_user_note(&mut self, text: impl Into<String>) {
         self.messages.push(ChatMessage::user(text));
-    }
-
-    /// Estimated USD spent this session: every model call, including delegated
-    /// sub-agents'. Estimates come from the models.dev catalog; unpriced
-    /// models (local servers) count as $0.
-    pub fn session_cost(&self) -> f64 {
-        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Zero the session cost counter (session reset — the counter tracks the
-    /// *session*, not the process).
-    pub fn reset_session_cost(&self) {
-        self.set_session_cost(0.0);
-    }
-
-    /// Seed the cost counter — a resumed conversation has already spent something,
-    /// so the agent counts on from there.
-    ///
-    /// The agent reports this total with every `Usage` event, and that is what the
-    /// counters show. A frontend adding a saved base on top of the agent's figure
-    /// would be keeping a second, divergent tally of the same number.
-    pub fn set_session_cost(&self, usd: f64) {
-        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner()) = usd;
     }
 
     /// Status of the post-edit LSP layer for `/doctor`:
@@ -5003,54 +4958,6 @@ impl Agent {
         // model switch, used to clear this).
         self.self_compact_failed = false;
         Ok((before, self.messages.len()))
-    }
-
-    async fn budget_preflight(&mut self) -> Result<()> {
-        let Some(cap) = self.max_cost else {
-            return Ok(());
-        };
-        let spent = *self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
-        if spent >= cap {
-            bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
-        }
-        if self.current_cost_rates().await.is_none() {
-            let model = self.resolved.reference();
-            bail!(
-                "cost budget cannot be enforced for unpriced model {model}; \
-                 remove max_cost or choose a priced model"
-            );
-        }
-        Ok(())
-    }
-
-    async fn account_usage(
-        &mut self,
-        acc: &Accumulator,
-    ) -> (u32, u32, Option<u32>, Option<f64>, Option<f64>) {
-        let (prompt_tokens, completion_tokens) = match &acc.usage {
-            Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
-            None => (
-                estimate_tokens_in_messages(&self.messages),
-                estimate_tokens(&acc.content),
-            ),
-        };
-        let cached_prompt_tokens = acc.usage.as_ref().and_then(|usage| usage.cached_tokens());
-        let cost_usd = self
-            .current_cost_rates()
-            .await
-            .map(|rates| rates.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
-        let session_cost_usd = {
-            let mut total = self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
-            *total += cost_usd.unwrap_or(0.0);
-            (*total > 0.0).then_some(*total)
-        };
-        (
-            prompt_tokens,
-            completion_tokens,
-            cached_prompt_tokens,
-            cost_usd,
-            session_cost_usd,
-        )
     }
 
     /// Run one no-tools request to completion, returning the streamed text.
@@ -6671,14 +6578,14 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Very rough token estimate (~4 characters per token) for `text`. Used only as
 /// a fallback when the server reports no usage — good enough for the context bar
 /// + auto-compaction, not for billing.
-fn estimate_tokens(text: &str) -> u32 {
+pub(crate) fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 4) as u32
 }
 
 /// Estimate the prompt tokens of a whole request: each message's content and any
 /// tool-call names/arguments, plus a small per-message overhead for the role and
 /// structural tokens the chat template adds.
-fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
+pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()
         .map(|m| {
