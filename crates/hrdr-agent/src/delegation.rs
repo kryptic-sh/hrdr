@@ -2174,15 +2174,15 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             name: "plan".to_string(),
             model: None,
             description: Some(
-                "Planner — investigates read-only, then writes a step-by-step plan \
-                 to a Markdown file (can create/edit `.md` files only, no other \
-                 changes)."
+                "Planner — investigates read-only and returns a concrete, \
+                 step-by-step implementation plan in its report. Changes nothing; \
+                 use it to design the work before delegating the change."
                     .to_string(),
             ),
             prompt: Some(PLAN_PROMPT.to_string()),
-            read_only: Some(false),
+            read_only: Some(true),
             tools: None,
-            write_ext: Some(vec!["md".to_string(), "markdown".to_string()]),
+            write_ext: None,
             temperature: None,
             effort: None,
             max_steps: None,
@@ -2264,14 +2264,14 @@ report your findings.
   it's clean, say so plainly.";
 
 const PLAN_PROMPT: &str = "\
-You are a PLAN sub-agent. Investigate the task read-only, then produce a concrete \
-implementation plan and PERSIST it to disk as a Markdown file. You can read and \
-search freely and create/edit Markdown (`.md`) files — but you cannot modify any \
-other file or run mutating commands. Plan the work; do NOT implement it.
+You are a PLAN sub-agent: a read-only planner. Investigate the task with your \
+read and search tools, then return a concrete implementation plan in your report. \
+You cannot modify files or run mutating commands. Plan the work; do NOT implement \
+it.
 
 - First understand the task: trace the relevant code with your read/search tools, \
   and note how the project already does similar things so the plan fits in.
-- Write the plan with: the goal in one line; the approach and why; the exact \
+- Build the plan with: the goal in one line; the approach and why; the exact \
   files/functions/types to change; ordered steps, each sized as an independently \
   implementable — and independently reviewable — chunk: a step names the \
   files/functions it changes, its constraints, and a done-criterion, so the \
@@ -2279,11 +2279,8 @@ other file or run mutating commands. Plan the work; do NOT implement it.
   brief; edge cases and risks; and how to verify (build/test/lint). Be concrete \
   enough that another agent can execute it without re-investigating — name real \
   paths and symbols, not placeholders.
-- Save it to a Markdown file (e.g. `PLAN.md`, or a path the caller names): create \
-  it if absent, update it if it exists.
-- Return the full plan in your report, plus the path you wrote it to. You may be \
-  running in an isolated worktree the parent hasn't merged, so it may act on the \
-  plan from your report alone — don't make it depend on reading the file.";
+- Return the full plan in your report — that report is your entire hand-off, and \
+  the caller acts on it directly. Do not depend on writing anything to disk.";
 
 const CODER_PROMPT: &str = "\
 You are a CODER sub-agent: implement the task you were given, exactly and \

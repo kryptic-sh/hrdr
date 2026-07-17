@@ -4,8 +4,8 @@
 //! net the file tools sit behind: it is not held to a sub-agent's `write_ext`
 //! allow-list. These tools route the same operations through
 //! [`ToolContext::ensure_writable_ext`], which also makes them available to
-//! sub-agents that have no shell at all (`plan` writes markdown, and can now
-//! rename and delete it).
+//! extension-scoped sub-agents that have no shell at all (e.g. a `write_ext =
+//! ["md"]` profile can create, rename, and delete markdown, and nothing else).
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -590,8 +590,9 @@ mod tests {
         );
     }
 
-    /// The `write_ext` gate (a `plan` sub-agent) applies to the destination *and*
-    /// the source: neither renaming a `.rs` away nor renaming a `.md` into one.
+    /// The `write_ext` gate (an extension-scoped write sub-agent) applies to the
+    /// destination *and* the source: neither renaming a `.rs` away nor renaming a
+    /// `.md` into one.
     #[tokio::test]
     async fn move_honors_the_write_ext_allow_list() {
         let dir = tempfile::tempdir().unwrap();

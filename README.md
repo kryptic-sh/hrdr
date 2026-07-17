@@ -588,9 +588,9 @@ Five **built-in agents** ship out of the box, selected with the `task` tool's
   write/edit/shell). Traces files, types, and call paths and reports back.
 - **`review`** — a read-only code reviewer. Audits code or a change for bugs,
   edge cases, and security issues, with `path:line` findings.
-- **`plan`** — a planner. Investigates read-only, then writes a step-by-step
-  plan to disk as a **Markdown file** — it can create/edit `.md` files only, no
-  other file changes.
+- **`plan`** — a read-only planner. Investigates with the read/search tools,
+  then returns a concrete, step-by-step implementation plan in its report.
+  Changes nothing; use it to design the work before delegating the change.
 - **`coder`** — a write-capable implementer. Hand it a precise, self-contained
   spec (exact files, symbols, before→after) and it implements exactly that,
   verifies, and commits — no drive-by refactors or scope creep.
@@ -598,10 +598,10 @@ Five **built-in agents** ship out of the box, selected with the `task` tool's
   modify). The same agent you get from `task` with no `agent` argument.
 
 Each runs on the main provider (respecting `subagent_model`) with a specialized
-system prompt and a scoped tool set — `explore`/`review` are read-only, `plan`
-adds Markdown-only writes, `coder`/`general` get everything. Without an explicit
-`subagent_model`, later delegations inherit the main agent's current provider,
-model, and effort, including changes made through `/model` or `/effort`.
+system prompt and a scoped tool set — `explore`/`review`/`plan` are read-only,
+`coder`/`general` get everything. Without an explicit `subagent_model`, later
+delegations inherit the main agent's current provider, model, and effort,
+including changes made through `/model` or `/effort`.
 
 The read-only `models` tool lets an agent inspect its current provider, model,
 effort and resolved default sub-agent model, and—using
@@ -687,10 +687,10 @@ prompt = "You are a security reviewer. Focus on authn, injection, and secrets…
 
 `prompt` is appended to the sub-agent's system prompt (its role); `read_only`
 scopes it to the read-only tools; `write_ext` grants the read-only tools plus
-file writes limited to those extensions (e.g. `write_ext = ["md"]`, how `plan`
-is built); `tools` is an explicit allow-list that takes precedence over both.
-Every write-capable sub-agent automatically runs in a fresh git worktree on a
-scratch branch — auto-removed if it made no changes, otherwise kept with a
+file writes limited to those extensions (e.g. `write_ext = ["md"]` for a
+doc-only writer); `tools` is an explicit allow-list that takes precedence over
+both. Every write-capable sub-agent automatically runs in a fresh git worktree
+on a scratch branch — auto-removed if it made no changes, otherwise kept with a
 pointer to the branch to review and merge; there's no per-profile setting for
 this.
 
@@ -754,7 +754,7 @@ of only being able to delegate to it. The name resolves from the same set as the
 
 ```bash
 hrdr --agent explore            # a read-only session for spelunking a codebase
-hrdr --agent plan "design the migration"   # investigate, then write PLAN.md
+hrdr --agent plan "design the migration"   # investigate, return a plan
 ```
 
 Unlike a delegated sub-agent, a primary agent keeps delegation (the `task` tool)

@@ -1152,7 +1152,8 @@ impl Agent {
         ctx.lsp = lsp;
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
-        // A write-scoped sub-agent (e.g. `plan`) may only touch these extensions.
+        // An extension-scoped write sub-agent may only touch these extensions
+        // (a user `write_ext` profile — e.g. `["md"]` for a doc-only writer).
         ctx.write_allow_ext = config.write_ext.clone();
         if let Some((proj, glob)) = &mem_dirs {
             ctx.memory_project = Some(proj.clone());
@@ -3887,15 +3888,11 @@ mod tests {
         let ps = builtin_subagent_profiles();
         let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["explore", "review", "plan", "coder", "general"]);
-        // explore/review are read-only; plan writes Markdown; coder/general are full.
+        // explore/review/plan are read-only; coder/general are full.
         let by = |n: &str| ps.iter().find(|p| p.name == n).unwrap();
         assert!(by("explore").is_read_only());
         assert!(by("review").is_read_only());
-        assert!(!by("plan").is_read_only());
-        assert_eq!(
-            by("plan").write_ext.as_deref(),
-            Some(&["md".to_string(), "markdown".to_string()][..])
-        );
+        assert!(by("plan").is_read_only() && by("plan").write_ext.is_none());
         assert!(!by("coder").is_read_only() && by("coder").write_ext.is_none());
         assert!(!by("general").is_read_only() && by("general").write_ext.is_none());
         // explore/review/coder are proactive; plan/general are opt-in.
@@ -3953,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_agent_gets_read_tools_plus_markdown_writes() {
+    fn plan_agent_is_read_only() {
         use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
         let base = AgentConfig {
             ..Default::default()
@@ -3963,19 +3960,17 @@ mod tests {
             .find(|p| p.name == "plan")
             .unwrap();
         let cfg = config_for_agent_profile(&subagent_base_config(&base), &plan).unwrap();
-        assert_eq!(
-            cfg.write_ext.as_deref(),
-            Some(&["md".to_string(), "markdown".to_string()][..])
-        );
+        // Fully read-only now: no write scoping at all (a dedicated plan-file
+        // capability is future work).
+        assert!(cfg.read_only);
+        assert!(cfg.write_ext.is_none());
         let agent = Agent::new(cfg).unwrap();
         let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
-        // Read/search tools plus the writers, but not the shell.
+        // Read/search tools only — no writers, no shell.
         assert!(tools.iter().any(|n| n == "read"));
-        assert!(tools.iter().any(|n| n == "write"));
-        assert!(tools.iter().any(|n| n == "edit"));
+        assert!(!tools.iter().any(|n| n == "write"));
+        assert!(!tools.iter().any(|n| n == "edit"));
         assert!(!tools.iter().any(|n| n == "bash"));
-        // (The write gate that confines mutations to Markdown is exercised by
-        // `write_allow_ext_confines_mutations_to_listed_extensions` in hrdr-tools.)
         assert!(system_prompt(&agent).contains("PLAN sub-agent"));
     }
 
@@ -4208,9 +4203,8 @@ mod tests {
     /// asserted rather than assumed.
     ///
     /// `read_only` is not a flag the sub-agent is asked to respect: the tool
-    /// registry is *pruned* before it runs, so `explore` and `review` have no
-    /// `bash` at all and cannot write by shelling out. `plan` keeps `write`/
-    /// `edit` but no shell, and its writes are extension-gated to markdown.
+    /// registry is *pruned* before it runs, so `explore`, `review`, and `plan`
+    /// have no `bash` at all and cannot write by shelling out.
     #[test]
     fn each_builtin_subagent_gets_exactly_the_tools_it_should() {
         let base = AgentConfig {
@@ -4250,23 +4244,8 @@ mod tests {
         ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);
-
-        // `plan` adds the mutating tools — still no shell. Each gates on
-        // `ensure_writable_ext`, which enforces `write_ext`, so its writes are
-        // confined to markdown (patch validates before it writes anything, and
-        // move/delete guard both the source and the destination). LSP `rename`
-        // is not in the writer allow-list: a server-computed workspace edit
-        // could touch any file type, sidestepping the extension gate.
-        let mut planner = readers.to_vec();
-        planner.extend([
-            "copy", "delete", "edit", "move", "patch", "replace", "write",
-        ]);
-        planner.sort();
-        assert_eq!(tools("plan"), planner);
-        assert!(
-            !tools("plan").contains(&"rename".to_string()),
-            "extension-gated writers must not get the LSP rename"
-        );
+        // `plan` is read-only too now: same reader set, no writers, no shell.
+        assert_eq!(tools("plan"), readers);
 
         // A general sub-agent has the full set, shell included…
         let general = tools("general");
@@ -4304,9 +4283,7 @@ mod tests {
     }
 
     /// Which pool a sub-agent lands in: the read-only cap or the (lower)
-    /// write-capable one. Capability is `!read_only`, so a profile that writes
-    /// only `.md` (`plan`) still counts as a writer — it touches the shared
-    /// working tree.
+    /// write-capable one. Capability is `!read_only`.
     ///
     /// Pins the arithmetic: 5 `explore` + 2 `general` may run at once.
     #[test]
@@ -4328,8 +4305,8 @@ mod tests {
         assert_eq!(pool("review"), "read-only");
         assert_eq!(pool("general"), "write");
         assert_eq!(pool("coder"), "write");
-        // Writes markdown only, but still writes: the stricter cap applies.
-        assert_eq!(pool("plan"), "write");
+        // Read-only now: lands in the read-only pool with explore/review.
+        assert_eq!(pool("plan"), "read-only");
 
         // A bare `task` with no profile inherits the base, which can write.
         assert!(!base.read_only, "an unprofiled sub-agent is write-capable");
