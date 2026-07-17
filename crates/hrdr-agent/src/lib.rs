@@ -15,6 +15,7 @@ extern crate hrdr_test_support;
 mod agents_dir;
 mod auth;
 mod prompt;
+mod store_lock;
 
 pub use agents_dir::{discover_agent_profiles, split_fence};
 

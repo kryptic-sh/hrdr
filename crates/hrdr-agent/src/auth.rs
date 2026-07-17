@@ -159,7 +159,19 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 ///
 /// The write is done through [`write_atomic`] — a concurrent reader never sees a
 /// partial write.
+///
+/// Concurrent *writers* are serialized by a cross-process lock
+/// ([`StoreLock`](crate::store_lock::StoreLock)): the read-modify-write happens
+/// entirely under the lock, so a second process re-reads the merged store the
+/// first one wrote instead of racing on a stale snapshot. Two writers adding
+/// *different* providers both survive; two writers targeting the *same* provider
+/// are last-writer-wins (the later login is the fresher credential).
 fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    // Acquire the write lock BEFORE the read, and hold it across the whole
+    // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
+    let _lock = crate::store_lock::StoreLock::acquire(path)?;
     let mut doc = match std::fs::read_to_string(path) {
         Ok(text) => text
             .parse::<toml_edit::DocumentMut>()
@@ -170,8 +182,6 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
         }
     };
     doc[provider] = toml_edit::value(token);
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let content = doc.to_string();
     write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
@@ -274,6 +284,76 @@ mod tests {
             .filter(|n| n != "out.txt")
             .collect();
         assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
+    }
+
+    /// Concurrent writers adding DIFFERENT providers all survive: the
+    /// cross-process lock serializes the read-modify-write, so each writer
+    /// re-reads the store the previous one wrote and merges its own key in
+    /// rather than clobbering with a stale snapshot.
+    #[test]
+    fn concurrent_writers_different_providers_all_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        // Seed the file so every writer starts from a real (parseable) store.
+        save_token_at(&path, "seed", "sk-seed").unwrap();
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let provider = format!("p{i}");
+                    let token = format!("sk-{i}");
+                    save_token_at(&path, &provider, &token).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let tokens = load_tokens_at(&path);
+        assert_eq!(tokens.get("seed").map(String::as_str), Some("sk-seed"));
+        for i in 0..n {
+            assert_eq!(
+                tokens.get(&format!("p{i}")).map(String::as_str),
+                Some(format!("sk-{i}").as_str()),
+                "writer {i}'s entry survived the concurrent writes"
+            );
+        }
+    }
+
+    /// Same-provider concurrent writers are last-writer-wins: they serialize on
+    /// the lock, and exactly one of the written values remains. (The policy is
+    /// documented on `save_token_at` — the later login is the fresher key.) The
+    /// store is never corrupted: it always parses and always holds one value.
+    #[test]
+    fn concurrent_writers_same_provider_last_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    save_token_at(&path, "shared", &format!("sk-{i}")).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let tokens = load_tokens_at(&path);
+        // Exactly one value survived, and it is one of the values written — no
+        // torn write, no corruption.
+        let got = tokens.get("shared").expect("the key exists");
+        let valid: Vec<String> = (0..n).map(|i| format!("sk-{i}")).collect();
+        assert!(
+            valid.contains(got),
+            "last-writer value is one written: {got}"
+        );
     }
 
     #[cfg(unix)]

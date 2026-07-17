@@ -544,7 +544,19 @@ fn has_oauth_credentials_at(path: &Path, kind: crate::ResolvedProviderKind, name
 }
 
 /// Path-based core of [`save_oauth`].
+///
+/// Concurrent *writers* are serialized by a cross-process lock
+/// ([`StoreLock`](crate::store_lock::StoreLock)): the read-modify-write runs
+/// entirely under the lock, so a second process re-reads the merged store the
+/// first one wrote rather than racing on a stale snapshot. Two writers adding
+/// *different* providers both survive; two writers targeting the *same* provider
+/// are last-writer-wins (the later credential is the fresher one).
 fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    // Hold the write lock across the whole read-modify-write. `_lock` releases
+    // on drop (normal return, `?`, panic).
+    let _lock = crate::store_lock::StoreLock::acquire(path)?;
     let mut map = match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).with_context(|| {
             format!("parsing existing OAuth credential store {}", path.display())
@@ -556,8 +568,6 @@ fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> 
         }
     };
     map.insert(provider.to_string(), creds.clone());
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let json = serde_json::to_vec_pretty(&map).context("serializing oauth.json")?;
     crate::write_atomic(path, &json).with_context(|| format!("writing {}", path.display()))
 }
@@ -1053,6 +1063,88 @@ mod tests {
         save_oauth_at(&path, "openai", &openai2).unwrap();
         assert_eq!(load_oauth_at(&path, "openai"), Some(openai2));
         assert_eq!(load_oauth_at(&path, "other"), Some(other));
+    }
+
+    /// Concurrent writers adding DIFFERENT providers all survive: the
+    /// cross-process lock serializes the read-modify-write so no writer clobbers
+    /// another's entry with a stale snapshot.
+    #[test]
+    fn concurrent_oauth_writers_different_providers_all_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+        // Seed so every writer starts from a real (parseable) store.
+        save_oauth_at(
+            &path,
+            "seed",
+            &OAuthCreds {
+                access: "a".into(),
+                refresh: "r".into(),
+                expires_ms: 1,
+                account_id: None,
+            },
+        )
+        .unwrap();
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let creds = OAuthCreds {
+                        access: format!("acc-{i}"),
+                        refresh: format!("ref-{i}"),
+                        expires_ms: i as u64,
+                        account_id: None,
+                    };
+                    save_oauth_at(&path, &format!("p{i}"), &creds).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(load_oauth_at(&path, "seed").is_some());
+        for i in 0..n {
+            let got = load_oauth_at(&path, &format!("p{i}")).expect("entry survived");
+            assert_eq!(got.access, format!("acc-{i}"));
+        }
+    }
+
+    /// Same-provider concurrent writers are last-writer-wins (documented on
+    /// `save_oauth_at`): they serialize on the lock and exactly one written
+    /// credential remains, with no corruption.
+    #[test]
+    fn concurrent_oauth_writers_same_provider_last_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.json");
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let creds = OAuthCreds {
+                        access: format!("acc-{i}"),
+                        refresh: format!("ref-{i}"),
+                        expires_ms: i as u64,
+                        account_id: None,
+                    };
+                    save_oauth_at(&path, "shared", &creds).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let got = load_oauth_at(&path, "shared").expect("the key exists");
+        let valid: Vec<String> = (0..n).map(|i| format!("acc-{i}")).collect();
+        assert!(
+            valid.contains(&got.access),
+            "surviving value is one written: {}",
+            got.access
+        );
     }
 
     #[test]
