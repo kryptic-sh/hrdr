@@ -322,6 +322,13 @@ impl SessionState {
     }
 }
 
+/// Maximum size of a single session file we are willing to load (100 MiB).
+///
+/// This prevents OOM from a corrupt or pathologically large session file.
+/// The limit is generous: even a conversation with tens of thousands of turns
+/// should fit comfortably within it.
+pub const MAX_SESSION_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// A saved conversation: file metadata plus the [`SessionState`] it carries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -449,6 +456,10 @@ impl Session {
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
         hrdr_agent::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
+        // Clean up the reservation lock left by `unique_session_id`, if any.
+        // A save that was NOT preceded by a reservation (e.g. an autosave of an
+        // already-assigned id) has no lock to clean up; `remove_file` is benign.
+        let _ = std::fs::remove_file(dir.join(format!(".{}.lock", sanitize_name(id))));
         // Two writes can land within the filesystem's mtime granularity
         // (Windows timestamps tick coarsely), and `meta_cache` trusts an
         // unchanged mtime — so a listing right after e.g. a rename could
@@ -467,7 +478,20 @@ impl Session {
 
     /// Load a session directly from a file path. The file id isn't stored in the
     /// file — it *is* the file name — so it's filled in here.
+    ///
+    /// Returns an error when the file exceeds [`MAX_SESSION_FILE_BYTES`].
     pub fn load_path(path: &Path) -> Result<Session> {
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?
+            .len();
+        if len > MAX_SESSION_FILE_BYTES {
+            anyhow::bail!(
+                "session file {} is {:.1} MiB, exceeds the {:.1} MiB limit",
+                path.display(),
+                len as f64 / (1024.0 * 1024.0),
+                MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
+            );
+        }
         let data =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut session: Session =
@@ -509,16 +533,41 @@ pub fn resolve_session(cwd: &str, arg: &str) -> Option<(String, Session)> {
 
 /// A collision-free file id (within `cwd`'s directory) derived from `name`:
 /// the slug, then `slug-2`, `slug-3`, … if files already exist.
+///
+/// The id is **reserved atomically** via a hidden lock file created with
+/// `O_EXCL`, so two concurrent processes in the same cwd never race on the
+/// existence check and mint the same id. `Session::save` removes the lock
+/// after a successful write.
 pub fn unique_session_id(cwd: &str, name: &str) -> String {
     let slug = sanitize_name(name);
     let dir = session_dir(cwd);
-    if !dir.join(format!("{slug}.json")).exists() {
-        return slug;
-    }
-    for i in 2..10_000 {
-        let cand = format!("{slug}-{i}");
-        if !dir.join(format!("{cand}.json")).exists() {
-            return cand;
+    let _ = std::fs::create_dir_all(&dir);
+
+    for i in 1..10_000 {
+        let cand = if i == 1 {
+            slug.clone()
+        } else {
+            format!("{slug}-{i}")
+        };
+        let json_path = dir.join(format!("{cand}.json"));
+        let lock = dir.join(format!(".{cand}.lock"));
+
+        // Already a real session file → permanently taken.
+        if json_path.exists() {
+            continue;
+        }
+        // Atomically claim via O_EXCL lock file.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(f) => {
+                drop(f);
+                return cand;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return cand, // best-effort fallback
         }
     }
     slug
@@ -577,6 +626,14 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
                 cache.insert(path, (mtime, meta.clone()));
             }
             out.push(meta);
+        } else {
+            // Corrupt or unparseable session files are silently skipped from
+            // listings. Emit a diagnostic so the user knows a file exists but
+            // could not be read.
+            eprintln!(
+                "[hrdr] warning: skipping unreadable session file {}",
+                path.display()
+            );
         }
     }
 }
@@ -932,6 +989,90 @@ mod tests {
             assert_eq!(unique_session_id(&cwd, "chat"), "chat");
             Session::new(state("chat", &cwd)).save("chat").unwrap();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
+        });
+    }
+
+    /// The lock file created by `unique_session_id` is cleaned up after a
+    /// successful `Session::save`.
+    #[test]
+    fn unique_session_id_lock_is_cleaned_up_after_save() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let dir = session_dir(&cwd);
+            let _ = std::fs::create_dir_all(&dir);
+
+            let id = unique_session_id(&cwd, "cleanup test");
+            assert_eq!(id, "cleanup-test");
+            let lock = dir.join(".cleanup-test.lock");
+            assert!(lock.exists(), "lock file exists after reservation");
+
+            // Save removes the lock.
+            Session::new(state("cleanup", &cwd)).save(&id).unwrap();
+            assert!(!lock.exists(), "lock file removed after save");
+        });
+    }
+
+    /// Two reservations without an intervening save produce different ids
+    /// (the second process would get the next suffix).
+    #[test]
+    fn unique_session_id_two_reservations_get_different_ids() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let first = unique_session_id(&cwd, "multi");
+            let second = unique_session_id(&cwd, "multi");
+            assert_eq!(first, "multi");
+            assert_eq!(second, "multi-2", "second reservation gets next suffix");
+        });
+    }
+
+    // ── file size limit ────────────────────────────────────────────────────────
+
+    /// A session file exceeding `MAX_SESSION_FILE_BYTES` is rejected with a
+    /// clear error message mentioning the limit.
+    #[test]
+    fn load_path_rejects_oversized_file() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            Session::new(state("big", &cwd)).save("big").unwrap();
+            let path = session_dir(&cwd).join("big.json");
+
+            // Stretch the file past the limit by appending junk.
+            let padding = " ".repeat(MAX_SESSION_FILE_BYTES as usize + 1);
+            std::fs::write(&path, padding).unwrap();
+
+            let err = Session::load_path(&path).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("100.0 MiB"),
+                "error mentions size limit: {msg}"
+            );
+            assert!(
+                msg.contains(&path.display().to_string()),
+                "error names the file: {msg}"
+            );
+        });
+    }
+
+    /// A normal-sized session file loads without error (the limit is generous
+    /// and only blocks pathologically large files).
+    #[test]
+    fn load_path_accepts_small_file() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            Session::new(state("small", &cwd)).save("small").unwrap();
+            let loaded = Session::load(&cwd, "small").unwrap();
+            assert_eq!(loaded.state.name, "small");
         });
     }
 

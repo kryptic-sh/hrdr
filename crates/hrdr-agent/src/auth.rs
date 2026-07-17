@@ -84,6 +84,13 @@ fn load_tokens_at(path: &Path) -> HashMap<String, String> {
 /// permissions from the start so there is no window where it exists with
 /// broader permissions.
 ///
+/// The parent directory is fsynced after a successful rename so that the
+/// rename is crash-durable (the directory entry change is flushed to media).
+/// A directory sync failure is **not** reported as an error: the rename
+/// itself is atomic and the data is already on disk — a lost sync only
+/// risks losing the rename itself if the machine crashes before the
+/// directory metadata write completes.
+///
 /// The parent directory must already exist. A rename failure removes the temp
 /// so no stray file is left behind.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -126,12 +133,24 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let result = result.and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // After a successful rename, sync the parent directory so the directory
+    // entry change (the rename) is crash-durable on Unix.  A sync failure is
+    // silently swallowed: the write is atomic and the data is on disk — the
+    // only thing a lost directory sync risks is losing the rename itself in a
+    // crash before the directory metadata flushes.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     // No non-unix permission tightening: the Windows read-only *attribute*
     // doesn't restrict reads (access is by ACL) and would make the file
     // un-replaceable by the next atomic rename. Unix already got 0600 above;
     // proper Windows hardening (per-user ACL) is a follow-up.
-    result
+    Ok(())
 }
 
 /// Write `provider = "token"` into the file at `path`, preserving other entries
@@ -266,5 +285,40 @@ mod tests {
         save_token_at(&path, "zen", "sk").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "credential file must be 0600");
+    }
+
+    /// `write_atomic` syncs the parent directory after a successful rename so
+    /// the directory entry change is crash-durable on Unix.  This test cannot
+    /// verify the sync itself (it is a kernel-level durability guarantee), but
+    /// it verifies that the sync does not break the happy path: the file is
+    /// written, the content is correct, no stray temps are left, and the
+    /// directory is still usable.
+    #[test]
+    fn write_atomic_with_dir_sync_completes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+
+        write_atomic(&path, b"sync test data").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"sync test data",
+            "content is preserved"
+        );
+
+        // No temp files or other stray files were left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "out.txt")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no stray files after write_atomic: {leftovers:?}"
+        );
+
+        // A second write_atomic on the same path also succeeds.
+        write_atomic(&path, b"second write").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second write");
     }
 }
