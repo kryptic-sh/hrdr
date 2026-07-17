@@ -208,6 +208,9 @@ mod tests {
         assert!(p.contains("sub-agent result as unfinished until reviewed and merged"));
         assert!(p.contains("git commit -m \"$(cat <<'EOF'"));
         assert!(p.contains("Keep the heredoc delimiter single-quoted"));
+        assert!(p.contains("dependent, non-interactive commands with `&&`"));
+        assert!(p.contains("failed checks prevent staging"));
+        assert!(p.contains("Never use `;` as a substitute"));
         assert!(p.contains("/tmp/x"));
         assert!(!p.contains("Project instructions"));
         // The OS line names the platform (and, where detectable, the distro +
