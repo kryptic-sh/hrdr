@@ -403,18 +403,28 @@ impl Drop for Reservation {
 /// Returns `true` when the lock file at `path` was written by a process that
 /// is no longer alive (or that started it long enough ago to be considered
 /// abandoned).
+///
+/// A lock whose content doesn't parse as `PID TIMESTAMP` (e.g. one written by
+/// an earlier hrdr build, which left the file empty) falls back to the file's
+/// mtime for the age check: without that, an unparseable lock could never be
+/// judged stale and would burn its slug forever.
 fn is_stale_lock(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
     let mut parts = content.split_whitespace();
-    let pid: u32 = match parts.next().and_then(|p| p.parse().ok()) {
-        Some(p) => p,
-        None => return false,
-    };
-    let ts: u64 = match parts.next().and_then(|t| t.parse().ok()) {
-        Some(t) => t,
-        None => return false,
+    let parsed: Option<(u32, u64)> = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .zip(parts.next().and_then(|t| t.parse().ok()));
+    let Some((pid, ts)) = parsed else {
+        // Unparseable owner: age by mtime alone — no PID to probe, so old
+        // enough means stale.
+        let age = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok());
+        return age.is_some_and(|a| a.as_secs() >= STALE_LOCK_AGE_SECS);
     };
     let now = hrdr_tools::unix_now();
     // Not old enough — definitely not stale.
@@ -703,12 +713,20 @@ pub fn unique_session_id(cwd: &str, name: &str) -> (String, Reservation) {
             .unwrap_or_default()
             .as_nanos()
     );
-    // Last resort — the fallback must always succeed.
-    loop {
+    // Last resort. Bounded: an unwritable session dir makes `try_reserve`
+    // fail on EVERY attempt, and an unbounded retry loop would hard-hang the
+    // app inside what looks like a pure id-picking call. After the bounded
+    // tries, return the id unreserved — a `Reservation` whose lock file was
+    // never created (its `Drop`'s `remove_file` is benign). That degrades to
+    // the pre-reservation race behavior instead of never returning; the save
+    // itself will surface the real filesystem error to the user.
+    for _ in 0..8 {
         if let Ok(res) = try_reserve(&dir, &fallback) {
             return (fallback, res);
         }
     }
+    let lock_path = dir.join(format!(".{fallback}.lock"));
+    (fallback, Reservation { lock_path })
 }
 
 /// In-process cache of each session file's [`SessionMeta`], keyed by its
