@@ -53,8 +53,9 @@ Completed and verified (with review fixes folded in):
 - **P2 endpoint host classification** — `hrdr-agent` now consumes the public
   `hrdr_llm::url_host` helper instead of maintaining a duplicate classifier.
 - **P3 README stale release line** — removed.
-- **Monolith, first slices** — `config.rs` (~1.5k lines) and `budget.rs` (114
-  lines) extracted while preserving the public API.
+- **Monolith, first slices** — `config.rs` (~1.5k lines), `budget.rs` (114
+  lines), lifecycle `hooks.rs` (54 lines), and turn input/delivery state
+  (`turn_state.rs`, 155 lines) extracted with API preserved.
 
 ## Priority map (open items)
 
@@ -76,16 +77,15 @@ Completed and verified (with review fixes folded in):
 
 (Promoted from P2 on review: in practice every change to the agent — prompts,
 delegation, pruning, tools — routes through this one file, so its cost is paid
-on every task, not occasionally. `config.rs` and `budget.rs` are extracted;
-~14.8k lines remain.)
+on every task, not occasionally. `config.rs`, `budget.rs`, lifecycle `hooks.rs`,
+and the turn input/delivery slice are extracted; ~14.6k lines remain.)
 
 ### Remaining extractions, in order
 
-1. `hooks`
-2. `turn` (the run-loop state machine; distinct from the existing
-   turn-statistics module)
-3. `compaction` and context management (pruning, elision, tail windows)
-4. `delegation` and `worktree` (the `task*` tool family, spawn paths,
+1. `turn` remainder (the run loop, tool execution, streaming, retries, and turn
+   cleanup; distinct from the existing turn-statistics module)
+2. `compaction` and context management (pruning, elision, tail windows)
+3. `delegation` and `worktree` (the `task*` tool family, spawn paths,
    transcripts)
 
 ### Verification strategy
