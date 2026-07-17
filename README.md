@@ -10,11 +10,11 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
-> Active development, released as **v0.2.x**. The agent loop, adaptive tool set,
-> sub-agents, sessions, config hot-reload, and a rich TUI are in place. hrdr
-> connects to any running OpenAI-compatible endpoint — a hosted provider or a
-> server you run yourself ([`infr`](https://github.com/kryptic-sh/infr),
-> llama.cpp, vLLM, …). See the roadmap for what's next.
+> Active development. The agent loop, adaptive tool set, sub-agents, sessions,
+> config hot-reload, and a rich TUI are in place. hrdr connects to any running
+> OpenAI-compatible endpoint — a hosted provider or a server you run yourself
+> ([`infr`](https://github.com/kryptic-sh/infr), llama.cpp, vLLM, …). See the
+> roadmap for what's next.
 
 ## Install
 

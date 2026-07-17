@@ -626,3 +626,27 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  tag-release-status:
+    name: tag-release status
+    needs:
+      [
+        build,
+        publish-github-release,
+        publish-crates,
+        aur-bin,
+        brew-tap,
+        scoop-bucket,
+        alpine,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          RESULT=$(echo '${{ toJSON(needs.*.result) }}')
+          echo "Release job results: $RESULT"
+          if echo "$RESULT" | grep -qE '"failure"|"cancelled"'; then
+            echo "❌ A required release job failed or was cancelled"
+            exit 1
+          fi
+          echo "✅ All release jobs completed successfully or were intentionally skipped"
