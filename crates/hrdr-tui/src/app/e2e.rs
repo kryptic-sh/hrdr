@@ -5145,6 +5145,7 @@ async fn session_selector_renders_columns_filters_and_closes() {
         cwd: cwd.to_string(),
         updated: two_min_ago,
         path: std::path::PathBuf::from(format!("/tmp/{id}.json")),
+        error: None,
     };
     h.app.session_selector = Some(crate::app::session_selector(vec![
         meta("fix-auth", "Fix the auth bug", "/home/u/api"),

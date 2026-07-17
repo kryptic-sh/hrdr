@@ -27,11 +27,17 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
     if !state.is_saveable() {
         return Ok(None);
     }
-    let (id, first_save) = match &state.id {
-        Some(id) => (id.clone(), false),
-        None => (crate::unique_session_id(&state.cwd, &state.name), true),
+    let (id, first_save, _reservation) = if let Some(id) = &state.id {
+        (id.clone(), false, None)
+    } else {
+        let (id, res) = crate::unique_session_id(&state.cwd, &state.name);
+        (id, true, Some(res))
     };
     Session::new(state.persisted()).save(&id)?;
+    // `_reservation` is dropped here. If `save` failed above, the drop
+    // removes the lock file that `unique_session_id` created — no stale
+    // lock is left behind. If `save` succeeded, `save()` already removed
+    // the lock; the second `remove_file` in `Reservation::drop` is benign.
     Ok(Some(SaveOutcome { id, first_save }))
 }
 
@@ -66,16 +72,39 @@ pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, Session)> {
 /// Every saved session as a display string, newest first, each row tagged with
 /// its cwd — the text fallback for frontends without the `/resume` picker
 /// modal. Returns a friendly empty-state message when there are none.
+///
+/// Corrupt/unreadable sessions are shown with an `[error]` tag in place of
+/// the name and cwd, so they are visible rather than silently skipped.
 pub fn session_list_text() -> String {
     let sessions = crate::list_sessions();
     if sessions.is_empty() {
         return format!("no saved sessions in {}", crate::sessions_dir().display());
     }
     let mut s = String::from("saved sessions (newest first; resume by id or name):");
+    let mut corrupt = 0;
     for m in sessions {
-        s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
+        if let Some(err) = &m.error {
+            corrupt += 1;
+            s.push_str(&format!("\n  {} — [unreadable: {err}]", m.id));
+        } else {
+            s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
+        }
+    }
+    if corrupt > 0 {
+        s.push_str(&format!(
+            "\n{corrupt} corrupt/unreadable session file(s) — /doctor for details"
+        ));
     }
     s
+}
+
+/// Return diagnostic information about every corrupt/unreadable session file
+/// found in the sessions directory. Used by `/doctor` to report session health.
+pub fn session_diagnostics() -> Vec<(String, String)> {
+    crate::list_sessions()
+        .into_iter()
+        .filter_map(|m| m.error.map(|err| (m.path.display().to_string(), err)))
+        .collect()
 }
 
 /// Case-insensitive fuzzy filter over session rows for the `/resume` picker:
@@ -122,6 +151,7 @@ mod tests {
             cwd: cwd.to_string(),
             updated: 0,
             path: std::path::PathBuf::new(),
+            error: None,
         };
         let sessions = vec![
             meta("fix-auth", "Fix the auth bug", "/home/u/proj-a"),

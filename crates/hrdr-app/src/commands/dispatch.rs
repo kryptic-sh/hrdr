@@ -534,6 +534,16 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 };
                 out.push('\n');
                 out.push_str(&lsp_status_text(&agent).await);
+                // Session health: report any corrupt/unreadable files.
+                let diags = crate::session_diagnostics();
+                if !diags.is_empty() {
+                    out.push_str(&format!("\nsessions: {} corrupt file(s)", diags.len()));
+                    for (path, err) in &diags {
+                        out.push_str(&format!("\n  {path}: {err}"));
+                    }
+                } else {
+                    out.push_str("\nsessions: ✓");
+                }
                 out
             }));
         }

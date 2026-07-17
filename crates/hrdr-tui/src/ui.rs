@@ -778,15 +778,15 @@ fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Session
         return;
     }
 
-    // Pre-render each visible row's cells: id · name · age · cwd.
-    let rows: Vec<(String, String, String, String)> = sel
+    // Pre-render each visible row's cells: id · name · age · cwd · error.
+    let rows: Vec<(String, String, String, String, Option<String>)> = sel
         .rows()
         .map(|m| {
             let ts = chrono::DateTime::from_timestamp(m.updated as i64, 0)
                 .map(|t| hrdr_app::relative_time(t.with_timezone(&chrono::Local)))
                 .unwrap_or_else(|| "—".to_string());
             let cwd = hrdr_app::display_dir(std::path::Path::new(&m.cwd));
-            (m.id.clone(), m.name.clone(), ts, cwd)
+            (m.id.clone(), m.name.clone(), ts, cwd, m.error.clone())
         })
         .collect();
 
@@ -814,6 +814,7 @@ fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Session
 
     // Column widths from the data: id and age fit their longest value (capped),
     // the cwd gets up to a third of the width, and the name takes the rest.
+    // Error rows use the error text as the display name.
     let id_w = rows
         .iter()
         .map(|r| r.0.chars().count())
@@ -828,6 +829,7 @@ fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Session
         .min(12);
     let cwd_w = rows
         .iter()
+        .filter(|r| r.4.is_none())
         .map(|r| r.3.chars().count())
         .max()
         .unwrap_or(2)
@@ -843,31 +845,52 @@ fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Session
         )));
     }
     let cell = |s: &str, w: usize| format!("{:<w$}", truncate_chars(s, w), w = w);
-    for (i, (id, name, ts, cwd)) in rows.iter().enumerate().skip(start).take(list_height) {
+    for (i, (id, name, ts, cwd, error)) in rows.iter().enumerate().skip(start).take(list_height) {
         let selected = i == sel.selected;
-        let (id, name, ts, cwd) = (
-            cell(id, id_w),
-            cell(name, name_w),
-            cell(ts, ts_w),
-            truncate_chars(cwd, cwd_w),
-        );
-        let line = if selected {
-            let row = format!("{id}  {name}  {ts}  {cwd}");
-            Line::from(Span::styled(
-                format!("{row:<inner_w$}"),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.user)
-                    .add_modifier(Modifier::BOLD),
-            ))
+        if let Some(err) = error {
+            // Error row: show id + truncated error message in dim style.
+            let err_label = format!("[corrupt: {err}]");
+            let line = if selected {
+                let row = format!("{id}  {err_label}");
+                Line::from(Span::styled(
+                    format!("{row:<inner_w$}"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.user)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{id}  "), Style::default().fg(theme.accent)),
+                    Span::styled(err_label, Style::default().fg(theme.dim)),
+                ])
+            };
+            lines.push(line);
         } else {
-            Line::from(vec![
-                Span::styled(format!("{id}  "), Style::default().fg(theme.accent)),
-                Span::styled(format!("{name}  "), Style::default().fg(theme.user)),
-                Span::styled(format!("{ts}  {cwd}"), Style::default().fg(theme.dim)),
-            ])
-        };
-        lines.push(line);
+            let (id, name, ts, cwd) = (
+                cell(id, id_w),
+                cell(name, name_w),
+                cell(ts, ts_w),
+                truncate_chars(cwd, cwd_w),
+            );
+            let line = if selected {
+                let row = format!("{id}  {name}  {ts}  {cwd}");
+                Line::from(Span::styled(
+                    format!("{row:<inner_w$}"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.user)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{id}  "), Style::default().fg(theme.accent)),
+                    Span::styled(format!("{name}  "), Style::default().fg(theme.user)),
+                    Span::styled(format!("{ts}  {cwd}"), Style::default().fg(theme.dim)),
+                ])
+            };
+            lines.push(line);
+        }
     }
     f.render_widget(Paragraph::new(lines), inner);
 }

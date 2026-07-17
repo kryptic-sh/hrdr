@@ -7,6 +7,7 @@
 //! files are easy to manage by hand and startup auto-resume scopes to a project.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -16,6 +17,13 @@ use anyhow::{Context, Result};
 use hrdr_agent::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use hrdr_tools::TodoItem;
 use serde::{Deserialize, Serialize};
+
+/// How long (in seconds) a reservation lock must exist before it may be
+/// considered stale. A process that crashes after reserving an id but before
+/// saving will leave a lock behind; this threshold prevents a permanent
+/// deadlock while avoiding false reaping of a lock that a slow filesystem or
+/// a concurrent process legitimately holds.
+const STALE_LOCK_AGE_SECS: u64 = 60;
 
 /// v2: the identity is ONE key — `model: "provider://model"` — where v1 wrote
 /// `model` and `provider` side by side. A v1 file still loads (see
@@ -156,10 +164,9 @@ impl<'de> Deserialize<'de> for SessionState {
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
-            .map(str::parse::<ModelSpec>)
+            .map(|m| m.parse::<ModelSpec>())
             .transpose()
-            .ok()
-            .flatten();
+            .map_err(serde::de::Error::custom)?;
         let provider = raw
             .provider
             .as_deref()
@@ -358,13 +365,112 @@ impl Session {
 pub struct SessionMeta {
     /// File stem — the id you `/resume` by.
     pub id: String,
-    /// The session's display name.
+    /// The session's display name (empty when the file could not be parsed).
     pub name: String,
-    /// The working directory this session belongs to.
+    /// The working directory this session belongs to (empty when unreadable).
     pub cwd: String,
     pub updated: u64,
     /// Absolute path to the session file.
     pub path: PathBuf,
+    /// `None` = valid session; `Some(reason)` = file could not be loaded.
+    pub error: Option<String>,
+}
+
+// ── Reservation guard ─────────────────────────────────────────────────────────
+
+/// An owned reservation guard that prevents two processes from claiming the
+/// same session id.
+///
+/// Holds an exclusive lock file (`.{id}.lock`) in the session directory. The
+/// lock is released when the guard is dropped — either through normal cleanup
+/// (the save completed) or on early return / error propagation (a crash or
+/// failed save leaves no permanent lock).
+///
+/// Each lock file carries the owner's PID and a timestamp so that a stale lock
+/// (an old or orphaned one) can be detected and reaped rather than blocking
+/// the candidate forever.
+#[derive(Debug)]
+pub struct Reservation {
+    lock_path: PathBuf,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Returns `true` when the lock file at `path` was written by a process that
+/// is no longer alive (or that started it long enough ago to be considered
+/// abandoned).
+fn is_stale_lock(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut parts = content.split_whitespace();
+    let pid: u32 = match parts.next().and_then(|p| p.parse().ok()) {
+        Some(p) => p,
+        None => return false,
+    };
+    let ts: u64 = match parts.next().and_then(|t| t.parse().ok()) {
+        Some(t) => t,
+        None => return false,
+    };
+    let now = hrdr_tools::unix_now();
+    // Not old enough — definitely not stale.
+    if now < ts || now.saturating_sub(ts) < STALE_LOCK_AGE_SECS {
+        return false;
+    }
+    // Linux: check `/proc` for the owning process (zero-dependency).
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return false; // process is still alive
+    }
+    // macOS / other Unix: try `kill -0` to check process existence.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return false; // process is still alive
+    }
+    // Old enough and no sign of the owning process → stale.
+    true
+}
+
+/// Atomically claim `cand` via `O_EXCL` lock file (after reaping any stale
+/// lock for the same candidate).
+fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
+    let lock_path = dir.join(format!(".{cand}.lock"));
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => {
+                // Write owner PID + creation timestamp into the lock so
+                // a concurrent (or future) process can detect staleness.
+                let content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                let mut f = f;
+                let _ = f.write_all(content.as_bytes());
+                let _ = f.flush();
+                drop(f);
+                return Ok(Reservation { lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_stale_lock(&lock_path) {
+                    // Reap the stale lock and retry O_EXCL.
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                return Err(());
+            }
+            Err(_) => return Err(()),
+        }
+    }
 }
 
 /// `$XDG_DATA_HOME/hrdr/sessions`, or `~/.local/share/hrdr/sessions`.
@@ -480,8 +586,15 @@ impl Session {
     /// file — it *is* the file name — so it's filled in here.
     ///
     /// Returns an error when the file exceeds [`MAX_SESSION_FILE_BYTES`].
+    ///
+    /// Safety: opens the file once and reads through the opened handle to
+    /// eliminate the TOCTOU race between stat and open. The limit is enforced
+    /// on the metadata length *and* on the bytes actually read (in case the
+    /// file grew between the checks).
     pub fn load_path(path: &Path) -> Result<Session> {
-        let len = std::fs::metadata(path)
+        let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let len = f
+            .metadata()
             .with_context(|| format!("reading metadata for {}", path.display()))?
             .len();
         if len > MAX_SESSION_FILE_BYTES {
@@ -492,8 +605,21 @@ impl Session {
                 MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
             );
         }
-        let data =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut data = String::with_capacity(1024.min(len as usize));
+        // Read through a limit so a file that grew between metadata and read
+        // cannot OOM the process.
+        f.take(MAX_SESSION_FILE_BYTES + 1)
+            .read_to_string(&mut data)
+            .with_context(|| format!("reading {}", path.display()))?;
+        // Reject the data if more bytes were present than allowed (take()
+        // silently truncates past the limit, so we must check).
+        if data.len() as u64 > MAX_SESSION_FILE_BYTES {
+            anyhow::bail!(
+                "session file {} exceeds the {:.1} MiB limit",
+                path.display(),
+                MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
+            );
+        }
         let mut session: Session =
             serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
         session.state.id = path
@@ -535,10 +661,15 @@ pub fn resolve_session(cwd: &str, arg: &str) -> Option<(String, Session)> {
 /// the slug, then `slug-2`, `slug-3`, … if files already exist.
 ///
 /// The id is **reserved atomically** via a hidden lock file created with
-/// `O_EXCL`, so two concurrent processes in the same cwd never race on the
-/// existence check and mint the same id. `Session::save` removes the lock
-/// after a successful write.
-pub fn unique_session_id(cwd: &str, name: &str) -> String {
+/// `O_EXCL` that carries the caller's PID and a timestamp, so two concurrent
+/// processes in the same cwd never race on the existence check and mint the
+/// same id. The returned [`Reservation`] guard releases the lock on drop (a
+/// crash or error leaves no permanent lock behind).
+///
+/// A lock whose owner PID no longer exists (or that is older than
+/// [`STALE_LOCK_AGE_SECS`]) is reaped automatically, so a crashed writer
+/// does not block future sessions forever.
+pub fn unique_session_id(cwd: &str, name: &str) -> (String, Reservation) {
     let slug = sanitize_name(name);
     let dir = session_dir(cwd);
     let _ = std::fs::create_dir_all(&dir);
@@ -550,38 +681,34 @@ pub fn unique_session_id(cwd: &str, name: &str) -> String {
             format!("{slug}-{i}")
         };
         let json_path = dir.join(format!("{cand}.json"));
-        let lock = dir.join(format!(".{cand}.lock"));
 
-        // Atomically claim via O_EXCL lock file.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(f) => {
-                drop(f);
-                // The session may have appeared before this reservation. Check
-                // only after owning the lock, then release it and try the next
-                // suffix if the real session already exists.
+        match try_reserve(&dir, &cand) {
+            Ok(res) => {
+                // The session may have appeared before this reservation.
+                // Check only after owning the lock — no TOCTOU race.
                 if json_path.exists() {
-                    let _ = std::fs::remove_file(&lock);
+                    drop(res); // releases the lock
                     continue;
                 }
-                return cand;
+                return (cand, res);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            // Never return an unowned candidate: save() could overwrite a
-            // concurrent session. Try another suffix instead.
-            Err(_) => continue,
+            Err(()) => continue,
         }
     }
-    format!(
+    // Fallback: nanosecond timestamp (very unlikely to collide).
+    let fallback = format!(
         "{slug}-{}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    )
+    );
+    // Last resort — the fallback must always succeed.
+    loop {
+        if let Ok(res) = try_reserve(&dir, &fallback) {
+            return (fallback, res);
+        }
+    }
 }
 
 /// In-process cache of each session file's [`SessionMeta`], keyed by its
@@ -625,26 +752,38 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        if let Ok(s) = Session::load_path(&path) {
-            let meta = SessionMeta {
-                id,
-                name: s.state.name,
-                cwd: s.state.cwd,
-                updated: s.updated,
-                path: path.clone(),
-            };
-            if let (Some(mtime), Ok(mut cache)) = (mtime, meta_cache().lock()) {
-                cache.insert(path, (mtime, meta.clone()));
+        match Session::load_path(&path) {
+            Ok(s) => {
+                let meta = SessionMeta {
+                    id,
+                    name: s.state.name,
+                    cwd: s.state.cwd,
+                    updated: s.updated,
+                    path: path.clone(),
+                    error: None,
+                };
+                if let (Some(mtime), Ok(mut cache)) = (mtime, meta_cache().lock()) {
+                    cache.insert(path, (mtime, meta.clone()));
+                }
+                out.push(meta);
             }
-            out.push(meta);
-        } else {
-            // Corrupt or unparseable session files are silently skipped from
-            // listings. Emit a diagnostic so the user knows a file exists but
-            // could not be read.
-            eprintln!(
-                "[hrdr] warning: skipping unreadable session file {}",
-                path.display()
-            );
+            Err(err) => {
+                // A session file that could not be parsed is still listed
+                // (as an error row) so the `/resume` picker and `/doctor`
+                // can report it, rather than silently disappearing.
+                let ts = mtime
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(SessionMeta {
+                    id,
+                    name: String::new(),
+                    cwd: String::new(),
+                    updated: ts,
+                    path: path.clone(),
+                    error: Some(format!("{err:#}")),
+                });
+            }
         }
     }
 }
@@ -986,7 +1125,7 @@ mod tests {
 
     #[test]
     fn unique_session_id_returns_plain_slug_when_dir_absent() {
-        let id = unique_session_id("/nonexistent/hrdr/test/path/12345", "my session");
+        let (id, _res) = unique_session_id("/nonexistent/hrdr/test/path/12345", "my session");
         assert_eq!(id, "my-session");
     }
 
@@ -997,9 +1136,11 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            assert_eq!(unique_session_id(&cwd, "chat"), "chat");
+            let (id, _res) = unique_session_id(&cwd, "chat");
+            assert_eq!(id, "chat");
             Session::new(state("chat", &cwd)).save("chat").unwrap();
-            assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
+            let (id, _res) = unique_session_id(&cwd, "chat");
+            assert_eq!(id, "chat-2");
         });
     }
 
@@ -1015,7 +1156,7 @@ mod tests {
             let dir = session_dir(&cwd);
             let _ = std::fs::create_dir_all(&dir);
 
-            let id = unique_session_id(&cwd, "cleanup test");
+            let (id, _res) = unique_session_id(&cwd, "cleanup test");
             assert_eq!(id, "cleanup-test");
             let lock = dir.join(".cleanup-test.lock");
             assert!(lock.exists(), "lock file exists after reservation");
@@ -1035,8 +1176,8 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            let first = unique_session_id(&cwd, "multi");
-            let second = unique_session_id(&cwd, "multi");
+            let (first, _res1) = unique_session_id(&cwd, "multi");
+            let (second, _res2) = unique_session_id(&cwd, "multi");
             assert_eq!(first, "multi");
             assert_eq!(second, "multi-2", "second reservation gets next suffix");
         });
@@ -1188,6 +1329,127 @@ mod tests {
             );
             let (_, s) = resolve_session(&b, "alpha").unwrap();
             assert_eq!(s.state.name, "Alpha B");
+        });
+    }
+
+    // ── stale lock / reservation cleanup / concurrency ──────────────────────────
+
+    /// A stale lock file (old timestamp, dead PID) is reaped by
+    /// `unique_session_id` so the candidate can be claimed.
+    #[test]
+    fn stale_lock_is_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        std::fs::create_dir(&dir).unwrap();
+        let cwd = dir.to_str().unwrap().to_string();
+
+        let sdir = session_dir(&cwd);
+        let _ = std::fs::create_dir_all(&sdir);
+        let lock_path = sdir.join(".stale-cand.lock");
+
+        // Create a lock with an old timestamp and a PID that (almost
+        // certainly) does not exist.
+        let old_ts = hrdr_tools::unix_now().saturating_sub(STALE_LOCK_AGE_SECS + 60);
+        std::fs::write(&lock_path, format!("4294967294 {old_ts}")).unwrap();
+
+        let (id, _res) = unique_session_id(&cwd, "stale-cand");
+        assert_eq!(id, "stale-cand", "stale lock was reaped");
+    }
+
+    /// The [`Reservation`] guard releases the lock on drop, so a failed
+    /// save never leaves a permanent lock behind.
+    #[test]
+    fn reservation_cleans_up_lock_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        std::fs::create_dir(&dir).unwrap();
+        let cwd = dir.to_str().unwrap().to_string();
+        let sdir = session_dir(&cwd);
+        let _ = std::fs::create_dir_all(&sdir);
+        let lock_path = sdir.join(".reservation-drop.lock");
+
+        {
+            let (id, _res) = unique_session_id(&cwd, "reservation-drop");
+            assert_eq!(id, "reservation-drop");
+            assert!(lock_path.exists(), "lock exists during reservation");
+            // _res dropped here
+        }
+        assert!(!lock_path.exists(), "lock removed after Reservation::drop");
+    }
+
+    /// Two concurrent reservations for the same name get different ids.
+    #[test]
+    fn concurrent_unique_session_ids_are_different() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("con");
+        std::fs::create_dir(&dir).unwrap();
+        let cwd = std::sync::Arc::new(dir.to_str().unwrap().to_string());
+
+        let cwd1 = cwd.clone();
+        let cwd2 = cwd.clone();
+        let t1 = std::thread::spawn(move || {
+            let sdir = session_dir(&cwd1);
+            let _ = std::fs::create_dir_all(&sdir);
+            unique_session_id(&cwd1, "concurrent")
+        });
+        let t2 = std::thread::spawn(move || {
+            let sdir = session_dir(&cwd2);
+            let _ = std::fs::create_dir_all(&sdir);
+            unique_session_id(&cwd2, "concurrent")
+        });
+
+        let (id1, _r1) = t1.join().unwrap();
+        let (id2, _r2) = t2.join().unwrap();
+        assert_ne!(id1, id2, "concurrent reservations get different ids");
+    }
+
+    // ── corrupt session listing ───────────────────────────────────────────────
+
+    /// A session file that cannot be parsed is still listed (with an error
+    /// message) rather than silently skipped.
+    #[test]
+    fn corrupt_session_file_is_listed_with_error() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+
+            // Write a valid session.
+            Session::new(state("good", &cwd)).save("good").unwrap();
+
+            // Write an unparseable file next to it.
+            let dir = session_dir(&cwd);
+            std::fs::write(dir.join("corrupt.json"), "not valid json").unwrap();
+
+            let all = list_sessions();
+            assert_eq!(all.len(), 2, "both valid and corrupt are listed");
+            let good = all.iter().find(|m| m.id == "good").unwrap();
+            assert!(good.error.is_none(), "valid session has no error");
+            let bad = all.iter().find(|m| m.id == "corrupt").unwrap();
+            assert!(
+                bad.error.is_some(),
+                "corrupt session carries an error message"
+            );
+            assert!(bad.name.is_empty(), "corrupt entry has no name");
+            assert!(bad.cwd.is_empty(), "corrupt entry has no cwd");
+        });
+    }
+
+    /// `session_diagnostics` returns only the corrupt entries.
+    #[test]
+    fn session_diagnostics_returns_only_corrupt_files() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+
+            Session::new(state("valid", &cwd)).save("valid").unwrap();
+            let dir = session_dir(&cwd);
+            std::fs::write(dir.join("broken.json"), "{{{").unwrap();
+
+            let diags = crate::session_diagnostics();
+            assert_eq!(diags.len(), 1);
+            assert!(diags[0].0.ends_with("broken.json"), "path: {}", diags[0].0);
         });
     }
 }
@@ -1564,5 +1826,36 @@ mod migration_tests {
         assert_eq!(back.state.model, "zen://kimi-k2".parse().unwrap());
         assert!(!back.state.provider_unset);
         assert_eq!(back.version, SESSION_VERSION);
+    }
+
+    /// A present but malformed `model` field (e.g. `"://"` with an empty
+    /// provider) is a load error — the file must be fixable by hand.
+    /// Absent or empty model fields still get the legacy fallback.
+    #[test]
+    fn malformed_present_model_identity_is_a_load_error() {
+        let json = r#"{"version":2,"created":0,"updated":0,"model":"://","name":"bad"}"#;
+        let err = serde_json::from_str::<Session>(json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected") || msg.contains("Empty") || msg.contains("provider"),
+            "error message about malformed model: {msg}"
+        );
+    }
+
+    /// An absent model field in a v2 file still gets the default identity,
+    /// not an error — preserving the legacy fallback.
+    #[test]
+    fn absent_model_field_gets_default_identity() {
+        let json = r#"{"version":2,"created":0,"updated":0,"name":"no-model"}"#;
+        let back: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            back.state.model.to_string(),
+            hrdr_agent::DEFAULT_MODEL_REF,
+            "missing model gets the default"
+        );
+        assert!(
+            back.state.provider_unset,
+            "a file with no model is flagged as provider_unset"
+        );
     }
 }
