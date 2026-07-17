@@ -974,7 +974,8 @@ mod tests {
                     "todos": [
                         {"content": "pending task",  "status": "pending"},
                         {"content": "active task",   "status": "in_progress"},
-                        {"content": "done task",     "status": "completed"}
+                        {"content": "done task",     "status": "completed"},
+                        {"content": "stopped task",  "status": "cancelled"}
                     ]
                 }),
                 &c,
@@ -982,8 +983,9 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("  pending task"), "pending: {out}");
-        assert!(out.contains("~ active task"), "in_progress: {out}");
+        assert!(out.contains("⠋ active task"), "in_progress: {out}");
         assert!(out.contains("✓ done task"), "completed: {out}");
+        assert!(out.contains("✗ stopped task"), "cancelled: {out}");
     }
 
     #[test]

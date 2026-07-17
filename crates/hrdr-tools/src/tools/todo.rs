@@ -135,7 +135,7 @@ fn render_todos(todos: &[TodoItem]) -> String {
         let mark = match t.status.as_str() {
             "completed" => "✓",
             "cancelled" => "✗",
-            "in_progress" => "~",
+            "in_progress" => "⠋",
             _ => " ",
         };
         out.push_str(&format!("{mark} {}\n", t.content));

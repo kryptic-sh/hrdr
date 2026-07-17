@@ -3522,10 +3522,24 @@ async fn the_queued_badge_sits_below_a_blank_row() {
 #[tokio::test]
 async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     let mut h = Harness::new(vec![]).await;
-    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
-        content: "ship it".to_string(),
-        status: "in_progress".to_string(),
-    }];
+    *h.app.todos.lock().unwrap() = vec![
+        hrdr_agent::Todo {
+            content: "ship it".to_string(),
+            status: "in_progress".to_string(),
+        },
+        hrdr_agent::Todo {
+            content: "wait here".to_string(),
+            status: "pending".to_string(),
+        },
+        hrdr_agent::Todo {
+            content: "landed".to_string(),
+            status: "completed".to_string(),
+        },
+        hrdr_agent::Todo {
+            content: "skip it".to_string(),
+            status: "cancelled".to_string(),
+        },
+    ];
 
     let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3560,10 +3574,11 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
             assert_eq!(cell(x, y).bg, h.app.theme.user_bg, "({x},{y}):\n{screen}");
         }
     }
-    // One blank row above and below the content.
+    // One blank row above and below the panel content.
+    let last_text_y = text_y + 3;
     assert_eq!(without_bar(&row(text_y - 1)), "", "top padding:\n{screen}");
     assert_eq!(
-        without_bar(&row(text_y + 1)),
+        without_bar(&row(last_text_y + 1)),
         "",
         "bottom padding:\n{screen}"
     );
@@ -3575,6 +3590,9 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         row(text_y).starts_with(&format!("{} {first_frame} ship it", crate::ui::BORDER_BAR)),
         "{screen}"
     );
+    assert!(screen.contains("  wait here"), "pending marker: {screen}");
+    assert!(screen.contains("✓ landed"), "completed marker: {screen}");
+    assert!(screen.contains("✗ skip it"), "cancelled marker: {screen}");
     // Green, where the input pane's is the prompt's mauve.
     for y in text_y - 1..=text_y + 1 {
         assert_eq!(cell(0, y).symbol(), crate::ui::BORDER_BAR, "{screen}");
