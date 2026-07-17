@@ -63,9 +63,11 @@ impl super::App {
                 let mut a = agent.lock().await;
                 a.clear();
                 if a.project_docs_changed() {
-                    let _ = tx.send(TurnMsg::System(
-                        hrdr_app::PROJECT_DOCS_RELOADED_MSG.to_string(),
-                    ));
+                    let _ = tx
+                        .send(TurnMsg::System(
+                            hrdr_app::PROJECT_DOCS_RELOADED_MSG.to_string(),
+                        ))
+                        .await;
                 }
             });
             false
@@ -308,7 +310,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
                 hrdr_app::LineKind::Diff => TurnMsg::Diff(line),
                 hrdr_app::LineKind::System => TurnMsg::System(line),
             };
-            let _ = tx.send(msg);
+            // Sync poster callback — can't await; these are one-shot command
+            // results into an otherwise-idle channel, so `try_send` is enough.
+            let _ = tx.try_send(msg);
         })
     }
     fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
@@ -319,7 +323,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // screen when the answer arrives.
         let id = self.app.panes.active();
         Box::new(move |tokens| {
-            let _ = tx.send(TurnMsg::ContextWindow(id, tokens));
+            let _ = tx.try_send(TurnMsg::ContextWindow(id, tokens));
         })
     }
     fn identity_poster(
@@ -331,7 +335,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // whatever the reader happens to be looking at when it arrives.
         let id = self.app.panes.active();
         Box::new(move |reference, base_url, window| {
-            let _ = tx.send(TurnMsg::Identity(id, reference, base_url, window));
+            let _ = tx.try_send(TurnMsg::Identity(id, reference, base_url, window));
         })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
@@ -947,7 +951,7 @@ impl super::App {
         let fut = start.future;
         self.browser_login_task = Some(tokio::spawn(async move {
             let outcome = fut.await;
-            let _ = tx.send(super::TurnMsg::BrowserLogin(outcome));
+            let _ = tx.send(super::TurnMsg::BrowserLogin(outcome)).await;
         }));
         self.login_modal = Some(super::LoginModal::Authorizing {
             login_id: id,
@@ -1087,7 +1091,7 @@ impl super::App {
                     ),
                 },
             };
-            let _ = tx.send(msg);
+            let _ = tx.send(msg).await;
         });
     }
 

@@ -135,7 +135,9 @@ impl super::App {
         let tx = self.tx.clone();
         let sent_cwd = cwd.clone();
         hrdr_app::spawn_file_index(cwd, move |files| {
-            let _ = tx.send(super::TurnMsg::FileIndex(sent_cwd, files));
+            // Sync (off-thread) callback — can't await; a one-shot index result
+            // into an idle channel, so `try_send` suffices.
+            let _ = tx.try_send(super::TurnMsg::FileIndex(sent_cwd, files));
         });
     }
 }

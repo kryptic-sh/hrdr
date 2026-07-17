@@ -25,7 +25,7 @@ pub(crate) enum Transport {
 /// stdio transport: a spawned child + a writer channel + the id→response map.
 /// Dropping it kills the child (`kill_on_drop`).
 pub(crate) struct StdioTransport {
-    pub(crate) stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    pub(crate) stdin_tx: tokio::sync::mpsc::Sender<String>,
     pub(crate) pending: Pending,
     pub(crate) _child: Child,
 }

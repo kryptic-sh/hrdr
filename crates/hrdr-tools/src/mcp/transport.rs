@@ -54,8 +54,12 @@ pub(crate) async fn stdio_request(
 ) -> Result<Value> {
     let msg = req.to_string();
     request_via_pending(&t.pending, id, timeout, || async move {
+        // Bounded writer channel: await capacity so a stalled child throttles
+        // callers instead of buffering unbounded JSON. A dead child drops the
+        // receiver, turning this into an error rather than a hang.
         t.stdin_tx
             .send(msg)
+            .await
             .map_err(|_| anyhow!("server is not running"))
     })
     .await

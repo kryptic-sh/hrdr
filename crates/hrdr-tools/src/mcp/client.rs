@@ -90,7 +90,7 @@ impl McpClient {
             .take()
             .ok_or_else(|| anyhow!("no stdout pipe"))?;
 
-        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(super::MCP_STDIN_CAP);
         tokio::spawn(async move {
             while let Some(line) = stdin_rx.recv().await {
                 if stdin.write_all(line.as_bytes()).await.is_err()
@@ -140,7 +140,11 @@ impl McpClient {
                                 // Cheap best-effort answer so a conformant
                                 // server doesn't consider us unresponsive.
                                 let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
-                                let _ = stdin_tx.send(reply.to_string());
+                                // Best-effort, non-blocking: the reader task must
+                                // never block on stdin capacity (that would stall
+                                // response routing). Dropping a ping reply under
+                                // backpressure is harmless.
+                                let _ = stdin_tx.try_send(reply.to_string());
                             }
                             // other notifications / server-initiated requests
                             // are otherwise ignored (v1).
@@ -400,13 +404,16 @@ impl McpClient {
     /// `initialize()` awaits this for `notifications/initialized`, so the
     /// HTTP/SSE sends are bounded by `HANDSHAKE_TIMEOUT`: without a deadline,
     /// a server that accepts the POST but never responds would wedge
-    /// `connect_http`/`connect_sse` forever (stdio's send is a non-blocking
-    /// channel enqueue, so it needs no timeout).
+    /// `connect_http`/`connect_sse` forever (stdio's send awaits only local
+    /// channel capacity and errors out if the child is gone, so it needs no
+    /// timeout).
     pub(crate) async fn notify(&self, method: &str, params: Value) {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         match &self.transport {
             Transport::Stdio(t) => {
-                let _ = t.stdin_tx.send(msg.to_string());
+                // Bounded channel: await capacity (backpressure). A dead child
+                // drops the receiver, so this errors out instead of hanging.
+                let _ = t.stdin_tx.send(msg.to_string()).await;
             }
             Transport::Http(t) => {
                 let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, http_send(t, &msg)).await;

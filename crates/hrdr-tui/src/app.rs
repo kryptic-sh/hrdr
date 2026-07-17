@@ -175,6 +175,131 @@ pub(crate) enum TurnMsg {
     ConfigChanged,
 }
 
+/// Capacity of the UI event channel ([`App::tx`] → the render loop).
+///
+/// The render loop drains the *entire* channel on every wake (a `recv` then a
+/// `try_recv` loop, see `tui::run_loop`), so in steady state it sits near
+/// empty. A bound is still needed for the window where the consumer is *not*
+/// draining — a slow `terminal.draw`, or the seconds/minutes the loop is
+/// suspended inside `$EDITOR` — while a fast local model streams tokens. The
+/// old unbounded channel let that window queue without limit. 1024 leaves
+/// generous headroom for the control events (tool start/end, notices, usage)
+/// that accrue during such a stall — the token deltas themselves are coalesced
+/// by [`EventSender`] into O(1) messages — while capping worst-case memory.
+/// Mirrors the agent's own `UI_STREAM_CAP` house value.
+const TUI_EVENT_CAP: usize = 1024;
+
+/// Coalescing, bounded sink for a turn's [`AgentEvent`] stream.
+///
+/// The agent turn drives events through a **synchronous** `FnMut` callback, so
+/// it cannot `await` backpressure inline. Feeding a fast token stream straight
+/// into a bounded channel with `try_send` would force a choice between blocking
+/// (impossible here) and dropping — and dropping a `ToolEnd`/error/state event
+/// is not acceptable. This sink resolves that by keeping a FIFO backlog outside
+/// the channel and draining it opportunistically:
+///
+/// * Adjacent streaming deltas of the same kind (`Text`, `Reasoning`, or
+///   `ToolOutput` for one call id) **coalesce** into the backlog's tail message
+///   before they ever reach the channel. This is exactly what the consumer
+///   would render anyway — every delta is a `push_str` (see
+///   `hrdr_app::apply_event`) — so it holds the token stream at O(1) queued
+///   messages regardless of arrival rate.
+/// * Every other event is **never dropped or merged**: it waits in the backlog,
+///   in order, until the channel accepts it.
+///
+/// [`EventSender::drain`] flushes any backlog still outstanding when a turn ends
+/// during a stall, applying real (async) backpressure at the turn boundary. A
+/// closed receiver (the app shutting down) turns every send into a no-op error
+/// rather than a block, so a producer awaiting capacity can never deadlock.
+struct EventSender {
+    tx: mpsc::Sender<TurnMsg>,
+    backlog: std::collections::VecDeque<TurnMsg>,
+}
+
+impl EventSender {
+    fn new(tx: mpsc::Sender<TurnMsg>) -> Self {
+        Self {
+            tx,
+            backlog: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Enqueue one event — coalescing streaming deltas into the backlog tail —
+    /// then push as much of the backlog into the channel as it will accept.
+    fn send(&mut self, ev: AgentEvent) {
+        if !self.coalesce_into_tail(&ev) {
+            self.backlog.push_back(TurnMsg::Event(ev));
+        }
+        self.pump();
+    }
+
+    /// If `ev` is a streaming delta whose kind (and, for tool output, call id)
+    /// matches the current backlog tail, append its text there and report
+    /// `true`. Only the tail is eligible: any earlier message may have an
+    /// order-sensitive event queued behind it.
+    fn coalesce_into_tail(&mut self, ev: &AgentEvent) -> bool {
+        let Some(TurnMsg::Event(tail)) = self.backlog.back_mut() else {
+            return false;
+        };
+        match (tail, ev) {
+            (AgentEvent::Text(acc), AgentEvent::Text(delta)) => {
+                acc.push_str(delta);
+                true
+            }
+            (AgentEvent::Reasoning(acc), AgentEvent::Reasoning(delta)) => {
+                acc.push_str(delta);
+                true
+            }
+            (
+                AgentEvent::ToolOutput {
+                    id: acc_id,
+                    chunk: acc,
+                },
+                AgentEvent::ToolOutput {
+                    id: delta_id,
+                    chunk: delta,
+                },
+            ) if *acc_id == *delta_id => {
+                acc.push_str(delta);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Push backlog messages into the channel until it is full or the backlog is
+    /// empty. Non-blocking: a full channel leaves the remainder queued for the
+    /// next call; a closed channel discards it (the receiver is gone).
+    fn pump(&mut self) {
+        while let Some(msg) = self.backlog.pop_front() {
+            if let Err(e) = self.tx.try_send(msg) {
+                match e {
+                    mpsc::error::TrySendError::Full(msg) => {
+                        self.backlog.push_front(msg);
+                        break;
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        self.backlog.clear();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flush any remaining backlog, awaiting channel capacity. Called once a turn
+    /// ends: if the stall that backed the queue up outlived the turn, this is
+    /// where the tail events finally land. A closed receiver ends the drain at
+    /// once instead of blocking.
+    async fn drain(mut self) {
+        while let Some(msg) = self.backlog.pop_front() {
+            if self.tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
     /// Every agent this session can show: the main one, plus each retained
@@ -353,8 +478,8 @@ pub(crate) struct App {
     // ---- live inference stats (for the loader above the input) ----
     /// When the current thinking block started (for the "Thought:" footer).
     pub(crate) reasoning_start: Option<Instant>,
-    tx: mpsc::UnboundedSender<TurnMsg>,
-    pub(crate) rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
+    tx: mpsc::Sender<TurnMsg>,
+    pub(crate) rx: Option<mpsc::Receiver<TurnMsg>>,
     pub(crate) should_quit: bool,
     /// Set by a turn task that *caught* a tool panic: the process-global panic
     /// hook already tore the terminal down (left the alt screen, dropped raw
@@ -405,7 +530,7 @@ impl App {
         let live_subagents = agent.live_subagents();
         let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(TUI_EVENT_CAP);
         let editor: Box<dyn TuiEditorEngine> = if vim_mode {
             Box::new(VimEngine::new())
         } else {
@@ -578,7 +703,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Some(warning) = hrdr_app::endpoint_health_warning(agent, model, base_url).await {
-                let _ = tx.send(TurnMsg::System(warning));
+                let _ = tx.send(TurnMsg::System(warning)).await;
             }
         });
     }
@@ -600,7 +725,9 @@ impl App {
             let window = agent.lock().await.probe_context_window().await;
             if let Some(w) = window {
                 // The startup probe is the *session* agent's, whatever is on screen.
-                let _ = tx.send(TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w));
+                let _ = tx
+                    .send(TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w))
+                    .await;
             }
         });
     }
@@ -617,7 +744,7 @@ impl App {
                 .run_session_hooks(hrdr_tools::HookEvent::SessionStart)
                 .await;
             for note in notes {
-                let _ = tx.send(TurnMsg::System(note));
+                let _ = tx.send(TurnMsg::System(note)).await;
             }
         });
     }
@@ -640,7 +767,10 @@ impl App {
     pub(crate) fn start_config_watch(&self) -> hrdr_app::ConfigWatcherGuard {
         let tx = self.tx.clone();
         hrdr_app::watch_config(move || {
-            let _ = tx.send(TurnMsg::ConfigChanged);
+            // Sync watcher callback — can't await. A dropped ping (channel
+            // momentarily full) is harmless: the mtime guard in
+            // `maybe_reload_config` re-checks on the next wake anyway.
+            let _ = tx.try_send(TurnMsg::ConfigChanged);
         })
     }
 
@@ -1000,15 +1130,17 @@ impl App {
             let mut child = match child.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(TurnMsg::UserShell(
-                        AgentEvent::ToolEnd {
-                            id: task_id,
-                            name: shell_name.to_string(),
-                            result: format!("couldn't run {program}: {e}"),
-                            ok: false,
-                        },
-                        None,
-                    ));
+                    let _ = tx
+                        .send(TurnMsg::UserShell(
+                            AgentEvent::ToolEnd {
+                                id: task_id,
+                                name: shell_name.to_string(),
+                                result: format!("couldn't run {program}: {e}"),
+                                ok: false,
+                            },
+                            None,
+                        ))
+                        .await;
                     return;
                 }
             };
@@ -1048,7 +1180,7 @@ impl App {
                                             chunk,
                                         },
                                         None,
-                                    ));
+                                    )).await;
                                 }
                             }
                         }
@@ -1066,7 +1198,7 @@ impl App {
                                             chunk,
                                         },
                                         None,
-                                    ));
+                                    )).await;
                                 }
                             }
                         }
@@ -1100,15 +1232,17 @@ impl App {
 ```",
                 bounded.trim_end()
             );
-            let _ = tx.send(TurnMsg::UserShell(
-                AgentEvent::ToolEnd {
-                    id: task_id,
-                    name: shell_name.to_string(),
-                    result,
-                    ok,
-                },
-                Some(note),
-            ));
+            let _ = tx
+                .send(TurnMsg::UserShell(
+                    AgentEvent::ToolEnd {
+                        id: task_id,
+                        name: shell_name.to_string(),
+                        result,
+                        ok,
+                    },
+                    Some(note),
+                ))
+                .await;
         });
         self.user_shell = Some(UserShell {
             id,
@@ -1404,8 +1538,10 @@ impl App {
         let tx = self.tx.clone();
         let delivered = self.live_subagents.send_prompt(key, input, move |ev| {
             // The events go to the agent's log; this only wakes the UI so the next
-            // frame picks them up.
-            let _ = tx.send(TurnMsg::SubAgent(key, ev));
+            // frame picks them up. Sync callback — can't await; and since the
+            // event is already durably in the agent's log, a dropped wake (full
+            // channel) only defers a redraw, never loses data.
+            let _ = tx.try_send(TurnMsg::SubAgent(key, ev));
         });
         self.sync_panes();
         if delivered.is_none() {
@@ -1774,7 +1910,7 @@ impl App {
         let agent = self.agent.clone();
         let steering = self.steering.clone();
         let tx = self.tx.clone();
-        let tx_events = tx.clone();
+        let mut events = EventSender::new(tx.clone());
         let terminal_lost = self.terminal_lost.clone();
         let handle = tokio::spawn(async move {
             use futures_util::FutureExt;
@@ -1789,10 +1925,7 @@ impl App {
             // an abort still sends no `Done` — `catch_unwind` does not intercept it.
             let run = async {
                 let mut a = agent.lock().await;
-                a.run(input, steering, |ev| {
-                    let _ = tx_events.send(TurnMsg::Event(ev));
-                })
-                .await
+                a.run(input, steering, |ev| events.send(ev)).await
             };
             let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
             let err = match outcome {
@@ -1804,7 +1937,11 @@ impl App {
                     Some(format!("turn crashed: {}", panic_message(&*payload)))
                 }
             };
-            let _ = tx.send(TurnMsg::Done(err));
+            // Flush any events the coalescing sink still holds (a stall that
+            // outlived the turn) before signalling completion, so no tool/state
+            // event is lost and `Done` never overtakes them.
+            events.drain().await;
+            let _ = tx.send(TurnMsg::Done(err)).await;
         });
         self.turn_handle = Some(handle);
     }
@@ -1846,7 +1983,7 @@ impl App {
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             let res = hrdr_app::run_compaction(agent, instructions).await;
-            let _ = tx.send(TurnMsg::Compacted(res));
+            let _ = tx.send(TurnMsg::Compacted(res)).await;
         });
         self.turn_handle = Some(handle);
     }
@@ -2263,5 +2400,177 @@ mod tests {
             "zero-size rect must never contain any cell"
         );
         assert!(!r.contains(0, 0));
+    }
+
+    // ---- EventSender: bounded, coalescing UI event sink ----
+
+    use super::{AgentEvent, EventSender, TurnMsg};
+    use tokio::sync::mpsc;
+
+    /// Canonical, order-preserving fold of an event stream: adjacent streaming
+    /// deltas of the same kind (and, for tool output, the same call id) merge
+    /// into one concatenated token; every other event is an opaque marker. Two
+    /// streams with equal canonical forms render identically (each delta is a
+    /// `push_str`), so this is the yardstick for "coalescing lost nothing".
+    fn canon(evs: &[AgentEvent]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for ev in evs {
+            let (tag, text): (String, Option<&str>) = match ev {
+                AgentEvent::Text(t) => ("T".to_string(), Some(t)),
+                AgentEvent::Reasoning(t) => ("R".to_string(), Some(t)),
+                AgentEvent::ToolOutput { id, chunk } => (format!("O:{id}"), Some(chunk)),
+                AgentEvent::ToolStart { id, .. } => (format!("start:{id}"), None),
+                AgentEvent::ToolEnd { id, ok, .. } => (format!("end:{id}:{ok}"), None),
+                other => (format!("{other:?}"), None),
+            };
+            match text {
+                // A same-kind delta right behind us: fold into it.
+                Some(t)
+                    if out
+                        .last()
+                        .is_some_and(|p| p.starts_with(&format!("{tag}="))) =>
+                {
+                    out.last_mut().unwrap().push_str(t);
+                }
+                Some(t) => out.push(format!("{tag}={t}")),
+                None => out.push(tag),
+            }
+        }
+        out
+    }
+
+    fn text(s: &str) -> AgentEvent {
+        AgentEvent::Text(s.to_string())
+    }
+    fn reasoning(s: &str) -> AgentEvent {
+        AgentEvent::Reasoning(s.to_string())
+    }
+    fn tool_out(id: &str, s: &str) -> AgentEvent {
+        AgentEvent::ToolOutput {
+            id: id.to_string(),
+            chunk: s.to_string(),
+        }
+    }
+
+    /// A fast producer streaming into a sink whose consumer isn't draining must
+    /// never let the channel exceed its capacity — the whole point of bounding.
+    /// Control events (tool start/end) interleaved with the flood must still be
+    /// retained (in the sink's backlog), never dropped.
+    #[tokio::test]
+    async fn event_sender_never_exceeds_channel_capacity() {
+        const CAP: usize = 4;
+        let (tx, mut rx) = mpsc::channel::<TurnMsg>(CAP);
+        let mut sender = EventSender::new(tx);
+
+        // 5000 events, no consumer draining. The channel must stay <= CAP the
+        // whole time; the overflow lives in the coalescing backlog.
+        for i in 0..5000u32 {
+            if i % 500 == 0 {
+                sender.send(AgentEvent::ToolStart {
+                    id: i.to_string(),
+                    name: "x".to_string(),
+                    args: String::new(),
+                });
+            } else {
+                sender.send(text("tok "));
+            }
+            assert!(
+                rx.len() <= CAP,
+                "channel held {} items, over cap {CAP}",
+                rx.len()
+            );
+        }
+
+        // Nothing was lost: drain everything (channel + flushed backlog) and
+        // confirm every ToolStart survived.
+        tokio::spawn(async move { sender.drain().await });
+        let mut starts = 0;
+        while let Some(TurnMsg::Event(ev)) = rx.recv().await {
+            if matches!(ev, AgentEvent::ToolStart { .. }) {
+                starts += 1;
+            }
+        }
+        assert_eq!(starts, 10, "a ToolStart was dropped under backpressure");
+    }
+
+    /// Coalescing must be invisible: the drained stream, folded canonically,
+    /// must equal the input folded canonically — same content, same order —
+    /// while actually reducing the message count (proving it engaged).
+    #[tokio::test]
+    async fn event_sender_coalescing_preserves_content_and_order() {
+        let input = vec![
+            text("Hello, "),
+            text("world"),
+            reasoning("think"),
+            reasoning("ing"),
+            AgentEvent::ToolStart {
+                id: "1".to_string(),
+                name: "sh".to_string(),
+                args: String::new(),
+            },
+            tool_out("1", "aa"),
+            tool_out("1", "bb"),
+            AgentEvent::ToolEnd {
+                id: "1".to_string(),
+                name: "sh".to_string(),
+                result: "done".to_string(),
+                ok: true,
+            },
+            // A different tool id must NOT coalesce with the previous output.
+            tool_out("2", "zz"),
+            text("bye"),
+        ];
+
+        // A tiny channel forces the backlog to build, so coalescing engages.
+        let (tx, mut rx) = mpsc::channel::<TurnMsg>(2);
+        let mut sender = EventSender::new(tx);
+        for ev in &input {
+            sender.send(ev.clone());
+        }
+        tokio::spawn(async move { sender.drain().await });
+
+        let mut got = Vec::new();
+        while let Some(TurnMsg::Event(ev)) = rx.recv().await {
+            got.push(ev);
+        }
+
+        assert_eq!(
+            canon(&got),
+            canon(&input),
+            "coalesced stream renders differently than the original"
+        );
+        assert!(
+            got.len() < input.len(),
+            "coalescing did not engage (got {} vs input {})",
+            got.len(),
+            input.len()
+        );
+    }
+
+    /// Shutdown while a producer is blocked on capacity must not deadlock: once
+    /// the receiver is dropped, `drain` (which awaits `send`) must return
+    /// promptly with the backlog abandoned, not hang forever.
+    #[tokio::test]
+    async fn event_sender_drain_does_not_deadlock_after_receiver_drop() {
+        let (tx, rx) = mpsc::channel::<TurnMsg>(1);
+        let mut sender = EventSender::new(tx);
+
+        // Fill the channel and pile more into the backlog.
+        sender.send(text("a")); // -> channel
+        sender.send(text("b")); // -> backlog (channel full)
+        sender.send(AgentEvent::ToolEnd {
+            id: "1".to_string(),
+            name: "sh".to_string(),
+            result: String::new(),
+            ok: true,
+        }); // -> backlog
+
+        // "Shutdown": the render loop is gone.
+        drop(rx);
+
+        // drain must observe the closed channel and return, not block.
+        tokio::time::timeout(std::time::Duration::from_secs(2), sender.drain())
+            .await
+            .expect("drain deadlocked after the receiver was dropped");
     }
 }

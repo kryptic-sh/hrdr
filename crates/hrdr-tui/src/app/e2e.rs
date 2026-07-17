@@ -266,7 +266,7 @@ fn esc(s: &str) -> String {
 /// Drives an [`App`] against a [`MockServer`] without the crossterm event loop.
 struct Harness {
     app: App,
-    rx: mpsc::UnboundedReceiver<TurnMsg>,
+    rx: mpsc::Receiver<TurnMsg>,
     _mock: MockServer,
     _tmp: tempfile::TempDir,
 }

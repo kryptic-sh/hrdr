@@ -45,6 +45,14 @@ pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// request timeout's `send()` phase is satisfied) but then trickles bytes
 /// forever without ever completing the body.
 pub(crate) const MAX_BODY_READ_TIME: Duration = Duration::from_secs(60);
+/// Depth of the stdio writer channel (serialized requests awaiting the child's
+/// stdin). Bounded so a stalled child — one that stops draining its stdin pipe
+/// — applies backpressure to the callers issuing requests instead of letting
+/// serialized JSON accumulate without limit. Each request awaits capacity
+/// (`send().await`); if the child exits, the writer task drops the receiver and
+/// every blocked sender errors out rather than hanging. 64 is ample slack for
+/// legitimate request pipelining while keeping worst-case buffered JSON small.
+pub(crate) const MCP_STDIN_CAP: usize = 64;
 
 pub use types::McpClient;
 
@@ -650,7 +658,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         use tokio::sync::mpsc;
 
         // Drop the receiver immediately; every subsequent send will fail.
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdin_tx, stdin_rx) = mpsc::channel::<String>(MCP_STDIN_CAP);
         drop(stdin_rx);
 
         // A trivial child satisfies the `_child: Child` field.  Its stdio is
@@ -684,6 +692,71 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             "stdio_request send-error path must remove the pending id before \
              returning (found: {:?})",
             pending.lock().await.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The stdio writer channel is bounded, so a request issued while the child
+    /// isn't draining its stdin blocks awaiting capacity. That block must be
+    /// released — not hung — the instant the child exits (its writer task drops
+    /// the receiver). Simulate a full channel + a receiver drop and assert the
+    /// blocked `stdio_request` errors out promptly and cleans up its pending id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_request_full_channel_releases_when_child_exits() {
+        use tokio::sync::mpsc;
+
+        // Pre-fill the writer channel to capacity so the request's own send
+        // has nowhere to go and must await capacity.
+        let (stdin_tx, stdin_rx) = mpsc::channel::<String>(MCP_STDIN_CAP);
+        for _ in 0..MCP_STDIN_CAP {
+            stdin_tx.send("queued".to_string()).await.unwrap();
+        }
+
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", ""])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh must be available on unix");
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let t = StdioTransport {
+            stdin_tx,
+            pending: pending.clone(),
+            _child: child,
+        };
+
+        // Drop the receiver shortly after the request starts blocking on
+        // `send().await` — this is what the writer task does when the child
+        // exits and its `write_all` fails.
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(stdin_rx);
+        });
+
+        let id = 91u64;
+        let req = json!({"jsonrpc":"2.0","id": id,"method":"tools/call","params":{}});
+        // A long request timeout so it's the receiver drop — not the timeout —
+        // that ends the wait; the outer timeout bounds the test itself.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            stdio_request(&t, id, req, Duration::from_secs(60)),
+        )
+        .await;
+        dropper.await.unwrap();
+
+        let result = outcome.expect(
+            "stdio_request hung after the receiver was dropped — blocked sender not released",
+        );
+        assert!(
+            result.is_err(),
+            "a send that fails when the child exits must surface as Err"
+        );
+        assert!(
+            pending.lock().await.is_empty(),
+            "the released send-error path must still clean up the pending id"
         );
     }
 }
