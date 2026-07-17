@@ -1754,6 +1754,7 @@ impl App {
     /// NOT touch the model/provider/endpoint (those are session-scoped).
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
         self.theme = Theme::load(ui.theme.as_deref());
+        crate::ui::clear_transcript_cache();
         // Effort and the compaction thresholds are the *agent's* — it publishes them
         // back into the chrome. Updating a frontend copy instead was how a reload
         // could move the context gauge while the agent kept its old behaviour.
