@@ -209,7 +209,8 @@ invoking a shell to parse/launch (injection and quoting complexity).
   headless model turn.
 - `apps/hrdr/src/main.rs` headless behavior (prompt prep, MCP setup, lifecycle
   hooks, NDJSON, usage, exit codes) is tested below the process boundary.
-- PTY tests (`apps/hrdr/tests/tui_pty.rs`) cover launch/quit only.
+- PTY tests (`apps/hrdr/tests/tui_pty.rs`) cover launch/quit and
+  unreachable-endpoint resilience only.
 
 ### Impact
 
