@@ -76,6 +76,7 @@ pub use config::{
     BUILTIN_PROVIDERS,
     CHATGPT_CODEX_BASE_URL,
     CHATGPT_PROVIDER_ALIASES,
+    ConfigDiagnostics,
     ConfigValue,
     DEFAULT_AUTO_COMPACT,
     DEFAULT_BASE_URL,
@@ -5462,11 +5463,12 @@ mod tests {
 
     use super::SubagentDirCell;
     use super::{
-        Agent, AgentConfig, AgentEvent, DEFAULT_BASE_URL, DEFAULT_MAX_READONLY_SUBAGENTS,
-        DEFAULT_MAX_WRITE_SUBAGENTS, DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS,
-        ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, LspFileConfig, LspServerEntry,
-        PRUNE_PLACEHOLDER, PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX,
-        ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider, compaction_tail_start,
+        Agent, AgentConfig, AgentEvent, ConfigDiagnostics, DEFAULT_BASE_URL,
+        DEFAULT_MAX_READONLY_SUBAGENTS, DEFAULT_MAX_WRITE_SUBAGENTS,
+        DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS,
+        FileConfig, LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER,
+        PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX, ProviderConfig,
+        SubagentSlots, ToolOutputConfig, builtin_provider, compaction_tail_start,
         elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
@@ -7880,13 +7882,13 @@ mod tests {
                 .map(|(_, f)| *f)
                 .unwrap_or_else(|| panic!("{name} is not wired into ENV_SETTERS"))
         };
-        setter("HRDR_MAX_READONLY_SUBAGENTS")(&mut cfg, "7".to_string());
-        setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "1".to_string());
+        setter("HRDR_MAX_READONLY_SUBAGENTS")(&mut cfg, "7").unwrap();
+        setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "1").unwrap();
         assert_eq!(cfg.max_readonly_subagents, 7);
         assert_eq!(cfg.max_write_subagents, 1);
 
-        // Junk is ignored rather than zeroing the cap.
-        setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "lots".to_string());
+        // Junk is reported rather than zeroing the cap.
+        assert!(setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "lots").is_err());
         assert_eq!(
             cfg.max_write_subagents, 1,
             "unparseable value left it alone"
@@ -9791,7 +9793,7 @@ mod tests {
 
     // ---- ENV_SETTERS ----
 
-    fn find_setter(key: &str) -> fn(&mut AgentConfig, String) {
+    fn find_setter(key: &str) -> fn(&mut AgentConfig, &str) -> Result<(), String> {
         ENV_SETTERS
             .iter()
             .find(|(k, _)| *k == key)
@@ -9871,11 +9873,15 @@ mod tests {
 
     #[test]
     fn env_setter_numeric_ignores_bad_value() {
-        // HRDR_AUTO_COMPACT with an unrecognized string must leave the value.
+        // HRDR_AUTO_COMPACT with an unrecognized string must leave the value and
+        // report a reason (the caller turns that into a warning).
         let setter = find_setter("HRDR_AUTO_COMPACT");
         let mut cfg = AgentConfig::default();
         let original = cfg.auto_compact;
-        setter(&mut cfg, "notanumber".to_string());
+        assert!(
+            setter(&mut cfg, "notanumber").is_err(),
+            "bad value should be reported"
+        );
         assert_eq!(cfg.auto_compact, original, "bad value should be ignored");
     }
 
@@ -9884,16 +9890,129 @@ mod tests {
         let setter = find_setter("HRDR_AUTO_COMPACT");
         let mut cfg = AgentConfig::default();
         // Legacy fractional spelling: any number > 0 enables.
-        setter(&mut cfg, "0.5".to_string());
+        setter(&mut cfg, "0.5").unwrap();
         assert!(cfg.auto_compact);
         // Legacy `0` disables.
-        setter(&mut cfg, "0".to_string());
+        setter(&mut cfg, "0").unwrap();
         assert!(!cfg.auto_compact);
         // Plain bool spellings.
-        setter(&mut cfg, "true".to_string());
+        setter(&mut cfg, "true").unwrap();
         assert!(cfg.auto_compact);
-        setter(&mut cfg, "off".to_string());
+        setter(&mut cfg, "off").unwrap();
         assert!(!cfg.auto_compact);
+    }
+
+    // ---- config validation ----
+
+    /// Zero sub-agent caps, zero tool-output limits, and zero context/output
+    /// token counts are nonsense in a config file: each is a named hard error.
+    #[test]
+    fn file_config_rejects_nonsense_zero_boundaries() {
+        let fc = FileConfig {
+            max_readonly_subagents: Some(0),
+            max_write_subagents: Some(0),
+            context_window: Some(0),
+            max_tokens: Some(0),
+            tool_output: Some(ToolOutputConfig {
+                max_lines: Some(0),
+                max_bytes: Some(0),
+            }),
+            ..Default::default()
+        };
+        let errors = fc.validate();
+        for field in [
+            "max_readonly_subagents",
+            "max_write_subagents",
+            "context_window",
+            "max_tokens",
+            "tool_output.max_lines",
+            "tool_output.max_bytes",
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(field) && e.contains("= 0")),
+                "expected a diagnostic naming {field}; got {errors:?}"
+            );
+        }
+        // Every problem is reported together — not first-error-wins.
+        assert_eq!(errors.len(), 6, "{errors:?}");
+    }
+
+    /// Valid file values (including the documented `request_timeout = 0` and a
+    /// zero compaction reserve) produce no boundary error.
+    #[test]
+    fn file_config_accepts_valid_and_documented_sentinels() {
+        let fc = FileConfig {
+            max_readonly_subagents: Some(3),
+            request_timeout: Some(0),     // documented: disables the timeout
+            compaction_reserved: Some(0), // valid: no reserve buffer
+            ..Default::default()
+        };
+        assert!(fc.validate().is_empty(), "{:?}", fc.validate());
+    }
+
+    /// A context window that cannot fit its compaction reserve is a semantic
+    /// error naming both values.
+    #[test]
+    fn context_window_smaller_than_compaction_reserve_is_reported() {
+        let cfg = AgentConfig {
+            context_window: Some(10_000),
+            compaction_reserved: 16_384, // exceeds the window
+            ..AgentConfig::default()
+        };
+        let errors = cfg.validate_semantics();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("compaction_reserved") && e.contains("10000")),
+            "{errors:?}"
+        );
+        // An unset window defers the check (it is derived/probed later).
+        let none = AgentConfig {
+            context_window: None,
+            compaction_reserved: u32::MAX,
+            ..AgentConfig::default()
+        };
+        assert!(none.validate_semantics().is_empty());
+    }
+
+    /// Invalid env values are reported (so the caller can warn) and the current
+    /// value is kept — env tweaks never brick a session.
+    #[test]
+    fn invalid_env_values_are_reported_and_keep_current_value() {
+        let mut cfg = AgentConfig::default();
+        // Unparseable number → reported, field untouched.
+        assert!(find_setter("HRDR_MAX_TOKENS")(&mut cfg, "abc").is_err());
+        assert_eq!(cfg.max_tokens, None);
+        // Zero where zero is nonsense → reported, default kept.
+        assert!(find_setter("HRDR_MAX_READONLY_SUBAGENTS")(&mut cfg, "0").is_err());
+        assert_eq!(cfg.max_readonly_subagents, DEFAULT_MAX_READONLY_SUBAGENTS);
+        // Unrecognized boolean → reported.
+        assert!(find_setter("HRDR_LSP")(&mut cfg, "maybe").is_err());
+        // The documented disable sentinel for the timeout is accepted.
+        assert!(find_setter("HRDR_REQUEST_TIMEOUT")(&mut cfg, "0").is_ok());
+        assert_eq!(cfg.request_timeout, Some(0));
+    }
+
+    /// The diagnostics container separates errors from warnings and renders each
+    /// group as one multi-line block (or nothing when empty).
+    #[test]
+    fn config_diagnostics_partitions_and_renders() {
+        let mut d = ConfigDiagnostics::default();
+        assert!(d.is_empty());
+        assert!(d.error_message().is_none());
+        assert!(d.warning_message().is_none());
+        d.errors.push("context_window = 0 is invalid".to_string());
+        d.errors.push("max_tokens = 0 is invalid".to_string());
+        d.warnings
+            .push("$HRDR_LSP = \"maybe\": expected a boolean".to_string());
+        let err = d.error_message().unwrap();
+        assert!(err.contains("context_window = 0"));
+        assert!(err.contains("max_tokens = 0"), "{err}");
+        let warn = d.warning_message().unwrap();
+        assert!(warn.contains("HRDR_LSP"));
+        assert!(!d.is_empty());
     }
 
     // ---- apply_file ----

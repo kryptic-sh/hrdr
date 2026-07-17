@@ -351,8 +351,23 @@ async fn main() -> Result<()> {
     // Precedence: CLI flag > env var > config file > built-in default. Display
     // knobs live in UiConfig (hrdr-app); model/endpoint/loop knobs in
     // AgentConfig (hrdr-agent) — both read the same config.toml + HRDR_* vars.
-    let mut config = AgentConfig::load();
-    let mut ui = hrdr_app::UiConfig::load();
+    let (mut config, config_diags) = AgentConfig::load_diagnosed();
+    let (mut ui, ui_warnings) = hrdr_app::UiConfig::load_diagnosed();
+
+    // Config-file values out of range or incompatible are hard errors, listed
+    // together (accumulated, not first-error-wins) like the legacy-form refusal
+    // above: refuse to start rather than silently substitute a default for a
+    // value the user wrote. Env-var and UI-enum problems are warnings — carried
+    // to `config_warnings` below and surfaced without stopping.
+    if let Some(msg) = config_diags.error_message() {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
+    let config_warnings: Vec<String> = config_diags
+        .warnings
+        .into_iter()
+        .chain(ui_warnings)
+        .collect();
 
     // ── The identity edge ───────────────────────────────────────────────────
     // config.toml, the environment and the CLI each name the model with ONE key —
@@ -552,6 +567,15 @@ async fn main() -> Result<()> {
                     .await
                     .ok()
                     .flatten();
+        }
+    }
+
+    // Surface non-fatal config warnings. On the headless / models paths stderr
+    // is the only channel, so print here; the TUI instead shows them as a
+    // startup notice (`hrdr_app::startup_config_warning`), so don't double-report.
+    if cli.command.is_some() {
+        for w in &config_warnings {
+            eprintln!("hrdr: {w}");
         }
     }
 

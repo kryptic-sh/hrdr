@@ -4,6 +4,43 @@
 //! (e.g. [`ProviderConfig`], [`ResolvedProvider`]), plus the full config-loading
 //! pipeline: built-in defaults, config-file parsing, environment-variable
 //! application, and the validation checks that refuse stale config forms.
+//!
+//! # Validation policy — error vs. warn
+//!
+//! Config problems are *accumulated* into a [`ConfigDiagnostics`] and surfaced
+//! together, so a user fixes everything in one pass rather than one boot at a
+//! time. The loader never panics on bad input and never silently substitutes a
+//! default for a value the user wrote — every rejected value produces a
+//! diagnostic that names the field, the value, and the accepted range.
+//!
+//! Whether a bad value is a hard **error** (refuse to start) or a **warning**
+//! (report, then fall back to the default) turns on *where the user wrote it*:
+//!
+//! - **Config-file values are hard errors.** A value in `config.toml` is a
+//!   deliberate statement of intent; a nonsensical one (a malformed table, a
+//!   zero sub-agent cap, a compaction reserve larger than the context window) is
+//!   a mistake worth stopping for, exactly like the stale two-key forms
+//!   [`legacy_config_error`] already refuses. These are collected by
+//!   [`FileConfig::validate`] (per-field bounds) and
+//!   [`AgentConfig::validate_semantics`] (cross-field checks on the merged
+//!   result). `main` prints them and exits non-zero.
+//! - **Environment-variable values are warnings.** A `HRDR_*` override is an
+//!   ad-hoc tweak, often exported for one run or inherited from a shell; a typo
+//!   there should not brick a session. An unparseable or out-of-range env value
+//!   is reported and the current value is kept. These are collected by
+//!   [`AgentConfig::apply_env`].
+//!
+//! Two deliberate exceptions to "zero is nonsense": `request_timeout = 0` is the
+//! documented sentinel for *disable the timeout* (see
+//! [`AgentConfig::request_timeout`]), and `compaction_reserved = 0` /
+//! `preserve_recent_tokens = 0` mean *no buffer / no verbatim tail* — all valid
+//! choices, so they are accepted. The semantic check only fires when a reserve
+//! exceeds the window it is carved out of.
+//!
+//! (Typed non-zero fields like `NonZeroUsize` were considered, but the caps and
+//! limits are plain `usize`/`u32` threaded through many call sites; converting
+//! them would churn far past the silent-failure paths this hardening targets, so
+//! validation guards the values instead.)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -82,6 +119,55 @@ pub const DEFAULT_TAIL_TURNS: usize = 2;
 /// Default token budget for the verbatim tail kept through compaction
 /// (`preserve_recent_tokens`). Matches opencode's `MAX_PRESERVE_RECENT_TOKENS`.
 pub const DEFAULT_PRESERVE_RECENT_TOKENS: u32 = 8_000;
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+
+/// Every problem found while loading config, accumulated so the user can fix
+/// them all at once instead of one boot at a time.
+///
+/// See the [module docs](self) for the error-vs-warning policy: `errors` come
+/// from config-file values (refuse to start), `warnings` from `HRDR_*` env
+/// overrides (report, then keep the current value).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigDiagnostics {
+    /// Config-file problems. Each is a full line naming the field, the offending
+    /// value, and the accepted range. A non-empty list should refuse startup.
+    pub errors: Vec<String>,
+    /// Environment-variable problems. Each names the var and value; the current
+    /// value was kept. Reported but non-fatal.
+    pub warnings: Vec<String>,
+}
+
+impl ConfigDiagnostics {
+    /// No errors and no warnings.
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
+
+    /// The accumulated errors as one multi-line message, or `None` when there
+    /// are none. Suitable for a single `bail!`/`eprintln!` that lists everything.
+    pub fn error_message(&self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "hrdr: invalid configuration:\n  {}",
+            self.errors.join("\n  ")
+        ))
+    }
+
+    /// The accumulated warnings as one multi-line message, or `None` when there
+    /// are none.
+    pub fn warning_message(&self) -> Option<String> {
+        if self.warnings.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "hrdr: configuration warnings:\n  {}",
+            self.warnings.join("\n  ")
+        ))
+    }
+}
 
 // ── Config structs ──────────────────────────────────────────────────────────
 
@@ -606,6 +692,61 @@ pub(crate) struct FileConfig {
     pub(crate) lsp: Option<LspFileConfig>,
 }
 
+impl FileConfig {
+    /// Per-field bounds check on the raw config-file values, accumulating a hard
+    /// error for each one that is out of range (see the [module docs](self) for
+    /// why file values are errors, not warnings). Values the file does not set
+    /// (`None`) and values in range produce nothing.
+    ///
+    /// Only the *nonsense* boundaries are rejected — a zero that silently
+    /// disables a whole subsystem. Documented sentinels (`request_timeout = 0`
+    /// disables the timeout; a zero compaction reserve / preserve budget) are
+    /// left to [`AgentConfig::validate_semantics`] or accepted outright.
+    pub(crate) fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut require_min1 = |value: Option<u64>, field: &str, what: &str| {
+            if value == Some(0) {
+                errors.push(format!(
+                    "{field} = 0 is invalid ({what}); it must be at least 1"
+                ));
+            }
+        };
+        require_min1(
+            self.max_readonly_subagents.map(|v| v as u64),
+            "max_readonly_subagents",
+            "it would refuse every read-only sub-agent",
+        );
+        require_min1(
+            self.max_write_subagents.map(|v| v as u64),
+            "max_write_subagents",
+            "it would refuse every write-capable sub-agent",
+        );
+        if let Some(to) = &self.tool_output {
+            require_min1(
+                to.max_lines.map(|v| v as u64),
+                "tool_output.max_lines",
+                "it would truncate all tool output to nothing",
+            );
+            require_min1(
+                to.max_bytes.map(|v| v as u64),
+                "tool_output.max_bytes",
+                "it would truncate all tool output to nothing",
+            );
+        }
+        require_min1(
+            self.context_window.map(|v| v as u64),
+            "context_window",
+            "the model would have no room to run",
+        );
+        require_min1(
+            self.max_tokens.map(|v| v as u64),
+            "max_tokens",
+            "the model could emit no output",
+        );
+        errors
+    }
+}
+
 /// One MCP server from a `[[mcp]]` config entry, registered with its tools
 /// namespaced `<name>_<tool>`. Three transports: **stdio** (set `command`)
 /// spawns `command args…` with `env`; **HTTP** (set `url`) POSTs to a
@@ -724,6 +865,37 @@ impl AgentConfig {
     /// real model id was ever named (see [`DEFAULT_MODEL`]).
     pub fn has_default_model(&self) -> bool {
         self.model.model() == DEFAULT_MODEL
+    }
+
+    /// Cross-field checks on the fully-merged config: a value that is fine alone
+    /// but incompatible with another. Returns a hard error per incompatible pair
+    /// (these reflect the user's config-file/CLI intent — see the
+    /// [module docs](self)). Per-field bounds live in [`FileConfig::validate`].
+    ///
+    /// A reserve carved out of the context window must be *smaller* than it: the
+    /// auto-compaction trigger is `context_window − compaction_reserved`, and a
+    /// verbatim tail of `preserve_recent_tokens` has to fit too. When the window
+    /// is unset (`None`) it is derived or probed later, so nothing is checked.
+    pub(crate) fn validate_semantics(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(window) = self.context_window {
+            if self.compaction_reserved >= window {
+                errors.push(format!(
+                    "compaction_reserved ({}) must be smaller than context_window ({window}); \
+                     the auto-compaction trigger (context_window − compaction_reserved) would \
+                     leave no room to run",
+                    self.compaction_reserved,
+                ));
+            }
+            if self.preserve_recent_tokens >= window {
+                errors.push(format!(
+                    "preserve_recent_tokens ({}) must be smaller than context_window ({window}); \
+                     the verbatim tail kept through compaction cannot exceed the window",
+                    self.preserve_recent_tokens,
+                ));
+            }
+        }
+        errors
     }
 }
 
@@ -1124,28 +1296,67 @@ pub fn read_config_file<T: serde::de::DeserializeOwned>() -> Option<T> {
 
 impl AgentConfig {
     /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in
-    /// defaults. Lenient: a malformed config file is ignored (treated as absent).
-    /// Does NOT auto-write a config file when one is missing.
+    /// defaults. Lenient: any invalid value (a malformed file, an out-of-range
+    /// number) is dropped and its default kept — see [`load_diagnosed`] to also
+    /// receive the diagnostics. Does NOT auto-write a config file when missing.
+    ///
+    /// [`load_diagnosed`]: Self::load_diagnosed
     pub fn load() -> Self {
-        // A malformed file is treated as absent: fall back to defaults, but
-        // still layer env vars on top (same as a missing file).
-        Self::load_checked().unwrap_or_else(|_| {
-            let mut cfg = Self::default();
-            cfg.apply_env();
-            cfg
-        })
+        Self::load_diagnosed().0
     }
 
-    /// Like [`load`](Self::load) but returns an error if the config file exists
-    /// and fails to parse (for surfacing a warning + falling back to defaults).
+    /// Like [`load`](Self::load) but returns an error listing every hard problem
+    /// (a config-file value out of range, a malformed file, an incompatible
+    /// pair) — accumulated into one message — so a caller that should refuse to
+    /// run can. `Ok` when the file is absent or wholly valid. Env-var warnings
+    /// are *not* errors; reach for [`load_diagnosed`](Self::load_diagnosed) to
+    /// see those.
     pub fn load_checked() -> Result<Self> {
+        let (cfg, diags) = Self::load_diagnosed();
+        match diags.error_message() {
+            Some(msg) => bail!(msg),
+            None => Ok(cfg),
+        }
+    }
+
+    /// The one loader [`load`](Self::load) and [`load_checked`](Self::load_checked)
+    /// delegate to: merge defaults ← file ← env and return the config alongside
+    /// every problem found. Infallible — the config is always the best-effort
+    /// merge (a rejected value keeps its default) — leaving the caller to decide
+    /// what a hard [error](ConfigDiagnostics::errors) (refuse to start) versus a
+    /// [warning](ConfigDiagnostics::warnings) (report and continue) should do.
+    pub fn load_diagnosed() -> (Self, ConfigDiagnostics) {
         let mut cfg = Self::default();
-        let file_spec = read_config_file::<FileConfig>().and_then(|fc| {
-            let spec = fc.model.clone();
-            cfg.apply_file(fc);
-            spec
-        });
-        cfg.apply_env();
+        let mut diags = ConfigDiagnostics::default();
+        // Read + parse the file directly (not via `read_config_file`, which folds a
+        // parse error into "no file"): a malformed config is a diagnostic, not
+        // silence. A missing/unreadable file is genuinely absent — no error.
+        let file_spec = match config_file_path()
+            .and_then(|p| std::fs::read_to_string(&p).ok().map(|text| (p, text)))
+        {
+            Some((path, text)) => match toml::from_str::<FileConfig>(&text) {
+                Ok(fc) => {
+                    // File values are hard errors (see the module docs): reject
+                    // out-of-range ones by field, but still apply the rest so the
+                    // report is complete rather than first-error-wins.
+                    diags.errors.extend(fc.validate());
+                    let spec = fc.model.clone();
+                    cfg.apply_file(fc);
+                    spec
+                }
+                Err(e) => {
+                    diags.errors.push(format!(
+                        "{}: could not parse config file: {e}",
+                        path.display()
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        // Env overrides are warnings: an invalid one is reported and the current
+        // value kept.
+        diags.warnings.extend(cfg.apply_env());
         // ONE key, layered by precedence: `$HRDR_MODEL` over config.toml's `model`.
         // A `provider://model` names the whole identity; a bare id is that model on
         // the provider in effect — which, here, is whatever the layer below settled
@@ -1162,7 +1373,10 @@ impl AgentConfig {
                 cfg.model = reference;
             }
         }
-        Ok(cfg)
+        // Cross-field checks run on the merged result (both halves may come from
+        // the file), so they join the hard errors.
+        diags.errors.extend(cfg.validate_semantics());
+        (cfg, diags)
     }
 
     /// Layer file values over the current config. The identity's one key
@@ -1283,14 +1497,20 @@ impl AgentConfig {
         }
     }
 
-    /// Layer environment variables over the current config. Every knob is one
-    /// row in [`ENV_SETTERS`]; adding a new env var means adding a row there, not
+    /// Layer environment variables over the current config, returning a warning
+    /// for each `HRDR_*` value that could not be applied (unparseable or out of
+    /// range) — the current value is kept in that case (see the module docs:
+    /// env tweaks are warnings, not hard errors). Every knob is one row in
+    /// [`ENV_SETTERS`]; adding a new env var means adding a row there, not
     /// another `if let` here. `HRDR_API_KEY` is special-cased (it has a fallback
     /// var) below.
-    pub(crate) fn apply_env(&mut self) {
+    pub(crate) fn apply_env(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
         for (name, set) in ENV_SETTERS {
-            if let Ok(v) = std::env::var(name) {
-                set(self, v);
+            if let Ok(v) = std::env::var(name)
+                && let Err(reason) = set(self, &v)
+            {
+                warnings.push(env_warning(name, &v, &reason));
             }
         }
         // HRDR_API_KEY always wins. OPENAI_API_KEY — commonly exported for
@@ -1304,6 +1524,7 @@ impl AgentConfig {
         {
             self.api_key = Some(k);
         }
+        warnings
     }
 }
 
@@ -1348,12 +1569,37 @@ where
     }))
 }
 
-/// Applies an env var's string value to the config.
-pub(crate) type EnvSetter = fn(&mut AgentConfig, String);
+/// The standard warning line for an env var that could not be applied: names
+/// the var, echoes the value, gives the reason, and states the current value was
+/// kept. One owner so every env diagnostic reads the same.
+fn env_warning(name: &str, value: &str, reason: &str) -> String {
+    format!("${name} = \"{value}\": {reason}; keeping the current value")
+}
+
+/// Parse an env value into `T`, mapping a parse failure to a warning reason that
+/// names what was expected.
+fn env_parse<T: std::str::FromStr>(v: &str, expected: &str) -> Result<T, String> {
+    v.trim()
+        .parse::<T>()
+        .map_err(|_| format!("expected {expected}"))
+}
+
+/// Parse a boolean env value, mapping an unrecognized spelling to a warning
+/// reason listing the accepted forms.
+fn env_bool(v: &str) -> Result<bool, String> {
+    parse_env_bool(v)
+        .ok_or_else(|| "expected a boolean (true/false, on/off, yes/no, 1/0)".to_string())
+}
+
+/// Applies an env var's string value to the config, returning `Err(reason)` when
+/// the value was invalid so [`AgentConfig::apply_env`] can warn and keep the
+/// current value.
+pub(crate) type EnvSetter = fn(&mut AgentConfig, &str) -> Result<(), String>;
 
 /// Env var → setter table used by [`AgentConfig::apply_env`]. Adding a knob is a
-/// single row here (non-capturing closures coerce to `fn` pointers). Values that
-/// need parsing (numbers, bools) silently keep the current value on a bad parse.
+/// single row here (non-capturing closures coerce to `fn` pointers). A setter
+/// returns `Err(reason)` for an unparseable or out-of-range value; the caller
+/// keeps the current value and reports the reason as a warning.
 ///
 /// `$HRDR_MODEL` is deliberately NOT here: it names the one identity, as a
 /// [`ModelSpec`] layered against config.toml's `model` (see
@@ -1364,81 +1610,92 @@ pub(crate) type EnvSetter = fn(&mut AgentConfig, String);
 /// move it would be an endpoint that belongs to nobody.
 pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_AUTO_COMPACT", |c, v| {
-        if let Some(b) = parse_toggle_or_num(&v) {
-            c.auto_compact = b;
-        }
+        c.auto_compact = parse_toggle_or_num(v)
+            .ok_or_else(|| "expected a boolean (or a number, > 0 = on)".to_string())?;
+        Ok(())
     }),
     ("HRDR_MAX_READONLY_SUBAGENTS", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.max_readonly_subagents = n;
+        let n: usize = env_parse(v, "a whole number ≥ 1")?;
+        if n == 0 {
+            return Err(
+                "must be at least 1 (0 would refuse every read-only sub-agent)".to_string(),
+            );
         }
+        c.max_readonly_subagents = n;
+        Ok(())
     }),
     ("HRDR_MAX_WRITE_SUBAGENTS", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.max_write_subagents = n;
+        let n: usize = env_parse(v, "a whole number ≥ 1")?;
+        if n == 0 {
+            return Err(
+                "must be at least 1 (0 would refuse every write-capable sub-agent)".to_string(),
+            );
         }
+        c.max_write_subagents = n;
+        Ok(())
     }),
     ("HRDR_COMPACTION_RESERVED", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.compaction_reserved = n;
-        }
+        c.compaction_reserved = env_parse(v, "a whole number of tokens")?;
+        Ok(())
     }),
     ("HRDR_AUTO_PRUNE", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.auto_prune = b;
-        }
+        c.auto_prune = env_bool(v)?;
+        Ok(())
     }),
     ("HRDR_LSP", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.lsp = b;
-        }
+        c.lsp = env_bool(v)?;
+        Ok(())
     }),
-    ("HRDR_PROMPT_CACHE", |c, v| c.prompt_cache = Some(v)),
+    ("HRDR_PROMPT_CACHE", |c, v| {
+        c.prompt_cache = Some(v.to_string());
+        Ok(())
+    }),
     ("HRDR_MAX_TOKENS", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.max_tokens = Some(n);
+        let n: u32 = env_parse(v, "a whole number ≥ 1")?;
+        if n == 0 {
+            return Err("must be at least 1 (0 would allow no output)".to_string());
         }
+        c.max_tokens = Some(n);
+        Ok(())
     }),
     ("HRDR_TOP_P", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.top_p = Some(n);
-        }
+        c.top_p = Some(env_parse(v, "a number")?);
+        Ok(())
     }),
     ("HRDR_SEED", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.seed = Some(n);
-        }
+        c.seed = Some(env_parse(v, "a whole number")?);
+        Ok(())
     }),
     ("HRDR_STREAM_USAGE", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.stream_usage = b;
-        }
+        c.stream_usage = env_bool(v)?;
+        Ok(())
     }),
     ("HRDR_REQUEST_TIMEOUT", |c, v| {
-        if let Ok(n) = v.parse() {
-            c.request_timeout = Some(n);
-        }
+        // 0 is the documented "disable the timeout" sentinel — accepted.
+        c.request_timeout = Some(env_parse(v, "a whole number of seconds (0 disables)")?);
+        Ok(())
     }),
-    ("HRDR_PROMPT_CACHE_TTL", |c, v| c.prompt_cache_ttl = Some(v)),
+    ("HRDR_PROMPT_CACHE_TTL", |c, v| {
+        c.prompt_cache_ttl = Some(v.to_string());
+        Ok(())
+    }),
     ("HRDR_SUBAGENT_MODEL", |c, v| {
-        if let Ok(spec) = v.parse() {
-            c.subagent_model = Some(spec);
-        }
+        c.subagent_model = Some(env_parse(v, "a provider://model or bare model id")?);
+        Ok(())
     }),
     ("HRDR_SUBAGENTS", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.subagents = b;
-        }
+        c.subagents = env_bool(v)?;
+        Ok(())
     }),
     ("HRDR_MEMORY", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.memory = b;
-        }
+        c.memory = env_bool(v)?;
+        Ok(())
     }),
     ("HRDR_MEMORY_DIR", |c, v| {
         if !v.trim().is_empty() {
             c.memory_dir = Some(PathBuf::from(v));
         }
+        Ok(())
     }),
 ];
 

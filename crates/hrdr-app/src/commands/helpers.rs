@@ -51,12 +51,23 @@ pub const PROJECT_DOCS_LOADED_MSG: &str = "loaded project instructions from AGEN
 pub const PROJECT_DOCS_RELOADED_MSG: &str =
     "AGENTS.md changed on disk — reloaded into the system prompt";
 
-/// Startup warning when the config file exists but is invalid (the running
-/// config already fell back to defaults + env).
+/// Startup notice for non-fatal config problems the TUI should surface: the
+/// agent-side env-override warnings and the UI-side enum warnings, combined into
+/// one block (each dropped-and-defaulted value on its own line). `None` when the
+/// config is clean.
+///
+/// Hard config errors do NOT come through here — `main` prints and exits on
+/// those before any frontend starts (see `hrdr_agent::ConfigDiagnostics`), so by
+/// the time the TUI is drawing, only warnings remain.
 pub fn startup_config_warning() -> Option<String> {
-    hrdr_agent::AgentConfig::load_checked()
-        .err()
-        .map(|e| format!("config file is invalid — using defaults: {e}"))
+    let (_, agent) = hrdr_agent::AgentConfig::load_diagnosed();
+    let (_, ui_warnings) = crate::UiConfig::load_diagnosed();
+    let mut lines: Vec<String> = agent.warnings;
+    lines.extend(ui_warnings);
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("configuration warnings:\n  {}", lines.join("\n  ")))
 }
 
 /// Guard shown when `/resume` is attempted mid-turn (the running turn holds

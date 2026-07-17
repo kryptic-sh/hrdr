@@ -3,6 +3,18 @@
 //! `hrdr_agent::AgentConfig` so the core agent crate stays
 //! representation-agnostic) plus the config-string ⇄ enum mappings for the
 //! display modes, so every frontend resolves and persists settings identically.
+//!
+//! # Validation policy
+//!
+//! The enum-like display settings (`icons`, `timestamps`, `statusbar`) are
+//! validated by [`UiConfig::validate`]: an unrecognized value produces a
+//! **warning** that names the valid options, rather than silently falling back
+//! to the default. These are cosmetic per-frontend preferences — a typo should
+//! not refuse to start the whole app — so they warn and default, unlike the
+//! agent-side config-file values that are hard errors (see
+//! `hrdr_agent::config`). Because a bad value defaults the same way whether it
+//! came from the file or a `HRDR_*` env var, [`UiConfig::validate`] checks the
+//! resolved value and does not distinguish the two sources.
 
 use hrdr_agent::parse_env_bool;
 
@@ -89,12 +101,72 @@ impl UiConfig {
     /// [`hrdr_agent::AgentConfig::load`]: a malformed file is treated as
     /// absent (the agent-side `load_checked` already surfaces the warning).
     pub fn load() -> Self {
+        Self::load_diagnosed().0
+    }
+
+    /// Load, returning the config alongside any warnings about unrecognized
+    /// enum-like settings (see [`validate`](Self::validate)). The frontends
+    /// surface the warnings as a startup notice; [`load`](Self::load) drops them.
+    pub fn load_diagnosed() -> (Self, Vec<String>) {
         let mut cfg = Self::default();
         if let Some(fc) = hrdr_agent::read_config_file::<UiFileConfig>() {
             cfg.apply_file(fc);
         }
         cfg.apply_env();
-        cfg
+        let warnings = cfg.validate();
+        (cfg, warnings)
+    }
+
+    /// Warn about unrecognized enum-like settings, naming the valid options for
+    /// each (`icons`, `timestamps`, `statusbar`). A warning, not an error: the
+    /// setting falls back to its default (see the [module docs](self)). Checks
+    /// the resolved value, so it covers both the config file and `HRDR_*` env.
+    pub fn validate(&self) -> Vec<String> {
+        /// Recognized spellings for one setting, and the canonical options to
+        /// print. `recognized` includes aliases the `from_config` mappings
+        /// accept; `options` is the short human-facing list.
+        fn check(
+            warnings: &mut Vec<String>,
+            field: &str,
+            value: Option<&str>,
+            recognized: &[&str],
+            options: &str,
+        ) {
+            if let Some(raw) = value {
+                let v = raw.trim().to_ascii_lowercase();
+                if !recognized.contains(&v.as_str()) {
+                    warnings.push(format!(
+                        "{field} = \"{raw}\" is not a known value (valid: {options}); \
+                         using the default"
+                    ));
+                }
+            }
+        }
+        let mut warnings = Vec::new();
+        check(
+            &mut warnings,
+            "icons",
+            self.icons.as_deref(),
+            &["nerd", "unicode", "ascii"],
+            "nerd, unicode, ascii",
+        );
+        check(
+            &mut warnings,
+            "timestamps",
+            self.timestamps.as_deref(),
+            &[
+                "none", "off", "hidden", "false", "0", "relative", "exact", "absolute", "abs",
+            ],
+            "none, relative, exact",
+        );
+        check(
+            &mut warnings,
+            "statusbar",
+            self.statusbar.as_deref(),
+            &["none", "off", "hidden", "truncate", "wrap"],
+            "none, truncate, wrap",
+        );
+        warnings
     }
 
     fn apply_file(&mut self, fc: UiFileConfig) {
@@ -295,6 +367,44 @@ mod tests {
             TimestampStyle::from_config(Some("garbage")),
             TimestampStyle::Relative
         );
+    }
+
+    #[test]
+    fn unknown_enum_values_warn_naming_valid_options() {
+        let mut cfg = UiConfig {
+            icons: Some("nerdfont".to_string()),
+            timestamps: Some("fuzzy".to_string()),
+            statusbar: Some("compact".to_string()),
+            ..Default::default()
+        };
+        let warnings = cfg.validate();
+        // Every bad enum is reported together, each naming its valid options.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("icons") && w.contains("nerd, unicode, ascii")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("timestamps") && w.contains("none, relative, exact")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("statusbar") && w.contains("none, truncate, wrap")),
+            "{warnings:?}"
+        );
+
+        // Recognized values (including aliases and case/whitespace) warn about
+        // nothing; unset fields are silent.
+        cfg.icons = Some("ASCII".to_string());
+        cfg.timestamps = Some(" abs ".to_string());
+        cfg.statusbar = None;
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
     #[test]
