@@ -1,6 +1,7 @@
 //! HTTP client over `/v1/chat/completions` and `/v1/models`.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 
@@ -20,10 +21,20 @@ use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 /// appended to the file as one JSON object per line. For debugging
 /// harness ⇄ server disagreements (tool-call framing, stream shape) — off
 /// unless the env var is set.
-static REQUEST_LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-static REQUEST_LOG_FULL_WARNED: std::sync::atomic::AtomicBool =
+static REQUEST_LOG: OnceLock<Option<WireLog>> = OnceLock::new();
+/// Latches once the wire log has permanently stopped (a rotation attempt
+/// failed): subsequent writes short-circuit, matching the historical
+/// stop-at-cap behavior and avoiding warning/rename spam.
+static REQUEST_LOG_STOPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static REQUEST_LOG_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// The open wire log together with its path, so [`log_wire`] can rotate the
+/// file in place (rename active → `<name>.1`, reopen a fresh active file).
+struct WireLog {
+    path: PathBuf,
+    file: Mutex<std::fs::File>,
+}
 
 /// Take the one-shot wire-log warning for delivery through the caller's normal
 /// event channel. This avoids writing stderr while a TUI owns the terminal.
@@ -35,36 +46,105 @@ pub fn take_request_log_warning() -> Option<String> {
         .and_then(|mut warning| warning.take())
 }
 
-fn request_log() -> Option<&'static Mutex<std::fs::File>> {
+fn request_log() -> Option<&'static WireLog> {
     REQUEST_LOG
         .get_or_init(|| {
             let path = std::env::var_os("HRDR_LOG_REQUESTS")?;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.create(true).append(true);
-            // Restrict permissions to owner-only on Unix (0600) so local
-            // users cannot read API request/response data from the log.
-            #[cfg(unix)]
-            opts.mode(0o600);
-            let file = opts.open(&path).ok()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if !file.metadata().ok()?.file_type().is_file() {
-                    return None;
-                }
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .ok()?;
-            }
-            Some(Mutex::new(file))
+            let path = PathBuf::from(path);
+            let file = open_wire_log(&path)?;
+            Some(WireLog {
+                path,
+                file: Mutex::new(file),
+            })
         })
         .as_ref()
 }
 
+/// Open (creating if needed) the wire-log file at `path` in append mode with
+/// owner-only (0600) permission hardening on Unix, so local users cannot read
+/// the API request/response data. Returns `None` if the target is not a
+/// regular file or the permissions cannot be applied. Used both for the
+/// initial open and for the fresh active file created on rotation, so both
+/// share the same 0600 discipline.
+fn open_wire_log(path: &Path) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // Restrict permissions to owner-only on Unix (0600) so local users cannot
+    // read API request/response data from the log.
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let file = opts.open(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !file.metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
+    }
+    Some(file)
+}
+
+/// The rotated (`.1`) path for `path`: the same path with `.1` appended
+/// (`requests.log` → `requests.log.1`).
+fn rotated_wire_log_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Rotate the active wire log: rename it to `<name>.1` (atomically replacing
+/// any previous `.1`, which preserves the 0600 perms of the moved inode) and
+/// swap `file` for a freshly created, 0600-hardened active file at `path`.
+///
+/// On any failure the original active file is left in place (a best-effort
+/// rename-back undoes a partial move) and an error is returned so the caller
+/// can fall back to stop-at-cap.
+fn rotate_wire_log(path: &Path, file: &mut std::fs::File) -> std::io::Result<()> {
+    let rotated = rotated_wire_log_path(path);
+    // `rename` replaces an existing `.1`, so no `.2`… ever accumulates, and it
+    // preserves the moved file's permissions (same inode).
+    std::fs::rename(path, &rotated)?;
+    match open_wire_log(path) {
+        Some(new_file) => {
+            *file = new_file;
+            Ok(())
+        }
+        None => {
+            // Reopen failed after the move: restore the original name so we
+            // don't leave the active path missing, then report failure.
+            let _ = std::fs::rename(&rotated, path);
+            Err(std::io::Error::other("failed to reopen rotated wire log"))
+        }
+    }
+}
+
+/// Whether appending a `line_len`-byte record to a `current`-byte file would
+/// meet or exceed `cap` (and so should trigger rotation).
+fn wire_log_over_cap(current: u64, line_len: u64, cap: u64) -> bool {
+    current >= cap || line_len > cap.saturating_sub(current)
+}
+
+/// Publish the one-shot wire-log warning for delivery through the caller's
+/// event channel (see [`take_request_log_warning`]).
+fn set_request_log_warning(msg: String) {
+    if let Ok(mut pending) = REQUEST_LOG_WARNING.get_or_init(|| Mutex::new(None)).lock() {
+        *pending = Some(msg);
+    }
+}
+
 /// Append one `{"ts":…,"kind":…,…}` line to the wire log (no-op when off).
 fn log_wire(kind: &str, fields: serde_json::Value) {
-    let Some(file) = request_log() else {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let Some(wire) = request_log() else {
         return;
     };
+    // A prior rotation failed and we fell back to stop-at-cap: stay stopped.
+    if REQUEST_LOG_STOPPED.load(Relaxed) {
+        return;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -75,25 +155,38 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
             o.insert(k.clone(), v.clone());
         }
     }
-    if let Ok(mut file) = file.lock() {
+    let mib = MAX_LOG_FILE_BYTES / (1024 * 1024);
+    if let Ok(mut file) = wire.file.lock() {
         let current = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let mut line = obj.to_string();
         line.push('\n');
-        if current >= MAX_LOG_FILE_BYTES
-            || line.len() as u64 > MAX_LOG_FILE_BYTES.saturating_sub(current)
-        {
-            if !REQUEST_LOG_FULL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let warning = format!(
-                    "request logging stopped after reaching {} MiB",
-                    MAX_LOG_FILE_BYTES / (1024 * 1024)
-                );
-                if let Ok(mut pending) = REQUEST_LOG_WARNING.get_or_init(|| Mutex::new(None)).lock()
-                {
-                    *pending = Some(warning);
+        if wire_log_over_cap(current, line.len() as u64, MAX_LOG_FILE_BYTES) {
+            // At the cap: rotate to keep the newest window rather than dropping
+            // the (usually most interesting) tail. Rotation fires once per fill,
+            // so the warning is naturally throttled to once per rotation.
+            match rotate_wire_log(&wire.path, &mut file) {
+                Ok(()) => {
+                    set_request_log_warning(format!(
+                        "request log reached {mib} MiB; rotated to <name>.1 \
+                         (keeping the newest {mib} MiB, at most {} MiB on disk)",
+                        mib * 2
+                    ));
+                }
+                Err(_) => {
+                    // Rotation failed: fall back to the historical stop-at-cap
+                    // behavior, warning once and then staying silent.
+                    if !REQUEST_LOG_STOPPED.swap(true, Relaxed) {
+                        set_request_log_warning(format!(
+                            "request log rotation failed; logging stopped after \
+                             reaching {mib} MiB"
+                        ));
+                    }
+                    return;
                 }
             }
-            return;
         }
+        // Always write after a successful rotation (fresh file), so a record is
+        // never silently dropped — even one larger than the cap.
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -1240,6 +1333,129 @@ mod tests {
         assert!(
             !would_skip,
             "log_wire must allow writes when file < MAX_LOG_FILE_BYTES"
+        );
+    }
+
+    // ── Rotation ────────────────────────────────────────────────────────
+    //
+    // These exercise the rotation mechanics directly (bypassing the 10 MiB
+    // global singleton) with a small simulated cap, mirroring log_wire's
+    // over-cap branch: fill the active file, rotate, keep writing.
+
+    /// Append `line` to the wire log at `path`, rotating first when the append
+    /// would meet/exceed `cap`. A trimmed clone of `log_wire`'s file-locked
+    /// body, parameterised on `cap` so a test needn't write 10 MiB.
+    fn append_with_cap(path: &Path, file: &mut std::fs::File, line: &str, cap: u64) {
+        let current = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if wire_log_over_cap(current, line.len() as u64, cap) {
+            rotate_wire_log(path, file).expect("rotation should succeed");
+        }
+        file.write_all(line.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn writing_past_cap_rotates_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+        let mut file = open_wire_log(&path).unwrap();
+
+        // Cap small enough that the second line trips rotation.
+        let cap = 4u64;
+        append_with_cap(&path, &mut file, "OLD\n", cap); // 4 bytes, under cap
+        append_with_cap(&path, &mut file, "NEW\n", cap); // would hit cap → rotate
+
+        let rotated = rotated_wire_log_path(&path);
+        assert!(rotated.exists(), ".1 file must exist after rotation");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "OLD\n");
+        // The active file continues with the new content.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW\n");
+    }
+
+    #[test]
+    fn second_rotation_replaces_dot_one_without_accumulating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+        let mut file = open_wire_log(&path).unwrap();
+
+        let cap = 4u64;
+        append_with_cap(&path, &mut file, "AAA\n", cap);
+        append_with_cap(&path, &mut file, "BBB\n", cap); // rotate: .1 = AAA
+        append_with_cap(&path, &mut file, "CCC\n", cap); // rotate: .1 = BBB
+
+        let rotated = rotated_wire_log_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "BBB\n",
+            ".1 must hold the most-recently-rotated content"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "CCC\n");
+        // No `.2` (or deeper) may accumulate.
+        let mut name = path.as_os_str().to_owned();
+        name.push(".2");
+        assert!(
+            !PathBuf::from(name).exists(),
+            "rotation must not create a .2 file"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn both_files_keep_0600_after_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+        let mut file = open_wire_log(&path).unwrap();
+
+        let cap = 4u64;
+        append_with_cap(&path, &mut file, "OLD\n", cap);
+        append_with_cap(&path, &mut file, "NEW\n", cap); // rotate
+
+        let rotated = rotated_wire_log_path(&path);
+        for p in [&path, &rotated] {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{p:?} must not have group/other bits (mode={mode:#o})"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_failure_returns_err_without_panicking() {
+        // Rename fails when the active path does not exist on disk (source
+        // missing). We hand rotate_wire_log a live file handle but a path that
+        // was never created, so the internal `rename` errors and the helper
+        // returns Err rather than panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created.log");
+        // A real, unrelated file to satisfy the &mut File argument.
+        let real = dir.path().join("scratch.log");
+        let mut file = open_wire_log(&real).unwrap();
+
+        let result = rotate_wire_log(&missing, &mut file);
+        assert!(
+            result.is_err(),
+            "rotating a nonexistent active path must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn wire_log_over_cap_boundaries() {
+        // At or past cap → rotate.
+        assert!(wire_log_over_cap(10, 1, 10));
+        assert!(wire_log_over_cap(11, 1, 10));
+        // Fits exactly → no rotation.
+        assert!(!wire_log_over_cap(6, 4, 10));
+        // One byte too many → rotate.
+        assert!(wire_log_over_cap(7, 4, 10));
+    }
+
+    #[test]
+    fn rotated_path_appends_dot_one() {
+        assert_eq!(
+            rotated_wire_log_path(Path::new("/var/log/requests.log")),
+            PathBuf::from("/var/log/requests.log.1")
         );
     }
 }

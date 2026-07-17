@@ -26,7 +26,10 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated]";
 
 /// Maximum size for the `HRDR_LOG_REQUESTS` log file in bytes (**10 MiB**).
 ///
-/// Beyond this, new log entries are dropped to cap disk growth.
+/// When the active file reaches this size it is rotated: renamed to
+/// `<name>.1` (replacing any previous `.1`) and a fresh active file is
+/// started. Disk use is therefore bounded by `2 x` this value, and the newest
+/// entries are always being written rather than silently dropped.
 pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read up to `max_bytes` from a [`reqwest::Response`] body and return as

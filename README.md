@@ -117,7 +117,11 @@ hrdr run --max-cost 0.50 "audit the error handling"
 
 For debugging harness ⇄ server disagreements, `HRDR_LOG_REQUESTS=<path>` appends
 every chat request body, raw SSE line, and non-2xx response to the file as
-JSON-per-line.
+JSON-per-line. On Unix the file is created 0600 (owner-only). When it reaches
+10 MiB it rotates: the active file is renamed to `<path>.1` (replacing any
+previous `.1`) and a fresh active file is started, so the newest entries are
+always captured rather than dropped and on-disk use stays bounded at 2× the cap
+(≈20 MiB).
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
