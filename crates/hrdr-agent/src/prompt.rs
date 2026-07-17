@@ -813,6 +813,11 @@ mod tests {
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");
         assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
+        assert!(
+            p.contains("Never put the parent checkout's absolute")
+                && p.contains("current worktree"),
+            "write-task briefs must not route sub-agents around isolation: {p}"
+        );
         // Decompose into small, reviewable chunks, sequenced when they overlap.
         assert!(
             p.contains("Break big work into small, self-contained chunks"),
@@ -829,6 +834,13 @@ mod tests {
         assert!(p.contains("`git diff HEAD...<branch>`"), "{p}");
         assert!(p.contains("Read the **entire** diff"), "{p}");
         assert!(p.contains("review it like a PR"), "{p}");
+        assert!(
+            p.contains("git status --short --untracked-files=all")
+                && p.contains("Every pre-existing staged, modified, and untracked path")
+                && p.contains("any form of `git clean`")
+                && p.contains("If an untracked file blocks integration, stop"),
+            "integration must preserve the main tree's untracked/user-owned files: {p}"
+        );
         // Trust but verify the findings of read-only agents, too.
         assert!(p.contains("Trust but verify the **findings**"), "{p}");
         assert!(p.contains("against the code yourself"), "{p}");
@@ -871,15 +883,19 @@ mod tests {
         );
         assert!(!main.contains("fresh checkout of"), "main is not");
 
-        // Commit-as-you-go + clean-worktree discipline is sub-agent-only.
+        // Commit-as-you-go + own-work-only discipline is sub-agent-only.
         assert!(
             sub.contains("do NOT wait to be asked to commit")
                 && sub.contains("one commit per task")
-                && sub.contains("working tree MUST be clean"),
+                && sub.contains("all work YOU created MUST be committed")
+                && sub.contains("The `Working directory` above is authoritative")
+                && sub.contains("never `cd` there")
+                && sub.contains("Never delete, overwrite, or commit a")
+                && sub.contains("stop instead of \"cleaning\" it"),
             "sub-agent gets commit discipline"
         );
         assert!(
-            !main.contains("working tree MUST be clean"),
+            !main.contains("all work YOU created MUST be committed"),
             "the main agent does not"
         );
 
