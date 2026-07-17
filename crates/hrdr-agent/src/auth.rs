@@ -141,10 +141,15 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// The write is done through [`write_atomic`] — a concurrent reader never sees a
 /// partial write.
 fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
-    let mut doc = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .unwrap_or_default();
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing existing credential store {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::default(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading credential store {}", path.display()));
+        }
+    };
     doc[provider] = toml_edit::value(token);
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -203,6 +208,21 @@ mod tests {
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_tokens_at(&dir.path().join("nope.toml")).is_empty());
+    }
+
+    #[test]
+    fn save_refuses_to_replace_a_malformed_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let original = b"openai = [not valid toml\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = save_token_at(&path, "zen", "sk-new")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("parsing existing credential store"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]

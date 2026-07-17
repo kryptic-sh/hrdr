@@ -193,6 +193,9 @@ pub(crate) struct App {
     /// reservation stays silent on purpose: announcing it there would print the
     /// notice ahead of the reply rather than after the turn, where it belongs.
     session_notice_pending: bool,
+    /// Last autosave error shown in the transcript. Identical failures stay
+    /// silent until a save succeeds, preventing every checkpoint from spamming.
+    session_save_error: Option<String>,
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
@@ -452,6 +455,7 @@ impl App {
                 panes
             },
             session_notice_pending: false,
+            session_save_error: None,
             editor,
             theme,
             logo,

@@ -14,25 +14,25 @@ pub struct SaveOutcome {
     pub first_save: bool,
 }
 
-/// Persist a conversation as a session (best-effort; filesystem errors are
-/// swallowed). Returns `None` when there's nothing worth saving yet (no user
-/// message).
+/// Persist a conversation as a session. Returns `Ok(None)` when there's nothing
+/// worth saving yet (no user message); filesystem failures are returned so a
+/// frontend never claims an unsaved conversation is durable.
 ///
 /// `state` is the frontend's whole session state, written as-is apart from the
 /// ephemeral session-chrome notices ([`SessionState::persisted`]). The file id
 /// comes from `state.id` when the session already has one, otherwise a fresh
 /// collision-free id is derived from its name (see [`crate::unique_session_id`])
 /// and reported back as `first_save`.
-pub fn save_session(state: &SessionState) -> Option<SaveOutcome> {
+pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
     if !state.is_saveable() {
-        return None;
+        return Ok(None);
     }
     let (id, first_save) = match &state.id {
         Some(id) => (id.clone(), false),
         None => (crate::unique_session_id(&state.cwd, &state.name), true),
     };
-    let _ = Session::new(state.persisted()).save(&id);
-    Some(SaveOutcome { id, first_save })
+    Session::new(state.persisted()).save(&id)?;
+    Ok(Some(SaveOutcome { id, first_save }))
 }
 
 /// Async wrapper over [`save_session`]: refresh the state's mirrors of the
@@ -41,7 +41,7 @@ pub fn save_session(state: &SessionState) -> Option<SaveOutcome> {
 pub async fn save_agent_session(
     agent: std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>,
     mut state: SessionState,
-) -> Option<SaveOutcome> {
+) -> anyhow::Result<Option<SaveOutcome>> {
     let (msgs, cwd, todos) = {
         let a = agent.lock().await;
         let todos = a.todos().lock().map(|t| t.clone()).unwrap_or_default();
@@ -106,12 +106,12 @@ mod tests {
     /// (importantly) no file is written.
     #[test]
     fn save_session_skips_conversations_with_no_user_message() {
-        assert!(save_session(&SessionState::default()).is_none());
+        assert!(save_session(&SessionState::default()).unwrap().is_none());
         let assistant_only = SessionState {
             messages: vec![hrdr_agent::Message::assistant("hi there")],
             ..Default::default()
         };
-        assert!(save_session(&assistant_only).is_none());
+        assert!(save_session(&assistant_only).unwrap().is_none());
     }
 
     #[test]

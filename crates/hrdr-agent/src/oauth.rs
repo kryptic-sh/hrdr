@@ -134,7 +134,10 @@ pub async fn await_oauth_code_within(
     }
 }
 
-/// Accept connections until one is the OAuth callback, then resolve it.
+/// Accept connections until one is an OAuth callback carrying the state this
+/// login minted. Callback-shaped requests with another state are local probes,
+/// not authoritative provider responses, so reject them without letting them
+/// terminate the real login.
 async fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
     loop {
         let (mut stream, _) = listener
@@ -145,21 +148,35 @@ async fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result
         let query = request_target(&line)
             .and_then(|t| t.split_once('?').map(|(_, q)| q))
             .unwrap_or("");
+        let params = parse_query(query);
         // Not the callback (e.g. a browser favicon probe) — keep waiting.
-        if !(query.contains("code=") || query.contains("error=")) {
+        if !(params.contains_key("code") || params.contains_key("error")) {
             let _ = write_response(&mut stream, "Waiting for authorization…").await;
             continue;
         }
-        return match parse_callback(&line, expected_state) {
+        // A process which did not start this login does not know its state. It
+        // must not be able to end the listener before the browser gets here.
+        if params.get("state").map(String::as_str).unwrap_or("") != expected_state {
+            let err = parse_callback(&line, expected_state)
+                .unwrap_err()
+                .to_string();
+            let _ = write_response(&mut stream, &error_page(&err)).await;
+            continue;
+        }
+        match parse_callback(&line, expected_state) {
             Ok(code) => {
                 let _ = write_response(&mut stream, SUCCESS_PAGE).await;
-                Ok(code)
+                return Ok(code);
             }
             Err(e) => {
                 let _ = write_response(&mut stream, &error_page(&e.to_string())).await;
-                Err(e)
+                // A provider error with our state is authoritative. A malformed
+                // code callback is not: keep listening for the browser retry.
+                if params.contains_key("error") {
+                    return Err(e);
+                }
             }
-        };
+        }
     }
 }
 
@@ -202,14 +219,6 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     let params = parse_query(query);
 
-    if let Some(err) = params.get("error") {
-        let desc = params.get("error_description").unwrap_or(err);
-        bail!("authorization failed: {desc}");
-    }
-    let code = params
-        .get("code")
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| anyhow!("callback is missing the authorization code"))?;
     let state = params.get("state").map(String::as_str).unwrap_or("");
     if state != expected_state {
         // Do NOT echo `expected_state` — this message is written into the HTML
@@ -218,6 +227,14 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
         // gratuitous. The received value is enough to diagnose.
         bail!("state mismatch — possible CSRF (got {state:?})");
     }
+    if let Some(err) = params.get("error") {
+        let desc = params.get("error_description").unwrap_or(err);
+        bail!("authorization failed: {desc}");
+    }
+    let code = params
+        .get("code")
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| anyhow!("callback is missing the authorization code"))?;
     Ok(code.clone())
 }
 
@@ -879,7 +896,7 @@ mod tests {
 
     #[test]
     fn parse_callback_surfaces_error_param() {
-        let line = "GET /auth/callback?error=access_denied&error_description=User+said+no HTTP/1.1";
+        let line = "GET /auth/callback?error=access_denied&error_description=User+said+no&state=xyz HTTP/1.1";
         let err = parse_callback(line, "xyz").unwrap_err().to_string();
         assert!(err.contains("User said no"), "got: {err}");
     }
@@ -1303,6 +1320,33 @@ mod tests {
         let res = await_oauth_code_within(port, "state", Duration::from_millis(120)).await;
         assert!(res.is_err(), "expired deadline yields a timeout error");
         assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn wrong_state_callback_cannot_end_the_real_login() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let waiter = tokio::spawn(async move { accept_callback(&listener, "right").await });
+
+        for target in [
+            "/auth/callback?code=forged&state=wrong",
+            "/auth/callback?error=access_denied&state=wrong",
+            "/auth/callback?code=&state=right",
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /auth/callback?code=real&state=right HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        assert_eq!(waiter.await.unwrap().unwrap(), "real");
     }
 
     #[tokio::test]

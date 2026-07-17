@@ -2770,8 +2770,9 @@ pub struct AgentConfig {
     /// Ask for streamed token usage (`stream_options.include_usage`); default
     /// `true`. A few strict/old servers reject it — set `false` to omit.
     pub stream_usage: bool,
-    /// Connect + idle-read timeout in seconds for model requests. `None` = no
-    /// timeout (default). A hung/stalled provider fails instead of blocking.
+    /// Connect + idle-read timeout in seconds for model requests. Defaults to
+    /// five minutes; each received stream chunk resets the idle deadline.
+    /// Configure `0` to disable the timeout explicitly.
     pub request_timeout: Option<u64>,
     /// Prompt-cache TTL: `5m` (default) or `1h`. `1h` emits a longer
     /// `cache_control` TTL (Anthropic native + OpenRouter) — cheaper for stable
@@ -3458,7 +3459,7 @@ impl Default for AgentConfig {
             seed: None,
             stop: Vec::new(),
             stream_usage: true,
-            request_timeout: None,
+            request_timeout: Some(300),
             prompt_cache_ttl: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
@@ -5642,7 +5643,12 @@ impl Agent {
         client.set_headers(config.headers.clone());
         client.set_api_version(config.api_version.clone());
         client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
-        client.set_timeout(config.request_timeout.map(std::time::Duration::from_secs));
+        client.set_timeout(
+            config
+                .request_timeout
+                .filter(|seconds| *seconds > 0)
+                .map(std::time::Duration::from_secs),
+        );
 
         Ok(Self {
             client,

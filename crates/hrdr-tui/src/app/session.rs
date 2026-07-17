@@ -7,6 +7,28 @@
 use super::*;
 
 impl super::App {
+    fn record_session_save(
+        &mut self,
+        result: anyhow::Result<Option<hrdr_app::SaveOutcome>>,
+    ) -> Option<hrdr_app::SaveOutcome> {
+        match result {
+            Ok(outcome) => {
+                self.session_save_error = None;
+                outcome
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if self.session_save_error.as_deref() != Some(&error) {
+                    self.push_entry(Entry::notice(format!(
+                        "session autosave failed — conversation is not safely stored: {error}"
+                    )));
+                    self.session_save_error = Some(error);
+                }
+                None
+            }
+        }
+    }
+
     /// Point the shared sub-agent transcript cell at the current session's dir.
     /// Called after the session id is assigned; sub-agents spawned before this
     /// (a brand-new session's first turn) are simply not persisted.
@@ -56,7 +78,8 @@ impl super::App {
         state.messages = messages;
         state.todos = todos;
         state.cwd = cwd;
-        if let Some(o) = hrdr_app::save_session(self.state()) {
+        let saved = hrdr_app::save_session(self.state());
+        if let Some(o) = self.record_session_save(saved) {
             if o.first_save {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
@@ -103,7 +126,8 @@ impl super::App {
         self.state_mut()
             .messages
             .push(hrdr_agent::Message::user(sent));
-        if let Some(o) = hrdr_app::save_session(self.state()) {
+        let saved = hrdr_app::save_session(self.state());
+        if let Some(o) = self.record_session_save(saved) {
             // Stay silent here: the notice belongs *after* the turn, not ahead of
             // the reply. Hand it to the first autosave, which would otherwise see
             // an id already set and conclude this was not a first save.
@@ -132,7 +156,8 @@ impl super::App {
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         self.state_mut().sync_from(msgs, todos, cwd);
 
-        if let Some(o) = hrdr_app::save_session(self.state()) {
+        let saved = hrdr_app::save_session(self.state());
+        if let Some(o) = self.record_session_save(saved) {
             // Notify once, when the session is first created — including when
             // `reserve_session_id` created it at turn start and deferred the
             // notice to here (it sees `first_save` as false by then).
