@@ -691,11 +691,21 @@ fn spawn_background(
     // Build and register synchronously so `steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
+    // The parent's cwd, captured before `keep()` below discards it — needed at
+    // completion time to compute the size summary (`git diff`/`git log` run from
+    // here, like `task_diff`, since worktrees share the parent's object store).
+    let repo_cwd = worktree.as_ref().map(|w| w.repo.clone());
     // Detach the worktree's automatic cleanup only now that the agent exists — so
     // if `Agent::new` fails above, the still-un-kept worktree is torn down by its
     // `Drop` instead of being orphaned (it is not yet on any registry). It must
     // outlive the run from here on; its path/branch go onto the registry entry.
     let worktree = worktree.map(|w| w.keep());
+    // (repo cwd, branch) for the completion-time size summary — `None` for a
+    // read-only task, which has no worktree/branch to diff.
+    let size_summary_target: Option<(PathBuf, String)> = worktree
+        .as_ref()
+        .zip(repo_cwd)
+        .map(|(w, repo)| (repo, w.branch.clone()));
     sub.cost_total = cost_total;
     sub.attach_live(live.clone(), live_key);
     sub.ctx.lsp = lsp;
@@ -758,6 +768,7 @@ fn spawn_background(
             cancelled: false,
             worktree: worktree.as_ref().map(|w| w.path.clone()),
             branch: worktree.as_ref().map(|w| w.branch.clone()),
+            size_summary: None,
             model: model_for_live.clone(),
             started: Some(std::time::Instant::now()),
             transcript: transcript_path,
@@ -886,11 +897,21 @@ fn spawn_background(
                 format!("(background task panicked: {msg})")
             }
         };
+        // Best-effort size summary for the delivery message — computed here (once,
+        // at completion, in this async context) rather than in `drain_background`,
+        // which is synchronous formatting code and must not shell out. `None` for a
+        // read-only task (no worktree/branch) or on any git failure; a missing
+        // summary never blocks or fails the delivery.
+        let size_summary = match &size_summary_target {
+            Some((repo, branch)) => task_size_summary(repo, branch).await,
+            None => None,
+        };
         if let Ok(mut v) = reg_done.lock()
             && let Some(t) = v.iter_mut().find(|t| t.id == id)
         {
             t.done = true;
             t.result = Some(final_result);
+            t.size_summary = size_summary;
         }
         // The sub-agent is idle now (RunGuard's drop inside catch_unwind
         // already sets running=false, done=true), but its answer is still
@@ -923,6 +944,83 @@ fn spawn_background(
          finishes; continue with your other work — do not poll or wait. If you have nothing to \
          do until it finishes, tell the user in one line what it is doing and end your turn.{isolation}"
     ))
+}
+
+/// Best-effort size summary for a finished write task: file count and
+/// insertions/deletions (`git diff --shortstat`, reformatted as `+ins -del`)
+/// plus the commit subjects (`git log --oneline`) — the same two facts
+/// `task_diff` would show, surfaced up front in the delivery message so the
+/// parent knows the SCALE of the result before deciding how to review it. Run
+/// from `repo` (the parent's cwd), like `task_diff`: worktrees share the
+/// parent's object store, so `branch` is visible there too. `None` on any git
+/// failure or when there is nothing to summarize (no commits) — this must
+/// never fail or block a delivery, only enrich it.
+async fn task_size_summary(repo: &std::path::Path, branch: &str) -> Option<String> {
+    let shortstat_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--shortstat", &format!("HEAD...{branch}")])
+        .output()
+        .await
+        .ok()?;
+    let log_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "--oneline", &format!("HEAD..{branch}")])
+        .output()
+        .await
+        .ok()?;
+    if !shortstat_out.status.success() || !log_out.status.success() {
+        return None;
+    }
+    let shortstat = format_shortstat(&String::from_utf8_lossy(&shortstat_out.stdout));
+    let commits = String::from_utf8_lossy(&log_out.stdout).trim().to_string();
+    if shortstat.is_none() && commits.is_empty() {
+        return None; // nothing landed — no summary worth showing
+    }
+    let mut out = String::new();
+    if let Some(s) = shortstat {
+        out.push_str(&format!("  size:     {s}\n"));
+    }
+    if !commits.is_empty() {
+        out.push_str("  commits:\n");
+        for line in commits.lines() {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// Reformat `git diff --shortstat`'s output (`" 7 files changed, 182 \
+/// insertions(+), 46 deletions(-)"`, with either count clause absent when
+/// zero) into the delivery message's compact `"7 files changed, +182 -46"`.
+/// `None` for empty input (a branch with commits that net no line changes,
+/// e.g. a pure rename).
+fn format_shortstat(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut parts = raw.split(',');
+    let files = parts.next()?.trim().to_string();
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    for clause in parts {
+        let clause = clause.trim();
+        let Some(n) = clause
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if clause.contains("insertion") {
+            insertions = n;
+        } else if clause.contains("deletion") {
+            deletions = n;
+        }
+    }
+    Some(format!("{files}, +{insertions} -{deletions}"))
 }
 
 /// The shared, lazily-resolved sub-agent transcript directory cell (see
@@ -2308,17 +2406,26 @@ impl hrdr_tools::Tool for TaskDiffTool {
         "task_diff"
     }
     fn description(&self) -> &'static str {
-        "Review a finished write sub-agent's work in one call: any uncommitted/untracked \
-         leftovers in its worktree, its commits, and the full merge-base diff (`git diff \
-         HEAD...<branch>`). Use it when a write task reports back, before you merge its work \
-         into your own working dir. Pass the task `id` (from `task_list` or the delivery \
-         message)."
+        "Review a finished write sub-agent's work: any uncommitted/untracked leftovers in its \
+         worktree, its commits, and either the full merge-base diff (`git diff \
+         HEAD...<branch>`) or — pass `commit` — just one commit's diff (`git show`), for \
+         reviewing a large result commit-by-commit instead of one unreviewable blob. Use it when \
+         a write task reports back, before you merge its work into your own working dir. Pass \
+         the task `id` (from `task_list` or the delivery message)."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+                "id": { "type": "integer", "description": "The task id (see `task_list`)." },
+                "commit": {
+                    "type": "string",
+                    "description": "Optional: review just one commit instead of the full diff. \
+                        Either a 1-based index into the commit list this tool prints (newest \
+                        first — so you can read the list, then pass e.g. \"2\"), or a git commit \
+                        hash. Must be one of this task's own commits (HEAD..<branch>); a rev \
+                        outside the task is refused."
+                }
             },
             "required": ["id"]
         })
@@ -2367,7 +2474,9 @@ impl hrdr_tools::Tool for TaskDiffTool {
             .to_string();
 
         // 2. The commits under review, run against the PARENT's cwd (the branch
-        // is visible there too — worktrees share one object store).
+        // is visible there too — worktrees share one object store). Also the
+        // list `commit` indexes into below, so its numbering matches what the
+        // model just read.
         let log_out = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&ctx.cwd)
@@ -2376,18 +2485,6 @@ impl hrdr_tools::Tool for TaskDiffTool {
             .await
             .context("running `git log` for the task's branch")?;
         let commits = String::from_utf8_lossy(&log_out.stdout).trim().to_string();
-
-        // 3. The full merge-base diff, also from the parent's cwd (three-dot:
-        // everything since the merge-base, not just what's uncommitted in the
-        // worktree — which is clean once the sub-agent has committed).
-        let diff_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&ctx.cwd)
-            .args(["diff", &format!("HEAD...{branch}")])
-            .output()
-            .await
-            .context("running `git diff` against the task's branch")?;
-        let diff = hrdr_tools::redact_secret_diffs(&String::from_utf8_lossy(&diff_out.stdout));
 
         let mut report = String::new();
         if !dirty.is_empty() {
@@ -2405,12 +2502,58 @@ impl hrdr_tools::Tool for TaskDiffTool {
         } else {
             report.push_str(&format!("Commits:\n{commits}\n\n"));
         }
-        report.push_str(&format!("Diff (git diff HEAD...{branch}):\n"));
-        report.push_str(if diff.trim().is_empty() {
-            "(no diff)\n"
-        } else {
-            &diff
-        });
+
+        let commit_arg = args
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match commit_arg {
+            // 3a. One commit only: resolve the selector against THIS task's
+            // commits (never arbitrary repo history), then `git show` it — a
+            // reviewable slice of a result too big for the full diff.
+            Some(selector) => {
+                let (hash, index, total) =
+                    resolve_task_commit(ctx, id, &branch, &commits, selector).await?;
+                let show_out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ctx.cwd)
+                    .args(["show", &hash])
+                    .output()
+                    .await
+                    .context("running `git show` for the selected commit")?;
+                let diff =
+                    hrdr_tools::redact_secret_diffs(&String::from_utf8_lossy(&show_out.stdout));
+                report.push_str(&format!(
+                    "Showing commit {index}/{total} (`git show {hash}`):\n"
+                ));
+                report.push_str(if diff.trim().is_empty() {
+                    "(no diff)\n"
+                } else {
+                    &diff
+                });
+            }
+            // 3b. The full merge-base diff, also from the parent's cwd (three-dot:
+            // everything since the merge-base, not just what's uncommitted in the
+            // worktree — which is clean once the sub-agent has committed).
+            None => {
+                let diff_out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ctx.cwd)
+                    .args(["diff", &format!("HEAD...{branch}")])
+                    .output()
+                    .await
+                    .context("running `git diff` against the task's branch")?;
+                let diff =
+                    hrdr_tools::redact_secret_diffs(&String::from_utf8_lossy(&diff_out.stdout));
+                report.push_str(&format!("Diff (git diff HEAD...{branch}):\n"));
+                report.push_str(if diff.trim().is_empty() {
+                    "(no diff)\n"
+                } else {
+                    &diff
+                });
+            }
+        }
 
         Ok(hrdr_tools::truncate_saved(
             &report,
@@ -2420,6 +2563,69 @@ impl hrdr_tools::Tool for TaskDiffTool {
             "task_diff",
         ))
     }
+}
+
+/// Resolve a `task_diff` `commit` selector to `(hash, 1-based index, total)`
+/// within task `id`'s own commits — never arbitrary repo history. `commits` is
+/// the trimmed `git log --oneline HEAD..<branch>` output already computed by
+/// the caller (newest first), so a numeric `selector` indexes into exactly the
+/// list the tool just printed. A non-numeric `selector` is a git rev, verified
+/// to actually be one of `HEAD..<branch>` via `git rev-list` before use — this
+/// is what stops the model from pulling up a diff from outside the task.
+async fn resolve_task_commit(
+    ctx: &hrdr_tools::ToolContext,
+    id: u64,
+    branch: &str,
+    commits: &str,
+    selector: &str,
+) -> anyhow::Result<(String, usize, usize)> {
+    let lines: Vec<&str> = commits.lines().collect();
+    let total = lines.len();
+    if let Ok(n) = selector.parse::<usize>() {
+        if n == 0 || n > total {
+            anyhow::bail!(
+                "task #{id} commit index {n} is out of range — its commit list has {total} \
+                 commit(s) (see the `Commits:` list `task_diff` just printed; it's 1-based, \
+                 newest first)"
+            );
+        }
+        let hash = lines[n - 1]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        return Ok((hash, n, total));
+    }
+    // Not an index — a git rev. Resolve it to a full hash, then require it
+    // actually be reachable as one of the task's own commits before showing it.
+    let rev_parse = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&ctx.cwd)
+        .args(["rev-parse", "--verify", &format!("{selector}^{{commit}}")])
+        .output()
+        .await
+        .context("resolving `commit` as a git rev")?;
+    if !rev_parse.status.success() {
+        anyhow::bail!("`{selector}` is not a valid git commit rev");
+    }
+    let hash = String::from_utf8_lossy(&rev_parse.stdout)
+        .trim()
+        .to_string();
+    let rev_list_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&ctx.cwd)
+        .args(["rev-list", &format!("HEAD..{branch}")])
+        .output()
+        .await
+        .context("listing task's commits to verify `commit` belongs to it")?;
+    let rev_list = String::from_utf8_lossy(&rev_list_out.stdout);
+    let Some(pos) = rev_list.lines().position(|l| l == hash) else {
+        anyhow::bail!(
+            "`{selector}` is not one of task #{id}'s commits (`git rev-list HEAD..{branch}`) — \
+             refusing to show history outside this task"
+        );
+    };
+    Ok((hash, pos + 1, total))
 }
 
 /// Agent configuration.
@@ -2946,9 +3152,13 @@ other file or run mutating commands. Plan the work; do NOT implement it.
 - First understand the task: trace the relevant code with your read/search tools, \
   and note how the project already does similar things so the plan fits in.
 - Write the plan with: the goal in one line; the approach and why; the exact \
-  files/functions/types to change; ordered steps; edge cases and risks; and how \
-  to verify (build/test/lint). Be concrete enough that another agent can execute \
-  it without re-investigating — name real paths and symbols, not placeholders.
+  files/functions/types to change; ordered steps, each sized as an independently \
+  implementable — and independently reviewable — chunk: a step names the \
+  files/functions it changes, its constraints, and a done-criterion, so the \
+  caller can hand any single step to a coder sub-agent as a self-contained \
+  brief; edge cases and risks; and how to verify (build/test/lint). Be concrete \
+  enough that another agent can execute it without re-investigating — name real \
+  paths and symbols, not placeholders.
 - Save it to a Markdown file (e.g. `PLAN.md`, or a path the caller names): create \
   it if absent, update it if it exists.
 - Return the full plan in your report, plus the path you wrote it to. You may be \
@@ -2970,6 +3180,10 @@ beyond it.
 - You cannot ask questions. If part of the spec is ambiguous or turns out wrong \
   against the real code, do the unambiguous part, and report exactly what you \
   skipped or adapted and why — an honest partial beats an improvised whole.
+- If faithful implementation balloons far past what the spec implies — many more \
+  files or far more churn than the brief names — stop rather than deliver a \
+  monster: implement the coherent core, commit it, and report the remainder as \
+  proposed follow-up chunks. A reviewable partial beats an unreviewable whole.
 - Commit each coherent unit as you go (Conventional Commits) and leave a clean \
   tree; your commits and report are the entire hand-off.";
 
@@ -6136,6 +6350,7 @@ impl Agent {
             label: String,
             result: String,
             worktree: Option<(std::path::PathBuf, String)>,
+            size_summary: Option<String>,
         }
         let finished: Vec<Finished> = {
             let mut v = self
@@ -6155,6 +6370,7 @@ impl Agent {
                     label: t.label.clone(),
                     result: t.result.clone().unwrap_or_default(),
                     worktree: t.worktree.clone().zip(t.branch.clone()),
+                    size_summary: t.size_summary.clone(),
                 });
             }
             // Prune cancelled entries and delivered ones that have no worktree
@@ -6181,6 +6397,7 @@ impl Agent {
                 label,
                 result,
                 worktree,
+                size_summary,
             } = f;
             on_event(AgentEvent::Notice(format!(
                 "background task #{id} ({label}) finished"
@@ -6191,23 +6408,32 @@ impl Agent {
             let body = match worktree {
                 Some((path, branch)) => {
                     let p = path.display();
+                    // The size summary (file count, +ins -del, commit subjects) is
+                    // computed at completion time (see `task_size_summary`) — a
+                    // best-effort extra, so its absence just collapses back to the
+                    // plain blank line the message always had here.
+                    let size_block = size_summary
+                        .as_deref()
+                        .map(|s| format!("{s}\n"))
+                        .unwrap_or_default();
                     format!(
                         "[Background task #{id} ({label}) finished. Its changes are on branch \
                          `{branch}` in an isolated git worktree — NOTHING has landed in your \
-                         working dir yet.\n  worktree: {p}\n  branch:   {branch}\n\nTrust but \
-                         verify before you merge. The sub-agent was told to commit all its work \
-                         and leave a clean tree, but confirm it actually did:\n  1. Call \
+                         working dir yet.\n  worktree: {p}\n  branch:   {branch}\n{size_block}\n\
+                         Trust but verify before you merge. The sub-agent was told to commit all \
+                         its work and leave a clean tree, but confirm it actually did:\n  1. Call \
                          `task_diff {id}` — shows any uncommitted/untracked leftovers (must be \
                          none), its commits, and the full diff (`git diff \
-                         HEAD...{branch}`).\n  2. If it flags uncommitted/untracked changes, do \
-                         not re-delegate to another sub-agent — review those changes and commit \
-                         them YOURSELF (a proper Conventional Commits message) before merging, or \
-                         that work is lost. Then review the diff like a PR — every hunk, not just \
-                         that commits exist — and fix anything off before bringing it \
-                         over.\nThen merge the branch into your working dir (rebase it onto HEAD \
-                         in the worktree first if that'd conflict — `git -C {p} rebase \
-                         <your-branch>`), and once its work is in, call `task_cleanup` with id \
-                         {id} to remove the worktree. Its report:]\n{result}"
+                         HEAD...{branch}`). For a large result, pass `commit` (an index from the \
+                         listed commits) to review it commit-by-commit instead.\n  2. If it flags \
+                         uncommitted/untracked changes, do not re-delegate to another sub-agent — \
+                         review those changes and commit them YOURSELF (a proper Conventional \
+                         Commits message) before merging, or that work is lost. Then review the \
+                         diff like a PR — every hunk, not just that commits exist — and fix \
+                         anything off before bringing it over.\nThen merge the branch into your \
+                         working dir (rebase it onto HEAD in the worktree first if that'd conflict \
+                         — `git -C {p} rebase <your-branch>`), and once its work is in, call \
+                         `task_cleanup` with id {id} to remove the worktree. Its report:]\n{result}"
                     )
                 }
                 None => {
@@ -10100,6 +10326,94 @@ mod tests {
         assert_eq!(v[0].id, 2);
     }
 
+    /// `format_shortstat` reformats `git diff --shortstat`'s prose into the
+    /// delivery message's compact `"N files changed, +ins -del"`, filling in
+    /// zero for whichever clause (insertions/deletions) git omits when it's
+    /// zero, and returns `None` for empty input.
+    #[test]
+    fn format_shortstat_reformats_git_output() {
+        use super::format_shortstat;
+        assert_eq!(
+            format_shortstat(" 7 files changed, 182 insertions(+), 46 deletions(-)"),
+            Some("7 files changed, +182 -46".to_string())
+        );
+        // Singular file, insertions only (git omits the deletions clause).
+        assert_eq!(
+            format_shortstat(" 1 file changed, 5 insertions(+)"),
+            Some("1 file changed, +5 -0".to_string())
+        );
+        // Deletions only.
+        assert_eq!(
+            format_shortstat(" 1 file changed, 3 deletions(-)"),
+            Some("1 file changed, +0 -3".to_string())
+        );
+        assert_eq!(format_shortstat(""), None, "empty shortstat (no diff)");
+        assert_eq!(format_shortstat("   \n  "), None, "whitespace-only");
+    }
+
+    /// `task_size_summary` (the function `spawn_background` calls when a write
+    /// task completes) computes the diffstat and commit subjects from the
+    /// PARENT's cwd, exactly as `task_diff` does — the worktree itself is never
+    /// touched by these two git calls.
+    #[tokio::test]
+    async fn task_size_summary_computes_diffstat_and_commits() {
+        use super::{Worktree, task_size_summary};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let wt = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt.path.join("work.txt"), "line one\nline two\n").unwrap();
+        for a in [
+            vec!["add", "."],
+            vec!["commit", "-qm", "feat: add work.txt"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt.path)
+                .args(&a)
+                .output()
+                .unwrap();
+        }
+        let kept = wt.keep();
+
+        let summary = task_size_summary(repo, &kept.branch).await.unwrap();
+        assert!(
+            summary.contains("1 file changed, +2 -0"),
+            "diffstat: {summary}"
+        );
+        assert!(
+            summary.contains("feat: add work.txt"),
+            "commit subject: {summary}"
+        );
+
+        // A branch with no commits beyond HEAD summarizes to nothing worth
+        // showing — the delivery message falls back to its plain form.
+        let wt2 = Worktree::create(repo).await.unwrap();
+        let kept2 = wt2.keep();
+        assert_eq!(
+            task_size_summary(repo, &kept2.branch).await,
+            None,
+            "no commits, no summary"
+        );
+    }
+
     /// A finished write-capable task is delivered with review-and-merge
     /// instructions (its changes are in a worktree, not the working dir), and a
     /// cancelled task is discarded without delivery.
@@ -10119,6 +10433,11 @@ mod tests {
                 result: Some("did the work".to_string()),
                 worktree: Some(std::path::PathBuf::from("/tmp/wt-x")),
                 branch: Some("hrdr/task-x".to_string()),
+                size_summary: Some(
+                    "  size:     7 files changed, +182 -46\n  commits:\n    \
+                     abc1234 feat(x): do the thing\n    def5678 test(x): cover the thing"
+                        .to_string(),
+                ),
                 ..Default::default()
             });
             v.push(hrdr_tools::BackgroundTask {
@@ -10145,6 +10464,17 @@ mod tests {
         assert!(
             last.contains("/tmp/wt-x"),
             "gives the worktree path: {last}"
+        );
+        // The size summary computed at completion time rides along in the
+        // delivery, so the parent sees the SCALE of the result up front.
+        assert!(
+            last.contains("size:     7 files changed, +182 -46"),
+            "delivery includes the diffstat: {last}"
+        );
+        assert!(
+            last.contains("abc1234 feat(x): do the thing")
+                && last.contains("def5678 test(x): cover the thing"),
+            "delivery includes the commit subjects: {last}"
         );
         // Trust-but-verify handoff: points at `task_diff` and still tells the
         // parent to commit any leftovers itself.
@@ -10893,6 +11223,138 @@ mod tests {
         assert!(
             err.to_string().contains("no changes to diff"),
             "read-only task explains there's nothing to diff: {err}"
+        );
+    }
+
+    /// `task_diff`'s `commit` parameter narrows the report to one commit's
+    /// `git show` output instead of the full merge-base diff — a numeric index
+    /// (1-based, newest first, matching the printed `Commits:` list) or a full
+    /// hash both work, and both an out-of-range index and a rev that isn't one
+    /// of the task's own commits are refused with a clear error.
+    #[tokio::test]
+    async fn task_diff_commit_param_selects_single_commit() {
+        use super::{TaskDiffTool, Worktree};
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let ctx = hrdr_tools::ToolContext::new(repo);
+        let diff_tool = TaskDiffTool;
+
+        // Two commits on the task's branch: "add a.txt" (older) then "add b.txt"
+        // (newer) — `git log --oneline HEAD..branch` lists b.txt first.
+        let wt = Worktree::create(repo).await.unwrap();
+        let wt_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt.path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        std::fs::write(wt.path.join("a.txt"), "aaa\n").unwrap();
+        wt_git(&["add", "."]);
+        wt_git(&["commit", "-qm", "add a.txt"]);
+        std::fs::write(wt.path.join("b.txt"), "bbb\n").unwrap();
+        wt_git(&["add", "."]);
+        wt_git(&["commit", "-qm", "add b.txt"]);
+        let kept = wt.keep();
+        let branch = kept.branch.clone();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 1,
+                delivered: true,
+                worktree: Some(kept.path.clone()),
+                branch: Some(branch.clone()),
+                ..Default::default()
+            });
+
+        // (a) index "1" is the newest commit — "add b.txt".
+        let out = diff_tool
+            .execute(serde_json::json!({"id": 1, "commit": "1"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Showing commit 1/2"),
+            "notes which commit is shown: {out}"
+        );
+        assert!(out.contains("add b.txt"), "shows the right commit: {out}");
+        assert!(out.contains("+bbb"), "shows that commit's diff hunk: {out}");
+        assert!(
+            !out.contains("+aaa"),
+            "does not leak the other commit's diff: {out}"
+        );
+        // The full commit list is still there for orientation.
+        assert!(
+            out.contains("add a.txt") && out.contains("add b.txt"),
+            "keeps the full commit list for orientation: {out}"
+        );
+
+        // (b) a full hash for the OLDER commit ("add a.txt", index 2/2).
+        let log = String::from_utf8(git(&["log", "--oneline", &format!("HEAD..{branch}")]).stdout)
+            .unwrap();
+        let older_hash = log
+            .lines()
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let out_hash = diff_tool
+            .execute(serde_json::json!({"id": 1, "commit": older_hash}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out_hash.contains("Showing commit 2/2"),
+            "resolves a hash to its position: {out_hash}"
+        );
+        assert!(
+            out_hash.contains("add a.txt") && out_hash.contains("+aaa"),
+            "shows the selected commit's diff: {out_hash}"
+        );
+
+        // (c) an out-of-range index is a clear error.
+        let err = diff_tool
+            .execute(serde_json::json!({"id": 1, "commit": "5"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "clear error for an out-of-range index: {err}"
+        );
+
+        // (d) a rev that exists in the repo but isn't one of the task's commits
+        // (the pre-task HEAD commit) is refused, not shown.
+        let head_hash = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        let err = diff_tool
+            .execute(
+                serde_json::json!({"id": 1, "commit": head_hash.trim()}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not one of task"),
+            "refuses a rev outside the task rather than showing arbitrary history: {err}"
         );
     }
 

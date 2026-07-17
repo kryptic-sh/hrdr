@@ -112,6 +112,14 @@ pub struct BackgroundTask {
     pub worktree: Option<PathBuf>,
     /// The scratch branch the [`worktree`](Self::worktree) is on, if any.
     pub branch: Option<String>,
+    /// Best-effort size summary for a finished write task — file count,
+    /// insertions/deletions (from `git diff --shortstat`), and the commit
+    /// subjects (from `git log --oneline`) — computed once, when the task
+    /// completes, and rendered into the `drain_background` delivery message so
+    /// the parent sees the scale of the result before calling `task_diff`.
+    /// `None` for a read-only task, or when the git calls failed (never blocks
+    /// or fails the delivery over this best-effort extra).
+    pub size_summary: Option<String>,
     /// The model the sub-agent runs on, for `task_list`.
     pub model: String,
     /// When the run started, for a `task_list` elapsed readout. `None` in tests /

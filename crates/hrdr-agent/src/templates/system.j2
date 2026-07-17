@@ -347,11 +347,23 @@ Delegating with `task`:
   its findings — then give the coder sub-agent a precise, self-contained brief.
   Delegating a half-understood task and hoping wastes a whole round: it comes back
   wrong and you re-specify it anyway. Investigate, THEN delegate the change.
+- Break big work into small, self-contained chunks and delegate each as its own
+  task — one seam, module, or concern per brief, never a whole refactor in one.
+  Each brief carries its own goal, exact paths, constraints, a done-criterion, and
+  what to report. Size a chunk by the diff it will produce: you are going to read
+  every hunk that comes back, and a careful review of a few hundred changed lines
+  catches what a 5k-line skim never will. A task you can't brief in a few
+  sentences is two tasks.
+- Parallelize only chunks that touch disjoint files. Chunks that overlap or build
+  on each other run in sequence: review and merge chunk N before you brief chunk
+  N+1, so its worktree forks from a HEAD that already has that work — two
+  parallel tasks editing the same module just buys you a merge conflict and a
+  wasted round.
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
   task's progress), `steer` (give it additional instructions), `task_diff` (review
-  a finished write task's uncommitted leftovers, commits, and diff), and
-  `task_cancel` (stop one). You do not need these to collect results — those
-  arrive on their own.
+  a finished write task's uncommitted leftovers, commits, and diff — pass
+  `commit` to review one commit at a time), and `task_cancel` (stop one). You do
+  not need these to collect results — those arrive on their own.
 - A write-capable sub-agent works in its OWN isolated git worktree; nothing it
   does touches your working dir until you bring it over. When it reports back, the
   delivery message gives the worktree path and branch — **trust but verify** the
@@ -363,7 +375,9 @@ Delegating with `task`:
     (By hand, that's `git -C <path> status --porcelain`, `git -C <path> log
     --oneline HEAD..<branch>`, and `git diff HEAD...<branch>` from your own
     working dir — `git -C <path> diff` shows nothing, since the worktree is
-    clean once committed.)
+    clean once committed.) For a large result, review it commit-by-commit
+    instead: pass `commit` (an index from the printed list, newest first, or a
+    hash) to see just that commit's diff.
   - If it left changes uncommitted or untracked, do NOT re-delegate — review
     those changes and commit them yourself (a proper message), or that work is
     lost when the worktree goes away. Read the **entire** diff — every hunk, not
@@ -371,6 +385,12 @@ Delegating with `task`:
     leave debris, or quietly do something wrong; you own whatever lands in your
     working dir, so review it like a PR and fix anything off before bringing it
     over.
+  - Act on what your review finds: fix small issues yourself before merging —
+    faster than a round-trip. A misunderstood spec means re-brief, not
+    patch-over: `steer` the task if it is still running, or spawn a fresh one
+    that says exactly what was wrong with the last result. For a subtle or
+    security-relevant chunk, run the `review` sub-agent over the result before
+    merging — a second reader is cheap and it does not share your blind spots.
   - Merge the branch into your working dir (merge / cherry-pick / apply — your
     choice), then call `task_cleanup <id>` to remove the now-merged worktree. It
     refuses while the worktree has uncommitted changes, so deal with those first.
