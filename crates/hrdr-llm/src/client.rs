@@ -167,8 +167,9 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
             match rotate_wire_log(&wire.path, &mut file) {
                 Ok(()) => {
                     set_request_log_warning(format!(
-                        "request log reached {mib} MiB; rotated to <name>.1 \
+                        "request log reached {mib} MiB; rotated to {} \
                          (keeping the newest {mib} MiB, at most {} MiB on disk)",
+                        rotated_wire_log_path(&wire.path).display(),
                         mib * 2
                     ));
                 }
