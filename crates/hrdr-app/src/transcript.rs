@@ -338,10 +338,10 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
             plain(s)
         }
         "ls" | "tree" => plain(arg_str(&v, "path").unwrap_or_else(|| ".".into())),
-        "todo" => ToolDisplay {
-            headline: String::new(),
-            body: ToolBody::Details(todo_details(&v)),
-        },
+        // The tool result already contains the normalized replacement list.
+        // Rendering the input too duplicates every item and can disagree with
+        // normalization performed by the tool.
+        "todo" => plain(String::new()),
         // `task` and every MCP tool: their arguments, one per row.
         _ => ToolDisplay {
             headline: String::new(),
@@ -377,30 +377,6 @@ fn arg_details(v: &serde_json::Value) -> Vec<(String, String)> {
         serde_json::Value::Null => Vec::new(),
         other => vec![(String::new(), detail_value(other))],
     }
-}
-
-/// `todo`'s argument is a list of items; show each as its own checkbox row
-/// rather than one enormous `todos: [{…}]` line.
-fn todo_details(v: &serde_json::Value) -> Vec<(String, String)> {
-    let Some(items) = v.get("todos").and_then(|t| t.as_array()) else {
-        return arg_details(v);
-    };
-    items
-        .iter()
-        .map(|t| {
-            let content = t
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let mark = match t.get("status").and_then(|s| s.as_str()) {
-                Some("completed") => "[x]",
-                Some("in_progress") => "[~]",
-                _ => "[ ]",
-            };
-            (mark.to_string(), content)
-        })
-        .collect()
 }
 
 /// Compact summary of `read` args: `path  (offset: N, limit: M)`.
@@ -885,28 +861,14 @@ mod tool_display_tests {
         assert_eq!(tool_display("write", "not json").headline, "?");
     }
 
-    /// `todo` lists its items as checkbox rows rather than one giant JSON blob.
+    /// `todo` renders only its normalized replacement list from the result.
     #[test]
-    fn todo_shows_one_checkbox_row_per_item() {
+    fn todo_does_not_duplicate_its_input_items() {
         let d = tool_display(
             "todo",
-            r#"{"todos":[{"content":"first","status":"completed"},
-                        {"content":"second","status":"in_progress"},
-                        {"content":"third","status":"pending"}]}"#,
+            r#"{"todos":[{"content":"first","status":"completed"}]}"#,
         );
         assert_eq!(d.headline, "");
-        assert_eq!(
-            d.body,
-            ToolBody::Details(vec![
-                ("[x]".into(), "first".into()),
-                ("[~]".into(), "second".into()),
-                ("[ ]".into(), "third".into()),
-            ])
-        );
-        // Without a `todos` array it degrades to the generic arg rows.
-        assert_eq!(
-            tool_display("todo", r#"{"x":"y"}"#).body,
-            ToolBody::Details(vec![("x".into(), "y".into())])
-        );
+        assert_eq!(d.body, ToolBody::Text);
     }
 }

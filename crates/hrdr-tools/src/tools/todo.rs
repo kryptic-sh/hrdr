@@ -127,7 +127,7 @@ fn render_todos(todos: &[TodoItem]) -> String {
     if todos.is_empty() {
         return "(todo list cleared)".to_string();
     }
-    let mut out = String::from("Updated task list:\n");
+    let mut out = String::new();
     for t in todos {
         let mark = match t.status.as_str() {
             "completed" => "x",
