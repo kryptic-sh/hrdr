@@ -129,7 +129,7 @@ impl Agent {
                         "[Background task #{id} ({label}) finished. Its changes are on branch \
                          `{branch}` in an isolated git worktree — NOTHING has landed in your \
                          working dir yet.\n  worktree: {p}\n  branch:   {branch}\n{size_block}\n\
-                         Trust but verify before you merge. The sub-agent was told to commit all \
+                         Read the whole diff yourself before merging. The sub-agent was told to commit all \
                          its work and leave a clean tree, but confirm it actually did:\n  1. Call \
                          `task_diff {id}` — shows any uncommitted/untracked leftovers (must be \
                          none), its commits, and the full diff (`git diff \

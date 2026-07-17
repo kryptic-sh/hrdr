@@ -4582,10 +4582,10 @@ mod tests {
                 && last.contains("def5678 test(x): cover the thing"),
             "delivery includes the commit subjects: {last}"
         );
-        // Trust-but-verify handoff: points at `task_diff` and still tells the
+        // Read-the-diff handoff: points at `task_diff` and still tells the
         // parent to commit any leftovers itself.
         assert!(
-            last.contains("Trust but verify")
+            last.contains("Read the whole diff yourself before merging")
                 && last.contains("task_diff 1")
                 && last.contains("commit them YOURSELF"),
             "handoff tells the parent to verify + commit leftovers itself: {last}"

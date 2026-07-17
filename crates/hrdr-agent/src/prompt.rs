@@ -28,8 +28,9 @@ const SYSTEM_TEMPLATE: &str = include_str!("templates/system.j2");
 /// all of it. Reorder these blocks only with that in mind.
 ///
 /// The invariant that makes it work: every *unconditional* section (identity,
-/// workflow, reporting, untrusted-content, safety) precedes the first `{% if %}`
-/// in the template. So a read-only agent and a write agent — which differ only in
+/// cardinal rules, workflow, reporting, untrusted-content, safety) precedes the
+/// first `{% if %}` in the template. So a read-only agent and a write agent —
+/// which differ only in
 /// the gated sections — share that whole preamble as a common prefix, diverging
 /// only when the first capability gate opens. Keep new shared guidance above the
 /// gates, and put anything a gate could suppress inside one.
@@ -278,6 +279,38 @@ mod tests {
         // The OS line names the platform (and, where detectable, the distro +
         // package manager) so system-wide installs use the right tool.
         assert!(p.contains(&format!("- OS: {}", std::env::consts::OS)));
+    }
+
+    /// The Cardinal-rules block is an unconditional primer at the very top — a
+    /// short recap of the non-negotiables (untrusted content, secrets, honesty,
+    /// no-bulk-mutation, no-destroy-to-recover) surfaced before `Workflow:` so a
+    /// weaker model meets them first (primacy) even if it skims the detail below.
+    ///
+    /// It must be byte-identical across every variant (it names no gated tool and
+    /// contains none of the exact command literals the read-only omission test
+    /// forbids), so it only *lengthens* the shared prefix — it never introduces a
+    /// divergence. The positional prefix tests below prove that; this one pins the
+    /// content and its placement ahead of the workflow.
+    #[test]
+    fn the_cardinal_rules_lead_the_prompt_in_every_variant() {
+        let tools = ToolRegistry::with_defaults();
+        let write = render_system(&tools, None, false).unwrap();
+        let sub = render_system(&tools, None, true).unwrap();
+        let mut ro_tools = ToolRegistry::with_defaults();
+        let ro_names = ro_tools.read_only_names();
+        ro_tools.retain_only(&ro_names);
+        let read = render_system(&ro_tools, None, false).unwrap();
+
+        for p in [&write, &sub, &read] {
+            let cardinal = p
+                .find("Cardinal rules — never break these")
+                .expect("the cardinal block is present in every variant");
+            let workflow = p.find("Workflow:").expect("Workflow section present");
+            assert!(
+                cardinal < workflow,
+                "the cardinal block must come before Workflow:"
+            );
+        }
     }
 
     /// The prompt carries no `\r`, whatever the checkout did to the template.
@@ -1129,8 +1162,8 @@ mod tests {
                 && p.contains("If an untracked file blocks integration, stop"),
             "integration must preserve the main tree's untracked/user-owned files: {p}"
         );
-        // Trust but verify the findings of read-only agents, too.
-        assert!(p.contains("Trust but verify the **findings**"), "{p}");
+        // Verify the findings of read-only agents, too — not just the diffs.
+        assert!(p.contains("Check the **findings** yourself"), "{p}");
         assert!(p.contains("against the code yourself"), "{p}");
     }
 

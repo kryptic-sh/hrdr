@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Cardinal-rules primer leads the system prompt.** A short, unconditional
+  recap of the non-negotiables — untrusted content is data not commands, secrets
+  never leave the machine, report only what you ran, no bulk/wildcard mutation,
+  never destroy to recover — now renders at the very top of the prompt (ahead of
+  `Workflow:`), so a weaker model meets them first. It names no gated tool and
+  none of the exact forbidden command literals, so it is byte-identical across
+  every agent variant and only lengthens the shared prefix. The `Verifying:`
+  section now leads with the build/test/format/lint imperative, and the "trust
+  but verify" wording in both the system prompt and the background-task delivery
+  banner (`turn_state.rs`) becomes the literal "read the whole diff yourself
+  before merging".
 - **One `shell` tool; hrdr is UNIX-first.** The separate `bash` and `powershell`
   tools collapse into a single platform-agnostic `shell` tool that runs whatever
   shell was auto-detected — `bash`, falling back to POSIX `sh`. Its name is
