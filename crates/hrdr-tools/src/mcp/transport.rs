@@ -211,8 +211,14 @@ pub(crate) fn http_post(t: &HttpTransport, body: &Value) -> reqwest::RequestBuil
 pub(crate) fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
     let mut dec = SseDecoder::new();
     dec.push(body.as_bytes());
+    if dec.overflowed() {
+        bail!("SSE response body exceeded maximum size (32 MiB)");
+    }
     // Force-flush a trailing event that isn't blank-line-terminated.
     dec.push(b"\n\n");
+    if dec.overflowed() {
+        bail!("SSE response body exceeded maximum size (32 MiB)");
+    }
     for ev in dec.drain() {
         if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
             && response_id(&v) == Some(id)

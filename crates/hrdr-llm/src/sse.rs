@@ -447,6 +447,58 @@ mod tests {
         assert_eq!(dec.line_buf.len(), MAX_BUFFER_BYTES);
     }
 
+    // ── overflow rejection pattern (consumer-side) ─────────────────────────
+
+    #[test]
+    fn overflowed_after_push_must_not_yield_events() {
+        // The pattern production consumers use: push, then check overflowed(),
+        // and if true, discard drain() results and error out — never process
+        // truncated events.
+        let mut dec = SseDecoder::new();
+        let big = vec![b'x'; MAX_BUFFER_BYTES + 1];
+        dec.push(&big);
+        assert!(dec.overflowed());
+        // Consumer discards the potentially-truncated events by calling
+        // drain() and throwing away the result.
+        let _ = dec.drain();
+        // After discarding, the decoder must still report overflowed so the
+        // consumer can check the flag at EOF too.
+        assert!(dec.overflowed(), "overflowed must persist across drain");
+        // Re-pushing more data must keep overflowed=true (already set).
+        dec.push(b"\n");
+        assert!(dec.overflowed());
+    }
+
+    #[test]
+    fn overflowed_at_finish_must_not_yield_events() {
+        // EOF path: finish() flushes buffered data, but overflow must still
+        // be detected and events discarded.
+        let mut dec = SseDecoder::new();
+        let big = vec![b'x'; MAX_BUFFER_BYTES + 1];
+        dec.push(&big);
+        assert!(dec.overflowed());
+        // Consumer discards finish() results if overflowed.
+        let _ = dec.finish();
+        assert!(dec.overflowed(), "overflowed must persist across finish");
+    }
+
+    #[test]
+    fn overflowed_does_not_interfere_with_normal_decoding() {
+        // A decoder that never hit the cap must report overflowed=false and
+        // decode normally.
+        let mut dec = SseDecoder::new();
+        dec.push(b"data: hello\n\n");
+        assert!(!dec.overflowed());
+        let ev = dec.drain();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].data, "hello");
+
+        // finish() on a clean decoder also must not report overflow.
+        assert!(!dec.overflowed());
+        assert!(dec.finish().is_empty());
+        assert!(!dec.overflowed());
+    }
+
     #[test]
     fn cur_data_is_capped_without_corrupting_utf8() {
         // An event whose blank-line terminator never arrives, fed `data:`
