@@ -21,6 +21,8 @@ use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 /// harness ⇄ server disagreements (tool-call framing, stream shape) — off
 /// unless the env var is set.
 static REQUEST_LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+static REQUEST_LOG_FULL_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn request_log() -> Option<&'static Mutex<std::fs::File>> {
     REQUEST_LOG
@@ -54,9 +56,15 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
     }
     if let Ok(mut file) = file.lock() {
         // Cap the log file at MAX_LOG_FILE_BYTES to prevent unbounded disk
-        // growth. Once the file exceeds the limit, new entries are silently
-        // dropped — the cap is documented on MAX_LOG_FILE_BYTES.
+        // growth. Once the file exceeds the limit, new entries are dropped
+        // after one warning — the cap is documented on MAX_LOG_FILE_BYTES.
         if file.metadata().map(|m| m.len()).unwrap_or(0) >= MAX_LOG_FILE_BYTES {
+            if !REQUEST_LOG_FULL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[hrdr] request logging stopped after reaching {} MiB",
+                    MAX_LOG_FILE_BYTES / (1024 * 1024)
+                );
+            }
             return;
         }
         let _ = writeln!(file, "{obj}");

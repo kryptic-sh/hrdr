@@ -552,10 +552,6 @@ pub fn unique_session_id(cwd: &str, name: &str) -> String {
         let json_path = dir.join(format!("{cand}.json"));
         let lock = dir.join(format!(".{cand}.lock"));
 
-        // Already a real session file → permanently taken.
-        if json_path.exists() {
-            continue;
-        }
         // Atomically claim via O_EXCL lock file.
         match std::fs::OpenOptions::new()
             .write(true)
@@ -564,13 +560,28 @@ pub fn unique_session_id(cwd: &str, name: &str) -> String {
         {
             Ok(f) => {
                 drop(f);
+                // The session may have appeared before this reservation. Check
+                // only after owning the lock, then release it and try the next
+                // suffix if the real session already exists.
+                if json_path.exists() {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
                 return cand;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return cand, // best-effort fallback
+            // Never return an unowned candidate: save() could overwrite a
+            // concurrent session. Try another suffix instead.
+            Err(_) => continue,
         }
     }
-    slug
+    format!(
+        "{slug}-{}",
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 /// In-process cache of each session file's [`SessionMeta`], keyed by its

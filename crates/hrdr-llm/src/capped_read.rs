@@ -26,7 +26,7 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated]";
 
 /// Maximum size for the `HRDR_LOG_REQUESTS` log file in bytes (**10 MiB**).
 ///
-/// Beyond this, new log entries are silently dropped to cap disk growth.
+/// Beyond this, new log entries are dropped to cap disk growth.
 pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read up to `max_bytes` from a [`reqwest::Response`] body and return as
@@ -40,6 +40,7 @@ pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 pub async fn read_capped_text(resp: reqwest::Response, max_bytes: usize) -> String {
     let cap = max_bytes;
     let mut buf = Vec::with_capacity(cap.min(4096));
+    let mut truncated = false;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -49,15 +50,22 @@ pub async fn read_capped_text(resp: reqwest::Response, max_bytes: usize) -> Stri
         let remaining = cap.saturating_sub(buf.len());
         if chunk.len() > remaining {
             buf.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
             break;
         }
         buf.extend_from_slice(&chunk);
-        if buf.len() >= cap {
+        if buf.len() == cap {
+            // Read one more chunk to distinguish an exactly-at-limit response
+            // from an oversized one while retaining at most `cap` bytes.
+            match stream.next().await {
+                Some(Ok(chunk)) if !chunk.is_empty() => truncated = true,
+                _ => {}
+            }
             break;
         }
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
-    if buf.len() >= cap {
+    if truncated {
         format!("{text}{TRUNCATION_MARKER}")
     } else {
         text
@@ -170,16 +178,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capped_text_at_limit_truncates() {
-        // Reading exactly cap bytes stops and appends the truncation marker
-        // because the reader cannot distinguish "body was exactly cap" from
-        // "body exceeds cap" — the marker is the safe overapproximation.
+    async fn capped_text_at_limit_is_not_truncated() {
         let body = vec![b'a'; MAX_DIAGNOSTIC_BYTES];
         let body_leak: &'static [u8] = Box::leak(body.into_boxed_slice());
         let resp = serve_response(body_leak, 200).await;
         let text = read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
-        assert_eq!(text.len(), MAX_DIAGNOSTIC_BYTES + TRUNCATION_MARKER.len());
-        assert!(text.ends_with(TRUNCATION_MARKER));
+        assert_eq!(text.len(), MAX_DIAGNOSTIC_BYTES);
+        assert!(!text.ends_with(TRUNCATION_MARKER));
     }
 
     #[tokio::test]
