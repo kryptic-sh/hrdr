@@ -44,7 +44,7 @@ pub(crate) use util::run_editor;
 pub(crate) struct UserShell {
     /// Tool-block id, to mark the entry cancelled.
     id: String,
-    /// Tool name shown on the block ("bash" / "powershell").
+    /// Tool name shown on the block (always "shell").
     name: String,
     /// The command, for the model's history note on cancel.
     command: String,
@@ -1088,7 +1088,11 @@ impl App {
             return;
         }
         let Some((program, mut args)) = hrdr_tools::user_shell() else {
-            self.system("no shell found — !commands need bash or PowerShell on PATH".to_string());
+            self.system(
+                "no shell found — !commands need bash or a POSIX shell on PATH (on Windows, \
+                 use WSL or Git Bash)"
+                    .to_string(),
+            );
             return;
         };
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1096,16 +1100,11 @@ impl App {
             "user-shell-{}",
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let shell_name = if program.contains("pwsh") || program.contains("powershell") {
-            "powershell"
-        } else {
-            "bash"
-        };
         // Open the tool block immediately (synchronously, so it lands before
-        // any streamed output).
+        // any streamed output). It renders as the `shell` tool.
         self.apply_event(AgentEvent::ToolStart {
             id: id.clone(),
-            name: shell_name.to_string(),
+            name: "shell".to_string(),
             args: format!("! {command}"),
         });
         let task_id = id.clone();
@@ -1140,7 +1139,7 @@ impl App {
                         .send(TurnMsg::UserShell(
                             AgentEvent::ToolEnd {
                                 id: task_id,
-                                name: shell_name.to_string(),
+                                name: "shell".to_string(),
                                 result: format!("couldn't run {program}: {e}"),
                                 ok: false,
                             },
@@ -1242,7 +1241,7 @@ impl App {
                 .send(TurnMsg::UserShell(
                     AgentEvent::ToolEnd {
                         id: task_id,
-                        name: shell_name.to_string(),
+                        name: "shell".to_string(),
                         result,
                         ok,
                     },
@@ -1252,7 +1251,7 @@ impl App {
         });
         self.user_shell = Some(UserShell {
             id,
-            name: shell_name.to_string(),
+            name: "shell".to_string(),
             command,
             handle,
         });

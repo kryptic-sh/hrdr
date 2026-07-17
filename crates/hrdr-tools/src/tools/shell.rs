@@ -11,11 +11,67 @@ use crate::{Tool, ToolContext};
 
 use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_MS};
 
-// ---- bash ----
+// ---- shell ----
 
-pub struct BashTool;
+/// The shell interpreter this session runs commands through, resolved once from
+/// `PATH`: `bash`, then POSIX `sh`. hrdr targets UNIX workflows, so there is no
+/// PowerShell path; on Windows this means WSL or Git Bash. The model is told
+/// which one it has (see [`ShellTool::description`]) so it can avoid bashisms
+/// when only `sh` is present.
+#[derive(Clone, Copy)]
+enum ShellKind {
+    Bash,
+    Posix,
+}
 
-/// Arguments shared by the shell tools (`bash`, `powershell`).
+impl ShellKind {
+    /// The interpreter program to invoke as `<program> -c <command>`.
+    fn program(self) -> &'static str {
+        match self {
+            ShellKind::Bash => "bash",
+            ShellKind::Posix => "sh",
+        }
+    }
+}
+
+/// The single, platform-agnostic `shell` tool. It runs whatever shell was
+/// auto-detected (`bash` or POSIX `sh`); its name is always `shell`, and its
+/// description names the actual interpreter in use.
+pub struct ShellTool {
+    kind: ShellKind,
+}
+
+impl ShellTool {
+    /// A `shell` tool backed by `bash`.
+    pub fn bash() -> Self {
+        Self {
+            kind: ShellKind::Bash,
+        }
+    }
+    /// A `shell` tool backed by POSIX `sh`.
+    pub fn posix() -> Self {
+        Self {
+            kind: ShellKind::Posix,
+        }
+    }
+}
+
+const BASH_DESC: &str = "Run a shell command via `bash -c` in the working directory. Use for build, test, \
+     git, and anything without a dedicated tool. Output is captured and length-bounded. \
+     Each call starts fresh in the working directory — `cd` does NOT persist between \
+     calls; chain it in one command (`cd sub && …`) or use paths from the cwd. \
+     Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
+     hook-skipping, and destructive commands are rejected.";
+
+const SH_DESC: &str = "Run a shell command via `sh -c` — this session's shell is POSIX `sh`, NOT bash, so \
+     avoid bash-only syntax (`[[ … ]]`, arrays, `source`, `set -o pipefail`, `<(…)`). \
+     Use for build, test, git, and anything without a dedicated tool. Output is captured \
+     and length-bounded. Each call starts fresh in the working directory — `cd` does NOT \
+     persist between calls; chain it in one command (`cd sub && …`) or use paths from the \
+     cwd. Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
+     hook-skipping, and destructive commands are rejected.";
+
+/// Arguments for the `shell` tool.
 #[derive(Deserialize)]
 struct ShellArgs {
     command: String,
@@ -23,8 +79,8 @@ struct ShellArgs {
     timeout_ms: Option<u64>,
 }
 
-/// The JSON-Schema shared by the shell tools; only the command description
-/// differs.
+/// The JSON-Schema for the `shell` tool; only the command description differs by
+/// shell.
 fn shell_parameters(command_desc: &str) -> serde_json::Value {
     json!({
         "type": "object",
@@ -44,27 +100,28 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
 }
 
 #[async_trait]
-impl Tool for BashTool {
+impl Tool for ShellTool {
     fn name(&self) -> &'static str {
-        "bash"
+        "shell"
     }
     fn description(&self) -> &'static str {
-        "Run a shell command via `bash -c` in the working directory. Use for build, test, \
-         git, and anything without a dedicated tool. Output is captured and length-bounded. \
-         Each call starts fresh in the working directory — `cd` does NOT persist between \
-         calls; chain it in one command (`cd sub && …`) or use paths from the cwd. \
-         Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
-         hook-skipping, and destructive commands are rejected."
+        match self.kind {
+            ShellKind::Bash => BASH_DESC,
+            ShellKind::Posix => SH_DESC,
+        }
+    }
+    fn shell_program(&self) -> Option<&'static str> {
+        Some(self.kind.program())
     }
     fn parameters(&self) -> serde_json::Value {
         shell_parameters("Shell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ShellArgs = crate::tool_args("bash", args)?;
+        let a: ShellArgs = crate::tool_args("shell", args)?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
-        let mut cmd = tokio::process::Command::new("bash");
+        let mut cmd = tokio::process::Command::new(self.kind.program());
         cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
         run_streamed_command(cmd, timeout, ctx).await
@@ -122,7 +179,7 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
 /// Spawn a configured command, streaming its stdout/stderr line-by-line to the
 /// UI sink while accumulating a length-bounded view of the output. Full output
 /// is written incrementally to an overflow file so the model can read/grep it
-/// even when the in-memory view is truncated. Shared by `bash` and `powershell`.
+/// even when the in-memory view is truncated. Used by the `shell` tool.
 async fn run_streamed_command(
     mut cmd: tokio::process::Command,
     timeout: Duration,
@@ -216,7 +273,7 @@ async fn run_streamed_command(
                     static COUNTER: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let p = overflow_dir.join(format!("bash-{stamp}-{seq}.txt"));
+                    let p = overflow_dir.join(format!("shell-{stamp}-{seq}.txt"));
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -380,91 +437,33 @@ fn cap_display(text: &str, max_bytes: usize, max_lines: usize, from_tail: bool) 
     crate::collect_lines(&lines, max_lines, max_bytes, from_tail)
 }
 
-/// The available shell tools for this machine (bash and/or PowerShell), only
-/// including a tool when its interpreter is actually on `PATH`.
+/// The shell tool for this machine as a 0-or-1 `Vec` (so the registry can
+/// register it in the same presence-gated loop as its other tools). `bash`
+/// first, then POSIX `sh`; empty when neither is on `PATH`.
 pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
-    let mut tools: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
+    detect_shell()
+        .map(|tool| vec![std::sync::Arc::new(tool) as std::sync::Arc<dyn Tool>])
+        .unwrap_or_default()
+}
+
+/// Resolve the session's shell from `PATH`: `bash`, then POSIX `sh`. `None`
+/// when neither exists (on Windows, install WSL or Git Bash).
+fn detect_shell() -> Option<ShellTool> {
     if which::which("bash").is_ok() {
-        tools.push(std::sync::Arc::new(BashTool));
+        Some(ShellTool::bash())
+    } else if which::which("sh").is_ok() {
+        Some(ShellTool::posix())
+    } else {
+        None
     }
-    if let Some(program) = detect_powershell() {
-        tools.push(std::sync::Arc::new(PowerShellTool { program }));
-    }
-    tools
 }
 
 /// The interpreter for a *user-typed* `!command` (the TUI's shell escape):
-/// `(program, leading args)`. Unix prefers `bash -c`; Windows prefers
-/// PowerShell (the `bash` on a Windows PATH is often the WSL stub, which
-/// fails without an installed distribution). `None` when no interpreter
-/// exists. The command string is appended as the final argument.
+/// `(program, leading args)` — the same shell the `shell` tool resolves to
+/// (`bash -c`, then `sh -c`). `None` when neither is on `PATH`. The command
+/// string is appended as the final argument.
 pub fn user_shell() -> Option<(String, Vec<String>)> {
-    let powershell = || {
-        detect_powershell().map(|p| {
-            (
-                p,
-                vec![
-                    "-NoProfile".to_string(),
-                    "-NonInteractive".to_string(),
-                    "-Command".to_string(),
-                ],
-            )
-        })
-    };
-    let bash = || {
-        which::which("bash")
-            .ok()
-            .map(|_| ("bash".to_string(), vec!["-c".to_string()]))
-    };
-    if cfg!(windows) {
-        powershell().or_else(bash)
-    } else {
-        bash().or_else(powershell)
-    }
-}
-
-/// Locate a PowerShell interpreter: prefer `pwsh` (PowerShell 7+, cross-platform)
-/// then `powershell` (Windows PowerShell). `None` if neither is on `PATH`.
-fn detect_powershell() -> Option<String> {
-    ["pwsh", "powershell"]
-        .into_iter()
-        .find(|p| which::which(p).is_ok())
-        .map(str::to_string)
-}
-
-// ---- powershell ----
-
-pub struct PowerShellTool {
-    program: String,
-}
-
-#[async_trait]
-impl Tool for PowerShellTool {
-    fn name(&self) -> &'static str {
-        "powershell"
-    }
-    fn description(&self) -> &'static str {
-        "Run a command via PowerShell (`pwsh`/`powershell`) in the working \
-         directory. Use for build, test, and anything without a dedicated tool, \
-         especially on Windows. Output is captured and length-bounded; large \
-         output is saved whole to a file and you get its path. Each call starts \
-         fresh in the working directory — `cd` does NOT persist between calls; \
-         chain it in one command or use paths from the cwd."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        shell_parameters("PowerShell command to run.")
-    }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ShellArgs = crate::tool_args("powershell", args)?;
-        if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
-            bail!("command blocked: {msg}");
-        }
-        let mut cmd = tokio::process::Command::new(&self.program);
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &a.command])
-            .current_dir(&ctx.cwd);
-        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
-        run_streamed_command(cmd, timeout, ctx).await
-    }
+    detect_shell().map(|s| (s.kind.program().to_string(), vec!["-c".to_string()]))
 }
 
 #[cfg(test)]
@@ -516,7 +515,7 @@ mod tests {
     }
 
     /// A shell command gets five minutes unless the model says otherwise — and the
-    /// schema *says so*, for both shells.
+    /// schema *says so*, for both shell backends.
     ///
     /// The default has to cover the commands actually worth running: a cold
     /// `cargo build`, a full test suite, an `npm install` on a fresh tree. At two
@@ -536,13 +535,10 @@ mod tests {
             "five minutes: long enough for a cold build, short enough to catch a hang"
         );
 
-        // Both shells, through the schema each actually advertises.
+        // Both backends, through the schema each actually advertises.
         let schemas = [
-            BashTool.parameters(),
-            PowerShellTool {
-                program: "pwsh".to_string(),
-            }
-            .parameters(),
+            ShellTool::bash().parameters(),
+            ShellTool::posix().parameters(),
         ];
         for schema in schemas {
             let desc = schema["properties"]["timeout_ms"]["description"]
@@ -615,7 +611,7 @@ mod tests {
         );
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
-        let out = BashTool
+        let out = ShellTool::bash()
             .execute(json!({"command": command, "timeout_ms": 300}), &ctx)
             .await
             .unwrap();
@@ -665,7 +661,7 @@ mod tests {
         // 50 lines of ~33 chars each (~1650 bytes total) — comfortably over
         // both caps, and small enough to stay under the 5x in-memory ring too
         // (so this exercises the final display trim, not the ring cap).
-        let result = BashTool
+        let result = ShellTool::bash()
             .execute(
                 serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
                 &c,

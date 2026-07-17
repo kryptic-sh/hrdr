@@ -10,6 +10,12 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
+**hrdr targets UNIX workflows.** The `shell` tool runs `bash` (or POSIX `sh`),
+and the guidance the model is given assumes a POSIX shell — where LLMs are
+strongest. Linux and macOS work out of the box. On Windows, run hrdr under
+**WSL** or install **Git Bash**; without one of those there is no shell tool and
+the agent can't run commands. PowerShell is intentionally not supported.
+
 > Active development. The agent loop, adaptive tool set, sub-agents, sessions,
 > config hot-reload, and a rich TUI are in place. hrdr connects to any running
 > OpenAI-compatible endpoint — a hosted provider or a server you run yourself
@@ -60,12 +66,12 @@ sudo rpm -i hrdr-*.rpm
   guard. The file tools otherwise have full filesystem access (hrdr runs in a
   codebase you trust); a process-level sandbox mode is planned. Token-bounded
   outputs and line-numbered reads for precise edits — and when
-  `bash`/`grep`/`git` output overflows, the **full** result is saved to a temp
+  `shell`/`grep`/`git` output overflows, the **full** result is saved to a temp
   file and the model is pointed at it (`read`/`grep`) instead of losing the
-  overflow. Tools that shell out are **presence-aware**: the shell tool is
-  `bash` and/or `powershell` depending on what's installed, and `grep` uses
-  ripgrep → POSIX grep → a built-in walker — so the model is only ever offered
-  tools it can actually run.
+  overflow. Tools that shell out are **presence-aware**: the single `shell` tool
+  runs `bash` (falling back to POSIX `sh`), and `grep` uses ripgrep → POSIX grep
+  → a built-in walker — so the model is only ever offered tools it can actually
+  run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
@@ -428,7 +434,7 @@ hrdr keeps context under control in three layers (modeled on opencode), all
 tunable in `config.toml`:
 
 ```toml
-# Per-tool output caps: over either limit, bash/grep/git output is truncated and
+# Per-tool output caps: over either limit, shell/grep/git output is truncated and
 # the full text saved to a temp file the model can read/grep. ~24 KB is ~6k
 # tokens — enough for a normal diff/status inline, small enough to catch a build
 # wall. Raise for fewer file hand-offs, lower for a leaner context.
@@ -788,7 +794,7 @@ instructions.
 
 ### Guardrails
 
-The shell tools mechanically reject the classic foot-guns before they run —
+The shell tool mechanically rejects the classic foot-guns before they run —
 blanket staging (`git add -A` / `--all` / `.`), force-push (`--force-with-lease`
 is allowed), hook skipping (`--no-verify`), destructive git commands
 (`reset --hard`, `clean -f`, `checkout/restore .`), interactive commands that
@@ -867,10 +873,10 @@ non-blocking warning. Hooks run sequentially, each bounded by its own
 | `session_end`   | on quit (after the final save)                 | —                              | —                                            |
 
 ```toml
-# Veto risky bash commands with your own policy script:
+# Veto risky shell commands with your own policy script:
 [[hooks]]
 event = "pre_tool"
-on = "bash"                  # tool-name filter (* = any tool)
+on = "shell"                 # tool-name filter (* = any tool)
 run = "./scripts/check-command.py"   # reads the JSON payload from stdin
 
 # Remind the model of house rules on every prompt:
@@ -956,14 +962,14 @@ definition can move it.)
 hrdr works with zero extra tools installed, but the agent is more capable when
 these are on `PATH`. It detects what's available and adapts.
 
-| Tool                           | Why                                                                                                               |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| **bash** and/or **PowerShell** | The shell tool. At least one lets the model run builds/tests/commands. `bash` on unix; `pwsh` runs anywhere.      |
-| **ripgrep** (`rg`)             | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.                    |
-| **git**                        | Repo awareness (branch in the status bar).                                                                        |
-| **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                                |
-| A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).                |
-| **infr** or **llama.cpp**      | Only to self-host a model locally — run one yourself (infr or `llama-server`). Not needed with a hosted provider. |
+| Tool                      | Why                                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **bash** (or POSIX `sh`)  | Backs the `shell` tool — lets the model run builds/tests/commands. Required on Windows via WSL or Git Bash.       |
+| **ripgrep** (`rg`)        | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.                    |
+| **git**                   | Repo awareness (branch in the status bar).                                                                        |
+| **`$EDITOR` / `$VISUAL`** | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                                |
+| A **Nerd Font**           | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).                |
+| **infr** or **llama.cpp** | Only to self-host a model locally — run one yourself (infr or `llama-server`). Not needed with a hosted provider. |
 
 `SEARXNG_URL` (optional) points `search` at a SearXNG instance for more reliable
 results than the zero-config DuckDuckGo default.
@@ -978,10 +984,11 @@ The shell and search tools adapt to the host:
 
 - **Linux / macOS** — `bash` + ripgrep is the typical setup; everything works
   out of the box.
-- **Windows** — PowerShell is always present, so the shell tool works, and the
-  built-in `grep` fallback means search works with nothing extra installed. For
-  parity with unix, optionally add **Git for Windows** (`bash`) and **ripgrep**
-  to `PATH`.
+- **Windows** — hrdr targets UNIX workflows, so run it under **WSL**, or install
+  **Git for Windows** so the `shell` tool has `bash`. Without one of those there
+  is no shell tool and the agent can't run commands (the rest of the TUI still
+  works). The built-in `grep` fallback means search works with nothing extra;
+  add **ripgrep** for speed.
 
 ## Status / roadmap
 

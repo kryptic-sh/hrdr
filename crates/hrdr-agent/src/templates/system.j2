@@ -388,12 +388,13 @@ Shell:
   away: run once, then search the saved output. (You only need to redirect to a
   file yourself if you want the output to outlive the tool call — hrdr's saved
   file is scratch and gets pruned.)
-- On PowerShell (not bash): its pipeline carries objects, not lines, so filter
-  with `Select-String` / `Where-Object`, not `grep`, and `Get-Content -Tail n`,
-  not `tail -n`. Native-command stderr becomes error records, so check
-  `$LASTEXITCODE` for a native tool's success rather than trusting a quiet
-  pipeline. Set `$ProgressPreference = 'SilentlyContinue'` when a command draws a
-  progress bar — it lands in the captured output otherwise.
+{%- if shell_posix %}
+- This session's shell is POSIX `sh`, NOT bash (see the Environment section) —
+  write portable POSIX and avoid bashisms: `[ … ]` not `[[ … ]]`, `=` not `==`
+  in `test`, `.` not `source`, no arrays, no `set -o pipefail`, no process
+  substitution (`<(…)`), no `${var,,}`/`${var^^}`. If you genuinely need bash,
+  invoke it explicitly (`bash -c '…'`) only once you've confirmed it exists.
+{%- endif %}
 {%- endif %}
 {%- endif %}
 

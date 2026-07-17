@@ -45,9 +45,9 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
-    BashTool, CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool,
-    MoveTool, PowerShellTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, TodoTool,
-    TreeTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs, user_shell,
+    CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
+    ReadTool, ReferencesTool, RenameTool, ReplaceTool, ShellTool, TodoTool, TreeTool, WatchTool,
+    WriteTool, available_shell_tools, redact_secret_diffs, user_shell,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -759,6 +759,14 @@ pub trait Tool: Send + Sync {
         self.read_only()
     }
 
+    /// If this is the `shell` tool, the interpreter it runs (`"bash"` or `"sh"`);
+    /// `None` for every other tool. Lets the prompt name the session's shell and
+    /// gate POSIX-`sh`-specific guidance, without the tool set knowing about
+    /// shell kinds.
+    fn shell_program(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Run the tool. A returned `Err` is surfaced to the model as a tool
     /// result, not propagated as a hard failure — the agent keeps going.
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
@@ -780,8 +788,16 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The default set: file/search/todo/web tools plus whichever shells are
-    /// actually available on this machine (`bash` and/or `powershell`).
+    /// The interpreter the registered `shell` tool runs (`"bash"` or `"sh"`), or
+    /// `None` when no shell tool is present (a read-only agent, or a machine with
+    /// no shell on `PATH`). Drives the prompt's shell gating and the Environment
+    /// block's `Shell:` line.
+    pub fn shell_program(&self) -> Option<&'static str> {
+        self.tools.values().find_map(|t| t.shell_program())
+    }
+
+    /// The default set: file/search/todo/web tools plus the `shell` tool when a
+    /// shell (`bash`, or POSIX `sh`) is available on this machine.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
@@ -1556,7 +1572,7 @@ mod tests {
         // … but the mutating ones never are.
         assert!(!ro.iter().any(|n| n == "write"));
         assert!(!ro.iter().any(|n| n == "edit"));
-        assert!(!ro.iter().any(|n| n == "bash"));
+        assert!(!ro.iter().any(|n| n == "shell"));
     }
 
     #[test]

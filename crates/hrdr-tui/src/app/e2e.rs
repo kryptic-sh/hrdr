@@ -945,7 +945,7 @@ async fn scroll_offset_clamped_to_max_scroll_after_render() {
 async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     let mut h = Harness::new(vec![
         MockReply::ToolCall {
-            name: "bash".into(),
+            name: "shell".into(),
             args: r#"{"command":"echo hi"}"#.into(),
         },
         MockReply::Text("done".into()),
@@ -1024,7 +1024,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
 
     // The tool block: status mark + name on the header, command below it, both
     // on the tool background.
-    let tool_y = find_row("✓ bash").expect("tool header rendered");
+    let tool_y = find_row("✓ shell").expect("tool header rendered");
     assert_eq!(
         bg_at(0, tool_y),
         theme.user_bg,

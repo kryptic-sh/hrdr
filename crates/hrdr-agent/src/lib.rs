@@ -3921,7 +3921,7 @@ mod tests {
         assert!(tools.iter().any(|n| n == "grep"));
         assert!(!tools.iter().any(|n| n == "write"));
         assert!(!tools.iter().any(|n| n == "edit"));
-        assert!(!tools.iter().any(|n| n == "bash"));
+        assert!(!tools.iter().any(|n| n == "shell"));
         // A read-only sub-agent can't itself delegate.
         assert!(!tools.iter().any(|n| n == "task"));
         // The persona made it into the system prompt.
@@ -3947,7 +3947,7 @@ mod tests {
         assert!(tools.iter().any(|n| n == "read"));
         assert!(!tools.iter().any(|n| n == "write"));
         assert!(!tools.iter().any(|n| n == "edit"));
-        assert!(!tools.iter().any(|n| n == "bash"));
+        assert!(!tools.iter().any(|n| n == "shell"));
         assert!(system_prompt(&agent).contains("PLAN sub-agent"));
     }
 
@@ -4224,7 +4224,7 @@ mod tests {
         // A general sub-agent has the full set, shell included…
         let general = tools("general");
         for t in [
-            "bash", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+            "shell", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
         ] {
             assert!(general.contains(&t.to_string()), "general should have {t}");
         }
@@ -4237,21 +4237,20 @@ mod tests {
         // `coder` is write-capable like `general` — same full set, shell included.
         let coder = tools("coder");
         for t in [
-            "bash", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+            "shell", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
         ] {
             assert!(coder.contains(&t.to_string()), "coder should have {t}");
         }
         assert!(!coder.contains(&"task".to_string()), "no nested delegation");
 
-        // No sub-agent gets `bash` unless it is write-capable in the first place.
+        // No sub-agent gets the `shell` tool unless it is write-capable in the
+        // first place.
         for ro in ["explore", "review", "plan"] {
             let t = tools(ro);
-            for shell in ["bash", "powershell"] {
-                assert!(
-                    !t.contains(&shell.to_string()),
-                    "{ro} must not have {shell}"
-                );
-            }
+            assert!(
+                !t.contains(&"shell".to_string()),
+                "{ro} must not have the shell tool"
+            );
             assert!(!t.contains(&"task".to_string()), "{ro} must not delegate");
         }
     }

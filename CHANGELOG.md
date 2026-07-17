@@ -6,8 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **One `shell` tool; hrdr is UNIX-first.** The separate `bash` and `powershell`
+  tools collapse into a single platform-agnostic `shell` tool that runs whatever
+  shell was auto-detected — `bash`, falling back to POSIX `sh`. Its name is
+  always `shell`; its description and a new `Shell:` line in the prompt's
+  Environment block name the actual interpreter, and the system prompt gains a
+  gated POSIX-`sh` section warning off bashisms when only `sh` is present.
+  Frontends key shell rendering off the `shell` tool name, and the TUI `!`
+  escape and hooks (`on = "shell"`) follow. hrdr now explicitly targets UNIX
+  workflows; on Windows use WSL or Git Bash (without a shell the agent can't run
+  commands, but the rest of the TUI still works).
+
 ### Removed
 
+- **PowerShell support removed.** The `PowerShellTool`, its `pwsh`/`powershell`
+  detection, and the PowerShell-specific prompt note are gone — LLMs are
+  strongest on bash/POSIX and PowerShell was a standing maintenance burden. The
+  `shell` tool is bash-or-`sh` only.
 - **Extension-scoped writes (`write_ext`) removed.** The `write_ext` field on
   sub-agent profiles (config `[[subagent]]`, agent-file frontmatter) and on
   `AgentConfig`, plus `ToolContext::write_allow_ext` and

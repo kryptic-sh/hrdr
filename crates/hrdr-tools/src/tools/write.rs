@@ -60,7 +60,7 @@ impl Tool for WriteTool {
                      has a line over {MAX_LINE} bytes, `read` clips that line every time no \
                      matter how it's paged, so it can never be marked fully read — retrying \
                      read then write will loop forever; use `edit` (targets known text, not \
-                     the whole file) or `bash` instead",
+                     the whole file) or `shell` instead",
                     path.display()
                 ),
                 crate::ReadState::Stale => bail!(
@@ -129,7 +129,7 @@ mod tests {
     /// *permanently* `Partial` (`read` clips that line every time, no matter
     /// how it's paged — see `read.rs`), so the generic "read it in full"
     /// advice can never be satisfied and the model would loop forever on
-    /// read-then-write. The refusal must instead point at `edit`/`bash`.
+    /// read-then-write. The refusal must instead point at `edit`/`shell`.
     #[tokio::test]
     async fn write_refusal_on_an_over_long_line_points_at_edit_not_a_reread() {
         let dir = tempfile::tempdir().unwrap();
@@ -156,7 +156,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("edit") && err.contains("bash"),
+            err.contains("edit") && err.contains("shell"),
             "the refusal must point at a workaround that can actually succeed: {err}"
         );
         assert!(

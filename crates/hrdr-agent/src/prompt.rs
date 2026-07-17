@@ -44,6 +44,10 @@ pub fn render_system(
     let tmpl = env.get_template("system")?;
 
     let has = |name: &str| tools.defs().iter().any(|d| d.function.name == name);
+    // The interpreter the `shell` tool runs (`"bash"`/`"sh"`), or `None` when the
+    // agent has no shell (read-only, or no shell on PATH). Read from the tool set
+    // itself so the prompt agrees with what was actually registered.
+    let shell_program = tools.shell_program();
 
     let rendered = tmpl
         .render(context! {
@@ -59,13 +63,12 @@ pub fn render_system(
             // an isolated worktree and must hand back a clean, properly-committed
             // git history (see the sub-agent commit section).
             is_subagent => is_subagent,
-            // The shell section only renders when a shell exists — `bash` and
-            // `powershell` are registered only when their interpreter is on PATH,
-            // so this asks the same question the tool set already answered. We
-            // don't split bash from PowerShell: the PowerShell-specific note is a
-            // handful of lines and rides along whenever a shell is present, which
-            // keeps one fewer gate in the prompt and one fewer divergence axis.
-            has_shell => has("bash") || has("powershell"),
+            // The shell section only renders when the `shell` tool is present (a
+            // write agent on a machine with a shell on PATH). `shell_posix` gates
+            // an extra pitfall note shown only when the shell is plain POSIX `sh`
+            // rather than bash — the general shell guidance assumes bash.
+            has_shell => shell_program.is_some(),
+            shell_posix => shell_program == Some("sh"),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -103,11 +106,19 @@ pub fn append_environment(mut system: String, cwd: &Path, tools: &ToolRegistry) 
     // wrong in changelog dates, copyright headers, and anything date-relative.
     // Re-rendered each session (and on /clear).
     let date = chrono::Local::now().format("%Y-%m-%d");
+    // Name the shell the `shell` tool runs, so the model writes for it — but only
+    // when the agent actually has a shell (a read-only agent gets no line). Goes
+    // before the working directory so `cwd` stays the volatile tail.
+    let shell_line = match tools.shell_program() {
+        Some("sh") => "\n- Shell: sh (POSIX — avoid bashisms)",
+        Some(_) => "\n- Shell: bash",
+        None => "",
+    };
     system.push_str(&format!(
         "\n\nEnvironment:\n\
          - Tools available: {tool_names}\n\
          - OS: {os}\n\
-         - Date: {date}\n\
+         - Date: {date}{shell_line}\n\
          - Working directory: {cwd}",
         os = os_context(),
         cwd = cwd.display(),
@@ -630,21 +641,18 @@ mod tests {
         assert!(!p.contains(".log` 2>&1"), "no manual redirect syntax: {p}");
     }
 
-    /// The Shell section — including the PowerShell note — renders exactly when a
-    /// shell exists, under one `has_shell` gate.
+    /// The Shell section renders when a shell exists, and the POSIX-`sh` pitfall
+    /// note renders only when the shell is plain `sh` rather than bash.
     ///
-    /// `bash` and `powershell` are registered only when their interpreter is on
-    /// PATH, so the prompt keys off the tool set. We deliberately do NOT split
-    /// bash from PowerShell: the PowerShell-specific note is a few lines and rides
-    /// along whenever any shell is present, trading a little dead advice on a
-    /// bash-only box for one fewer gate (and one fewer divergence axis).
+    /// The single `shell` tool is registered only when a shell is on PATH, so the
+    /// prompt keys off the tool set. The general shell guidance assumes bash; the
+    /// extra `shell_posix` note warns off bashisms when only `sh` is present.
     #[test]
     fn the_shell_rules_match_the_shell_the_machine_has() {
-        // Drive the single gate directly: which shell tool exists depends on the
-        // machine (there is no PowerShell on a stock Linux CI box, and no way to
-        // register a tool whose interpreter isn't on PATH), so the test asserts the
-        // gate's effect rather than a particular machine's shell.
-        let render = |has_shell: bool| -> String {
+        // Drive the gates directly rather than depending on the test machine's
+        // shell: `has_shell` (is there a shell at all) and `shell_posix` (is it
+        // plain POSIX `sh`).
+        let render = |has_shell: bool, shell_posix: bool| -> String {
             let mut env = Environment::new();
             env.add_template("system", SYSTEM_TEMPLATE).unwrap();
             env.get_template("system")
@@ -656,50 +664,53 @@ mod tests {
                     can_write => true,
                     can_delegate => false,
                     has_shell => has_shell,
+                    shell_posix => shell_posix,
                     instructions => None::<&str>,
                 })
                 .unwrap()
         };
 
-        // A shell exists: the Shell section, the run-raw rule (once), and the
-        // PowerShell note all render.
-        let p = render(true);
+        // bash shell: the Shell section and the run-raw rule (once), and NO
+        // POSIX-sh note.
+        let p = render(true, false);
         assert!(p.contains("Shell:"), "{p}");
-        assert!(p.contains("On PowerShell (not bash)"), "{p}");
+        assert!(!p.contains("POSIX `sh`, NOT bash"), "{p}");
         assert_eq!(
             p.matches("Run a slow or noisy command once, raw").count(),
             1,
             "the run-raw rule is stated once, shell-agnostic"
         );
 
-        // No shell: no Shell section, and so no PowerShell note either.
-        let p = render(false);
+        // POSIX sh: the Shell section plus the bashism warning.
+        let p = render(true, true);
+        assert!(p.contains("Shell:"), "{p}");
+        assert!(p.contains("POSIX `sh`, NOT bash"), "{p}");
+
+        // No shell: no Shell section, and so no POSIX note either.
+        let p = render(false, false);
         assert!(!p.contains("Shell:"), "{p}");
-        assert!(!p.contains("On PowerShell (not bash)"), "{p}");
+        assert!(!p.contains("POSIX `sh`, NOT bash"), "{p}");
     }
 
-    /// The gate is wired to the tool set, not to a guess about the platform.
-    ///
-    /// `bash` and `powershell` are registered only when their interpreter is on
-    /// PATH, so "does this agent have a shell" is a question the registry has
-    /// already answered. The Shell section — PowerShell note included — appears
-    /// exactly when a shell tool does.
+    /// The gate is wired to the tool set, not to a guess about the platform. The
+    /// single `shell` tool is registered only when a shell is on PATH, so the
+    /// Shell section appears exactly when the registry has a `shell` tool, and the
+    /// POSIX-`sh` note exactly when that tool runs `sh`.
     #[test]
     fn the_shell_gates_follow_the_registered_tools() {
         let tools = ToolRegistry::with_defaults();
-        let names: Vec<String> = tools.defs().into_iter().map(|d| d.function.name).collect();
         let p = render_system(&tools, None, false).unwrap();
 
-        let has_shell = names.iter().any(|n| n == "bash" || n == "powershell");
+        let shell = tools.shell_program();
         assert_eq!(
-            has_shell,
+            shell.is_some(),
             p.contains("Shell:"),
             "the Shell section appears exactly when a shell tool does"
         );
         assert_eq!(
-            has_shell,
-            p.contains("On PowerShell (not bash)"),
-            "the PowerShell note rides along with the Shell section, under one gate"
+            shell == Some("sh"),
+            p.contains("POSIX `sh`, NOT bash"),
+            "the POSIX-sh note appears exactly when the shell tool runs `sh`"
         );
     }
 
@@ -1215,6 +1226,39 @@ mod tests {
         );
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(p.contains(&format!("- Date: {today}")), "{p}");
+    }
+
+    /// The Environment block names the session's shell, so the model writes for
+    /// it — but only when the agent actually has one. A write agent on any dev
+    /// machine has a shell (`bash` here); a read-only agent has none and gets no
+    /// `Shell:` line.
+    #[test]
+    fn the_environment_names_the_shell_only_when_there_is_one() {
+        let tools = ToolRegistry::with_defaults();
+        let shell = tools.shell_program().expect("a dev machine has a shell");
+        let write = append_environment(
+            render_system(&tools, None, false).unwrap(),
+            Path::new("/tmp/x"),
+            &tools,
+        );
+        let expected = if shell == "sh" {
+            "- Shell: sh (POSIX — avoid bashisms)"
+        } else {
+            "- Shell: bash"
+        };
+        assert!(write.contains(expected), "{write}");
+
+        // A read-only agent has no shell tool → no line.
+        let mut ro = ToolRegistry::with_defaults();
+        let names = ro.read_only_names();
+        ro.retain_only(&names);
+        assert!(ro.shell_program().is_none());
+        let read = append_environment(
+            render_system(&ro, None, false).unwrap(),
+            Path::new("/tmp/x"),
+            &ro,
+        );
+        assert!(!read.contains("- Shell:"), "{read}");
     }
 
     /// The persona is stated to win over the base prompt on conflict.

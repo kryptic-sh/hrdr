@@ -238,7 +238,7 @@ mod unix_time {
 /// Extract the `command` field from a JSON tool-args string, if any.
 /// Returns `None` for non-shell tools or malformed args.
 pub fn extract_shell_command(name: &str, args: &str) -> Option<String> {
-    if name != "bash" && name != "powershell" {
+    if name != "shell" {
         return None;
     }
     serde_json::from_str::<serde_json::Value>(args)
@@ -298,7 +298,7 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
         body: ToolBody::Text,
     };
     match name {
-        "bash" | "powershell" => ToolDisplay {
+        "shell" => ToolDisplay {
             headline: String::new(),
             body: ToolBody::Shell {
                 command: arg_str(&v, "command").unwrap_or_default(),
@@ -779,7 +779,7 @@ mod tool_display_tests {
 
     #[test]
     fn shell_puts_the_command_in_the_body_not_the_headline() {
-        let d = tool_display("bash", r#"{"command":"ls -la"}"#);
+        let d = tool_display("shell", r#"{"command":"ls -la"}"#);
         assert!(d.headline.is_empty());
         assert_eq!(
             d.body,

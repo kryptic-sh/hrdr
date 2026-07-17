@@ -3822,13 +3822,13 @@ mod block_tests {
 
     /// Shell calls render the command verbatim on its own rows, with the
     /// command's output below it. No `$ ` prompt — the block's header says
-    /// `bash` already.
+    /// `shell` already.
     #[test]
     fn shell_tool_shows_the_command_then_its_output() {
         let t = Theme::default();
         let lines = tool_lines(
             &t,
-            "bash",
+            "shell",
             r#"{"command":"ls\nwc -l"}"#,
             "a.rs\nb.rs",
             true,
@@ -3837,7 +3837,7 @@ mod block_tests {
             "",
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
-        assert_eq!(rows[0].trim(), "✓ bash", "no args preview on the header");
+        assert_eq!(rows[0].trim(), "✓ shell", "no args preview on the header");
         assert_eq!(rows[1], "ls", "the command, verbatim");
         assert_eq!(rows[2], "wc -l", "its continuation lines too");
         assert_eq!(rows[3], "a.rs");
