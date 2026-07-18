@@ -21,9 +21,13 @@ struct PendingGuard<'a> {
     done: bool,
 }
 
-impl PendingGuard<'_> {
-    fn new(pending: &Pending, id: u64) -> Self {
-        Self { pending, id, done: false }
+impl<'a> PendingGuard<'a> {
+    fn new(pending: &'a Pending, id: u64) -> Self {
+        Self {
+            pending,
+            id,
+            done: false,
+        }
     }
     fn disarm(&mut self) {
         self.done = true;
@@ -32,10 +36,10 @@ impl PendingGuard<'_> {
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        if !self.done {
-            if let Ok(mut p) = self.pending.try_lock() {
-                p.remove(&self.id);
-            }
+        if !self.done
+            && let Ok(mut p) = self.pending.try_lock()
+        {
+            p.remove(&self.id);
         }
     }
 }

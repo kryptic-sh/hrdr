@@ -1800,8 +1800,7 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
