@@ -1754,54 +1754,285 @@ pub(crate) fn is_openrouter(base_url: &str) -> bool {
 
 /// Set `key = value` in the user config file (creating it if needed), preserving
 /// existing keys, ordering, and comments. Returns the file path.
+///
+/// Errors (and changes nothing on disk) when the existing file is not valid
+/// TOML — see [`persist_setting_at`].
 pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathBuf> {
     let path =
         config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
-    let mut doc = read_config_doc(&path);
+    persist_setting_at(&path, key, value)?;
+    Ok(path)
+}
+
+/// Remove `key` from the user config file (if present). Returns the file path.
+///
+/// Errors (and changes nothing on disk) when the existing file is not valid
+/// TOML — see [`remove_setting_at`].
+pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
+    let path =
+        config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
+    remove_setting_at(&path, key)?;
+    Ok(path)
+}
+
+/// [`persist_setting`] against an explicit path — the whole read-modify-write,
+/// run under the cross-process config lock.
+///
+/// The lock is taken *before* the read and held past the rename, so a second
+/// process re-reads the file the first one wrote instead of overwriting a stale
+/// snapshot (the lost-update this used to have). Contention is bounded: see
+/// [`StoreLock::acquire`](crate::store_lock::StoreLock::acquire), which retries
+/// briefly and then errors rather than blocking forever.
+pub(crate) fn persist_setting_at(
+    path: &std::path::Path,
+    key: &str,
+    value: ConfigValue,
+) -> Result<()> {
+    let _lock = lock_config(path)?;
+    let mut doc = read_config_doc(path)?;
     match value {
         ConfigValue::Str(s) => doc[key] = toml_edit::value(s),
         ConfigValue::Bool(b) => doc[key] = toml_edit::value(b),
         ConfigValue::Float(f) => doc[key] = toml_edit::value(f),
         ConfigValue::Int(i) => doc[key] = toml_edit::value(i),
     }
-    write_config_doc(&path, &doc)?;
-    Ok(path)
+    write_config_doc(path, &doc)
 }
 
-/// Remove `key` from the user config file (if present). Returns the file path.
-pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
-    let path =
-        config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
-    let mut doc = read_config_doc(&path);
+/// [`remove_setting`] against an explicit path, under the same lock and with the
+/// same malformed-file refusal as [`persist_setting_at`].
+pub(crate) fn remove_setting_at(path: &std::path::Path, key: &str) -> Result<()> {
+    let _lock = lock_config(path)?;
+    let mut doc = read_config_doc(path)?;
     doc.remove(key);
-    write_config_doc(&path, &doc)?;
-    Ok(path)
+    write_config_doc(path, &doc)
 }
 
-pub(crate) fn read_config_doc(path: &std::path::Path) -> toml_edit::DocumentMut {
+/// Take the cross-process write lock for the config file, creating its parent
+/// directory first (the lock is a sibling file, so the directory must exist).
+fn lock_config(path: &std::path::Path) -> Result<crate::store_lock::StoreLock> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    crate::store_lock::StoreLock::acquire(path)
+}
+
+/// Parse the config file into an editable document, preserving comments and
+/// ordering.
+///
+/// A missing file yields an empty document — that is how the first
+/// `/theme`-style command creates one. Anything else is an **error**, never a
+/// silently-empty document: a file we could not read or could not parse may
+/// still hold every setting the user wrote, and returning a default here is what
+/// let the next write erase it. The malformed file is copied to a `.bak` sibling
+/// as a safety net, but the original is left exactly as it was and the caller is
+/// told to fix it.
+pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return toml_edit::DocumentMut::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(toml_edit::DocumentMut::default());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading config file {}", path.display()));
+        }
     };
     match content.parse::<toml_edit::DocumentMut>() {
-        Ok(doc) => doc,
-        Err(_) => {
-            // Back up the malformed file before returning empty.
-            let backup = path.with_extension("toml.bak");
-            let _ = std::fs::copy(path, &backup);
-            toml_edit::DocumentMut::default()
+        Ok(doc) => Ok(doc),
+        Err(e) => {
+            // Keep a copy so a hand-mangled file is still recoverable, then
+            // refuse: overwriting it with a default document would drop every
+            // setting it holds.
+            let backup = backup_path(path);
+            let saved = std::fs::copy(path, &backup).is_ok();
+            let note = if saved {
+                format!(" (a copy was saved to {})", backup.display())
+            } else {
+                String::new()
+            };
+            Err(anyhow::anyhow!(
+                "config file {} is not valid TOML: {e}{note} — refusing to overwrite it; \
+                 fix or remove the file and retry",
+                path.display()
+            ))
         }
     }
 }
 
+/// The `.bak` sibling a malformed config is copied to before we refuse to write.
+fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Write `doc` over `path` atomically: build it in a unique sibling temp file,
+/// then rename that onto the target.
+///
+/// The temp name comes from [`hrdr_llm::unique_sibling_path`] (PID + a
+/// process-wide counter), so two writers racing on the same config never build
+/// their new contents in the same scratch file — a fixed `.tmp` name let one
+/// writer's half-written bytes get renamed into place by the other.
 pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension("toml.tmp");
+    let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
     std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Don't leave the scratch file behind when the rename is the thing that
+        // failed (a read-only directory, a cross-device target).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn doc_of(path: &std::path::Path) -> toml_edit::DocumentMut {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap()
+    }
+
+    /// The lost-update this finding is about: two writers doing an unsynchronized
+    /// read-modify-write each keep their own snapshot, and the later rename drops
+    /// the earlier writer's key. Under the lock every key survives.
+    #[test]
+    fn concurrent_writers_do_not_lose_each_others_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "existing = \"kept\"\n").unwrap();
+
+        let keys = ["theme", "model", "provider", "effort", "todo_ttl", "temp"];
+        std::thread::scope(|s| {
+            for key in keys {
+                let path = path.clone();
+                s.spawn(move || {
+                    persist_setting_at(&path, key, ConfigValue::Str(key)).unwrap();
+                });
+            }
+        });
+
+        let doc = doc_of(&path);
+        for key in keys {
+            assert_eq!(
+                doc.get(key).and_then(|v| v.as_str()),
+                Some(key),
+                "writer for '{key}' was lost; file:\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
+        assert_eq!(doc["existing"].as_str(), Some("kept"));
+    }
+
+    /// A removal is serialized against a concurrent write the same way, and both
+    /// effects survive.
+    #[test]
+    fn concurrent_write_and_remove_both_take_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"old\"\nkeep = 1\n").unwrap();
+
+        std::thread::scope(|s| {
+            let p = path.clone();
+            s.spawn(move || persist_setting_at(&p, "model", ConfigValue::Str("m")).unwrap());
+            let p = path.clone();
+            s.spawn(move || remove_setting_at(&p, "theme").unwrap());
+        });
+
+        let doc = doc_of(&path);
+        assert_eq!(doc["model"].as_str(), Some("m"));
+        assert!(doc.get("theme").is_none(), "removal was lost");
+        assert_eq!(doc["keep"].as_integer(), Some(1));
+    }
+
+    /// Two writers must never build their new contents in the same scratch file
+    /// (the old fixed `*.toml.tmp`), and a completed write leaves none behind.
+    #[test]
+    fn temp_paths_are_unique_and_cleaned_up() {
+        let path = std::path::Path::new("/cfg/config.toml");
+        let a = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
+        let b = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
+        assert_ne!(a, b, "concurrent writers must not share a temp path");
+        assert_eq!(a.parent(), path.parent(), "temp must be a sibling");
+        assert_ne!(a, path.with_extension("toml.tmp"), "no fixed temp name");
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("config.toml");
+        persist_setting_at(&real, "theme", ConfigValue::Str("dark")).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files after write: {leftovers:?}"
+        );
+    }
+
+    /// A malformed config is reported, not reset: the original bytes stay on
+    /// disk and a `.bak` copy is left as a safety net.
+    #[test]
+    fn malformed_config_is_reported_and_left_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "theme = \"solarized\"\nthis is not = = toml\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = persist_setting_at(&path, "theme", ConfigValue::Str("dark"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not valid TOML"), "{err}");
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the malformed config must be left byte-for-byte intact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.bak")).unwrap(),
+            original,
+            "a recoverable copy must be kept"
+        );
+
+        // A removal refuses the same way.
+        assert!(remove_setting_at(&path, "theme").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// The happy paths still work: a missing file is created, and an existing
+    /// file keeps its comments and unrelated keys.
+    #[test]
+    fn persist_creates_and_preserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        persist_setting_at(&path, "theme", ConfigValue::Str("dark")).unwrap();
+        assert_eq!(doc_of(&path)["theme"].as_str(), Some("dark"));
+
+        std::fs::write(&path, "# keep me\nother = true\ntheme = \"dark\"\n").unwrap();
+        persist_setting_at(&path, "theme", ConfigValue::Str("light")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        assert!(text.contains("other = true"), "{text}");
+        assert_eq!(doc_of(&path)["theme"].as_str(), Some("light"));
+
+        remove_setting_at(&path, "theme").unwrap();
+        assert!(doc_of(&path).get("theme").is_none());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# keep me")
+        );
+    }
 }

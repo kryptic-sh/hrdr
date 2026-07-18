@@ -147,7 +147,11 @@ pub trait CommandHost {
     /// Persist one setting to the user config file. Default writes directly;
     /// the TUI overrides to also suppress its config hot-reload.
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
-        let _ = hrdr_agent::persist_setting(key, value);
+        if let Err(e) = hrdr_agent::persist_setting(key, value) {
+            // A malformed config is refused rather than overwritten, so this is
+            // the only place the user learns the setting did not stick.
+            self.info(format!("couldn't save '{key}' to config: {e}"));
+        }
     }
     /// The reasoning-effort label shown in status chrome.
     fn effort(&self) -> Option<String> {
@@ -226,7 +230,9 @@ pub trait CommandHost {
     /// Remove one setting from the user config file (`/theme` reset). Default
     /// writes directly; the TUI overrides to suppress its hot-reload.
     fn unpersist_setting(&mut self, key: &str) {
-        let _ = hrdr_agent::remove_setting(key);
+        if let Err(e) = hrdr_agent::remove_setting(key) {
+            self.info(format!("couldn't update config: {e}"));
+        }
     }
 
     /// Open `path` in an editor (`/edit`). The default launches the OS default
