@@ -8,7 +8,7 @@
 //! placeholder is absent and arguments were given, with them appended on their
 //! own line). Discovery mirrors the sub-agent files: project dirs first, then
 //! user dirs, hrdr → Claude Code → opencode conventions, then hrdr's own
-//! built-in skills (`:commit`, `:release`, `:review`) last — deduped by name
+//! built-in skills (`:commit`, `:release`, `:review`, `:audit`) last — deduped by name
 //! (first source wins), so a user or project file always overrides a
 //! built-in of the same name.
 
@@ -16,13 +16,14 @@ use std::path::{Path, PathBuf};
 
 // The skills hrdr ships with, baked into the binary via `include_str!` — the
 // same convention `hrdr_agent::prompt` uses for `system.j2` — so a fresh
-// install has a working `:commit`, `:release`, `:review` with no setup.
+// install has a working `:commit`, `:release`, `:review`, `:audit` with no setup.
 // Content lives in `templates/skills/*.md`, not here: keep the prompt text in
 // Markdown (reviewable, diffable, editable without touching Rust) and this
 // file to parsing/wiring only.
 const BUILTIN_COMMIT: &str = include_str!("templates/skills/commit.md");
 const BUILTIN_RELEASE: &str = include_str!("templates/skills/release.md");
 const BUILTIN_REVIEW: &str = include_str!("templates/skills/review.md");
+const BUILTIN_AUDIT: &str = include_str!("templates/skills/audit.md");
 
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +105,8 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     out
 }
 
-/// hrdr's built-in skills — `:commit`, `:release`, `:review` — parsed from the
-/// Markdown templates baked into the binary at compile time. Always three
+/// hrdr's built-in skills — `:commit`, `:release`, `:review`, `:audit` — parsed from the
+/// Markdown templates baked into the binary at compile time. Always four
 /// entries (each template is a checked-in, non-empty file, so parsing cannot
 /// fail); sorted by name like a scanned directory's entries are, so their
 /// relative order matches wherever they'd sit if they were plain files on
@@ -115,6 +116,7 @@ pub fn builtin_skills() -> Vec<Skill> {
         (BUILTIN_COMMIT, "commit"),
         (BUILTIN_RELEASE, "release"),
         (BUILTIN_REVIEW, "review"),
+        (BUILTIN_AUDIT, "audit"),
     ]
     .into_iter()
     .filter_map(|(text, stem)| parse_skill_file(text, stem, "built-in"))
@@ -501,16 +503,16 @@ mod tests {
         assert!(!skills.iter().any(|s| s.name == "notes"));
     }
 
-    /// The three built-in templates each parse into a usable skill: a name,
-    /// a non-empty description and body, and — for `release`/`review`, whose
+    /// The four built-in templates each parse into a usable skill: a name,
+    /// a non-empty description and body, and — for `release`/`review`/`audit`, whose
     /// templates declare `args:` — the completion candidates the popup should
     /// offer after `:name `. `commit` declares none, so its list is empty.
     #[test]
     fn builtins_parse_with_names_descriptions_bodies_and_args() {
         let skills = builtin_skills();
-        assert_eq!(skills.len(), 3, "commit, release, review");
+        assert_eq!(skills.len(), 4, "audit, commit, release, review");
 
-        for name in ["commit", "release", "review"] {
+        for name in ["audit", "commit", "release", "review"] {
             let s = skills
                 .iter()
                 .find(|s| s.name == name)
@@ -537,18 +539,22 @@ mod tests {
             skills.iter().find(|s| s.name == "review").unwrap().args,
             vec!["low", "high"]
         );
+        assert_eq!(
+            skills.iter().find(|s| s.name == "audit").unwrap().args,
+            vec!["low", "high"]
+        );
     }
 
     /// `discover_skills` on a cwd with no skill directories at all still
-    /// returns the three built-ins — the whole point of shipping them is that
-    /// `:commit`/`:release`/`:review` work with zero setup.
+    /// returns the four built-ins — the whole point of shipping them is that
+    /// `:commit`/`:release`/`:review`/`:audit` work with zero setup.
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
         let skills = discover_skills(dir.path());
         let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["commit", "release", "review"]);
+        assert_eq!(names, vec!["audit", "commit", "release", "review"]);
         assert!(skills.iter().all(|s| s.source == "built-in"));
     }
 
@@ -566,7 +572,7 @@ mod tests {
         let commit = skills.iter().find(|s| s.name == "commit").unwrap();
         assert_eq!(commit.body, "project commit wins");
         assert_ne!(commit.source, "built-in");
-        // The other two built-ins are still present, unshadowed.
+        // The other three built-ins are still present, unshadowed.
         assert!(
             skills
                 .iter()

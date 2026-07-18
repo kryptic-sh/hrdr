@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`:audit` built-in skill.** New `:audit` skill for auditing a codebase for
+  security vulnerabilities, bugs, and correctness issues. Accepts `low`/`high`
+  depth argument like `:review`.
+
 ### Fixed
 
 - **Release pipeline gate: `leak-guard`, `smoke`, and `test` now block
