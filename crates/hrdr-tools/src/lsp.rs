@@ -859,9 +859,15 @@ pub fn parse_locations(result: &Value) -> Result<Vec<LspLocation>> {
 /// `documentChanges` array form) into per-file edit lists. Errors on file
 /// create/rename/delete operations — hrdr applies text edits only.
 pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdits>> {
+    // Canonicalize BOTH sides before comparing. Canonicalizing only the target
+    // breaks wherever the workspace path itself contains a symlink: on macOS a
+    // temp dir under `/var/folders/…` canonicalizes to `/private/var/folders/…`,
+    // so a legitimate in-workspace rename compared against the raw `cwd` looks
+    // like an escape and is refused.
+    let base = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let check_confined = |path: &Path| -> Result<()> {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !canon.starts_with(cwd) {
+        if !canon.starts_with(&base) {
             anyhow::bail!("rename target {} is outside the workspace", path.display());
         }
         Ok(())
@@ -1400,6 +1406,52 @@ mod tests {
         assert_eq!(many.len(), 2);
         assert_eq!(many[1].path, PathBuf::from("/p/b.rs"));
         assert!(parse_locations(&Value::Null).unwrap().is_empty());
+    }
+
+    /// Rename confinement compares canonical paths on BOTH sides.
+    ///
+    /// Regression, and a CI-only one: canonicalizing only the target breaks
+    /// wherever the workspace path itself contains a symlink. On macOS a temp
+    /// dir under `/var/folders/…` canonicalizes to `/private/var/folders/…`, so
+    /// a legitimate in-workspace rename compared against the raw `cwd` looked
+    /// like an escape and was refused — `nav_tools_ride_the_language_server`
+    /// failed on macos-latest and nowhere else. This reproduces it on any
+    /// platform with an explicit symlinked workspace root, so the fix cannot
+    /// regress on a Linux-only `cargo test`.
+    #[test]
+    #[cfg(unix)]
+    fn confinement_resolves_a_symlinked_workspace_root() {
+        let real = tempfile::tempdir().unwrap();
+        let target = real.path().join("main.xyz");
+        std::fs::write(&target, "let boom = 1;\n").unwrap();
+
+        // A symlink standing in for the workspace root, as macOS's `/var` does.
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("ws");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let we = serde_json::json!({"changes": {
+        format!("file://{}", target.display()): [
+            {"range": {"start": {"line": 0, "character": 4},
+                       "end": {"line": 0, "character": 8}}, "newText": "blast"}
+        ]}});
+        let files = parse_workspace_edit(&we, &link)
+            .expect("an in-workspace rename must pass through a symlinked cwd");
+        assert_eq!(files.len(), 1);
+
+        // The guard still refuses a genuine escape.
+        let outside = tempfile::tempdir().unwrap();
+        let evil_path = outside.path().join("evil.xyz");
+        std::fs::write(&evil_path, "x\n").unwrap();
+        let evil = serde_json::json!({"changes": {
+        format!("file://{}", evil_path.display()): [
+            {"range": {"start": {"line": 0, "character": 0},
+                       "end": {"line": 0, "character": 1}}, "newText": "y"}
+        ]}});
+        assert!(
+            parse_workspace_edit(&evil, &link).is_err(),
+            "a target outside the workspace must still be refused"
+        );
     }
 
     #[test]
