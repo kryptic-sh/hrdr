@@ -201,7 +201,15 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 last.refresh_hash();
                 mutated = true;
             }
-            if !mutated {
+            // Same `!is_empty` guard the `Text` arm above uses, and for a
+            // sharper reason: an empty reasoning entry renders as nothing, but
+            // it still lands at the tail of the transcript, and `Text` only
+            // coalesces when the last entry is `Assistant`. So an empty delta
+            // would silently split one streamed reply into a separate block per
+            // chunk. Servers do emit these — a Qwen3-style backend keeps sending
+            // `reasoning_content: ""` on every content chunk once it stops
+            // thinking, where other providers omit the field entirely.
+            if !mutated && !t.is_empty() {
                 transcript.push(Entry::reasoning(t.clone()));
             }
         }
@@ -735,6 +743,47 @@ mod tests {
             ),
             "the block is closed once the model moves on"
         );
+    }
+
+    /// An empty reasoning delta must not split a streamed reply into one block
+    /// per chunk.
+    ///
+    /// Regression: a Qwen3-style backend keeps emitting `reasoning_content: ""`
+    /// on every content chunk once it has stopped thinking (providers that omit
+    /// the field deserialize to `None` and never reach here). Each empty delta
+    /// used to push a `Reasoning` entry that rendered as nothing but sat at the
+    /// tail of the transcript, so the next `Text` could not coalesce — the reply
+    /// came out as `#8 assistant`, `#9 assistant`, … one header per token group,
+    /// with the prose sliced across them.
+    #[test]
+    fn an_empty_reasoning_delta_does_not_split_the_reply() {
+        let mut t = Vec::new();
+        for fragment in ["I'll ", "audit ", "the codebase."] {
+            apply_event(&mut t, &AgentEvent::Reasoning(String::new()));
+            apply_event(&mut t, &AgentEvent::Text(fragment.into()));
+        }
+        assert_eq!(
+            t.len(),
+            1,
+            "one streamed reply is one block, not one per chunk: {:?}",
+            t.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(matches!(&t[0].kind, EntryKind::Assistant(s) if s == "I'll audit the codebase."));
+    }
+
+    /// The guard is on emptiness, not on reasoning: real reasoning still opens
+    /// its own block and still breaks the assistant run, as before.
+    #[test]
+    fn a_non_empty_reasoning_delta_still_starts_its_own_block() {
+        let mut t = Vec::new();
+        apply_event(&mut t, &AgentEvent::Text("before".into()));
+        apply_event(&mut t, &AgentEvent::Reasoning("thinking".into()));
+        apply_event(&mut t, &AgentEvent::Text("after".into()));
+        let kinds: Vec<&EntryKind> = t.iter().map(|e| &e.kind).collect();
+        assert_eq!(kinds.len(), 3);
+        assert!(matches!(kinds[0], EntryKind::Assistant(s) if s == "before"));
+        assert!(matches!(kinds[1], EntryKind::Reasoning { text, .. } if text == "thinking"));
+        assert!(matches!(kinds[2], EntryKind::Assistant(s) if s == "after"));
     }
 
     #[test]
