@@ -92,6 +92,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     } else {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
+    // Hide the TODO panel while a sub-agent is running: the TODO panel belongs
+    // to the active pane, but when a sub-agent is mid-turn the viewer is watching
+    // that sub-agent's own thinking, not its task list — suppress it so it does
+    // not occupy scarce vertical space. A running main agent does not suppress it.
+    let any_sub_running = app
+        .panes
+        .subs()
+        .iter()
+        .any(|p| p.status == hrdr_app::PaneStatus::Running);
+    let todo_height = if any_sub_running { 0 } else { todo_height };
 
     // The loader heads the input section while **the agent on screen** works. It
     // hides while that agent's tool calls run: the model is idle then, and a spinner

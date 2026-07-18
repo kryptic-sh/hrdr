@@ -5567,3 +5567,77 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     );
     assert!(screen.contains("sub task"), "sub-agent's todos:\n{screen}");
 }
+
+/// Regression: the TODO panel must not render while any sub-agent has
+/// `PaneStatus::Running`. A running main agent must not hide TODOs, and
+/// idle/done sub-agents must not hide them either.
+#[tokio::test]
+async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
+    let mut h = Harness::new(vec![]).await;
+
+    // Give the main agent a TODO.
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "main task".to_string(),
+        status: "in_progress".to_string(),
+    }];
+
+    // Register a running sub-agent with its own TODO.
+    let sub_key = 1u64;
+    let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
+        content: "sub task".to_string(),
+        status: "in_progress".to_string(),
+    }]));
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: sub_key,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        todos: sub_todos.clone(),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        turn: hrdr_agent::TurnStats::default(),
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        compacting: false,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
+    h.app.sync_panes();
+
+    // With a running sub-agent, the TODO panel should be hidden even though
+    // the main agent has TODOs.
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("main task"),
+        "main-agent todos hidden while sub-agent runs:\n{screen}"
+    );
+
+    // Mark the sub-agent as no longer running (done). After re-sync, the TODO
+    // panel should reappear.
+    h.app.live_subagents.update(sub_key, |s| {
+        s.running = false;
+        s.done = true;
+    });
+    h.app.sync_panes();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("main task"),
+        "main-agent todos reappear when sub-agent done:\n{screen}"
+    );
+}

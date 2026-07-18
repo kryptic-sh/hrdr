@@ -516,9 +516,15 @@ mod tests {
     #[test]
     fn builtins_parse_with_names_descriptions_bodies_and_args() {
         let skills = builtin_skills();
-        assert_eq!(skills.len(), 7, "audit, commit, fix, release, review, test, todo");
+        assert_eq!(
+            skills.len(),
+            7,
+            "audit, commit, fix, release, review, test, todo"
+        );
 
-        for name in ["audit", "commit", "fix", "release", "review", "test", "todo"] {
+        for name in [
+            "audit", "commit", "fix", "release", "review", "test", "todo",
+        ] {
             let s = skills
                 .iter()
                 .find(|s| s.name == name)
@@ -587,7 +593,12 @@ mod tests {
         let skills = discover_skills(dir.path());
         let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["audit", "commit", "fix", "release", "review", "test", "todo"]);
+        assert_eq!(
+            names,
+            vec![
+                "audit", "commit", "fix", "release", "review", "test", "todo"
+            ]
+        );
         assert!(skills.iter().all(|s| s.source == "built-in"));
     }
 
