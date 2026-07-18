@@ -58,18 +58,20 @@ impl ShellTool {
 
 const BASH_DESC: &str = "Run a shell command via `bash -c` in the working directory. Use for build, test, \
      git, and anything without a dedicated tool. Output is captured and length-bounded. \
-     Each call starts fresh in the working directory — `cd` does NOT persist between \
-     calls; chain it in one command (`cd sub && …`) or use paths from the cwd. \
+     Each call starts fresh in the working directory (you are already there — no need \
+     to `cd` to it). If you need to change dir, chain it (`cd sub && …`) or use paths \
+     from the cwd; `cd` does NOT persist between calls. \
      Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
      hook-skipping, and destructive commands are rejected.";
 
 const SH_DESC: &str = "Run a shell command via `sh -c` — this session's shell is POSIX `sh`, NOT bash, so \
      avoid bash-only syntax (`[[ … ]]`, arrays, `source`, `set -o pipefail`, `<(…)`). \
      Use for build, test, git, and anything without a dedicated tool. Output is captured \
-     and length-bounded. Each call starts fresh in the working directory — `cd` does NOT \
-     persist between calls; chain it in one command (`cd sub && …`) or use paths from the \
-     cwd. Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
-     hook-skipping, and destructive commands are rejected.";
+     and length-bounded. Each call starts fresh in the working directory (you are already \
+     there — no need to `cd` to it). If you need to change dir, chain it (`cd sub && …`) \
+     or use paths from the cwd; `cd` does NOT persist between calls. Git: stage explicit \
+     paths (`git add <file> …`); blanket staging, force-push, hook-skipping, and \
+     destructive commands are rejected.";
 
 /// Arguments for the `shell` tool.
 #[derive(Deserialize)]
