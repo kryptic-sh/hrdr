@@ -75,6 +75,29 @@ fn request_log() -> Option<&'static WireLog> {
 /// leaks the logged request/response data on **any** platform; callers should
 /// keep it under a directory only they can read.
 fn open_wire_log(path: &Path) -> Option<std::fs::File> {
+    // Preflight: reject a pre-existing symlink or a non-regular file before
+    // opening.  This closes the ordinary mistaken-setup or symlink-in-path
+    // case but is NOT an atomic O_NOFOLLOW guarantee — a concurrent path
+    // replacement between this check and the open below could still
+    // substitute a link.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            // symlink_metadata on a symlink returns the symlink's own type,
+            // so is_symlink() is true only for actual symbolic links.
+            if meta.file_type().is_symlink() {
+                return None;
+            }
+            if !meta.file_type().is_file() {
+                return None;
+            }
+            // Existing regular file — proceed to open for append.
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Path does not exist — open will create it.
+        }
+        Err(_) => return None,
+    }
+
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     // Restrict permissions to owner-only on Unix (0600) so local users cannot
@@ -85,6 +108,10 @@ fn open_wire_log(path: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Post-open descriptor check: confirm the opened handle refers to a
+        // regular file.  On Unix OpenOptions::open follows links, so a
+        // symlink substituted between preflight and open would still reach a
+        // regular-file target; the preflight above closes the ordinary case.
         if !file.metadata().ok()?.file_type().is_file() {
             return None;
         }
@@ -1342,6 +1369,128 @@ mod tests {
         assert!(
             !would_skip,
             "log_wire must allow writes when file < MAX_LOG_FILE_BYTES"
+        );
+    }
+
+    // ── Preflight hardening ────────────────────────────────────────────
+    //
+    // open_wire_log now rejects pre-existing symlinks and non-regular files
+    // before opening.  These tests verify the preflight independently of the
+    // global singleton.
+
+    #[test]
+    #[cfg(unix)]
+    fn open_wire_log_rejects_pre_existing_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.log");
+        let link = dir.path().join("requests.log");
+
+        // Create a regular target with known content and permissions.
+        std::fs::write(&target, b"secret data").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Place a symlink at the wire-log path.
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // open_wire_log must refuse to follow the symlink.
+        assert!(
+            open_wire_log(&link).is_none(),
+            "must reject a pre-existing symlink"
+        );
+
+        // Neither the target content nor its permissions may be changed.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "secret data",
+            "target content must be unchanged"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0o044,
+            "target permissions must be unchanged (mode={mode:#o})"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_wire_log_rejects_symlink_placed_after_rename() {
+        // Simulate the race window that rotate_wire_log faces: rename the
+        // original active file to .1, then an external actor places a symlink
+        // at the now-empty path before open_wire_log is called.  This is a
+        // deterministic test of that code path (no timing needed).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+        let rotated = rotated_wire_log_path(&path);
+
+        // 1. Create a regular active file.
+        std::fs::write(&path, b"original data").unwrap();
+
+        // 2. Rename it to .1 (as rotate_wire_log does).
+        std::fs::rename(&path, &rotated).unwrap();
+
+        // 3. A symlink appears at the now-vacant active path.
+        let target = dir.path().join("target.log");
+        std::fs::write(&target, b"evil payload").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // 4. open_wire_log (called by rotate_wire_log for the fresh file)
+        //    must reject the symlink.
+        assert!(
+            open_wire_log(&path).is_none(),
+            "must reject a symlink placed at path after rename"
+        );
+
+        // 5. The symlink target must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "evil payload",
+            "target content must be unchanged"
+        );
+    }
+
+    #[test]
+    fn open_wire_log_creates_new_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+
+        let file = open_wire_log(&path);
+        assert!(file.is_some(), "must create a new file at a fresh path");
+        drop(file);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "created path must be a regular file"
+        );
+    }
+
+    #[test]
+    fn open_wire_log_opens_existing_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+
+        // Pre-create a regular file.
+        std::fs::write(&path, b"existing content").unwrap();
+
+        let file = open_wire_log(&path);
+        assert!(
+            file.is_some(),
+            "must open an existing regular file for append"
+        );
+    }
+
+    #[test]
+    fn open_wire_log_rejects_directory() {
+        // A directory is non-regular on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("mydir");
+        std::fs::create_dir(&d).unwrap();
+
+        assert!(
+            open_wire_log(&d).is_none(),
+            "must reject a pre-existing directory"
         );
     }
 
