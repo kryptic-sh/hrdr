@@ -134,7 +134,7 @@ impl Tool for ReplaceTool {
             // could expand even a single sub-2 MB file into gigabytes. (A regex
             // replacement's size depends on per-match captures, so it isn't
             // guarded here — its input is already capped at `MAX_FILE_BYTES`.)
-            if !a.regex && a.replace.len() > a.find.len() {
+            if a.replace.len() > a.find.len() {
                 let projected = before
                     .len()
                     .saturating_add(hits.saturating_mul(a.replace.len() - a.find.len()));
