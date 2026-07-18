@@ -166,8 +166,9 @@ impl WrappedLayout {
 ///
 /// 1. **Word wrap** — when a word (contiguous non-whitespace) does not fit
 ///    on the current visual line but would fit on an empty line, start a new
-///    line and place it there.  Whitespace preceding that word is dropped from
-///    display (the break boundary).
+///    line and place it there. Whitespace remains at the end of the previous
+///    line when it fits; whitespace that crosses the edge is omitted visually
+///    but remains unchanged in the editable buffer.
 ///
 /// 2. **Hard wrap** — words longer than `width` are split character-by-
 ///    character across multiple lines, as in the original hard-wrap.
@@ -257,7 +258,8 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
                 lines[cur].width = col;
             }
         } else {
-            // Whitespace run.
+            // Keep whitespace that fits. A run crossing the edge is a soft-wrap
+            // boundary: omit it visually while retaining it in the buffer.
             let cur = lines.len() - 1;
             if lines[cur].width + run_width <= w {
                 let mut col = lines[cur].width;
@@ -268,8 +270,6 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
                 }
                 lines[cur].width = col;
             } else {
-                // Does not fit — drop from display.  All these whitespace
-                // positions map to the end of the current visual line.
                 let end = (cur, lines[cur].width);
                 for j in 0..run.len() {
                     positions[run_start + j] = end;
@@ -592,7 +592,7 @@ mod wrap_tests {
         let area = Rect::new(0, 0, 7, 10);
         let mut term = Terminal::new(TestBackend::new(7, 10)).unwrap();
         term.draw(|f| e.render(f, area)).unwrap();
-        let content_len = e.content().len();
+        let content_len = e.content().chars().count();
         let (rv, cv) = layout.cursor_pos(content_len);
         assert_eq!(
             term.get_cursor_position().unwrap(),

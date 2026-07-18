@@ -8,16 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing
-  a pasted error — parses the error, traces backward to the root cause,
-  applies the minimal fix, and verifies it.
-- **`:test` built-in skill.** New `:test` skill for writing tests against
-  the current change and iterating until green — discovers the project's
-  test framework and conventions, covers happy-path, edge cases, and
-  regression paths.
-- **`:todo` built-in skill.** New `:todo` skill for reporting what remains
-  to be done from the current session context — unfinished items, deferred
-  decisions, half-finished work, and scratch files.
+- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing a
+  pasted error — parses the error, traces backward to the root cause, applies
+  the minimal fix, and verifies it.
+- **`:test` built-in skill.** New `:test` skill for writing tests against the
+  current change and iterating until green — discovers the project's test
+  framework and conventions, covers happy-path, edge cases, and regression
+  paths.
+- **`:todo` built-in skill.** New `:todo` skill for reporting what remains to be
+  done from the current session context — unfinished items, deferred decisions,
+  half-finished work, and scratch files.
+
+### Changed
+
+- **TODO panel yields to active sub-agents.** The TUI hides the TODO list while
+  any delegated sub-agent is running, then restores it when all sub-agents are
+  idle or finished.
+
+### Fixed
+
+- **Plain input wraps at word boundaries.** The non-Vim input box now moves
+  whole words when they fit on the next visual row, hard-wraps oversized words,
+  and keeps Unicode-aware row counts and cursor placement aligned with
+  rendering.
 
 ### Removed
 
