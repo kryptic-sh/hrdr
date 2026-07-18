@@ -27,6 +27,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Wire-log paths reject pre-existing symlinks.** `HRDR_LOG_REQUESTS` now
+  refuses symbolic links and other non-regular targets before initial open and
+  rotation reopen, preventing accidental writes and permission changes through
+  an existing link.
 - **Plain input wraps at word boundaries.** The non-Vim input box now moves
   whole words when they fit on the next visual row, hard-wraps oversized words,
   and keeps Unicode-aware row counts and cursor placement aligned with
