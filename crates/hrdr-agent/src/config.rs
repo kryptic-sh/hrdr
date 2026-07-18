@@ -1779,10 +1779,19 @@ pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
 }
 
 pub(crate) fn read_config_doc(path: &std::path::Path) -> toml_edit::DocumentMut {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .unwrap_or_default()
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return toml_edit::DocumentMut::default(),
+    };
+    match content.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => {
+            // Back up the malformed file before returning empty.
+            let backup = path.with_extension("toml.bak");
+            let _ = std::fs::copy(path, &backup);
+            toml_edit::DocumentMut::default()
+        }
+    }
 }
 
 pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
@@ -1790,6 +1799,10 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
