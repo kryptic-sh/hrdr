@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`:todo` built-in skill.** New `:todo` skill for reporting what remains
+  to be done from the current session context — unfinished items, deferred
+  decisions, half-finished work, and scratch files.
+
 ### Removed
 
 - **`patch` tool removed.** The `patch` tool (multi-file unified-diff apply) has
