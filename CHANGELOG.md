@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`:test` built-in skill.** New `:test` skill for writing tests against
+  the current change and iterating until green — discovers the project's
+  test framework and conventions, covers happy-path, edge cases, and
+  regression paths.
 - **`:todo` built-in skill.** New `:todo` skill for reporting what remains
   to be done from the current session context — unfinished items, deferred
   decisions, half-finished work, and scratch files.
