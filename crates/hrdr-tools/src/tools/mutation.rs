@@ -120,9 +120,12 @@ async fn write_via_temp(
     // in-flight file and the renames would race.
     let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
 
-    let _guard = TempFile::new(tmp.clone());
+    let mut _guard = TempFile::new(tmp.clone());
 
-    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp).await?;
     file.write_all(content.as_bytes()).await?;
     file.sync_all().await?;
     drop(file);
