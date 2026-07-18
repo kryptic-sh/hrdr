@@ -29,6 +29,9 @@ const BUILTIN_TODO: &str = include_str!("templates/skills/todo.md");
 const BUILTIN_TEST: &str = include_str!("templates/skills/test.md");
 const BUILTIN_FIX: &str = include_str!("templates/skills/fix.md");
 
+/// Max bytes for a single skill file; files larger than this are skipped.
+const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -86,6 +89,9 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
             .filter_map(|entry| {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    return None;
+                }
+                if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_SKILL_FILE_BYTES {
                     return None;
                 }
                 let text = std::fs::read_to_string(&path).ok()?;

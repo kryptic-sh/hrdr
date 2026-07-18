@@ -181,6 +181,9 @@ fn detect_package_manager() -> Option<&'static str> {
 /// File name for the open-standard project instructions (https://agents.md).
 const AGENTS_FILE: &str = "AGENTS.md";
 
+/// Max bytes for a single AGENTS.md file; files larger than this are skipped.
+const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
 /// the filesystem root, plus global instruction files from standard locations.
 /// Less specific files (system, then user-global, then ancestors) come first so
@@ -190,7 +193,10 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     let mut docs: Vec<String> = Vec::new();
     let mut dir = Some(cwd);
     while let Some(d) = dir {
-        if let Ok(text) = std::fs::read_to_string(d.join(AGENTS_FILE)) {
+        let af = d.join(AGENTS_FILE);
+        if af.metadata().map(|m| m.len()).unwrap_or(u64::MAX) <= MAX_AGENTS_FILE_BYTES
+            && let Ok(text) = std::fs::read_to_string(&af)
+        {
             let text = text.trim();
             if !text.is_empty() {
                 docs.push(text.to_string());
@@ -216,6 +222,7 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
         global_paths.push(home.join(".claude/CLAUDE.md"));
     }
     if let Some(path) = global_paths.iter().find(|p| p.is_file())
+        && path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) <= MAX_AGENTS_FILE_BYTES
         && let Ok(text) = std::fs::read_to_string(path)
     {
         let text = text.trim();
