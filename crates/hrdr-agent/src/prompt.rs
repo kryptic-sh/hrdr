@@ -270,7 +270,8 @@ mod tests {
         // Economy applies to prose, not to leaving work unfinished.
         assert!(p.contains("stopping before the task is done saves\nno one anything"));
         assert!(p.contains("git commit -m \"$(cat <<'EOF'"));
-        assert!(p.contains("Keep the heredoc delimiter single-quoted"));
+        assert!(p.contains("pass a single-quoted heredoc"));
+        assert!(p.contains("glab mr create"));
         assert!(p.contains("dependent, non-interactive commands with `&&`"));
         assert!(p.contains("failed checks prevent staging"));
         assert!(p.contains("Never use `;` as a substitute"));

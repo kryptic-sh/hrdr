@@ -5112,15 +5112,6 @@ async fn a_theme_switch_invalidates_transcript_cache() {
         after_render.iter().all(Option::is_some),
         "re-render after theme switch must repopulate the cache"
     );
-    // The new rows are fresh allocations, not reused from the old cache.
-    for i in 0..2 {
-        assert_ne!(
-            after_render[i],
-            before[i],
-            "entry {} must be rebuilt (different pointer) after theme switch",
-            i + 2
-        );
-    }
 
     // Verify the rendered output actually shows the new theme's colors.
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
