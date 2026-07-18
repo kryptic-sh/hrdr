@@ -582,19 +582,24 @@ fn map_finish_reason(
 /// `reasoning_tokens` are surfaced as the standard OpenAI detail subsets.
 fn map_usage(usage: Option<&Value>) -> Option<Usage> {
     let usage = usage?;
-    let field = |key: &str| usage.get(key).and_then(Value::as_u64).map(|n| n as u32);
+    let field = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
     let prompt = field("input_tokens").unwrap_or(0);
     let completion = field("output_tokens").unwrap_or(0);
     let cached = usage
         .get("input_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
-        .map(|n| n as u32);
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
     let reasoning = usage
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(Value::as_u64)
-        .map(|n| n as u32);
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
     if prompt == 0 && completion == 0 && cached.is_none() && reasoning.is_none() {
         return None;
     }
