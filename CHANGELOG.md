@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release pipeline gate: `leak-guard`, `smoke`, and `test` now block
+  publishing.** `publish-github-release` previously depended on
+  `[build, fmt, clippy, deny, machete]` — the leak guard and smoke tests could
+  fail on a tag push and the release would still ship to GitHub, crates.io, AUR,
+  Homebrew, and Scoop. `leak-guard`, `smoke`, and `test` are now in the `needs`
+  list, so a red quality gate prevents the release from going out.
+
 ## [0.6.1] - 2026-07-18
 
 ### Fixed

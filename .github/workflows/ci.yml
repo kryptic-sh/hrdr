@@ -353,7 +353,7 @@ jobs:
 
   publish-github-release:
     name: Publish GitHub Release
-    needs: [build, fmt, clippy, deny, machete]
+    needs: [build, fmt, clippy, deny, machete, leak-guard, smoke, test]
     if: >-
       github.event_name == 'workflow_dispatch' || (github.event_name == 'push'
       && startsWith(github.ref, 'refs/tags/v'))
