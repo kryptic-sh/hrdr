@@ -2,11 +2,12 @@
 //! (`:name args…`), shared by hrdr's frontends.
 //!
 //! A skill is a Markdown file — optional YAML frontmatter (`name:`,
-//! `description:`, `args:`), body = the prompt. On invocation the body is
-//! sent to the model with
-//! `$ARGUMENTS` replaced by everything after the skill name (or, when the
-//! placeholder is absent and arguments were given, with them appended on their
-//! own line). Discovery mirrors the sub-agent files: project dirs first, then
+//! `description:`, `args:`), body = the prompt. On invocation the body is sent
+//! to the model with `$ARGUMENTS` filled from the text after the skill name: a
+//! skill that declares `args:` takes just the first token as its argument and
+//! appends any trailing text as extra context, while a skill without `args:`
+//! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
+//! sub-agent files: project dirs first, then
 //! user dirs, hrdr → Claude Code → opencode conventions, then hrdr's own
 //! built-in skills (`:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`) last — deduped by name
 //! (first source wins), so a user or project file always overrides a
@@ -216,23 +217,49 @@ fn scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
 }
 
 /// If `input` invokes a skill (`:name args…`, matched case-insensitively),
-/// return the prompt to send: the skill body with every `$ARGUMENTS` replaced
-/// by the arguments — or, when the body has no placeholder and arguments were
-/// given, with them appended on their own line. `None` when the input isn't a
-/// `:` invocation or names no known skill (it then goes to the model as-is).
+/// return the prompt to send. `None` when the input isn't a `:` invocation or
+/// names no known skill (it then goes to the model as-is).
+///
+/// How the text after the name is used depends on whether the skill declares
+/// `args:`:
+/// - A skill **with** `args:` takes a single positional argument — the first
+///   whitespace-delimited token. That token fills `$ARGUMENTS`, and anything
+///   after it is extra free-form context appended to the body on its own line.
+///   So `:audit high focus on the parser` runs the audit at depth `high` with
+///   "focus on the parser" appended as guidance.
+/// - A skill **without** `args:` treats the whole remainder as `$ARGUMENTS`
+///   (or, when the body has no placeholder, appends it) — free-form input like
+///   a pasted error or a commit scope isn't split on the first space.
 pub fn expand_skill(input: &str, skills: &[Skill]) -> Option<String> {
     let rest = input.trim_start().strip_prefix(':')?;
     let mut parts = rest.splitn(2, char::is_whitespace);
     let name = parts.next().filter(|n| !n.is_empty())?;
-    let args = parts.next().unwrap_or("").trim();
+    let after_name = parts.next().unwrap_or("").trim();
     let skill = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
-    Some(if skill.body.contains("$ARGUMENTS") {
-        skill.body.replace("$ARGUMENTS", args)
-    } else if args.is_empty() {
+
+    // A declared-`args:` skill consumes only its first token as the argument;
+    // the rest is appended. A skill without `args:` takes the whole remainder.
+    let (arg, extra) = if skill.args.is_empty() {
+        (after_name, "")
+    } else {
+        let mut split = after_name.splitn(2, char::is_whitespace);
+        (
+            split.next().unwrap_or(""),
+            split.next().unwrap_or("").trim(),
+        )
+    };
+
+    let mut prompt = if skill.body.contains("$ARGUMENTS") {
+        skill.body.replace("$ARGUMENTS", arg)
+    } else if arg.is_empty() {
         skill.body.clone()
     } else {
-        format!("{}\n\n{args}", skill.body)
-    })
+        format!("{}\n\n{arg}", skill.body)
+    };
+    if !extra.is_empty() {
+        prompt = format!("{prompt}\n\n{extra}");
+    }
+    Some(prompt)
 }
 
 /// Case-insensitive fuzzy filter over skills for the `/skills` picker: the
@@ -488,6 +515,52 @@ mod tests {
         assert!(expand_skill(":nope", &skills).is_none());
         assert!(expand_skill("hello :ship", &skills).is_none());
         assert!(expand_skill(": ship", &skills).is_none());
+    }
+
+    /// A skill that declares `args:` consumes only its first token as the
+    /// argument; any text after it is appended to the body as extra context.
+    #[test]
+    fn declared_args_skill_splits_arg_from_trailing_context() {
+        let mut audit = skill("audit", "", "Audit at depth $ARGUMENTS.");
+        audit.args = vec!["low".into(), "high".into()];
+        let skills = vec![audit];
+
+        // First token fills $ARGUMENTS; the rest is appended on its own line.
+        assert_eq!(
+            expand_skill(":audit high focus on the parser", &skills).unwrap(),
+            "Audit at depth high.\n\nfocus on the parser"
+        );
+        // Just the arg, no trailing context: nothing is appended.
+        assert_eq!(
+            expand_skill(":audit low", &skills).unwrap(),
+            "Audit at depth low."
+        );
+        // No arg at all: $ARGUMENTS renders empty, as before.
+        assert_eq!(expand_skill(":audit", &skills).unwrap(), "Audit at depth .");
+    }
+
+    /// A skill with `args:` but no `$ARGUMENTS` placeholder still appends the
+    /// first token (existing no-placeholder behavior) followed by any extra.
+    #[test]
+    fn declared_args_skill_without_placeholder_appends_both() {
+        let mut s = skill("audit", "", "Run the audit.");
+        s.args = vec!["low".into(), "high".into()];
+        let skills = vec![s];
+        assert_eq!(
+            expand_skill(":audit high and check the auth flow", &skills).unwrap(),
+            "Run the audit.\n\nhigh\n\nand check the auth flow"
+        );
+    }
+
+    /// A skill WITHOUT `args:` is unchanged: the whole remainder is one argument
+    /// and is not split on the first space (a pasted error, a commit scope).
+    #[test]
+    fn free_form_skill_keeps_whole_remainder_as_one_argument() {
+        let skills = vec![skill("fix", "", "Fix this: $ARGUMENTS")];
+        assert_eq!(
+            expand_skill(":fix TypeError at line 5 in foo.rs", &skills).unwrap(),
+            "Fix this: TypeError at line 5 in foo.rs"
+        );
     }
 
     #[test]
