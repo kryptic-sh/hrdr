@@ -254,7 +254,7 @@ impl Tool for RenameTool {
                 json!({"newName": a.new_name}),
             )
             .await?;
-        let files = crate::lsp::parse_workspace_edit(&result)?;
+        let files = crate::lsp::parse_workspace_edit(&result, &ctx.cwd)?;
         if files.is_empty() {
             bail!(
                 "the server returned no edits for renaming `{}` at {}:{}",
@@ -267,6 +267,8 @@ impl Tool for RenameTool {
         // confinement plus a clean application of every file's edits.
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {
+            crate::guard_secret_read(&file.path)
+                .with_context(|| format!("refusing to rename {}", file.path.display()))?;
             let before = tokio::fs::read_to_string(&file.path)
                 .await
                 .with_context(|| format!("reading {}", file.path.display()))?;
