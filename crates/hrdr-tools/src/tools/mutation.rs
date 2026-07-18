@@ -125,7 +125,8 @@ async fn write_via_temp(
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&tmp).await?;
+        .open(&tmp)
+        .await?;
     file.write_all(content.as_bytes()).await?;
     file.sync_all().await?;
     drop(file);
