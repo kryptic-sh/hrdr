@@ -253,12 +253,29 @@ pub(crate) async fn drain_stream<F: FnMut(AgentEvent)>(
     let mut acc = Accumulator::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        // Empty deltas are dropped rather than forwarded, in BOTH directions.
+        // Servers do send them: a Qwen3-style backend keeps emitting
+        // `reasoning_content: ""` on every content chunk once it stops thinking
+        // (and `content: ""` while it is still thinking), where other providers
+        // omit the field entirely. Either one, forwarded, silently shreds the
+        // transcript — the frontend only merges a delta into the previous entry
+        // when that entry is the matching kind, so an empty event of the *other*
+        // kind lands in between and forces a new block per chunk. An empty
+        // `Text` also closes the open reasoning block, fragmenting reasoning the
+        // same way. Both render as nothing, so the only visible symptom is one
+        // `#N assistant` header per token group.
+        //
+        // `acc.push` is still called for every chunk — it accumulates content
+        // and tool-call fragments; only the *event* is suppressed.
         if let Some(choice) = chunk.choices.first()
             && let Some(r) = &choice.delta.reasoning_content
+            && !r.is_empty()
         {
             on_event(AgentEvent::Reasoning(r.clone()));
         }
-        if let Some(text) = acc.push(&chunk) {
+        if let Some(text) = acc.push(&chunk)
+            && !text.is_empty()
+        {
             on_event(AgentEvent::Text(text));
         }
     }
@@ -1067,5 +1084,97 @@ impl Agent {
                 self.todo_ttl,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hrdr_llm::{ChatChunk, ChunkChoice, Delta};
+
+    fn chunk(content: Option<&str>, reasoning: Option<&str>) -> ChatChunk {
+        ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta {
+                    content: content.map(str::to_string),
+                    reasoning_content: reasoning.map(str::to_string),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            anthropic_thinking_blocks: vec![],
+        }
+    }
+
+    async fn events_for(chunks: Vec<ChatChunk>) -> (Vec<AgentEvent>, Accumulator) {
+        let mut stream: ChatStream =
+            Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+        let mut seen = Vec::new();
+        let acc = drain_stream(&mut stream, &mut |ev| seen.push(ev))
+            .await
+            .unwrap();
+        (seen, acc)
+    }
+
+    /// An empty delta is dropped rather than forwarded — in both directions.
+    ///
+    /// Regression: a Qwen3-style backend keeps emitting `reasoning_content: ""`
+    /// on every content chunk once it stops thinking, and `content: ""` while it
+    /// is still thinking. Providers that omit the field deserialize to `None` and
+    /// never reach here. Forwarded, each empty event lands between two deltas of
+    /// the *other* kind, and the frontend only merges into the previous entry
+    /// when it is the matching kind — so the reply came out as one
+    /// `#N assistant` header per token group, with reasoning shredded the same
+    /// way. Both empties render as nothing, so the split was the only symptom.
+    #[tokio::test]
+    async fn empty_deltas_are_not_forwarded_as_events() {
+        let (events, _) = events_for(vec![
+            chunk(None, Some("thinking")),
+            chunk(Some(""), None), // must not close the reasoning block
+            chunk(None, Some(" harder")),
+            chunk(Some("answer"), Some("")), // empty reasoning must not split text
+            chunk(Some(" more"), Some("")),
+        ])
+        .await;
+
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Reasoning(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            reasoning,
+            vec!["thinking", " harder"],
+            "no empty reasoning event may be forwarded"
+        );
+        assert_eq!(
+            text,
+            vec!["answer", " more"],
+            "no empty text event may be forwarded"
+        );
+    }
+
+    /// Suppressing the *event* must not suppress accumulation: `acc.push` still
+    /// runs for every chunk, so the assembled reply is unaffected.
+    #[tokio::test]
+    async fn empty_deltas_still_accumulate_into_the_final_message() {
+        let (_, acc) = events_for(vec![
+            chunk(Some("hello"), Some("")),
+            chunk(Some(""), None),
+            chunk(Some(" world"), Some("")),
+        ])
+        .await;
+        assert_eq!(acc.into_message().content.as_deref(), Some("hello world"));
     }
 }
