@@ -9,6 +9,29 @@ pub struct FileChange {
     pub notes: Vec<String>,
 }
 
+/// RAII guard that removes the temp file on drop unless kept.
+struct TempFile {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl TempFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Checkpoint the file, write `content`, run post-edit hooks, re-read if hooks
 /// ran, then collect LSP diagnostics for the final content. Returns the
 /// post-hook content plus hook/diagnostic notes (if any).
@@ -97,22 +120,19 @@ async fn write_via_temp(
     // in-flight file and the renames would race.
     let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
 
-    let result = async {
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(content.as_bytes()).await?;
-        file.sync_all().await?;
-        drop(file);
-        if let Some(perms) = perms {
-            tokio::fs::set_permissions(&tmp, perms).await?;
-        }
-        tokio::fs::rename(&tmp, path).await
-    }
-    .await;
+    let _guard = TempFile::new(tmp.clone());
 
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(content.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    if let Some(perms) = perms {
+        tokio::fs::set_permissions(&tmp, perms).await?;
     }
-    result
+    tokio::fs::rename(&tmp, path).await?;
+    _guard.keep();
+
+    Ok(())
 }
 
 #[cfg(test)]

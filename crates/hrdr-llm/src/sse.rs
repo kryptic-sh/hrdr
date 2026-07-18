@@ -201,6 +201,12 @@ impl SseDecoder {
         std::mem::take(&mut self.ready)
     }
 
+    /// Number of raw bytes currently held in internal buffers (partial line +
+    /// partial event data) that have not yet been emitted as a complete event.
+    pub fn buffered_bytes(&self) -> usize {
+        self.line_buf.len() + self.cur_data.len()
+    }
+
     /// Flush at end-of-stream: emit any event whose `data:` was received but
     /// whose blank-line terminator never arrived (the byte stream closed right
     /// after the last line). This restores the leniency of a line-based parser

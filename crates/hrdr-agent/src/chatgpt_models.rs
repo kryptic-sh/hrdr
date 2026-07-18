@@ -231,6 +231,9 @@ fn builtin_fallback() -> Vec<ChatGptModel> {
 // ── Cache I/O (path-injectable cores) ───────────────────────────────────────
 
 fn load_cache_at(path: &Path) -> Option<CacheFile> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > 10 * 1024 * 1024 {
+        return None;
+    }
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -522,8 +525,9 @@ async fn fetch_catalog(access: &OAuthAccess, etag: Option<String>) -> FetchOutco
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = match resp.text().await {
-        Ok(t) => t,
+    let body = match resp.bytes().await {
+        Ok(b) if b.len() <= 10 * 1024 * 1024 => String::from_utf8_lossy(&b).into_owned(),
+        Ok(_) => return FetchOutcome::Recoverable("catalog response too large".into()),
         Err(_) => return FetchOutcome::Recoverable("could not read the catalog response".into()),
     };
     let value: Value = match serde_json::from_str(&body) {

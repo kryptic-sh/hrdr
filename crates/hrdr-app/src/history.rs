@@ -13,6 +13,11 @@ fn history_path() -> Option<PathBuf> {
     hjkl_xdg::data_dir("hrdr").ok().map(|d| d.join("history"))
 }
 
+/// Max bytes for the persisted history file. 200 entries × 4 KiB average line
+/// is safely under 1 MiB, but actual input lines are much shorter; this generous
+/// cap prevents OOM on a corrupted or replaced history file.
+const MAX_HISTORY_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+
 /// Load persisted single-line input history (most recent [`MAX_HISTORY`], oldest
 /// first). Blank lines are skipped; a missing/unreadable file yields an empty
 /// history.
@@ -20,6 +25,9 @@ pub fn load_history() -> Vec<String> {
     let Some(path) = history_path() else {
         return Vec::new();
     };
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_HISTORY_FILE_BYTES {
+        return Vec::new();
+    }
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };

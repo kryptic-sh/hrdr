@@ -199,8 +199,7 @@ impl EditorEngine for PlainEngine {
     }
 
     fn desired_rows(&self, width: u16, max: u16) -> u16 {
-        wrapped_row_count(&self.content(), width)
-            .clamp(1, max as usize) as u16
+        wrapped_row_count(&self.content(), width).clamp(1, max as usize) as u16
     }
 
     fn paste(&mut self, text: &str) {

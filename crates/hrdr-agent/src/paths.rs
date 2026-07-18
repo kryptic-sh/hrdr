@@ -23,5 +23,9 @@ pub fn cwd_slug(cwd: &str) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     let suffix = format!("-{:016x}", hasher.finish());
-    if s.is_empty() { format!("root{suffix}") } else { format!("{s}{suffix}") }
+    if s.is_empty() {
+        format!("root{suffix}")
+    } else {
+        format!("{s}{suffix}")
+    }
 }

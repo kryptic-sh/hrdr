@@ -396,7 +396,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             match arg.parse::<u64>() {
                 Ok(n) => {
                     host.set_todo_ttl(n);
-                    host.persist_setting("todo_ttl", hrdr_agent::ConfigValue::Int(n as i64));
+                    // Clamp to i64::MAX for TOML persistence so very large
+                    // values don't wrap to negative on reload.
+                    let clamped = n.min(i64::MAX as u64) as i64;
+                    host.persist_setting("todo_ttl", hrdr_agent::ConfigValue::Int(clamped));
                     host.info(format!(
                         "todo-ttl → {n} turn{}",
                         if n == 1 { "" } else { "s" }

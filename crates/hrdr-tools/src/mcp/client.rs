@@ -257,7 +257,9 @@ impl McpClient {
                     }
                     let events = decoder.drain();
                     if !events.is_empty() {
-                        undecoded_bytes = 0;
+                        // Only carried-forward bytes (still buffered for the next
+                        // incomplete event) count toward the next message's cap.
+                        undecoded_bytes = decoder.buffered_bytes();
                     }
                     for ev in events {
                         if ev.event.as_deref() == Some("endpoint") {

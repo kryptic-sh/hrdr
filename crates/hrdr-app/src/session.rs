@@ -697,7 +697,13 @@ pub fn unique_session_id(cwd: &str, name: &str) -> (String, Reservation) {
     let dir = session_dir(cwd);
     let _ = std::fs::create_dir_all(&dir);
 
+    // Fail fast: if the directory is unwritable, skip the 10k probe loop.
+    let dir_ok = dir.is_dir();
+
     for i in 1..10_000 {
+        if !dir_ok {
+            break;
+        }
         let cand = if i == 1 {
             slug.clone()
         } else {
