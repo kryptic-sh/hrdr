@@ -14,6 +14,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fail on a tag push and the release would still ship to GitHub, crates.io, AUR,
   Homebrew, and Scoop. `leak-guard`, `smoke`, and `test` are now in the `needs`
   list, so a red quality gate prevents the release from going out.
+- **Shell tool description stopped triggering `cd` prefix spam.** The shell
+  tool's `cd` chaining note (`cd sub && …`) was read as a universal invocation
+  pattern, making the model prefix every command with `cd $CWD &&`. The
+  description now leads with "you are already there" and explains the chaining
+  pattern only for actual directory changes.
+
+### Added
+
+- **`gh`/`glab` heredoc example in system prompt.** The Git section's
+  single-quoted heredoc pattern (`"$(cat <<'EOF'…)"`) now has a companion
+  example for `gh pr create` and `glab` commands, showing how to pass shell-safe
+  bodies containing `$()` and backticks without expansion.
 
 ## [0.6.1] - 2026-07-18
 

@@ -233,6 +233,28 @@ Git:
   Keep the heredoc delimiter single-quoted exactly as shown; an unquoted delimiter
   expands shell content inside the message. A one-line trivial message may still
   use a normal `git commit -m "subject"`.
+- The same heredoc pattern works for `gh` and `glab` commands that carry
+  shell-sensitive text in body or title flags — PR descriptions, issue bodies,
+  release notes — where `$()`, backticks, `$VAR`, and quotes would otherwise
+  expand or vanish:
+
+  ```bash
+  gh pr create \
+    --title "fix(parser): handle empty payloads gracefully" \
+    --body "$(cat <<'EOF'
+  The parser panicked with an index-out-of-bounds when handed an empty
+  payload from the SSE stream.  `SseDecoder::feed` now short-circuits on
+  a zero-length buffer and returns `Ok(None)` instead.
+
+  The `$payload` variable in the caller is gone — the intermediate binding
+  served only to guard the (now-removed) index expression.
+  EOF
+  )"
+  ```
+
+  The single-quoted `'EOF'` keeps every character literal inside the body;
+  drop the quotes and `$(…)`, `$VAR`, and backticks expand before reaching
+  the CLI.
 - Respect the standard 50/72 commit-message convention. Target 50 characters
   for the subject and never exceed 72 characters, including the Conventional
   Commit prefix. Put exactly one blank line between subject and body. Hard-wrap
