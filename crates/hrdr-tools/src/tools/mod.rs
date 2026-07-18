@@ -1,4 +1,4 @@
-//! The built-in tool set (read, write, edit, patch, shell, grep, find, ls, todo, fetch, search).
+//! The built-in tool set (read, write, edit, shell, grep, find, ls, todo, fetch, search).
 
 pub(crate) mod edit;
 pub(crate) mod fileops;

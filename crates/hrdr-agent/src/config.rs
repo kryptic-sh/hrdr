@@ -421,7 +421,7 @@ pub struct SubagentProfile {
     #[serde(default)]
     pub prompt: Option<String>,
     /// Restrict this sub-agent to the read-only tool set (read/grep/find/ls/web
-    /// — no write/edit/patch/shell). Ignored when `tools` is set explicitly.
+    /// — no write/edit/shell). Ignored when `tools` is set explicitly.
     /// `None` means "not specified by this profile" — distinct from `Some(false)`
     /// — so overlaying a profile onto a built-in (e.g. pinning `review`'s model)
     /// doesn't silently clear a built-in's `read_only = true`. Use

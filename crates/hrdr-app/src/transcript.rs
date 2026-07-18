@@ -261,7 +261,7 @@ pub enum ToolBody {
         lang: String,
         content: String,
     },
-    /// `edit`/`patch`: the result is a unified diff — color it as one.
+    /// `edit`: the result is a unified diff — color it as one.
     Diff,
     /// `read`: the result's *tail* is the interesting part (the file content,
     /// not the preamble).
@@ -319,7 +319,7 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
                 },
             }
         }
-        "edit" | "patch" => ToolDisplay {
+        "edit" => ToolDisplay {
             headline: arg_str(&v, "path").unwrap_or_else(|| "?".into()),
             body: ToolBody::Diff,
         },
@@ -803,12 +803,13 @@ mod tool_display_tests {
     }
 
     #[test]
-    fn edit_and_patch_show_the_path_and_render_a_diff() {
-        for name in ["edit", "patch"] {
-            let d = tool_display(name, r#"{"path":"x.rs","old_string":"a","new_string":"b"}"#);
-            assert_eq!(d.headline, "x.rs");
-            assert_eq!(d.body, ToolBody::Diff);
-        }
+    fn edit_shows_the_path_and_renders_a_diff() {
+        let d = tool_display(
+            "edit",
+            r#"{"path":"x.rs","old_string":"a","new_string":"b"}"#,
+        );
+        assert_eq!(d.headline, "x.rs");
+        assert_eq!(d.body, ToolBody::Diff);
     }
 
     #[test]

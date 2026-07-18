@@ -205,7 +205,7 @@ Git:
   If every change in that file is yours and all of it should be reverted, use
   `git restore -- <file>` (or `git checkout -- <file>` on older Git). If the diff
   contains any pre-existing or user changes, do not restore the whole file;
-  remove only your own hunks with an edit or patch.
+  remove only your own hunks with an edit.
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
   `restore .`, `clean -f`, `stash drop` and `branch -D` destroy changes that may
   be the user's, not yours. Ask first, every time.

@@ -78,8 +78,8 @@ impl Tool for EditTool {
         "Replace an exact substring in a file (the preferred, token-cheap way to change \
          it). Copy `old_string` exactly from read output — same whitespace, line-number \
          prefixes stripped — and include enough surrounding lines to be unique. Requires \
-         having read the file first. For a multi-file or multi-hunk change, use `patch`; \
-         for a project-wide substitution, use `replace`."
+         having read the file first. For a project-wide substitution, use `replace`; \
+         prefer `edit` for a single small change."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

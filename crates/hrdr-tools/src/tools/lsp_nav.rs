@@ -263,7 +263,7 @@ impl Tool for RenameTool {
                 a.line
             );
         }
-        // Validate everything before writing anything (atomic, like `patch`):
+        // Validate everything before writing anything atomically:
         // confinement plus a clean application of every file's edits.
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {

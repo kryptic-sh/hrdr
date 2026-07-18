@@ -2813,7 +2813,7 @@ fn markdown_lines(
 
 /// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +
 /// headline) followed by tool-specific detail — the command and its output for
-/// shell calls, the file contents for `write`, the patch for `edit`/`patch`,
+/// shell calls, the file contents for `write`, the diff for `edit`,
 /// the tail of the file for `read`, plain output otherwise.
 #[allow(clippy::too_many_arguments)]
 fn tool_lines(
@@ -2911,7 +2911,7 @@ fn tool_lines(
     }
     let is_diff = disp.body == hrdr_app::ToolBody::Diff;
     let is_read = disp.body == hrdr_app::ToolBody::Read;
-    // A diff is the point of an edit/patch block, so it gets a taller preview.
+    // A diff is the point of an edit block, so it gets a taller preview.
     let preview = if is_diff {
         DIFF_PREVIEW_LINES
     } else {

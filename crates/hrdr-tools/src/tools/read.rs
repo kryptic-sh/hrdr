@@ -33,7 +33,7 @@ impl Tool for ReadTool {
          prefix is display-only — never include it in edit strings). Use `offset`/`limit` to \
          page through large files. A read that doesn't cover the whole file — `offset`/`limit` \
          short of EOF, or any line over 2000 bytes (clipped) — marks the file partially-read; \
-         `edit`/`patch` still work against it, but `write` refuses to overwrite a file that \
+         `edit` still works against it, but `write` refuses to overwrite a file that \
          hasn't been read in full. You must read a file before editing it."
     }
     fn parameters(&self) -> serde_json::Value {

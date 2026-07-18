@@ -1,6 +1,6 @@
 //! `hrdr-tools` — the agentic tool set.
 //!
-//! The built-in set: `read`, `write`, `edit`, `patch`, `bash`, `grep`, `find`, `ls`,
+//! The built-in set: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`,
 //! `todo`, `fetch`, `search`. Each implements [`Tool`] and is exposed to the model
 //! as a native OpenAI function. Efficiency is in the design: token-bounded
 //! outputs, line-numbered reads for precise edits, ripgrep-backed search.
@@ -26,7 +26,6 @@ mod hooks;
 mod lsp;
 mod mcp;
 mod memory;
-mod patch;
 mod proc;
 mod tools;
 mod web;
@@ -43,7 +42,6 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
-pub use patch::PatchTool;
 pub use tools::{
     CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
     ReadTool, ReferencesTool, RenameTool, ReplaceTool, ShellTool, TodoTool, TreeTool, WatchTool,
@@ -195,7 +193,7 @@ pub struct ToolContext {
     pub guardrails: Arc<Vec<Guardrail>>,
     /// Files whose content the model has seen this session (read, or written by
     /// it), each with whether the read was **complete** and the file's
-    /// change-signature at the time. `edit`/`write`/`patch` consult this via
+    /// change-signature at the time. `edit`/`write` consult this via
     /// [`read_state`](Self::read_state): a blind mutation against guessed content
     /// is the top source of corrupt patches, a `write` after a partial read
     /// drops the unseen tail, and a `write` over a file that changed on disk
@@ -267,7 +265,7 @@ impl ToolContext {
     }
 
     /// Like [`mark_read`](Self::mark_read), but records a **partial** read
-    /// (paged with `offset`/`limit`, or truncated): enough for `edit`/`patch`,
+    /// (paged with `offset`/`limit`, or truncated): enough for `edit`,
     /// which re-read the file and operate on its live content, but not for a
     /// `write` that would overwrite the unseen remainder.
     pub fn mark_read_partial(&self, path: &std::path::Path) {
@@ -370,7 +368,7 @@ pub enum ReadState {
     /// Never read this session.
     Unread,
     /// Read, but only part of it (paged or truncated) — unsafe to overwrite the
-    /// whole file, though fine for `edit`/`patch` (which re-read live content).
+    /// whole file, though fine for `edit` (which re-reads live content).
     Partial,
     /// Read, but the file changed on disk since — the model's view is stale.
     Stale,
@@ -803,7 +801,6 @@ impl ToolRegistry {
         r.register(Arc::new(ReadTool));
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
-        r.register(Arc::new(patch::PatchTool));
         r.register(Arc::new(MoveTool));
         r.register(Arc::new(DeleteTool));
         r.register(Arc::new(CopyTool));

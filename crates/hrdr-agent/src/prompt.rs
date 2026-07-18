@@ -1035,7 +1035,7 @@ mod tests {
             "whole-file restore must require a clean, agent-owned diff"
         );
         assert!(
-            p.contains("remove only your own hunks with an edit or patch"),
+            p.contains("remove only your own hunks with an edit"),
             "mixed files must preserve pre-existing and user changes"
         );
     }

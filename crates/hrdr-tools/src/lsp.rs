@@ -1,4 +1,4 @@
-//! Post-edit LSP diagnostics: after `edit`/`write`/`patch`/`replace` mutate a
+//! Post-edit LSP diagnostics: after `edit`/`write`/`replace` mutate a
 //! file, the matching language server checks it and any **errors** ride back
 //! to the model appended to the tool result — a wrong edit is caught in the
 //! same round it was made, instead of at the next build.

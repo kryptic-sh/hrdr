@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **`patch` tool removed.** The `patch` tool (multi-file unified-diff apply) has
+  been removed — models frequently misformat hunks, causing silent degradation
+  to multiple `edit` calls, which are more robust. `edit` handles the same
+  single-file changes reliably; multi-file changes are still covered by
+  `replace` (textual substitution) and the LSP `rename` tool.
+
 ## [0.6.2] - 2026-07-18
 
 ### Added

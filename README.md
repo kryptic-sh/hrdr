@@ -57,21 +57,20 @@ sudo rpm -i hrdr-*.rpm
   internal history to Claude's wire format — unlocking native prompt caching.
   The server owns chat-template application; hrdr only ever sends structured
   `messages[]` + `tools[]`.
-- **Efficient, adaptive tool set.** `read`, `write`, `edit`, `patch` (multi-file
-  unified-diff), `replace` (project-wide substitution with a diff and a
-  `dry_run`), `move`, `copy`, `delete`, `find`, `ls`, `tree`, `grep`, `git`
-  (read-only: status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell,
-  and any MCP-server tools. The read tools keep **credential/secret files**
-  off-limits — unlike the same access through the shell, which has no such
-  guard. The file tools otherwise have full filesystem access (hrdr runs in a
-  codebase you trust); a process-level sandbox mode is planned. Token-bounded
-  outputs and line-numbered reads for precise edits — and when
-  `shell`/`grep`/`git` output overflows, the **full** result is saved to a temp
-  file and the model is pointed at it (`read`/`grep`) instead of losing the
-  overflow. Tools that shell out are **presence-aware**: the single `shell` tool
-  runs `bash` (falling back to POSIX `sh`), and `grep` uses ripgrep → POSIX grep
-  → a built-in walker — so the model is only ever offered tools it can actually
-  run.
+- **Efficient, adaptive tool set.** `read`, `write`, `edit`, `replace`
+  (project-wide substitution with a diff and a `dry_run`), `move`, `copy`,
+  `delete`, `find`, `ls`, `tree`, `grep`, `git` (read-only:
+  status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell, and any
+  MCP-server tools. The read tools keep **credential/secret files** off-limits —
+  unlike the same access through the shell, which has no such guard. The file
+  tools otherwise have full filesystem access (hrdr runs in a codebase you
+  trust); a process-level sandbox mode is planned. Token-bounded outputs and
+  line-numbered reads for precise edits — and when `shell`/`grep`/`git` output
+  overflows, the **full** result is saved to a temp file and the model is
+  pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
+  out are **presence-aware**: the single `shell` tool runs `bash` (falling back
+  to POSIX `sh`), and `grep` uses ripgrep → POSIX grep → a built-in walker — so
+  the model is only ever offered tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
@@ -895,9 +894,9 @@ work.
 
 ### LSP diagnostics
 
-After `edit`/`write`/`patch`/`replace` mutate a file, its language server checks
-the result and any **errors** ride back to the model appended to the tool result
-— a wrong edit is caught in the same round it was made, not at the next build.
+After `edit`/`write`/`replace` mutate a file, its language server checks the
+result and any **errors** ride back to the model appended to the tool result — a
+wrong edit is caught in the same round it was made, not at the next build.
 Warnings and hints are dropped (signal over lint noise).
 
 It's presence-aware, like the rest of the tool set: a server only spawns if its
