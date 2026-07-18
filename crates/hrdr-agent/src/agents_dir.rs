@@ -29,6 +29,9 @@ use anyhow::{Result, bail};
 
 use crate::SubagentProfile;
 
+/// Max bytes for a single agent profile file; files larger than this are skipped.
+const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+
 /// Discover agent-definition files across the Claude/opencode/hrdr locations,
 /// relative to `cwd` for project scopes and the home/XDG dirs for user scopes.
 /// Returns one profile per unique name (first source in precedence order wins).
@@ -101,6 +104,10 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_AGENTS_FILE_BYTES {
+            eprintln!("hrdr: skipping agent file {} (too large)", path.display());
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
