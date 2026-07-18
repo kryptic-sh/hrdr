@@ -213,51 +213,20 @@ impl EditorEngine for PlainEngine {
 
 impl crate::TuiRender for PlainEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
-        // Hard-wrap at the inner width in *display columns*, tracking the
-        // cursor's wrapped position the same way, so render and
-        // `desired_rows` (both driven by `wrapped_row_count`'s column math)
-        // agree and the terminal cursor lands on the right cell even with
-        // wide (CJK/emoji) or zero-width (combining-mark) glyphs.
         let width = area.width.max(1) as usize;
-        let mut lines: Vec<String> = vec![String::new()];
-        let mut col = 0usize; // display column within the current wrapped line
-        let (mut crow, mut ccol) = (0usize, 0usize);
-        for i in 0..=self.chars.len() {
-            if i == self.cursor {
-                crow = lines.len() - 1;
-                ccol = col;
-            }
-            if i == self.chars.len() {
-                break;
-            }
-            match self.chars[i] {
-                '\n' => {
-                    lines.push(String::new());
-                    col = 0;
-                }
-                c => {
-                    let cw = crate::char_width(c);
-                    // A zero-width mark rides on the previous cell: it never
-                    // advances `col` and never triggers a wrap on its own.
-                    if cw > 0 && col + cw > width {
-                        lines.push(String::new());
-                        col = 0;
-                    }
-                    lines.last_mut().unwrap().push(c);
-                    col += cw;
-                }
-            }
-        }
+        let layout = crate::compute_wrapped_layout(&self.content(), width);
 
-        // Vertically scroll so the cursor row stays visible when the content is
-        // taller than the (capped) box.
+        // Vertically scroll so the cursor row stays visible when the content
+        // is taller than the (capped) box.
+        let (crow, ccol) = layout.cursor_pos(self.cursor);
         let height = area.height.max(1) as usize;
         let top = crow.saturating_sub(height - 1);
-        let visible: Vec<Line> = lines
+        let visible: Vec<Line> = layout
+            .lines
             .iter()
             .skip(top)
             .take(height)
-            .map(|l| Line::from(l.clone()))
+            .map(|vl| Line::from(vl.chars.iter().collect::<String>()))
             .collect();
         frame.render_widget(Paragraph::new(visible), area);
 

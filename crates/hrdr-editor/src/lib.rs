@@ -115,7 +115,7 @@ impl<T: EditorEngine + TuiRender> TuiEditorEngine for T {}
 
 /// Display width of one char, terminal-cell accounting: a zero-width
 /// combining mark contributes 0 (it rides on the previous cell), most glyphs
-/// 1, and wide glyphs (CJK, many emoji) 2. Shared by [`wrapped_row_count`] and
+/// 1, and wide glyphs (CJK, many emoji) 2. Shared by the wrapping layout and
 /// [`plain::PlainEngine`]'s renderer so wrap math and cursor placement agree
 /// with what the terminal actually draws — counting chars instead of columns
 /// overflows the input box on wide glyphs and misplaces the cursor.
@@ -123,31 +123,173 @@ pub(crate) fn char_width(c: char) -> usize {
     c.width().unwrap_or(0)
 }
 
-/// Number of display rows `text` occupies when hard-wrapped at `width` display
-/// columns (not chars). A wide glyph that would straddle the boundary wraps
-/// whole onto the next row, matching the terminal's own behavior, and
-/// zero-width marks never trigger a wrap.
-pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
-    let w = width.max(1) as usize;
-    text.split('\n')
-        .map(|line| {
-            let mut rows = 1usize;
-            let mut col = 0usize;
-            for c in line.chars() {
-                let cw = char_width(c);
-                if cw == 0 {
-                    continue;
+// ---------------------------------------------------------------------------
+// Word-wrapping layout — shared by [`wrapped_row_count`] and
+// [`plain::PlainEngine::render`] so both count and visual lines agree.
+// ---------------------------------------------------------------------------
+
+/// A single visual (wrapped) line: the chars rendered on one terminal row.
+#[derive(Debug)]
+pub(crate) struct VisualLine {
+    pub(crate) chars: Vec<char>,
+    pub(crate) width: usize,
+}
+
+/// The result of word-wrapping text at a given display width.
+///
+/// Provides the visual lines for rendering and a mapping from source char
+/// index to (row, col) for cursor placement.
+#[derive(Debug)]
+pub(crate) struct WrappedLayout {
+    pub(crate) lines: Vec<VisualLine>,
+    /// `positions[i]` = (visual_row, visual_col) where char index `i` sits.
+    /// `positions[text.chars().count()]` = position after the last char.
+    positions: Vec<(usize, usize)>,
+}
+
+impl WrappedLayout {
+    /// Total visual lines — at least 1 for an empty buffer.
+    pub(crate) fn row_count(&self) -> usize {
+        self.lines.len().max(1)
+    }
+
+    /// Visual position `(row, col)` for the cursor at `cursor` (a char index
+    /// in `0..=text.chars().count()`).
+    pub(crate) fn cursor_pos(&self, cursor: usize) -> (usize, usize) {
+        self.positions.get(cursor).copied().unwrap_or((0, 0))
+    }
+}
+
+/// Word-wrap `text` at `width` display columns.
+///
+/// Wrapping rules (in order):
+///
+/// 1. **Word wrap** — when a word (contiguous non-whitespace) does not fit
+///    on the current visual line but would fit on an empty line, start a new
+///    line and place it there.  Whitespace preceding that word is dropped from
+///    display (the break boundary).
+///
+/// 2. **Hard wrap** — words longer than `width` are split character-by-
+///    character across multiple lines, as in the original hard-wrap.
+///
+/// 3. **Explicit newlines** (`\n`) always force a line break.
+///
+/// 4. **Unicode width** — wide glyphs (CJK, emoji, width 2) and zero-width
+///    combining marks are accounted for identically to `char_width`.
+pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout {
+    let w = width.max(1);
+    let src: Vec<char> = text.chars().collect();
+    let n = src.len();
+
+    let mut lines: Vec<VisualLine> = vec![VisualLine {
+        chars: vec![],
+        width: 0,
+    }];
+    let mut positions = vec![(0usize, 0usize); n + 1];
+
+    let mut i = 0; // byte-iteration equivalent via src index
+    while i < n {
+        if src[i] == '\n' {
+            // Record position for this newline char.
+            positions[i] = (lines.len() - 1, lines[lines.len() - 1].width);
+            lines.push(VisualLine {
+                chars: vec![],
+                width: 0,
+            });
+            i += 1;
+            continue;
+        }
+
+        // Collect a homogeneous run: word (non-whitespace) or whitespace.
+        let run_start = i;
+        let is_word = !src[i].is_whitespace();
+        while i < n && src[i] != '\n' && is_word == !src[i].is_whitespace() {
+            i += 1;
+        }
+        let run: Vec<char> = src[run_start..i].to_vec();
+        let run_width: usize = run.iter().map(|&c| char_width(c)).sum();
+
+        if is_word {
+            let cur = lines.len() - 1;
+            if lines[cur].width + run_width <= w {
+                // Fits on the current line.
+                let mut col = lines[cur].width;
+                for (j, &c) in run.iter().enumerate() {
+                    positions[run_start + j] = (cur, col);
+                    lines[cur].chars.push(c);
+                    col += char_width(c);
                 }
-                if col + cw > w {
-                    rows += 1;
-                    col = 0;
+                lines[cur].width = col;
+            } else if run_width <= w {
+                // Fits on an empty line — wrap the whole word there.
+                let new_idx = lines.len();
+                lines.push(VisualLine {
+                    chars: vec![],
+                    width: 0,
+                });
+                let mut col = 0usize;
+                for (j, &c) in run.iter().enumerate() {
+                    positions[run_start + j] = (new_idx, col);
+                    lines[new_idx].chars.push(c);
+                    col += char_width(c);
                 }
-                col += cw;
+                lines[new_idx].width = col;
+            } else {
+                // Word is wider than a whole row — hard-break it.
+                let mut cur = lines.len() - 1;
+                let mut col = lines[cur].width;
+                for (j, &c) in run.iter().enumerate() {
+                    let cw = char_width(c);
+                    if cw > 0 && col + cw > w {
+                        cur = lines.len();
+                        lines.push(VisualLine {
+                            chars: vec![],
+                            width: 0,
+                        });
+                        col = 0;
+                    }
+                    positions[run_start + j] = (cur, col);
+                    lines[cur].chars.push(c);
+                    if cw > 0 {
+                        col += cw;
+                    }
+                }
+                lines[cur].width = col;
             }
-            rows
-        })
-        .sum::<usize>()
-        .max(1)
+        } else {
+            // Whitespace run.
+            let cur = lines.len() - 1;
+            if lines[cur].width + run_width <= w {
+                let mut col = lines[cur].width;
+                for (j, &c) in run.iter().enumerate() {
+                    positions[run_start + j] = (cur, col);
+                    lines[cur].chars.push(c);
+                    col += char_width(c);
+                }
+                lines[cur].width = col;
+            } else {
+                // Does not fit — drop from display.  All these whitespace
+                // positions map to the end of the current visual line.
+                let end = (cur, lines[cur].width);
+                for j in 0..run.len() {
+                    positions[run_start + j] = end;
+                }
+            }
+        }
+    }
+
+    // Position after the very last char.
+    positions[n] = (lines.len() - 1, lines[lines.len() - 1].width);
+
+    WrappedLayout { lines, positions }
+}
+
+/// Number of display rows `text` occupies when word-wrapped at `width`
+/// display columns (not chars).  Delegates to [`compute_wrapped_layout`],
+/// guaranteeing that [`PlainEngine::desired_rows`] and `PlainEngine::render`
+/// always agree.
+pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
+    compute_wrapped_layout(text, width.max(1) as usize).row_count()
 }
 
 /// The default discipline: hjkl's vim FSM.
@@ -327,42 +469,165 @@ impl TuiRender for VimEngine {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::wrapped_row_count;
+    use super::*;
 
-    /// Plain ASCII: unchanged behavior from the char-counting version — one
-    /// row exactly at the boundary, two rows one char past it.
+    // ------------------------------------------------------------------
+    // Basic wrapping (applies to both hard-wrap and word-wrap)
+    // ------------------------------------------------------------------
+
+    /// Plain ASCII: one row exactly at the boundary, two rows one char past.
     #[test]
     fn ascii_wraps_at_the_column_boundary() {
         assert_eq!(wrapped_row_count("0123456789", 10), 1);
         assert_eq!(wrapped_row_count("01234567890", 10), 2);
     }
 
-    /// Wide glyphs (CJK, width 2) count as 2 columns each, so half as many fit
-    /// per row as ASCII — the char-counting bug undercounted rows by 2x here.
+    /// Wide glyphs (CJK, width 2) count as 2 columns each.
     #[test]
     fn wide_glyphs_count_as_two_columns() {
-        // 6 wide chars = 12 columns; at width 10 that's 2 rows (a 7th char
-        // would overflow the 5th slot, so only 5 fit on the first row).
         let line: String = std::iter::repeat_n('国', 6).collect();
         assert_eq!(wrapped_row_count(&line, 10), 2);
     }
 
-    /// A wide glyph that would straddle the boundary wraps whole onto the next
-    /// row rather than splitting across it.
+    /// A wide glyph that would straddle the boundary wraps whole.
     #[test]
     fn a_wide_glyph_does_not_split_across_the_boundary() {
-        // 9 narrow chars fill columns 0..9, leaving 1 free column — too
-        // narrow for the wide glyph that follows, so it wraps whole.
         let line = format!("{}{}", "a".repeat(9), '国');
         assert_eq!(wrapped_row_count(&line, 10), 2);
     }
 
-    /// Zero-width combining marks ride on the previous cell — they never
-    /// advance the column count or trigger a wrap.
+    /// Zero-width combining marks ride on the previous cell.
     #[test]
     fn zero_width_combining_marks_are_free() {
-        // "e" + combining acute accent (U+0301), repeated to fill a row.
         let line: String = std::iter::repeat_n("e\u{0301}", 10).collect();
         assert_eq!(wrapped_row_count(&line, 10), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Word-wrap specific behavior
+    // ------------------------------------------------------------------
+
+    /// Ordinary word wrapping: avoid splitting a word that can move whole.
+    #[test]
+    fn word_wrap_does_not_split_words() {
+        // "hello world" at width 7: "hello" (5) + ws (1) = 6 fits,
+        // "world" (5) would make 11 > 7.  Word-wrap puts "world" on row 2.
+        assert_eq!(wrapped_row_count("hello world", 7), 2);
+
+        // At width 11 everything fits on one row.
+        assert_eq!(wrapped_row_count("hello world", 11), 1);
+    }
+
+    /// A word longer than width is still hard-wrapped.
+    #[test]
+    fn overlong_word_is_hard_wrapped() {
+        // "superlongword" at width 6: each chunk of 6 chars wraps.
+        assert_eq!(wrapped_row_count("superlongword", 6), 3); // superl ongwor d
+    }
+
+    /// Word-wrap + explicit newlines interact correctly.
+    #[test]
+    fn explicit_newlines_force_breaks() {
+        // Two short logical lines each fit their own row.
+        assert_eq!(wrapped_row_count("ab\ncd", 10), 2);
+        // Long first line wraps, second fits.
+        assert_eq!(wrapped_row_count("hello world\nab", 7), 3);
+    }
+
+    /// Unicode width with word-wrap: wide chars in words.
+    #[test]
+    fn word_wrap_wide_glyph() {
+        // "hello 世界 world" at width 11:
+        // "hello " = 6 fits, "世界" (4 cols) + " world" (6) = overflow.
+        // "世" alone is 2 cols; "世界" is 4 cols, fits on empty line.
+        assert_eq!(wrapped_row_count("hello 世界 world", 11), 2);
+    }
+
+    /// Cursor position mapping at various char indices.
+    #[test]
+    fn cursor_positions_after_wrapping() {
+        let layout = compute_wrapped_layout("hello world", 7);
+        // Index 0 ('h') → row 0, col 0
+        assert_eq!(layout.cursor_pos(0), (0, 0));
+        // Index 5 (space) → row 0, col 5  (end of "hello")
+        assert_eq!(layout.cursor_pos(5), (0, 5));
+        // Index 6 ('w') → row 1, col 0  (start of wrapped "world")
+        assert_eq!(layout.cursor_pos(6), (1, 0));
+        // Index 11 (EOF) → row 1, col 5 (end of "world")
+        assert_eq!(layout.cursor_pos(11), (1, 5));
+    }
+
+    /// Cursor at a soft-wrap boundary (the whitespace that triggers the wrap).
+    #[test]
+    fn cursor_at_wrap_boundary() {
+        // "foo bar" at width 5: "foo" fits, space doesn't, word-wraps.
+        let layout = compute_wrapped_layout("foo bar", 5);
+        // 'foo' on row 0 (cols 0-2), space at (0,3), 'bar' on row 1 (cols 0-2)
+        assert_eq!(layout.cursor_pos(3), (0, 3)); // space
+        assert_eq!(layout.cursor_pos(4), (1, 0)); // 'b'
+        assert_eq!(layout.cursor_pos(0), (0, 0)); // 'f'
+        assert_eq!(layout.cursor_pos(7), (1, 3)); // EOF
+    }
+
+    /// desired_rows computed by PlainEngine matches the rendered layout.
+    #[test]
+    fn desired_rows_matches_rendered_rows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let mut e = PlainEngine::new();
+        e.set_content("hello world again");
+
+        let desired = e.desired_rows(7, 10);
+        let layout = compute_wrapped_layout(&e.content(), 7);
+        assert_eq!(
+            desired as usize,
+            layout.row_count(),
+            "desired_rows must match layout row_count"
+        );
+
+        // Render to a terminal and verify the cursor lands where the layout
+        // predicts.  After set_content, the cursor sits at the buffer end.
+        let area = Rect::new(0, 0, 7, 10);
+        let mut term = Terminal::new(TestBackend::new(7, 10)).unwrap();
+        term.draw(|f| e.render(f, area)).unwrap();
+        let content_len = e.content().len();
+        let (rv, cv) = layout.cursor_pos(content_len);
+        assert_eq!(
+            term.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(cv as u16, rv as u16),
+            "terminal cursor must match layout cursor_pos at EOF"
+        );
+    }
+
+    /// Word-wrap drops whitespace at break boundaries but never modifies the
+    /// original buffer content.
+    #[test]
+    fn content_is_unchanged_by_wrapping() {
+        let text = "hello   world  ";
+        let layout = compute_wrapped_layout(text, 5);
+        // Two visual rows: "hello" and "world"; the spaces between are dropped
+        // from display but the source string is never touched.
+        assert_eq!(layout.row_count(), 2);
+        assert_eq!(text, "hello   world  ", "source text is untouched");
+        assert_eq!(layout.lines[0].chars.iter().collect::<String>(), "hello");
+        assert_eq!(layout.lines[1].chars.iter().collect::<String>(), "world");
+    }
+
+    /// Empty text produces 1 row.
+    #[test]
+    fn empty_text() {
+        assert_eq!(wrapped_row_count("", 10), 1);
+        let layout = compute_wrapped_layout("", 10);
+        assert_eq!(layout.row_count(), 1);
+        assert_eq!(layout.cursor_pos(0), (0, 0));
+    }
+
+    /// Text that is only newlines.
+    #[test]
+    fn only_newlines() {
+        assert_eq!(wrapped_row_count("\n", 10), 2);
+        assert_eq!(wrapped_row_count("\n\n", 10), 3);
     }
 }
