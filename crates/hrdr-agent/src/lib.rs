@@ -3861,7 +3861,13 @@ mod tests {
         let over = dir.path().join("elsewhere");
         let (p2, g2) =
             super::memory_dirs(std::path::Path::new("/home/x/proj"), Some(&over)).unwrap();
-        assert_eq!(p2, over.join("projects").join("home-x-proj"));
+        let expected_parent = over.join("projects");
+        assert_eq!(p2.parent(), Some(expected_parent.as_path()), "parent should be projects/");
+        assert!(
+            p2.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("home-x-proj-"),
+            "project dir should start with 'home-x-proj-', got {:?}",
+            p2
+        );
         assert_eq!(g2, over.join("global"));
         // OKF-style `index.md` is recognized too (copy from either ecosystem).
         std::fs::remove_file(proj.join("MEMORY.md")).unwrap();
