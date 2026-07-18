@@ -677,6 +677,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             stdin_tx,
             pending: pending.clone(),
             _child: child,
+            _group: None,
         };
 
         let id = 77u64;
@@ -726,6 +727,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             stdin_tx,
             pending: pending.clone(),
             _child: child,
+            _group: None,
         };
 
         // Drop the receiver shortly after the request starts blocking on

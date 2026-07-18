@@ -23,11 +23,19 @@ pub(crate) enum Transport {
 }
 
 /// stdio transport: a spawned child + a writer channel + the id→response map.
-/// Dropping it kills the child (`kill_on_drop`).
+/// Dropping it kills the child (`kill_on_drop`) *and* every descendant it
+/// forked (the [`ProcessGroup`](crate::proc::ProcessGroup) guard's `Drop`).
 pub(crate) struct StdioTransport {
     pub(crate) stdin_tx: tokio::sync::mpsc::Sender<String>,
     pub(crate) pending: Pending,
     pub(crate) _child: Child,
+    /// Owns the process group / job object `_child` was placed in. Declared
+    /// after `_child` so it drops after it. `kill_on_drop` only reaps the
+    /// leader pid; an MCP server launched through `npx`/`uvx`/a wrapper script
+    /// forks its real server as a grandchild, which would otherwise survive
+    /// teardown holding sockets and file locks. This guard's `Drop` takes the
+    /// whole tree down — unix `kill(-pgid)`, Windows job-handle close.
+    pub(crate) _group: Option<crate::proc::ProcessGroup>,
 }
 
 /// Streamable-HTTP transport: POST to `url`, carrying `headers` (auth) and the
