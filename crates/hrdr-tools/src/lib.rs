@@ -463,7 +463,11 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
 ///
 /// The file handle is opened before validation and read through that same handle,
 /// preventing the validated path from being replaced between validation and read.
-pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+pub fn read_attach_file(
+    path_str: &str,
+    cwd: &std::path::Path,
+    max_bytes: Option<usize>,
+) -> anyhow::Result<String> {
     use std::io::Read;
 
     let resolved = resolve_under(cwd, path_str);
@@ -485,6 +489,20 @@ pub fn read_attach_file(path_str: &str, cwd: &std::path::Path) -> anyhow::Result
             anyhow::bail!(
                 "{} changed while it was being validated",
                 resolved.display()
+            );
+        }
+    }
+
+    if let Some(max) = max_bytes {
+        let len = file
+            .metadata()
+            .map_err(|e| anyhow::anyhow!("can't stat {}: {e}", resolved.display()))?
+            .len() as usize;
+        if len > max {
+            anyhow::bail!(
+                "{} is {} bytes, over the {max} byte limit for attachments",
+                resolved.display(),
+                len
             );
         }
     }

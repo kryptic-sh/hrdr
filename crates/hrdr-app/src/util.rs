@@ -138,7 +138,7 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
         if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
             continue;
         }
-        let Ok(text) = hrdr_tools::read_attach_file(rel, cwd) else {
+        let Ok(text) = hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES)) else {
             continue;
         };
         let text = if text.len() > MAX_ATTACH_BYTES {

@@ -292,7 +292,11 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info("usage: /add <file>".to_string());
                 return true;
             }
-            let content = match hrdr_tools::read_attach_file(&arg, &host.cwd()) {
+            let content = match hrdr_tools::read_attach_file(
+                &arg,
+                &host.cwd(),
+                Some(crate::MAX_ATTACH_BYTES),
+            ) {
                 Ok(content) => content,
                 Err(e) => {
                     host.info(format!("can't add {arg}: {e}"));
@@ -784,7 +788,7 @@ mod tests {
 
         assert!(dispatch(&mut host, "/add huge.txt"));
         assert!(
-            host.info_log.iter().any(|l| l.contains("too large")),
+            host.info_log.iter().any(|l| l.contains("byte limit")),
             "{:?}",
             host.info_log
         );
