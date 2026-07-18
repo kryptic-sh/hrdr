@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing
+  a pasted error — parses the error, traces backward to the root cause,
+  applies the minimal fix, and verifies it.
 - **`:test` built-in skill.** New `:test` skill for writing tests against
   the current change and iterating until green — discovers the project's
   test framework and conventions, covers happy-path, edge cases, and
