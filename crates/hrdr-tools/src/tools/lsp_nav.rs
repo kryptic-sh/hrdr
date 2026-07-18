@@ -22,6 +22,91 @@ use crate::{Tool, ToolContext, guard_secret_read, truncate};
 /// can be thousands).
 const MAX_LOCATIONS: usize = 50;
 
+/// One file's share of a planned rename: its pre-rename bytes and the bytes the
+/// server's edits produce. Everything is planned before anything is written, so
+/// a file that can't be read or whose edits don't apply aborts the rename with
+/// the workspace still untouched.
+struct PlannedEdit {
+    path: PathBuf,
+    edit_count: usize,
+    before: String,
+    after: String,
+}
+
+/// Whether `path`'s current bytes differ from `before` — i.e. whether it still
+/// needs restoring. An unreadable file counts as "differs": better to attempt a
+/// restore that fails loudly than to assume a file we can't inspect is clean.
+fn needs_restore(path: &std::path::Path, before: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|now| now != before)
+        .unwrap_or(true)
+}
+
+/// RAII rollback for the commit phase of a multi-file rename, in the shape of
+/// [`super::mutation`]'s `TempFile` guard: it undoes the writes recorded so far
+/// on drop unless [`disarm`](Self::disarm) marked the rename complete.
+///
+/// The error path rolls back explicitly (see [`RenameTool::execute`]) — this
+/// guard exists for *cancellation*: if the surrounding future is dropped at any
+/// `.await` inside the commit loop (user hits Esc, the turn is aborted), nothing
+/// else would ever restore the files already rewritten and the workspace would
+/// be left half-renamed.
+struct RenameRollback<'a> {
+    /// `(path, pre-rename bytes)` for every file whose write has been *started*,
+    /// in write order. Recorded before the write, not after, so a file that was
+    /// modified by a write that then failed (or was cancelled in flight) is
+    /// still covered.
+    written: Vec<(&'a std::path::Path, &'a str)>,
+    disarmed: bool,
+}
+
+impl<'a> RenameRollback<'a> {
+    fn new() -> Self {
+        Self {
+            written: Vec::new(),
+            disarmed: false,
+        }
+    }
+
+    fn record(&mut self, path: &'a std::path::Path, before: &'a str) {
+        self.written.push((path, before));
+    }
+
+    /// Mark the rename committed: drop becomes a no-op.
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    /// Restore every recorded file that still differs from its pre-rename bytes,
+    /// newest first. Returns the paths that could not be restored — those are
+    /// left holding renamed content.
+    fn restore_blocking(&self) -> Vec<PathBuf> {
+        let mut failed = Vec::new();
+        for (path, before) in self.written.iter().rev() {
+            if needs_restore(path, before) && std::fs::write(path, before).is_err() {
+                failed.push(path.to_path_buf());
+            }
+        }
+        failed
+    }
+}
+
+impl Drop for RenameRollback<'_> {
+    fn drop(&mut self) {
+        if self.disarmed || self.written.is_empty() {
+            return;
+        }
+        // Deliberately blocking `std::fs`: `Drop` is synchronous and cannot
+        // `.await`, and a cancelled future has no runtime left to block on, so
+        // there is no async option here. Two consequences, both accepted:
+        // post-edit hooks are *not* re-run on the restored bytes (unlike the
+        // error path below, which rolls back through `apply_file_change`), and
+        // a restore that itself fails cannot be reported — the caller that
+        // would have been told is exactly the thing that went away.
+        let _failed = self.restore_blocking();
+    }
+}
+
 #[derive(Deserialize)]
 struct NavArgs {
     path: String,
@@ -206,6 +291,70 @@ impl Tool for ReferencesTool {
     }
 }
 
+/// Commit phase of a rename: write every planned file through the normal
+/// mutation path, all-or-nothing.
+///
+/// Three ways out, and each leaves the workspace whole:
+/// * every write succeeds — the guard is disarmed and the [`FileChange`]s
+///   (hook/diagnostic notes) come back;
+/// * a write fails — the files already written are restored *through
+///   [`apply_file_change`]* so post-edit hooks run on the restored bytes too,
+///   then the original error is returned, with any file that could not be
+///   restored named first (a workspace left half-renamed matters more to the
+///   user than why the write failed);
+/// * the future is dropped mid-loop — `RenameRollback`'s `Drop` restores
+///   synchronously; see its comment for what that path can't do.
+async fn commit_planned(ctx: &ToolContext, planned: &[PlannedEdit]) -> Result<Vec<FileChange>> {
+    let mut applied: Vec<FileChange> = Vec::new();
+    let mut rollback = RenameRollback::new();
+    let mut failure: Option<(&std::path::Path, anyhow::Error)> = None;
+
+    for plan in planned {
+        rollback.record(&plan.path, &plan.before);
+        match apply_file_change(ctx, &plan.path, "rename", &plan.after).await {
+            Ok(fc) => {
+                ctx.mark_read(&plan.path);
+                applied.push(fc);
+            }
+            Err(e) => {
+                failure = Some((&plan.path, e));
+                break;
+            }
+        }
+    }
+
+    let Some((failed_path, err)) = failure else {
+        rollback.disarm();
+        return Ok(applied);
+    };
+
+    // Roll back what was written. The guard stays armed until this finishes, so
+    // cancelling *during* the rollback still falls back to its blocking restore
+    // (which is idempotent with this loop: both skip files already at `before`).
+    let mut unrestored: Vec<String> = Vec::new();
+    for (path, before) in rollback.written.iter().rev() {
+        if !needs_restore(path, before) {
+            continue;
+        }
+        match apply_file_change(ctx, path, "rename", before).await {
+            Ok(_) => ctx.mark_read(path),
+            Err(e) => unrestored.push(format!("{} ({e:#})", path.display())),
+        }
+    }
+    rollback.disarm();
+
+    let err = err.context(format!("writing {}", failed_path.display()));
+    if unrestored.is_empty() {
+        return Err(err);
+    }
+    Err(err.context(format!(
+        "rename rolled back, but {} file(s) could NOT be restored and still hold renamed \
+         content — fix them by hand: {}",
+        unrestored.len(),
+        unrestored.join(", ")
+    )))
+}
+
 pub struct RenameTool;
 
 #[async_trait]
@@ -277,33 +426,19 @@ impl Tool for RenameTool {
                 .with_context(|| format!("reading {}", file.path.display()))?;
             let after = crate::lsp::apply_lsp_edits(&before, &file.edits)
                 .with_context(|| format!("applying rename edits to {}", file.path.display()))?;
-            planned.push((file.path.clone(), file.edits.len(), before, after));
+            planned.push(PlannedEdit {
+                path: file.path.clone(),
+                edit_count: file.edits.len(),
+                before,
+                after,
+            });
         }
 
-        // Commit all writes with rollback on first failure.
-        let mut written: Vec<PathBuf> = Vec::new();
-        let mut applied: Vec<FileChange> = Vec::new();
-        for (path, _edit_count, _before, after) in &planned {
-            match apply_file_change(ctx, path, "rename", after).await {
-                Ok(fc) => {
-                    ctx.mark_read(path);
-                    written.push(path.clone());
-                    applied.push(fc);
-                }
-                Err(e) => {
-                    // Rollback: restore original content of every written file.
-                    for p in written.iter().rev() {
-                        if let Some((_, _, orig, _)) = planned.iter().find(|(pl, ..)| pl == p) {
-                            let _ = tokio::fs::write(p, orig).await;
-                        }
-                    }
-                    return Err(e).context(format!("writing {}", path.display()));
-                }
-            }
-        }
+        let applied = commit_planned(ctx, &planned).await?;
 
         let mut summary = Vec::with_capacity(planned.len());
-        for ((path, edit_count, _before, _after), fc) in planned.iter().zip(applied.iter()) {
+        for (plan, fc) in planned.iter().zip(applied.iter()) {
+            let (path, edit_count) = (&plan.path, plan.edit_count);
             let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path).display();
             let mut line = format!("{rel} ({edit_count} edit(s))");
             if !fc.notes.is_empty() {
@@ -321,5 +456,130 @@ impl Tool for RenameTool {
             ),
             ctx.max_output,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::task::{Context as TaskContext, Waker};
+
+    use super::*;
+
+    fn plan(path: &std::path::Path, before: &str, after: &str) -> PlannedEdit {
+        PlannedEdit {
+            path: path.to_path_buf(),
+            edit_count: 1,
+            before: before.to_string(),
+            after: after.to_string(),
+        }
+    }
+
+    /// A failed write mid-commit must leave *no* file renamed: the ones already
+    /// written go back to their original bytes, and the error names the file
+    /// that failed. Here the second target is a directory, so writing it fails
+    /// and restoring it can't be confirmed either — which must be reported
+    /// rather than swallowed.
+    #[tokio::test]
+    async fn a_failed_write_rolls_back_and_reports_both_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let one = dir.path().join("one.rs");
+        let blocked = dir.path().join("blocked.rs");
+        tokio::fs::write(&one, "fn old() {}\n").await.unwrap();
+        // A directory can be neither written over nor restored.
+        tokio::fs::create_dir(&blocked).await.unwrap();
+
+        let planned = vec![
+            plan(&one, "fn old() {}\n", "fn new() {}\n"),
+            plan(&blocked, "fn old() {}\n", "fn new() {}\n"),
+        ];
+
+        let err = commit_planned(&ctx, &planned)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("blocked.rs"), "{msg}");
+        assert!(
+            msg.contains("could NOT be restored"),
+            "a failed restore must be surfaced, not swallowed: {msg}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&one).await.unwrap(),
+            "fn old() {}\n",
+            "the already-written file must be restored byte-for-byte"
+        );
+    }
+
+    /// Cancellation (the surrounding future dropped mid-commit) must roll back
+    /// too — that's the guard's whole job. Driven by polling the future by hand
+    /// and dropping it once the first file is on disk, so it doesn't depend on
+    /// timing.
+    #[tokio::test]
+    async fn dropping_the_commit_future_restores_written_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let one = dir.path().join("one.rs");
+        let two = dir.path().join("two.rs");
+        tokio::fs::write(&one, "one old\n").await.unwrap();
+        tokio::fs::write(&two, "two old\n").await.unwrap();
+
+        let planned = vec![
+            plan(&one, "one old\n", "one new\n"),
+            plan(&two, "two old\n", "two new\n"),
+        ];
+
+        let mut fut = Box::pin(commit_planned(&ctx, &planned));
+        let mut task_cx = TaskContext::from_waker(Waker::noop());
+        let mut reached = false;
+        for _ in 0..200 {
+            assert!(
+                fut.as_mut().poll(&mut task_cx).is_pending(),
+                "the commit must not finish before we cancel it"
+            );
+            if tokio::fs::read_to_string(&one).await.unwrap() == "one new\n" {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(reached, "the first file was never written");
+        assert_eq!(
+            tokio::fs::read_to_string(&two).await.unwrap(),
+            "two old\n",
+            "the second file must not be written yet, or this tests nothing"
+        );
+
+        drop(fut);
+
+        assert_eq!(
+            tokio::fs::read_to_string(&one).await.unwrap(),
+            "one old\n",
+            "a cancelled rename must restore the file it had already written"
+        );
+        assert_eq!(tokio::fs::read_to_string(&two).await.unwrap(), "two old\n");
+    }
+
+    /// The happy path stays untouched: every file renamed, nothing restored.
+    #[tokio::test]
+    async fn a_successful_commit_writes_every_file_and_restores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let one = dir.path().join("one.rs");
+        let two = dir.path().join("two.rs");
+        tokio::fs::write(&one, "one old\n").await.unwrap();
+        tokio::fs::write(&two, "two old\n").await.unwrap();
+
+        let planned = vec![
+            plan(&one, "one old\n", "one new\n"),
+            plan(&two, "two old\n", "two new\n"),
+        ];
+
+        let applied = commit_planned(&ctx, &planned).await.unwrap();
+
+        assert_eq!(applied.len(), 2);
+        assert_eq!(tokio::fs::read_to_string(&one).await.unwrap(), "one new\n");
+        assert_eq!(tokio::fs::read_to_string(&two).await.unwrap(), "two new\n");
     }
 }
