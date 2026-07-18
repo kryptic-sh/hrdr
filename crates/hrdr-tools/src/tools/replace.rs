@@ -129,11 +129,10 @@ impl Tool for ReplaceTool {
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
-            // A literal substitution's output size is exactly computable from the
-            // hit count, so bound it before allocating: `find="e"`, `replace=50KB`
-            // could expand even a single sub-2 MB file into gigabytes. (A regex
-            // replacement's size depends on per-match captures, so it isn't
-            // guarded here — its input is already capped at `MAX_FILE_BYTES`.)
+            // Bound output size before allocating: `find="e"`, `replace=50KB`
+            // could expand even a single sub-2 MB file into gigabytes. For regex
+            // mode the projection is conservative (captures can vary), but still
+            // prevents catastrophic OOM.
             if a.replace.len() > a.find.len() {
                 let projected = before
                     .len()
