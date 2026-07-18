@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::mutation::apply_file_change;
-use crate::{Tool, ToolContext, truncate};
+use crate::{Tool, ToolContext, guard_secret_read, truncate};
 
 /// Most locations listed before "…and N more" (references in a big codebase
 /// can be thousands).
@@ -45,6 +45,7 @@ async fn locate(
     symbol: Option<&str>,
 ) -> Result<(std::path::PathBuf, String, u32, u32)> {
     let path = ctx.resolve(path);
+    guard_secret_read(&path).with_context(|| format!("refusing to navigate {}", path.display()))?;
     let content = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
@@ -60,9 +61,8 @@ async fn locate(
         Some(sym) if !sym.is_empty() => {
             let byte = text.find(sym).with_context(|| {
                 format!(
-                    "`{sym}` does not appear on line {line} of {} (that line is: {})",
+                    "`{sym}` does not appear on line {line} of {}",
                     path.display(),
-                    text.trim()
                 )
             })?;
             crate::lsp::byte_to_utf16_col(text, byte)
@@ -267,7 +267,10 @@ impl Tool for RenameTool {
         // confinement plus a clean application of every file's edits.
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {
-            let before = tokio::fs::read_to_string(&file.path)
+            let path = &file.path;
+            guard_secret_read(path)
+                .with_context(|| format!("refusing to read {}", path.display()))?;
+            let before = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("reading {}", file.path.display()))?;
             let after = crate::lsp::apply_lsp_edits(&before, &file.edits)
