@@ -859,15 +859,25 @@ pub fn parse_locations(result: &Value) -> Result<Vec<LspLocation>> {
 /// `documentChanges` array form) into per-file edit lists. Errors on file
 /// create/rename/delete operations — hrdr applies text edits only.
 pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdits>> {
-    // Canonicalize BOTH sides before comparing. Canonicalizing only the target
-    // breaks wherever the workspace path itself contains a symlink: on macOS a
-    // temp dir under `/var/folders/…` canonicalizes to `/private/var/folders/…`,
-    // so a legitimate in-workspace rename compared against the raw `cwd` looks
-    // like an escape and is refused.
-    let base = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    // Compare like with like: either BOTH sides canonical, or BOTH raw. Mixing
+    // the two is what breaks, and it breaks differently per platform.
+    //
+    // Canonicalizing only the target refuses a legitimate rename whenever the
+    // workspace root itself contains a symlink — on macOS a temp dir under
+    // `/var/folders/…` resolves to `/private/var/folders/…`. But canonicalizing
+    // only the base is just as wrong: `canonicalize` needs the path to exist, so
+    // a target that doesn't exist yet stays raw, and on Windows a raw `/p/a.rs`
+    // then gets compared against a base that resolved to `\\?\C:\`.
+    let base_canon = cwd.canonicalize().ok();
     let check_confined = |path: &Path| -> Result<()> {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !canon.starts_with(&base) {
+        let confined = match (path.canonicalize().ok(), base_canon.as_ref()) {
+            // Both resolved — the symlinked-workspace-root case.
+            (Some(canon), Some(base)) => canon.starts_with(base),
+            // Either side unresolvable (target not created yet): fall back to
+            // the raw pair rather than comparing across representations.
+            _ => path.starts_with(cwd),
+        };
+        if !confined {
             anyhow::bail!("rename target {} is outside the workspace", path.display());
         }
         Ok(())
