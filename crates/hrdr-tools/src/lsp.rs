@@ -836,7 +836,15 @@ pub fn parse_locations(result: &Value) -> Vec<LspLocation> {
 /// Parse a rename's `WorkspaceEdit` (either the `changes` map or
 /// `documentChanges` array form) into per-file edit lists. Errors on file
 /// create/rename/delete operations — hrdr applies text edits only.
-pub fn parse_workspace_edit(result: &Value) -> Result<Vec<LspFileEdits>> {
+pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdits>> {
+    let check_confined = |path: &Path| -> Result<()> {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !canon.starts_with(cwd) {
+            anyhow::bail!("rename target {} is outside the workspace", path.display());
+        }
+        Ok(())
+    };
+
     fn text_edits(edits: &Value) -> Vec<LspTextEdit> {
         edits
             .as_array()
@@ -861,6 +869,7 @@ pub fn parse_workspace_edit(result: &Value) -> Result<Vec<LspFileEdits>> {
     if let Some(changes) = result.get("changes").and_then(Value::as_object) {
         for (uri, edits) in changes {
             let path = uri_to_path(uri).context("bad uri in WorkspaceEdit")?;
+            check_confined(&path)?;
             out.push(LspFileEdits {
                 path,
                 edits: text_edits(edits),
@@ -875,8 +884,10 @@ pub fn parse_workspace_edit(result: &Value) -> Result<Vec<LspFileEdits>> {
                 .pointer("/textDocument/uri")
                 .and_then(Value::as_str)
                 .context("bad documentChanges entry")?;
+            let path = uri_to_path(uri).context("bad uri in WorkspaceEdit")?;
+            check_confined(&path)?;
             out.push(LspFileEdits {
-                path: uri_to_path(uri).context("bad uri in WorkspaceEdit")?,
+                path,
                 edits: text_edits(change.get("edits").unwrap_or(&Value::Null)),
             });
         }
@@ -1354,7 +1365,7 @@ mod tests {
             {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}},
              "newText": "blast"}
         ]}});
-        let files = parse_workspace_edit(&we).unwrap();
+        let files = parse_workspace_edit(&we, Path::new("/")).unwrap();
         assert_eq!(files.len(), 1);
         let out = apply_lsp_edits("let boom = 1;\nboom();\n", &files[0].edits).unwrap();
         assert_eq!(out, "let blast = 1;\nblast();\n");
@@ -1365,9 +1376,9 @@ mod tests {
              "edits": [{"range": {"start": {"line": 0, "character": 0},
                                   "end": {"line": 0, "character": 3}}, "newText": "new"}]}
         ]});
-        assert_eq!(parse_workspace_edit(&dc).unwrap().len(), 1);
+        assert_eq!(parse_workspace_edit(&dc, Path::new("/")).unwrap().len(), 1);
         let op = serde_json::json!({"documentChanges": [{"kind": "rename"}]});
-        assert!(parse_workspace_edit(&op).is_err());
+        assert!(parse_workspace_edit(&op, Path::new("/")).is_err());
 
         // Overlapping edits are refused rather than corrupting the file.
         let overlap = vec![

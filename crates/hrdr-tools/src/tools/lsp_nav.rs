@@ -254,7 +254,7 @@ impl Tool for RenameTool {
                 json!({"newName": a.new_name}),
             )
             .await?;
-        let files = crate::lsp::parse_workspace_edit(&result)?;
+        let files = crate::lsp::parse_workspace_edit(&result, &ctx.cwd)?;
         if files.is_empty() {
             bail!(
                 "the server returned no edits for renaming `{}` at {}:{}",
