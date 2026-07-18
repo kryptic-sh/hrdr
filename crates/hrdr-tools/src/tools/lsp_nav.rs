@@ -8,12 +8,14 @@
 //! `read` tool, so lines are reliable and columns aren't; the tool finds the
 //! symbol on the line and converts to the UTF-16 position LSP wants.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::mutation::apply_file_change;
+use super::mutation::{FileChange, apply_file_change};
 use crate::{Tool, ToolContext, guard_secret_read, truncate};
 
 /// Most locations listed before "…and N more" (references in a big codebase
@@ -140,7 +142,7 @@ impl Tool for DefinitionTool {
                 json!({}),
             )
             .await?;
-        let locations = crate::lsp::parse_locations(&result);
+        let locations = crate::lsp::parse_locations(&result)?;
         if locations.is_empty() {
             bail!(
                 "no definition found for `{}` at {}:{} (the server may still be indexing — try again)",
@@ -187,7 +189,7 @@ impl Tool for ReferencesTool {
                 json!({"context": {"includeDeclaration": true}}),
             )
             .await?;
-        let locations = crate::lsp::parse_locations(&result);
+        let locations = crate::lsp::parse_locations(&result)?;
         if locations.is_empty() {
             bail!(
                 "no references found for `{}` at {}:{} (the server may still be indexing — try again)",
@@ -275,16 +277,34 @@ impl Tool for RenameTool {
                 .with_context(|| format!("reading {}", file.path.display()))?;
             let after = crate::lsp::apply_lsp_edits(&before, &file.edits)
                 .with_context(|| format!("applying rename edits to {}", file.path.display()))?;
-            planned.push((file.path.clone(), file.edits.len(), after));
+            planned.push((file.path.clone(), file.edits.len(), before, after));
         }
-        // The edits are server-computed against on-disk content, so the
-        // read-before-edit gate doesn't apply; every touched file is marked
-        // read afterwards (the model has effectively seen the change).
+
+        // Commit all writes with rollback on first failure.
+        let mut written: Vec<PathBuf> = Vec::new();
+        let mut applied: Vec<FileChange> = Vec::new();
+        for (path, _edit_count, _before, after) in &planned {
+            match apply_file_change(ctx, path, "rename", after).await {
+                Ok(fc) => {
+                    ctx.mark_read(path);
+                    written.push(path.clone());
+                    applied.push(fc);
+                }
+                Err(e) => {
+                    // Rollback: restore original content of every written file.
+                    for p in written.iter().rev() {
+                        if let Some((_, _, orig, _)) = planned.iter().find(|(pl, ..)| pl == p) {
+                            let _ = tokio::fs::write(p, orig).await;
+                        }
+                    }
+                    return Err(e).context(format!("writing {}", path.display()));
+                }
+            }
+        }
+
         let mut summary = Vec::with_capacity(planned.len());
-        for (path, edit_count, after) in planned {
-            let fc = apply_file_change(ctx, &path, "rename", &after).await?;
-            ctx.mark_read(&path);
-            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(&path).display();
+        for ((path, edit_count, _before, _after), fc) in planned.iter().zip(applied.iter()) {
+            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path).display();
             let mut line = format!("{rel} ({edit_count} edit(s))");
             if !fc.notes.is_empty() {
                 line.push_str(&format!("  [{}]", fc.notes.join("; ")));

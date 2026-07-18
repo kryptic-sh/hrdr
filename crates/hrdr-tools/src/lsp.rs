@@ -808,28 +808,50 @@ fn utf16_to_byte_col(line: &str, utf16_col: u32) -> usize {
 /// Normalize a definition/references result — `null`, a single `Location`, an
 /// array of `Location`s, or an array of `LocationLink`s — into printable
 /// locations (1-based).
-pub fn parse_locations(result: &Value) -> Vec<LspLocation> {
-    let one = |v: &Value| -> Option<LspLocation> {
-        // LocationLink targets; plain Locations carry `uri` + `range`.
+pub fn parse_locations(result: &Value) -> Result<Vec<LspLocation>> {
+    let one = |v: &Value| -> Result<LspLocation> {
         let (uri, range) = if let Some(target) = v.get("targetUri") {
             (
-                target.as_str()?,
+                target
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("targetUri not a string"))?,
                 v.get("targetSelectionRange")
-                    .or_else(|| v.get("targetRange"))?,
+                    .or_else(|| v.get("targetRange"))
+                    .ok_or_else(|| anyhow::anyhow!("missing target range"))?,
             )
         } else {
-            (v.get("uri")?.as_str()?, v.get("range")?)
+            (
+                v.get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing uri"))?,
+                v.get("range")
+                    .ok_or_else(|| anyhow::anyhow!("missing range"))?,
+            )
         };
-        Some(LspLocation {
-            path: uri_to_path(uri)?,
-            line: range.pointer("/start/line")?.as_u64()? as u32 + 1,
-            column: range.pointer("/start/character")?.as_u64()? as u32 + 1,
+        Ok(LspLocation {
+            path: uri_to_path(uri).ok_or_else(|| anyhow::anyhow!("bad uri: {uri}"))?,
+            line: u32::try_from(
+                range
+                    .pointer("/start/line")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing start/line"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("line out of range"))?
+                + 1,
+            column: u32::try_from(
+                range
+                    .pointer("/start/character")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing start/character"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("character out of range"))?
+                + 1,
         })
     };
     match result {
-        Value::Array(items) => items.iter().filter_map(one).collect(),
-        Value::Null => Vec::new(),
-        v => one(v).into_iter().collect(),
+        Value::Array(items) => items.iter().map(one).collect(),
+        Value::Null => Ok(Vec::new()),
+        v => Ok(vec![one(v)?]),
     }
 }
 
@@ -845,23 +867,47 @@ pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdi
         Ok(())
     };
 
-    fn text_edits(edits: &Value) -> Vec<LspTextEdit> {
+    fn text_edits(edits: &Value) -> Result<Vec<LspTextEdit>> {
         edits
             .as_array()
-            .map(|a| a.iter().filter_map(one_edit).collect())
-            .unwrap_or_default()
+            .map(|a| a.iter().map(one_edit).collect::<Result<Vec<_>>>())
+            .unwrap_or(Ok(Vec::new()))
     }
-    fn one_edit(e: &Value) -> Option<LspTextEdit> {
-        Some(LspTextEdit {
+    fn one_edit(e: &Value) -> Result<LspTextEdit> {
+        Ok(LspTextEdit {
             start: (
-                e.pointer("/range/start/line")?.as_u64()? as u32,
-                e.pointer("/range/start/character")?.as_u64()? as u32,
+                u32::try_from(
+                    e.pointer("/range/start/line")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("missing start/line"))?,
+                )
+                .map_err(|_| anyhow::anyhow!("start line out of range"))?,
+                u32::try_from(
+                    e.pointer("/range/start/character")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("missing start/character"))?,
+                )
+                .map_err(|_| anyhow::anyhow!("start character out of range"))?,
             ),
             end: (
-                e.pointer("/range/end/line")?.as_u64()? as u32,
-                e.pointer("/range/end/character")?.as_u64()? as u32,
+                u32::try_from(
+                    e.pointer("/range/end/line")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("missing end/line"))?,
+                )
+                .map_err(|_| anyhow::anyhow!("end line out of range"))?,
+                u32::try_from(
+                    e.pointer("/range/end/character")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("missing end/character"))?,
+                )
+                .map_err(|_| anyhow::anyhow!("end character out of range"))?,
             ),
-            new_text: e.get("newText")?.as_str()?.to_string(),
+            new_text: e
+                .get("newText")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing newText"))?
+                .to_string(),
         })
     }
 
@@ -872,7 +918,7 @@ pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdi
             check_confined(&path)?;
             out.push(LspFileEdits {
                 path,
-                edits: text_edits(edits),
+                edits: text_edits(edits)?,
             });
         }
     } else if let Some(doc_changes) = result.get("documentChanges").and_then(Value::as_array) {
@@ -888,7 +934,7 @@ pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdi
             check_confined(&path)?;
             out.push(LspFileEdits {
                 path,
-                edits: text_edits(change.get("edits").unwrap_or(&Value::Null)),
+                edits: text_edits(change.get("edits").unwrap_or(&Value::Null))?,
             });
         }
     } else if !result.is_null() {
@@ -1347,13 +1393,13 @@ mod tests {
         let link = serde_json::json!({"targetUri": "file:///p/b.rs",
             "targetSelectionRange": {"start": {"line": 0, "character": 0},
                                      "end": {"line": 0, "character": 1}}});
-        let single = parse_locations(&loc);
+        let single = parse_locations(&loc).unwrap();
         assert_eq!(single[0].path, PathBuf::from("/p/a.rs"));
         assert_eq!((single[0].line, single[0].column), (5, 3), "1-based");
-        let many = parse_locations(&serde_json::json!([loc, link]));
+        let many = parse_locations(&serde_json::json!([loc, link])).unwrap();
         assert_eq!(many.len(), 2);
         assert_eq!(many[1].path, PathBuf::from("/p/b.rs"));
-        assert!(parse_locations(&Value::Null).is_empty());
+        assert!(parse_locations(&Value::Null).unwrap().is_empty());
     }
 
     #[test]
