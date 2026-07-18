@@ -6,11 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-18
+
 ### Added
 
 - **`:audit` built-in skill.** New `:audit` skill for auditing a codebase for
   security vulnerabilities, bugs, and correctness issues. Accepts `low`/`high`
   depth argument like `:review`.
+- **`gh`/`glab` heredoc example in system prompt.** The Git section's
+  single-quoted heredoc pattern (`"$(cat <<'EOF'…)"`) now has a companion
+  example for `gh pr create` and `glab` commands, showing how to pass shell-safe
+  bodies containing `$()` and backticks without expansion.
 
 ### Fixed
 
@@ -25,13 +31,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pattern, making the model prefix every command with `cd $CWD &&`. The
   description now leads with "you are already there" and explains the chaining
   pattern only for actual directory changes.
-
-### Added
-
-- **`gh`/`glab` heredoc example in system prompt.** The Git section's
-  single-quoted heredoc pattern (`"$(cat <<'EOF'…)"`) now has a companion
-  example for `gh pr create` and `glab` commands, showing how to pass shell-safe
-  bodies containing `$()` and backticks without expansion.
+- **Watch tool description warns against gating on CI success.** The `watch`
+  tool's CI example now says "always test for a terminal status like
+  `completed`, never for `success`, or watch polls forever on a red run" — a
+  concrete, unmissable warning the model reads before invoking the tool.
+- **Removed allocator-dependent pointer-inequality assertion in the TUI e2e
+  test.** `theme_switch_invalidates_transcript_cache` compared raw heap pointers
+  of rebuilt cache blocks, which the Windows allocator can reuse, making the
+  test flaky. The behavior guarantee is already covered by the terminal-buffer
+  color check, so the pointer comparison is dropped.
 
 ## [0.6.1] - 2026-07-18
 
@@ -3064,7 +3072,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/kryptic-sh/hrdr/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/hrdr/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/hrdr/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/kryptic-sh/hrdr/compare/v0.5.1...v0.5.2
