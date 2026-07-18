@@ -13,6 +13,33 @@ use crate::truncate;
 use super::types::Pending;
 use super::{HttpTransport, PROTOCOL_VERSION, SseTransport, StdioTransport, response_id};
 
+/// Drop guard that removes `id` from `pending` unless disarmed.
+/// Covers future cancellation (no explicit remove path).
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    id: u64,
+    done: bool,
+}
+
+impl PendingGuard<'_> {
+    fn new(pending: &Pending, id: u64) -> Self {
+        Self { pending, id, done: false }
+    }
+    fn disarm(&mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            if let Ok(mut p) = self.pending.try_lock() {
+                p.remove(&self.id);
+            }
+        }
+    }
+}
+
 /// Shared plumbing for stdio + SSE: register an id in `pending`, execute
 /// `send_fn` (which should fire off the request), then race `rx` against
 /// `timeout`. On send failure or timeout the id is cleaned up.
@@ -27,21 +54,22 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     let (tx, rx) = oneshot::channel();
+    let mut guard = PendingGuard::new(pending, id);
     {
         let mut p = pending.lock().await;
         p.insert(id, tx);
     }
     if let Err(e) = send_fn().await {
-        pending.lock().await.remove(&id);
         return Err(anyhow!("send failed: {e}"));
+        // guard.drop removes the id
     }
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(msg)) => Ok(msg),
-        Ok(Err(_)) => bail!("connection closed"),
-        Err(_) => {
-            pending.lock().await.remove(&id);
-            bail!("request timed out")
+        Ok(Ok(msg)) => {
+            guard.disarm(); // reader task already removed it
+            Ok(msg)
         }
+        Ok(Err(_)) => bail!("connection closed"),
+        Err(_) => bail!("request timed out"),
     }
 }
 
