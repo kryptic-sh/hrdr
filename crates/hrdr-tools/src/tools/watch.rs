@@ -50,14 +50,16 @@ impl Tool for WatchTool {
 
     fn description(&self) -> &'static str {
         "Wait for something outside hrdr to reach an end state, then report it. \
-         Runs `command` on a loop until it exits 0 — exit 0 means \"what I am waiting for has \
-         happened\", any other exit code means \"not yet, ask again\" — and returns that final \
-         check's output. Use it instead of polling by hand (a model round-trip per check) or \
+         Runs `command` on a loop until it exits 0 — exit 0 means \"the thing I waited \
+         for reached ANY terminal state (pass, fail, done), not necessarily a good one\", \
+         any other exit code means \"not yet, ask again\" — and returns that final check's \
+         output. Use it instead of polling by hand (a model round-trip per check) or \
          sleeping blindly. \
          The command must *test* a condition and exit, not block: \
-         `gh run view <id> --json status -q .status | grep -q completed` (satisfied whether CI \
-         passed or failed — read the output to see which), `test -f build/done`, \
-         `curl -sf localhost:8080/health`. \
+         `gh run view <id> --json status -q .status | grep -q completed` (exits 0 whether \
+         CI passed or failed — always test for a terminal status like `completed`, never \
+         for `success`, or `watch` polls forever on a red run), \
+         `test -f build/done`, `curl -sf localhost:8080/health`. \
          Checks every `interval_secs` (default 10). Gives up after `timeout_secs` (default 1800, \
          max 21600) and reports the last check's output."
     }
