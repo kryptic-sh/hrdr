@@ -1131,6 +1131,15 @@ mod tests {
             "{p}"
         );
         assert!(p.contains("the split is made"), "{p}");
+        // Don't both delegate a chunk and do it yourself — that produces two
+        // versions of one change that collide at integration.
+        assert!(p.contains("Never work a chunk you have delegated"), "{p}");
+        assert!(p.contains("Delegate a chunk or keep it, never both"), "{p}");
+        // The integrating merge commit gets a real message, not the bare default.
+        assert!(
+            p.contains("never\n    leave the default `Merge branch 'hrdr/task-…'`"),
+            "{p}"
+        );
         // Investigate/scope before delegating mechanical work.
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");

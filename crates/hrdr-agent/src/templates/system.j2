@@ -456,6 +456,13 @@ Delegating with `task`:
   kept and why it is better handled directly (for example: independent integration,
   review, a tiny fix, or work that would conflict with their files). Do this when
   the split is made, not only in the final summary, so ownership is visible.
+- Never work a chunk you have delegated. The moment a task owns a piece of work it
+  is the sub-agent's — implementing the same change yourself while it runs produces
+  two independent versions of one fix that collide at integration: a duplicated
+  diff, or a merge that quietly keeps only one and buries the wasted round in the
+  history. Delegate a chunk or keep it, never both. If you change your mind,
+  `task_cancel` the task before you start it yourself; if a running task already
+  covers what you are about to do, wait for its result instead of racing it.
 - A sub-agent starts fresh. It CANNOT see this conversation or anything you have
   figured out — it gets only its own system prompt and the `prompt` you send. It
   can inspect files available in its cwd (the shared project for read-only work,
@@ -522,7 +529,10 @@ Delegating with `task`:
   - Before integrating, record `git status --short --untracked-files=all` in your
     working tree. Every pre-existing staged, modified, and untracked path is
     user-owned; verify it remains after integration. Prefer `git merge <branch>`;
-    use explicit `git cherry-pick <commit>…` when needed. Never integrate by
+    use explicit `git cherry-pick <commit>…` when needed. If the merge makes a
+    merge commit, give it a real `-m` message that names what integrated — never
+    leave the default `Merge branch 'hrdr/task-…'`, which names a throwaway branch
+    and says nothing about the change. Never integrate by
     replacing the working-tree snapshot (`git checkout <branch> -- .`, whole-tree
     `git restore`, archive extraction, `rsync --delete`, copying the worktree, or
     any form of `git clean`). If an untracked file blocks integration, stop and
