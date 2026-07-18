@@ -51,7 +51,7 @@ pub async fn apply_file_change(
     let content_after = if !ctx.hooks.is_empty() {
         tokio::fs::read_to_string(path)
             .await
-            .unwrap_or_else(|_| content.to_string())
+            .with_context(|| format!("rereading {} after {hook_event} hook", path.display()))?
     } else {
         content.to_string()
     };

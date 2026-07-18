@@ -78,6 +78,8 @@ impl McpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (k, v) in env {
             cmd.env(k, v);
         }

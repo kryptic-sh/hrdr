@@ -566,7 +566,8 @@ fn map_event(
                 .get("usage")
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                .unwrap_or(0);
             let finish = ev
                 .get("delta")
                 .and_then(|d| d.get("stop_reason"))
@@ -639,11 +640,11 @@ fn map_stop_reason(stop: &str) -> String {
 }
 
 /// Read a `u64` counter from an Anthropic usage object.
-fn usage_field(usage: Option<&Value>, key: &str) -> u32 {
+fn usage_field(usage: Option<&Value>, key: &str) -> u64 {
     usage
         .and_then(|u| u.get(key))
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32
+        .unwrap_or(0)
 }
 
 /// A prompt-usage chunk from Anthropic's `message_start`: total prompt tokens
@@ -652,14 +653,14 @@ fn usage_field(usage: Option<&Value>, key: &str) -> u32 {
 fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
     let cache_read = usage_field(usage, "cache_read_input_tokens");
     let prompt = usage_field(usage, "input_tokens")
-        + cache_read
-        + usage_field(usage, "cache_creation_input_tokens");
+        .saturating_add(cache_read)
+        .saturating_add(usage_field(usage, "cache_creation_input_tokens"));
     let mut u = Usage {
-        prompt_tokens: prompt,
+        prompt_tokens: u32::try_from(prompt).unwrap_or(u32::MAX),
         ..Default::default()
     };
     if cache_read > 0 {
-        u.prompt_tokens_details.cached_tokens = Some(cache_read);
+        u.prompt_tokens_details.cached_tokens = Some(u32::try_from(cache_read).unwrap_or(u32::MAX));
     }
     ChatChunk {
         choices: vec![],
