@@ -76,7 +76,7 @@ pub trait EditorEngine {
     /// Default counts logical lines (suits no-wrap engines like vim).
     fn desired_rows(&self, _width: u16, max: u16) -> u16 {
         let lines = self.content().split('\n').count().max(1);
-        (lines as u16).clamp(1, max)
+        lines.clamp(1, max as usize) as u16
     }
     /// Insert pasted (bracketed-paste) text at the cursor. Default feeds each
     /// character as a key event (works for any insert-mode engine); engines may

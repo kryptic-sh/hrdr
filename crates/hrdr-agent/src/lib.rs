@@ -7795,11 +7795,22 @@ mod tests {
 
     #[test]
     fn cwd_slug_sanitizes_path() {
-        assert_eq!(cwd_slug("/home/me/projects/foo"), "home-me-projects-foo");
-        assert_eq!(cwd_slug("/"), "root");
-        assert_eq!(cwd_slug("  "), "root");
+        assert!(cwd_slug("/home/me/projects/foo").starts_with("home-me-projects-foo-"));
+        assert!(cwd_slug("/").starts_with("root-"));
+        assert!(cwd_slug("  ").starts_with("root-"));
         // Consecutive separators collapse to a single dash.
-        assert_eq!(cwd_slug("a//b"), "a-b");
+        assert!(cwd_slug("a//b").starts_with("a-b-"));
+    }
+
+    #[test]
+    fn cwd_slug_distinguishes_colliding_paths() {
+        // Paths that would map to the same slug without the hash suffix
+        // must produce different slugs.
+        let a = cwd_slug("/work/foo-bar");
+        let b = cwd_slug("/work/foo_bar");
+        assert_ne!(a, b, "colliding paths must produce distinct slugs");
+        assert!(a.starts_with("work-foo-bar-"));
+        assert!(b.starts_with("work-foo-bar-"));
     }
 
     // ---- bg_handle_count reaping ----
