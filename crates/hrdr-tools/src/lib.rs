@@ -570,9 +570,11 @@ pub fn secret_file_reason(path: &std::path::Path) -> Option<&'static str> {
     let parent = if n >= 2 { comps[n - 2].as_str() } else { "" };
     let has_component = |name: &str| comps.iter().any(|c| c == name);
 
-    // hrdr credential store: `<config>/hrdr/auth.toml` (XDG or ~/.config).
-    if parent == "hrdr" && file == "auth.toml" {
-        return Some("hrdr credential store (auth.toml)");
+    // hrdr credential store: `<config>/hrdr/auth.json` (XDG or ~/.config), plus
+    // the pre-unification `auth.toml`/`oauth.json` that may still linger before
+    // (or after a partial) migration. All hold raw API keys / OAuth tokens.
+    if parent == "hrdr" && matches!(file, "auth.json" | "auth.toml" | "oauth.json") {
+        return Some("hrdr credential store");
     }
 
     // --- Whole directories that only ever hold key material / secrets. ---
@@ -1448,7 +1450,9 @@ mod tests {
 
     #[test]
     fn secret_file_reason_matches_credential_patterns() {
+        assert!(secret_file_reason(Path::new("/home/u/.config/hrdr/auth.json")).is_some());
         assert!(secret_file_reason(Path::new("/home/u/.config/hrdr/auth.toml")).is_some());
+        assert!(secret_file_reason(Path::new("/home/u/.config/hrdr/oauth.json")).is_some());
         assert!(secret_file_reason(Path::new("/home/u/.ssh/id_ed25519")).is_some());
         assert!(secret_file_reason(Path::new("/home/u/.aws/credentials")).is_some());
         assert!(secret_file_reason(Path::new("/home/u/.config/gh/hosts.yml")).is_some());

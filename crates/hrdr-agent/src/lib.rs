@@ -14,6 +14,7 @@ extern crate hrdr_test_support;
 
 mod agents_dir;
 mod auth;
+mod auth_store;
 mod prompt;
 mod store_lock;
 

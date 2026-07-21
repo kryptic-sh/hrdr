@@ -8,7 +8,8 @@
 //!   [`auth`](crate::auth) store; nothing OAuth-specific is persisted.
 //! - **OpenAI (Codex)** — the ChatGPT Pro/Plus browser flow, mirroring
 //!   opencode's `codex.ts`. It yields short-lived `access`/`refresh` tokens that
-//!   are stored here (in `oauth.json`) and transparently refreshed.
+//!   are stored as `oauth` entries in the unified credential store
+//!   ([`crate::auth_store`], `auth.json`) and transparently refreshed.
 //!
 //! The wire details (endpoints, params, constants) match opencode's
 //! `packages/opencode/src/plugin/openai/codex.ts` and
@@ -457,6 +458,10 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
 // ── OAuth credential store (OpenAI tokens) ──────────────────────────────────
 
 /// Stored OAuth credentials for one provider.
+///
+/// This is the public type callers use. In the unified store it is persisted as
+/// an [`AuthEntry::Oauth`](crate::auth_store) `oauth` entry, with a lossless
+/// conversion in both directions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OAuthCreds {
     pub access: String,
@@ -467,22 +472,26 @@ pub struct OAuthCreds {
     pub account_id: Option<String>,
 }
 
-/// Path to the OAuth token store (`~/.config/hrdr/oauth.json`), if `HOME` is set.
+/// Path to the credential store (`~/.config/hrdr/auth.json`), if `HOME` is set.
+///
+/// OAuth credentials now share the single unified store with API keys, so this
+/// returns the same `auth.json` path as [`crate::auth_file_path`]. The name is
+/// kept for the callers that display it.
 pub fn oauth_file_path() -> Option<PathBuf> {
-    Some(crate::config_dir()?.join("oauth.json"))
+    crate::auth_store::store_path()
 }
 
 /// Persist `creds` for `provider` (atomic write, `0600` on unix), preserving any
 /// other providers' entries. Returns the file path.
 pub fn save_oauth(provider: &str, creds: &OAuthCreds) -> Result<PathBuf> {
-    let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate oauth.json"))?;
-    save_oauth_at(&path, provider, creds)?;
+    let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate auth.json"))?;
+    crate::auth_store::save_oauth_entry_at(&path, provider, creds)?;
     Ok(path)
 }
 
 /// The stored OAuth credentials for `provider`, if any.
 pub fn load_oauth(provider: &str) -> Option<OAuthCreds> {
-    load_oauth_at(&oauth_file_path()?, provider)
+    crate::auth_store::load_oauth_entry_at(&oauth_file_path()?, provider)
 }
 
 /// The store key for a provider's OAuth credentials, canonicalized ONLY for
@@ -540,54 +549,12 @@ fn has_oauth_credentials_at(path: &Path, kind: crate::ResolvedProviderKind, name
     if kind != crate::ResolvedProviderKind::ChatGptOAuth {
         return false;
     }
-    let Some(creds) = load_oauth_at(path, canonical_oauth_key(kind, name)) else {
+    let Some(creds) = crate::auth_store::load_oauth_entry_at(path, canonical_oauth_key(kind, name))
+    else {
         return false;
     };
     let has_valid_access = !creds.access.is_empty() && !access_expired(creds.expires_ms, now_ms());
     has_valid_access || !creds.refresh.is_empty()
-}
-
-/// Path-based core of [`save_oauth`].
-///
-/// Concurrent *writers* are serialized by a cross-process lock
-/// ([`StoreLock`](crate::store_lock::StoreLock)): the read-modify-write runs
-/// entirely under the lock, so a second process re-reads the merged store the
-/// first one wrote rather than racing on a stale snapshot. Two writers adding
-/// *different* providers both survive; two writers targeting the *same* provider
-/// are last-writer-wins (the later credential is the fresher one).
-fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    crate::auth::create_dir_owner_only(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
-    // Hold the write lock across the whole read-modify-write. `_lock` releases
-    // on drop (normal return, `?`, panic).
-    let _lock = crate::store_lock::StoreLock::acquire(path)?;
-    let mut map = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).with_context(|| {
-            format!("parsing existing OAuth credential store {}", path.display())
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("reading OAuth credential store {}", path.display()));
-        }
-    };
-    map.insert(provider.to_string(), creds.clone());
-    let json = serde_json::to_vec_pretty(&map).context("serializing oauth.json")?;
-    crate::write_atomic(path, &json).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Path-based core of [`load_oauth`].
-fn load_oauth_at(path: &Path, provider: &str) -> Option<OAuthCreds> {
-    load_all(path).remove(provider)
-}
-
-/// All `provider → creds` entries (empty on any read/parse failure).
-fn load_all(path: &Path) -> HashMap<String, OAuthCreds> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
 }
 
 /// A valid access token for `provider`, refreshing it first if it has (or is
@@ -645,7 +612,7 @@ pub struct OAuthAccess {
 /// Process-global single-flight coordinator for one ChatGPT credential slot.
 /// Shared by main agents and all sub-agents so concurrent refreshes collapse to
 /// one token request (concurrent writers would otherwise race on the atomic
-/// `oauth.json` replace and could strand a rotated refresh chain).
+/// `auth.json` replace and could strand a rotated refresh chain).
 struct RefreshCoordinator {
     state: Mutex<CoordState>,
     notify: tokio::sync::Notify,
@@ -699,12 +666,12 @@ pub async fn coordinated_oauth_access(
     {
         bail!("coordinated_oauth_access is only valid for trusted ChatGPT OAuth");
     }
-    let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate oauth.json"))?;
+    let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate auth.json"))?;
     coordinated_access_core(
         chatgpt_coord(),
-        || load_oauth_at(&path, "chatgpt"),
+        || crate::auth_store::load_oauth_entry_at(&path, "chatgpt"),
         |c| {
-            let _ = save_oauth_at(&path, "chatgpt", c);
+            let _ = crate::auth_store::save_oauth_entry_at(&path, "chatgpt", c);
         },
         |refresh_token, prev| async move { refresh_to_creds(&refresh_token, prev).await },
     )
@@ -1054,202 +1021,6 @@ mod tests {
         assert!(!access_expired(1_000_000, 939_999));
     }
 
-    // ── Store round-trip ─────────────────────────────────────────────────────
-
-    #[test]
-    fn oauth_store_round_trips_and_preserves_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
-
-        let openai = OAuthCreds {
-            access: "acc-1".to_string(),
-            refresh: "ref-1".to_string(),
-            expires_ms: 111,
-            account_id: Some("acct_1".to_string()),
-        };
-        let other = OAuthCreds {
-            access: "acc-2".to_string(),
-            refresh: "ref-2".to_string(),
-            expires_ms: 222,
-            account_id: None,
-        };
-        save_oauth_at(&path, "openai", &openai).unwrap();
-        save_oauth_at(&path, "other", &other).unwrap();
-
-        assert_eq!(load_oauth_at(&path, "openai"), Some(openai));
-        assert_eq!(load_oauth_at(&path, "other"), Some(other.clone()));
-
-        // Re-saving one entry leaves the other intact.
-        let openai2 = OAuthCreds {
-            access: "acc-1b".to_string(),
-            refresh: "ref-1b".to_string(),
-            expires_ms: 333,
-            account_id: None,
-        };
-        save_oauth_at(&path, "openai", &openai2).unwrap();
-        assert_eq!(load_oauth_at(&path, "openai"), Some(openai2));
-        assert_eq!(load_oauth_at(&path, "other"), Some(other));
-    }
-
-    /// The directory holding `oauth.json` must be owner-only (`0700`) so the
-    /// presence of OAuth credentials isn't world-listable. Driving the real
-    /// `save_oauth_at` path proves the fix, not a reimpl.
-    #[cfg(unix)]
-    #[test]
-    fn saved_oauth_dir_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        // A nested path whose parent doesn't exist yet, so the save creates it.
-        let cfg_dir = tmp.path().join("hrdr");
-        let path = cfg_dir.join("oauth.json");
-        save_oauth_at(
-            &path,
-            "openai",
-            &OAuthCreds {
-                access: "acc".to_string(),
-                refresh: "ref".to_string(),
-                expires_ms: 1,
-                account_id: None,
-            },
-        )
-        .unwrap();
-        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "oauth credential dir must be 0700");
-    }
-
-    /// Concurrent writers adding DIFFERENT providers all survive: the
-    /// cross-process lock serializes the read-modify-write so no writer clobbers
-    /// another's entry with a stale snapshot.
-    #[test]
-    fn concurrent_oauth_writers_different_providers_all_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
-        // Seed so every writer starts from a real (parseable) store.
-        save_oauth_at(
-            &path,
-            "seed",
-            &OAuthCreds {
-                access: "a".into(),
-                refresh: "r".into(),
-                expires_ms: 1,
-                account_id: None,
-            },
-        )
-        .unwrap();
-
-        let n = 16;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    let creds = OAuthCreds {
-                        access: format!("acc-{i}"),
-                        refresh: format!("ref-{i}"),
-                        expires_ms: i as u64,
-                        account_id: None,
-                    };
-                    save_oauth_at(&path, &format!("p{i}"), &creds).unwrap();
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert!(load_oauth_at(&path, "seed").is_some());
-        for i in 0..n {
-            let got = load_oauth_at(&path, &format!("p{i}")).expect("entry survived");
-            assert_eq!(got.access, format!("acc-{i}"));
-        }
-    }
-
-    /// Same-provider concurrent writers are last-writer-wins (documented on
-    /// `save_oauth_at`): they serialize on the lock and exactly one written
-    /// credential remains, with no corruption.
-    #[test]
-    fn concurrent_oauth_writers_same_provider_last_writer_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
-
-        let n = 16;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    let creds = OAuthCreds {
-                        access: format!("acc-{i}"),
-                        refresh: format!("ref-{i}"),
-                        expires_ms: i as u64,
-                        account_id: None,
-                    };
-                    save_oauth_at(&path, "shared", &creds).unwrap();
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let got = load_oauth_at(&path, "shared").expect("the key exists");
-        let valid: Vec<String> = (0..n).map(|i| format!("acc-{i}")).collect();
-        assert!(
-            valid.contains(&got.access),
-            "surviving value is one written: {}",
-            got.access
-        );
-    }
-
-    #[test]
-    fn oauth_store_missing_is_none() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_oauth_at(&dir.path().join("nope.json"), "openai"), None);
-    }
-
-    #[test]
-    fn oauth_store_save_refuses_to_replace_malformed_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
-        let original = b"{ not valid json\n";
-        std::fs::write(&path, original).unwrap();
-        let creds = OAuthCreds {
-            access: "new-access".to_string(),
-            refresh: "new-refresh".to_string(),
-            expires_ms: 123,
-            account_id: None,
-        };
-
-        let err = save_oauth_at(&path, "chatgpt", &creds)
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err.contains("parsing existing OAuth credential store"),
-            "{err}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
-    #[test]
-    fn oauth_store_save_refuses_to_replace_unreadable_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
-        let original = b"\xff\xfe\xfd";
-        std::fs::write(&path, original).unwrap();
-        let creds = OAuthCreds {
-            access: "new-access".to_string(),
-            refresh: "new-refresh".to_string(),
-            expires_ms: 123,
-            account_id: None,
-        };
-
-        let err = save_oauth_at(&path, "chatgpt", &creds)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("reading OAuth credential store"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
     // ── Kind-gated key + readiness ───────────────────────────────────────────
     use crate::ResolvedProviderKind as K;
 
@@ -1270,7 +1041,7 @@ mod tests {
 
     /// Store a `chatgpt` OAuth entry with an `expires_ms` relative to real now.
     fn seed_chatgpt(path: &Path, access: &str, refresh: &str, expires_ms: u64) {
-        save_oauth_at(
+        crate::auth_store::save_oauth_entry_at(
             path,
             "chatgpt",
             &OAuthCreds {
@@ -1286,7 +1057,7 @@ mod tests {
     #[test]
     fn readiness_valid_access_is_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
         assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
     }
@@ -1294,7 +1065,7 @@ mod tests {
     #[test]
     fn readiness_expired_access_with_refresh_is_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", 1); // long past
         assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
     }
@@ -1303,7 +1074,7 @@ mod tests {
     fn readiness_refresh_only_is_ready() {
         // Selectable with refresh-only credentials (empty access, refresh present).
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "", "ref", 1);
         assert!(has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
     }
@@ -1311,7 +1082,7 @@ mod tests {
     #[test]
     fn readiness_expired_access_without_refresh_is_not_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "", 1); // expired, no refresh
         assert!(!has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
     }
@@ -1319,7 +1090,7 @@ mod tests {
     #[test]
     fn readiness_empty_tokens_is_not_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "", "", now_ms() + 3_600_000);
         assert!(!has_oauth_credentials_at(&path, K::ChatGptOAuth, "chatgpt"));
     }
@@ -1327,7 +1098,7 @@ mod tests {
     #[test]
     fn readiness_unrelated_provider_is_not_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
         // Nothing stored under "openrouter"; and its kind is not ChatGptOAuth.
         assert!(!has_oauth_credentials_at(&path, K::BuiltIn, "openrouter"));
@@ -1337,7 +1108,7 @@ mod tests {
     fn custom_shadow_cannot_read_builtin_oauth_credentials() {
         // Built-in ChatGPT creds are present in the slot...
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oauth.json");
+        let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
         // ...but a custom provider spelled "chatgpt" resolves to kind Custom, and
         // the kind gate returns false before any load — not a spelling oracle.

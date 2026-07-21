@@ -1,29 +1,33 @@
-//! Dedicated credential store, kept out of `config.toml` so API keys never land
-//! in a file users commit or share. Plaintext TOML at
-//! `$XDG_CONFIG_HOME/hrdr/auth.toml` (`0600` on unix; on Windows no explicit
-//! ACL — hrdr relies on the default ACLs of the containing per-user profile
-//! directory, which is user-scoped by default), a flat map of provider name →
-//! API key. Written by the `/login` wizard, read at startup and on a live
-//! provider switch (the `/model` picker or `/login`).
+//! Raw-API-key access to the unified credential store, kept out of `config.toml`
+//! so API keys never land in a file users commit or share. Keys live as `key`
+//! entries in `$XDG_CONFIG_HOME/hrdr/auth.json` (`0600` on unix; on Windows no
+//! explicit ACL — hrdr relies on the default ACLs of the containing per-user
+//! profile directory, which is user-scoped by default). Written by the `/login`
+//! wizard, read at startup and on a live provider switch (the `/model` picker or
+//! `/login`).
+//!
+//! The store schema, its locked/atomic read-modify-write, and the one-time
+//! migration from the old `auth.toml`/`oauth.json` files all live in
+//! [`crate::auth_store`]; this module is the key-facing view over it. The
+//! atomic-write and directory-permission primitives ([`write_atomic`],
+//! [`create_dir_owner_only`]) live here because they are shared by every store.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use crate::ProviderName;
 
-use crate::{ProviderName, config_dir};
-
-/// Path to the credential store (`~/.config/hrdr/auth.toml`), if `HOME` is set.
+/// Path to the credential store (`~/.config/hrdr/auth.json`), if `HOME` is set.
 pub fn auth_file_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("auth.toml"))
+    crate::auth_store::store_path()
 }
 
 /// All stored `provider → api_key` pairs. Empty when the file is missing or
 /// unreadable — credentials are best-effort and never fail a load.
 pub fn load_auth_tokens() -> HashMap<String, String> {
     auth_file_path()
-        .map(|p| load_tokens_at(&p))
+        .map(|p| crate::auth_store::load_keys_at(&p))
         .unwrap_or_default()
 }
 
@@ -46,7 +50,8 @@ pub fn auth_key(provider: &str) -> &str {
 }
 
 /// The stored API key for `provider`, if any. Looks under the shared
-/// [`auth_key`] first, then (for pre-unification stores) the raw provider name.
+/// [`auth_key`] first, then the raw provider name (covering a key saved before
+/// the OpenCode-sharing rule collapsed the aliases onto one slot).
 pub fn auth_token(provider: &str) -> Option<String> {
     let tokens = load_auth_tokens();
     tokens
@@ -58,26 +63,11 @@ pub fn auth_token(provider: &str) -> Option<String> {
 /// Store `provider`'s `token` in the credential file (creating it, `0600` on
 /// unix), preserving any other entries. Saved under the shared [`auth_key`], so
 /// the OpenCode endpoints write one entry between them. Returns the file path.
-pub fn save_auth_token(provider: &str, token: &str) -> Result<PathBuf> {
+pub fn save_auth_token(provider: &str, token: &str) -> anyhow::Result<PathBuf> {
     let path =
         auth_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the auth file"))?;
-    save_token_at(&path, auth_key(provider), token)?;
+    crate::auth_store::save_key_at(&path, auth_key(provider), token)?;
     Ok(path)
-}
-
-/// Parse a credential file at `path` into a `provider → token` map (empty on any
-/// read/parse failure). The path-based core of [`load_auth_tokens`].
-fn load_tokens_at(path: &Path) -> HashMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return HashMap::new();
-    };
-    doc.as_table()
-        .iter()
-        .filter_map(|(k, v)| Some((k.to_string(), v.as_str()?.to_string())))
-        .collect()
 }
 
 /// Write `data` to `path` atomically: write to a temp file in the same
@@ -185,57 +175,14 @@ pub(crate) fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write `provider = "token"` into the file at `path`, preserving other entries
-/// and ensuring owner-only (`0600`) permissions on unix. The path-based core of
-/// [`save_auth_token`].
-///
-/// The write is done through [`write_atomic`] — a concurrent reader never sees a
-/// partial write.
-///
-/// Concurrent *writers* are serialized by a cross-process lock
-/// ([`StoreLock`](crate::store_lock::StoreLock)): the read-modify-write happens
-/// entirely under the lock, so a second process re-reads the merged store the
-/// first one wrote instead of racing on a stale snapshot. Two writers adding
-/// *different* providers both survive; two writers targeting the *same* provider
-/// are last-writer-wins (the later login is the fresher credential).
-fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    create_dir_owner_only(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // Acquire the write lock BEFORE the read, and hold it across the whole
-    // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
-    let _lock = crate::store_lock::StoreLock::acquire(path)?;
-    let mut doc = match std::fs::read_to_string(path) {
-        Ok(text) => text
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("parsing existing credential store {}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::default(),
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading credential store {}", path.display()));
-        }
-    };
-    doc[provider] = toml_edit::value(token);
-    let content = doc.to_string();
-    write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn save_then_load_round_trips_and_preserves_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        save_token_at(&path, "zen", "sk-zen-1").unwrap();
-        save_token_at(&path, "openai", "sk-oai-2").unwrap();
-        // A re-save updates one entry without dropping the other.
-        save_token_at(&path, "zen", "sk-zen-3").unwrap();
-
-        let tokens = load_tokens_at(&path);
-        assert_eq!(tokens.get("zen").map(String::as_str), Some("sk-zen-3"));
-        assert_eq!(tokens.get("openai").map(String::as_str), Some("sk-oai-2"));
-    }
-
+    /// The OpenCode-sharing rule ([`auth_key`]) collapses `zen`/`go`/`opencode*`
+    /// onto one store slot while every other provider keeps its own name; a key
+    /// saved while on `zen` resolves when the session is on `go`. Drives the
+    /// real key store (`auth.json`) via [`crate::auth_store`].
     #[test]
     fn opencode_endpoints_share_one_credential_entry() {
         // All the OpenCode aliases collapse to a single store key…
@@ -255,52 +202,14 @@ mod tests {
 
         // A key saved while on `zen` resolves when the session is on `go`.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        save_token_at(&path, auth_key("zen"), "sk-opencode").unwrap();
-        let tokens = load_tokens_at(&path);
+        let path = dir.path().join("auth.json");
+        crate::auth_store::save_key_at(&path, auth_key("zen"), "sk-opencode").unwrap();
+        let tokens = crate::auth_store::load_keys_at(&path);
         assert_eq!(
             tokens.get(auth_key("go")).map(String::as_str),
             Some("sk-opencode"),
             "go finds the credential saved under zen"
         );
-    }
-
-    #[test]
-    fn load_missing_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(load_tokens_at(&dir.path().join("nope.toml")).is_empty());
-    }
-
-    #[test]
-    fn save_refuses_to_replace_a_malformed_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        let original = b"openai = [not valid toml\n";
-        std::fs::write(&path, original).unwrap();
-
-        let err = save_token_at(&path, "zen", "sk-new")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("parsing existing credential store"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
-    #[test]
-    fn save_leaves_no_temp_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        save_token_at(&path, "zen", "sk").unwrap();
-        save_token_at(&path, "openai", "sk2").unwrap();
-        // The only file in the directory is the credential file itself — the
-        // atomic-write temp is renamed away, never orphaned.
-        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "auth.toml")
-            .collect();
-        assert!(leftovers.is_empty(), "unexpected files left: {leftovers:?}");
     }
 
     #[test]
@@ -316,103 +225,6 @@ mod tests {
             .filter(|n| n != "out.txt")
             .collect();
         assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
-    }
-
-    /// Concurrent writers adding DIFFERENT providers all survive: the
-    /// cross-process lock serializes the read-modify-write, so each writer
-    /// re-reads the store the previous one wrote and merges its own key in
-    /// rather than clobbering with a stale snapshot.
-    #[test]
-    fn concurrent_writers_different_providers_all_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        // Seed the file so every writer starts from a real (parseable) store.
-        save_token_at(&path, "seed", "sk-seed").unwrap();
-
-        let n = 16;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    let provider = format!("p{i}");
-                    let token = format!("sk-{i}");
-                    save_token_at(&path, &provider, &token).unwrap();
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let tokens = load_tokens_at(&path);
-        assert_eq!(tokens.get("seed").map(String::as_str), Some("sk-seed"));
-        for i in 0..n {
-            assert_eq!(
-                tokens.get(&format!("p{i}")).map(String::as_str),
-                Some(format!("sk-{i}").as_str()),
-                "writer {i}'s entry survived the concurrent writes"
-            );
-        }
-    }
-
-    /// Same-provider concurrent writers are last-writer-wins: they serialize on
-    /// the lock, and exactly one of the written values remains. (The policy is
-    /// documented on `save_token_at` — the later login is the fresher key.) The
-    /// store is never corrupted: it always parses and always holds one value.
-    #[test]
-    fn concurrent_writers_same_provider_last_writer_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-
-        let n = 16;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    save_token_at(&path, "shared", &format!("sk-{i}")).unwrap();
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let tokens = load_tokens_at(&path);
-        // Exactly one value survived, and it is one of the values written — no
-        // torn write, no corruption.
-        let got = tokens.get("shared").expect("the key exists");
-        let valid: Vec<String> = (0..n).map(|i| format!("sk-{i}")).collect();
-        assert!(
-            valid.contains(got),
-            "last-writer value is one written: {got}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn saved_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.toml");
-        save_token_at(&path, "zen", "sk").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "credential file must be 0600");
-    }
-
-    /// The directory holding the credential file must be owner-only (`0700`) so
-    /// the provider filenames and timestamps it contains aren't world-listable.
-    /// Driving the real `save_token_at` path proves the fix, not a reimpl.
-    #[cfg(unix)]
-    #[test]
-    fn saved_credential_dir_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        // A nested path whose parent doesn't exist yet, so the save creates it.
-        let cfg_dir = tmp.path().join("hrdr");
-        let path = cfg_dir.join("auth.toml");
-        save_token_at(&path, "zen", "sk").unwrap();
-        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "credential dir must be 0700");
     }
 
     /// `write_atomic` syncs the parent directory after a successful rename so
