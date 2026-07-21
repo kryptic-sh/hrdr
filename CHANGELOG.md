@@ -19,17 +19,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   done from the current session context — unfinished items, deferred decisions,
   half-finished work, and scratch files.
 
+### Breaking
+
+- **`openai` and `chatgpt` are now one provider.** The separate `chatgpt`
+  (ChatGPT/Codex OAuth) and `openai` (API key) built-in providers are merged
+  into a single `openai` whose endpoint, kind, and model catalog are derived
+  from whichever credential is present: an API key talks to `api.openai.com`, a
+  stored OAuth credential talks to the ChatGPT/Codex endpoint. `chatgpt`,
+  `codex`, and `openai-oauth` remain aliases that resolve to `openai`, so
+  existing `chatgpt://…` model references keep working. OpenAI OAuth is now
+  stored under the `openai` credential slot (previously `chatgpt`) — re-login
+  once via `/login` → "ChatGPT subscription".
+- **Credential storage unified into a single `auth.json`.** The former
+  `auth.toml` (raw API keys) and `oauth.json` (OAuth tokens) stores are replaced
+  by one `~/.config/hrdr/auth.json` — a tagged map whose entries are either
+  `{"type":"key",…}` or `{"type":"oauth",…}`. **No migration** (pre-1.0): the
+  old files are not read or converted; re-run `/login` to repopulate.
+  `auth.json` is on the read-tool secret deny-list. Public credential APIs are
+  unchanged.
+
+### Added
+
+- **Key-or-browser login for `openai` and `openrouter`.** `/login` now offers
+  two routes for each: an API-key entry and a browser login. For `openai` the
+  browser route is the ChatGPT subscription OAuth flow (stored as OAuth); for
+  `openrouter` it is the PKCE flow that mints an API key. A successful ChatGPT
+  login seeds `gpt-5.5` as the default so the session is immediately usable.
+- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing a
+  pasted error — parses the error, traces backward to the root cause, applies
+  the minimal fix, and verifies it.
+- **`:test` built-in skill.** New `:test` skill for writing tests against the
+  current change and iterating until green — discovers the project's test
+  framework and conventions, covers happy-path, edge cases, and regression
+  paths.
+- **`:todo` built-in skill.** New `:todo` skill for reporting what remains to be
+  done from the current session context — unfinished items, deferred decisions,
+  half-finished work, and scratch files.
+
 ### Changed
 
-- **Unified credential storage into a single `auth.json`.** The separate
-  `auth.toml` (raw API keys) and `oauth.json` (OAuth tokens) stores are replaced
-  by one `~/.config/hrdr/auth.json` holding a tagged map — each provider entry
-  is either `{"type":"key",…}` or `{"type":"oauth",…}`. Existing credentials
-  migrate automatically on first run (both old files are read, folded into
-  `auth.json`, then deleted only after the new store is written); a credential
-  file that cannot be parsed is preserved, not dropped. `auth.json` is also
-  added to the read-tool secret deny-list. Public credential APIs are unchanged.
-  (The openai/chatgpt single-provider merge is tracked separately in #21.)
 - **TODO panel yields to active sub-agents.** The TUI hides the TODO list while
   any delegated sub-agent is running, then restores it when all sub-agents are
   idle or finished.
