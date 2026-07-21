@@ -43,7 +43,7 @@ pub use paths::cwd_slug;
 mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod resolve;
-pub use resolve::{AuthContext, ResolvedModel, resolve, resolve_in};
+pub use resolve::{AuthContext, ResolvedModel, oauth_derived, resolve, resolve_in};
 mod validate;
 pub use validate::{
     Entitlements, Identity, PLACEHOLDER_MODEL, Unconfirmed, confirm_identity,
@@ -108,6 +108,8 @@ pub use config::{
     AgentConfig,
     BUILTIN_PROVIDERS,
     CHATGPT_CODEX_BASE_URL,
+    CHATGPT_DEFAULT_CONTEXT_WINDOW,
+    CHATGPT_DEFAULT_MODEL,
     CHATGPT_PROVIDER_ALIASES,
     ConfigDiagnostics,
     ConfigValue,
@@ -141,6 +143,7 @@ pub use config::{
     is_chatgpt_provider_name,
     is_codex_oauth,
     is_local_endpoint,
+    is_openai_oauth_capable,
     legacy_config_error,
     named_model_specs,
     parse_env_bool,
@@ -319,19 +322,15 @@ impl hrdr_tools::Tool for ModelsTool {
                 {
                     Ok(access) => {
                         let catalog = chatgpt_model_catalog(&access, false).await;
-                        // Label the live rows with the name this session actually
-                        // uses for ChatGPT (`codex`, `openai-oauth`, …), not the
-                        // canonical spelling: the rows must match the `provider`
-                        // field in this same payload, or the model reads back a
-                        // provider name that does not exist in the user's config.
-                        // Matching the superseded rows by alias likewise keeps the
-                        // stale preset row from surviving as a duplicate.
-                        let chatgpt_name = Some(active_provider.clone())
-                            .filter(|p| is_chatgpt_provider_name(p))
-                            .unwrap_or_else(|| "chatgpt".to_string());
-                        available.retain(|m| !is_chatgpt_provider_name(&m.provider));
+                        // On the Codex endpoint the provider in force is the merged
+                        // `openai`. Replace its static preset rows with the live
+                        // account catalog, labelled with that same name so the rows
+                        // match the `provider` field in this payload (a row the model
+                        // reads back must name a provider that resolves).
+                        let openai_name = active_provider.clone();
+                        available.retain(|m| m.provider != openai_name);
                         available.extend(catalog.models.into_iter().map(|m| AvailableModel {
-                            provider: chatgpt_name.clone(),
+                            provider: openai_name.clone(),
                             model: m.slug,
                             label: m.label,
                             source: ModelSource::AccountCatalog,
@@ -1019,7 +1018,13 @@ impl Agent {
         // carries. Adopting keeps the agent talking to the endpoint it was handed;
         // it can no longer be a *different* provider's, because nothing but a
         // provider definition can name an endpoint.
-        let resolved = ResolvedModel::from_config(&config);
+        // The auth-derived endpoint switch is applied HERE, at the layer that can
+        // read the OAuth store (`resolve`/`from_config` are pure and cannot): a
+        // built-in `openai` with no resolved key but a stored OpenAI OAuth
+        // credential becomes the ChatGPT/Codex endpoint (base_url + kind). The
+        // client below is configured from this resolved value, not the raw config
+        // fields, so it and `self.resolved` can never disagree.
+        let resolved = oauth_derived(ResolvedModel::from_config(&config));
         let delegation_runtime = new_delegation_runtime(&config, &resolved);
         let live_subagents = LiveSubagents::new();
         tools.register(Arc::new(ModelsTool {
@@ -1219,11 +1224,14 @@ impl Agent {
             config.is_subagent,
         )?;
 
-        let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
+        // Configure the client from the (possibly auth-switched) resolved model,
+        // not the raw config fields — so an OAuth `openai` talks to the Codex
+        // endpoint, and the client's endpoint/headers match `self.resolved`.
+        let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), resolved.base_url());
         let mut client = Client::new(
-            config.base_url,
-            config.api_key,
-            config.model.model().to_string(),
+            resolved.base_url().to_string(),
+            resolved.api_key().map(str::to_string),
+            resolved.reference().model().to_string(),
         )
         .with_cache(cache_mode);
         if let Some(t) = config.temperature {
@@ -1237,8 +1245,8 @@ impl Agent {
             stop: config.stop.clone(),
             include_usage: config.stream_usage,
         });
-        client.set_headers(config.headers.clone());
-        client.set_api_version(config.api_version.clone());
+        client.set_headers(resolved.headers().to_vec());
+        client.set_api_version(resolved.api_version().map(str::to_string));
         client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
         client.set_timeout(
             config
@@ -1572,7 +1580,13 @@ impl Agent {
 
     /// Apply a resolved identity to the client and the runtime, atomically. The
     /// single writer of `self.resolved`.
+    ///
+    /// The auth-derived endpoint switch is applied here — the single writer — so a
+    /// `/model` switch to a keyless built-in `openai` with a stored OpenAI OAuth
+    /// credential lands on the ChatGPT/Codex endpoint, exactly as construction
+    /// does. [`resolve_in`] stays pure; this is where the OAuth store is read.
     fn adopt_resolved(&mut self, resolved: ResolvedModel) {
+        let resolved = oauth_derived(resolved);
         let cache = resolve_cache_mode(self.prompt_cache.as_deref(), resolved.base_url());
         self.client.set_base_url(resolved.base_url().to_string());
         self.client
@@ -2371,23 +2385,22 @@ mod tests {
         );
     }
 
-    /// The live ChatGPT rows must carry the provider name this session uses, so
-    /// they match the `provider` field in the same payload and can be fed back to
-    /// a provider switch — and the stale preset row must not survive as a duplicate.
+    /// A session spelled with an OpenAI OAuth alias (`codex://…`) reports the merged
+    /// canonical provider `openai` in its envelope, and its rows name that same
+    /// provider — never a raw alias the model could not feed back to a switch.
     ///
-    /// ASSERTION CHANGED (provider/model coupling): a config spelled `codex` used to
-    /// yield rows spelled `codex`, and the test asserted no row said `chatgpt`.
-    /// `ProviderName` now folds every alias onto the canonical name *on the way in*,
-    /// so the session's own name IS `chatgpt` — and the rows say `chatgpt` with it.
-    /// The invariant this protects is unchanged and asserted directly: **the rows
-    /// name the same provider as the envelope**, so what the model reads back is a
-    /// provider that exists.
+    /// ASSERTION CHANGED (provider merge): the `openai`/`chatgpt`/`codex` split is
+    /// gone — every spelling folds onto `openai` on the way in — so the session's own
+    /// name IS `openai`, and the rows say `openai` with it. The invariant this
+    /// protects is unchanged: **the rows name the same provider as the envelope**, so
+    /// what the model reads back is a provider that exists. (Keyed, so the agent is a
+    /// stable API-key `openai`; the account-catalog path needs a live OAuth login and
+    /// is unit-tested separately in `models::merge_chatgpt_choices`.)
     #[tokio::test]
-    async fn models_available_has_no_duplicate_or_misnamed_chatgpt_rows() {
-        use super::CHATGPT_CODEX_BASE_URL;
+    async fn models_available_names_the_merged_openai_provider_coherently() {
         let agent = Agent::new(AgentConfig {
-            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             model: r("codex://gpt-5.5"),
+            api_key: Some("k".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -2402,26 +2415,24 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         let session_provider = value["provider"].as_str().unwrap().to_string();
-        assert_eq!(
-            session_provider, "chatgpt",
-            "the alias folded on the way in"
-        );
+        assert_eq!(session_provider, "openai", "the alias folded on the way in");
         let rows = value["available_models"].as_array().unwrap();
 
-        // Every ChatGPT row names the provider the envelope names — a row the model
-        // could not feed back to a switch is worse than no row.
+        // No row names a raw OAuth alias — a row the model could not feed back to a
+        // switch is worse than no row.
         assert!(
-            rows.iter()
-                .filter(|r| super::is_chatgpt_provider_name(r["provider"].as_str().unwrap()))
-                .all(|r| r["provider"] == session_provider.as_str()),
-            "rows must name the session's provider, got {rows:?}"
+            !rows.iter().any(|r| matches!(
+                r["provider"].as_str(),
+                Some("chatgpt" | "codex" | "openai-oauth")
+            )),
+            "no row names a raw alias, got {rows:?}"
         );
-        // And the active model must appear exactly once.
+        // The active model appears exactly once, under the merged provider name.
         let active = rows
             .iter()
             .filter(|r| r["provider"] == session_provider.as_str() && r["model"] == "gpt-5.5")
             .count();
-        assert_eq!(active, 1, "the active model must not be duplicated");
+        assert_eq!(active, 1, "the active model must appear once as `openai`");
     }
 
     /// A provider switch publishes the whole endpoint — a sub-agent spawned after
@@ -2720,13 +2731,25 @@ mod tests {
             "so it can still tell that it is nearly full"
         );
 
-        // A preset that *does* declare one still wins. The ChatGPT preset's window
-        // is the account catalog's figure for its default model (gpt-5.5 = 272k),
-        // NOT the old hardcoded 400k — the per-model window for other entitled
-        // models is resolved from the account catalog cache, not this constant.
-        apply_model_ref(&mut cfg, r("chatgpt://gpt-5.5"), None).unwrap();
+        // A provider that *does* declare a window still wins over the inherited one.
+        // (No built-in declares one now — the merged `openai` included — so this is
+        // shown with a `[providers.*]` entry that sets `context_window`.)
+        cfg.providers.insert(
+            "big".to_string(),
+            ProviderConfig {
+                base_url: "https://big.example/v1".to_string(),
+                key_env: None,
+                api_key: Some("k".to_string()),
+                model: None,
+                remote: None,
+                context_window: Some(272_000),
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        apply_model_ref(&mut cfg, r("big://some-model"), None).unwrap();
         assert_eq!(cfg.context_window, Some(272_000));
-        assert_eq!(cfg.base_url, super::CHATGPT_CODEX_BASE_URL);
+        assert_eq!(cfg.base_url, "https://big.example/v1");
     }
 
     #[test]
@@ -2996,17 +3019,28 @@ mod tests {
     }
 
     #[test]
-    fn builtin_chatgpt_aliases_resolve_to_chatgpt_oauth() {
-        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
+    fn builtin_chatgpt_aliases_resolve_to_the_openai_builtin() {
+        use super::ResolvedProviderKind;
         let cfg = AgentConfig::default();
-        for alias in ["chatgpt", "codex", "openai-oauth", "ChatGPT", "CODEX"] {
+        // `chatgpt`/`codex`/`openai-oauth` fold onto the merged built-in `openai`.
+        // Pure resolution (no OAuth store) is the STANDARD OpenAI endpoint; the
+        // Codex/OAuth form is produced only by the auth-derived switch.
+        for alias in [
+            "chatgpt",
+            "codex",
+            "openai-oauth",
+            "ChatGPT",
+            "CODEX",
+            "openai",
+        ] {
             let p = cfg.resolve_provider(alias).expect("resolves");
             assert_eq!(
                 p.kind,
-                ResolvedProviderKind::ChatGptOAuth,
-                "{alias} must be trusted ChatGPT OAuth"
+                ResolvedProviderKind::BuiltIn,
+                "{alias} resolves to the built-in openai preset"
             );
-            assert_eq!(p.base_url, CHATGPT_CODEX_BASE_URL);
+            assert_eq!(p.base_url, "https://api.openai.com/v1");
+            assert_eq!(p.key_env.as_deref(), Some("OPENAI_API_KEY"));
         }
     }
 
@@ -3062,38 +3096,44 @@ mod tests {
 
     #[test]
     fn chatgpt_codex_base_url_owns_the_endpoint_literal() {
-        use super::{CHATGPT_CODEX_BASE_URL, builtin_provider};
+        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind, oauth_derived, resolve};
         assert_eq!(
             CHATGPT_CODEX_BASE_URL,
             "https://chatgpt.com/backend-api/codex"
         );
-        assert_eq!(
-            builtin_provider("chatgpt").unwrap().base_url,
-            CHATGPT_CODEX_BASE_URL
-        );
+        // The Codex endpoint is no longer a static preset — it is the auth-derived
+        // form of the built-in `openai`. Drive the switch (store treated as ready)
+        // to confirm the constant is what it lands on.
+        let cfg = AgentConfig::default();
+        let base = resolve(&r("openai://gpt-5.5"), &cfg, None).unwrap();
+        assert_eq!(base.base_url(), "https://api.openai.com/v1");
+        let switched = super::resolve::oauth_derived_with(base.clone(), true);
+        assert_eq!(switched.base_url(), CHATGPT_CODEX_BASE_URL);
+        assert_eq!(switched.kind(), ResolvedProviderKind::ChatGptOAuth);
+        // And the real store-reading wrapper is a no-op with no credential present.
+        let unswitched = oauth_derived(base);
+        assert_eq!(unswitched.base_url(), "https://api.openai.com/v1");
     }
 
-    /// The OAuth bearer must never outlive the provider it belongs to. Switching
-    /// away from ChatGPT repoints the endpoint with the new provider's own
-    /// credential (`None` for a keyless one), and the next request's
-    /// `refresh_oauth_if_needed` must not re-inject or retain the ChatGPT bearer
-    /// or the `ChatGPT-Account-Id` header — otherwise we would send a ChatGPT
-    /// subscription token to an unrelated host.
+    /// The OAuth bearer must never outlive the provider it belongs to. The bearer
+    /// and `ChatGPT-Account-Id` header live only on the client (a completed OAuth
+    /// injection writes them straight there, never into the resolved identity), so
+    /// an identity switch to a provider that doesn't have them must clear them —
+    /// otherwise we would send a ChatGPT subscription token to an unrelated host.
+    ///
+    /// Hermetic: the switched-from ChatGPT state is simulated on the client rather
+    /// than built by logging in (the auth-derived switch reads the global OAuth
+    /// store, which a parallel test must not seed).
     #[tokio::test]
-    async fn switching_away_from_chatgpt_leaves_no_bearer_or_account_header() {
-        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
-        let config = AgentConfig {
-            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
-            model: r("chatgpt://gpt-5.5"),
+    async fn switching_identity_leaves_no_stale_bearer_or_account_header() {
+        let mut agent = Agent::new(AgentConfig {
+            model: r("openrouter://some-model"),
+            api_key: Some("or-key".to_string()),
             ..Default::default()
-        };
-        let mut agent = Agent::new(config).unwrap();
-        assert_eq!(agent.provider_kind(), ResolvedProviderKind::ChatGptOAuth);
-        assert!(agent.resolved().is_codex_oauth(), "the double gate passes");
-
-        // Stand in for a completed OAuth injection: bearer + account header, exactly
-        // as `refresh_oauth_if_needed` writes them — straight onto the client, never
-        // into the resolved identity (which is why they can't outlive it).
+        })
+        .unwrap();
+        // Stand in for a completed ChatGPT OAuth injection: bearer + account header,
+        // exactly as `refresh_oauth_if_needed` writes them — on the client only.
         agent.client.set_api_key(Some("oauth-bearer".to_string()));
         agent.client.set_headers(vec![(
             "ChatGPT-Account-Id".to_string(),
@@ -3101,9 +3141,9 @@ mod tests {
         )]);
         assert!(agent.client().has_api_key());
 
-        // Now switch to the keyless `local` provider — ONE call, because there is
-        // one identity: the endpoint, the key, the headers and the trust kind move
-        // with it or not at all.
+        // Switch to the keyless `local` provider — ONE call, because there is one
+        // identity: the endpoint, the key, the headers and the trust kind move with
+        // it or not at all.
         agent.set_model_ref(r("local://small")).unwrap();
         assert!(!agent.resolved().is_codex_oauth());
         agent.refresh_oauth_if_needed().await;
@@ -3118,45 +3158,34 @@ mod tests {
         );
     }
 
-    /// The OAuth double gate, once: the trusted `chatgpt` KIND alone does not buy
-    /// the account's bearer — the endpoint has to be the Codex one too.
-    ///
-    /// The endpoint now comes only from a provider definition, so the CLI cannot
-    /// build the mismatched pair any more; this asserts the gate itself, against a
-    /// config that carries one, so the conjunction can never quietly become an `or`.
-    #[tokio::test]
-    async fn a_chatgpt_identity_away_from_the_codex_endpoint_gets_no_bearer() {
-        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
-        let codex = Agent::new(AgentConfig {
-            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
-            model: r("chatgpt://gpt-5.5"),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(codex.resolved().is_codex_oauth());
-
-        let mut elsewhere = Agent::new(AgentConfig {
-            base_url: "http://localhost:9099/v1".to_string(),
-            model: r("chatgpt://gpt-5.5"),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(
-            elsewhere.provider_kind(),
+    /// The OAuth double gate, once: the trusted `ChatGptOAuth` KIND alone does not
+    /// buy the account's bearer — the endpoint has to be the Codex one too, and the
+    /// endpoint alone is not enough either. The conjunction lives in
+    /// [`is_codex_oauth`], asserted directly here so it can never quietly become an
+    /// `or`. (Since the auth-derived switch sets BOTH halves together, a live agent
+    /// can no longer even carry a mismatched pair — this pins the gate itself.)
+    #[test]
+    fn the_codex_oauth_gate_requires_both_the_kind_and_the_endpoint() {
+        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind, is_codex_oauth};
+        // Both halves → the real Codex endpoint.
+        assert!(is_codex_oauth(
             ResolvedProviderKind::ChatGptOAuth,
-            "the trust kind is the provider's, and it is still chatgpt",
-        );
-        assert!(
-            !elsewhere.resolved().is_codex_oauth(),
-            "…but it is not at the endpoint the account's credentials belong to",
-        );
-        // So the refresh path does not inject anything.
-        elsewhere.refresh_oauth_if_needed().await;
-        assert!(
-            !elsewhere
-                .client()
-                .extra_headers_contains("ChatGPT-Account-Id")
-        );
+            CHATGPT_CODEX_BASE_URL
+        ));
+        // Trusted kind, wrong endpoint → NOT the account's endpoint.
+        assert!(!is_codex_oauth(
+            ResolvedProviderKind::ChatGptOAuth,
+            "http://localhost:9099/v1"
+        ));
+        // Right endpoint, untrusted kind (a custom shadow at the Codex URL) → no.
+        assert!(!is_codex_oauth(
+            ResolvedProviderKind::Custom,
+            CHATGPT_CODEX_BASE_URL
+        ));
+        assert!(!is_codex_oauth(
+            ResolvedProviderKind::BuiltIn,
+            CHATGPT_CODEX_BASE_URL
+        ));
     }
 
     #[test]
@@ -3373,9 +3402,25 @@ mod tests {
             "the model from the provider being LEFT is never an answer: {err}"
         );
         // A provider that DOES declare one answers with it — never with kimi-k2.
+        // (No built-in declares a model now, so this is shown with a `[providers.*]`
+        // entry that sets `model`.)
+        let mut cfg_declares = cfg.clone();
+        cfg_declares.providers.insert(
+            "declares".to_string(),
+            ProviderConfig {
+                base_url: "https://declares.example/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: Some("its-own-model".to_string()),
+                remote: None,
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
         assert_eq!(
-            named_spec_ref(&cfg, Some("chatgpt://")).unwrap(),
-            Some(r("chatgpt://gpt-5.5"))
+            named_spec_ref(&cfg_declares, Some("declares://")).unwrap(),
+            Some(r("declares://its-own-model"))
         );
         // And a whole `provider://model` is always taken as given.
         assert_eq!(
@@ -6240,19 +6285,21 @@ mod tests {
         assert!(builtin_provider("nope").is_none());
     }
 
-    /// The ChatGPT OAuth provider points at the Codex Responses endpoint, carries
-    /// no `key_env` (the Bearer token comes from the OAuth store), and defaults
-    /// to an allow-listed model.
+    /// The OAuth/Codex spellings fold onto the merged built-in `openai`: the
+    /// STANDARD OpenAI endpoint with `OPENAI_API_KEY`. The Codex endpoint is not a
+    /// static preset any more — it is the auth-derived form of this provider.
     #[test]
-    fn chatgpt_builtin_uses_the_codex_endpoint_with_no_key_env() {
-        for name in ["chatgpt", "codex", "openai-oauth", "ChatGPT"] {
-            let p = builtin_provider(name).expect("chatgpt resolves");
-            assert_eq!(p.base_url, "https://chatgpt.com/backend-api/codex");
-            assert!(p.key_env.is_none(), "OAuth provider has no key_env");
-            assert_eq!(p.model.as_deref(), Some("gpt-5.5"));
+    fn chatgpt_aliases_fold_onto_the_openai_builtin() {
+        for name in ["openai", "chatgpt", "codex", "openai-oauth", "ChatGPT"] {
+            let p = builtin_provider(name).expect("openai resolves");
+            assert_eq!(p.base_url, "https://api.openai.com/v1");
+            assert_eq!(p.key_env.as_deref(), Some("OPENAI_API_KEY"));
+            assert_eq!(p.model, None, "no built-in declares a default model");
             assert!(p.remote);
         }
-        assert!(crate::BUILTIN_PROVIDERS.contains(&"chatgpt"));
+        // The merged provider is `openai`; `chatgpt` is no longer a separate entry.
+        assert!(crate::BUILTIN_PROVIDERS.contains(&"openai"));
+        assert!(!crate::BUILTIN_PROVIDERS.contains(&"chatgpt"));
     }
 
     #[test]
@@ -10271,35 +10318,13 @@ mod provider_only_policy_tests {
         }
     }
 
-    /// A profile can name a provider and let the provider pick: `model = "chatgpt://"`
-    /// takes the model IT declares (`gpt-5.5`).
+    /// A profile can name a provider and let the provider pick: `model = "mylocal://"`
+    /// takes the model IT declares. (No built-in declares a default model any more —
+    /// the merged `openai` included — so a `[providers.*]` entry carries the default.)
     #[test]
     fn a_profile_naming_a_provider_takes_its_declared_model() {
-        let base = cfg_on("zen://kimi-k2");
-        let profile = SubagentProfile {
-            name: "codex".to_string(),
-            model: Some(spec("chatgpt://")),
-            description: None,
-            prompt: Some("Implement.".to_string()),
-            read_only: None,
-            tools: None,
-            temperature: None,
-            effort: None,
-            max_steps: None,
-            proactive: None,
-        };
-        let sub = config_for_agent_profile(&base, &profile).unwrap();
-        assert_eq!(
-            sub.model,
-            "chatgpt://gpt-5.5".parse().unwrap(),
-            "the provider's own declared model — never zen's kimi-k2"
-        );
-        assert_eq!(sub.base_url, CHATGPT_CODEX_BASE_URL, "and its endpoint");
-        assert_eq!(sub.agent_prompt.as_deref(), Some("Implement."));
-
-        // A `[providers.<name>]` entry's declared model answers the same way.
-        let mut cfg = base.clone();
-        cfg.providers.insert(
+        let mut base = cfg_on("zen://kimi-k2");
+        base.providers.insert(
             "mylocal".to_string(),
             ProviderConfig {
                 base_url: "http://localhost:9099/v1".to_string(),
@@ -10312,8 +10337,30 @@ mod provider_only_policy_tests {
                 api_version: None,
             },
         );
+        let profile = SubagentProfile {
+            name: "impl".to_string(),
+            model: Some(spec("mylocal://")),
+            description: None,
+            prompt: Some("Implement.".to_string()),
+            read_only: None,
+            tools: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
+            proactive: None,
+        };
+        let sub = config_for_agent_profile(&base, &profile).unwrap();
         assert_eq!(
-            named_spec_ref(&cfg, Some("mylocal://")).unwrap(),
+            sub.model,
+            "mylocal://qwen3".parse().unwrap(),
+            "the provider's own declared model — never zen's kimi-k2"
+        );
+        assert_eq!(sub.base_url, "http://localhost:9099/v1", "and its endpoint");
+        assert_eq!(sub.agent_prompt.as_deref(), Some("Implement."));
+
+        // And `named_spec_ref` answers the same way for that provider.
+        assert_eq!(
+            named_spec_ref(&base, Some("mylocal://")).unwrap(),
             Some("mylocal://qwen3".parse().unwrap())
         );
     }

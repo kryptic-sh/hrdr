@@ -1001,10 +1001,11 @@ mod tests {
         // provider. Injecting the store lets every branch be asserted outright.
         let empty = LastModels::default();
         let zen = builtin_provider("zen").unwrap();
-        let chatgpt = builtin_provider("chatgpt").unwrap();
+        // `chatgpt`/`codex` fold onto the merged built-in `openai`.
+        let openai = builtin_provider("openai").unwrap();
 
-        // (1) The model last used ON THAT PROVIDER wins — including over a preset
-        //     default, which is the whole point of remembering it.
+        // (1) The model last used ON THAT PROVIDER wins. The OAuth/Codex spellings
+        //     fold onto `openai`, so a `chatgpt://` pick is remembered for `openai`.
         let mut remembered = LastModels::default();
         remembered.record(&r("zen://kimi-k2"));
         remembered.record(&r("chatgpt://gpt-5.6-sol"));
@@ -1013,23 +1014,16 @@ mod tests {
             r("zen://kimi-k2"),
         );
         assert_eq!(
-            model_for_resolved_provider_in(&remembered, &ProviderName::new("chatgpt"), &chatgpt)
+            model_for_resolved_provider_in(&remembered, &ProviderName::new("codex"), &openai)
                 .unwrap(),
-            r("chatgpt://gpt-5.6-sol"),
-            "what you last used there beats the preset default",
+            r("openai://gpt-5.6-sol"),
+            "what you last used there wins, and the alias folds to `openai`",
         );
 
-        // (2) Nothing remembered → a model the provider itself declares.
-        assert_eq!(
-            chatgpt.model.as_deref(),
-            Some("gpt-5.5"),
-            "the only built-in with one"
-        );
-        assert_eq!(
-            model_for_resolved_provider_in(&empty, &ProviderName::new("codex"), &chatgpt).unwrap(),
-            r("chatgpt://gpt-5.5"),
-            "and the alias folds to the canonical name",
-        );
+        // (2) No built-in declares a model of its own any more — the merged `openai`
+        //     included (its Codex default lives in `CHATGPT_DEFAULT_MODEL`, not the
+        //     preset). With nothing remembered, resolution falls through to (3).
+        assert!(openai.model.is_none());
 
         // (3) Nothing remembered and none declared → an ERROR naming the flag that
         //     settles it. Emphatically NOT whatever model the caller was using

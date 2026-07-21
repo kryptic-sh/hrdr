@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{CHATGPT_CODEX_BASE_URL, OAuthAccess, builtin_provider, write_atomic};
+use crate::{
+    CHATGPT_CODEX_BASE_URL, CHATGPT_DEFAULT_CONTEXT_WINDOW, CHATGPT_DEFAULT_MODEL, OAuthAccess,
+    write_atomic,
+};
 
 /// The Codex client-protocol version declared on the catalog request. A
 /// compatibility pin (protocol declaration), not a model allowlist — compatible
@@ -211,26 +214,17 @@ pub fn parse_catalog(v: &Value) -> Result<Vec<ChatGptModel>> {
 
 // ── Fallback ────────────────────────────────────────────────────────────────
 
-/// The built-in ChatGPT preset as a single-row catalog — the fallback when the
-/// endpoint is unreachable or the account is not entitled. Derived from
-/// [`builtin_provider`], never duplicated literals.
+/// The default ChatGPT model as a single-row catalog — the fallback when the
+/// endpoint is unreachable or the account is not entitled. Derived from the
+/// [`CHATGPT_DEFAULT_MODEL`]/[`CHATGPT_DEFAULT_CONTEXT_WINDOW`] constants (the
+/// Codex endpoint is no longer a static provider preset — it is the auth-derived
+/// form of the built-in `openai`), never duplicated literals.
 fn builtin_fallback() -> Vec<ChatGptModel> {
-    let p = builtin_provider("chatgpt");
-    match p {
-        Some(p) => {
-            let slug = p.model.unwrap_or_default();
-            if slug.is_empty() {
-                Vec::new()
-            } else {
-                vec![ChatGptModel {
-                    label: slug.clone(),
-                    slug,
-                    context_window: p.context_window,
-                }]
-            }
-        }
-        None => Vec::new(),
-    }
+    vec![ChatGptModel {
+        slug: CHATGPT_DEFAULT_MODEL.to_string(),
+        label: CHATGPT_DEFAULT_MODEL.to_string(),
+        context_window: Some(CHATGPT_DEFAULT_CONTEXT_WINDOW),
+    }]
 }
 
 // ── Cache I/O (path-injectable cores) ───────────────────────────────────────
@@ -697,12 +691,11 @@ mod tests {
     // ── Fallback ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn fallback_derives_from_builtin_provider_not_literals() {
+    fn fallback_derives_from_the_chatgpt_default_constants_not_literals() {
         let fb = builtin_fallback();
-        let p = builtin_provider("chatgpt").unwrap();
         assert_eq!(fb.len(), 1);
-        assert_eq!(Some(&fb[0].slug), p.model.as_ref());
-        assert_eq!(fb[0].context_window, p.context_window);
+        assert_eq!(fb[0].slug, CHATGPT_DEFAULT_MODEL);
+        assert_eq!(fb[0].context_window, Some(CHATGPT_DEFAULT_CONTEXT_WINDOW));
     }
 
     // ── Cache freshness / matching ──────────────────────────────────────────

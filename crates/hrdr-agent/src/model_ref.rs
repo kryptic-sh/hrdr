@@ -50,7 +50,7 @@ impl fmt::Display for ModelRefError {
 impl std::error::Error for ModelRefError {}
 
 /// A provider's canonical app-facing name — the single owner of the alias
-/// folding (`opencode` → `zen`, `anthropic` → `claude`, `codex` → `chatgpt`, …)
+/// folding (`opencode` → `zen`, `anthropic` → `claude`, `codex` → `openai`, …)
 /// and of the two *other* namespaces the same provider lives in:
 /// [`catalog_key`](Self::catalog_key) (models.dev) and
 /// [`auth_key`](Self::auth_key) (`auth.toml`).
@@ -71,9 +71,12 @@ impl ProviderName {
             "zen" | "opencode" | "opencode-zen" => "zen",
             "go" | "opencode-go" => "go",
             "claude" | "anthropic" => "claude",
-            "chatgpt" | "codex" | "openai-oauth" => "chatgpt",
+            // OpenAI is one provider: the API-key spellings and the OAuth/Codex
+            // spellings all fold onto `openai`. Which endpoint (`api.openai.com`
+            // vs. the Codex backend) is derived from which credential is present,
+            // not from the name.
+            "openai" | "chatgpt" | "codex" | "openai-oauth" => "openai",
             "local" | "infr" => "local",
-            "openai" => "openai",
             "openrouter" => "openrouter",
             _ => return Self(folded),
         };
@@ -90,17 +93,20 @@ impl ProviderName {
     pub fn is_builtin(&self) -> bool {
         matches!(
             self.0.as_str(),
-            "zen" | "go" | "openai" | "openrouter" | "claude" | "chatgpt" | "local"
+            "zen" | "go" | "openai" | "openrouter" | "claude" | "local"
         )
     }
 
     /// The models.dev catalog key for a built-in preset. hrdr's names and
     /// models.dev's are NOT the same namespace: `zen` is models.dev's `opencode`,
     /// `go` is `opencode-go`, `claude` is `anthropic`. `None` for a provider with
-    /// no catalog presence — `local` (a server you run), `chatgpt` (the Codex
-    /// subscription models are resolved from the account catalog, and models.dev
-    /// lists the differently-windowed API models of the same ids) — and for a
-    /// custom provider (see [`catalog_provider_key`] for the custom-name fallback).
+    /// no catalog presence — `local` (a server you run) — and for a custom
+    /// provider (see [`catalog_provider_key`] for the custom-name fallback).
+    ///
+    /// `openai` maps to models.dev's `openai`. On the OAuth/Codex endpoint the
+    /// per-model window is resolved from the account catalog instead (models.dev
+    /// lists the differently-windowed API models of the same ids); that path is
+    /// gated on the endpoint in `derived_context_window`, not on this key.
     pub fn catalog_key(&self) -> Option<&'static str> {
         Some(match self.0.as_str() {
             "zen" => "opencode",
@@ -401,12 +407,13 @@ mod tests {
         assert_eq!(n("opencode-go"), "go");
         assert_eq!(n("claude"), "claude");
         assert_eq!(n("anthropic"), "claude");
-        assert_eq!(n("chatgpt"), "chatgpt");
-        assert_eq!(n("codex"), "chatgpt");
-        assert_eq!(n("openai-oauth"), "chatgpt");
+        // OpenAI is one provider: the OAuth/Codex spellings fold onto `openai`.
+        assert_eq!(n("openai"), "openai");
+        assert_eq!(n("chatgpt"), "openai");
+        assert_eq!(n("codex"), "openai");
+        assert_eq!(n("openai-oauth"), "openai");
         assert_eq!(n("local"), "local");
         assert_eq!(n("infr"), "local");
-        assert_eq!(n("openai"), "openai");
         assert_eq!(n("openrouter"), "openrouter");
         // Case- and whitespace-insensitive, like `builtin_provider`.
         assert_eq!(n("  OpenCode-GO \n"), "go");
@@ -428,11 +435,12 @@ mod tests {
         assert_eq!(p("claude").catalog_key(), Some("anthropic"));
         assert_eq!(p("Anthropic").catalog_key(), Some("anthropic"));
         assert_eq!(p("openai").catalog_key(), Some("openai"));
+        // The OAuth/Codex spellings fold onto `openai`, so they share its key.
+        assert_eq!(p("chatgpt").catalog_key(), Some("openai"));
+        assert_eq!(p("codex").catalog_key(), Some("openai"));
         assert_eq!(p("openrouter").catalog_key(), Some("openrouter"));
         // No catalog presence.
         assert_eq!(p("local").catalog_key(), None);
-        assert_eq!(p("chatgpt").catalog_key(), None);
-        assert_eq!(p("codex").catalog_key(), None);
         assert_eq!(p("mycustom").catalog_key(), None);
 
         // The OpenCode endpoints share one credential; everyone else keys on self.
@@ -442,6 +450,8 @@ mod tests {
         assert_eq!(p("claude").auth_key(), "claude");
         assert_eq!(p("anthropic").auth_key(), "claude");
         assert_eq!(p("openai").auth_key(), "openai");
+        assert_eq!(p("chatgpt").auth_key(), "openai");
+        assert_eq!(p("codex").auth_key(), "openai");
         assert_eq!(p("mycustom").auth_key(), "mycustom");
     }
 
@@ -470,9 +480,13 @@ mod tests {
             catalog_provider_key(Some("cortecs")).as_deref(),
             Some("cortecs")
         );
+        // The OAuth/Codex spellings fold onto `openai` and share its key.
+        assert_eq!(
+            catalog_provider_key(Some("chatgpt")).as_deref(),
+            Some("openai")
+        );
         // No catalog entry exists for these: scan instead of matching nothing.
         assert_eq!(catalog_provider_key(Some("local")), None);
-        assert_eq!(catalog_provider_key(Some("chatgpt")), None);
         assert_eq!(catalog_provider_key(None), None);
         assert_eq!(catalog_provider_key(Some("   ")), None);
     }
@@ -482,7 +496,7 @@ mod tests {
     #[test]
     fn model_refs_round_trip_through_the_wire_format() {
         let cases = [
-            ("chatgpt://gpt-5.5", "chatgpt", "gpt-5.5"),
+            ("openai://gpt-5.5", "openai", "gpt-5.5"),
             (
                 "openrouter://deepseek/deepseek-chat",
                 "openrouter",
@@ -568,7 +582,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<ProviderName>("\"Codex\"").unwrap(),
-            ProviderName::new("chatgpt")
+            ProviderName::new("openai")
         );
     }
 

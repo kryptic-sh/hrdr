@@ -510,18 +510,19 @@ pub fn load_oauth(provider: &str) -> Option<OAuthCreds> {
 }
 
 /// The store key for a provider's OAuth credentials, canonicalized ONLY for
-/// trusted ChatGPT OAuth. Returns the fixed `"chatgpt"` slot when — and only
-/// when — `kind == ChatGptOAuth`, so the built-in ChatGPT login shares one
-/// credential slot across its aliases (`chatgpt`/`codex`/`openai-oauth`). For
-/// every other kind it returns the exact `name` unchanged.
+/// trusted OpenAI OAuth. Returns the fixed `"openai"` slot when — and only
+/// when — `kind == ChatGptOAuth`, so the built-in `openai` OAuth login stores
+/// its credential in the same slot the merged `openai` provider reads. For every
+/// other kind it returns the exact `name` unchanged.
 ///
 /// The canonicalization is driven by the trusted [`ResolvedProviderKind`],
 /// never by the provider spelling or its `base_url`. A custom-shadow call
-/// (kind `Custom`) therefore never resolves to the built-in `chatgpt` slot,
-/// even when spelled `chatgpt` — it reads/writes its own exact-name entry.
+/// (kind `Custom`) therefore never resolves to the built-in `openai` slot,
+/// even when spelled `openai`/`chatgpt` — it reads/writes its own exact-name
+/// entry.
 pub fn canonical_oauth_key(kind: crate::ResolvedProviderKind, name: &str) -> &str {
     match kind {
-        crate::ResolvedProviderKind::ChatGptOAuth => "chatgpt",
+        crate::ResolvedProviderKind::ChatGptOAuth => "openai",
         _ => name,
     }
 }
@@ -684,9 +685,9 @@ pub async fn coordinated_oauth_access(
     let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate auth.json"))?;
     coordinated_access_core(
         chatgpt_coord(),
-        || crate::auth_store::load_oauth_entry_at(&path, "chatgpt"),
+        || crate::auth_store::load_oauth_entry_at(&path, "openai"),
         |c| {
-            let _ = crate::auth_store::save_oauth_entry_at(&path, "chatgpt", c);
+            let _ = crate::auth_store::save_oauth_entry_at(&path, "openai", c);
         },
         |refresh_token, prev| async move { refresh_to_creds(&refresh_token, prev).await },
     )
@@ -1069,24 +1070,25 @@ mod tests {
 
     #[test]
     fn canonical_oauth_key_canonicalizes_only_for_chatgpt_oauth() {
-        // Trusted ChatGPT OAuth: every alias collapses to the one slot.
-        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "chatgpt"), "chatgpt");
-        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "codex"), "chatgpt");
+        // Trusted OpenAI OAuth: every alias collapses to the one `openai` slot.
+        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "openai"), "openai");
+        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "chatgpt"), "openai");
+        assert_eq!(canonical_oauth_key(K::ChatGptOAuth, "codex"), "openai");
         assert_eq!(
             canonical_oauth_key(K::ChatGptOAuth, "openai-oauth"),
-            "chatgpt"
+            "openai"
         );
         // Any other kind keeps the exact name — no canonicalization by spelling.
-        assert_eq!(canonical_oauth_key(K::Custom, "chatgpt"), "chatgpt");
+        assert_eq!(canonical_oauth_key(K::Custom, "openai"), "openai");
         assert_eq!(canonical_oauth_key(K::Custom, "my-provider"), "my-provider");
         assert_eq!(canonical_oauth_key(K::BuiltIn, "openrouter"), "openrouter");
     }
 
-    /// Store a `chatgpt` OAuth entry with an `expires_ms` relative to real now.
+    /// Store an `openai` OAuth entry with an `expires_ms` relative to real now.
     fn seed_chatgpt(path: &Path, access: &str, refresh: &str, expires_ms: u64) {
         crate::auth_store::save_oauth_entry_at(
             path,
-            "chatgpt",
+            "openai",
             &OAuthCreds {
                 access: access.to_string(),
                 refresh: refresh.to_string(),

@@ -137,7 +137,7 @@ pub fn validate_identity_in(
     // OAuth store can say which rows are this account's entitlements.
     let entitled = m
         .is_codex_oauth()
-        .then(|| crate::load_oauth("chatgpt")?.account_id)
+        .then(|| crate::load_oauth("openai")?.account_id)
         .flatten()
         .and_then(|id| crate::chatgpt_models::cached_entitlements(&id));
     let catalog = hrdr_llm::catalog::load_cached();
@@ -365,7 +365,11 @@ mod tests {
     }
 
     fn resolved(spec: &str, cfg: &AgentConfig) -> ResolvedModel {
-        resolve(&r(spec), cfg, None).expect("resolves")
+        // Apply the auth-derived switch with the OAuth store treated as READY, so
+        // a keyless built-in `openai` (the fold target of `chatgpt://`/`codex://`)
+        // resolves to the ChatGPT/Codex endpoint the way a logged-in session does.
+        // A no-op for every other provider (non-`openai`, custom, or keyed).
+        crate::resolve::oauth_derived_with(resolve(&r(spec), cfg, None).expect("resolves"), true)
     }
 
     fn entitlements(slugs: &[&str]) -> Vec<ChatGptModel> {
@@ -529,10 +533,11 @@ mod tests {
             );
             assert_eq!(calls, 1);
         }
-        // And models.dev never gets a say about ChatGPT: it lists the differently
-        // windowed *API* models under `openai`, which are not this account's
-        // entitlements. `chatgpt` has no catalog key at all — rule 1 is the whole rule.
-        assert!(m.reference().provider().catalog_key().is_none());
+        // And models.dev never gets a say about ChatGPT: the Codex endpoint routes
+        // through rule 1 (the account entitlements), never the models.dev index —
+        // which lists the differently windowed *API* models of the same ids. The
+        // gate is the ENDPOINT (`is_codex_oauth`), not the catalog key.
+        assert!(m.is_codex_oauth());
     }
 
     /// A `[providers.chatgpt]` shadow is `Custom`, never OAuth — so it is never

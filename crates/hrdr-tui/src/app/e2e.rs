@@ -4756,9 +4756,17 @@ async fn browser_login_esc_cancels_then_late_result_is_dropped() {
 }
 
 /// A matching, successful browser login runs the switch transaction: the modal
-/// closes and the live provider is switched.
+/// closes and the model picker opens.
+///
+/// BEHAVIOUR CHANGED (openai/chatgpt provider merge): `chatgpt` now folds onto the
+/// merged built-in `openai`, which declares no default model. So a successful
+/// ChatGPT login can no longer auto-switch to a model — it opens the `/model`
+/// picker (the `NeedsModel` path) for the user to choose one, exactly as an
+/// API-key `openai` login always did. The login modal still closes; no
+/// `TurnMsg::Identity` is emitted (nothing switched), so this does NOT settle a
+/// switch. (Refining the post-login default is the separate login slice.)
 #[tokio::test]
-async fn browser_login_success_switches_provider() {
+async fn browser_login_success_opens_the_model_picker() {
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
@@ -4772,15 +4780,13 @@ async fn browser_login_success_switches_provider() {
         token_saved: true,
         error: None,
     });
-    h.settle_switch().await;
     assert!(
         h.app.login_modal.is_none(),
         "the switch transaction closed the modal"
     );
-    assert_eq!(
-        h.app.state().model.provider().as_str(),
-        "chatgpt",
-        "the live provider switched to ChatGPT"
+    assert!(
+        h.app.model_selector.is_some(),
+        "the merged `openai` declares no default model, so the picker opens to choose one"
     );
 }
 

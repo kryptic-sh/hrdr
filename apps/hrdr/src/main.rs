@@ -927,10 +927,10 @@ mod cli_tests {
         };
 
         // `--model chatgpt://gpt-5.5` sets the WHOLE identity — it does not matter
-        // what was in effect before.
+        // what was in effect before. (`chatgpt` folds onto the merged `openai`.)
         assert_eq!(
             got(Some("zen://kimi-k2"), &[spec("chatgpt://gpt-5.5")]),
-            "chatgpt://gpt-5.5"
+            "openai://gpt-5.5"
         );
         // `--model gpt-5.5` (bare) keeps the provider in effect.
         assert_eq!(
@@ -1010,13 +1010,29 @@ mod cli_tests {
             "never the old provider's model: {err}"
         );
 
-        // 3. A provider that DECLARES a model answers with it, store or no store.
-        let chatgpt: ModelSpec = "chatgpt://".parse().unwrap();
+        // 3. A provider that DECLARES a model answers with it, store or no store. No
+        //    built-in declares one now (the merged `openai` included), so this is
+        //    shown with a `[providers.*]` entry that sets `model`.
+        let mut cfg_declares = AgentConfig::default();
+        cfg_declares.providers.insert(
+            "declares".to_string(),
+            hrdr_agent::ProviderConfig {
+                base_url: "https://declares.example/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: Some("its-own-model".to_string()),
+                remote: None,
+                context_window: None,
+                headers: std::collections::HashMap::new(),
+                api_version: None,
+            },
+        );
+        let declares: ModelSpec = "declares://".parse().unwrap();
         assert_eq!(
-            settle_identity(&LastModels::default(), &[chatgpt], &cfg)
+            settle_identity(&LastModels::default(), &[declares], &cfg_declares)
                 .unwrap()
                 .to_string(),
-            "chatgpt://gpt-5.5"
+            "declares://its-own-model"
         );
     }
 

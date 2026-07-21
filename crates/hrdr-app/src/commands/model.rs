@@ -314,6 +314,29 @@ pub async fn endpoint_health_warning(
 mod tests {
     use super::*;
 
+    /// Serializes the two tests in this binary that are sensitive to the built-in
+    /// `openai` OAuth store: the merged `openai` provider becomes ChatGptOAuth when a
+    /// credential is present (the auth-derived switch reads the shared per-process
+    /// store), so a test that seeds one and a test that must see NONE cannot overlap.
+    static OPENAI_OAUTH_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Store an OpenAI OAuth credential in the `openai` slot (valid, or neutralized
+    /// with empty tokens so the switch stops firing). Empty tokens are how the store
+    /// is "cleared" without deleting sibling entries — there is no remove helper.
+    fn set_openai_oauth(valid: bool) {
+        let creds = hrdr_agent::OAuthCreds {
+            access: if valid { "acc".into() } else { String::new() },
+            refresh: if valid { "ref".into() } else { String::new() },
+            expires_ms: if valid {
+                u64::MAX / 2 // comfortably in the future
+            } else {
+                0
+            },
+            account_id: None,
+        };
+        hrdr_agent::save_oauth("openai", &creds).expect("seed openai oauth");
+    }
+
     /// A remote provider with no credential is not probed at all: the request
     /// would 401 by construction, and a 401 is a fact about the missing key, not
     /// about the endpoint.
@@ -328,13 +351,21 @@ mod tests {
     /// `list_models`.
     #[tokio::test]
     async fn a_remote_provider_with_no_key_is_told_to_log_in_not_that_it_is_down() {
-        let config = hrdr_agent::AgentConfig {
-            model: "openai://gpt-5".parse().unwrap(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: None,
-            ..Default::default()
+        // The agent's resolved identity is fixed at construction, so the gate only
+        // needs to cover the store-reading `Agent::new` — dropped before the await.
+        // This keyless `openai` must resolve WITHOUT the auth-derived OAuth switch,
+        // so no sibling may have a credential seeded while it is built.
+        let agent = {
+            let _gate = OPENAI_OAUTH_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            set_openai_oauth(false); // ensure the store has no usable openai credential
+            let config = hrdr_agent::AgentConfig {
+                model: "openai://gpt-5".parse().unwrap(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: None,
+                ..Default::default()
+            };
+            Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()))
         };
-        let agent = Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()));
         let warning = endpoint_health_warning(
             agent,
             "gpt-5".to_string(),
@@ -377,14 +408,33 @@ mod tests {
     /// Trusted ChatGPT OAuth skips the generic `/models` probe — the Codex
     /// backend returns a false 401 to it (v1 provenance). The skip happens before
     /// `list_models`, so this returns `None` without any network call.
+    ///
+    /// The merged `openai` provider reaches ChatGptOAuth via the auth-derived switch
+    /// when a credential is present, so this seeds one (holding the gate so no
+    /// sibling sees it) and neutralizes it again on the way out.
     #[tokio::test]
     async fn health_probe_skipped_for_trusted_chatgpt_oauth() {
-        let config = hrdr_agent::AgentConfig {
-            model: "chatgpt://gpt-5.5".parse().unwrap(),
-            base_url: hrdr_agent::CHATGPT_CODEX_BASE_URL.to_string(),
-            ..Default::default()
+        // The agent's resolved kind is fixed at construction, so the gate only needs
+        // to cover the store-reading `Agent::new` (and the credential it seeds) —
+        // dropped before the await. `chatgpt://` folds onto `openai`; with a stored
+        // OAuth credential and no key, the auth-derived switch resolves it to
+        // ChatGptOAuth/Codex.
+        let agent = {
+            let _gate = OPENAI_OAUTH_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            set_openai_oauth(true);
+            let config = hrdr_agent::AgentConfig {
+                model: "chatgpt://gpt-5.5".parse().unwrap(),
+                ..Default::default()
+            };
+            let agent = hrdr_agent::Agent::new(config).unwrap();
+            set_openai_oauth(false); // neutralize before releasing the gate
+            assert_eq!(
+                agent.provider_kind(),
+                hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
+                "the auth-derived switch made this trusted ChatGPT OAuth"
+            );
+            Arc::new(Mutex::new(agent))
         };
-        let agent = Arc::new(Mutex::new(hrdr_agent::Agent::new(config).unwrap()));
         let warning = endpoint_health_warning(
             agent,
             "gpt-5.5".to_string(),

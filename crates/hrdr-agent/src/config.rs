@@ -91,26 +91,36 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
 pub const DEFAULT_MODEL: &str = "default";
 
 /// The canonical Codex OAuth endpoint for built-in ChatGPT subscription login.
-/// Single owner of the endpoint literal — built-in resolution, refresh trust
-/// gating, catalog requests, and tests all reference this constant.
+/// Single owner of the endpoint literal — the auth-derived `openai` endpoint
+/// switch, refresh trust gating, catalog requests, and tests all reference this
+/// constant.
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+/// The default ChatGPT (Codex) model slug — the one the account-catalog fallback
+/// offers when the endpoint is unreachable or the account is not entitled.
+pub const CHATGPT_DEFAULT_MODEL: &str = "gpt-5.5";
+
+/// The account catalog's context window for the default ChatGPT model
+/// ([`CHATGPT_DEFAULT_MODEL`]). A last-resort floor only: per-model windows are
+/// resolved live from the account catalog cache
+/// (`chatgpt_models::cached_context_window`) — the endpoint 401s on `/v1/models`
+/// and models.dev lists the differently-windowed *API* models, so neither can be
+/// trusted here.
+pub const CHATGPT_DEFAULT_CONTEXT_WINDOW: u32 = 272_000;
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
 /// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
-pub const BUILTIN_PROVIDERS: &[&str] = &[
-    "zen",
-    "go",
-    "openai",
-    "openrouter",
-    "claude",
-    "chatgpt",
-    "local",
-];
+/// `openai` is one provider: an API key talks to `api.openai.com`, an OpenAI
+/// OAuth credential talks to the Codex endpoint (see the auth-derived switch in
+/// [`resolve::oauth_derived`](crate::oauth_derived)).
+pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "go", "openai", "openrouter", "claude", "local"];
 
-/// The spellings that name the built-in ChatGPT subscription provider. Sole
-/// owner of the alias set: resolution, the `/login` route, and the `/model`
-/// selector's catalog merge all ask [`is_chatgpt_provider_name`] rather than
-/// re-encoding the list, so they cannot drift apart.
+/// The spellings that fold onto the built-in `openai` provider's OAuth/Codex
+/// login. Sole owner of the alias set: the `/login` route and the `/model`
+/// selector's catalog merge ask [`is_chatgpt_provider_name`] rather than
+/// re-encoding the list, so they cannot drift apart. Resolution folds these onto
+/// `openai` via [`ProviderName`](crate::ProviderName); this set only names the
+/// spellings the OAuth-specific surfaces still recognise.
 pub const CHATGPT_PROVIDER_ALIASES: &[&str] = &["chatgpt", "codex", "openai-oauth"];
 
 /// Default recent turns kept verbatim through compaction (`tail_turns`).
@@ -1034,35 +1044,56 @@ pub fn resolve_api_key(
         })
 }
 
+/// Whether `(kind, name)` may authenticate via the OpenAI OAuth (Codex) store —
+/// the ONLY providers allowed to report [`ProviderAuthState::OAuth`] or receive
+/// the auth-derived Codex endpoint switch:
+///
+/// * a resolved [`ResolvedProviderKind::ChatGptOAuth`] (already the trusted kind,
+///   e.g. after [`oauth_derived`](crate::oauth_derived) fired), or
+/// * the built-in `openai` provider — [`ResolvedProviderKind::BuiltIn`] whose
+///   canonical name is `openai` — BEFORE the switch has run.
+///
+/// A user-defined `[providers.*]` entry (kind `Custom`), however it is spelled
+/// (`openai`, `chatgpt`, `codex`), is excluded: it can never read the account's
+/// OAuth credential.
+pub fn is_openai_oauth_capable(kind: ResolvedProviderKind, name: &str) -> bool {
+    kind == ResolvedProviderKind::ChatGptOAuth
+        || (kind == ResolvedProviderKind::BuiltIn && ProviderName::new(name).as_str() == "openai")
+}
+
 /// Unified readiness for a resolved provider: how it authenticates, or that it
 /// is unconfigured. Precedence, matching the existing key resolution:
 ///
 /// 1. an API key ([`resolve_api_key`]) → [`ProviderAuthState::Key`];
-/// 2. trusted ChatGPT OAuth with usable/refreshable credentials
-///    ([`has_oauth_credentials`]) → [`ProviderAuthState::OAuth`];
+/// 2. an OpenAI OAuth credential on an OAuth-capable provider
+///    ([`is_openai_oauth_capable`] + [`has_oauth_credentials`]) →
+///    [`ProviderAuthState::OAuth`];
 /// 3. a keyless local endpoint (`remote = false`) → [`ProviderAuthState::Keyless`];
 /// 4. otherwise → [`ProviderAuthState::Missing`].
 ///
-/// OAuth trust is gated on `resolved.kind`, so a custom provider spelled
-/// `chatgpt` (kind `Custom`) can never report `OAuth`.
+/// A `key` beats `oauth`: a resolvable API key wins even if an OAuth credential
+/// is also stored (the `/login` flow keeps them mutually exclusive). OAuth is
+/// gated on [`is_openai_oauth_capable`], so a custom provider spelled `openai`
+/// (kind `Custom`) can never report `OAuth`.
 pub fn provider_auth_state(
     name: &str,
     resolved: &ResolvedProvider,
     parent_key: Option<&str>,
     parent_base_url: Option<&str>,
 ) -> ProviderAuthState {
-    // Readiness of the trusted ChatGPT OAuth store is only consulted for the
-    // trusted kind; passing the real store result into the pure core keeps the
-    // core deterministically testable (no HOME dependency).
-    let oauth_ready = resolved.kind == ResolvedProviderKind::ChatGptOAuth
-        && has_oauth_credentials(resolved.kind, name);
+    // The OAuth store is only consulted for an OAuth-capable provider; passing
+    // the real store result into the pure core keeps the core deterministically
+    // testable (no HOME dependency). The credential lives in the fixed `openai`
+    // slot, so `has_oauth_credentials` is asked with the trusted kind.
+    let oauth_ready = is_openai_oauth_capable(resolved.kind, name)
+        && has_oauth_credentials(ResolvedProviderKind::ChatGptOAuth, name);
     provider_auth_state_with(name, resolved, parent_key, parent_base_url, oauth_ready)
 }
 
 /// Pure core of [`provider_auth_state`]: `oauth_ready` is the caller-supplied
-/// trusted-OAuth readiness bit (see [`has_oauth_credentials`]). Only honored
-/// when `resolved.kind == ChatGptOAuth`, so a custom shadow can never report
-/// `OAuth` even if a caller passed `true`.
+/// OpenAI-OAuth readiness bit (see [`has_oauth_credentials`]). Only honored when
+/// [`is_openai_oauth_capable`], so a custom shadow can never report `OAuth` even
+/// if a caller passed `true`.
 pub(crate) fn provider_auth_state_with(
     name: &str,
     resolved: &ResolvedProvider,
@@ -1073,7 +1104,7 @@ pub(crate) fn provider_auth_state_with(
     if resolve_api_key(name, resolved, parent_key, parent_base_url).is_some() {
         return ProviderAuthState::Key;
     }
-    if resolved.kind == ResolvedProviderKind::ChatGptOAuth && oauth_ready {
+    if is_openai_oauth_capable(resolved.kind, name) && oauth_ready {
         return ProviderAuthState::OAuth;
     }
     if !resolved.remote {
@@ -1091,35 +1122,23 @@ pub fn is_chatgpt_provider_name(name: &str) -> bool {
 }
 
 /// Resolve a built-in provider name (no config file) to its endpoint and env key.
+///
+/// `openai` (and its OAuth spellings, which fold onto it) resolves to the
+/// STANDARD OpenAI endpoint: `api.openai.com` + `OPENAI_API_KEY` +
+/// [`ResolvedProviderKind::BuiltIn`]. The Codex/OAuth endpoint and
+/// [`ResolvedProviderKind::ChatGptOAuth`] kind are NOT a static preset any more —
+/// they are produced by the auth-derived switch
+/// [`oauth_derived`](crate::oauth_derived), which fires only when the built-in
+/// `openai` has no resolvable API key but a stored OpenAI OAuth credential.
 pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
-    // ChatGPT via Codex OAuth: no `key_env` (the Bearer token comes from the
-    // OAuth store, refreshed per request), the native Codex Responses backend
-    // (selected by the base URL), and a default allow-listed model.
-    if is_chatgpt_provider_name(name) {
-        return Some(ResolvedProvider {
-            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
-            key_env: None,
-            api_key: None,
-            model: Some("gpt-5.5".to_string()),
-            remote: true,
-            // The account catalog's window for the default model (gpt-5.5). A
-            // last-resort floor only: per-model windows are resolved live from
-            // the account catalog cache (`chatgpt_models::cached_context_window`)
-            // — the endpoint 401s on `/v1/models` and models.dev lists the
-            // differently-windowed *API* models, so neither can be trusted here.
-            // The old 400k was wrong for every entitled model, gpt-5.5 included.
-            context_window: Some(272_000),
-            headers: HashMap::new(),
-            api_version: None,
-            kind: ResolvedProviderKind::ChatGptOAuth,
-        });
-    }
     let (base_url, key_env, remote) = match name.trim().to_ascii_lowercase().as_str() {
         "zen" | "opencode" | "opencode-zen" => {
             ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", true)
         }
         "go" | "opencode-go" => ("https://opencode.ai/zen/go/v1", "OPENCODE_API_KEY", true),
-        "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", true),
+        "openai" | "chatgpt" | "codex" | "openai-oauth" => {
+            ("https://api.openai.com/v1", "OPENAI_API_KEY", true)
+        }
         "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", true),
         // Anthropic's own host → hrdr uses the native Messages API (`x-api-key`),
         // which unlocks prompt caching (the OpenAI-compat endpoint can't cache).

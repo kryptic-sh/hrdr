@@ -20,7 +20,8 @@ use anyhow::{Result, anyhow};
 use crate::model_ref::{ModelRef, catalog_provider_key};
 use crate::{
     AgentConfig, BUILTIN_PROVIDERS, CHATGPT_CODEX_BASE_URL, ProviderConfig, ResolvedProviderKind,
-    builtin_provider, chatgpt_models, is_codex_oauth, resolve_api_key, resolve_provider_in,
+    chatgpt_models, has_oauth_credentials, is_codex_oauth, is_openai_oauth_capable,
+    resolve_api_key, resolve_provider_in,
 };
 
 /// The key-inheritance context a *child* agent resolves against: the caller's
@@ -222,6 +223,61 @@ pub fn resolve_in(
     })
 }
 
+/// The auth-derived endpoint switch for the merged built-in `openai` provider —
+/// the ONE impure adjustment that [`resolve_in`] cannot make.
+///
+/// [`resolve_in`] is deliberately PURE: it never reads the OAuth store, so it
+/// cannot know whether the built-in `openai` should talk to `api.openai.com`
+/// (API key) or the Codex backend (OAuth). This runs at the layers that DO know
+/// the OAuth-readiness — [`Agent::new`](crate::Agent) and
+/// [`Agent::set_model_ref`](crate::Agent::set_model_ref) — and rewrites a
+/// resolved `openai` into its OAuth form when, and only when:
+///
+/// * it is the built-in `openai` ([`ResolvedProviderKind::BuiltIn`]) — a custom
+///   `[providers.openai]` shadow (kind `Custom`) is left untouched;
+/// * it resolved NO API key (an inline / `key_env` / stored key beats OAuth); and
+/// * a stored OpenAI OAuth credential exists (in the fixed `openai` slot).
+///
+/// In that case the endpoint becomes [`CHATGPT_CODEX_BASE_URL`], the kind becomes
+/// [`ResolvedProviderKind::ChatGptOAuth`], and the window is re-derived against
+/// the Codex endpoint (the account catalog). Every other resolved model — a key
+/// on `openai`, any non-`openai` provider — passes through unchanged.
+pub fn oauth_derived(resolved: ResolvedModel) -> ResolvedModel {
+    // The ONLY impure step: read the fixed `openai` OAuth slot. Everything else
+    // (which providers may switch, key-beats-oauth) is the pure core below.
+    let oauth_ready = has_oauth_credentials(
+        ResolvedProviderKind::ChatGptOAuth,
+        resolved.reference.provider().as_str(),
+    );
+    oauth_derived_with(resolved, oauth_ready)
+}
+
+/// Pure core of [`oauth_derived`]: `oauth_ready` is the caller-supplied
+/// OpenAI-OAuth-store readiness bit. The structural guards — built-in `openai`,
+/// no resolved API key — stay here, so a stray `true` can never switch a keyed
+/// `openai`, a custom shadow, or any other provider onto the Codex endpoint.
+pub(crate) fn oauth_derived_with(resolved: ResolvedModel, oauth_ready: bool) -> ResolvedModel {
+    let name = resolved.reference.provider().as_str();
+    let switch = oauth_ready
+        && resolved.kind == ResolvedProviderKind::BuiltIn
+        && is_openai_oauth_capable(resolved.kind, name)
+        && resolved.api_key.is_none();
+    if !switch {
+        return resolved;
+    }
+    let context_window = derived_context_window(
+        Some(name),
+        CHATGPT_CODEX_BASE_URL,
+        resolved.reference.model(),
+    );
+    ResolvedModel {
+        base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+        kind: ResolvedProviderKind::ChatGptOAuth,
+        context_window,
+        ..resolved
+    }
+}
+
 /// A config `HashMap` of headers as a stable, ordered list. Header order carries
 /// no meaning on the wire; sorting only makes the resolved value deterministic.
 fn sorted_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -251,7 +307,7 @@ pub(crate) fn derived_context_window(
 ) -> Option<u32> {
     if base_url == CHATGPT_CODEX_BASE_URL {
         return chatgpt_models::cached_context_window(model)
-            .or_else(|| builtin_provider("chatgpt").and_then(|p| p.context_window));
+            .or(Some(crate::CHATGPT_DEFAULT_CONTEXT_WINDOW));
     }
     hrdr_llm::catalog::context_window_cached(catalog_provider_key(provider).as_deref(), model)
 }
@@ -259,7 +315,7 @@ pub(crate) fn derived_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProviderConfig, context_window_for};
+    use crate::{ProviderConfig, builtin_provider, context_window_for};
 
     /// A config with no `[providers.*]` entries: every name resolves to a built-in.
     fn cfg() -> AgentConfig {
@@ -316,23 +372,28 @@ mod tests {
         assert_eq!(url("openai"), "https://api.openai.com/v1");
         assert_eq!(url("openrouter"), "https://openrouter.ai/api/v1");
         assert_eq!(url("claude"), "https://api.anthropic.com/v1");
-        assert_eq!(url("chatgpt"), CHATGPT_CODEX_BASE_URL);
+        // `chatgpt`/`codex` fold onto the merged `openai` provider, which — with
+        // no OAuth credential in scope — resolves to the STANDARD OpenAI endpoint.
+        assert_eq!(url("chatgpt"), "https://api.openai.com/v1");
+        assert_eq!(url("codex"), "https://api.openai.com/v1");
         assert_eq!(url("local"), "http://localhost:8080/v1");
-        // Only the built-in ChatGPT preset is OAuth-trusted, and it sits on the
-        // canonical endpoint — so it, and only it, passes the double gate.
+        // `resolve` is pure — it never reads the OAuth store — so NO built-in
+        // resolves to the Codex endpoint on its own. The auth-derived switch
+        // (`oauth_derived`) is what turns `openai` into ChatGPT OAuth, and only
+        // when a credential is present (exercised in its own test below).
         for name in BUILTIN_PROVIDERS {
             let m = resolve(&r(&format!("{name}://m")), &cfg(), None).unwrap();
-            assert_eq!(m.is_codex_oauth(), *name == "chatgpt", "{name}");
+            assert!(!m.is_codex_oauth(), "{name}");
         }
         // Aliases fold before resolution: `anthropic://` IS `claude://`.
         assert_eq!(
             resolve(&r("anthropic://m"), &cfg(), None).unwrap(),
             resolve(&r("claude://m"), &cfg(), None).unwrap()
         );
-        assert!(
-            resolve(&r("codex://m"), &cfg(), None)
-                .unwrap()
-                .is_codex_oauth()
+        // …and `codex://` IS `openai://`.
+        assert_eq!(
+            resolve(&r("codex://m"), &cfg(), None).unwrap(),
+            resolve(&r("openai://m"), &cfg(), None).unwrap()
         );
     }
 
@@ -382,7 +443,7 @@ mod tests {
             ("opencode-zen", "zen"),
             ("opencode-go", "go"),
             ("infr", "local"),
-            ("openai-oauth", "chatgpt"),
+            ("openai-oauth", "openai"),
         ] {
             let mut p = provider_config(URL);
             p.api_key = Some("my-gateway-key".to_string());
@@ -441,12 +502,13 @@ mod tests {
                 assert_eq!(m.api_key(), None, "and no key it was never given");
             }
         }
-        // …while an UNSHADOWED `codex://` is still the real thing.
-        assert!(
-            resolve(&r("codex://gpt-5.5"), &cfg(), None)
-                .unwrap()
-                .is_codex_oauth()
-        );
+        // …while an UNSHADOWED `codex://` folds onto the built-in `openai`. Pure
+        // `resolve` never reads the OAuth store, so it lands on the standard
+        // OpenAI endpoint (BuiltIn); the Codex switch is `oauth_derived`'s job.
+        let m = resolve(&r("codex://gpt-5.5"), &cfg(), None).unwrap();
+        assert_eq!(m.kind(), ResolvedProviderKind::BuiltIn);
+        assert_eq!(m.base_url(), "https://api.openai.com/v1");
+        assert!(!m.is_codex_oauth());
     }
 
     /// The surprising-but-correct interaction, pinned: the TRUST gate keys on the
@@ -551,11 +613,18 @@ mod tests {
     /// the models.dev CATALOG key (`zen` → `opencode`), never the raw app name.
     #[test]
     fn context_window_derives_from_the_endpoint_and_the_catalog_key() {
-        // The Codex endpoint: an uncached slug lands on the 272k preset floor —
-        // models.dev is never consulted for it.
-        let m = resolve(&r("chatgpt://totally-fake-model-xyz"), &cfg(), None).unwrap();
-        assert!(m.is_codex_oauth());
-        assert_eq!(m.context_window(), Some(272_000));
+        // The Codex endpoint: an uncached slug lands on the 272k floor — models.dev
+        // is never consulted for it. Gated on the ENDPOINT, not the name, so it
+        // holds for whatever provider points there (here asked directly, since pure
+        // `resolve` no longer produces the Codex endpoint without an OAuth switch).
+        assert_eq!(
+            context_window_for(
+                Some("openai"),
+                CHATGPT_CODEX_BASE_URL,
+                "totally-fake-model-xyz"
+            ),
+            Some(crate::CHATGPT_DEFAULT_CONTEXT_WINDOW)
+        );
 
         // Everyone else: models.dev, keyed by the CATALOG name. Asserted against the
         // catalog directly, so it holds with or without a cached models.json.
@@ -624,5 +693,66 @@ mod tests {
             ],
             "sorted by name, so the resolved value is deterministic"
         );
+    }
+
+    /// THE AUTH-DERIVED SWITCH: the built-in `openai` with no resolved key but a
+    /// stored OAuth credential becomes the ChatGPT/Codex endpoint. Driven through
+    /// the pure core (`oauth_derived_with`) so it needs no HOME.
+    #[test]
+    fn oauth_derived_switches_keyless_openai_to_the_codex_endpoint() {
+        // With a key: the built-in `openai` that inherited a key (here from a
+        // same-endpoint parent) never switches — a key beats OAuth. Prove
+        // pass-through even when the store says "ready".
+        let parent = AuthContext {
+            api_key: Some("sk-parent"),
+            base_url: "https://api.openai.com/v1",
+        };
+        let with_key = resolve(&r("openai://gpt-5.5"), &cfg(), Some(&parent)).unwrap();
+        assert_eq!(with_key.kind(), ResolvedProviderKind::BuiltIn);
+        assert_eq!(with_key.api_key(), Some("sk-parent"));
+        let after = oauth_derived_with(with_key.clone(), true);
+        assert_eq!(after, with_key, "a resolved key blocks the switch");
+
+        // Keyless built-in `openai` + a ready OAuth store → the Codex endpoint.
+        let keyless = resolve(&r("openai://gpt-5.5"), &cfg(), None).unwrap();
+        assert_eq!(keyless.kind(), ResolvedProviderKind::BuiltIn);
+        assert_eq!(keyless.base_url(), "https://api.openai.com/v1");
+        assert!(!keyless.is_codex_oauth());
+        let switched = oauth_derived_with(keyless.clone(), true);
+        assert_eq!(switched.base_url(), CHATGPT_CODEX_BASE_URL);
+        assert_eq!(switched.kind(), ResolvedProviderKind::ChatGptOAuth);
+        assert!(switched.is_codex_oauth(), "the double gate now passes");
+        // The window re-derives against the Codex endpoint (account-catalog floor).
+        assert_eq!(
+            switched.context_window(),
+            Some(crate::CHATGPT_DEFAULT_CONTEXT_WINDOW)
+        );
+        // The identity itself is untouched — same provider name and model.
+        assert_eq!(switched.reference(), keyless.reference());
+
+        // No credential (store not ready) → unchanged, on standard OpenAI.
+        assert_eq!(oauth_derived_with(keyless.clone(), false), keyless);
+
+        // The `codex://`/`chatgpt://` spellings fold onto `openai`, so they switch
+        // the same way.
+        for alias in ["codex", "chatgpt", "openai-oauth"] {
+            let m = resolve(&r(&format!("{alias}://gpt-5.5")), &cfg(), None).unwrap();
+            assert!(oauth_derived_with(m, true).is_codex_oauth(), "{alias}");
+        }
+    }
+
+    /// The switch never fires for a non-`openai` provider or a custom shadow, even
+    /// if a caller hands the core a stray `true`.
+    #[test]
+    fn oauth_derived_never_switches_non_openai_or_a_custom_shadow() {
+        // A different built-in.
+        let claude = resolve(&r("claude://opus"), &cfg(), None).unwrap();
+        assert_eq!(oauth_derived_with(claude.clone(), true), claude);
+
+        // A custom `[providers.openai]` shadow resolves `Custom` — never switched.
+        let cfg = cfg_with("openai", provider_config("http://localhost:9099/v1"));
+        let shadow = resolve(&r("openai://gpt-5.5"), &cfg, None).unwrap();
+        assert_eq!(shadow.kind(), ResolvedProviderKind::Custom);
+        assert_eq!(oauth_derived_with(shadow.clone(), true), shadow);
     }
 }
