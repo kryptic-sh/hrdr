@@ -8,14 +8,3 @@
   file before pruning).
 
 No open security findings remain.
-
----
-
-_The OpenRouter OAuth `state` finding (pass 2, finding 3) was resolved — the
-flow now mints a random `state`, embeds it in the callback URL, and validates it
-on the callback (OpenRouter's OAuth PKCE upgrade added `state` support). Pending
-one live-login sanity check of the round-trip._
-
-_The `openai` + `chatgpt`/`codex` provider merge (was issue #21) shipped — one
-`openai` provider derives endpoint / kind / catalog from the stored credential
-(key **or** OAuth, XOR-enforced in `auth.json`)._
