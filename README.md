@@ -170,8 +170,8 @@ hrdr ships nine built-in skills that work with zero setup:
 - `:release [patch|minor|major]` — cut a release: bump version, update
   changelog, commit, tag, push
 - `:review [low|high]` — review the pending diff for correctness bugs
-- `:simplify` — tidy the change for reuse, dead code, and over-abstraction
 - `:test` — write tests for a change and iterate to green
+- `:tidy` — DRY up reuse, cut dead code and over-abstraction (quality, not bugs)
 - `:todo` — report what is left to work on from the session context
 
 They sit last in the discovery order, so a project or user skill file with the

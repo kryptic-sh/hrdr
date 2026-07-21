@@ -1,9 +1,9 @@
 ---
-name: simplify
-description: tidy the change for reuse, dead code, and over-abstraction
+name: tidy
+description: tidy the change — DRY up reuse, cut dead code and over-abstraction
 ---
 
-Simplify the change — a quality pass, NOT a bug hunt. Scope: the pending diff by
+Tidy the change — a quality pass, NOT a bug hunt. Scope: the pending diff by
 default, or the target named in arguments if given: $ARGUMENTS
 
 1. Collect the scope. With no arguments, take the pending changes (staged,
@@ -11,8 +11,8 @@ default, or the target named in arguments if given: $ARGUMENTS
    merge-base with the default branch. If arguments name a file, module, or
    area, use that instead.
 2. Read the changed code together with what it touches — the helpers it calls,
-   the callers it has, and the siblings it sits beside — so a simplification
-   reuses what already exists rather than reinventing it.
+   the callers it has, and the siblings it sits beside — so a cleanup reuses
+   what already exists rather than reinventing it.
 3. Look only for quality cleanups, not correctness — that's `:review`, not this:
    - duplicated logic that should call an existing helper instead of repeating
      it,
@@ -28,4 +28,4 @@ default, or the target named in arguments if given: $ARGUMENTS
    behavior, leave it and note it rather than making it.
 5. Run the project's format, lint, and tests; confirm they pass and behavior is
    unchanged.
-6. Report what you simplified and why, and anything you deliberately left alone.
+6. Report what you tidied and why, and anything you deliberately left alone.

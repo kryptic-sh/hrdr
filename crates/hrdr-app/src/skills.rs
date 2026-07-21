@@ -9,7 +9,7 @@
 //! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
 //! sub-agent files: project dirs first, then
 //! user dirs, hrdr → Claude Code → opencode conventions, then hrdr's own
-//! built-in skills (`:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:simplify`) last — deduped by name
+//! built-in skills (`:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:tidy`) last — deduped by name
 //! (first source wins), so a user or project file always overrides a
 //! built-in of the same name.
 
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 // The skills hrdr ships with, baked into the binary via `include_str!` — the
 // same convention `hrdr_agent::prompt` uses for `system.j2` — so a fresh
-// install has a working `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:simplify` with no setup.
+// install has a working `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:tidy` with no setup.
 // Content lives in `templates/skills/*.md`, not here: keep the prompt text in
 // Markdown (reviewable, diffable, editable without touching Rust) and this
 // file to parsing/wiring only.
@@ -29,7 +29,7 @@ const BUILTIN_TODO: &str = include_str!("templates/skills/todo.md");
 const BUILTIN_TEST: &str = include_str!("templates/skills/test.md");
 const BUILTIN_FIX: &str = include_str!("templates/skills/fix.md");
 const BUILTIN_PLAN: &str = include_str!("templates/skills/plan.md");
-const BUILTIN_SIMPLIFY: &str = include_str!("templates/skills/simplify.md");
+const BUILTIN_TIDY: &str = include_str!("templates/skills/tidy.md");
 
 /// Max bytes for a single skill file; files larger than this are skipped.
 const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
@@ -151,7 +151,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     out
 }
 
-/// hrdr's built-in skills — `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:simplify` — parsed from the
+/// hrdr's built-in skills — `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:tidy` — parsed from the
 /// Markdown templates baked into the binary at compile time. Always nine
 /// entries (each template is a checked-in, non-empty file, so parsing cannot
 /// fail); sorted by name like a scanned directory's entries are, so their
@@ -167,7 +167,7 @@ pub fn builtin_skills() -> Vec<Skill> {
         (BUILTIN_TEST, "test"),
         (BUILTIN_FIX, "fix"),
         (BUILTIN_PLAN, "plan"),
-        (BUILTIN_SIMPLIFY, "simplify"),
+        (BUILTIN_TIDY, "tidy"),
     ]
     .into_iter()
     .filter_map(|(text, stem)| parse_skill_file(text, stem, "built-in"))
@@ -629,18 +629,18 @@ mod tests {
     /// The nine built-in templates each parse into a usable skill: a name,
     /// a non-empty description and body, and — for `release`/`review`/`audit`, whose
     /// templates declare `args:` — the completion candidates the popup should
-    /// offer after `:name `. `commit`, `fix`, `test`, `todo`, `plan`, and `simplify` declare none, so their lists are empty.
+    /// offer after `:name `. `commit`, `fix`, `test`, `todo`, `plan`, and `tidy` declare none, so their lists are empty.
     #[test]
     fn builtins_parse_with_names_descriptions_bodies_and_args() {
         let skills = builtin_skills();
         assert_eq!(
             skills.len(),
             9,
-            "audit, commit, fix, plan, release, review, simplify, test, todo"
+            "audit, commit, fix, plan, release, review, test, tidy, todo"
         );
 
         for name in [
-            "audit", "commit", "fix", "plan", "release", "review", "simplify", "test", "todo",
+            "audit", "commit", "fix", "plan", "release", "review", "test", "tidy", "todo",
         ] {
             let s = skills
                 .iter()
@@ -711,17 +711,17 @@ mod tests {
         assert!(
             skills
                 .iter()
-                .find(|s| s.name == "simplify")
+                .find(|s| s.name == "tidy")
                 .unwrap()
                 .args
                 .is_empty(),
-            "simplify declares no args"
+            "tidy declares no args"
         );
     }
 
     /// `discover_skills` on a cwd with no skill directories at all still
     /// returns the nine built-ins — the whole point of shipping them is that
-    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:simplify` work with zero setup.
+    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy` work with zero setup.
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
@@ -731,7 +731,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "audit", "commit", "fix", "plan", "release", "review", "simplify", "test", "todo"
+                "audit", "commit", "fix", "plan", "release", "review", "test", "tidy", "todo"
             ]
         );
         assert!(skills.iter().all(|s| s.source == "built-in"));
