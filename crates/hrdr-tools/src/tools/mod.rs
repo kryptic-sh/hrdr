@@ -318,14 +318,18 @@ mod tests {
     #[tokio::test]
     async fn read_rejects_credential_store() {
         let dir = tempfile::tempdir().unwrap();
-        // Simulate an auth store at <cwd>/.config/hrdr/auth.toml.
-        let auth = dir.path().join(".config/hrdr/auth.toml");
+        // Simulate an auth store at <cwd>/.config/hrdr/auth.json.
+        let auth = dir.path().join(".config/hrdr/auth.json");
         std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
-        std::fs::write(&auth, "api_key = \"secret\"\n").unwrap();
+        std::fs::write(
+            &auth,
+            "{\"openrouter\":{\"type\":\"key\",\"key\":\"secret\"}}\n",
+        )
+        .unwrap();
         let c = ctx(dir.path().to_path_buf());
 
         let err = ReadTool
-            .execute(json!({ "path": ".config/hrdr/auth.toml" }), &c)
+            .execute(json!({ "path": ".config/hrdr/auth.json" }), &c)
             .await
             .unwrap_err()
             .to_string();

@@ -328,16 +328,11 @@ pub fn last_model_on(provider: &ProviderName) -> Option<ModelRef> {
     load_last_models().on(provider)
 }
 
-/// Parse the stored JSON, in either shape. Pure, so the rules are testable
-/// without a file.
+/// Parse the stored JSON. Pure, so the rules are testable without a file.
 ///
-/// BACK-COMPAT: the old file was a single pair, `{"provider":…,"model":…}`. It
-/// still reads — as the last identity AND as that provider's one `by_provider`
-/// entry, so an existing user's next `/login <same provider>` already knows their
-/// model. A malformed half (either side empty, or a `last` that doesn't parse) is
+/// A malformed half (either side empty, or a `last` that doesn't parse) is
 /// dropped rather than fabricated into a half-identity.
 fn parse_last_model(v: &Value) -> LastModels {
-    // The current shape.
     let mut out = LastModels {
         last: v
             .get("last")
@@ -351,24 +346,13 @@ fn parse_last_model(v: &Value) -> LastModels {
                 continue;
             };
             // Route both halves through `ModelRef` so the stored key is canonical
-            // (an old `anthropic` entry answers a lookup for `claude`) and an empty
+            // (an `anthropic` entry answers a lookup for `claude`) and an empty
             // half is rejected rather than stored.
             if let Ok(r) = ModelRef::new(ProviderName::new(provider), model) {
                 out.by_provider
                     .insert(r.provider().as_str().to_string(), r.model().to_string());
             }
         }
-    }
-    // The old single-pair shape.
-    if let (Some(provider), Some(model)) = (
-        v.get("provider").and_then(Value::as_str),
-        v.get("model").and_then(Value::as_str),
-    ) && let Ok(r) = ModelRef::new(ProviderName::new(provider), model)
-    {
-        out.by_provider
-            .entry(r.provider().as_str().to_string())
-            .or_insert_with(|| r.model().to_string());
-        out.last.get_or_insert(r);
     }
     out
 }
@@ -936,30 +920,6 @@ mod tests {
         // A `last` that isn't a complete identity is not one.
         assert_eq!(parse_last_model(&json!({"last": "gpt-5.5"})).last, None);
         assert_eq!(parse_last_model(&json!({})), LastModels::default());
-    }
-
-    /// BACK-COMPAT: yesterday's single-pair file still reads — as the last identity
-    /// AND as that provider's entry, so an existing user's first `/login zen` in the
-    /// new world already knows which model they were on.
-    #[test]
-    fn last_model_still_reads_the_old_single_pair_file() {
-        let store = parse_last_model(&json!({"provider": "zen", "model": "grok-code"}));
-        assert_eq!(store.last, Some(r("zen://grok-code")));
-        assert_eq!(
-            store.on(&ProviderName::new("zen")),
-            Some(r("zen://grok-code"))
-        );
-        // …and nothing is invented for any other provider — the whole point.
-        assert_eq!(store.on(&ProviderName::new("openai")), None);
-
-        // A half pair is not an identity.
-        for v in [
-            json!({"provider": "", "model": "m"}),
-            json!({"provider": "zen"}),
-            json!({"provider": "zen", "model": ""}),
-        ] {
-            assert_eq!(parse_last_model(&v), LastModels::default(), "{v}");
-        }
     }
 
     /// Recording an identity touches ITS provider's entry and no other — a store

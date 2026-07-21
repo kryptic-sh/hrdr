@@ -1,6 +1,6 @@
 //! Cross-process write lock for the credential stores.
 //!
-//! The credential files (`auth.toml`, `oauth.json`) are updated read-modify-
+//! The credential store (`auth.json`) is updated read-modify-
 //! write: read the whole store, change one entry, then atomically rename a temp
 //! over the target. The atomic rename protects *readers* — nobody ever sees a
 //! half-written file — but it does NOT serialize *writers*. Two processes can

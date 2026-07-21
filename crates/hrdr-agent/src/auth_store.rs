@@ -11,21 +11,16 @@
 //! }
 //! ```
 //!
-//! This replaces the two former stores (`auth.toml` for keys, `oauth.json` for
-//! OAuth). A one-time [`migrate_if_needed_at`] folds any old files into the new
-//! one on first access and then removes them, so callers only ever see
-//! `auth.json`.
-//!
-//! ## Discipline (shared with the old stores, reused not reinvented)
+//! ## Discipline
 //!
 //! * Writes go through [`crate::write_atomic`] — `0600` on unix, atomic rename,
 //!   a reader never sees a partial write.
 //! * The containing directory is tightened to `0700`
 //!   ([`crate::auth::create_dir_owner_only`]).
-//! * Every mutating operation (and the migration) holds the cross-process
+//! * Every mutating operation holds the cross-process
 //!   [`StoreLock`](crate::store_lock::StoreLock) on `auth.json` across the whole
 //!   read-modify-write, so concurrent writers serialize instead of racing on a
-//!   stale snapshot. One lock on `auth.json` now serializes *all* credential
+//!   stale snapshot. One lock on `auth.json` serializes *all* credential
 //!   writes (keys and OAuth alike).
 
 use std::collections::HashMap;
@@ -45,9 +40,9 @@ use crate::store_lock::StoreLock;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum AuthEntry {
-    /// A raw API key (formerly `auth.toml`'s `provider = "key"`).
+    /// A raw API key.
     Key { key: String },
-    /// OAuth tokens (formerly an `oauth.json` entry). Mirrors [`OAuthCreds`].
+    /// OAuth tokens. Mirrors [`OAuthCreds`].
     Oauth {
         access: String,
         refresh: String,
@@ -105,13 +100,9 @@ pub(crate) fn store_path() -> Option<PathBuf> {
 
 // ── Whole-map read/write ────────────────────────────────────────────────────
 
-/// Load the whole `provider → AuthEntry` map at `auth_json`, migrating any old
-/// stores first. Best-effort: an empty map on a missing/unreadable/corrupt
-/// file — a load never fails.
+/// Load the whole `provider → AuthEntry` map at `auth_json`. Best-effort: an
+/// empty map on a missing/unreadable/corrupt file — a load never fails.
 fn load_map_at(auth_json: &Path) -> HashMap<String, AuthEntry> {
-    // Fold any pre-unification files in first; a migration hiccup must not fail
-    // a read (best-effort), so its error is deliberately ignored here.
-    let _ = migrate_if_needed_at(auth_json);
     std::fs::read_to_string(auth_json)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -119,8 +110,8 @@ fn load_map_at(auth_json: &Path) -> HashMap<String, AuthEntry> {
 }
 
 /// Insert/replace one `key → entry` in the store at `auth_json` (atomic,
-/// `0600`), preserving every other entry. The migrate-then-locked-RMW core that
-/// backs every save.
+/// `0600`), preserving every other entry. The locked-RMW core that backs every
+/// save.
 ///
 /// Concurrent *writers* are serialized by the [`StoreLock`]: the read-modify-
 /// write runs entirely under the lock, so a second process re-reads the merged
@@ -135,9 +126,6 @@ fn save_entry_at(auth_json: &Path, key: &str, entry: AuthEntry) -> Result<()> {
     let parent = auth_json.parent().unwrap_or(Path::new("."));
     crate::auth::create_dir_owner_only(parent)
         .with_context(|| format!("creating {}", parent.display()))?;
-    // Migrate before we take our own lock (migration takes and releases the same
-    // lock internally); after it, `auth.json` is the single source of truth.
-    migrate_if_needed_at(auth_json)?;
     // Acquire the write lock BEFORE the read and hold it across the whole
     // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
     let _lock = StoreLock::acquire(auth_json)?;
@@ -195,138 +183,6 @@ pub(crate) fn save_oauth_entry_at(
     creds: &OAuthCreds,
 ) -> Result<()> {
     save_entry_at(auth_json, provider, AuthEntry::from(creds.clone()))
-}
-
-// ── Migration from the two old stores ───────────────────────────────────────
-
-/// The result of trying to read one old store file.
-enum OldFile<T> {
-    /// The file does not exist — nothing to migrate, nothing to delete.
-    Absent,
-    /// The file was read and parsed — its entries migrate, and it is safe to
-    /// delete once `auth.json` has been written.
-    Parsed(T),
-    /// The file exists but could not be read or parsed. Its entries are NOT
-    /// migrated and the file is NOT deleted — it is left in place for the user
-    /// to recover, never silently dropped.
-    Unparsable,
-}
-
-/// One-time, idempotent migration of the two pre-unification stores
-/// (`auth.toml`, `oauth.json`) into `auth.json`, run before the first read or
-/// write.
-///
-/// Ordering is strict — **read old → write new → delete old** — and never
-/// deletes on a failed write:
-/// 1. If `auth.json` already exists, do nothing (already migrated).
-/// 2. Otherwise best-effort read `auth.toml` (keys) and `oauth.json` (OAuth).
-/// 3. Build the unified map and write `auth.json` *atomically*.
-/// 4. **Only after** that write succeeds, delete each old file that was
-///    successfully parsed. A file that failed to parse is left untouched.
-///
-/// Concurrency-safe: the whole migration runs under the `auth.json`
-/// [`StoreLock`], and re-checks `auth.json` *inside* the lock, so two processes
-/// racing on first start migrate exactly once (the loser sees the file the
-/// winner wrote and no-ops).
-pub(crate) fn migrate_if_needed_at(auth_json: &Path) -> Result<()> {
-    // Fast path: already migrated. Cheap check outside the lock.
-    if auth_json.exists() {
-        return Ok(());
-    }
-    let parent = auth_json.parent().unwrap_or(Path::new("."));
-    let toml_path = parent.join("auth.toml");
-    let json_path = parent.join("oauth.json");
-    // A fresh install with no old files: nothing to do. The first real save
-    // creates `auth.json`. (Avoids creating the dir / lock needlessly.)
-    if !toml_path.exists() && !json_path.exists() {
-        return Ok(());
-    }
-    crate::auth::create_dir_owner_only(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
-    // Serialize the whole migration against concurrent writers/migrators.
-    let _lock = StoreLock::acquire(auth_json)?;
-    // Re-check under the lock: another process may have migrated while we waited.
-    if auth_json.exists() {
-        return Ok(());
-    }
-
-    let keys = read_old_keys(&toml_path);
-    let oauth = read_old_oauth(&json_path);
-
-    let mut map: HashMap<String, AuthEntry> = HashMap::new();
-    if let OldFile::Parsed(m) = &keys {
-        for (k, v) in m {
-            map.insert(k.clone(), AuthEntry::Key { key: v.clone() });
-        }
-    }
-    // OAuth entries second: on the (unexpected) chance a provider appears in both
-    // stores, the OAuth credential wins. The openai/chatgpt provider merge that
-    // would actually collide is deliberately out of scope, so no collision is
-    // expected in practice.
-    if let OldFile::Parsed(m) = &oauth {
-        for (k, v) in m {
-            map.insert(k.clone(), AuthEntry::from(v.clone()));
-        }
-    }
-
-    // If every old file that is present is unparsable, do NOT write `auth.json`:
-    // leave the old files exactly as they are so a user who fixes them gets them
-    // migrated on a later run, rather than stranding their (unreadable) data
-    // behind an empty new store.
-    let any_parsed = matches!(keys, OldFile::Parsed(_)) || matches!(oauth, OldFile::Parsed(_));
-    if !any_parsed {
-        return Ok(());
-    }
-
-    // Write the unified store. If this fails, the old files are left intact and
-    // the error is surfaced — we NEVER delete an old file on a failed write.
-    let json = serde_json::to_vec_pretty(&map).context("serializing migrated auth.json")?;
-    crate::write_atomic(auth_json, &json)
-        .with_context(|| format!("writing migrated {}", auth_json.display()))?;
-
-    // The write landed. Delete only the sources we actually parsed; an
-    // unparsable source is preserved for the user. Best-effort: a delete failure
-    // does not undo a successful migration.
-    if matches!(keys, OldFile::Parsed(_)) {
-        let _ = std::fs::remove_file(&toml_path);
-    }
-    if matches!(oauth, OldFile::Parsed(_)) {
-        let _ = std::fs::remove_file(&json_path);
-    }
-    Ok(())
-}
-
-/// Best-effort read of the old `auth.toml` key store into `provider → key`.
-/// A missing file is [`OldFile::Absent`]; an unreadable or unparsable one is
-/// [`OldFile::Unparsable`] (kept, not deleted).
-fn read_old_keys(path: &Path) -> OldFile<HashMap<String, String>> {
-    match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OldFile::Absent,
-        Err(_) => OldFile::Unparsable,
-        Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
-            Ok(doc) => OldFile::Parsed(
-                doc.as_table()
-                    .iter()
-                    .filter_map(|(k, v)| Some((k.to_string(), v.as_str()?.to_string())))
-                    .collect(),
-            ),
-            Err(_) => OldFile::Unparsable,
-        },
-    }
-}
-
-/// Best-effort read of the old `oauth.json` store into `provider → OAuthCreds`.
-/// A missing file is [`OldFile::Absent`]; an unreadable or unparsable one is
-/// [`OldFile::Unparsable`] (kept, not deleted).
-fn read_old_oauth(path: &Path) -> OldFile<HashMap<String, OAuthCreds>> {
-    match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OldFile::Absent,
-        Err(_) => OldFile::Unparsable,
-        Ok(text) => match serde_json::from_str::<HashMap<String, OAuthCreds>>(&text) {
-            Ok(m) => OldFile::Parsed(m),
-            Err(_) => OldFile::Unparsable,
-        },
-    }
 }
 
 #[cfg(test)]
@@ -514,171 +370,5 @@ mod tests {
                 "writer {i}'s entry survived"
             );
         }
-    }
-
-    // ── Migration ────────────────────────────────────────────────────────────
-
-    fn seed_old_toml(dir: &Path, pairs: &[(&str, &str)]) {
-        let body: String = pairs
-            .iter()
-            .map(|(k, v)| format!("{k} = \"{v}\"\n"))
-            .collect();
-        std::fs::write(dir.join("auth.toml"), body).unwrap();
-    }
-
-    fn seed_old_oauth(dir: &Path, provider: &str, creds: &OAuthCreds) {
-        let mut m: HashMap<String, OAuthCreds> = HashMap::new();
-        m.insert(provider.to_string(), creds.clone());
-        std::fs::write(
-            dir.join("oauth.json"),
-            serde_json::to_vec_pretty(&m).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn migration_folds_both_old_files_and_deletes_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        seed_old_toml(d, &[("openrouter", "sk-or"), ("openai", "sk-oai")]);
-        seed_old_oauth(d, "chatgpt", &oauth("acc", "ref", 777, Some("acct")));
-        let path = d.join("auth.json");
-
-        migrate_if_needed_at(&path).unwrap();
-
-        // auth.json now holds all three with the right tags.
-        assert_eq!(
-            load_keys_at(&path).get("openrouter").map(String::as_str),
-            Some("sk-or")
-        );
-        assert_eq!(
-            load_keys_at(&path).get("openai").map(String::as_str),
-            Some("sk-oai")
-        );
-        assert_eq!(
-            load_oauth_entry_at(&path, "chatgpt"),
-            Some(oauth("acc", "ref", 777, Some("acct")))
-        );
-        // Both old files are gone.
-        assert!(
-            !d.join("auth.toml").exists(),
-            "auth.toml deleted after migration"
-        );
-        assert!(
-            !d.join("oauth.json").exists(),
-            "oauth.json deleted after migration"
-        );
-    }
-
-    #[test]
-    fn migration_only_toml_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        seed_old_toml(d, &[("openai", "sk-oai")]);
-        let path = d.join("auth.json");
-        migrate_if_needed_at(&path).unwrap();
-        assert_eq!(
-            load_keys_at(&path).get("openai").map(String::as_str),
-            Some("sk-oai")
-        );
-        assert!(!d.join("auth.toml").exists());
-        assert!(!d.join("oauth.json").exists());
-    }
-
-    #[test]
-    fn migration_only_oauth_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        seed_old_oauth(d, "chatgpt", &oauth("acc", "ref", 5, None));
-        let path = d.join("auth.json");
-        migrate_if_needed_at(&path).unwrap();
-        assert_eq!(
-            load_oauth_entry_at(&path, "chatgpt"),
-            Some(oauth("acc", "ref", 5, None))
-        );
-        assert!(!d.join("oauth.json").exists());
-    }
-
-    #[test]
-    fn migration_neither_present_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        migrate_if_needed_at(&path).unwrap();
-        assert!(!path.exists(), "no auth.json created on a fresh install");
-    }
-
-    #[test]
-    fn migration_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        seed_old_toml(d, &[("openai", "sk-oai")]);
-        let path = d.join("auth.json");
-        migrate_if_needed_at(&path).unwrap();
-        let after_first = std::fs::read(&path).unwrap();
-        // A second (and third) run is a no-op: auth.json is unchanged, no error.
-        migrate_if_needed_at(&path).unwrap();
-        migrate_if_needed_at(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), after_first);
-    }
-
-    #[test]
-    fn migration_does_not_delete_a_corrupt_old_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        // A good toml plus a corrupt oauth.json.
-        seed_old_toml(d, &[("openai", "sk-oai")]);
-        let corrupt = b"{ not valid json";
-        std::fs::write(d.join("oauth.json"), corrupt).unwrap();
-        let path = d.join("auth.json");
-
-        migrate_if_needed_at(&path).unwrap();
-
-        // The parseable source migrated and was deleted...
-        assert_eq!(
-            load_keys_at(&path).get("openai").map(String::as_str),
-            Some("sk-oai")
-        );
-        assert!(!d.join("auth.toml").exists());
-        // ...the corrupt one survives, and its (unreadable) provider is absent —
-        // never silently dropped AND deleted.
-        assert!(
-            d.join("oauth.json").exists(),
-            "corrupt oauth.json is preserved"
-        );
-        assert_eq!(std::fs::read(d.join("oauth.json")).unwrap(), corrupt);
-        assert_eq!(load_oauth_entry_at(&path, "chatgpt"), None);
-    }
-
-    #[test]
-    fn migration_all_sources_corrupt_writes_nothing_and_keeps_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        std::fs::write(d.join("auth.toml"), b"= not valid toml").unwrap();
-        std::fs::write(d.join("oauth.json"), b"{ not valid json").unwrap();
-        let path = d.join("auth.json");
-        migrate_if_needed_at(&path).unwrap();
-        // Nothing parseable → no auth.json written, both files left for the user.
-        assert!(!path.exists(), "no auth.json when every source is corrupt");
-        assert!(d.join("auth.toml").exists());
-        assert!(d.join("oauth.json").exists());
-    }
-
-    #[test]
-    fn migration_preexisting_auth_json_is_never_overwritten() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        // An already-migrated store, plus a stray old file.
-        save_key_at(&d.join("auth.json"), "openai", "sk-current").unwrap();
-        let existing = std::fs::read(d.join("auth.json")).unwrap();
-        seed_old_toml(d, &[("openai", "sk-STALE")]);
-        migrate_if_needed_at(&d.join("auth.json")).unwrap();
-        // auth.json untouched (never overwritten by migration).
-        assert_eq!(std::fs::read(d.join("auth.json")).unwrap(), existing);
-        assert_eq!(
-            load_keys_at(&d.join("auth.json"))
-                .get("openai")
-                .map(String::as_str),
-            Some("sk-current")
-        );
     }
 }

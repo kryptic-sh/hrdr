@@ -6,8 +6,7 @@
 //! wizard, read at startup and on a live provider switch (the `/model` picker or
 //! `/login`).
 //!
-//! The store schema, its locked/atomic read-modify-write, and the one-time
-//! migration from the old `auth.toml`/`oauth.json` files all live in
+//! The store schema and its locked/atomic read-modify-write live in
 //! [`crate::auth_store`]; this module is the key-facing view over it. The
 //! atomic-write and directory-permission primitives ([`write_atomic`],
 //! [`create_dir_owner_only`]) live here because they are shared by every store.
