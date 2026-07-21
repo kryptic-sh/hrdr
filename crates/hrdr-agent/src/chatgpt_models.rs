@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,6 +42,10 @@ const CATALOG_TTL_MS: u64 = 5 * 60 * 1000;
 /// has NO total-request timeout, so without this a network black-hole would hang
 /// the caller and the "timeout" stale-cache trigger could never fire.
 const CATALOG_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hard cap (10 MiB) on the catalog body, enforced while streaming so a hostile
+/// endpoint cannot force an unbounded allocation before the check fires.
+const MAX_CATALOG_BYTES: usize = 10 * 1024 * 1024;
 
 /// Where an entitled catalog came from — surfaced to the selector so the UI can
 /// distinguish live data from a cached or degraded list.
@@ -231,7 +236,7 @@ fn builtin_fallback() -> Vec<ChatGptModel> {
 // ── Cache I/O (path-injectable cores) ───────────────────────────────────────
 
 fn load_cache_at(path: &Path) -> Option<CacheFile> {
-    if path.metadata().map(|m| m.len()).unwrap_or(0) > 10 * 1024 * 1024 {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_CATALOG_BYTES as u64 {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
@@ -472,6 +477,37 @@ pub async fn chatgpt_model_catalog(access: &OAuthAccess, force: bool) -> ChatGpt
     result
 }
 
+/// Read a byte stream into a `Vec`, aborting the moment the accumulated length
+/// would exceed `cap`. Peak memory stays at or below `cap` (an over-cap chunk is
+/// never appended), so a hostile endpoint streaming a huge body cannot exhaust
+/// memory before the check fires. Generic over the chunk/error types so it is
+/// unit-testable with `futures_util::stream::iter`.
+///
+/// Returns `Err(e)` on a transport error mid-stream, `Ok(Err(TooLarge))` when the
+/// cap is crossed, and `Ok(Ok(body))` with the full body otherwise.
+async fn read_body_capped<S, B, E>(mut stream: S, cap: usize) -> Result<Vec<u8>, ReadError<E>>
+where
+    S: Stream<Item = std::result::Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReadError::Transport)?;
+        let chunk = chunk.as_ref();
+        if buf.len() + chunk.len() > cap {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(chunk);
+    }
+    Ok(buf)
+}
+
+/// Why a capped body read failed: a transport error, or the size cap being hit.
+enum ReadError<E> {
+    Transport(E),
+    TooLarge,
+}
+
 /// Perform the catalog HTTP request and classify the outcome. Isolated so the
 /// decision logic in [`resolve_catalog`] stays pure and testable.
 async fn fetch_catalog(access: &OAuthAccess, etag: Option<String>) -> FetchOutcome {
@@ -525,10 +561,14 @@ async fn fetch_catalog(access: &OAuthAccess, etag: Option<String>) -> FetchOutco
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = match resp.bytes().await {
-        Ok(b) if b.len() <= 10 * 1024 * 1024 => String::from_utf8_lossy(&b).into_owned(),
-        Ok(_) => return FetchOutcome::Recoverable("catalog response too large".into()),
-        Err(_) => return FetchOutcome::Recoverable("could not read the catalog response".into()),
+    let body = match read_body_capped(Box::pin(resp.bytes_stream()), MAX_CATALOG_BYTES).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(ReadError::TooLarge) => {
+            return FetchOutcome::Recoverable("catalog response too large".into());
+        }
+        Err(ReadError::Transport(_)) => {
+            return FetchOutcome::Recoverable("could not read the catalog response".into());
+        }
     };
     let value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -910,5 +950,69 @@ mod tests {
         // No matching cache → fallback.
         let (res2, _) = resolve_catalog(FetchOutcome::NotModified, None, Some(&d), 50);
         assert_eq!(res2.source, CatalogSource::BuiltInFallback);
+    }
+
+    // ── Capped streaming body read ───────────────────────────────────────────
+
+    /// A stream whose total exceeds `cap` aborts early with `TooLarge`, and the
+    /// aborting chunk is never appended — so peak allocation stays at or below
+    /// `cap` (well under the full body it refused to buffer).
+    #[tokio::test]
+    async fn read_body_capped_aborts_over_cap_without_buffering_whole_body() {
+        let cap = 10;
+        // Total 12 bytes across 4-byte chunks: 4, 8, then the third would hit 12.
+        let chunks: Vec<std::result::Result<Vec<u8>, ()>> =
+            vec![Ok(vec![b'a'; 4]), Ok(vec![b'b'; 4]), Ok(vec![b'c'; 4])];
+        let stream = futures_util::stream::iter(chunks);
+        match read_body_capped(stream, cap).await {
+            Err(ReadError::TooLarge) => {}
+            _ => panic!("expected TooLarge"),
+        }
+    }
+
+    /// A single chunk larger than `cap` is rejected without being appended.
+    #[tokio::test]
+    async fn read_body_capped_rejects_first_oversized_chunk() {
+        let cap = 8;
+        let chunks: Vec<std::result::Result<Vec<u8>, ()>> = vec![Ok(vec![b'x'; 100])];
+        let stream = futures_util::stream::iter(chunks);
+        assert!(matches!(
+            read_body_capped(stream, cap).await,
+            Err(ReadError::TooLarge)
+        ));
+    }
+
+    /// A stream at or under `cap` yields the full body intact, in order.
+    #[tokio::test]
+    async fn read_body_capped_under_cap_returns_full_body() {
+        let cap = 10;
+        let chunks: Vec<std::result::Result<Vec<u8>, ()>> =
+            vec![Ok(b"hel".to_vec()), Ok(b"lo".to_vec())];
+        let stream = futures_util::stream::iter(chunks);
+        let body = read_body_capped(stream, cap).await.ok().unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    /// A body exactly `cap` bytes is accepted (matches the original `<=` bound).
+    #[tokio::test]
+    async fn read_body_capped_accepts_exactly_cap() {
+        let cap = 6;
+        let chunks: Vec<std::result::Result<Vec<u8>, ()>> =
+            vec![Ok(b"abc".to_vec()), Ok(b"def".to_vec())];
+        let stream = futures_util::stream::iter(chunks);
+        let body = read_body_capped(stream, cap).await.ok().unwrap();
+        assert_eq!(body, b"abcdef");
+    }
+
+    /// A transport error mid-stream surfaces as `Transport`, not `TooLarge`.
+    #[tokio::test]
+    async fn read_body_capped_propagates_transport_error() {
+        let cap = 100;
+        let chunks: Vec<std::result::Result<Vec<u8>, &str>> = vec![Ok(b"ok".to_vec()), Err("boom")];
+        let stream = futures_util::stream::iter(chunks);
+        assert!(matches!(
+            read_body_capped(stream, cap).await,
+            Err(ReadError::Transport("boom"))
+        ));
     }
 }
