@@ -32,6 +32,16 @@ const BUILTIN_FIX: &str = include_str!("templates/skills/fix.md");
 /// Max bytes for a single skill file; files larger than this are skipped.
 const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
 
+/// Aggregate ceilings on skill ingestion across ALL skill dirs combined: at
+/// most this many skill files read, and at most this many total bytes. A real
+/// setup has a handful of small skill Markdown files, so 256 files / 4 MiB is
+/// far beyond anything genuine — the cap only stops a hostile or accidental
+/// directory full of files from making hrdr read unbounded bytes on every `:`
+/// input and skill listing. Once either is hit we stop reading and warn; the
+/// built-ins are always appended regardless.
+const MAX_SKILLS: usize = 256;
+const MAX_SKILLS_TOTAL_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -80,25 +90,41 @@ fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// shadows it.
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
+    // Aggregate budget across ALL skill dirs combined. Dirs are scanned in
+    // precedence order (project before user), so exhausting the budget drops
+    // the least-specific files first.
+    let mut file_count: usize = 0;
+    let mut total_bytes: usize = 0;
+    let mut truncated = false;
     for dir in skill_dirs(cwd) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut found: Vec<Skill> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    return None;
-                }
-                if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_SKILL_FILE_BYTES {
-                    return None;
-                }
-                let text = std::fs::read_to_string(&path).ok()?;
-                let stem = path.file_stem()?.to_str()?;
-                parse_skill_file(&text, stem, &crate::display_dir(&dir))
-            })
-            .collect();
+        let mut found: Vec<Skill> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_SKILL_FILE_BYTES {
+                continue;
+            }
+            if file_count >= MAX_SKILLS || total_bytes >= MAX_SKILLS_TOTAL_BYTES {
+                truncated = true;
+                break;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            file_count += 1;
+            total_bytes = total_bytes.saturating_add(text.len());
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Some(skill) = parse_skill_file(&text, stem, &crate::display_dir(&dir)) {
+                found.push(skill);
+            }
+        }
         // Stable order within a directory (read_dir order is unspecified).
         found.sort_by(|a, b| a.name.cmp(&b.name));
         for skill in found {
@@ -106,6 +132,17 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
                 out.push(skill);
             }
         }
+        // Merge this dir's finds before stopping, so nothing already read is lost.
+        if truncated {
+            break;
+        }
+    }
+    if truncated {
+        eprintln!(
+            "hrdr: skill discovery hit the aggregate cap \
+             ({MAX_SKILLS} files / {MAX_SKILLS_TOTAL_BYTES} bytes); \
+             some skill files were not read"
+        );
     }
     for skill in builtin_skills() {
         if !out.iter().any(|s| s.name.eq_ignore_ascii_case(&skill.name)) {
@@ -705,6 +742,37 @@ mod tests {
             skills
                 .iter()
                 .any(|s| s.name == "review" && s.source == "built-in")
+        );
+    }
+
+    /// A skill dir holding far more than `MAX_SKILLS` files yields a bounded
+    /// set: discovery stops at the aggregate file-count cap rather than reading
+    /// every file. The project `.hrdr/skills` dir is scanned first and fills the
+    /// budget, so the cap bites there (no reliance on the machine's user dirs);
+    /// the built-ins are still appended afterwards.
+    #[test]
+    fn discover_skills_caps_the_file_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join(".hrdr/skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        for i in 0..(MAX_SKILLS + 50) {
+            std::fs::write(
+                skills_dir.join(format!("skill{i:04}.md")),
+                format!("Body for skill {i}."),
+            )
+            .unwrap();
+        }
+        let skills = discover_skills(dir.path());
+        let discovered = skills.iter().filter(|s| s.source != "built-in").count();
+        assert_eq!(
+            discovered, MAX_SKILLS,
+            "skill ingestion must stop at the aggregate file-count cap"
+        );
+        // The built-ins survive the cap — they're appended unconditionally.
+        assert!(
+            skills
+                .iter()
+                .any(|s| s.name == "commit" && s.source == "built-in")
         );
     }
 

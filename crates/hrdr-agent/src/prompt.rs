@@ -184,13 +184,29 @@ const AGENTS_FILE: &str = "AGENTS.md";
 /// Max bytes for a single AGENTS.md file; files larger than this are skipped.
 const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
 
+/// Aggregate ceiling on ALL gathered instruction bytes — every `AGENTS.md` up
+/// the ancestor chain plus the one global file, combined. 1 MiB is ~16 full
+/// 64 KiB files, already far more instruction text than any real project
+/// carries, so a genuine checkout never approaches it; the cap only stops a
+/// hostile or accidental deep tree of large `AGENTS.md` files from reading
+/// unbounded bytes into the prompt. When it bites we keep the nearest
+/// (most-specific) files and drop the farthest ancestors, since the walk is
+/// cwd-first.
+const MAX_AGENTS_TOTAL_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
 /// the filesystem root, plus global instruction files from standard locations.
 /// Less specific files (system, then user-global, then ancestors) come first so
 /// nearer files override by appearing later. Returns `None` if nothing is found.
 pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
-    // Walk up from cwd; collect cwd-first (most specific first).
+    // Walk up from cwd; collect cwd-first (most specific first). Accumulate a
+    // running byte total and stop once the next file would push it over the
+    // aggregate ceiling: because the walk is cwd-first, breaking here keeps the
+    // nearest/most-specific files already collected and drops only the farther
+    // ancestors — the correct precedence (a nearer file overrides a farther one).
     let mut docs: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    let mut truncated = false;
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         let af = d.join(AGENTS_FILE);
@@ -199,6 +215,11 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
         {
             let text = text.trim();
             if !text.is_empty() {
+                if total.saturating_add(text.len()) > MAX_AGENTS_TOTAL_BYTES {
+                    truncated = true;
+                    break;
+                }
+                total += text.len();
                 docs.push(text.to_string());
             }
         }
@@ -227,8 +248,22 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     {
         let text = text.trim();
         if !text.is_empty() {
-            docs.insert(0, text.to_string());
+            // The global file is the least-specific source (it prepends at the
+            // front), so it only goes in if the budget the ancestor walk left
+            // can hold it; otherwise it's the first thing to drop.
+            if total.saturating_add(text.len()) > MAX_AGENTS_TOTAL_BYTES {
+                truncated = true;
+            } else {
+                docs.insert(0, text.to_string());
+            }
         }
+    }
+
+    if truncated {
+        eprintln!(
+            "hrdr: project instructions exceeded {MAX_AGENTS_TOTAL_BYTES} bytes total; \
+             kept the nearest AGENTS.md files and dropped farther ancestors/global"
+        );
     }
 
     if docs.is_empty() {
@@ -1351,5 +1386,48 @@ mod tests {
         // and unsafe under any parallel getenv), a source of CI-only flakes.
         let docs = gather_agent_docs(&proj).unwrap();
         assert!(docs.contains("Project-level"));
+    }
+
+    /// A deep ancestor chain of large `AGENTS.md` files whose combined size
+    /// exceeds the aggregate ceiling is bounded: the result stays under
+    /// `MAX_AGENTS_TOTAL_BYTES`, keeps the nearest (most-specific) files, and
+    /// drops the farthest ancestors — the walk is cwd-first, so precedence
+    /// (nearer overrides farther) is preserved when truncating.
+    #[test]
+    fn gather_agent_docs_caps_total_bytes_and_keeps_the_nearest() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Each file is ~60 KiB (under the 64 KiB per-file cap), so ~18 of them
+        // exceed the 1 MiB aggregate ceiling — build a chain of 40 to be sure.
+        const LEVELS: usize = 40;
+        const PAD: usize = 60 * 1024;
+        let mut dir = tmp.path().to_path_buf();
+        for level in 0..LEVELS {
+            dir = dir.join(format!("l{level:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            // Marker line names the level so we can tell which files survived;
+            // padding makes the file big enough to fill the budget quickly.
+            let body = format!("LEVEL_{level:02}\n{}", "x".repeat(PAD));
+            std::fs::write(dir.join(AGENTS_FILE), body).unwrap();
+        }
+        // `dir` is now the deepest level (l39) — the cwd, most specific.
+        let docs = gather_agent_docs(&dir).unwrap();
+
+        // Bounded: never more than the aggregate ceiling (any dropped global
+        // only shrinks it further).
+        assert!(
+            docs.len() <= MAX_AGENTS_TOTAL_BYTES,
+            "gathered instructions must be bounded by the aggregate ceiling, got {}",
+            docs.len()
+        );
+        // The nearest file (cwd, l39) is kept…
+        assert!(
+            docs.contains(&format!("LEVEL_{:02}", LEVELS - 1)),
+            "the nearest AGENTS.md must survive truncation"
+        );
+        // …and the farthest ancestor (l00) is dropped to fit.
+        assert!(
+            !docs.contains("LEVEL_00"),
+            "the farthest ancestor must be dropped when the total exceeds the cap"
+        );
     }
 }

@@ -32,6 +32,16 @@ use crate::SubagentProfile;
 /// Max bytes for a single agent profile file; files larger than this are skipped.
 const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
 
+/// Aggregate ceilings on agent-profile ingestion in one directory: at most this
+/// many profile files, and at most this many total bytes across them. A real
+/// `.claude/agents` (or `.hrdr/agents`) holds a handful of small Markdown
+/// files, so 256 files / 4 MiB is orders of magnitude beyond anything genuine —
+/// the cap only stops a hostile or accidental directory full of files from
+/// making hrdr read unbounded bytes. Once either is hit we stop reading the
+/// directory and warn.
+const MAX_AGENT_PROFILES: usize = 256;
+const MAX_AGENT_PROFILES_TOTAL_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
 /// Discover agent-definition files across the Claude/opencode/hrdr locations,
 /// relative to `cwd` for project scopes and the home/XDG dirs for user scopes.
 /// Returns one profile per unique name (first source in precedence order wins).
@@ -101,15 +111,30 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
         return Ok(Vec::new());
     };
     let mut profiles = Vec::new();
+    let mut count: usize = 0;
+    let mut total_bytes: u64 = 0;
+    let mut truncated = false;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_AGENTS_FILE_BYTES {
+        let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if len > MAX_AGENTS_FILE_BYTES {
             eprintln!("hrdr: skipping agent file {} (too large)", path.display());
             continue;
         }
+        // Aggregate ceiling across the directory: stop once this dir has read
+        // its file-count or total-byte budget, so a directory stuffed with
+        // files can't read unbounded bytes.
+        if count >= MAX_AGENT_PROFILES
+            || total_bytes.saturating_add(len) > MAX_AGENT_PROFILES_TOTAL_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        count += 1;
+        total_bytes = total_bytes.saturating_add(len);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -128,6 +153,14 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
             }
             Err(e) => return Err(legacy_error(&path, &e)),
         }
+    }
+    if truncated {
+        eprintln!(
+            "hrdr: agent-profile discovery in {} hit the aggregate cap \
+             ({MAX_AGENT_PROFILES} files / {MAX_AGENT_PROFILES_TOTAL_BYTES} bytes); \
+             some files were not read",
+            dir.display()
+        );
     }
     // Stable order within a directory (read_dir order is unspecified).
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
@@ -741,5 +774,27 @@ mod tests {
         );
         let fine = found.iter().find(|p| p.name == "fine").unwrap();
         assert_eq!(fine.description.as_deref(), Some("a working agent"));
+    }
+
+    /// A directory holding far more than `MAX_AGENT_PROFILES` files yields a
+    /// bounded result: ingestion stops at the cap rather than reading every
+    /// file. Exercised directly on `read_dir_profiles` so it stays hermetic
+    /// (no reliance on the machine's user-scope agent dirs).
+    #[test]
+    fn read_dir_profiles_caps_the_file_count() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_AGENT_PROFILES + 50) {
+            std::fs::write(
+                dir.path().join(format!("agent{i:04}.md")),
+                format!("---\nname: agent{i:04}\n---\nBody {i}.\n"),
+            )
+            .unwrap();
+        }
+        let profiles = read_dir_profiles(dir.path()).unwrap();
+        assert_eq!(
+            profiles.len(),
+            MAX_AGENT_PROFILES,
+            "profile ingestion must stop at the aggregate file-count cap"
+        );
     }
 }
