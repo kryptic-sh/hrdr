@@ -828,24 +828,29 @@ pub fn parse_locations(result: &Value) -> Result<Vec<LspLocation>> {
                     .ok_or_else(|| anyhow::anyhow!("missing range"))?,
             )
         };
+        // Add 1 on the u64 *before* narrowing to u32 so that a `u32::MAX`
+        // position (which fits u32) can't wrap/panic on the `+ 1`; it now
+        // fails the `try_from` and errors "out of range" instead.
+        let line = range
+            .pointer("/start/line")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("missing start/line"))?;
+        let line = line
+            .checked_add(1)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("line out of range"))?;
+        let column = range
+            .pointer("/start/character")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("missing start/character"))?;
+        let column = column
+            .checked_add(1)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("character out of range"))?;
         Ok(LspLocation {
             path: uri_to_path(uri).ok_or_else(|| anyhow::anyhow!("bad uri: {uri}"))?,
-            line: u32::try_from(
-                range
-                    .pointer("/start/line")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("missing start/line"))?,
-            )
-            .map_err(|_| anyhow::anyhow!("line out of range"))?
-                + 1,
-            column: u32::try_from(
-                range
-                    .pointer("/start/character")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("missing start/character"))?,
-            )
-            .map_err(|_| anyhow::anyhow!("character out of range"))?
-                + 1,
+            line,
+            column,
         })
     };
     match result {
@@ -1416,6 +1421,39 @@ mod tests {
         assert_eq!(many.len(), 2);
         assert_eq!(many[1].path, PathBuf::from("/p/b.rs"));
         assert!(parse_locations(&Value::Null).unwrap().is_empty());
+    }
+
+    /// A `line`/`character` of exactly `u32::MAX` fits `u32`, so narrowing
+    /// first and then doing `+ 1` would wrap to 0 in release and panic under
+    /// overflow checks. Adding on the `u64` before narrowing rejects it
+    /// cleanly, and every normal value still converts to `n + 1`.
+    #[test]
+    fn locations_reject_out_of_range_positions_instead_of_overflowing() {
+        let max = u32::MAX as u64; // 4_294_967_295
+        let boom = serde_json::json!({"uri": "file:///p/a.rs",
+            "range": {"start": {"line": max, "character": 2},
+                      "end": {"line": max, "character": 6}}});
+        let err = parse_locations(&boom).unwrap_err().to_string();
+        assert!(
+            err.contains("out of range"),
+            "u32::MAX line must error, not wrap/panic: got {err}"
+        );
+
+        let boom_col = serde_json::json!({"uri": "file:///p/a.rs",
+            "range": {"start": {"line": 1, "character": max},
+                      "end": {"line": 1, "character": 6}}});
+        let err = parse_locations(&boom_col).unwrap_err().to_string();
+        assert!(
+            err.contains("out of range"),
+            "u32::MAX character must error, not wrap/panic: got {err}"
+        );
+
+        // A normal small value still increments by 1 exactly as before.
+        let ok = serde_json::json!({"uri": "file:///p/a.rs",
+            "range": {"start": {"line": 4, "character": 2},
+                      "end": {"line": 4, "character": 6}}});
+        let parsed = parse_locations(&ok).unwrap();
+        assert_eq!((parsed[0].line, parsed[0].column), (5, 3));
     }
 
     /// Rename confinement compares canonical paths on BOTH sides.
