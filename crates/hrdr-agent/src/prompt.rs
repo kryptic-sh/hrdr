@@ -1176,11 +1176,10 @@ mod tests {
         // versions of one change that collide at integration.
         assert!(p.contains("Never work a chunk you have delegated"), "{p}");
         assert!(p.contains("Delegate a chunk or keep it, never both"), "{p}");
-        // The integrating merge commit gets a real message, not the bare default.
-        assert!(
-            p.contains("never\n    leave the default `Merge branch 'hrdr/task-…'`"),
-            "{p}"
-        );
+        // Integration keeps history linear: rebase the task branch, then
+        // fast-forward it in — never a merge commit off a diverged branch.
+        assert!(p.contains("Integrate so history stays\n    LINEAR"), "{p}");
+        assert!(p.contains("git merge --ff-only <branch>"), "{p}");
         // Investigate/scope before delegating mechanical work.
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");

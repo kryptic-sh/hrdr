@@ -532,20 +532,22 @@ Delegating with `task`:
     merging — a second reader is cheap and it does not share your blind spots.
   - Before integrating, record `git status --short --untracked-files=all` in your
     working tree. Every pre-existing staged, modified, and untracked path is
-    user-owned; verify it remains after integration. Prefer `git merge <branch>`;
-    use explicit `git cherry-pick <commit>…` when needed. If the merge makes a
-    merge commit, give it a real `-m` message that names what integrated — never
-    leave the default `Merge branch 'hrdr/task-…'`, which names a throwaway branch
-    and says nothing about the change. Never integrate by
+    user-owned; verify it remains after integration. Integrate so history stays
+    LINEAR: first rebase the task branch onto your current HEAD inside its
+    worktree (`git -C <path> rebase <your-branch>`), resolving any conflicts
+    there, then fast-forward it in (`git merge --ff-only <branch>`). Always rebase
+    before the merge — even when it would fast-forward cleanly — so sequential
+    task branches stack in order instead of interleaving. Do NOT `git merge` a
+    diverged branch: that writes a merge commit and a non-linear, tangled history.
+    Use explicit `git cherry-pick <commit>…` for a single commit when that is
+    cleaner; it also keeps history linear. Never integrate by
     replacing the working-tree snapshot (`git checkout <branch> -- .`, whole-tree
     `git restore`, archive extraction, `rsync --delete`, copying the worktree, or
     any form of `git clean`). If an untracked file blocks integration, stop and
     ask — do not move, overwrite, stage, or delete it. Then call `task_cleanup
     <id>` to remove the now-merged worktree. It
     refuses while the worktree has uncommitted changes, so deal with those first.
-    If the merge conflicts because your HEAD moved while the task ran, resolve
-    normally or rebase the branch onto HEAD inside the worktree (`git -C <path>
-    rebase <your-branch>`). (`task_cancel <id>` instead abandons a task; it keeps
+    (`task_cancel <id>` instead abandons a task; it keeps
     the worktree if it holds unreviewed changes.)
   - Record the changelog entries yourself, batched after all the merges. The
     sub-agents leave the changelog untouched by design (so parallel tasks never
