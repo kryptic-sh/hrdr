@@ -1874,9 +1874,18 @@ impl hrdr_tools::Tool for TaskDiffTool {
             ));
         }
         if commits.is_empty() {
+            // An empty `HEAD..branch` is ambiguous and reads as a benign
+            // all-clear, so name both cases and the one check that tells them
+            // apart — otherwise the model spends calls playing detective (it
+            // can't be resolved by git topology alone: a branch that produced
+            // nothing and one whose commit was already fast-forwarded into HEAD
+            // both leave the branch tip at HEAD).
             report.push_str(&format!(
                 "Commits: branch `{branch}` has no commits beyond your HEAD — nothing to \
-                 merge.\n\n"
+                 merge. This means EITHER the sub-agent produced no commits, OR its work was \
+                 already integrated into your HEAD (e.g. a fast-forward from branch timing). \
+                 If you expected changes, run `git show --stat HEAD` to check whether its \
+                 commit already landed before you rely on this or run `task_cleanup`.\n\n"
             ));
         } else {
             report.push_str(&format!("Commits:\n{commits}\n\n"));
