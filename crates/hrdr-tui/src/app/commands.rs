@@ -538,16 +538,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             &self.app.cfg,
             Some(self.app.state().model.provider().as_str()),
         );
-        // A built-in ChatGPT login contributes rows asynchronously (its models
-        // aren't in the sync catalog), so the picker may open even when the sync
-        // list is empty — the async load fills it. Gated on the TRUSTED built-in
-        // (a custom `chatgpt` shadow resolves to Custom and is left untouched).
-        let chatgpt_ready = self.app.cfg.resolve_provider("chatgpt").map(|p| p.kind)
-            == Some(hrdr_agent::ResolvedProviderKind::ChatGptOAuth)
-            && hrdr_agent::has_oauth_credentials(
-                hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
-                "chatgpt",
-            );
+        // A ChatGPT (Codex) OAuth login contributes rows asynchronously (its
+        // models aren't in the sync catalog), so the picker may open even when
+        // the sync list is empty — the async load fills it.
+        let chatgpt_ready = self.app.on_chatgpt_oauth();
         if choices.is_empty() && !chatgpt_ready {
             self.info(
                 "no models to choose from yet — configure a provider (or run a turn so the \
@@ -1058,15 +1052,27 @@ impl super::App {
     /// runs when a built-in ChatGPT login is set up. Captures the current
     /// generation; the result ([`TurnMsg::ModelCatalog`]) is applied only if the
     /// generation still matches when it lands.
+    /// Whether the session is authenticated via ChatGPT/Codex OAuth: the
+    /// built-in `openai` provider resolves to the `OAuth` auth-state (no
+    /// resolvable key, an OpenAI OAuth credential in the store). This is what
+    /// gates loading the ChatGPT account-model catalog. A custom
+    /// `[providers.openai]` shadow is `Custom` and never reports `OAuth`.
+    pub(super) fn on_chatgpt_oauth(&self) -> bool {
+        self.cfg.resolve_provider("openai").is_some_and(|p| {
+            hrdr_agent::provider_auth_state("openai", &p, None, None)
+                == hrdr_agent::ProviderAuthState::OAuth
+        })
+    }
+
     pub(super) fn spawn_model_catalog_load(&mut self, force: bool) {
         use hrdr_agent::{CHATGPT_CODEX_BASE_URL, CatalogSource, ResolvedProviderKind};
-        // Only when the built-in ChatGPT resolves to trusted OAuth (a custom
-        // `[providers.chatgpt]` shadow resolves to Custom — leave its rows alone)
-        // AND a login is set up.
-        if self.cfg.resolve_provider("chatgpt").map(|p| p.kind)
-            != Some(ResolvedProviderKind::ChatGptOAuth)
-            || !hrdr_agent::has_oauth_credentials(ResolvedProviderKind::ChatGptOAuth, "chatgpt")
-        {
+        // Only when the session is on ChatGPT/Codex OAuth. Post-merge that is the
+        // built-in `openai` provider resolving to the OAuth auth-state — no key,
+        // an OpenAI OAuth credential present. `resolve_provider` is the pure
+        // preset (never `ChatGptOAuth` now the two are one provider), so ask
+        // `provider_auth_state`, which reads the OAuth store; a custom
+        // `[providers.openai]` shadow is `Custom` and never reports `OAuth`.
+        if !self.on_chatgpt_oauth() {
             return;
         }
         self.model_loading = true;
