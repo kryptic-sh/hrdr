@@ -427,6 +427,14 @@ async fn main() -> Result<()> {
         let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
         eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
     }
+    // Surface when the key hrdr will use comes from the environment — a stray
+    // `OPENAI_API_KEY` silently overriding a `/login` credential should be
+    // visible, not mysterious.
+    if let Some(var) = hrdr_agent::api_key_env_source(&p) {
+        eprintln!(
+            "hrdr: using the API key from ${var} (environment) for '{name}' — overrides any /login credential"
+        );
+    }
     // Stamp the provider's flat preset — EXCEPT for the Codex endpoint, whose preset
     // is only right for its default model (gpt-5.5 = 272k) and would over-state a
     // smaller entitled model (a 128k codex model). Codex is resolved per-model below,

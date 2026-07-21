@@ -511,6 +511,20 @@ impl App {
         logo: &'static str,
     ) -> Result<Self> {
         let identity = config.model.clone();
+        // Compute the env-sourced-key warning while `config` is still whole
+        // (it is consumed later building the agent); pushed into the transcript
+        // below alongside the other startup notices.
+        let env_auth_warning = {
+            let prov = config.model.provider().as_str().to_string();
+            config.resolve_provider(&prov).and_then(|p| {
+                hrdr_agent::api_key_env_source(&p).map(|var| {
+                    format!(
+                        "⚠ using the API key from ${var} (environment) for '{prov}' — \
+                         this overrides any /login credential"
+                    )
+                })
+            })
+        };
         let vim_mode = ui.vim_mode;
         let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
@@ -568,6 +582,13 @@ impl App {
         // Warn (but don't fail) if the config file exists but is invalid — the
         // running config has already fallen back to defaults + env in that case.
         if let Some(warning) = hrdr_app::startup_config_warning() {
+            transcript.push(Entry::notice(warning));
+        }
+        // Surface when the API key hrdr will use is coming from an environment
+        // variable (rather than `/login` or config): a stray `OPENAI_API_KEY`
+        // silently overriding a stored credential should be visible. Computed
+        // early (see `env_auth_warning` above) so `config` is still un-moved.
+        if let Some(warning) = env_auth_warning {
             transcript.push(Entry::notice(warning));
         }
         if project_docs_loaded {

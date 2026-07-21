@@ -1044,6 +1044,21 @@ pub fn resolve_api_key(
         })
 }
 
+/// The environment variable the effective API key is drawn FROM, if any — i.e.
+/// no inline preset key shadows it and `key_env`'s variable is set in the
+/// environment. `None` when the key is inline, from the `/login` store, a
+/// parent, or absent. Mirrors [`resolve_api_key`]'s precedence (inline beats
+/// env beats store), so a `Some` here means the key hrdr will actually use came
+/// from the environment — worth surfacing so a stray `OPENAI_API_KEY` silently
+/// overriding a `/login` credential is visible rather than mysterious.
+pub fn api_key_env_source(p: &ResolvedProvider) -> Option<String> {
+    if p.api_key.is_some() {
+        return None; // an inline key wins over the environment
+    }
+    let var = p.key_env.as_ref()?;
+    std::env::var(var).ok().map(|_| var.clone())
+}
+
 /// Whether `(kind, name)` may authenticate via the OpenAI OAuth (Codex) store —
 /// the ONLY providers allowed to report [`ProviderAuthState::OAuth`] or receive
 /// the auth-derived Codex endpoint switch:
@@ -1910,6 +1925,39 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
         return Err(e).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod env_source_tests {
+    use super::*;
+
+    /// `api_key_env_source` reports the variable name only when the effective key
+    /// is genuinely environment-sourced: `key_env` set to a variable that exists,
+    /// and no inline key shadowing it. Uses `PATH` (always set) for the positive
+    /// case and an unset name for the negative — no environment mutation, so this
+    /// is hermetic and parallel-safe.
+    #[test]
+    fn api_key_env_source_reports_only_an_env_sourced_key() {
+        let mut p = builtin_provider("openai").expect("built-in openai");
+
+        // key_env → a set variable, no inline key: reported by its name.
+        p.api_key = None;
+        p.key_env = Some("PATH".to_string());
+        assert_eq!(api_key_env_source(&p), Some("PATH".to_string()));
+
+        // An inline key wins over the environment → not env-sourced.
+        p.api_key = Some("sk-inline".to_string());
+        assert_eq!(api_key_env_source(&p), None);
+
+        // key_env naming an UNSET variable → not env-sourced.
+        p.api_key = None;
+        p.key_env = Some("HRDR_DEFINITELY_UNSET_VAR_XYZ".to_string());
+        assert_eq!(api_key_env_source(&p), None);
+
+        // No key_env at all → None.
+        p.key_env = None;
+        assert_eq!(api_key_env_source(&p), None);
+    }
 }
 
 #[cfg(test)]

@@ -134,6 +134,7 @@ pub use config::{
     ResolvedProvider,
     ResolvedProviderKind,
     SubagentProfile,
+    api_key_env_source,
     builtin_provider,
     canonical_providers,
     check_config_compat,
