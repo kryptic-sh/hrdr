@@ -1272,6 +1272,7 @@ dependencies = [
  "futures-util",
  "hjkl-xdg",
  "hrdr-test-support",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

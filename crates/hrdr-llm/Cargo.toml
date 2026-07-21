@@ -16,6 +16,12 @@ anyhow.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW on the wire-log open (`open_wire_log` in src/client.rs) so a
+# final-component symlink swapped in at open time fails with ELOOP instead of
+# being followed — closing the check→open TOCTOU window atomically.
+libc = "0.2"
+
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
