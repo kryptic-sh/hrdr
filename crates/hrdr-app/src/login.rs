@@ -23,25 +23,42 @@ enum Step {
     Key { name: String },
 }
 
-/// Resolve a picker line to a provider name: a valid 1-based index selects from
-/// `builtins`; anything else is lower-cased and taken as a name (so a custom
-/// `[providers.<name>]` or a built-in typed by name both work).
-fn parse_provider_pick(line: &str, builtins: &[&str]) -> String {
-    match line.parse::<usize>() {
-        Ok(n) if (1..=builtins.len()).contains(&n) => builtins[n - 1].to_string(),
-        _ => line.to_ascii_lowercase(),
-    }
+/// What a wizard picker line resolved to.
+enum ProviderPick {
+    /// A 1-based index into the CHOICE list — carries the row (and its route).
+    Choice(LoginProviderChoice),
+    /// A free-form provider name (lower-cased): a built-in typed by name, or a
+    /// custom `[providers.<name>]`. Its route is derived when picked.
+    Name(String),
 }
 
-/// Friendly label for a built-in provider name (for the picker).
+/// Resolve a wizard picker line against the CHOICE list: a valid 1-based index
+/// selects that row (so its explicit [`LoginRoute`] is carried, distinguishing the
+/// two rows of a dual-auth provider); anything else is a free-form provider name.
+///
+/// Indexing the choice list — not `BUILTIN_PROVIDERS` — is what keeps the number a
+/// user sees in the prompt aligned with the row it selects now that `openai` and
+/// `openrouter` each contribute two rows.
+fn parse_provider_pick(line: &str, choices: &[LoginProviderChoice]) -> ProviderPick {
+    if let Ok(n) = line.parse::<usize>()
+        && (1..=choices.len()).contains(&n)
+    {
+        return ProviderPick::Choice(choices[n - 1].clone());
+    }
+    ProviderPick::Name(line.to_ascii_lowercase())
+}
+
+/// Friendly label for a built-in provider name (used by the key-entry warning
+/// and the browser-open copy — the picker rows carry their own labels, see
+/// [`login_provider_choices`]).
 fn provider_label(name: &str) -> &'static str {
     match name {
         "zen" => "OpenCode Zen",
         "go" => "OpenCode Go",
         "openai" => "OpenAI",
-        "openrouter" => "OpenRouter (browser login)",
+        "openrouter" => "OpenRouter",
         "claude" => "Anthropic (Claude)",
-        "chatgpt" | "codex" | "openai-oauth" => "ChatGPT subscription (browser login)",
+        "chatgpt" | "codex" | "openai-oauth" => "ChatGPT subscription",
         "local" => "self-hosted, no key",
         _ => "",
     }
@@ -61,38 +78,80 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// One provider the login flow offers (the modal picker's rows).
+/// One login ROUTE the flow offers (one modal picker row). A provider can expose
+/// more than one — `openai` and `openrouter` each get a key row and a browser
+/// row — so the row carries its own [`route`](Self::route): the picker dispatches
+/// on the chosen row, never by re-deriving from the (shared) `name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginProviderChoice {
-    /// The name `login_pick_provider` accepts.
+    /// The provider this row configures. Not unique across rows: both `openai`
+    /// rows carry `"openai"`, distinguished only by [`route`](Self::route).
     pub name: String,
-    /// Friendly label ("OpenCode Zen", …).
+    /// Friendly label ("OpenAI (API key)", "ChatGPT subscription (browser login)", …).
     pub label: String,
-    /// How it authenticates: "browser login", "API key", or "no key needed".
+    /// How this row authenticates: "browser login", "API key", or "no key needed".
     pub detail: String,
+    /// The login flow this row drives — carried explicitly so the two rows of a
+    /// dual-auth provider dispatch differently despite the shared `name`.
+    pub route: LoginRoute,
 }
 
-/// The built-in providers as login choices, in registry order.
+/// The built-in providers as login choices, in registry order. `openai` and
+/// `openrouter` each emit TWO rows (an API-key row and a browser-login row); every
+/// other built-in emits one (keyless for a non-remote endpoint, key otherwise).
 pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
-    hrdr_agent::BUILTIN_PROVIDERS
-        .iter()
-        .map(|name| {
-            let detail = if is_oauth_login(name) {
-                "browser login"
-            } else if hrdr_agent::builtin_provider(name).is_some_and(|p| !p.remote) {
-                "no key needed"
-            } else {
-                "API key"
-            };
-            LoginProviderChoice {
-                name: (*name).to_string(),
-                label: provider_label(name)
-                    .trim_end_matches(" (browser login)")
-                    .to_string(),
-                detail: detail.to_string(),
+    let mut out = Vec::new();
+    for name in hrdr_agent::BUILTIN_PROVIDERS {
+        match *name {
+            // OpenAI: paste an API key (standard endpoint) OR a ChatGPT
+            // subscription browser login (Codex OAuth). Same provider slot; one
+            // credential replaces the other at resolve time (key beats OAuth).
+            "openai" => {
+                out.push(LoginProviderChoice {
+                    name: "openai".to_string(),
+                    label: "OpenAI (API key)".to_string(),
+                    detail: "API key".to_string(),
+                    route: LoginRoute::Key,
+                });
+                out.push(LoginProviderChoice {
+                    name: "openai".to_string(),
+                    label: "ChatGPT subscription (browser login)".to_string(),
+                    detail: "browser login".to_string(),
+                    route: LoginRoute::Browser,
+                });
             }
-        })
-        .collect()
+            // OpenRouter: paste an API key OR a browser login that MINTS an API
+            // key (PKCE) — both land as a key in the `openrouter` slot.
+            "openrouter" => {
+                out.push(LoginProviderChoice {
+                    name: "openrouter".to_string(),
+                    label: "OpenRouter (API key)".to_string(),
+                    detail: "API key".to_string(),
+                    route: LoginRoute::Key,
+                });
+                out.push(LoginProviderChoice {
+                    name: "openrouter".to_string(),
+                    label: "OpenRouter (browser login)".to_string(),
+                    detail: "browser login".to_string(),
+                    route: LoginRoute::Browser,
+                });
+            }
+            other => {
+                let keyless = hrdr_agent::builtin_provider(other).is_some_and(|p| !p.remote);
+                out.push(LoginProviderChoice {
+                    name: other.to_string(),
+                    label: provider_label(other).to_string(),
+                    detail: if keyless { "no key needed" } else { "API key" }.to_string(),
+                    route: if keyless {
+                        LoginRoute::Keyless
+                    } else {
+                        LoginRoute::Key
+                    },
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Case-insensitive fuzzy filter over login choices (name + label + detail).
@@ -151,9 +210,10 @@ pub fn login_route(name: &str, resolved: &hrdr_agent::ResolvedProvider) -> Login
     }
 }
 
-/// Act on a provider pick: launch the OAuth flow, apply a keyless endpoint,
-/// or report that an API key is needed next. Shared by the wizard (text
-/// frontends) and the TUI's login modal.
+/// Act on a provider pick BY NAME — the free-form typed path (a wizard line that
+/// isn't a picker index), where there is no row to carry a route, so the route is
+/// derived from the resolved trust kind ([`login_route`]). Launch the OAuth flow,
+/// apply a keyless endpoint, or report that an API key is needed next.
 pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick {
     let name = name.to_ascii_lowercase();
     let Some(p) = host.resolve_provider(&name) else {
@@ -162,30 +222,61 @@ pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick 
         ));
         return LoginPick::Done;
     };
-    match login_route(&name, &p) {
+    login_dispatch(&name, login_route(&name, &p), host)
+}
+
+/// Act on a picked CHOICE by its explicit [`route`](LoginProviderChoice::route) —
+/// the picker path. This is the ONLY way to drive a dual-auth provider correctly:
+/// its two rows share a `name` and differ only by route, so re-deriving the route
+/// from the name (as [`login_pick_provider`] must, having only a name) would
+/// collapse them. Launch the OAuth flow, apply a keyless endpoint, or report that
+/// an API key is needed next.
+pub fn login_pick_choice(choice: &LoginProviderChoice, host: &mut dyn CommandHost) -> LoginPick {
+    let name = choice.name.to_ascii_lowercase();
+    if host.resolve_provider(&name).is_none() {
+        host.info(format!(
+            "unknown provider '{name}' — pick a built-in or configured name."
+        ));
+        return LoginPick::Done;
+    }
+    login_dispatch(&name, choice.route, host)
+}
+
+/// Dispatch a resolved `(name, route)` to its login flow — the shared core of
+/// [`login_pick_provider`] and [`login_pick_choice`].
+fn login_dispatch(name: &str, route: LoginRoute, host: &mut dyn CommandHost) -> LoginPick {
+    match route {
         // Browser login: launch it (the wizard/non-TUI path persists + reports on
-        // completion; the TUI manages its own typed pending state).
+        // completion; the TUI intercepts this route before calling here and manages
+        // its own typed pending state instead).
         LoginRoute::Browser => {
-            start_oauth_login(&name, host);
+            start_oauth_login(name, host);
             LoginPick::Done
         }
         // A keyless (self-hosted) endpoint needs no API key — apply and finish.
         LoginRoute::Keyless => {
-            match apply_provider_or_pick(host, &name) {
-                Ok(p) => {
-                    host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
-                    host.info(format!(
-                        "✓ using {name} ({}). No API key needed; set as your default provider.",
-                        p.base_url
-                    ));
-                }
-                // A provider that can't name a model has already opened the picker
-                // (`apply_provider_or_pick`); anything else is a real failure.
-                Err(e) => host.info(e.to_string()),
-            }
+            apply_keyless(name, host);
             LoginPick::Done
         }
-        LoginRoute::Key => LoginPick::NeedsKey { name },
+        LoginRoute::Key => LoginPick::NeedsKey {
+            name: name.to_string(),
+        },
+    }
+}
+
+/// Apply a keyless (self-hosted) endpoint and persist it as the default provider.
+fn apply_keyless(name: &str, host: &mut dyn CommandHost) {
+    match apply_provider_or_pick(host, name) {
+        Ok(p) => {
+            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
+            host.info(format!(
+                "✓ using {name} ({}). No API key needed; set as your default provider.",
+                p.base_url
+            ));
+        }
+        // A provider that can't name a model has already opened the picker
+        // (`apply_provider_or_pick`); anything else is a real failure.
+        Err(e) => host.info(e.to_string()),
     }
 }
 
@@ -230,11 +321,12 @@ pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
     }
 }
 
-/// The provider-picker prompt (numbered built-ins + free-form name).
+/// The provider-picker prompt (numbered login rows + free-form name). The numbers
+/// index the CHOICE list, so `openai`/`openrouter` each show their two rows.
 fn provider_prompt() -> String {
-    let mut s = String::from("🔑 /login — pick a provider:\n");
-    for (i, name) in hrdr_agent::BUILTIN_PROVIDERS.iter().enumerate() {
-        s.push_str(&format!("  {}. {name} — {}\n", i + 1, provider_label(name)));
+    let mut s = String::from("🔑 /login — pick a login method:\n");
+    for (i, c) in login_provider_choices().iter().enumerate() {
+        s.push_str(&format!("  {}. {} — {}\n", i + 1, c.label, c.detail));
     }
     s.push_str("Type a number or a provider name. /cancel to abort.");
     s
@@ -283,23 +375,30 @@ impl LoginWizard {
         }
     }
 
-    /// Provider step: resolve the pick, skip the key for a keyless endpoint,
-    /// else advance to the key prompt.
+    /// Provider step: resolve the pick against the choice list (a number carries
+    /// the row's route; a name derives it), skip the key for a keyless endpoint or
+    /// launch the browser flow, else advance to the key prompt.
     fn pick_provider(&mut self, line: &str, host: &mut dyn CommandHost) -> bool {
         if line.is_empty() {
             host.info("pick a number or a provider name, or /cancel.".to_string());
             return false;
         }
-        let name = parse_provider_pick(line, hrdr_agent::BUILTIN_PROVIDERS);
-        // A typo'd name still errors inside login_pick_provider, but a valid
-        // pick either finishes (keyless/OAuth) or advances to the key step.
-        if host.resolve_provider(&name).is_none() {
-            host.info(format!(
-                "unknown provider '{name}' — pick a number, or a built-in / configured name."
-            ));
-            return false;
-        }
-        match login_pick_provider(&name, host) {
+        let pick = match parse_provider_pick(line, &login_provider_choices()) {
+            // A numbered row carries its own route — dispatch on that.
+            ProviderPick::Choice(choice) => login_pick_choice(&choice, host),
+            // A typed name derives its route from the resolved trust kind.
+            ProviderPick::Name(name) => {
+                if host.resolve_provider(&name).is_none() {
+                    host.info(format!(
+                        "unknown provider '{name}' — pick a number, or a built-in / configured \
+                         name."
+                    ));
+                    return false;
+                }
+                login_pick_provider(&name, host)
+            }
+        };
+        match pick {
             LoginPick::Done => true,
             LoginPick::NeedsKey { name } => {
                 host.info(format!(
@@ -331,16 +430,18 @@ impl LoginWizard {
 /// value. `login_id` lets the caller reject a stale/duplicate login's result.
 ///
 /// `None` only when `name` is not a browser-login provider (caller should have
-/// routed via [`login_route`] first).
+/// routed via the chosen row's [`LoginRoute`] first; see [`browser_login_provider`]).
 pub fn browser_login_start(
     name: &str,
     login_id: u64,
     host: &mut dyn CommandHost,
 ) -> Option<BrowserLoginStart> {
+    // A browser login has only two shapes, keyed off the target slot.
+    let target = browser_login_provider(name)?;
     let (verifier, challenge) = hrdr_agent::generate_pkce();
-    let label = provider_label(name);
 
-    if name == "openrouter" {
+    if target == "openrouter" {
+        let label = "OpenRouter";
         // OpenRouter's OAuth PKCE flow carries `state` in the callback URL and
         // echoes it back with `code` — mint one for CSRF defence, so a local
         // prober can't inject a forged callback with an attacker's code.
@@ -369,15 +470,10 @@ pub fn browser_login_start(
         });
     }
 
-    // Only the ChatGPT aliases reach the Codex flow below; any other name is not
-    // a browser-login provider (callers route via `login_route` first, but guard
-    // so an unexpected name never silently launches a ChatGPT OAuth flow).
-    if !hrdr_agent::is_chatgpt_provider_name(name) {
-        return None;
-    }
-
-    // ChatGPT (Codex) subscription login. The whole callback+exchange+save is
-    // wrapped in the 60-minute backstop (not the 5-minute OpenRouter deadline).
+    // The merged `openai` slot (target == "openai"): a ChatGPT (Codex)
+    // subscription login. The whole callback+exchange+save is wrapped in the
+    // 60-minute backstop (not the 5-minute OpenRouter deadline).
+    let label = "ChatGPT subscription";
     let state = hrdr_agent::generate_state();
     let redirect = hrdr_agent::OPENAI_REDIRECT_URI.to_string();
     let url = hrdr_agent::openai_authorize_url(&redirect, &challenge, &state);
@@ -393,18 +489,39 @@ pub fn browser_login_start(
                 Ok(Err(e)) => (false, Some(e.to_string())),
                 Err(_) => (false, Some("ChatGPT login timed out".to_string())),
             };
+        // The OAuth credential is stored in — and resolved from — the merged
+        // `openai` slot, so the login outcome (and the switch it drives) targets
+        // `openai`, not the old `chatgpt` spelling.
         BrowserLoginOutcome {
             login_id,
-            provider: "chatgpt".to_string(),
+            provider: "openai".to_string(),
             token_saved,
             error,
         }
     });
     Some(BrowserLoginStart {
         login_id,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         future,
     })
+}
+
+/// The provider slot a browser login targets, or `None` when `name` is not a
+/// browser-login provider (the caller should have routed via the chosen row's
+/// [`LoginRoute`] first; this is also the guard that keeps an unexpected name from
+/// silently launching an OAuth flow):
+///
+/// * `openrouter` → the `openrouter` key slot (PKCE mints an API key);
+/// * `openai` (and the `chatgpt`/`codex`/`openai-oauth` aliases, for a typed
+///   name) → the merged `openai` OAuth slot (the Codex subscription flow).
+fn browser_login_provider(name: &str) -> Option<&'static str> {
+    if name == "openrouter" {
+        Some("openrouter")
+    } else if name == "openai" || hrdr_agent::is_chatgpt_provider_name(name) {
+        Some("openai")
+    } else {
+        None
+    }
 }
 
 /// A sanitized completion line for a finished browser login, and (on success)
@@ -412,6 +529,9 @@ pub fn browser_login_start(
 /// TUI additionally performs a live switch + model refresh.
 pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
     if outcome.token_saved {
+        // Seed a usable default model before persisting, so the next start (this
+        // path does no live switch) lands on a talkable model rather than stalling.
+        record_oauth_default_model(&outcome.provider);
         let _ = hrdr_agent::persist_setting(
             "provider",
             hrdr_agent::ConfigValue::Str(&outcome.provider),
@@ -420,9 +540,11 @@ pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
             "openrouter" => "✓ logged in to OpenRouter. Key saved and set as your default \
                              — pick a model with /model to use it now."
                 .to_string(),
-            _ => "✓ signed in with ChatGPT. Tokens saved and set as your default \
-                  — pick a model with /model to use it now."
-                .to_string(),
+            _ => format!(
+                "✓ signed in with ChatGPT. Tokens saved and set as your default (model \
+                 {}) — /model to switch models.",
+                hrdr_agent::CHATGPT_DEFAULT_MODEL
+            ),
         }
     } else {
         format!(
@@ -430,6 +552,28 @@ pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
             outcome.provider,
             outcome.error.as_deref().unwrap_or("unknown error")
         )
+    }
+}
+
+/// Seed the post-login default model for a browser login that landed OAuth
+/// credentials in the merged `openai` slot. That provider declares no default
+/// model, and a fresh ChatGPT OAuth login has none recorded on it either — so
+/// without this the provider switch stalls on `NeedsModel` and the session is left
+/// pointed at a provider it can't talk to. Records the ChatGPT subscription
+/// default ([`hrdr_agent::CHATGPT_DEFAULT_MODEL`], `gpt-5.5`) as the model last
+/// used on `openai`, so the switch (and the next start) lands on a talkable model.
+///
+/// Only `openai` (OAuth) gets a seeded default: OpenRouter mints an API key and
+/// keeps the pick-a-model prompt, matching how its key-entry row lands.
+pub fn record_oauth_default_model(provider: &str) {
+    if provider != "openai" {
+        return;
+    }
+    if let Ok(r) = hrdr_agent::ModelRef::new(
+        hrdr_agent::ProviderName::new("openai"),
+        hrdr_agent::CHATGPT_DEFAULT_MODEL,
+    ) {
+        hrdr_agent::record_last_model(&r);
     }
 }
 
@@ -480,7 +624,9 @@ async fn openrouter_exchange_and_save(
 
 /// ChatGPT: wait for the callback code (no 5-minute inner deadline — the caller
 /// wraps the whole flow in the 60-minute backstop), exchange it for the
-/// access/refresh token set, and store it in the OAuth credential store.
+/// access/refresh token set, and store it in the OAuth credential store under the
+/// merged `openai` slot (via the trust-gated [`hrdr_agent::save_oauth_for`], which
+/// canonicalizes `ChatGptOAuth` onto `openai` — the same slot resolution reads).
 /// Exchange/save only — the caller persists the default + performs the switch.
 async fn chatgpt_exchange_and_save(
     verifier: &str,
@@ -505,7 +651,11 @@ async fn chatgpt_exchange_and_save(
         expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
         account_id,
     };
-    hrdr_agent::save_oauth("chatgpt", &creds)?;
+    hrdr_agent::save_oauth_for(
+        hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
+        "openai",
+        &creds,
+    )?;
     Ok(())
 }
 
@@ -588,18 +738,137 @@ mod tests {
         }
     }
 
+    /// The wizard's numeric pick indexes the CHOICE list (not `BUILTIN_PROVIDERS`)
+    /// and carries the selected row's route — so it can name the right one of a
+    /// dual-auth provider's two rows. A non-index line is a free-form name.
     #[test]
-    fn provider_pick_parses_number_or_name() {
-        let b = &["zen", "openai", "local"];
-        // In-range 1-based indices select from the list.
-        assert_eq!(parse_provider_pick("1", b), "zen");
-        assert_eq!(parse_provider_pick("3", b), "local");
+    fn provider_pick_indexes_the_choice_list_and_carries_route() {
+        let choices = login_provider_choices();
+        // Pick each row by its 1-based number and confirm it selects THAT row,
+        // route and all — including both `openai`/`openrouter` rows, which a
+        // `BUILTIN_PROVIDERS`-indexed pick could never tell apart.
+        for (i, expected) in choices.iter().enumerate() {
+            match parse_provider_pick(&(i + 1).to_string(), &choices) {
+                ProviderPick::Choice(c) => {
+                    assert_eq!(&c, expected, "row {} selects itself", i + 1);
+                }
+                ProviderPick::Name(_) => panic!("a valid index must select a choice row"),
+            }
+        }
         // A name passes through, lower-cased.
-        assert_eq!(parse_provider_pick("OpenAI", b), "openai");
-        assert_eq!(parse_provider_pick("mycustom", b), "mycustom");
+        match parse_provider_pick("OpenAI", &choices) {
+            ProviderPick::Name(n) => assert_eq!(n, "openai"),
+            ProviderPick::Choice(_) => panic!("a name is not an index"),
+        }
+        match parse_provider_pick("mycustom", &choices) {
+            ProviderPick::Name(n) => assert_eq!(n, "mycustom"),
+            ProviderPick::Choice(_) => panic!("a name is not an index"),
+        }
         // Out-of-range numbers are treated as a literal name (not an index).
-        assert_eq!(parse_provider_pick("0", b), "0");
-        assert_eq!(parse_provider_pick("9", b), "9");
+        for out in ["0", "999"] {
+            match parse_provider_pick(out, &choices) {
+                ProviderPick::Name(n) => assert_eq!(n, out),
+                ProviderPick::Choice(_) => panic!("{out} is out of range"),
+            }
+        }
+    }
+
+    /// `openai` and `openrouter` each expose TWO rows (one key, one browser) with
+    /// distinguishable labels/details; every other built-in exposes exactly one,
+    /// with its existing route.
+    #[test]
+    fn login_choices_offer_key_and_browser_for_openai_and_openrouter() {
+        let choices = login_provider_choices();
+        for provider in ["openai", "openrouter"] {
+            let rows: Vec<&LoginProviderChoice> =
+                choices.iter().filter(|c| c.name == provider).collect();
+            assert_eq!(rows.len(), 2, "{provider} offers two login rows");
+            let key = rows.iter().find(|c| c.route == LoginRoute::Key);
+            let browser = rows.iter().find(|c| c.route == LoginRoute::Browser);
+            let (key, browser) = (
+                key.unwrap_or_else(|| panic!("{provider} has a key row")),
+                browser.unwrap_or_else(|| panic!("{provider} has a browser row")),
+            );
+            assert_eq!(key.detail, "API key");
+            assert_eq!(browser.detail, "browser login");
+            assert_ne!(
+                key.label, browser.label,
+                "{provider} rows are labelled apart"
+            );
+        }
+        // Single-route built-ins keep exactly one row, with their existing route.
+        for (provider, route) in [
+            ("zen", LoginRoute::Key),
+            ("go", LoginRoute::Key),
+            ("claude", LoginRoute::Key),
+            ("local", LoginRoute::Keyless),
+        ] {
+            let rows: Vec<&LoginProviderChoice> =
+                choices.iter().filter(|c| c.name == provider).collect();
+            assert_eq!(rows.len(), 1, "{provider} offers exactly one row");
+            assert_eq!(rows[0].route, route, "{provider} route");
+        }
+    }
+
+    /// A browser login for `openai` (and the ChatGPT aliases a typed name may use)
+    /// targets the merged `openai` OAuth slot — the Codex flow; `openrouter`
+    /// targets its own key slot — the PKCE flow; a non-browser name has none.
+    #[test]
+    fn browser_login_targets_the_right_slot() {
+        assert_eq!(browser_login_provider("openai"), Some("openai"));
+        for alias in ["chatgpt", "codex", "openai-oauth"] {
+            assert_eq!(
+                browser_login_provider(alias),
+                Some("openai"),
+                "{alias} folds onto the openai OAuth slot"
+            );
+        }
+        assert_eq!(browser_login_provider("openrouter"), Some("openrouter"));
+        for keyed in ["zen", "go", "claude", "local"] {
+            assert_eq!(
+                browser_login_provider(keyed),
+                None,
+                "{keyed} has no browser flow"
+            );
+        }
+    }
+
+    /// The picker dispatches on the CHOSEN row's route: a Key row → key entry (for
+    /// the exact provider), a Keyless row → applied (its provider-model picker
+    /// opens). Driven through [`login_pick_choice`], the picker's entry point.
+    #[tokio::test]
+    async fn login_pick_choice_routes_by_the_rows_route() {
+        let choices = login_provider_choices();
+        let key_row = |provider: &str| {
+            choices
+                .iter()
+                .find(|c| c.name == provider && c.route == LoginRoute::Key)
+                .cloned()
+                .unwrap()
+        };
+
+        // Both dual-auth providers' Key rows go to key entry, for THAT provider.
+        for provider in ["openai", "openrouter"] {
+            let mut host = RouteTestHost::new();
+            match login_pick_choice(&key_row(provider), &mut host) {
+                LoginPick::NeedsKey { name } => assert_eq!(name, provider),
+                LoginPick::Done => panic!("{provider} key row must go to key entry"),
+            }
+        }
+
+        // The keyless `local` row applies and (declaring no model) opens its
+        // provider-scoped model picker — never key entry, never a browser flow.
+        let local = choices.iter().find(|c| c.name == "local").cloned().unwrap();
+        let mut host = RouteTestHost::new();
+        assert!(matches!(
+            login_pick_choice(&local, &mut host),
+            LoginPick::Done
+        ));
+        assert_eq!(
+            host.model_picker_for.as_deref(),
+            Some("local"),
+            "a keyless provider with no model opens its model picker"
+        );
     }
 
     /// The frontend masks the input pane only while the wizard is waiting for
@@ -621,11 +890,111 @@ mod tests {
     }
 
     #[test]
-    fn provider_prompt_lists_all_builtins() {
+    fn provider_prompt_lists_every_login_row() {
         let p = provider_prompt();
-        for name in hrdr_agent::BUILTIN_PROVIDERS {
-            assert!(p.contains(name), "prompt should mention {name}");
+        // One numbered line per login row (both `openai`/`openrouter` methods
+        // included), so the numbers align with `parse_provider_pick`'s indexing.
+        for (i, c) in login_provider_choices().iter().enumerate() {
+            let line = format!("  {}. {} — {}", i + 1, c.label, c.detail);
+            assert!(p.contains(&line), "prompt should list row: {line}\n{p}");
         }
+        assert!(
+            p.contains("browser login") && p.contains("API key"),
+            "both auth methods are shown"
+        );
         assert!(p.contains("/cancel"), "prompt should note how to abort");
+    }
+
+    /// A minimal [`CommandHost`] for the routing tests: real provider resolution
+    /// (so the built-ins resolve), a recording `begin_model_selector_for`, and a
+    /// no-op `persist_setting` (never touch the real config). Everything else is a
+    /// harmless stub — proving, by never being hit, that these tests exercise only
+    /// the routing they mean to.
+    struct RouteTestHost {
+        cfg: hrdr_agent::AgentConfig,
+        agent: std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>,
+        model: hrdr_agent::ModelRef,
+        model_picker_for: Option<String>,
+    }
+
+    impl RouteTestHost {
+        fn new() -> Self {
+            let model: hrdr_agent::ModelRef = "local://test-model".parse().unwrap();
+            let agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+                model: model.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            Self {
+                cfg: hrdr_agent::AgentConfig::default(),
+                agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
+                model,
+                model_picker_for: None,
+            }
+        }
+    }
+
+    impl CommandHost for RouteTestHost {
+        fn info(&mut self, _line: String) {}
+        fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
+            self.cfg.resolve_provider(name)
+        }
+        fn begin_model_selector_for(&mut self, provider: &str) {
+            self.model_picker_for = Some(provider.to_string());
+        }
+        // Never write to the real user config from a test.
+        fn persist_setting(&mut self, _key: &str, _value: hrdr_agent::ConfigValue) {}
+        fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
+            self.agent.clone()
+        }
+        fn cwd(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+        fn base_url(&self) -> String {
+            "http://test.invalid".to_string()
+        }
+        fn model_ref(&self) -> hrdr_agent::ModelRef {
+            self.model.clone()
+        }
+        fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
+            self.model = reference;
+        }
+        fn show_thinking(&self) -> bool {
+            false
+        }
+        fn set_show_thinking(&mut self, _on: bool) {}
+        fn clear_conversation(&mut self) {}
+        fn session_id(&self) -> Option<String> {
+            None
+        }
+        fn set_session_label(&mut self, _name: String) {}
+        fn autosave(&mut self) {}
+        fn resume(&mut self, _id: String, _session: crate::Session) {}
+        fn copy_to_clipboard(&mut self, _text: &str, _label: &str) -> String {
+            String::new()
+        }
+        fn last_reply(&self) -> Option<String> {
+            None
+        }
+        fn transcript_text(&self) -> String {
+            String::new()
+        }
+        fn nth_message_text(&self, _n: usize) -> Option<String> {
+            None
+        }
+        fn line_poster(&self) -> Box<dyn Fn(crate::commands::LineKind, String) + Send> {
+            Box::new(|_, _| {})
+        }
+        fn is_busy(&self) -> bool {
+            false
+        }
+        fn send_prompt(&mut self, _prompt: String, _show_as_user: bool) {}
+        fn set_input(&mut self, _text: String) {}
+        fn prepend_input(&mut self, _text: String) {}
+        fn insert_input(&mut self, _text: String) {}
+        fn set_tool_expansion(&mut self, _mode: crate::commands::ExpandMode) -> String {
+            String::new()
+        }
+        fn start_compaction(&mut self, _instructions: Option<String>) {}
     }
 }

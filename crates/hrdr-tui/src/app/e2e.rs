@@ -4699,13 +4699,13 @@ async fn browser_login_ignores_a_stale_login_id() {
     let mut h = Harness::new(vec![]).await;
     h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
         login_id: 2,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         label: "ChatGPT".to_string(),
     });
     // A late result from an older login (id 1) must not disturb id 2.
     h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
         login_id: 1,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         token_saved: true,
         error: None,
     });
@@ -4725,7 +4725,7 @@ async fn browser_login_esc_cancels_then_late_result_is_dropped() {
     let mut h = Harness::new(vec![]).await;
     h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
         login_id: 1,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         label: "ChatGPT".to_string(),
     });
     // A long-lived task stands in for the real callback/exchange future.
@@ -4745,7 +4745,7 @@ async fn browser_login_esc_cancels_then_late_result_is_dropped() {
     // The in-flight task's late result now matches nothing → no-op.
     h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
         login_id: 1,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         token_saved: true,
         error: None,
     });
@@ -4755,28 +4755,27 @@ async fn browser_login_esc_cancels_then_late_result_is_dropped() {
     );
 }
 
-/// A matching, successful browser login runs the switch transaction: the modal
-/// closes and the model picker opens.
+/// A matching, successful ChatGPT browser login runs the switch transaction: the
+/// modal closes, a usable default model is seeded, and the model picker opens so
+/// the user can switch to another entitled model.
 ///
-/// BEHAVIOUR CHANGED (openai/chatgpt provider merge): `chatgpt` now folds onto the
-/// merged built-in `openai`, which declares no default model. So a successful
-/// ChatGPT login can no longer auto-switch to a model — it opens the `/model`
-/// picker (the `NeedsModel` path) for the user to choose one, exactly as an
-/// API-key `openai` login always did. The login modal still closes; no
-/// `TurnMsg::Identity` is emitted (nothing switched), so this does NOT settle a
-/// switch. (Refining the post-login default is the separate login slice.)
+/// The login targets the merged built-in `openai` (the OAuth credential lives in
+/// the `openai` slot), which declares no default model — so the login slice seeds
+/// the ChatGPT subscription default (`gpt-5.5`) as the model last used on `openai`.
+/// The switch then lands on a talkable model instead of stalling on `NeedsModel`,
+/// and the picker still opens for a deliberate choice.
 #[tokio::test]
-async fn browser_login_success_opens_the_model_picker() {
+async fn browser_login_success_seeds_default_and_opens_the_model_picker() {
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
         login_id: 7,
-        provider: "chatgpt".to_string(),
-        label: "ChatGPT".to_string(),
+        provider: "openai".to_string(),
+        label: "ChatGPT subscription".to_string(),
     });
     h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
         login_id: 7,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         token_saved: true,
         error: None,
     });
@@ -4786,8 +4785,16 @@ async fn browser_login_success_opens_the_model_picker() {
     );
     assert!(
         h.app.model_selector.is_some(),
-        "the merged `openai` declares no default model, so the picker opens to choose one"
+        "the post-login model picker opens to choose an entitled model"
     );
+    // The subscription default was seeded as the model last used on `openai`, so
+    // the session lands on a talkable model even without a picker choice.
+    let seeded = hrdr_agent::model_for_provider(
+        &hrdr_agent::ProviderName::new("openai"),
+        &hrdr_agent::AgentConfig::default(),
+    )
+    .expect("a default model is recorded for openai after ChatGPT login");
+    assert_eq!(seeded.model(), hrdr_agent::CHATGPT_DEFAULT_MODEL);
 }
 
 /// A failed (matching) browser login reports the error and closes the modal
@@ -4797,12 +4804,12 @@ async fn browser_login_failure_reports_and_closes() {
     let mut h = Harness::new(vec![]).await;
     h.app.login_modal = Some(crate::app::LoginModal::Authorizing {
         login_id: 3,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         label: "ChatGPT".to_string(),
     });
     h.app.on_browser_login(hrdr_app::BrowserLoginOutcome {
         login_id: 3,
-        provider: "chatgpt".to_string(),
+        provider: "openai".to_string(),
         token_saved: false,
         error: Some("authorization was rejected".to_string()),
     });

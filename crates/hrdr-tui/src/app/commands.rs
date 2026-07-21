@@ -865,21 +865,17 @@ impl super::App {
                         self.login_modal = None;
                         return;
                     };
-                    // Route by resolved trust kind (not spelling): a browser
-                    // login enters the TUI's typed pending state; keyless/key go
-                    // through the shared pick.
-                    let route = {
-                        let host = TuiHost { app: self };
-                        host.resolve_provider(&c.name)
-                            .map(|p| hrdr_app::login_route(&c.name, &p))
-                    };
-                    if route == Some(hrdr_app::LoginRoute::Browser) {
+                    // Dispatch on the CHOSEN row's explicit route (not re-derived
+                    // from the shared name — `openai`/`openrouter` each have a key
+                    // row and a browser row): a browser login enters the TUI's
+                    // typed pending state; keyless/key go through the shared pick.
+                    if c.route == hrdr_app::LoginRoute::Browser {
                         self.start_browser_login(&c.name, c.label.clone());
                         return;
                     }
                     let pick = {
                         let mut host = TuiHost { app: self };
-                        hrdr_app::login_pick_provider(&c.name, &mut host)
+                        hrdr_app::login_pick_choice(&c, &mut host)
                     };
                     self.login_modal = match pick {
                         hrdr_app::LoginPick::Done => None,
@@ -1012,6 +1008,11 @@ impl super::App {
         }
         // Enter the non-interruptible switch transaction.
         self.login_modal = Some(super::LoginModal::Switching { label });
+        // A ChatGPT OAuth login lands in the merged `openai` provider, which
+        // declares no default model; seed the subscription default so the switch
+        // below resolves a talkable model instead of stalling on `NeedsModel`
+        // (OpenRouter is a no-op here — it minted a key and keeps the picker).
+        hrdr_app::record_oauth_default_model(&outcome.provider);
         {
             let mut host = TuiHost { app: self };
             host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&outcome.provider));
@@ -1041,7 +1042,8 @@ impl super::App {
     /// picker so the entitled models appear without a restart. Login-forced, so
     /// it may open a closed picker (a plain `/model` load never reopens one).
     fn refresh_models_after_login(&mut self, provider: &str) {
-        if provider != "chatgpt" {
+        // The ChatGPT OAuth login now targets the merged `openai` provider.
+        if provider != "openai" {
             return;
         }
         let choices =
