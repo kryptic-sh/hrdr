@@ -308,27 +308,46 @@ fn collect_files(
 /// taken non-overlapping and left-to-right, the gap before each match is copied
 /// verbatim, and the template is expanded by the regex crate's own
 /// [`regex::Captures::expand`] — the very `$`-expansion `replace_all` uses. The
-/// only added behaviour is the ceiling: as soon as the accumulated output
-/// passes `cap` this returns `Err(len)` with the size reached so far (a lower
-/// bound on the true output) instead of finishing the allocation. The check
-/// runs after each append, so the buffer never grows more than one match's
-/// expansion past `cap`.
+/// only added behaviour is the ceiling: this returns `Err(len)` (a lower bound
+/// on the true output) instead of finishing the allocation once the output
+/// would pass `cap`.
+///
+/// The ceiling is checked BEFORE each `expand`, against a per-match upper bound —
+/// the gap plus the template length plus (number of `$` references × this
+/// match's length), since each `$N` reference expands to at most the whole
+/// match. Bounding pre-expansion is what makes a *single* pathological match
+/// safe: a lone `(a+)` over 2 MiB with a template repeating `$1` thousands of
+/// times would expand to gigabytes in one `expand` call, so a post-expand check
+/// would already have allocated it. Here that match is refused before `expand`
+/// runs, so `out` never grows more than one bounded gap past `cap`.
 fn bounded_regex_replace(
     re: &regex::Regex,
     template: &str,
     input: &str,
     cap: usize,
 ) -> std::result::Result<String, usize> {
+    // Conservative count of expansion sites: every `$` could begin a capture
+    // reference. `$$` (a literal `$`) is counted too — that only over-estimates,
+    // which is safe (it can never let an over-cap expansion through).
+    let refs = template.matches('$').count();
     let mut out = String::new();
     let mut last_end = 0;
     for caps in re.captures_iter(input) {
         let m = caps.get(0).expect("group 0 always participates in a match");
+        let gap = m.start() - last_end;
+        let match_len = m.end() - m.start();
+        // Upper bound on what this iteration appends, computed without expanding.
+        let projected = out
+            .len()
+            .saturating_add(gap)
+            .saturating_add(template.len())
+            .saturating_add(refs.saturating_mul(match_len));
+        if projected > cap {
+            return Err(projected);
+        }
         out.push_str(&input[last_end..m.start()]);
         caps.expand(template, &mut out);
         last_end = m.end();
-        if out.len() > cap {
-            return Err(out.len());
-        }
     }
     out.push_str(&input[last_end..]);
     Ok(out)
@@ -719,6 +738,27 @@ mod tests {
         assert!(
             err < cap + 2_000,
             "aborted a hair past the cap, not after the full ~100 MB blow-up: {err}"
+        );
+    }
+
+    /// A SINGLE giant match must be refused BEFORE it expands, not after.
+    ///
+    /// This is the case a post-expand check misses: `(a+)` matches the whole
+    /// input once, and a template repeating `$1` a thousand times would expand
+    /// that one match to ~200 MB in a single `expand` call — allocated in full
+    /// before any "did we pass the cap?" check that runs afterward could fire.
+    /// The pre-expand projection refuses it up front, so `out` never holds the
+    /// blow-up: the call returns an `Err` far above `cap` essentially instantly.
+    #[test]
+    fn bounded_regex_replace_refuses_a_single_giant_match_before_expanding() {
+        let re = regex::Regex::new("(a+)").unwrap(); // one match over the whole input
+        let template = "$1".repeat(1_000);
+        let input = "a".repeat(200_000); // one 200k capture × 1000 refs ≈ 200 MB
+        let cap = 1024;
+        let err = bounded_regex_replace(&re, &template, &input, cap).unwrap_err();
+        assert!(
+            err > 100_000_000,
+            "must report the projected blow-up ({err}) and refuse before expanding"
         );
     }
 
