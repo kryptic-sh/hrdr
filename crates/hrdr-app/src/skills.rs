@@ -134,15 +134,12 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         }
         // Merge this dir's finds before stopping, so nothing already read is lost.
         if truncated {
+            // Silent on purpose: `discover_skills` runs inside the TUI (on every
+            // cwd change and `:`-completion), so writing to stderr here would
+            // corrupt the display. The cap is a defensive ceiling (256 files /
+            // 4 MiB) no real setup reaches, so there is nothing actionable to say.
             break;
         }
-    }
-    if truncated {
-        eprintln!(
-            "hrdr: skill discovery hit the aggregate cap \
-             ({MAX_SKILLS} files / {MAX_SKILLS_TOTAL_BYTES} bytes); \
-             some skill files were not read"
-        );
     }
     for skill in builtin_skills() {
         if !out.iter().any(|s| s.name.eq_ignore_ascii_case(&skill.name)) {

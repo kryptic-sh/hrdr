@@ -206,7 +206,6 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     // ancestors — the correct precedence (a nearer file overrides a farther one).
     let mut docs: Vec<String> = Vec::new();
     let mut total: usize = 0;
-    let mut truncated = false;
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         let af = d.join(AGENTS_FILE);
@@ -215,8 +214,10 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
         {
             let text = text.trim();
             if !text.is_empty() {
+                // Stop at the nearest files once the running total would exceed
+                // the aggregate ceiling — the walk is cwd-first, so this keeps
+                // the most-specific AGENTS.md and drops only farther ancestors.
                 if total.saturating_add(text.len()) > MAX_AGENTS_TOTAL_BYTES {
-                    truncated = true;
                     break;
                 }
                 total += text.len();
@@ -247,23 +248,17 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
         && let Ok(text) = std::fs::read_to_string(path)
     {
         let text = text.trim();
-        if !text.is_empty() {
+        if !text.is_empty()
             // The global file is the least-specific source (it prepends at the
             // front), so it only goes in if the budget the ancestor walk left
-            // can hold it; otherwise it's the first thing to drop.
-            if total.saturating_add(text.len()) > MAX_AGENTS_TOTAL_BYTES {
-                truncated = true;
-            } else {
-                docs.insert(0, text.to_string());
-            }
+            // can hold it; otherwise it's the first thing to drop. Truncation is
+            // silent: this runs during prompt assembly under the TUI, so stderr
+            // output would corrupt the display, and the 1 MiB ceiling is a
+            // defensive bound no real project reaches.
+            && total.saturating_add(text.len()) <= MAX_AGENTS_TOTAL_BYTES
+        {
+            docs.insert(0, text.to_string());
         }
-    }
-
-    if truncated {
-        eprintln!(
-            "hrdr: project instructions exceeded {MAX_AGENTS_TOTAL_BYTES} bytes total; \
-             kept the nearest AGENTS.md files and dropped farther ancestors/global"
-        );
     }
 
     if docs.is_empty() {
