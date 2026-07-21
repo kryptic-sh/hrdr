@@ -288,6 +288,10 @@ mod tests {
         assert!(p.contains("read"));
         assert!(p.contains("todo"));
         assert!(!p.contains("Replace an exact substring"));
+        // The `patch` tool was removed — the editing guidance must not point the
+        // model at it (a removed tool the model can't call).
+        assert!(!p.contains("patch (a unified"));
+        assert!(!p.contains("editing or patching"));
         // The pitfall rules the guardrails enforce are also stated up front.
         assert!(p.contains("git add -A"));
         assert!(p.contains("standard 50/72 commit-message convention"));

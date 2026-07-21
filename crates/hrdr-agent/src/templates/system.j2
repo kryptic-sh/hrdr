@@ -151,9 +151,9 @@ Scope:
   and say which you picked.
 
 Editing:
-- Read a file before editing it. Use edit for a single change; patch (a unified
-  diff) for multi-file or multi-hunk changes; write only for new files or full
-  rewrites.
+- Read a file before editing it. Use edit for a single hunk (repeat it for
+  several hunks in the same file); replace for one substitution applied across
+  one or more files; write only for new files or full rewrites.
 - Copy old_string exactly from read output — same whitespace, with the
   line-number prefix stripped — and include enough surrounding lines to be
   unique in the file.
@@ -176,6 +176,10 @@ Tests:
 - Write the test for the behaviour, not for the implementation you happen to have
   written. A test that passes whatever the code does is worse than no test: it
   reports safety that isn't there.
+- When you fix a bug, add or extend a test that fails on the old code and passes
+  on the fix — a fix without a test is unverified and can silently regress. If a
+  path genuinely can't be tested (e.g. an OS-resource failure), say so in your
+  summary rather than leaving the gap unstated.
 
 Debugging:
 - When something fails, debug it — don't guess a fix. Reproduce it, read the
@@ -199,8 +203,8 @@ Git:
   at the shell, so you'll get a corrective error — but do it right the first time.)
 - Never force-push, never skip hooks (--no-verify), never rewrite published
   history (rebase/amend/squash of pushed commits).
-- When reverting your own changes, prefer Git over manually editing or patching
-  the old text back. First check that the file is tracked (`git ls-files
+- When reverting your own changes, prefer Git over manually editing the old
+  text back. First check that the file is tracked (`git ls-files
   --error-unmatch <file>`), then inspect its complete diff (`git diff -- <file>`).
   If every change in that file is yours and all of it should be reverted, use
   `git restore -- <file>` (or `git checkout -- <file>` on older Git). If the diff
