@@ -129,26 +129,44 @@ impl Tool for ReplaceTool {
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
-            // Bound output size before allocating: `find="e"`, `replace=50KB`
-            // could expand even a single sub-2 MB file into gigabytes. For regex
-            // mode the projection is conservative (captures can vary), but still
-            // prevents catastrophic OOM.
-            if a.replace.len() > a.find.len() {
-                let projected = before
-                    .len()
-                    .saturating_add(hits.saturating_mul(a.replace.len() - a.find.len()));
-                if projected > MAX_EDIT_OUTPUT_BYTES {
-                    bail!(
-                        "replacing {:?} in {} would produce ~{projected} bytes; narrow `find` or \
+            //
+            // Bound output size before it can OOM: `find="e"`, `replace=50KB`
+            // could expand even a single sub-2 MB file into gigabytes. The two
+            // modes are bounded differently because only one admits an exact
+            // pre-projection:
+            //   * LITERAL — each hit grows the output by exactly
+            //     `replace.len() - find.len()`, so the projection below is exact
+            //     and can refuse before allocating anything.
+            //   * REGEX — the template's capture references (`$1`, `${name}`,
+            //     `$0`) expand to matched text of unknown size, so no pre-hoc
+            //     estimate off `replace.len()` is safe (it under-counts and would
+            //     let a `$1$1$1…` template OOM). It is bounded *incrementally*
+            //     while the output is built (`bounded_regex_replace`), aborting
+            //     the moment the real output crosses the ceiling.
+            let after = if a.regex {
+                match bounded_regex_replace(&re, &a.replace, &before, MAX_EDIT_OUTPUT_BYTES) {
+                    Ok(after) => after,
+                    Err(len) => bail!(
+                        "replacing {:?} in {} would produce ~{len}+ bytes; narrow `find` or \
                          the sweep",
                         a.find,
                         path.strip_prefix(&ctx.cwd).unwrap_or(&path).display()
-                    );
+                    ),
                 }
-            }
-            let after = if a.regex {
-                re.replace_all(&before, a.replace.as_str()).into_owned()
             } else {
+                if a.replace.len() > a.find.len() {
+                    let projected = before
+                        .len()
+                        .saturating_add(hits.saturating_mul(a.replace.len() - a.find.len()));
+                    if projected > MAX_EDIT_OUTPUT_BYTES {
+                        bail!(
+                            "replacing {:?} in {} would produce ~{projected} bytes; narrow `find` \
+                             or the sweep",
+                            a.find,
+                            path.strip_prefix(&ctx.cwd).unwrap_or(&path).display()
+                        );
+                    }
+                }
                 before.replace(&a.find, &a.replace)
             };
             if after == before {
@@ -280,6 +298,40 @@ fn collect_files(
     out.sort();
     oversized.sort();
     Ok((out, oversized))
+}
+
+/// [`regex::Regex::replace_all`] with an output ceiling, so a template whose
+/// capture references (`$1`, `${name}`, `$0`) expand the matched text can't
+/// drive an unbounded allocation and OOM the process.
+///
+/// Byte-for-byte identical to `replace_all` for the in-bounds case: matches are
+/// taken non-overlapping and left-to-right, the gap before each match is copied
+/// verbatim, and the template is expanded by the regex crate's own
+/// [`regex::Captures::expand`] — the very `$`-expansion `replace_all` uses. The
+/// only added behaviour is the ceiling: as soon as the accumulated output
+/// passes `cap` this returns `Err(len)` with the size reached so far (a lower
+/// bound on the true output) instead of finishing the allocation. The check
+/// runs after each append, so the buffer never grows more than one match's
+/// expansion past `cap`.
+fn bounded_regex_replace(
+    re: &regex::Regex,
+    template: &str,
+    input: &str,
+    cap: usize,
+) -> std::result::Result<String, usize> {
+    let mut out = String::new();
+    let mut last_end = 0;
+    for caps in re.captures_iter(input) {
+        let m = caps.get(0).expect("group 0 always participates in a match");
+        out.push_str(&input[last_end..m.start()]);
+        caps.expand(template, &mut out);
+        last_end = m.end();
+        if out.len() > cap {
+            return Err(out.len());
+        }
+    }
+    out.push_str(&input[last_end..]);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -644,6 +696,87 @@ mod tests {
             read(&dir.path().join("a.txt")).await,
             "old\n",
             "nothing written, so the hook never ran"
+        );
+    }
+
+    /// A regex template that repeats a capture (`$1$1…`) expands each match far
+    /// beyond `replace.len()`, so the literal projection would under-count it.
+    /// The incremental ceiling must trip on the *real* output size and stop
+    /// early rather than materialising the whole blown-up string: here a full
+    /// run would be ~100 MB but `cap` is 1 KiB, and the reported size is only
+    /// one match's expansion past the cap — proof the walk aborted mid-stream
+    /// instead of allocating the full output.
+    #[test]
+    fn bounded_regex_replace_aborts_early_on_capture_expansion() {
+        let re = regex::Regex::new("(a)").unwrap();
+        // 100_000 single-char matches, each expanding to 1_000 bytes → ~100 MB
+        // if run to completion.
+        let template = "$1".repeat(1_000);
+        let input = "a".repeat(100_000);
+        let cap = 1024;
+        let err = bounded_regex_replace(&re, &template, &input, cap).unwrap_err();
+        assert!(err > cap, "must report a size past the ceiling: {err}");
+        assert!(
+            err < cap + 2_000,
+            "aborted a hair past the cap, not after the full ~100 MB blow-up: {err}"
+        );
+    }
+
+    /// The bounded path is byte-for-byte identical to `replace_all` for a normal
+    /// in-bounds replacement with a capture reference — the ceiling only changes
+    /// behaviour when it is actually crossed. A no-match input round-trips too.
+    #[test]
+    fn bounded_regex_replace_matches_replace_all() {
+        let re = regex::Regex::new(r"(\w+)").unwrap();
+        let input = "foo bar_baz qux\nlonger line with words\n";
+        // `${1}` is braced: a bare `$1_x` would name group `1_x` (nonexistent)
+        // and expand to nothing — the exact gotcha `replace_all` also has.
+        let template = "${1}_x";
+        let expected = re.replace_all(input, template).into_owned();
+        let got = bounded_regex_replace(&re, template, input, MAX_EDIT_OUTPUT_BYTES).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(
+            got,
+            "foo_x bar_baz_x qux_x\nlonger_x line_x with_x words_x\n"
+        );
+
+        let none = "!!! ??? ...";
+        assert_eq!(
+            bounded_regex_replace(&re, template, none, MAX_EDIT_OUTPUT_BYTES).unwrap(),
+            re.replace_all(none, template).into_owned(),
+            "a no-match input is returned unchanged, like replace_all"
+        );
+    }
+
+    /// End-to-end: a regex replace whose template repeats a capture is refused
+    /// with the size error rather than being allowed to OOM. The literal
+    /// projection can't see the expansion (it only knows `replace.len()`), so
+    /// this exercises the incremental ceiling wired into the tool — the full run
+    /// would be ~2 GB, but the tool bails once the real output crosses
+    /// `MAX_EDIT_OUTPUT_BYTES`, and leaves the file untouched.
+    #[tokio::test]
+    async fn regex_capture_expansion_is_refused_with_the_size_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        // Just under MAX_FILE_BYTES (2 MiB) so it is not skipped as oversized.
+        let input = "a".repeat(2_000_000);
+        write(&dir.path().join("big.txt"), &input).await;
+
+        let err = ReplaceTool
+            .execute(
+                json!({"find": "(a)", "replace": "$1".repeat(1_000), "regex": true}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("would produce"), "{msg}");
+        assert!(msg.contains("+ bytes"), "reports a lower-bound size: {msg}");
+        assert!(msg.contains("narrow `find`"), "{msg}");
+        assert_eq!(
+            read(&dir.path().join("big.txt")).await,
+            input,
+            "the file must be left exactly as it was — the sweep aborted"
         );
     }
 }
