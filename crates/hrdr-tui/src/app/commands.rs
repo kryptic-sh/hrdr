@@ -100,6 +100,9 @@ impl super::App {
         // land there too (`Agent::clear` zeroes the agent's own cost counter).
         self.publish_main_agent();
         self.state_mut().id = None; // detach; next message starts a new session
+        // Release the current session's open-lock: we no longer own it. The next
+        // message mints a fresh session and takes a new open-lock with it.
+        self.active_lock = None;
         // Detach the sub-agent transcript dir with it — otherwise a `task`
         // spawned early in the next session (before its first autosave assigns
         // an id) would resolve this now-abandoned session's dir and misfile its
@@ -382,7 +385,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.autosave();
     }
     fn resume(&mut self, id: String, session: hrdr_app::Session) {
-        self.app.apply_session(id, session);
+        // `resolve_session` already located + loaded the file (unlocked); take
+        // its open-lock now via the same locked path the picker uses. The loaded
+        // copy is discarded — `resume_locked_path` re-loads under the lock so we
+        // never adopt a session we couldn't own.
+        let path = hrdr_app::session_file_path(&session.state.cwd, &id);
+        self.app.resume_locked_path(id, &path);
     }
     fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
         self.app.clipboard_status(text, label)
@@ -741,10 +749,10 @@ impl super::App {
             return;
         };
         self.session_selector = None;
-        match hrdr_app::Session::load_path(&m.path) {
-            Ok(session) => self.apply_session(m.id, session),
-            Err(e) => self.system(format!("can't load session {}: {e}", m.id)),
-        }
+        // Take the session's open-lock before loading and before releasing the
+        // current one: a session held open in another window is refused, and the
+        // current session is left untouched.
+        self.resume_locked_path(m.id, &m.path);
     }
 
     /// Route one key to the open `/theme` picker: Esc/Ctrl+C closes it and

@@ -12,6 +12,12 @@ use crate::{Session, SessionState};
 pub struct SaveOutcome {
     pub id: String,
     pub first_save: bool,
+    /// The freshly-minted session's open-lock, present only on `first_save`. The
+    /// frontend must hold it for as long as the session is active (see
+    /// [`crate::SessionLock`]) so another instance's auto-resume can't adopt this
+    /// brand-new session and collide. `None` on every subsequent save, and on the
+    /// (near-impossible) case that the minted id's open-lock was already held.
+    pub open_lock: Option<crate::SessionLock>,
 }
 
 /// Persist a conversation as a session. Returns `Ok(None)` when there's nothing
@@ -27,18 +33,30 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
     if !state.is_saveable() {
         return Ok(None);
     }
-    let (id, first_save, _reservation) = if let Some(id) = &state.id {
-        (id.clone(), false, None)
+    let (id, first_save, _reservation, open_lock) = if let Some(id) = &state.id {
+        (id.clone(), false, None, None)
     } else {
         let (id, res) = crate::unique_session_id(&state.cwd, &state.name);
-        (id, true, Some(res))
+        // Take the per-session open-lock for the freshly-minted id, keyed by the
+        // same directory the file lands in. `.ok()` degrades gracefully: the
+        // brand-new id is unique, so a live open-lock for it is near-impossible;
+        // if the acquire somehow can't take it we still save (just without the
+        // extra guard) rather than erroring the user's first turn.
+        let lock = crate::acquire_session_lock(&state.cwd, &id).ok();
+        (id, true, Some(res), lock)
     };
     Session::new(state.persisted()).save(&id)?;
     // `_reservation` is dropped here. If `save` failed above, the drop
     // removes the lock file that `unique_session_id` created — no stale
     // lock is left behind. If `save` succeeded, `save()` already removed
-    // the lock; the second `remove_file` in `Reservation::drop` is benign.
-    Ok(Some(SaveOutcome { id, first_save }))
+    // the reservation lock (`.{id}.lock`, distinct from the open-lock); the
+    // second `remove_file` in `Reservation::drop` is benign. `open_lock` is
+    // NOT dropped — it is handed to the caller to hold.
+    Ok(Some(SaveOutcome {
+        id,
+        first_save,
+        open_lock,
+    }))
 }
 
 /// Async wrapper over [`save_session`]: refresh the state's mirrors of the
@@ -67,6 +85,45 @@ pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, Session)> {
         .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)?;
     let session = Session::load_path(&meta.path).ok()?;
     (session.state.messages.len() > 1).then_some((meta.id, session))
+}
+
+/// The most recent resumable session for `cwd`, **opened under its open-lock**
+/// so the resumed session is owned exclusively — the locked counterpart to
+/// [`latest_session_for_cwd`], used by startup auto-resume.
+///
+/// Selection matches [`latest_session_for_cwd`] (newest for the cwd, more than a
+/// bare system prompt). Returns:
+/// * `Ok(Some((id, session, lock)))` — resume this and hold the guard;
+/// * `Ok(None)` — nothing worth resuming here (no candidate, corrupt newest, or
+///   content too thin);
+/// * `Err(SessionBusy)` — the newest session is already open in another live
+///   instance. Startup auto-resume treats this the same as `None` (start fresh)
+///   rather than surfacing a jarring error; only an explicit `/resume` refuses.
+pub fn open_latest_session_for_cwd(
+    cwd: &str,
+) -> Result<Option<(String, Session, crate::SessionLock)>, crate::SessionBusy> {
+    let cur = hrdr_agent::cwd_slug(cwd);
+    let Some(meta) = crate::list_sessions()
+        .into_iter()
+        .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)
+    else {
+        return Ok(None);
+    };
+    match Session::open_path(&meta.path) {
+        Ok((session, lock)) => {
+            if session.state.messages.len() > 1 {
+                Ok(Some((meta.id, session, lock)))
+            } else {
+                // Not worth resuming — release the lock we just took.
+                drop(lock);
+                Ok(None)
+            }
+        }
+        Err(crate::OpenError::Busy { pid, started }) => Err(crate::SessionBusy { pid, started }),
+        // A corrupt/unreadable newest session is skipped, exactly as
+        // `latest_session_for_cwd`'s `.ok()?` did.
+        Err(crate::OpenError::Load(_)) => Ok(None),
+    }
 }
 
 /// Every saved session as a display string, newest first, each row tagged with

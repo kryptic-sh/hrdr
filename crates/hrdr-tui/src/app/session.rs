@@ -45,11 +45,51 @@ impl super::App {
     /// directory (if any). No match → leave the fresh session as-is.
     pub(super) fn auto_resume_latest(&mut self) {
         let cwd = self.current_cwd();
-        // Shared lookup (skips empty/system-prompt-only sessions).
-        let Some((id, session)) = hrdr_app::latest_session_for_cwd(&cwd) else {
-            return; // nothing saved here yet — start fresh
-        };
-        self.auto_resume_state(session.state, id);
+        // Shared lookup, taking the session's open-lock (skips empty/system-only).
+        //
+        // Anything other than a resumable, ownable session — nothing saved here
+        // yet, a corrupt newest file, OR (the `Err`) a session already open in
+        // another hrdr window — falls through to a fresh start. Auto-resume never
+        // hard-errors on a busy candidate: a jarring startup error is the wrong
+        // UX; only an explicit `/resume` refuses.
+        if let Ok(Some((id, session, lock))) = hrdr_app::open_latest_session_for_cwd(&cwd) {
+            self.active_lock = Some(lock);
+            self.auto_resume_state(session.state, id);
+        }
+    }
+
+    /// Open `path`'s session under its open-lock and swap it in as the active
+    /// session — the shared body of an **explicit** resume (the `/resume` picker
+    /// and the `/resume <arg>` text path). `id` is the file id, shown in messages.
+    ///
+    /// Ordering is acquire-new-before-release-old: [`hrdr_app::Session::open_path`]
+    /// takes the new lock first, so a session held open elsewhere (`Busy`) leaves
+    /// the current session and its lock untouched. On success the old lock is
+    /// dropped as the new one is stored.
+    pub(super) fn resume_locked_path(&mut self, id: String, path: &std::path::Path) {
+        match hrdr_app::Session::open_path(path) {
+            Ok((session, lock)) => {
+                // A running turn holds the agent lock; `apply_session` would
+                // reject the swap. Drop the freshly-taken lock and keep the
+                // current session rather than releasing its lock for nothing.
+                if self.running() {
+                    drop(lock);
+                    self.system(hrdr_app::RESUME_BUSY_MSG);
+                    return;
+                }
+                self.active_lock = Some(lock); // releases the previous session's lock
+                self.apply_session(id, session);
+            }
+            Err(hrdr_app::OpenError::Busy { pid, .. }) => {
+                self.system(format!(
+                    "session {id} is open in another hrdr window (pid {pid}) — \
+                     refusing to open it to avoid losing work"
+                ));
+            }
+            Err(hrdr_app::OpenError::Load(e)) => {
+                self.system(format!("can't load session {id}: {e}"));
+            }
+        }
     }
 
     /// The state-swap half of [`Self::auto_resume_latest`], split out so it can
@@ -79,7 +119,12 @@ impl super::App {
         state.todos = todos;
         state.cwd = cwd;
         let saved = hrdr_app::save_session(self.state());
-        if let Some(o) = self.record_session_save(saved) {
+        if let Some(mut o) = self.record_session_save(saved) {
+            // On the first save this session's id is minted and its open-lock is
+            // taken — hold it. `None` on every later save, so this never clobbers.
+            if let Some(lock) = o.open_lock.take() {
+                self.active_lock = Some(lock);
+            }
             if o.first_save {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
@@ -127,7 +172,11 @@ impl super::App {
             .messages
             .push(hrdr_agent::Message::user(sent));
         let saved = hrdr_app::save_session(self.state());
-        if let Some(o) = self.record_session_save(saved) {
+        if let Some(mut o) = self.record_session_save(saved) {
+            // Hold the freshly-minted session's open-lock (see `autosave`).
+            if let Some(lock) = o.open_lock.take() {
+                self.active_lock = Some(lock);
+            }
             // Stay silent here: the notice belongs *after* the turn, not ahead of
             // the reply. Hand it to the first autosave, which would otherwise see
             // an id already set and conclude this was not a first save.
@@ -157,7 +206,11 @@ impl super::App {
         self.state_mut().sync_from(msgs, todos, cwd);
 
         let saved = hrdr_app::save_session(self.state());
-        if let Some(o) = self.record_session_save(saved) {
+        if let Some(mut o) = self.record_session_save(saved) {
+            // Hold the freshly-minted session's open-lock, if this was the mint.
+            if let Some(lock) = o.open_lock.take() {
+                self.active_lock = Some(lock);
+            }
             // Notify once, when the session is first created — including when
             // `reserve_session_id` created it at turn start and deferred the
             // notice to here (it sees `first_save` as false by then).

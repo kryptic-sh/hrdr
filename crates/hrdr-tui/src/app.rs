@@ -321,6 +321,12 @@ pub(crate) struct App {
     /// Last autosave error shown in the transcript. Identical failures stay
     /// silent until a save succeeds, preventing every checkpoint from spamming.
     session_save_error: Option<String>,
+    /// The open-lock for the session currently loaded, if any. Held for the whole
+    /// time this session is active so a second hrdr instance can't resume the same
+    /// session and silently clobber our turns (last-writer-wins). Set when a
+    /// session is minted (first save), resumed (picker / `/resume`), or
+    /// auto-resumed; dropped — releasing the lock — on `/new` and on exit.
+    active_lock: Option<hrdr_app::SessionLock>,
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
@@ -586,6 +592,7 @@ impl App {
             },
             session_notice_pending: false,
             session_save_error: None,
+            active_lock: None,
             editor,
             theme,
             logo,

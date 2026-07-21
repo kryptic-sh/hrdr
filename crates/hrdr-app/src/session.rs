@@ -496,6 +496,140 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
     }
 }
 
+// ── Open lock (per-session ownership) ──────────────────────────────────────────
+
+/// An owned guard proving this process has a session **open** for editing.
+///
+/// Only one hrdr instance may hold a given session open at a time: without it,
+/// two windows resuming the same session both autosave, and the last write wins
+/// — silently discarding the other window's turns. The guard holds an exclusive
+/// lock file `.{id}.open.lock` in the session directory, released on drop
+/// (a clean swap, `/new`, or process exit). A crash can't run `Drop`, so the
+/// dead-PID lock it leaves behind is reaped on the next open (see
+/// [`acquire_open_lock`] / [`is_stale_lock`]).
+///
+/// This is a **distinct** file from the brief `.{id}.lock` id-reservation that
+/// [`unique_session_id`] takes and [`Session::save`] deletes: save's cleanup
+/// removes only `.{id}.lock`, so it never disturbs a live open-lock, and the two
+/// mechanisms don't interfere.
+#[derive(Debug)]
+pub struct SessionLock {
+    lock_path: PathBuf,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// The session is already held open by a live process. Carries the owner's PID
+/// and the unix timestamp it acquired the lock, so a caller can name it in a
+/// clear refusal message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionBusy {
+    pub pid: u32,
+    pub started: u64,
+}
+
+/// The open-lock file for `id` inside `dir` — deliberately `.{id}.open.lock`,
+/// separate from the `.{id}.lock` reservation.
+fn open_lock_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!(".{}.open.lock", sanitize_name(id)))
+}
+
+/// Parse the `PID TIMESTAMP` owner out of a held open-lock. Unparseable content
+/// (e.g. one written by an older build) still counts as busy, just with a zero
+/// owner — better to respect a lock we can't read than to steal it.
+fn read_open_lock_owner(path: &Path) -> SessionBusy {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut parts = content.split_whitespace();
+    let pid = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let started = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+    SessionBusy { pid, started }
+}
+
+/// Acquire the per-session open-lock for `id` in `dir`.
+///
+/// `O_EXCL`-creates `.{id}.open.lock` and writes `PID TIMESTAMP` (the exact
+/// format [`try_reserve`] uses). When the lock already exists this distinguishes
+/// two cases via [`is_stale_lock`]:
+///
+/// * **stale** — the owner PID is gone (or the lock is older than
+///   [`STALE_LOCK_AGE_SECS`] with no live owner): reap it and retry the create.
+///   This is the dead-PID auto-cleanup, so a crashed instance never blocks the
+///   session forever.
+/// * **live** — a running owner: return [`SessionBusy`] with its PID + timestamp,
+///   without touching the lock.
+///
+/// A create failure that is *not* `AlreadyExists` (an unwritable dir, say) can't
+/// prove another owner, so rather than fabricate a `SessionBusy` or block the
+/// user out of their own session it degrades to a best-effort guard whose file
+/// was never created (its `Drop`'s `remove_file` is benign) — the same graceful
+/// fallback [`unique_session_id`] takes.
+pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
+    let lock_path = open_lock_path(dir, id);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                let content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                let _ = f.write_all(content.as_bytes());
+                let _ = f.flush();
+                drop(f);
+                return Ok(SessionLock { lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_stale_lock(&lock_path) {
+                    // Dead-PID / abandoned lock: reap and retry the O_EXCL create.
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                return Err(read_open_lock_owner(&lock_path));
+            }
+            // Not a contention error — degrade to an un-backed guard rather than
+            // refusing the owner access to their own session.
+            Err(_) => return Ok(SessionLock { lock_path }),
+        }
+    }
+}
+
+/// Acquire the open-lock for session `id` living under `cwd`'s directory.
+pub fn acquire_session_lock(cwd: &str, id: &str) -> Result<SessionLock, SessionBusy> {
+    acquire_open_lock(&session_dir(cwd), id)
+}
+
+/// The on-disk path of session `id` under `cwd` — `<cwd-slug>/<id>.json`.
+pub fn session_file_path(cwd: &str, id: &str) -> PathBuf {
+    session_dir(cwd).join(format!("{}.json", sanitize_name(id)))
+}
+
+/// Why [`Session::open_path`] couldn't take ownership of a session.
+#[derive(Debug)]
+pub enum OpenError {
+    /// Another live process holds the session's open-lock. Do not swap it in.
+    Busy { pid: u32, started: u64 },
+    /// The open-lock was acquired but the file failed to load; the lock has
+    /// already been released before this is returned.
+    Load(anyhow::Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Busy { pid, .. } => {
+                write!(f, "session is open in another hrdr instance (pid {pid})")
+            }
+            OpenError::Load(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
 /// `$XDG_DATA_HOME/hrdr/sessions`, or `~/.local/share/hrdr/sessions`.
 pub fn sessions_dir() -> PathBuf {
     // The fallback must be absolute: a relative path would scatter session
@@ -656,6 +790,39 @@ impl Session {
             cache.insert(path.to_path_buf(), session.created);
         }
         Ok(session)
+    }
+
+    /// Open a session for **exclusive** editing: acquire its open-lock *first*
+    /// (so we never read a session another live window owns), then load it.
+    ///
+    /// On success returns the session paired with the [`SessionLock`] the caller
+    /// must hold for as long as the session stays active — dropping the guard
+    /// releases the lock. On [`OpenError::Busy`] the file is **not** loaded. A
+    /// load error after the lock was taken releases it before returning.
+    ///
+    /// This is the ownership-taking counterpart to [`Self::load_path`], which
+    /// stays lock-free for listing, preview and tests.
+    pub fn open_path(path: &Path) -> Result<(Session, SessionLock), OpenError> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
+        let lock = acquire_open_lock(dir, id)
+            .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
+        match Self::load_path(path) {
+            Ok(session) => Ok((session, lock)),
+            Err(e) => {
+                drop(lock); // release the lock we just took before surfacing the error
+                Err(OpenError::Load(e))
+            }
+        }
+    }
+
+    /// [`Self::open_path`] keyed by `cwd` + `id` (the locked counterpart to
+    /// [`Self::load`]).
+    pub fn open(cwd: &str, id: &str) -> Result<(Session, SessionLock), OpenError> {
+        Self::open_path(&session_file_path(cwd, id))
     }
 }
 
@@ -1450,6 +1617,135 @@ mod tests {
             let (id1, _r1) = t1.join().unwrap();
             let (id2, _r2) = t2.join().unwrap();
             assert_ne!(id1, id2, "concurrent reservations get different ids");
+        });
+    }
+
+    // ── open lock (per-session ownership) ──────────────────────────────────────
+
+    /// A fresh acquire writes `PID TIMESTAMP` into `.{id}.open.lock`, and the
+    /// guard's `Drop` removes the file.
+    #[test]
+    fn open_lock_acquire_writes_owner_and_drop_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chat.open.lock");
+        {
+            let _lock = acquire_open_lock(dir.path(), "chat").expect("fresh id acquires");
+            assert!(path.exists(), "lock file exists while the guard is held");
+            let content = std::fs::read_to_string(&path).unwrap();
+            let mut parts = content.split_whitespace();
+            let pid: u32 = parts.next().unwrap().parse().unwrap();
+            let ts: u64 = parts.next().unwrap().parse().unwrap();
+            assert_eq!(pid, std::process::id(), "records this process's PID");
+            assert!(ts > 0, "records a timestamp");
+            // _lock dropped here
+        }
+        assert!(!path.exists(), "Drop removes the lock file");
+    }
+
+    /// A second acquire while the first guard is alive is refused with the live
+    /// owner's PID.
+    #[test]
+    fn open_lock_second_acquire_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire_open_lock(dir.path(), "chat").expect("first acquire");
+        let err = acquire_open_lock(dir.path(), "chat").expect_err("second is refused");
+        assert_eq!(
+            err.pid,
+            std::process::id(),
+            "SessionBusy names the live owner"
+        );
+    }
+
+    /// Dead-PID reclaim: a lock left by a process that no longer exists (old
+    /// timestamp, never-alive PID) is reaped so the acquire succeeds. This is the
+    /// crash auto-cleanup — remove the `is_stale_lock` reap branch in
+    /// `acquire_open_lock` and this test fails with `SessionBusy` instead.
+    #[test]
+    fn open_lock_dead_pid_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chat.open.lock");
+        let old_ts = hrdr_tools::unix_now().saturating_sub(STALE_LOCK_AGE_SECS + 60);
+        // 4294967294 (u32::MAX - 1) is almost certainly not a live PID.
+        std::fs::write(&path, format!("4294967294 {old_ts}")).unwrap();
+        let lock = acquire_open_lock(dir.path(), "chat").expect("stale lock is reclaimed");
+        assert!(path.exists(), "the reclaimed lock is now ours");
+        drop(lock);
+    }
+
+    /// A live, recent lock (this process's PID, current timestamp) is NOT
+    /// reclaimed — it is respected as busy.
+    #[test]
+    fn open_lock_live_recent_is_not_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chat.open.lock");
+        std::fs::write(
+            &path,
+            format!("{} {}", std::process::id(), hrdr_tools::unix_now()),
+        )
+        .unwrap();
+        let err = acquire_open_lock(dir.path(), "chat").expect_err("live lock is not stolen");
+        assert_eq!(err.pid, std::process::id());
+    }
+
+    /// `Session::open_path` refuses (without loading) when the open-lock is held,
+    /// and returns the session + guard when it is free.
+    #[test]
+    fn open_path_refuses_when_busy_and_opens_when_free() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            Session::new(state("My Chat", &cwd))
+                .save("my-chat")
+                .unwrap();
+            let path = session_file_path(&cwd, "my-chat");
+
+            // Hold the open-lock, so open_path must refuse.
+            let held = acquire_open_lock(&session_dir(&cwd), "my-chat").unwrap();
+            match Session::open_path(&path) {
+                Err(OpenError::Busy { pid, .. }) => assert_eq!(pid, std::process::id()),
+                other => panic!("expected Busy, got {other:?}"),
+            }
+            drop(held);
+
+            // Free now: open_path loads and hands back the guard.
+            let (session, _lock) = Session::open_path(&path).expect("opens when free");
+            assert_eq!(session.state.name, "My Chat");
+        });
+    }
+
+    /// The open-lock file name is distinct from the `.{id}.lock` reservation, and
+    /// `Session::save` (which removes the reservation) leaves the open-lock alone.
+    #[test]
+    fn open_lock_is_distinct_from_reservation_and_survives_save() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            // A first save creates the session directory (and the file).
+            Session::new(state("My Chat", &cwd))
+                .save("my-chat")
+                .unwrap();
+            let sdir = session_dir(&cwd);
+
+            let _held = acquire_open_lock(&sdir, "my-chat").unwrap();
+            let open_lock = sdir.join(".my-chat.open.lock");
+            let reservation = sdir.join(".my-chat.lock");
+            assert_ne!(open_lock, reservation, "distinct file names");
+            assert!(open_lock.exists(), "open-lock file was created");
+
+            // Simulate a stray reservation lock next to the open-lock.
+            std::fs::write(&reservation, format!("{} 0", std::process::id())).unwrap();
+
+            // A save deletes only the reservation; the open-lock must survive.
+            Session::new(state("My Chat", &cwd))
+                .save("my-chat")
+                .unwrap();
+            assert!(
+                open_lock.exists(),
+                "save must not remove the live open-lock"
+            );
+            assert!(!reservation.exists(), "save removes the reservation lock");
         });
     }
 
