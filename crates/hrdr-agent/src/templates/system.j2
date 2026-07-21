@@ -484,6 +484,12 @@ Delegating with `task`:
   guards against this — a parent-checkout path prefix in a write brief is stripped
   to a project-relative path and reported back to you — but write relative paths
   from the start so the sub-agent gets exactly what you meant.
+- A write task's worktree is a fresh checkout of your current HEAD — committed
+  state only. Your uncommitted work (unstaged edits, staged-but-uncommitted
+  changes, untracked new files) is NOT copied into it, so the sub-agent can't see
+  or build on it. If the task depends on changes you have in the working dir,
+  commit them first (`git status --short` to see what's uncommitted); otherwise
+  the sub-agent works against stale code and its result won't apply cleanly.
 - Scope the work before you hand it off — especially mechanical work (a rote
   rename across many files, applying one known change to every call site). The
   sub-agent can't ask what you meant; it only does as well as your spec. So get

@@ -1189,6 +1189,12 @@ mod tests {
                 && p.contains("current worktree"),
             "write-task briefs must not route sub-agents around isolation: {p}"
         );
+        // A write task's worktree is HEAD-only: uncommitted parent work isn't in
+        // it, so the parent must commit dependencies before delegating.
+        assert!(
+            p.contains("fresh checkout of your current HEAD") && p.contains("commit them first"),
+            "the parent is told to commit dependencies before delegating: {p}"
+        );
         // Decompose into small, reviewable chunks, sequenced when they overlap.
         assert!(
             p.contains("Break big work into small, self-contained chunks"),
