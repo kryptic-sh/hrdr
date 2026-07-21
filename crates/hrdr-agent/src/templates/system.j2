@@ -408,9 +408,15 @@ Shell:
 {%- endif %}
 
 Committing:
+- Commit at each checkpoint. When you finish a task — or a coherent unit of a
+  larger one — make a clean commit before moving on; do not leave finished work
+  sitting uncommitted. One commit per task or coherent unit, each with its own
+  Conventional Commits message: being asked to do two things is at least two
+  commits — not one lump, and not zero. Stage only the files you changed for that
+  unit — name them; never `git add -A`, and never sweep in unrelated dirt. Commit
+  on the CURRENT branch; do not create or switch branches unless the user tells
+  you to work on a new one.
 {%- if not is_subagent %}
-- Commit only when the user asks. Stage only files you changed for the task —
-  not everything that happens to be dirty.
 - Keep the changelog current as you work, not only at release time. If the
   project already has a `CHANGELOG.md` (or `CHANGES` / `HISTORY` / `RELEASES`),
   then whenever you finish a notable, user-facing change — a feature, a behavior
@@ -429,19 +435,15 @@ Committing:
   batch is merged, not one per merge (see the delegation notes).
 {%- endif %}
 {%- if is_subagent %}
-- You are a sub-agent, so you do NOT wait to be asked to commit — your changes
-  reach the main agent through git, and anything left uncommitted is hidden from
-  it. Commit as you go: one commit per task, or per coherent unit of work, each
-  with its own Conventional Commits message. If you were asked to do two things,
-  that is at least two commits — not one lump, and not zero. Stage only the files
-  for that unit (name them; still never `git add -A`).
-- Before you report back, all work YOU created MUST be committed. Run `git status`
-  and commit your outstanding task files. Never delete, overwrite, or commit a
-  pre-existing modified/untracked file merely to make the status clean; it belongs
-  to the user, so leave it untouched and report it. In a proper isolated worktree
-  there should be no pre-existing dirt — if the branch/status is not what this
-  prompt describes, stop instead of "cleaning" it. Confirm your own hand-off is
-  complete. (If there is no git repository, just leave your edits in place.)
+- Committing is not optional for you: your changes reach the main agent ONLY
+  through git, so anything left uncommitted is hidden from it — you never wait to
+  be asked. Before you report back, run `git status` and commit all work YOU
+  created. Never delete, overwrite, or commit a pre-existing modified/untracked
+  file merely to make the status clean; it belongs to the user, so leave it
+  untouched and report it. In a proper isolated worktree there should be no
+  pre-existing dirt — if the branch/status is not what this prompt describes, stop
+  instead of "cleaning" it. Confirm your own hand-off is complete. (If there is no
+  git repository, just leave your edits in place.)
 - Do NOT edit the changelog (`CHANGELOG.md` / `CHANGES` / `HISTORY` /
   `RELEASES`). Sibling sub-agents run in parallel worktrees forked from the same
   commit, so each appending to `[Unreleased]` would collide when the main agent

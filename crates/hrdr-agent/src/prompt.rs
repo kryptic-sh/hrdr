@@ -1231,9 +1231,10 @@ mod tests {
         assert!(p.ends_with("Use tabs."));
     }
 
-    /// A sub-agent's prompt announces that it is a sub-agent and tells it to
-    /// commit as it goes and leave a clean worktree; the main agent's prompt does
-    /// neither and keeps the "commit only when the user asks" rule.
+    /// A sub-agent's prompt announces that it is a sub-agent and adds the
+    /// report-back commit rule (its work reaches the main agent only through git).
+    /// Both agents share the commit-at-each-checkpoint discipline; the main agent
+    /// keeps the changelog while the sub-agent leaves it alone.
     #[test]
     fn subagent_prompt_carries_commit_discipline() {
         let tools = ToolRegistry::with_defaults();
@@ -1260,11 +1261,27 @@ mod tests {
         );
         assert!(!main.contains("fresh checkout of"), "main is not");
 
-        // Commit-as-you-go + own-work-only discipline is sub-agent-only.
+        // The commit-at-each-checkpoint discipline is shared by both, above the
+        // is_subagent gate.
         assert!(
-            sub.contains("do NOT wait to be asked to commit")
-                && sub.contains("one commit per task")
-                && sub.contains("all work YOU created MUST be committed")
+            main.contains("Commit at each checkpoint"),
+            "main commits proactively"
+        );
+        assert!(
+            sub.contains("Commit at each checkpoint"),
+            "so does the sub-agent"
+        );
+        assert!(
+            main.contains("One commit per task or coherent unit")
+                && main.contains("do not create or switch branches unless"),
+            "shared commit discipline reaches the main agent: {main}"
+        );
+
+        // The report-back + own-work-only + no-clean-the-dirt discipline is
+        // sub-agent-only (its work reaches the main agent only through git).
+        assert!(
+            sub.contains("Committing is not optional for you")
+                && sub.contains("and commit all work YOU")
                 && sub.contains(
                     "Your `Working directory` (in the Environment section below) is authoritative"
                 )
@@ -1273,18 +1290,13 @@ mod tests {
                 && sub.contains("project-relative paths")
                 && sub.contains("never `cd` there")
                 && sub.contains("Never delete, overwrite, or commit a")
-                && sub.contains("stop instead of \"cleaning\" it"),
-            "sub-agent gets commit discipline"
+                && sub.contains("instead of \"cleaning\" it"),
+            "sub-agent gets the report-back commit discipline"
         );
         assert!(
-            !main.contains("all work YOU created MUST be committed"),
-            "the main agent does not"
+            !main.contains("Committing is not optional for you"),
+            "the main agent does not get the sub-agent report-back rule"
         );
-
-        // The main agent keeps "commit only when asked"; the sub-agent drops it
-        // (it commits proactively).
-        assert!(main.contains("Commit only when the user asks"));
-        assert!(!sub.contains("Commit only when the user asks"));
     }
 
     /// A read-only sub-agent (explore/review: is_subagent but no write tools)
