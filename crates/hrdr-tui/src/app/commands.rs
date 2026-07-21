@@ -103,6 +103,8 @@ impl super::App {
         // Release the current session's open-lock: we no longer own it. The next
         // message mints a fresh session and takes a new open-lock with it.
         self.active_lock = None;
+        // Drop any armed fork offer — it referred to the session we're leaving.
+        self.pending_fork = None;
         // Detach the sub-agent transcript dir with it — otherwise a `task`
         // spawned early in the next session (before its first autosave assigns
         // an id) would resolve this now-abandoned session's dir and misfile its

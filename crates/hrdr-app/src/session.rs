@@ -824,6 +824,59 @@ impl Session {
     pub fn open(cwd: &str, id: &str) -> Result<(Session, SessionLock), OpenError> {
         Self::open_path(&session_file_path(cwd, id))
     }
+
+    /// Open a **copy** of the session at `source_path` as a fresh, independently
+    /// owned session under `cwd` — the escape hatch when the source is held open
+    /// by another live instance (an [`OpenError::Busy`]) and can't be resumed
+    /// directly.
+    ///
+    /// The source is read with the **unlocked** [`Self::load_path`]: reading is
+    /// safe because writes are atomic (a whole old-or-new file is always seen),
+    /// and deliberately *not* taking the source's open-lock is the whole point —
+    /// the other instance holds it, and the fork must not disturb it. The source
+    /// file and its `.{id}.open.lock` are left entirely untouched.
+    ///
+    /// The copy is renamed `"{orig} (fork)"` (falling back to a plain base when
+    /// the source has no name), given a fresh collision-free id, and persisted via
+    /// the ordinary new-session save path ([`crate::save_session`]) — so it lands
+    /// with BOTH its file written AND its own `.{id}.open.lock` held. The returned
+    /// [`SessionLock`] is exactly the guard a first save mints; the caller holds it
+    /// for as long as the fork stays active.
+    ///
+    /// Returns `(new_id, forked_session, fork_lock)`.
+    pub fn fork(cwd: &str, source_path: &Path) -> Result<(String, Session, SessionLock)> {
+        // Read the source's current on-disk snapshot WITHOUT taking its lock.
+        let mut state = Self::load_path(source_path)
+            .with_context(|| format!("reading {}", source_path.display()))?
+            .state;
+        // Derive a fork name from the source's, falling back to a sensible base.
+        let base = state.name.trim();
+        let base = if base.is_empty() {
+            let derived = crate::session_name_from(&state.messages);
+            if derived.trim().is_empty() {
+                "session".to_string()
+            } else {
+                derived
+            }
+        } else {
+            base.to_string()
+        };
+        // Force the new-session save path to mint a fresh id + open-lock, and file
+        // the copy under this window's cwd.
+        state.name = format!("{base} (fork)");
+        state.id = None;
+        state.cwd = cwd.to_string();
+        let outcome = crate::save_session(&state)?
+            .context("forked session had no user message to persist")?;
+        let lock = outcome
+            .open_lock
+            .context("could not acquire the forked session's open-lock")?;
+        // Reload so the returned session reflects exactly what was written
+        // (persisted transcript, id stamped from the filename).
+        let session = Self::load_path(&session_file_path(cwd, &outcome.id))
+            .with_context(|| format!("reloading forked session {}", outcome.id))?;
+        Ok((outcome.id, session, lock))
+    }
 }
 
 /// Resolve a `/resume` argument to `(id, Session)`. Looks in `cwd`'s directory
@@ -1746,6 +1799,87 @@ mod tests {
                 "save must not remove the live open-lock"
             );
             assert!(!reservation.exists(), "save removes the reservation lock");
+        });
+    }
+
+    // ── fork ──────────────────────────────────────────────────────────────────
+
+    /// Forking copies the source's on-disk snapshot into a NEW, independently
+    /// locked session: a distinct id, a `" (fork)"` name, the content copied —
+    /// while the SOURCE file and its held open-lock are left untouched.
+    #[test]
+    fn fork_copies_content_into_a_new_locked_session_leaving_the_source_alone() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            let sdir = session_dir(&cwd);
+
+            // A source session with real content.
+            let mut src = state("Orig", &cwd);
+            src.messages = vec![Message::user("keep me"), Message::assistant("sure")];
+            Session::new(src).save("orig").unwrap();
+            let source_path = session_file_path(&cwd, "orig");
+
+            // The other instance holds the source's open-lock.
+            let _source_held = acquire_open_lock(&sdir, "orig").unwrap();
+            let source_open_lock = sdir.join(".orig.open.lock");
+            assert!(source_open_lock.exists());
+
+            let (new_id, forked, fork_lock) = Session::fork(&cwd, &source_path).unwrap();
+
+            // Distinct id, forked name, content copied.
+            assert_ne!(new_id, "orig", "fork gets a fresh id");
+            assert!(
+                forked.state.name.ends_with(" (fork)"),
+                "forked name ends with ' (fork)': {}",
+                forked.state.name
+            );
+            assert_eq!(forked.state.name, "Orig (fork)");
+            assert_eq!(
+                forked.state.messages.len(),
+                2,
+                "conversation copied from the source"
+            );
+            assert_eq!(forked.state.id.as_deref(), Some(new_id.as_str()));
+
+            // The fork holds its OWN open-lock, and a fresh open of it is Busy.
+            assert!(
+                sdir.join(format!(".{new_id}.open.lock")).exists(),
+                "fork's open-lock file was created"
+            );
+            let fork_path = session_file_path(&cwd, &new_id);
+            match Session::open_path(&fork_path) {
+                Err(OpenError::Busy { pid, .. }) => assert_eq!(pid, std::process::id()),
+                other => panic!("fork lock is not real — expected Busy, got {other:?}"),
+            }
+
+            // The SOURCE file and its open-lock are untouched.
+            assert!(source_open_lock.exists(), "source open-lock left intact");
+            let reloaded = Session::load_path(&source_path).unwrap();
+            assert_eq!(reloaded.state.name, "Orig", "source file not renamed");
+            assert_eq!(reloaded.state.messages.len(), 2, "source content unchanged");
+
+            drop(fork_lock);
+            // Once the fork lock is released, the fork opens cleanly.
+            Session::open_path(&fork_path).expect("fork opens once its lock is freed");
+        });
+    }
+
+    /// Two forks of the same source get different ids (no collision) and each
+    /// holds its own lock.
+    #[test]
+    fn forking_twice_yields_distinct_ids() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+            Session::new(state("Orig", &cwd)).save("orig").unwrap();
+            let source_path = session_file_path(&cwd, "orig");
+
+            let (id1, _s1, _l1) = Session::fork(&cwd, &source_path).unwrap();
+            let (id2, _s2, _l2) = Session::fork(&cwd, &source_path).unwrap();
+            assert_ne!(id1, id2, "a second fork does not collide with the first");
         });
     }
 

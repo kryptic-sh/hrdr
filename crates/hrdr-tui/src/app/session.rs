@@ -78,16 +78,48 @@ impl super::App {
                     return;
                 }
                 self.active_lock = Some(lock); // releases the previous session's lock
+                self.pending_fork = None; // a normal resume clears any stale offer
                 self.apply_session(id, session);
             }
             Err(hrdr_app::OpenError::Busy { pid, .. }) => {
+                // Can't take the session (a live instance owns it) — but the user
+                // can open a forked copy instead. Arm the offer for the next key.
+                self.pending_fork = Some((id.clone(), path.to_path_buf()));
                 self.system(format!(
                     "session {id} is open in another hrdr window (pid {pid}) — \
-                     refusing to open it to avoid losing work"
+                     press f to open a copy, or Esc to cancel"
                 ));
             }
             Err(hrdr_app::OpenError::Load(e)) => {
                 self.system(format!("can't load session {id}: {e}"));
+            }
+        }
+    }
+
+    /// Open a forked copy of the session at `path` (the busy-`/resume` escape
+    /// hatch): copy the source's current snapshot into a fresh, independently
+    /// locked session and swap it in exactly like a successful resume — set
+    /// [`Self::active_lock`] to the fork's guard (dropping the old one) and
+    /// [`Self::apply_session`]. `source_id` names the busy original in messages.
+    ///
+    /// Gated on no running turn, matching [`Self::resume_locked_path`]: a running
+    /// turn holds the agent lock and `apply_session` would reject the swap, so
+    /// refuse up front rather than mint a fork we can't use.
+    pub(super) fn fork_session(&mut self, source_id: String, path: &std::path::Path) {
+        if self.running() {
+            self.system(hrdr_app::RESUME_BUSY_MSG);
+            return;
+        }
+        match hrdr_app::Session::fork(&self.current_cwd(), path) {
+            Ok((new_id, session, lock)) => {
+                self.active_lock = Some(lock); // releases the previous session's lock
+                self.apply_session(new_id.clone(), session);
+                self.system(format!(
+                    "session {source_id} is open elsewhere — opened a copy as {new_id}"
+                ));
+            }
+            Err(e) => {
+                self.system(format!("couldn't fork session {source_id}: {e:#}"));
             }
         }
     }

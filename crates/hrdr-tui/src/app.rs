@@ -486,6 +486,11 @@ pub(crate) struct App {
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
+    /// A `/resume` that hit a session held open by another live instance armed an
+    /// offer to open a forked copy instead; carries the busy session's `(id,
+    /// path)`. The next key answers: `f`/`y` forks, any other key cancels. Like
+    /// [`Self::quit_armed`], a lightweight armed flag consumed by the next key.
+    pub(crate) pending_fork: Option<(String, std::path::PathBuf)>,
     // ---- live inference stats (for the loader above the input) ----
     /// When the current thinking block started (for the "Thought:" footer).
     pub(crate) reasoning_start: Option<Instant>,
@@ -648,6 +653,7 @@ impl App {
             background_tasks,
             subagent_hits: Vec::new(),
             quit_armed: false,
+            pending_fork: None,
             reasoning_start: None,
             tx,
             rx: Some(rx),
@@ -797,6 +803,21 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !is_ctrl_c {
             self.quit_armed = false;
+        }
+
+        // A `/resume` refused a session held open elsewhere and armed an offer to
+        // open a forked copy: `f`/`y` forks, any other key cancels (and is then
+        // handled normally — we don't swallow unrelated input). Mirrors the
+        // `quit_armed` armed-flag pattern.
+        if self.pending_fork.is_some() {
+            let confirm = key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('y'));
+            if confirm {
+                let (id, path) = self.pending_fork.take().expect("just checked is_some");
+                self.fork_session(id, &path);
+                return Action::None;
+            }
+            self.pending_fork = None;
         }
 
         // The `/model` selector modal captures every key while it is open.

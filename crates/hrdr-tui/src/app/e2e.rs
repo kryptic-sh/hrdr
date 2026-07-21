@@ -1535,6 +1535,104 @@ async fn history_snapshot_persists_the_session_mid_turn() {
     );
 }
 
+/// A `/resume` of a session another live instance holds open refuses to open it
+/// directly, but arms an offer to open a forked copy — and pressing `f` mints
+/// the copy, swaps it in as the active session, and leaves the busy original
+/// untouched. Esc-style cancel (any other key) just clears the offer.
+#[tokio::test]
+async fn a_busy_resume_offers_a_fork_that_f_accepts() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let cwd = h.app.current_cwd();
+
+    // A saved session that a *different* live instance holds open.
+    let st = hrdr_app::SessionState {
+        name: "Other".into(),
+        cwd: cwd.clone(),
+        model: "local://test-model".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::user("hello there")],
+        ..Default::default()
+    };
+    let outcome = hrdr_app::save_session(&st).unwrap().unwrap();
+    let busy_id = outcome.id.clone();
+    // The other instance's grip on the source — keep it held for the whole test.
+    let _other = outcome.open_lock.expect("first save takes the open-lock");
+    let path = hrdr_app::session_file_path(&cwd, &busy_id);
+
+    // Explicit /resume of the busy session: refuses to open, arms the fork offer.
+    h.app.resume_locked_path(busy_id.clone(), &path);
+    assert!(
+        h.app.pending_fork.is_some(),
+        "a busy /resume arms the fork offer"
+    );
+    // The active session is unchanged (no id yet — nothing was resumed).
+    assert!(
+        h.app.state().id.is_none(),
+        "the busy session was not swapped in"
+    );
+
+    // Press `f`: fork the copy and swap it in.
+    h.press(KeyCode::Char('f'));
+    assert!(h.app.pending_fork.is_none(), "the offer was consumed");
+
+    let new_id = h
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("the fork became the active session");
+    assert_ne!(
+        new_id, busy_id,
+        "the active session is the fork, not the busy original"
+    );
+    assert!(
+        h.app.state().name.ends_with(" (fork)"),
+        "the fork carries a ' (fork)' name: {}",
+        h.app.state().name
+    );
+    assert_eq!(
+        h.app.state().messages.len(),
+        1,
+        "the fork copied the source's conversation"
+    );
+
+    // The busy original is untouched: still its old name, still locked.
+    let src = hrdr_app::Session::load(&cwd, &busy_id).expect("source file intact");
+    assert_eq!(src.state.name, "Other", "source not renamed by the fork");
+    match hrdr_app::Session::open_path(&path) {
+        Err(hrdr_app::OpenError::Busy { .. }) => {}
+        other => panic!("source's open-lock was disturbed: {other:?}"),
+    }
+}
+
+/// A non-confirming key cancels the fork offer without forking.
+#[tokio::test]
+async fn a_busy_resume_offer_is_cancelled_by_any_other_key() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let cwd = h.app.current_cwd();
+
+    let st = hrdr_app::SessionState {
+        name: "Other".into(),
+        cwd: cwd.clone(),
+        model: "local://test-model".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::user("hello there")],
+        ..Default::default()
+    };
+    let outcome = hrdr_app::save_session(&st).unwrap().unwrap();
+    let busy_id = outcome.id.clone();
+    let _other = outcome.open_lock.expect("first save takes the open-lock");
+    let path = hrdr_app::session_file_path(&cwd, &busy_id);
+
+    h.app.resume_locked_path(busy_id.clone(), &path);
+    assert!(h.app.pending_fork.is_some());
+
+    // Esc cancels: the offer clears and nothing is forked or swapped in.
+    h.press(KeyCode::Esc);
+    assert!(h.app.pending_fork.is_none(), "Esc cleared the offer");
+    assert!(h.app.state().id.is_none(), "nothing was resumed or forked");
+}
+
 /// The app's state is the session file's payload: a turn's autosave writes it
 /// to disk, and loading it back yields the same transcript, usage and identity —
 /// no conversion layer in between.
