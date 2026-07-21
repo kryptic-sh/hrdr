@@ -21,6 +21,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Unified credential storage into a single `auth.json`.** The separate
+  `auth.toml` (raw API keys) and `oauth.json` (OAuth tokens) stores are replaced
+  by one `~/.config/hrdr/auth.json` holding a tagged map — each provider entry
+  is either `{"type":"key",…}` or `{"type":"oauth",…}`. Existing credentials
+  migrate automatically on first run (both old files are read, folded into
+  `auth.json`, then deleted only after the new store is written); a credential
+  file that cannot be parsed is preserved, not dropped. `auth.json` is also
+  added to the read-tool secret deny-list. Public credential APIs are unchanged.
+  (The openai/chatgpt single-provider merge is tracked separately in #21.)
 - **TODO panel yields to active sub-agents.** The TUI hides the TODO list while
   any delegated sub-agent is running, then restores it when all sub-agents are
   idle or finished.
