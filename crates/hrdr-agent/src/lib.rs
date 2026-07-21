@@ -30,7 +30,8 @@ pub use oauth::{
     await_oauth_code_within, canonical_oauth_key, coordinated_oauth_access, generate_pkce,
     generate_state, has_oauth_credentials, load_oauth, load_oauth_for, oauth_file_path,
     openai_authorize_url, openai_exchange, openai_refresh, openrouter_authorize_url,
-    openrouter_exchange, parse_account_id, save_oauth, save_oauth_for, valid_access_token,
+    openrouter_callback_url, openrouter_exchange, parse_account_id, save_oauth, save_oauth_for,
+    valid_access_token,
 };
 mod chatgpt_models;
 pub use chatgpt_models::{

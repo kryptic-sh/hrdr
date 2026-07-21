@@ -341,16 +341,20 @@ pub fn browser_login_start(
     let label = provider_label(name);
 
     if name == "openrouter" {
-        // OpenRouter's PKCE flow has no `state`; any local callback port works.
+        // OpenRouter's OAuth PKCE flow carries `state` in the callback URL and
+        // echoes it back with `code` — mint one for CSRF defence, so a local
+        // prober can't inject a forged callback with an attacker's code.
         const PORT: u16 = 1456;
-        let callback = format!("http://localhost:{PORT}/auth/callback");
+        let state = hrdr_agent::generate_state();
+        let callback = hrdr_agent::openrouter_callback_url(PORT, &state);
         let url = hrdr_agent::openrouter_authorize_url(&callback, &challenge);
         open_browser(&url, label, "5 minutes", host);
         let future = Box::pin(async move {
-            let (token_saved, error) = match openrouter_exchange_and_save(PORT, &verifier).await {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e.to_string())),
-            };
+            let (token_saved, error) =
+                match openrouter_exchange_and_save(PORT, &verifier, &state).await {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
             BrowserLoginOutcome {
                 login_id,
                 provider: "openrouter".to_string(),
@@ -463,8 +467,12 @@ fn open_browser(url: &str, label: &str, deadline: &str, host: &mut dyn CommandHo
 /// OpenRouter (5-minute callback deadline): wait for the callback code, exchange
 /// it for a normal API key, and save it to the credential store. Exchange/save
 /// only — the caller persists the default provider.
-async fn openrouter_exchange_and_save(port: u16, verifier: &str) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code(port, "").await?;
+async fn openrouter_exchange_and_save(
+    port: u16,
+    verifier: &str,
+    state: &str,
+) -> anyhow::Result<()> {
+    let code = hrdr_agent::await_oauth_code(port, state).await?;
     let key = hrdr_agent::openrouter_exchange(&code, verifier).await?;
     hrdr_agent::save_auth_token("openrouter", &key)?;
     Ok(())

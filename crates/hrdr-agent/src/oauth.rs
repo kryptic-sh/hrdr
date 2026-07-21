@@ -282,7 +282,22 @@ fn html_escape(s: &str) -> String {
 
 // ── OpenRouter flow (produces a normal API key) ─────────────────────────────
 
-/// The OpenRouter authorization URL to open in the browser.
+/// The OpenRouter loopback callback URL, carrying the CSRF `state` token.
+///
+/// OpenRouter's OAuth PKCE flow supports `state` by preserving a `state` query
+/// parameter embedded in the `callback_url` you hand it (per OpenRouter's OAuth
+/// upgrade — the flow has no separate top-level `state` param the way OpenAI's
+/// does). It appends `code` to this URL on redirect, so the callback returns as
+/// `…/auth/callback?state=<state>&code=<code>` and [`parse_callback`] verifies
+/// the round-trip. `state` is base64url ([`generate_state`]), so it is already
+/// URL-safe and needs no extra encoding here.
+pub fn openrouter_callback_url(port: u16, state: &str) -> String {
+    format!("http://localhost:{port}/auth/callback?state={state}")
+}
+
+/// The OpenRouter authorization URL to open in the browser. `callback_url` is
+/// the loopback URL (see [`openrouter_callback_url`], which embeds the CSRF
+/// `state`); it is form-encoded whole, so any query it carries survives.
 pub fn openrouter_authorize_url(callback_url: &str, challenge: &str) -> String {
     format!(
         "https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256",
@@ -949,6 +964,34 @@ mod tests {
             "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A8976%2Fcallback\
              &code_challenge=chal_abc&code_challenge_method=S256"
         );
+    }
+
+    /// The OpenRouter callback URL embeds the CSRF `state`, and the callback
+    /// OpenRouter returns (`state` + appended `code`) round-trips through
+    /// `parse_callback` — while a forged or missing `state` is refused. This is
+    /// the CSRF defence the flow previously lacked (it awaited with an empty
+    /// `expected_state`, accepting any callback).
+    #[test]
+    fn openrouter_callback_carries_state_that_parse_callback_validates() {
+        // `generate_state` is base64url, so a token like this needs no encoding.
+        let state = "Xy_9-abcDEF";
+        assert_eq!(
+            openrouter_callback_url(1456, state),
+            "http://localhost:1456/auth/callback?state=Xy_9-abcDEF"
+        );
+
+        // OpenRouter redirects to that URL with `code` appended (with `&`, since
+        // the callback already carries `?state=`): the round-trip validates.
+        let good = format!("GET /auth/callback?state={state}&code=THE_CODE HTTP/1.1");
+        assert_eq!(parse_callback(&good, state).unwrap(), "THE_CODE");
+
+        // A forged callback with a different state is rejected as possible CSRF.
+        let forged = "GET /auth/callback?state=attacker&code=EVIL HTTP/1.1";
+        assert!(parse_callback(forged, state).is_err());
+
+        // A callback with NO state (the pre-fix always-accept path) is rejected.
+        let bare = "GET /auth/callback?code=THE_CODE HTTP/1.1";
+        assert!(parse_callback(bare, state).is_err());
     }
 
     #[test]
