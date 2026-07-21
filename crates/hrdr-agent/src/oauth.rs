@@ -270,9 +270,13 @@ fn error_page(msg: &str) -> String {
 }
 
 fn html_escape(s: &str) -> String {
+    // `&` MUST be replaced first so the `&` it introduces is not re-escaped by
+    // the later replacements.
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 // ── OpenRouter flow (produces a normal API key) ─────────────────────────────
@@ -945,6 +949,27 @@ mod tests {
         let line = "GET /auth/callback?state=xyz HTTP/1.1";
         let err = parse_callback(line, "xyz").unwrap_err().to_string();
         assert!(err.contains("missing the authorization code"), "got: {err}");
+    }
+
+    // ── HTML escaping ────────────────────────────────────────────────────────
+
+    #[test]
+    fn html_escape_covers_all_five_entities() {
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#39;");
+
+        // Combined input exercises every entity together.
+        assert_eq!(
+            html_escape("he said \"<a href='x'>&\""),
+            "he said &quot;&lt;a href=&#39;x&#39;&gt;&amp;&quot;"
+        );
+
+        // `&` is escaped exactly once — a literal `&amp;` round-trips to
+        // `&amp;amp;`, not `&amp;amp;amp;...`.
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
     }
 
     // ── URL builders ─────────────────────────────────────────────────────────
