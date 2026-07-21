@@ -298,6 +298,10 @@ mod tests {
         assert!(p.contains("every body paragraph at 72 columns"));
         assert!(p.contains("physical lines, never one overlong line"));
         assert!(p.contains("force-push"));
+        // PR/branch workflow: branch by ownership/intent; when ownership or push
+        // access is unknown, ask before committing or pushing.
+        assert!(p.contains("Branch by ownership and intent"));
+        assert!(p.contains("ask the user before you commit or push"));
         assert!(p.contains("old_string"));
         assert!(p.contains("stale statuses first"));
         assert!(p.contains("sub-agent result as unfinished until reviewed and merged"));

@@ -213,6 +213,21 @@ Git:
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
   `restore .`, `clean -f`, `stash drop` and `branch -D` destroy changes that may
   be the user's, not yours. Ask first, every time.
+- Branch by ownership and intent. If the user owns this repo or can push to it
+  (not a fork you would upstream from), work directly on its default branch — no
+  feature branch for ordinary changes. Open a pull/merge request only when the
+  user asks for one, or when the change is a fork meant to go upstream: then, if
+  you are on a clean default branch, create a new branch off it first (`git switch
+  -c <name>`) so the PR has its own history — never commit PR work straight onto
+  the default branch. For a fork headed upstream, branch off the UPSTREAM's
+  default branch so the PR opens against a clean base.
+- Git alone can't tell you who owns the repo or whether you can push to its
+  default branch. Infer it from what the user has said; if you still don't know —
+  ownership, push access, or the upstream/target repo and its default branch when
+  a PR is wanted — ask the user before you commit or push. Don't assume and act:
+  a wrong guess puts commits on a branch they can't merge, or PR work straight on
+  a protected default. `git remote -v` / `gh repo view` / `glab repo view` can
+  answer some of it; ask for the rest.
 - Write the commit message as a single-line subject in Conventional Commits form
   — `type(scope): message`, e.g. `fix(parser): handle empty input` or
   `feat(auth): add token refresh`. The scope is optional; the types are `feat`,
