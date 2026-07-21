@@ -168,6 +168,23 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `dir` (and any missing parents) and, on Unix, tighten it to owner-only
+/// (`0700`) so the credential filenames and timestamps it holds aren't
+/// world-listable. `dir` is the hrdr config dir, so tightening the whole
+/// directory to owner-only is the intended outcome.
+///
+/// The permission tightening is best-effort: a failure to `set_permissions` must
+/// not stop a credential from being saved (the files inside are already `0600`).
+pub(crate) fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
 /// Write `provider = "token"` into the file at `path`, preserving other entries
 /// and ensuring owner-only (`0600`) permissions on unix. The path-based core of
 /// [`save_auth_token`].
@@ -183,7 +200,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// are last-writer-wins (the later login is the fresher credential).
 fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    create_dir_owner_only(parent).with_context(|| format!("creating {}", parent.display()))?;
     // Acquire the write lock BEFORE the read, and hold it across the whole
     // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
     let _lock = crate::store_lock::StoreLock::acquire(path)?;
@@ -380,6 +397,22 @@ mod tests {
         save_token_at(&path, "zen", "sk").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "credential file must be 0600");
+    }
+
+    /// The directory holding the credential file must be owner-only (`0700`) so
+    /// the provider filenames and timestamps it contains aren't world-listable.
+    /// Driving the real `save_token_at` path proves the fix, not a reimpl.
+    #[cfg(unix)]
+    #[test]
+    fn saved_credential_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A nested path whose parent doesn't exist yet, so the save creates it.
+        let cfg_dir = tmp.path().join("hrdr");
+        let path = cfg_dir.join("auth.toml");
+        save_token_at(&path, "zen", "sk").unwrap();
+        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "credential dir must be 0700");
     }
 
     /// `write_atomic` syncs the parent directory after a successful rename so

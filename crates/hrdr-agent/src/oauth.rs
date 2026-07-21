@@ -553,7 +553,8 @@ fn has_oauth_credentials_at(path: &Path, kind: crate::ResolvedProviderKind, name
 /// are last-writer-wins (the later credential is the fresher one).
 fn save_oauth_at(path: &Path, provider: &str, creds: &OAuthCreds) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    crate::auth::create_dir_owner_only(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
     // Hold the write lock across the whole read-modify-write. `_lock` releases
     // on drop (normal return, `?`, panic).
     let _lock = crate::store_lock::StoreLock::acquire(path)?;
@@ -1063,6 +1064,32 @@ mod tests {
         save_oauth_at(&path, "openai", &openai2).unwrap();
         assert_eq!(load_oauth_at(&path, "openai"), Some(openai2));
         assert_eq!(load_oauth_at(&path, "other"), Some(other));
+    }
+
+    /// The directory holding `oauth.json` must be owner-only (`0700`) so the
+    /// presence of OAuth credentials isn't world-listable. Driving the real
+    /// `save_oauth_at` path proves the fix, not a reimpl.
+    #[cfg(unix)]
+    #[test]
+    fn saved_oauth_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A nested path whose parent doesn't exist yet, so the save creates it.
+        let cfg_dir = tmp.path().join("hrdr");
+        let path = cfg_dir.join("oauth.json");
+        save_oauth_at(
+            &path,
+            "openai",
+            &OAuthCreds {
+                access: "acc".to_string(),
+                refresh: "ref".to_string(),
+                expires_ms: 1,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "oauth credential dir must be 0700");
     }
 
     /// Concurrent writers adding DIFFERENT providers all survive: the
