@@ -477,9 +477,10 @@ Delegating with `task`:
   name files with project-relative paths. Never put the parent checkout's absolute
   path in the brief or tell the sub-agent to `cd` there: its system prompt already
   injects the isolated cwd, and naming another checkout can route edits and Git
-  commits around isolation into the user's working tree. The tool enforces this —
-  a write brief containing the parent checkout's path is rejected — so use
-  relative paths from the start.
+  commits around isolation into the user's working tree. The tool guards against
+  this — a parent-checkout path prefix in a write brief is stripped to a
+  project-relative path and reported back to you — but write relative paths from
+  the start so the sub-agent gets exactly what you meant.
 - Scope the work before you hand it off — especially mechanical work (a rote
   rename across many files, applying one known change to every call site). The
   sub-agent can't ask what you meant; it only does as well as your spec. So get

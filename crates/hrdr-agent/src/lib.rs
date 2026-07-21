@@ -9917,11 +9917,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn write_subagent_brief_naming_parent_path_is_rejected() {
+        async fn write_subagent_brief_naming_parent_path_is_rewritten() {
             use super::super::{LiveSubagents, SubagentTool};
             use hrdr_tools::Tool;
-            // No response is needed: the guard must reject before any spawn.
-            let server = MockServer::start(vec![]).await;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "done"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path();
             let git = |args: &[&str]| {
@@ -9962,22 +9966,33 @@ mod tests {
             );
             let ctx = hrdr_tools::ToolContext::new(repo);
 
-            // A write brief that names the parent checkout's absolute path must be
-            // rejected before any worktree is created or task registered.
+            // A write brief naming the parent checkout's absolute path is NOT
+            // rejected: the harness strips the parent prefix so the path resolves
+            // inside the worktree, runs the task, and reports the rewrite back.
             let brief = format!("fix the bug in {}/f.txt", repo.display());
-            let err = tool
+            let ack = tool
                 .execute(json!({"prompt": brief, "description": "impl"}), &ctx)
                 .await
-                .expect_err("a brief naming the parent path is rejected");
-            let msg = format!("{err:#}");
+                .expect("the task runs on the rewritten brief");
+            assert!(ack.starts_with("Started background task"), "{ack}");
             assert!(
-                msg.contains("isolated git worktree") && msg.contains("project-relative"),
-                "the error steers to relative paths: {msg}"
+                ack.contains("stripped that prefix") && ack.contains("project-relative"),
+                "the ack reports the path rewrite: {ack}"
             );
             assert!(
-                ctx.background_tasks.lock().unwrap().is_empty(),
-                "no task was spawned"
+                !ack.contains(&format!("{}/f.txt", repo.display())),
+                "the ack no longer shows the absolute path: {ack}"
             );
+
+            // The task really was spawned, and its brief no longer carries the
+            // parent-absolute path.
+            let task_id = {
+                let reg = ctx.background_tasks.lock().unwrap();
+                reg.first().expect("a background task was registered").id
+            };
+            let handle = bg_handles.lock().unwrap().pop().unwrap().1;
+            handle.await.unwrap();
+            let _ = task_id;
         }
     } // mod mock_server
 

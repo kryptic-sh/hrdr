@@ -1105,7 +1105,7 @@ impl hrdr_tools::Tool for SubagentTool {
         args: serde_json::Value,
         ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
-        let prompt = args
+        let mut prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
             .filter(|p| !p.trim().is_empty())
@@ -1228,24 +1228,34 @@ impl hrdr_tools::Tool for SubagentTool {
         let worktrees_available = write_capable && in_git_repo(&ctx.cwd);
 
         // Isolation is enforced by pointing the sub-agent's cwd at a private
-        // worktree — but that only redirects RELATIVE paths. An absolute path to
-        // the parent checkout in the brief escapes the worktree entirely: with
-        // full-FS access and no cwd confinement, the sub-agent's tools operate on
-        // that path directly, so its edits and commits land in the user's live
-        // working tree, silently defeating isolation and racing the main agent
-        // (it has destroyed untracked user files this way). Reject a brief that
-        // names the parent's path before spawning, and steer to relative paths.
+        // worktree — but that only redirects RELATIVE paths. An absolute path
+        // INTO the parent checkout (`<cwd>/sub/path`) in the brief escapes the
+        // worktree entirely: with full-FS access and no cwd confinement, the
+        // sub-agent's tools operate on it directly, so its edits and commits
+        // land in the user's live tree, silently defeating isolation and racing
+        // the main agent (it has destroyed untracked user files this way).
+        // Rather than reject the brief, rewrite those paths to be
+        // project-relative (which resolve inside the worktree) and tell the
+        // delegating model what changed so it does it right next time.
+        let mut path_rewrite_note: Option<String> = None;
         if worktrees_available {
-            let parent_cwd = ctx.cwd.display().to_string();
-            if prompt.contains(&parent_cwd) {
-                bail!(
-                    "the task brief names the parent checkout's absolute path `{parent_cwd}`. A \
-                     write sub-agent runs in its OWN isolated git worktree; an absolute path to \
-                     the parent tree escapes that isolation and routes the sub-agent's edits and \
-                     commits into your live working directory. Rewrite the brief with \
-                     project-relative paths (e.g. `crates/foo/src/bar.rs`, not \
-                     `{parent_cwd}/crates/foo/src/bar.rs`)."
-                );
+            let parent_prefix = format!("{}/", ctx.cwd.display());
+            if prompt.contains(&parent_prefix) {
+                let n = prompt.matches(&parent_prefix).count();
+                prompt = prompt.replace(&parent_prefix, "");
+                path_rewrite_note = Some(format!(
+                    "NOTE: your brief named the parent checkout's absolute path \
+                     `{}` ({n} occurrence{}). A write sub-agent runs in its OWN isolated git \
+                     worktree, where an absolute path to the parent tree escapes isolation and \
+                     would route its edits and commits into your live working directory — so the \
+                     harness stripped that prefix, leaving project-relative paths that resolve \
+                     inside the worktree. The task ran on the rewritten brief. Write briefs with \
+                     project-relative paths (`crates/foo/src/bar.rs`, not \
+                     `{}/crates/foo/src/bar.rs`) from the start.",
+                    ctx.cwd.display(),
+                    if n == 1 { "" } else { "s" },
+                    ctx.cwd.display(),
+                ));
             }
         }
 
@@ -1299,7 +1309,7 @@ impl hrdr_tools::Tool for SubagentTool {
             None
         };
 
-        spawn_background(
+        let ack = spawn_background(
             cfg,
             prompt,
             label,
@@ -1313,7 +1323,12 @@ impl hrdr_tools::Tool for SubagentTool {
             self.transcript_dir.clone(),
             self.live.clone(),
             worktree,
-        )
+        )?;
+        // Surface any path rewrite to the delegating model alongside the ack.
+        Ok(match path_rewrite_note {
+            Some(note) => format!("{ack}\n\n{note}"),
+            None => ack,
+        })
     }
 }
 
