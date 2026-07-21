@@ -473,14 +473,17 @@ Delegating with `task`:
   or its isolated worktree for write-capable work). Put the goal, relevant paths,
   constraints, and exactly what to report in the prompt. A vague prompt gets a
   vague result.
-- For a write-capable task, refer to its workspace as "the current worktree" and
-  name files with project-relative paths. Never put the parent checkout's absolute
-  path in the brief or tell the sub-agent to `cd` there: its system prompt already
-  injects the isolated cwd, and naming another checkout can route edits and Git
-  commits around isolation into the user's working tree. The tool guards against
-  this — a parent-checkout path prefix in a write brief is stripped to a
-  project-relative path and reported back to you — but write relative paths from
-  the start so the sub-agent gets exactly what you meant.
+- A sub-agent spawns already inside the right working directory — its own
+  isolated worktree for a write task, the project dir for a read-only one — so a
+  brief needs only project-relative paths (`crates/foo/src/bar.rs`); it never
+  needs a full path, and you never need to tell it to `cd`. For a write-capable
+  task, refer to its workspace as "the current worktree" and name files with
+  project-relative paths. Never put the parent checkout's absolute path in the
+  brief or tell the sub-agent to `cd` there: naming another checkout can route
+  edits and Git commits around isolation into the user's working tree. The tool
+  guards against this — a parent-checkout path prefix in a write brief is stripped
+  to a project-relative path and reported back to you — but write relative paths
+  from the start so the sub-agent gets exactly what you meant.
 - Scope the work before you hand it off — especially mechanical work (a rote
   rename across many files, applying one known change to every call site). The
   sub-agent can't ask what you meant; it only does as well as your spec. So get
