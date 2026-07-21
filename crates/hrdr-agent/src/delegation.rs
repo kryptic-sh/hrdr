@@ -1227,6 +1227,28 @@ impl hrdr_tools::Tool for SubagentTool {
         let write_capable = !cfg.read_only;
         let worktrees_available = write_capable && in_git_repo(&ctx.cwd);
 
+        // Isolation is enforced by pointing the sub-agent's cwd at a private
+        // worktree — but that only redirects RELATIVE paths. An absolute path to
+        // the parent checkout in the brief escapes the worktree entirely: with
+        // full-FS access and no cwd confinement, the sub-agent's tools operate on
+        // that path directly, so its edits and commits land in the user's live
+        // working tree, silently defeating isolation and racing the main agent
+        // (it has destroyed untracked user files this way). Reject a brief that
+        // names the parent's path before spawning, and steer to relative paths.
+        if worktrees_available {
+            let parent_cwd = ctx.cwd.display().to_string();
+            if prompt.contains(&parent_cwd) {
+                bail!(
+                    "the task brief names the parent checkout's absolute path `{parent_cwd}`. A \
+                     write sub-agent runs in its OWN isolated git worktree; an absolute path to \
+                     the parent tree escapes that isolation and routes the sub-agent's edits and \
+                     commits into your live working directory. Rewrite the brief with \
+                     project-relative paths (e.g. `crates/foo/src/bar.rs`, not \
+                     `{parent_cwd}/crates/foo/src/bar.rs`)."
+                );
+            }
+        }
+
         // Bound how many run at once. Read-only agents get the higher cap. A
         // worktree-isolated writer gets the write cap; a shared-dir writer (no git
         // repo) is limited to one at a time so concurrent writers can't collide.

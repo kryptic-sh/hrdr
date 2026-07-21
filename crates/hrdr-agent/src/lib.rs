@@ -9915,6 +9915,70 @@ mod tests {
             );
             assert_ne!(sub_cwd, repo, "and NOT in the parent repo root");
         }
+
+        #[tokio::test]
+        async fn write_subagent_brief_naming_parent_path_is_rejected() {
+            use super::super::{LiveSubagents, SubagentTool};
+            use hrdr_tools::Tool;
+            // No response is needed: the guard must reject before any spawn.
+            let server = MockServer::start(vec![]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "t@t"]);
+            git(&["config", "user.name", "t"]);
+            std::fs::write(repo.join("f.txt"), "hi").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "init"]);
+            if !repo.join(".git").exists() {
+                return;
+            }
+
+            let cfg = test_cfg(server.base_url(), repo);
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let live = LiveSubagents::new();
+            let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                bg_handles.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                live.clone(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(repo);
+
+            // A write brief that names the parent checkout's absolute path must be
+            // rejected before any worktree is created or task registered.
+            let brief = format!("fix the bug in {}/f.txt", repo.display());
+            let err = tool
+                .execute(json!({"prompt": brief, "description": "impl"}), &ctx)
+                .await
+                .expect_err("a brief naming the parent path is rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("isolated git worktree") && msg.contains("project-relative"),
+                "the error steers to relative paths: {msg}"
+            );
+            assert!(
+                ctx.background_tasks.lock().unwrap().is_empty(),
+                "no task was spawned"
+            );
+        }
     } // mod mock_server
 
     /// The transcript dir is keyed by session id, so it survives a resume, while
