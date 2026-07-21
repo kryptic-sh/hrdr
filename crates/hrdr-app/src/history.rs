@@ -117,6 +117,14 @@ pub fn persist_history(history: &[String]) {
     let Some(path) = history_path() else {
         return;
     };
+    persist_history_to(&path, history);
+}
+
+/// Persist input history to an explicit path. Best-effort — filesystem errors
+/// are silently ignored. The write goes through [`hrdr_agent::write_atomic`],
+/// which creates the file owner-only (`0600` on Unix) and renames it into place,
+/// so the history (which may contain pasted secrets) is never world-readable.
+fn persist_history_to(path: &std::path::Path, history: &[String]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -126,7 +134,7 @@ pub fn persist_history(history: &[String]) {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = std::fs::write(path, body);
+    let _ = hrdr_agent::write_atomic(path, body.as_bytes());
 }
 
 #[cfg(test)]
@@ -151,5 +159,19 @@ mod tests {
         // Empty history: Up does nothing.
         let mut empty = HistoryBrowser::default();
         assert_eq!(empty.recall_prev("draft"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_history_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        persist_history_to(&path, &["one".into(), "two".into()]);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
     }
 }
