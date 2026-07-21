@@ -294,7 +294,11 @@ fn settle_identity(
 /// name?". Refusing it for not having named one would be a closed loop, so it is
 /// exempt from (2) alone; the identity checks still run.
 async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
-    let resolved = hrdr_agent::ResolvedModel::from_config(config);
+    // Apply the auth-derived endpoint switch (reads the OAuth store) so a
+    // keyless built-in `openai` with a stored OAuth credential validates and
+    // probes against the Codex endpoint — not `api.openai.com`, which would
+    // spuriously warn "no credential" and probe the wrong host.
+    let resolved = hrdr_agent::oauth_derived(hrdr_agent::ResolvedModel::from_config(config));
     let verdict = hrdr_agent::validate_identity(&resolved, config);
     for w in hrdr_agent::confirm_identity(verdict).await? {
         eprintln!("{w}");

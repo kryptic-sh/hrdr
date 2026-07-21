@@ -2295,9 +2295,12 @@ beyond it.
 /// tool uses. Every other provider falls back to the OpenAI-compatible
 /// `/v1/models` listing.
 pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
-    // The identity resolved against this config — including the double gate,
-    // asked once (`is_codex_oauth`) rather than re-written here.
-    let resolved = ResolvedModel::from_config(config);
+    // The identity resolved against this config, with the auth-derived switch
+    // applied (`oauth_derived` reads the OAuth store) so a keyless built-in
+    // `openai` with a stored OAuth credential reports the Codex endpoint here —
+    // otherwise this would list `/v1/models` off `api.openai.com` (401, no key)
+    // instead of the account catalog.
+    let resolved = crate::oauth_derived(ResolvedModel::from_config(config));
     if resolved.is_codex_oauth() {
         let access = coordinated_oauth_access(resolved.kind(), resolved.base_url()).await?;
         let catalog = chatgpt_model_catalog(&access, false).await;
