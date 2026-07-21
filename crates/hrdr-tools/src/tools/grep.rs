@@ -174,7 +174,7 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     // silently return "(no matches)" or hang. Default to cwd, matching the POSIX
     // backend below.
     cmd.arg(a.path.as_deref().unwrap_or("."));
-    run_search_cmd(cmd, "ripgrep", a.max_matches(), ctx).await
+    run_search_cmd(cmd, "ripgrep", a.literal, a.max_matches(), ctx).await
 }
 
 async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
@@ -207,7 +207,7 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     }
     cmd.arg("--").arg(&a.pattern);
     cmd.arg(a.path.as_deref().unwrap_or("."));
-    run_search_cmd(cmd, "grep", a.max_matches(), ctx).await
+    run_search_cmd(cmd, "grep", a.literal, a.max_matches(), ctx).await
 }
 
 /// Run a configured search command: empty stdout means "(no matches)" (search
@@ -216,6 +216,7 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 async fn run_search_cmd(
     cmd: tokio::process::Command,
     tool: &str,
+    literal: bool,
     max_matches: usize,
     ctx: &ToolContext,
 ) -> Result<String> {
@@ -234,7 +235,11 @@ async fn run_search_cmd(
     if raw.is_empty() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
         if !stderr.is_empty() {
-            bail!("{tool}: {}", stderr.trim());
+            bail!(
+                "{tool}: {}{}",
+                stderr.trim(),
+                regex_error_hint(&stderr, literal)
+            );
         }
         return Ok("(no matches)".to_string());
     }
@@ -258,6 +263,29 @@ async fn run_search_cmd(
         TruncateSide::Head,
         "grep",
     ))
+}
+
+/// When a search backend rejects the pattern as an invalid regex, suggest the
+/// arg that lets the model self-correct without a user nudge: `multiline: true`
+/// for a newline-spanning pattern (ripgrep flags `\n` explicitly), or
+/// `literal: true` to match the pattern as a fixed string. Returns "" when the
+/// error isn't a regex-parse failure, so unrelated errors stay verbatim.
+fn regex_error_hint(stderr: &str, literal: bool) -> &'static str {
+    let s = stderr.to_ascii_lowercase();
+    let is_regex_err = s.contains("regex parse error")
+        || s.contains("error parsing regex")
+        || s.contains("unclosed")
+        || s.contains("not allowed in a regex");
+    if !is_regex_err {
+        return "";
+    }
+    if s.contains("multiline") || s.contains("not allowed in a regex") {
+        return "\n(hint: to match across line boundaries, set `multiline: true`)";
+    }
+    if !literal {
+        return "\n(hint: to match this pattern as a fixed string, set `literal: true`)";
+    }
+    ""
 }
 
 /// Compile `a.pattern` into a `Regex`, honoring `literal` (escape to a fixed
@@ -568,6 +596,23 @@ mod tests {
         assert_eq!(
             schema["properties"]["multiline"]["type"],
             serde_json::Value::String("boolean".into())
+        );
+    }
+
+    #[test]
+    fn regex_error_hint_steers_recovery() {
+        // A newline-in-regex rejection → suggest multiline, even when literal.
+        let nl = "regex parse error: the literal \"\\n\" is not allowed in a regex";
+        assert!(regex_error_hint(nl, false).contains("multiline: true"));
+        assert!(regex_error_hint(nl, true).contains("multiline: true"));
+        // A generic regex-parse failure on a non-literal search → suggest literal.
+        let bad = "regex parse error: unclosed character class";
+        assert!(regex_error_hint(bad, false).contains("literal: true"));
+        // Already literal (or a non-regex error): no misleading hint.
+        assert_eq!(regex_error_hint(bad, true), "");
+        assert_eq!(
+            regex_error_hint("some other error: permission denied", false),
+            ""
         );
     }
 
