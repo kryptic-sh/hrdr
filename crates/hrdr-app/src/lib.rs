@@ -41,9 +41,7 @@ pub use highlight::*;
 pub use history::*;
 pub use login::*;
 pub use palette::*;
-pub use pane::{
-    Pane, PaneId, PaneRow, PaneSet, PaneStatus, PaneView, apply_event, pane_row_marker, pane_rows,
-};
+pub use pane::{Pane, PaneId, PaneRow, PaneSet, PaneStatus, PaneView, pane_row_marker, pane_rows};
 pub use session::*;
 pub use sessions::*;
 pub use skills::*;

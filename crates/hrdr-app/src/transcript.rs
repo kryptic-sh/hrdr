@@ -8,7 +8,7 @@
 //! depend on hrdr-app's [`crate::parse_duration`].
 
 pub use hrdr_agent::{
-    Entry, EntryKind, ToolBody, ToolDisplay, extract_shell_command, find_hits,
+    Entry, EntryKind, ToolBody, ToolDisplay, apply_event, extract_shell_command, find_hits,
     first_message_since, message_count, nth_message_text, settle_restored_tools, time_from_system,
     time_from_unix, tool_display, transcript_to_text,
 };

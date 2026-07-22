@@ -9,6 +9,7 @@
 //! exactly these entries, so a resume restores what was on screen without a
 //! lossy rebuild from the chat messages.
 
+use crate::AgentEvent;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -503,6 +504,138 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
     out.trim_end().to_string()
 }
 
+/// Fold an agent event into a transcript. The shared reducer behind every pane —
+/// the main agent's stream and a sub-agent's stream are assembled by the same
+/// rules, so a sub-agent's view reads exactly like the main one.
+///
+/// Only transcript-visible events do anything; `Usage`, `History` and `TurnDone`
+/// carry no transcript content and are ignored here (a frontend still handles
+/// them for its own bookkeeping).
+pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
+    // Close an open reasoning block as soon as anything else arrives, so its
+    // duration label stops streaming.
+    if !matches!(ev, AgentEvent::Reasoning(_)) {
+        finish_reasoning(transcript);
+    }
+    match ev {
+        AgentEvent::Text(t) => {
+            let mut mutated = false;
+            if let Some(last) = transcript.last_mut()
+                && let EntryKind::Assistant(s) = &mut last.kind
+            {
+                s.push_str(t);
+                last.refresh_hash();
+                mutated = true;
+            }
+            if !mutated && !t.is_empty() {
+                transcript.push(Entry::assistant(t.clone()));
+            }
+        }
+        AgentEvent::Reasoning(t) => {
+            let mut mutated = false;
+            if let Some(last) = transcript.last_mut()
+                && let EntryKind::Reasoning {
+                    text,
+                    took_ms: None,
+                } = &mut last.kind
+            {
+                text.push_str(t);
+                last.refresh_hash();
+                mutated = true;
+            }
+            // Same `!is_empty` guard the `Text` arm above uses, and for a
+            // sharper reason: an empty reasoning entry renders as nothing, but
+            // it still lands at the tail of the transcript, and `Text` only
+            // coalesces when the last entry is `Assistant`. So an empty delta
+            // would silently split one streamed reply into a separate block per
+            // chunk. Servers do emit these — a Qwen3-style backend keeps sending
+            // `reasoning_content: ""` on every content chunk once it stops
+            // thinking, where other providers omit the field entirely.
+            if !mutated && !t.is_empty() {
+                transcript.push(Entry::reasoning(t.clone()));
+            }
+        }
+        AgentEvent::ToolStart { id, name, args } => {
+            transcript.push(Entry::at(
+                EntryKind::Tool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    result: String::new(),
+                    ok: true,
+                    done: false,
+                    expanded: false,
+                },
+                chrono::Local::now(),
+            ));
+        }
+        AgentEvent::ToolOutput { id, chunk } => {
+            if let Some(entry) = open_tool(transcript, id)
+                && let EntryKind::Tool { result, .. } = &mut entry.kind
+            {
+                result.push_str(chunk);
+                entry.refresh_hash();
+            }
+        }
+        AgentEvent::ToolEnd {
+            id,
+            result,
+            ok,
+            name: _,
+        } => {
+            if let Some(entry) = open_tool(transcript, id)
+                && let EntryKind::Tool {
+                    result: r,
+                    ok: o,
+                    done,
+                    ..
+                } = &mut entry.kind
+            {
+                *r = result.clone();
+                *o = *ok;
+                *done = true;
+                entry.refresh_hash();
+            }
+        }
+        // An agent's notice (an error, an MCP warning, an exhausted step budget) is
+        // something the agent said about the run, so it is a system line and it
+        // persists — unlike frontend chrome (`Entry::notice`), which is stripped
+        // from a saved session.
+        AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
+        // A steered message is a real user turn in this conversation.
+        AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
+        AgentEvent::Usage { .. }
+        | AgentEvent::History(_)
+        | AgentEvent::TurnDone
+        | AgentEvent::TodoUpdated(_) => {}
+    }
+}
+
+/// The still-open tool entry with `id`, searched from the end (a tool id is
+/// unique within a turn, and the newest match is the live one).
+fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
+    transcript.iter_mut().rev().find(|e| {
+        matches!(&e.kind, EntryKind::Tool {
+        id: tid,
+        done: false,
+        ..
+    } if tid == id)
+    })
+}
+
+/// Stamp a duration on a reasoning block that is still streaming. The frontend
+/// owns the wall-clock, so this only marks it closed (`took_ms: Some(0)` would
+/// lie); a frontend that tracks timing overwrites it.
+fn finish_reasoning(transcript: &mut [Entry]) {
+    if let Some(EntryKind::Reasoning {
+        took_ms: took @ None,
+        ..
+    }) = transcript.last_mut().map(|e| &mut e.kind)
+    {
+        *took = Some(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +843,136 @@ mod tool_display_tests {
         let d = tool_display("git", "{}");
         assert_eq!(d.headline, "");
         assert_eq!(d.body, ToolBody::Text);
+    }
+}
+
+#[cfg(test)]
+mod apply_event_tests {
+    use super::*;
+
+    fn tool_start(id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolStart {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn text_coalesces_and_an_empty_delta_opens_nothing() {
+        let mut t = Vec::new();
+        apply_event(&mut t, &AgentEvent::Text(String::new()));
+        assert!(t.is_empty(), "an empty delta must not open an entry");
+        apply_event(&mut t, &AgentEvent::Text("he".into()));
+        apply_event(&mut t, &AgentEvent::Text("llo".into()));
+        assert_eq!(t.len(), 1);
+        assert!(matches!(&t[0].kind, EntryKind::Assistant(s) if s == "hello"));
+    }
+
+    #[test]
+    fn a_tool_call_opens_streams_and_closes() {
+        let mut t = Vec::new();
+        apply_event(&mut t, &tool_start("c1", "bash"));
+        apply_event(
+            &mut t,
+            &AgentEvent::ToolOutput {
+                id: "c1".into(),
+                chunk: "partial".into(),
+            },
+        );
+        assert!(
+            matches!(&t[0].kind, EntryKind::Tool { result, done: false, .. } if result == "partial")
+        );
+        apply_event(
+            &mut t,
+            &AgentEvent::ToolEnd {
+                id: "c1".into(),
+                name: "bash".into(),
+                result: "final".into(),
+                ok: false,
+            },
+        );
+        assert!(
+            matches!(&t[0].kind, EntryKind::Tool { result, done: true, ok: false, .. } if result == "final")
+        );
+    }
+
+    #[test]
+    fn a_steered_message_becomes_a_user_turn_in_the_pane() {
+        // This is what makes a sub-agent view a conversation rather than a log:
+        // what you send it shows up in its transcript, where you said it.
+        let mut t = Vec::new();
+        apply_event(&mut t, &AgentEvent::Text("working".into()));
+        apply_event(&mut t, &AgentEvent::Steered("actually, stop".into()));
+        apply_event(&mut t, &AgentEvent::Text("ok".into()));
+        let kinds: Vec<&EntryKind> = t.iter().map(|e| &e.kind).collect();
+        assert!(matches!(kinds[0], EntryKind::Assistant(s) if s == "working"));
+        assert!(matches!(kinds[1], EntryKind::User(s) if s == "actually, stop"));
+        assert!(
+            matches!(kinds[2], EntryKind::Assistant(s) if s == "ok"),
+            "the reply after steering is a new block, not appended to the old one"
+        );
+    }
+
+    #[test]
+    fn reasoning_closes_when_anything_else_arrives() {
+        let mut t = Vec::new();
+        apply_event(&mut t, &AgentEvent::Reasoning("hmm".into()));
+        assert!(matches!(
+            &t[0].kind,
+            EntryKind::Reasoning { took_ms: None, .. }
+        ));
+        apply_event(&mut t, &AgentEvent::Text("answer".into()));
+        assert!(
+            matches!(
+                &t[0].kind,
+                EntryKind::Reasoning {
+                    took_ms: Some(_),
+                    ..
+                }
+            ),
+            "the block is closed once the model moves on"
+        );
+    }
+
+    /// An empty reasoning delta must not split a streamed reply into one block
+    /// per chunk.
+    ///
+    /// Regression: a Qwen3-style backend keeps emitting `reasoning_content: ""`
+    /// on every content chunk once it has stopped thinking (providers that omit
+    /// the field deserialize to `None` and never reach here). Each empty delta
+    /// used to push a `Reasoning` entry that rendered as nothing but sat at the
+    /// tail of the transcript, so the next `Text` could not coalesce — the reply
+    /// came out as `#8 assistant`, `#9 assistant`, … one header per token group,
+    /// with the prose sliced across them.
+    #[test]
+    fn an_empty_reasoning_delta_does_not_split_the_reply() {
+        let mut t = Vec::new();
+        for fragment in ["I'll ", "audit ", "the codebase."] {
+            apply_event(&mut t, &AgentEvent::Reasoning(String::new()));
+            apply_event(&mut t, &AgentEvent::Text(fragment.into()));
+        }
+        assert_eq!(
+            t.len(),
+            1,
+            "one streamed reply is one block, not one per chunk: {:?}",
+            t.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(matches!(&t[0].kind, EntryKind::Assistant(s) if s == "I'll audit the codebase."));
+    }
+
+    /// The guard is on emptiness, not on reasoning: real reasoning still opens
+    /// its own block and still breaks the assistant run, as before.
+    #[test]
+    fn a_non_empty_reasoning_delta_still_starts_its_own_block() {
+        let mut t = Vec::new();
+        apply_event(&mut t, &AgentEvent::Text("before".into()));
+        apply_event(&mut t, &AgentEvent::Reasoning("thinking".into()));
+        apply_event(&mut t, &AgentEvent::Text("after".into()));
+        let kinds: Vec<&EntryKind> = t.iter().map(|e| &e.kind).collect();
+        assert_eq!(kinds.len(), 3);
+        assert!(matches!(kinds[0], EntryKind::Assistant(s) if s == "before"));
+        assert!(matches!(kinds[1], EntryKind::Reasoning { text, .. } if text == "thinking"));
+        assert!(matches!(kinds[2], EntryKind::Assistant(s) if s == "after"));
     }
 }
