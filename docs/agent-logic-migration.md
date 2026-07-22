@@ -13,14 +13,41 @@ Status: **Phase 1 complete** (on main). Phase 2 pending.
   transcript lives in the sibling jsonl (rebuilt via `read_transcript` on load),
   so a round no longer re-serializes the whole transcript.
 
-**Remaining efficiency lever (not yet done):** the MAIN agent still
-full-rewrites its whole session (multi-MB) on every tool round via the
-frontend's `persist_mid_turn`, on the UI thread — O(n²) over a session. The 1:1
-endgame is to give the main agent the same jsonl-transcript + compact
-messages-snapshot model the sub-agent now uses (transcript appended per event,
-`.json` snapshot carries only messages+metadata), which makes main == sub AND
-turns the per-round cost from O(full doc) into O(one appended line). Larger
-change (main session on-disk format) — tackle as its own slice.
+## What persists from the transcript (decided)
+
+Only the **`AgentEvent` fold** persists — User (`Steered`), Assistant (`Text`),
+Reasoning text, Tool (args+results), agent `Notice`→`System`. Frontend-pushed
+**chrome is NOT persisted** (slash-command `System` output, `/diff` `Diff`,
+per-turn `Stats`, `Header`, `Reasoning.took_ms`): it is display-only, not
+context, and not needed to resume. So the transcript is a pure fold of the event
+stream for every agent — no `Pushed` record, no `record_pushed` (removed).
+
+Progress since: `Record::Pushed` removed; sub-agent transcript writer now lives
+on the `LiveSubagent` entry and is driven by `LiveSubagents::record`, so a
+sub-agent's **steered** turns persist too (not just its delegated run).
+
+## Remaining: W2 — main agent onto the event-fold jsonl (the O(n²) fix + 1:1 finish)
+
+The MAIN agent still embeds `Vec<Entry>` in its `.json` and full-rewrites the
+whole multi-MB session on every tool round (frontend `persist_mid_turn`, UI
+thread) — O(n²). Give it the sub-agent model: transcript appended to a jsonl per
+event, `.json` carries only messages+metadata, resume rebuilds via
+`read_transcript`. Two parts, because of one constraint found in the code:
+
+1. **Unify main user-input onto the event stream.** Main user messages today
+   enter the transcript via `push_entry(Entry::user)` (`app.rs`
+   `launch_turn_shown`), NOT as events — so an event-fold jsonl would drop them.
+   Record the submission as `AgentEvent::Steered` via `record(MAIN_KEY, …)` (as
+   sub-agents already do their prompt) and let the sync-fold render it; drop the
+   direct `push_entry`.
+2. **Flip the format + rebuild on resume.** Main gets a
+   `sessions/<cwd>/<id>.jsonl` writer (created on id assignment), `.json` drops
+   the transcript, and the resume path rebuilds `transcript` from the jsonl
+   (listing stays cheap — no rebuild). Add a resume round-trip test on a real
+   multi-round session.
+
+Risk: touches the main submit path + resume format — its own slice(s), tested
+against a genuine session before landing.
 
 ## Principle
 
