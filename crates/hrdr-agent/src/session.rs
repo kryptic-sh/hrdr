@@ -733,7 +733,12 @@ impl Session {
         };
         let mut snap = self.clone();
         snap.created = created;
-        let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
+        // Compact, not pretty: a real session reaches multiple MB (full message
+        // history + transcript with tool results), and this is rewritten on every
+        // tool round — pretty-printing spends ~15-30% more bytes and serialize CPU
+        // per save for indentation no one reads (idle files are zstd-compressed by
+        // retention anyway).
+        let json = serde_json::to_string(&snap).context("serializing session")?;
         crate::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         // If retention had compressed this session, the plaintext we just wrote
@@ -787,7 +792,8 @@ impl Session {
         };
         let mut snap = self.clone();
         snap.created = created;
-        let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
+        // Compact, not pretty — see the note in `save`.
+        let json = serde_json::to_string(&snap).context("serializing session")?;
         crate::write_atomic(path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
