@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
+use crate::canonicalize_nearest;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -878,9 +879,10 @@ pub fn parse_workspace_edit(result: &Value, cwd: &Path) -> Result<Vec<LspFileEdi
         let confined = match (path.canonicalize().ok(), base_canon.as_ref()) {
             // Both resolved — the symlinked-workspace-root case.
             (Some(canon), Some(base)) => canon.starts_with(base),
-            // Either side unresolvable (target not created yet): fall back to
-            // the raw pair rather than comparing across representations.
-            _ => path.starts_with(cwd),
+            // Either side unresolvable (target not created yet): use
+            // canonicalize_nearest to resolve existing ancestors and
+            // normalize lexical `..` components in the tail.
+            _ => canonicalize_nearest(path).starts_with(canonicalize_nearest(cwd)),
         };
         if !confined {
             anyhow::bail!("rename target {} is outside the workspace", path.display());
