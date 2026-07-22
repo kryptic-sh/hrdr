@@ -2,6 +2,13 @@
 //! run, written independently of the parent session so a sub-agent that dies
 //! mid-run leaves all completed work recoverable on disk.
 //!
+//! Each line is a [`Record`] — a complete, serializable projection of the
+//! sub-agent's `AgentEvent` stream: tool calls keep their full args and results,
+//! so the on-disk record shows exactly which files and paths a tool touched. On
+//! read, each `Record` maps back to an `AgentEvent` and folds through the SAME
+//! [`crate::apply_event`] reducer as the main transcript, so a sub-agent's
+//! durable record renders identically to the main agent's.
+//!
 //! Persistence is best-effort: every write error is swallowed, because writing
 //! a transcript must never break the actual sub-agent run. A brand-new,
 //! never-saved session has no id yet, so the very first sub-agent spawned
@@ -31,22 +38,46 @@ pub enum EndStatus {
     Cancelled,
 }
 
-/// One line in a sub-agent transcript. Serialized with a `t` discriminator so a
-/// reader can dispatch on the event kind.
+/// One line in a sub-agent transcript. A complete, serializable projection of
+/// the sub-agent's `AgentEvent` stream — tool calls keep their full args and
+/// results — plus the `Start`/`End`/`Error` framing needed for orphan
+/// detection. Serialized with a `t` discriminator so a reader can dispatch on
+/// the record kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
-pub enum Event {
+pub enum Record {
     Start {
         model: String,
         label: String,
         kind: SpawnKind,
         prompt: String,
     },
+    Reasoning {
+        text: String,
+    },
     Text {
         chunk: String,
     },
-    Tool {
+    ToolStart {
+        id: String,
         name: String,
+        args: String,
+    },
+    ToolOutput {
+        id: String,
+        chunk: String,
+    },
+    ToolEnd {
+        id: String,
+        name: String,
+        result: String,
+        ok: bool,
+    },
+    Notice {
+        msg: String,
+    },
+    Steered {
+        text: String,
     },
     Error {
         msg: String,
@@ -59,6 +90,89 @@ pub enum Event {
         /// never collected. A size hint only; it gates nothing.
         bytes: usize,
     },
+}
+
+impl Record {
+    /// Project a live agent event onto the transcript record to persist, if any.
+    /// The write side of the sub-agent transcript: keeps tool args and results
+    /// intact. Bulky bookkeeping (`Usage`, `History`) and non-transcript signals
+    /// (`TurnDone`, `TodoUpdated`) are dropped.
+    pub fn from_event(ev: &crate::AgentEvent) -> Option<Record> {
+        use crate::AgentEvent;
+        match ev {
+            AgentEvent::Reasoning(t) => Some(Record::Reasoning { text: t.clone() }),
+            AgentEvent::Text(t) => Some(Record::Text { chunk: t.clone() }),
+            AgentEvent::ToolStart { id, name, args } => Some(Record::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.clone(),
+            }),
+            AgentEvent::ToolOutput { id, chunk } => Some(Record::ToolOutput {
+                id: id.clone(),
+                chunk: chunk.clone(),
+            }),
+            AgentEvent::ToolEnd {
+                id,
+                name,
+                result,
+                ok,
+            } => Some(Record::ToolEnd {
+                id: id.clone(),
+                name: name.clone(),
+                result: result.clone(),
+                ok: *ok,
+            }),
+            AgentEvent::Notice(n) => Some(Record::Notice { msg: n.clone() }),
+            AgentEvent::Steered(s) => Some(Record::Steered { text: s.clone() }),
+            AgentEvent::Usage { .. }
+            | AgentEvent::History(_)
+            | AgentEvent::TodoUpdated(_)
+            | AgentEvent::TurnDone => None,
+        }
+    }
+
+    /// Map this record back to the `AgentEvent` the shared reducer expects, if
+    /// it carries transcript content. The read side of the sub-agent transcript.
+    ///
+    /// `Start` opens the folded transcript with the task as a user turn
+    /// (`Steered`), matching the live path (`delegation.rs` records the prompt as
+    /// a `Steered` event before the run). `Error` surfaces as a `Notice`. `End`
+    /// is pure framing and folds to nothing.
+    // Used by `read_transcript` (and its test); the crash-recovery UI (a later
+    // WISHLIST item) is its non-test consumer.
+    #[allow(dead_code)]
+    pub fn as_event(&self) -> Option<crate::AgentEvent> {
+        use crate::AgentEvent;
+        match self {
+            Record::Start { prompt, .. } => Some(AgentEvent::Steered(prompt.clone())),
+            Record::Reasoning { text } => Some(AgentEvent::Reasoning(text.clone())),
+            Record::Text { chunk } => Some(AgentEvent::Text(chunk.clone())),
+            Record::ToolStart { id, name, args } => Some(AgentEvent::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.clone(),
+            }),
+            Record::ToolOutput { id, chunk } => Some(AgentEvent::ToolOutput {
+                id: id.clone(),
+                chunk: chunk.clone(),
+            }),
+            Record::ToolEnd {
+                id,
+                name,
+                result,
+                ok,
+            } => Some(AgentEvent::ToolEnd {
+                id: id.clone(),
+                name: name.clone(),
+                result: result.clone(),
+                ok: *ok,
+            }),
+            Record::Notice { msg } => Some(AgentEvent::Notice(msg.clone())),
+            Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
+            Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
+            Record::End { .. } => None,
+        }
+    }
 }
 
 /// An open append-only transcript file for one sub-agent run.
@@ -106,10 +220,10 @@ impl SubagentTranscript {
         Ok(Self { file, path })
     }
 
-    /// Append one event as a JSON line and flush. All errors are swallowed: a
+    /// Append one record as a JSON line and flush. All errors are swallowed: a
     /// failed transcript write must never break the sub-agent run.
-    pub fn write(&mut self, ev: &Event) {
-        if let Ok(mut line) = serde_json::to_string(ev) {
+    pub fn write(&mut self, rec: &Record) {
+        if let Ok(mut line) = serde_json::to_string(rec) {
             line.push('\n');
             let _ = self.file.write_all(line.as_bytes());
             let _ = self.file.flush();
@@ -117,7 +231,7 @@ impl SubagentTranscript {
     }
 }
 
-/// Whether a transcript file ends in an `End` event. A file with no `End` line
+/// Whether a transcript file ends in an `End` record. A file with no `End` line
 /// is an orphan: the sub-agent crashed or is still running.
 // Used by tests now; the crash-recovery UI (a later WISHLIST item) is its
 // non-test consumer.
@@ -133,9 +247,33 @@ pub fn is_complete(path: &Path) -> bool {
         }
     }
     match last {
-        Some(l) => matches!(serde_json::from_str::<Event>(&l), Ok(Event::End { .. })),
+        Some(l) => matches!(serde_json::from_str::<Record>(&l), Ok(Record::End { .. })),
         None => false,
     }
+}
+
+/// Read a sub-agent transcript file and fold it into a Vec<Entry> using the
+/// SAME reducer as the main transcript, so the on-disk sub-agent record renders
+/// identically (tool args + results intact). Best-effort: unparsable lines are skipped.
+// Used by tests now; the crash-recovery UI (a later WISHLIST item) is its
+// non-test consumer.
+#[allow(dead_code)]
+pub fn read_transcript(path: &Path) -> Vec<crate::Entry> {
+    let mut entries = Vec::new();
+    let Ok(file) = File::open(path) else {
+        return entries;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<Record>(&line)
+            && let Some(ev) = rec.as_event()
+        {
+            crate::apply_event(&mut entries, &ev);
+        }
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -143,8 +281,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_serializes_with_t_tag_and_snake_case() {
-        let start = Event::Start {
+    fn record_serializes_with_t_tag_and_snake_case() {
+        let start = Record::Start {
             model: "m".into(),
             label: "l".into(),
             kind: SpawnKind::Background,
@@ -154,9 +292,21 @@ mod tests {
         assert!(s.contains(r#""t":"start""#), "got {s}");
         assert!(s.contains(r#""kind":"background""#), "got {s}");
         // Round-trips.
-        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), start);
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), start);
 
-        let end = Event::End {
+        // A tool call keeps its full args on the wire (the whole point of the
+        // complete projection).
+        let tool = Record::ToolStart {
+            id: "t1".into(),
+            name: "edit".into(),
+            args: r#"{"path":"src/main.rs"}"#.into(),
+        };
+        let s = serde_json::to_string(&tool).unwrap();
+        assert!(s.contains(r#""t":"tool_start""#), "got {s}");
+        assert!(s.contains("src/main.rs"), "args survive serialization: {s}");
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), tool);
+
+        let end = Record::End {
             status: EndStatus::Panicked,
             bytes: 3,
         };
@@ -168,28 +318,89 @@ mod tests {
     }
 
     #[test]
-    fn write_appends_one_line_per_event() {
+    fn write_appends_one_line_per_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut t = SubagentTranscript::create(dir.path(), "001-x").unwrap();
-        t.write(&Event::Start {
+        t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
             kind: SpawnKind::Blocking,
             prompt: "p".into(),
         });
-        t.write(&Event::Text {
+        t.write(&Record::Text {
             chunk: "hello".into(),
         });
-        t.write(&Event::End {
+        t.write(&Record::End {
             status: EndStatus::Ok,
             bytes: 5,
         });
         let body = std::fs::read_to_string(dir.path().join("001-x.jsonl")).unwrap();
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 3, "one line per event: {body:?}");
+        assert_eq!(lines.len(), 3, "one line per record: {body:?}");
         for l in &lines {
-            serde_json::from_str::<Event>(l).expect("each line is a standalone Event");
+            serde_json::from_str::<Record>(l).expect("each line is a standalone Record");
         }
+    }
+
+    /// The whole point of the complete projection: a tool call's args (the path
+    /// it touched) and its result (the diff it produced) survive to disk and
+    /// back, folded into an `EntryKind::Tool` by the SAME reducer as the main
+    /// transcript.
+    #[test]
+    fn read_transcript_preserves_tool_args_and_result() {
+        use crate::EntryKind;
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = SubagentTranscript::create(dir.path(), "003-edit").unwrap();
+        let args = r#"{"path":"src/lib.rs"}"#;
+        let result = "@@ -1 +1 @@\n-old line\n+new line";
+        t.write(&Record::Start {
+            model: "m".into(),
+            label: "edit-task".into(),
+            kind: SpawnKind::Blocking,
+            prompt: "edit the file".into(),
+        });
+        t.write(&Record::ToolStart {
+            id: "call-1".into(),
+            name: "edit".into(),
+            args: args.into(),
+        });
+        t.write(&Record::ToolEnd {
+            id: "call-1".into(),
+            name: "edit".into(),
+            result: result.into(),
+            ok: true,
+        });
+        t.write(&Record::End {
+            status: EndStatus::Ok,
+            bytes: 0,
+        });
+
+        let entries = read_transcript(&dir.path().join("003-edit.jsonl"));
+        let tool = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::Tool {
+                    name,
+                    args,
+                    result,
+                    ok,
+                    ..
+                } => Some((name.clone(), args.clone(), result.clone(), *ok)),
+                _ => None,
+            })
+            .expect("a folded Tool entry");
+        assert_eq!(tool.0, "edit");
+        assert!(
+            tool.1.contains("src/lib.rs"),
+            "args (path) survive: {}",
+            tool.1
+        );
+        assert!(
+            tool.2.contains("new line"),
+            "result (diff) survives: {}",
+            tool.2
+        );
+        assert!(tool.3, "ok flag survives");
     }
 
     /// A run owns its file. The dir is keyed by session id and survives a resume,
@@ -201,7 +412,7 @@ mod tests {
     fn create_refuses_to_reuse_an_existing_run_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut first = SubagentTranscript::create(dir.path(), "000-sub-task").unwrap();
-        first.write(&Event::Start {
+        first.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
             kind: SpawnKind::Blocking,
@@ -246,13 +457,13 @@ mod tests {
         // One run holds one handle for its whole life — the file is never
         // reopened, so this mirrors the real spawn paths.
         let mut t = SubagentTranscript::create(dir.path(), "002-x").unwrap();
-        t.write(&Event::Start {
+        t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
             kind: SpawnKind::Blocking,
             prompt: "p".into(),
         });
-        t.write(&Event::Text {
+        t.write(&Record::Text {
             chunk: "done work".into(),
         });
 
@@ -265,7 +476,7 @@ mod tests {
         );
 
         // The terminal event lands on the same handle the run has held all along.
-        t.write(&Event::End {
+        t.write(&Record::End {
             status: EndStatus::Failed,
             bytes: 9,
         });

@@ -93,8 +93,7 @@ pub(crate) use delegation::{
     BACKGROUND_REPORT_MAX_BYTES, REVIEW_PROMPT, SubagentDirCell, SubagentSlots, Worktree,
     apply_model_ref, apply_task_overrides, format_shortstat, named_spec_ref,
     open_next_subagent_transcript_from, remove_worktree, resolve_subagent_dir,
-    subagent_context_window, subagent_event_for, subagent_transcript_id, subagent_usage,
-    task_size_summary,
+    subagent_context_window, subagent_transcript_id, subagent_usage, task_size_summary,
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskCancelTool, TaskCleanupTool, TaskDiffTool,
@@ -2023,8 +2022,7 @@ mod tests {
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
         parse_env_bool, provider_alias_collision_error, repair_dangling_tool_calls, resolve,
         resolve_subagent_dir, retry_after_hint, steering_queue, strip_user_timestamp,
-        subagent_base_config, subagent_event_for, subagent_transcript_id, tail_window,
-        timestamped_user_message,
+        subagent_base_config, subagent_transcript_id, tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::subagent_live;
@@ -9363,7 +9361,7 @@ mod tests {
 
         fn read_events(
             ts_dir: &std::path::Path,
-        ) -> (std::path::PathBuf, Vec<subagent_transcript::Event>) {
+        ) -> (std::path::PathBuf, Vec<subagent_transcript::Record>) {
             let files: Vec<std::path::PathBuf> = std::fs::read_dir(ts_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
@@ -9481,18 +9479,18 @@ mod tests {
 
             let (path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
+                matches!(&events[0], subagent_transcript::Record::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
             assert!(
-                events.iter().any(|e| matches!(e, subagent_transcript::Event::Text { chunk } if chunk.contains("sub work done"))),
+                events.iter().any(|e| matches!(e, subagent_transcript::Record::Text { chunk } if chunk.contains("sub work done"))),
                 "text chunk recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Event::End {
+                    subagent_transcript::Record::End {
                         status: subagent_transcript::EndStatus::Ok,
                         ..
                     }
@@ -9528,13 +9526,13 @@ mod tests {
             assert!(
                 events
                     .iter()
-                    .any(|e| matches!(e, subagent_transcript::Event::Error { .. })),
+                    .any(|e| matches!(e, subagent_transcript::Record::Error { .. })),
                 "error recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Event::End {
+                    subagent_transcript::Record::End {
                         status: subagent_transcript::EndStatus::Failed,
                         ..
                     }
@@ -9603,18 +9601,18 @@ mod tests {
 
             let (_path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], subagent_transcript::Event::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
+                matches!(&events[0], subagent_transcript::Record::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
             assert!(
-                events.iter().any(|e| matches!(e, subagent_transcript::Event::Text { chunk } if chunk.contains("bg work done"))),
+                events.iter().any(|e| matches!(e, subagent_transcript::Record::Text { chunk } if chunk.contains("bg work done"))),
                 "text chunk recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Event::End {
+                    subagent_transcript::Record::End {
                         status: subagent_transcript::EndStatus::Ok,
                         ..
                     }
@@ -10019,13 +10017,13 @@ mod tests {
     #[test]
     fn a_resumed_session_never_writes_into_a_previous_runs_transcript() {
         use super::open_next_subagent_transcript_from;
-        use subagent_transcript::{EndStatus, Event, SpawnKind};
+        use subagent_transcript::{EndStatus, Record, SpawnKind};
 
         let dir = tempfile::tempdir().unwrap();
         // A previous process left an orphaned run behind (crashed: no End).
         let mut old = subagent_transcript::SubagentTranscript::create(dir.path(), "000-sub-task")
             .expect("seed the previous run");
-        old.write(&Event::Start {
+        old.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
             kind: SpawnKind::Blocking,
@@ -10038,13 +10036,13 @@ mod tests {
         let seq = std::sync::atomic::AtomicU64::new(0);
         let mut fresh = open_next_subagent_transcript_from(&seq, dir.path(), "sub-task")
             .expect("opens a transcript");
-        fresh.write(&Event::Start {
+        fresh.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
             kind: SpawnKind::Blocking,
             prompt: "work from the resumed session".into(),
         });
-        fresh.write(&Event::End {
+        fresh.write(&Record::End {
             status: EndStatus::Ok,
             bytes: 0,
         });
@@ -10103,27 +10101,34 @@ mod tests {
     }
 
     #[test]
-    fn subagent_event_for_maps_text_and_tool_only() {
-        use subagent_transcript::Event;
+    fn record_from_event_keeps_tool_args_and_drops_bookkeeping() {
+        use subagent_transcript::Record;
         assert_eq!(
-            subagent_event_for(&AgentEvent::Text("hi".into())),
-            Some(Event::Text { chunk: "hi".into() })
+            Record::from_event(&AgentEvent::Text("hi".into())),
+            Some(Record::Text { chunk: "hi".into() })
         );
+        // The complete projection keeps the tool call's id AND args, so the
+        // on-disk record shows which paths the tool touched.
         assert_eq!(
-            subagent_event_for(&AgentEvent::ToolStart {
+            Record::from_event(&AgentEvent::ToolStart {
                 id: "x".into(),
                 name: "bash".into(),
-                args: "{}".into(),
+                args: r#"{"command":"ls /tmp"}"#.into(),
             }),
-            Some(Event::Tool {
-                name: "bash".into()
+            Some(Record::ToolStart {
+                id: "x".into(),
+                name: "bash".into(),
+                args: r#"{"command":"ls /tmp"}"#.into(),
             })
         );
-        // Reasoning / output / usage events are not recorded.
+        // Reasoning is now recorded too (it's transcript content).
         assert_eq!(
-            subagent_event_for(&AgentEvent::Reasoning("hmm".into())),
-            None
+            Record::from_event(&AgentEvent::Reasoning("hmm".into())),
+            Some(Record::Reasoning { text: "hmm".into() })
         );
+        // Bulky bookkeeping is dropped.
+        assert_eq!(Record::from_event(&AgentEvent::TurnDone), None);
+        assert_eq!(Record::from_event(&AgentEvent::History(Vec::new())), None);
     }
 
     /// The config's `[providers.*]` map is rekeyed by the CANONICAL name at load, so

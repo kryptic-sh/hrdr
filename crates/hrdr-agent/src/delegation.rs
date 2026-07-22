@@ -190,7 +190,7 @@ fn spawn_background(
     if let Ok(mut g) = transcript.lock()
         && let Some(t) = g.as_mut()
     {
-        t.write(&subagent_transcript::Event::Start {
+        t.write(&subagent_transcript::Record::Start {
             model: model_for_live.clone(),
             label: label.clone(),
             kind: subagent_transcript::SpawnKind::Background,
@@ -263,9 +263,9 @@ fn spawn_background(
                         usage_live.record(live_key, &ev);
                         if let Ok(mut g) = ts_inner.lock()
                             && let Some(t) = g.as_mut()
-                            && let Some(tev) = subagent_event_for(&ev)
+                            && let Some(rec) = subagent_transcript::Record::from_event(&ev)
                         {
-                            t.write(&tev);
+                            t.write(&rec);
                         }
                         let chunk = match ev {
                             AgentEvent::Text(t) => {
@@ -308,7 +308,7 @@ fn spawn_background(
                         // The transcript is the durable full record — its byte
                         // count is the whole run, not the (possibly narrower)
                         // report delivered to the parent below.
-                        t.write(&subagent_transcript::Event::End {
+                        t.write(&subagent_transcript::Record::End {
                             status: subagent_transcript::EndStatus::Ok,
                             bytes: o.len(),
                         });
@@ -341,10 +341,10 @@ fn spawn_background(
                     if let Ok(mut g) = ts_inner.lock()
                         && let Some(t) = g.as_mut()
                     {
-                        t.write(&subagent_transcript::Event::Error {
+                        t.write(&subagent_transcript::Record::Error {
                             msg: format!("{e:#}"),
                         });
-                        t.write(&subagent_transcript::Event::End {
+                        t.write(&subagent_transcript::Record::End {
                             status: subagent_transcript::EndStatus::Failed,
                             bytes: out.len(),
                         });
@@ -366,7 +366,7 @@ fn spawn_background(
                 if let Ok(mut g) = ts_outer.lock()
                     && let Some(t) = g.as_mut()
                 {
-                    t.write(&subagent_transcript::Event::End {
+                    t.write(&subagent_transcript::Record::End {
                         status: subagent_transcript::EndStatus::Panicked,
                         bytes: 0,
                     });
@@ -584,16 +584,6 @@ pub(crate) fn open_next_subagent_transcript_from(
         }
     }
     None
-}
-
-/// Map a live agent event to the transcript event to record, if any.
-pub(crate) fn subagent_event_for(ev: &AgentEvent) -> Option<subagent_transcript::Event> {
-    use subagent_transcript::Event;
-    match ev {
-        AgentEvent::Text(t) => Some(Event::Text { chunk: t.clone() }),
-        AgentEvent::ToolStart { name, .. } => Some(Event::Tool { name: name.clone() }),
-        _ => None,
-    }
 }
 
 /// The context window a delegated sub-agent should run against, given the window
@@ -1332,25 +1322,15 @@ impl hrdr_tools::Tool for SubagentTool {
     }
 }
 
-/// Render a background sub-agent's live event log into a compact, human-readable
-/// peek (for `task_output`): assistant text verbatim, tool activity as one-line
-/// markers. Bulky/structural events (usage, history, token deltas) are skipped.
-fn render_events_peek(events: &[AgentEvent]) -> String {
-    let mut out = String::new();
+/// Render a background sub-agent's live event log into a human-readable peek
+/// (for `task_output`) by folding it through the SHARED transcript reducer, so
+/// the peek matches the durable on-disk record (tool args + results intact).
+fn peek_events(events: &[AgentEvent]) -> String {
+    let mut entries = Vec::new();
     for ev in events {
-        match ev {
-            AgentEvent::Text(t) => out.push_str(t),
-            AgentEvent::Reasoning(_) => {}
-            AgentEvent::ToolStart { name, .. } => out.push_str(&format!("\n· {name}")),
-            AgentEvent::ToolEnd { name, ok, .. } => {
-                out.push_str(&format!(" {} {name}\n", if *ok { "✓" } else { "✗" }))
-            }
-            AgentEvent::Notice(n) => out.push_str(&format!("\n[{n}]\n")),
-            AgentEvent::Steered(s) => out.push_str(&format!("\n» {s}\n")),
-            _ => {}
-        }
+        crate::apply_event(&mut entries, ev);
     }
-    out.trim().to_string()
+    crate::transcript_to_text(&entries)
 }
 
 /// Compact human duration for `task_list`: `8s`, `3m12s`, `1h4m`.
@@ -1466,7 +1446,7 @@ impl hrdr_tools::Tool for TaskOutputTool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .since(0)
                     .0;
-                render_events_peek(&events)
+                peek_events(&events)
             })
         });
         if let Some(text) = peek.filter(|t| !t.is_empty()) {
