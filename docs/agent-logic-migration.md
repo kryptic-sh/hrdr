@@ -1,6 +1,26 @@
 # Agent-logic migration: hrdr-agent owns all agent logic, hrdr-app is only glue
 
-Status: **in progress.**
+Status: **Phase 1 complete** (on main). Phase 2 pending.
+
+## Progress
+
+- `3c49a2c` — slice 1: session persistence → hrdr-agent.
+- `14b313b` — slice 2: Pane/PaneSet → hrdr-agent.
+- `7a54f47` — slice 3: sub-agent persists its own SessionState
+  (`Session::save_to_path`) on every round + at completion.
+- `d8c2afc` — perf: session files written as compact JSON (not pretty).
+- `51bf3eb` — perf: sub-agent snapshot stores messages + metadata only; its
+  transcript lives in the sibling jsonl (rebuilt via `read_transcript` on load),
+  so a round no longer re-serializes the whole transcript.
+
+**Remaining efficiency lever (not yet done):** the MAIN agent still
+full-rewrites its whole session (multi-MB) on every tool round via the
+frontend's `persist_mid_turn`, on the UI thread — O(n²) over a session. The 1:1
+endgame is to give the main agent the same jsonl-transcript + compact
+messages-snapshot model the sub-agent now uses (transcript appended per event,
+`.json` snapshot carries only messages+metadata), which makes main == sub AND
+turns the per-round cost from O(full doc) into O(one appended line). Larger
+change (main session on-disk format) — tackle as its own slice.
 
 ## Principle
 
