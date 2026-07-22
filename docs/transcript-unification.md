@@ -1,6 +1,20 @@
 # Transcript unification: hrdr-agent owns recording, frontends only render
 
-Status: **approved design, implementation pending.**
+Status: **implemented** (main: `8469b4d` model, `732ff8e` builder, `de59605`
+sub-agent transcript).
+
+## Implementation note (refinement of "raw AgentEvent JSONL")
+
+`AgentEvent` does not derive `Serialize`, and its `History(Vec<ChatMessage>)` /
+`Usage` variants are bulky bookkeeping that `apply_event` ignores. So the
+sub-agent transcript persists a **serializable projection** — a `Record` enum
+covering every transcript-relevant event with full fidelity (tool `args` +
+`result` kept), keeping the `Start`/`End`/`Error` framing for orphan detection.
+`Record::from_event` is the single write mapping (replaced the lossy
+`subagent_event_for`); `Record::as_event` maps each line back to an `AgentEvent`
+so `read_transcript` folds it through the **same** `apply_event` as the main
+transcript. `task_output`'s peek folds the in-memory event log through the same
+builder + `transcript_to_text` (replaced `render_events_peek`).
 
 ## The problem
 
