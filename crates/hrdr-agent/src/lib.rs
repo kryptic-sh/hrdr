@@ -9918,6 +9918,16 @@ mod tests {
                 "the sub-agent's tools run inside its worktree"
             );
             assert_ne!(sub_cwd, repo, "and NOT in the parent repo root");
+
+            // And the SYSTEM PROMPT the sub-agent reads names that same worktree
+            // as its Working directory — so it can't be misled into constructing
+            // parent-repo paths. (The prompt and the tool cwd are both built from
+            // `config.cwd`, so they cannot diverge — this pins that.)
+            let sub_prompt = agent.lock().await.system_prompt().unwrap_or_default();
+            assert!(
+                sub_prompt.contains(&format!("Working directory: {}", worktree.display())),
+                "sub-agent prompt names the worktree as its cwd, got:\n{sub_prompt}"
+            );
         }
 
         #[tokio::test]
