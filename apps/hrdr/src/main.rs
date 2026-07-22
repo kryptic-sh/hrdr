@@ -669,9 +669,15 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
             eprintln!("\x1b[90m[{note}]\x1b[0m");
         }
     }
-    // Headless runs have no interactive steering.
+    // Headless runs have no interactive steering: enqueue the prompt as the
+    // turn's opener (the same queue an interactive steer would use) and run.
+    let steering = hrdr_agent::steering_queue();
+    steering
+        .lock()
+        .unwrap()
+        .push_back(hrdr_agent::Steer::plain(prompt));
     let result = agent
-        .run(prompt, hrdr_agent::steering_queue(), |ev| {
+        .run(steering, |ev| {
             if json {
                 println!("{}", event_json(&ev));
                 let _ = std::io::stdout().flush();

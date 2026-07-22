@@ -414,26 +414,34 @@ impl LiveSubagents {
         })
     }
 
-    /// Atomically take the next queued message, or mark the turn idle when none
-    /// remains. Both this and `send_prompt` lock the entry before its queue, so a
-    /// prompt cannot be accepted after the worker decides it is finished.
-    pub fn take_pending_or_finish(&self, key: u64) -> Option<crate::Steer> {
+    /// After a turn ends: if another message is already queued for `key`, keep the
+    /// agent running (the next `run` drains it as the opening) and return `true`;
+    /// otherwise mark the turn finished (`running = false`, `turn.end()`) and
+    /// return `false`.
+    ///
+    /// It does NOT pop (a queue-driven `run` drains the opening itself), it only
+    /// decides continue-vs-finish under the entry lock — so a steer arriving
+    /// concurrently (via `send_prompt`, which takes the same lock) can neither be
+    /// lost nor spin the loop. Both this and `send_prompt` lock the entry before
+    /// its queue, so a prompt cannot be accepted after the worker decides it is
+    /// finished.
+    pub fn continue_or_finish(&self, key: u64) -> bool {
         self.with(|v| {
-            let e = v.iter_mut().find(|e| e.key == key)?;
-            // Poison-tolerant, like every other lock here: a `.ok()?` would bail
-            // out on a poisoned queue and skip marking the turn finished, leaving
-            // `running` stuck true (RunGuard would later correct it, but the state
-            // would be briefly inconsistent).
-            let next = e
+            let Some(e) = v.iter_mut().find(|e| e.key == key) else {
+                return false;
+            };
+            // Poison-tolerant, like every other lock here.
+            let has_more = !e
                 .steering
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front();
-            if next.is_none() {
-                e.running = false;
-                e.turn.end();
+                .is_empty();
+            if has_more {
+                return true;
             }
-            next
+            e.running = false;
+            e.turn.end();
+            false
         })
     }
 
@@ -510,7 +518,7 @@ impl LiveSubagents {
         F: FnMut(crate::AgentEvent) + Send + 'static,
     {
         // Decide and enqueue under the SAME entry lock the worker takes in
-        // `take_pending_or_finish`, so a steer can't be pushed into the queue
+        // `continue_or_finish`, so a steer can't be pushed into the queue
         // *after* the worker has read it empty and marked the turn finished (a
         // lost message wrongly reported as `Steered`). The running-branch push
         // happens inside the closure; the idle branch hands `input` back out so a
@@ -544,13 +552,13 @@ impl LiveSubagents {
 
         // Idle: a further turn on the agent we kept alive for exactly this.
         //
-        // `run` emits `Steered` for a message it *drains* mid-turn, but nothing for
-        // the input that opens a turn — so record it here. Without it the agent's
-        // record shows the reply and not the question, and a pane rebuilt from that
-        // record would too.
-        self.record(key, &crate::AgentEvent::Steered(input.display.clone()));
+        // Enqueue the prompt as the turn's opening onto the very queue `run`
+        // drains; `run` pops it, emits `Steered`, and pushes it into history — so
+        // the question lands in the agent's record (and any pane rebuilt from it)
+        // exactly like a mid-turn steer, through one path. A single turn, no
+        // continuation loop.
+        self.enqueue(key, input);
         self.begin_turn(key);
-        let input = input.sent;
         let live = self.clone();
         tokio::spawn(async move {
             // The guard marks it idle again on every exit — including cancellation,
@@ -565,7 +573,7 @@ impl LiveSubagents {
                 on_event(ev);
             };
             let mut a = agent.lock().await;
-            if let Err(e) = a.run(input, steering, &mut on_event).await {
+            if let Err(e) = a.run(steering, &mut on_event).await {
                 on_event(crate::AgentEvent::Notice(format!("[error] {e:#}")));
                 // `run` only emits `TurnDone` on success; a frontend still needs to
                 // know the turn is over.

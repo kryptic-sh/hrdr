@@ -267,16 +267,17 @@ fn spawn_background(
             // run that ends mid-tool-call with no closing text has a fallback.
             let mut final_segment = String::new();
             let result: anyhow::Result<()> = async {
-                // Open its record with the task it was given, so its transcript shows
-                // the question and not just the answer.
+                // Hand the task to the agent as the turn's opening: enqueue it onto
+                // the very queue `run` drains. `run` pops it, emits `Steered`, and
+                // pushes it into history — so its record opens with the question and
+                // not just the answer, exactly as a steered follow-up turn does.
                 live.begin_turn(live_key);
-                live.record(live_key, &AgentEvent::Steered(prompt.clone()));
+                live.enqueue(live_key, crate::Steer::plain(prompt));
                 let _run_guard = RunGuard::new(live.clone(), live_key);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
-                let mut next_prompt = prompt;
                 loop {
-                    sub.run(next_prompt, Arc::clone(&steering), |ev| {
+                    sub.run(Arc::clone(&steering), |ev| {
                         // Its run is recorded on its own entry — what it did and what it
                         // spent. This is the *only* way a background sub-agent's work
                         // reaches a frontend: its `task` call returned the instant it was
@@ -336,12 +337,14 @@ fn spawn_background(
                         }
                     })
                     .await?;
-                    let Some(next) = live.take_pending_or_finish(live_key) else {
+                    // A steer may have landed while the turn ran; if so, keep the
+                    // agent running and let the next `run` drain it as its opening.
+                    // Otherwise the turn is finished. Decided atomically under the
+                    // entry lock, so a concurrent steer is never lost.
+                    if !live.continue_or_finish(live_key) {
                         break;
-                    };
+                    }
                     live.begin_turn(live_key);
-                    live.record(live_key, &AgentEvent::Steered(next.display));
-                    next_prompt = next.sent;
                 }
                 Ok(())
             }

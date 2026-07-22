@@ -1353,11 +1353,11 @@ impl App {
         }
         self.autosave();
         // The note is now in the agent's history but hasn't been shown to the
-        // model yet. Kick off a turn with empty input — `agent.run("")` skips
-        // pushing another user message (the note is already there) and sends
+        // model yet. Kick off an opener-less turn — nothing enqueued, so `run`
+        // pushes no user message of its own (the note is already there) and sends
         // the request with the shell output as context.
         if launch_turn && !self.running() {
-            self.launch_turn(String::new());
+            self.launch_turn();
         }
     }
 
@@ -1943,29 +1943,29 @@ impl App {
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
         let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
-        self.launch_turn_shown(hrdr_agent::Steer::new(sent, input));
+        // Reserve the session id from what the user actually sent (seeds the saved
+        // mirror so a first save is named), then enqueue the message as the turn's
+        // opener onto the agent's own queue — the same queue a mid-turn steer lands
+        // on. `run` drains it, emits `Steered`, and the frontend folds that into the
+        // user entry; nothing is pushed into the transcript here.
+        self.reserve_session_id(&sent);
+        self.live_subagents
+            .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
+        self.launch_turn();
     }
 
-    /// Start a turn and show what was said. The message carries both forms — what
-    /// the model reads and what the user typed — so the transcript never shows an
-    /// `@file` expansion back to the person who wrote the `@file`.
-    fn launch_turn_shown(&mut self, msg: hrdr_agent::Steer) {
-        // Commit the message into the transcript at send time (a queued message
-        // lives as a pending bottom item until this point).
-        self.push_entry(Entry::user(msg.display));
-        self.launch_turn(msg.sent);
-    }
-
-    /// Run a turn against the model with `input` as the (already-prepared) user
-    /// message. The caller is responsible for any transcript display.
-    fn launch_turn(&mut self, input: String) {
-        self.reserve_session_id(&input);
-        // The agent is what is running; the registry is where that is recorded.
+    /// Run a turn against the model. Any opener is drained from the agent's steering
+    /// queue by `run` itself (enqueued by [`Self::spawn_turn`]); an opener-less call
+    /// exists to hand the agent something already in its history (a `!command`'s
+    /// output, a landed background result). The user message is shown by folding the
+    /// `Steered` event `run` emits — not by pushing an entry here — so a normal
+    /// message and a steering message reach the transcript the same way.
+    fn launch_turn(&mut self) {
+        // The agent is what is running; the registry is where that is recorded. The
+        // turn clock belongs to the agent whose turn it is, so a frontend showing
+        // that agent shows its loader.
         self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
         self.reasoning_start = None;
-        // The turn clock belongs to the agent whose turn it is — the registry keeps
-        // it, so a frontend showing that agent shows its loader.
-        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
@@ -1986,7 +1986,7 @@ impl App {
             // an abort still sends no `Done` — `catch_unwind` does not intercept it.
             let run = async {
                 let mut a = agent.lock().await;
-                a.run(input, steering, |ev| events.send(ev)).await
+                a.run(steering, |ev| events.send(ev)).await
             };
             let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
             let err = match outcome {
@@ -2005,6 +2005,30 @@ impl App {
             let _ = tx.send(TurnMsg::Done(err)).await;
         });
         self.turn_handle = Some(handle);
+    }
+
+    /// Launch a turn whose opener enters the model's history but is NOT shown in
+    /// the transcript (`/init`). The prompt is pushed as a user note, then an
+    /// opener-less turn runs against it — so the model acts on the instruction
+    /// without it appearing as something the user typed. The queue-driven opener
+    /// path is deliberately not used: it emits `Steered`, which the frontend would
+    /// fold into a visible user entry.
+    fn launch_hidden(&mut self, prompt: String) {
+        // The command guard ensured no turn is running, so the lock is free; push
+        // the note synchronously so it precedes the request the opener-less turn
+        // issues. On the off chance the lock is momentarily held, fall back to a
+        // task — it still lands before `run`'s first request, which waits on the
+        // same lock.
+        match self.agent.try_lock() {
+            Ok(mut a) => a.push_user_note(prompt),
+            Err(_) => {
+                let agent = self.agent.clone();
+                tokio::spawn(async move {
+                    agent.lock().await.push_user_note(prompt);
+                });
+            }
+        }
+        self.launch_turn();
     }
 
     /// Connect the configured MCP servers (once, at startup), showing a status
@@ -2138,11 +2162,13 @@ impl App {
                 // copy of the same threshold only re-compacted what the agent had
                 // just compacted. `/compact` remains, as a deliberate user action.
                 // The turn ended without draining what was queued (the model
-                // answered instead of calling a tool). Drop the agent's prepared
-                // copies — `spawn_turn` re-prepares — and send the oldest as a
-                // turn of its own. The rest wait for that turn to finish.
-                if let Some(next) = self.live_subagents.take_pending(hrdr_agent::MAIN_KEY) {
-                    self.launch_turn_shown(next);
+                // answered instead of calling a tool). Launch a fresh turn if
+                // anything is still queued: `run` drains the head as its opener and
+                // emits `Steered`, which the frontend folds into the user entry. Any
+                // further queued messages steer that new turn, exactly as before.
+                let has_pending = self.steering.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                if has_pending {
+                    self.launch_turn();
                 }
             }
             TurnMsg::FileIndex(cwd, files) => {
@@ -2198,9 +2224,11 @@ impl App {
                     self.autosave();
                 }
                 self.scroll_offset = 0;
-                // Resume any queued work now that the context is compact.
-                if let Some(next) = self.live_subagents.take_pending(hrdr_agent::MAIN_KEY) {
-                    self.launch_turn_shown(next);
+                // Resume any queued work now that the context is compact: `run`
+                // drains the head as its opener (shown via the folded `Steered`).
+                let has_pending = self.steering.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                if has_pending {
+                    self.launch_turn();
                 }
             }
         }
@@ -2240,7 +2268,7 @@ impl App {
             .map(|v| v.iter().any(|t| t.done && !t.delivered))
             .unwrap_or(false);
         if ready {
-            self.launch_turn(String::new());
+            self.launch_turn();
         }
     }
 

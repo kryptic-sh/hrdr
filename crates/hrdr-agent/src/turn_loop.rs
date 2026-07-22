@@ -394,12 +394,7 @@ impl Agent {
     /// Run one user turn to completion, emitting events as it goes. `steering` is
     /// a shared queue the caller can push to mid-turn (see [`SteeringQueue`]);
     /// pass [`steering_queue()`] when there's no interactive steering.
-    pub async fn run<F>(
-        &mut self,
-        user_input: impl Into<String>,
-        steering: SteeringQueue,
-        mut on_event: F,
-    ) -> Result<()>
+    pub async fn run<F>(&mut self, steering: SteeringQueue, mut on_event: F) -> Result<()>
     where
         F: FnMut(AgentEvent),
     {
@@ -407,39 +402,19 @@ impl Agent {
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.
         repair_dangling_tool_calls(&mut self.messages);
-        let mut user_input = user_input.into();
-        if !user_input.trim().is_empty() {
-            // `user_prompt` hooks see the message before the turn starts: a
-            // block (exit 2) fails the turn before anything enters history;
-            // hook stdout rides along as extra context for the model (the
-            // frontend still displays only what the user typed).
-            if self.has_event_hooks(hrdr_tools::HookEvent::UserPrompt) {
-                let payload = serde_json::json!({
-                    "event": "user_prompt",
-                    "prompt": user_input,
-                    "cwd": self.ctx.cwd.display().to_string(),
-                    "model": self.client.model,
-                });
-                let out = hrdr_tools::run_event_hooks(
-                    &self.event_hooks,
-                    hrdr_tools::HookEvent::UserPrompt,
-                    None,
-                    &payload,
-                    &self.ctx.cwd,
-                )
-                .await;
-                for note in out.notes {
-                    on_event(AgentEvent::Notice(note));
-                }
-                if let Some(reason) = out.block {
-                    bail!("blocked by user_prompt hook: {reason}");
-                }
-                if !out.context.is_empty() {
-                    user_input.push_str("\n\n[hook context]\n");
-                    user_input.push_str(&out.context.join("\n"));
-                }
-            }
-            self.push_user_message(user_input, MessageOrigin::User);
+        // Drain the turn opener from the queue — the same queue a mid-turn steer
+        // lands on. A normal turn has one waiting (the caller enqueued it); an
+        // opener-less turn — nothing queued — exists only to hand the agent
+        // something already in its history (a `!command`'s output, a landed
+        // background result), so it skips delivery and proceeds straight to the
+        // loop.
+        let opening = steering
+            .lock()
+            .map(|mut q| q.pop_front())
+            .unwrap_or_default();
+        if let Some(opening) = opening {
+            self.deliver_user_message(opening, /*opening*/ true, &mut on_event)
+                .await?;
         }
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
@@ -453,7 +428,7 @@ impl Agent {
         for step in 0..self.max_steps {
             // Deliver any steering messages submitted since the last request — a
             // mid-turn correction reaches the model after the current tool round.
-            self.drain_steering(&steering, &mut on_event);
+            self.drain_steering(&steering, &mut on_event).await;
             // Fold in any detached background sub-agent results that have landed.
             self.drain_background(&mut on_event);
             // Reclaim stale tool output before compacting or building the next
@@ -712,6 +687,73 @@ impl Agent {
         self.release_finished_subagents();
         self.age_todos();
         on_event(AgentEvent::TurnDone);
+        Ok(())
+    }
+
+    /// Deliver one queued user message into the turn: (opening only) run the
+    /// `user_prompt` hook, then emit [`AgentEvent::Steered`] carrying the display
+    /// form and push the (possibly hook-augmented) `sent` text into history.
+    ///
+    /// The single path a user message takes to reach the model, whether it opens
+    /// a turn or steers one already in flight — so a normal message and a steering
+    /// message are the same thing (a queued message), differing only in *when*
+    /// they are drained. Both announce themselves with `Steered`, so every user
+    /// turn is in the event stream.
+    ///
+    /// Returns `Err` only when a `user_prompt` hook blocks the turn (opening
+    /// only); a mid-turn steer never runs the hook, so it never blocks.
+    pub(crate) async fn deliver_user_message<F: FnMut(AgentEvent)>(
+        &mut self,
+        msg: Steer,
+        opening: bool,
+        on_event: &mut F,
+    ) -> Result<()> {
+        let mut sent = msg.sent;
+        // `user_prompt` hooks see the message before the turn starts: a block
+        // (exit 2) fails the turn before anything enters history; hook stdout
+        // rides along as extra context for the model (the frontend still displays
+        // only what the user typed). This fires for the turn opener, not for a
+        // mid-turn steer — preserving today's behavior.
+        if opening
+            && !sent.trim().is_empty()
+            && self.has_event_hooks(hrdr_tools::HookEvent::UserPrompt)
+        {
+            let payload = serde_json::json!({
+                "event": "user_prompt",
+                "prompt": sent,
+                "cwd": self.ctx.cwd.display().to_string(),
+                "model": self.client.model,
+            });
+            let out = hrdr_tools::run_event_hooks(
+                &self.event_hooks,
+                hrdr_tools::HookEvent::UserPrompt,
+                None,
+                &payload,
+                &self.ctx.cwd,
+            )
+            .await;
+            for note in out.notes {
+                on_event(AgentEvent::Notice(note));
+            }
+            if let Some(reason) = out.block {
+                bail!("blocked by user_prompt hook: {reason}");
+            }
+            if !out.context.is_empty() {
+                sent.push_str("\n\n[hook context]\n");
+                sent.push_str(&out.context.join("\n"));
+            }
+        }
+        // The model reads the expanded (`sent`) form; the transcript shows what was
+        // typed (`display`). A real opener is a `User` turn; a mid-turn correction
+        // is tagged `Steering` so pruning/session serialization can still tell them
+        // apart (both count as turn boundaries — see `plan_prune`).
+        on_event(AgentEvent::Steered(msg.display));
+        let origin = if opening {
+            MessageOrigin::User
+        } else {
+            MessageOrigin::Steering
+        };
+        self.push_user_message(sent, origin);
         Ok(())
     }
 

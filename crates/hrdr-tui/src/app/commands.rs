@@ -426,7 +426,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             self.app.spawn_turn(prompt);
         } else {
             self.app.scroll_offset = 0;
-            self.app.launch_turn(prompt);
+            self.app.launch_hidden(prompt);
         }
     }
     fn set_input(&mut self, text: String) {

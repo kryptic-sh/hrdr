@@ -5768,8 +5768,8 @@ mod tests {
         assert!(!system_prompt(&agent).contains("UPDATED_MARKER"));
     }
 
-    #[test]
-    fn drain_steering_injects_messages_and_signals() {
+    #[tokio::test]
+    async fn drain_steering_injects_messages_and_signals() {
         let cfg = AgentConfig {
             ..Default::default()
         };
@@ -5783,7 +5783,9 @@ mod tests {
         assert!(Agent::has_steering(&steering));
 
         let mut events = Vec::new();
-        agent.drain_steering(&steering, &mut |e| events.push(e));
+        agent
+            .drain_steering(&steering, &mut |e| events.push(e))
+            .await;
 
         // Both messages are appended as user turns — stamped with an entry-time
         // timestamp like every user-role turn (they go through the same
@@ -8115,6 +8117,22 @@ mod tests {
             }
         }
 
+        impl Agent {
+            /// Drive one turn with `input` as its opener: enqueue it on a fresh
+            /// steering queue (the way a caller opens a turn) and run. The
+            /// queue-driven `run` pops it as the opening. For an opener-less turn
+            /// (nothing to deliver), call `agent.run(steering_queue(), cb)`
+            /// directly instead.
+            async fn run_input<F>(&mut self, input: &str, on_event: F) -> anyhow::Result<()>
+            where
+                F: FnMut(AgentEvent),
+            {
+                let q = steering_queue();
+                q.lock().unwrap().push_back(crate::Steer::plain(input));
+                self.run(q, on_event).await
+            }
+        }
+
         // ── (a) plain text turn ───────────────────────────────────────────────
 
         /// Agent::run against a mock server that returns a plain text response.
@@ -8131,10 +8149,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
-            agent
-                .run("hi", steering_queue(), |ev| events.push(ev))
-                .await
-                .unwrap();
+            agent.run_input("hi", |ev| events.push(ev)).await.unwrap();
 
             let text: String = events
                 .iter()
@@ -8166,7 +8181,7 @@ mod tests {
 
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
-            agent.run("hi", steering_queue(), |_| {}).await.unwrap();
+            agent.run_input("hi", |_| {}).await.unwrap();
 
             let last = agent.messages().last().expect("assistant reply pushed");
             assert_eq!(last.role, hrdr_llm::Role::Assistant);
@@ -8192,7 +8207,7 @@ mod tests {
             let mut agent = Agent::new(cfg).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             let err = agent
-                .run("hi", steering_queue(), |ev| events.push(ev))
+                .run_input("hi", |ev| events.push(ev))
                 .await
                 .unwrap_err();
             assert!(
@@ -8221,7 +8236,7 @@ mod tests {
             agent.cost_rates = Some((key, None)); // unpriced
             let mut events: Vec<AgentEvent> = Vec::new();
             let err = agent
-                .run("hi", steering_queue(), |ev| events.push(ev))
+                .run_input("hi", |ev| events.push(ev))
                 .await
                 .unwrap_err();
             assert!(
@@ -8256,7 +8271,7 @@ mod tests {
             agent.cost_rates = Some((key, None)); // unpriced, deterministic
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("hi", steering_queue(), |ev| events.push(ev))
+                .run_input("hi", |ev| events.push(ev))
                 .await
                 .expect("the unpriced call proceeds under allow_unpriced");
             assert!(
@@ -8287,7 +8302,7 @@ mod tests {
             cfg.allow_unpriced = true;
             let mut agent = Agent::new(cfg).unwrap();
             agent.set_session_cost(2.0); // priced spend already past the cap
-            let err = agent.run("hi", steering_queue(), |_| {}).await.unwrap_err();
+            let err = agent.run_input("hi", |_| {}).await.unwrap_err();
             assert!(
                 err.to_string().contains("exhausted"),
                 "cap still bites: {err}"
@@ -8329,7 +8344,7 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .run_input("read the file", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8450,7 +8465,7 @@ mod tests {
 
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .run_input("do the thing", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8521,7 +8536,7 @@ mod tests {
 
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .run_input("do the thing", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8566,7 +8581,7 @@ mod tests {
 
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .run_input("do the thing", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8611,7 +8626,7 @@ mod tests {
 
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("review it", steering_queue(), |ev| events.push(ev))
+                .run_input("review it", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8671,7 +8686,7 @@ mod tests {
 
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("do the thing", steering_queue(), |ev| events.push(ev))
+                .run_input("do the thing", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -8744,7 +8759,7 @@ mod tests {
             let mut agent = Agent::new(cfg).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .run_input("read the file", |ev| events.push(ev))
                 .await
                 .unwrap();
             let blocked = events.iter().any(|e| {
@@ -8772,7 +8787,7 @@ mod tests {
             let mut agent = Agent::new(cfg).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .run_input("read the file", |ev| events.push(ev))
                 .await
                 .unwrap();
             let annotated = events.iter().any(|e| {
@@ -8804,10 +8819,7 @@ mod tests {
                 "echo remember-the-context",
             )];
             let mut agent = Agent::new(cfg).unwrap();
-            agent
-                .run("do the thing", steering_queue(), |_| {})
-                .await
-                .unwrap();
+            agent.run_input("do the thing", |_| {}).await.unwrap();
             let user_msg = agent
                 .messages_owned()
                 .into_iter()
@@ -8832,10 +8844,7 @@ mod tests {
             )];
             let mut agent = Agent::new(cfg).unwrap();
             let before = agent.messages_owned().len();
-            let err = agent
-                .run("do the thing", steering_queue(), |_| {})
-                .await
-                .unwrap_err();
+            let err = agent.run_input("do the thing", |_| {}).await.unwrap_err();
             assert!(
                 err.to_string()
                     .contains("blocked by user_prompt hook: denied"),
@@ -8868,7 +8877,7 @@ mod tests {
                 event_hook_cfg("session_end", "*", "echo bye-failed >&2; exit 1"),
             ];
             let mut agent = Agent::new(cfg).unwrap();
-            agent.run("hi", steering_queue(), |_| {}).await.unwrap();
+            agent.run_input("hi", |_| {}).await.unwrap();
             assert!(
                 dir.path().join("turn-end-ran").exists(),
                 "the turn_end hook ran (in the agent's cwd)"
@@ -8915,6 +8924,11 @@ mod tests {
             .await;
 
             let steering = steering_queue();
+            // The opener rides the same queue as a steer — enqueued before the run.
+            steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::plain("read the file"));
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             // Queued "while the tool runs": the first request is already in
             // flight by the time `run` drains again, before request 2.
@@ -8924,7 +8938,7 @@ mod tests {
             {
                 let q = steering.clone();
                 agent
-                    .run("read the file", steering.clone(), |ev| {
+                    .run(steering.clone(), |ev| {
                         if matches!(&ev, AgentEvent::ToolStart { .. }) {
                             q.lock()
                                 .unwrap()
@@ -8936,7 +8950,8 @@ mod tests {
                     .unwrap();
             }
 
-            // Delivered exactly once, and announced.
+            // Both the opener and the mid-turn steer are announced via `Steered`,
+            // in order — the opener as it enters, the correction once delivered.
             let steered: Vec<&str> = events
                 .iter()
                 .filter_map(|e| match e {
@@ -8944,7 +8959,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(steered, ["use ripgrep"], "delivered once");
+            assert_eq!(steered, ["read the file", "use ripgrep"], "delivered once");
             assert!(steering.lock().unwrap().is_empty(), "drained");
 
             // In the conversation it sits after the tool result, not before it.
@@ -8988,6 +9003,11 @@ mod tests {
             .await;
 
             let steering = steering_queue();
+            // The opener rides the same queue as a steer — enqueued before the run.
+            steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::plain("a question"));
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             // Submitted while the answer streams: the only drain point left is a
             // request that never comes, because the model called no tool.
@@ -8996,7 +9016,7 @@ mod tests {
                 let q = steering.clone();
                 let mut submitted = false;
                 agent
-                    .run("a question", steering.clone(), |ev| {
+                    .run(steering.clone(), |ev| {
                         // Once, on the first streamed chunk — the answer may
                         // arrive as several.
                         if matches!(&ev, AgentEvent::Text(_)) && !submitted {
@@ -9015,10 +9035,16 @@ mod tests {
                 events.iter().any(|e| matches!(e, AgentEvent::TurnDone)),
                 "the turn ended"
             );
-            assert!(
-                !events.iter().any(|e| matches!(e, AgentEvent::Steered(_))),
-                "nothing was delivered"
-            );
+            // Only the opener was announced; the pending steer was never delivered
+            // (the turn ended on a text answer, with no request to carry it).
+            let steered: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Steered(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steered, ["a question"], "only the opener was delivered");
             assert_eq!(
                 steering.lock().unwrap().len(),
                 1,
@@ -9056,7 +9082,7 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("hello", steering_queue(), |ev| events.push(ev))
+                .run_input("hello", |ev| events.push(ev))
                 .await
                 .unwrap();
 
@@ -9212,8 +9238,10 @@ mod tests {
             agent.messages.push(super::assistant_with_calls(&["a"]));
             agent.messages.push(ChatMessage::tool_result("a", "ok"));
 
+            // Opener-less: nothing enqueued — the turn runs on the history already
+            // present (an interrupted tool round), which is what overflows.
             let err = agent
-                .run("", steering_queue(), |_| {})
+                .run(steering_queue(), |_| {})
                 .await
                 .expect_err("must fail, not silently loop on an unshrinkable overflow");
             let msg = err.to_string();
@@ -9287,7 +9315,7 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             let mut events: Vec<AgentEvent> = Vec::new();
             agent
-                .run("hello", steering_queue(), |ev| events.push(ev))
+                .run_input("hello", |ev| events.push(ev))
                 .await
                 .unwrap();
 

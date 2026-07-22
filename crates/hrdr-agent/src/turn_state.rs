@@ -26,7 +26,12 @@ impl Agent {
     /// Drain any steering messages submitted since the last request into the
     /// conversation as user messages, emitting [`AgentEvent::Steered`] for each
     /// so the frontend can display it at delivery time.
-    pub(crate) fn drain_steering<F: FnMut(AgentEvent)>(
+    ///
+    /// Each drained message goes through [`Agent::deliver_user_message`] — the
+    /// same helper the turn opener uses — so a mid-turn steer and an opening
+    /// message travel one code path. A mid-turn steer runs no `user_prompt` hook,
+    /// so delivery cannot block: the returned `Result` is always `Ok` here.
+    pub(crate) async fn drain_steering<F: FnMut(AgentEvent)>(
         &mut self,
         steering: &SteeringQueue,
         on_event: &mut F,
@@ -36,9 +41,10 @@ impl Agent {
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
         for msg in pending {
-            // The model reads the expanded form; the transcript shows what was typed.
-            on_event(AgentEvent::Steered(msg.display));
-            self.push_user_message(msg.sent, MessageOrigin::Steering);
+            // `opening = false`: no hook, so this never returns `Err`.
+            let _ = self
+                .deliver_user_message(msg, /*opening*/ false, on_event)
+                .await;
         }
     }
 

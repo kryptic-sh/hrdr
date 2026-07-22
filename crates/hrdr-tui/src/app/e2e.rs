@@ -1231,8 +1231,15 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     assert!(h.app.running(), "the running turn was not disturbed");
     assert_eq!(h.app.editor.content(), "", "the draft was taken");
 
-    // The turn ends: the queued message becomes its own turn.
+    // The turn ends: the queued message becomes a turn of its own.
     h.app.on_turn_msg(TurnMsg::Done(None));
+    assert!(
+        h.app.running(),
+        "a fresh turn was spawned for the queued message"
+    );
+    // Its opener is drained and shown by `run` — via the folded `Steered` event,
+    // not a push at submit time — so pump the relaunched turn to completion.
+    h.pump().await;
     assert!(h.app.pending().is_empty(), "the queue drained");
     assert!(
         h.app
@@ -1241,7 +1248,6 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
         "the queued message was sent after the turn"
     );
-    assert!(h.app.running(), "as a turn of its own");
 }
 
 /// The steering path: a message queued while the model is working rides in with
@@ -1324,13 +1330,21 @@ async fn queued_messages_are_sent_fifo_one_turn_at_a_time() {
         h.type_str(msg);
         h.press(KeyCode::Enter);
     }
+    // Queued in the order typed, not dumped into the transcript at submit.
     assert_eq!(h.app.pending(), ["one", "two"]);
 
+    // The turn ends: a fresh turn is spawned to drain the queue, oldest first.
+    // The agent takes messages off its own queue as `run` delivers them (the head
+    // is the opener), so nothing is popped synchronously here.
     h.app.on_turn_msg(TurnMsg::Done(None));
+    assert!(
+        h.app.running(),
+        "a fresh turn was spawned to drain the queue"
+    );
     assert_eq!(
         h.app.pending(),
-        ["two"],
-        "one turn spawns per completion, oldest first"
+        ["one", "two"],
+        "still FIFO on the agent's queue, for run to drain oldest first"
     );
 
     // Cancelling drops what is still waiting rather than sending it later.
