@@ -6594,6 +6594,8 @@ mod tests {
             stop: vec!["<END>".to_string()],
             stream_usage: Some(false),
             request_timeout: Some(30),
+            session_compress_after: Some(111),
+            session_purge_after: Some(222),
             prompt_cache_ttl: Some("1h".to_string()),
             subagents: Some(false),
             memory: Some(false),
@@ -6648,6 +6650,8 @@ mod tests {
         assert_eq!(cfg.stop, vec!["<END>".to_string()]);
         assert!(!cfg.stream_usage);
         assert_eq!(cfg.request_timeout, Some(30));
+        assert_eq!(cfg.session_compress_after, Some(111));
+        assert_eq!(cfg.session_purge_after, Some(222));
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
         assert_eq!(cfg.max_cost, Some(2.5));
         assert!(cfg.allow_unpriced);

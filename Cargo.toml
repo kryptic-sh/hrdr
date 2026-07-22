@@ -68,6 +68,8 @@ similar = "2"
 toml = { version = "0.8", features = ["parse"] }
 toml_edit = "0.22"
 tempfile = "3"
+zstd = "0.13"
+filetime = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.10"

@@ -137,6 +137,16 @@ struct Cli {
     #[arg(long, global = true)]
     todo_ttl: Option<u64>,
 
+    /// Compress a session file idle longer than this many seconds (0 disables;
+    /// default one week). See docs/session-retention.md.
+    #[arg(long, global = true)]
+    session_compress_after: Option<u64>,
+
+    /// Purge an auto-named session idle longer than this many seconds (0
+    /// disables; default one month). User-named sessions are never purged.
+    #[arg(long, global = true)]
+    session_purge_after: Option<u64>,
+
     /// Show the model's `<think>` reasoning: on/off/1/0 (default on).
     #[arg(long = "show-thinking", global = true, value_name = "on|off")]
     show_thinking: Option<String>,
@@ -523,6 +533,12 @@ async fn main() -> Result<()> {
     }
     if let Some(n) = cli.todo_ttl {
         ui.todo_ttl = n;
+    }
+    if let Some(n) = cli.session_compress_after {
+        config.session_compress_after = Some(n);
+    }
+    if let Some(n) = cli.session_purge_after {
+        config.session_purge_after = Some(n);
     }
     if let Some(v) = cli
         .show_thinking

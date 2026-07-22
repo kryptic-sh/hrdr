@@ -67,6 +67,11 @@ pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 2;
 /// Turns a completed TODO stays in the agent's list before it ages out.
 pub const DEFAULT_TODO_TTL: u64 = 5;
 
+/// Session-retention defaults (seconds): compress after a week idle, purge an
+/// auto-named session after a month idle. See `docs/session-retention.md`.
+pub const DEFAULT_SESSION_COMPRESS_AFTER: u64 = 7 * 24 * 60 * 60;
+pub const DEFAULT_SESSION_PURGE_AFTER: u64 = 30 * 24 * 60 * 60;
+
 /// Auto-compaction on by default. The *trigger point* is set by
 /// [`AgentConfig::compaction_reserved`], not by this toggle.
 pub const DEFAULT_AUTO_COMPACT: bool = true;
@@ -246,6 +251,14 @@ pub struct AgentConfig {
     /// five minutes; each received stream chunk resets the idle deadline.
     /// Configure `0` to disable the timeout explicitly.
     pub request_timeout: Option<u64>,
+    /// Session retention: compress a session file whose mtime is older than this
+    /// many seconds (zstd). `None` or `0` disables compression. Default one week.
+    /// See `docs/session-retention.md`.
+    pub session_compress_after: Option<u64>,
+    /// Session retention: purge an AUTO-NAMED session whose mtime is older than
+    /// this many seconds. `None` or `0` disables purging. User-named sessions are
+    /// never purged. Default one month.
+    pub session_purge_after: Option<u64>,
     /// Prompt-cache TTL: `5m` (default) or `1h`. `1h` emits a longer
     /// `cache_control` TTL (Anthropic native + OpenRouter) — cheaper for stable
     /// prompts reused across a longer window. Only meaningful when caching is on.
@@ -662,6 +675,8 @@ pub(crate) struct FileConfig {
     pub(crate) stop: Vec<String>,
     pub(crate) stream_usage: Option<bool>,
     pub(crate) request_timeout: Option<u64>,
+    pub(crate) session_compress_after: Option<u64>,
+    pub(crate) session_purge_after: Option<u64>,
     pub(crate) prompt_cache_ttl: Option<String>,
     pub(crate) max_cost: Option<f64>,
     pub(crate) allow_unpriced: Option<bool>,
@@ -815,6 +830,8 @@ impl Default for AgentConfig {
             stop: Vec::new(),
             stream_usage: true,
             request_timeout: Some(300),
+            session_compress_after: Some(DEFAULT_SESSION_COMPRESS_AFTER),
+            session_purge_after: Some(DEFAULT_SESSION_PURGE_AFTER),
             prompt_cache_ttl: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
@@ -1435,6 +1452,12 @@ impl AgentConfig {
         if let Some(v) = fc.request_timeout {
             self.request_timeout = Some(v);
         }
+        if let Some(v) = fc.session_compress_after {
+            self.session_compress_after = Some(v);
+        }
+        if let Some(v) = fc.session_purge_after {
+            self.session_purge_after = Some(v);
+        }
         if let Some(v) = fc.prompt_cache_ttl {
             self.prompt_cache_ttl = Some(v);
         }
@@ -1697,6 +1720,14 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_REQUEST_TIMEOUT", |c, v| {
         // 0 is the documented "disable the timeout" sentinel — accepted.
         c.request_timeout = Some(env_parse(v, "a whole number of seconds (0 disables)")?);
+        Ok(())
+    }),
+    ("HRDR_SESSION_COMPRESS_AFTER", |c, v| {
+        c.session_compress_after = Some(env_parse(v, "a whole number of seconds (0 disables)")?);
+        Ok(())
+    }),
+    ("HRDR_SESSION_PURGE_AFTER", |c, v| {
+        c.session_purge_after = Some(env_parse(v, "a whole number of seconds (0 disables)")?);
         Ok(())
     }),
     ("HRDR_PROMPT_CACHE_TTL", |c, v| {

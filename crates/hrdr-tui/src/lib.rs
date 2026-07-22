@@ -160,6 +160,26 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout());
     let mut terminal: Tui = Terminal::new(backend)?;
 
+    // Session retention: a background worker compresses idle sessions and purges
+    // old auto-named ones. First pass 30s after start (out of the way of launch),
+    // then hourly. Peer-safe via each session's open-lock, so several instances
+    // coexist. The sweep is blocking fs I/O, so it runs on a blocking thread. See
+    // docs/session-retention.md.
+    let compress_after = config.session_compress_after.filter(|&t| t > 0);
+    let purge_after = config.session_purge_after.filter(|&t| t > 0);
+    if compress_after.is_some() || purge_after.is_some() {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                let _ = tokio::task::spawn_blocking(move || {
+                    hrdr_app::sweep_sessions(compress_after, purge_after)
+                })
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+            }
+        });
+    }
+
     let mut app = App::new(config, ui, logo)?;
     app.connect_mcp().await;
     tui::run_loop(&mut app, &mut terminal, command).await?;

@@ -1,6 +1,6 @@
 # Session retention: compression and purge
 
-Status: **approved design, implementation in progress.**
+Status: **implemented.**
 
 hrdr accumulates one JSON transcript per session under
 `$XDG_DATA_HOME/hrdr/sessions/<cwd-slug>/<id>.json`. Over time this grows

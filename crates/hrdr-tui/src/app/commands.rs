@@ -381,7 +381,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.state().id.clone()
     }
     fn set_session_label(&mut self, name: String) {
-        self.app.state_mut().name = name;
+        let st = self.app.state_mut();
+        st.name = name;
+        // The user named this session explicitly (`/rename` or `/new <name>`), so
+        // retention must never purge it. The auto-name path does not come through
+        // here, so it stays `named_by_user == false`.
+        st.named_by_user = true;
     }
     fn autosave(&mut self) {
         self.app.autosave();

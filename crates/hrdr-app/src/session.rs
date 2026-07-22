@@ -64,6 +64,12 @@ pub struct SessionState {
     /// Human-friendly session name (defaults to the first user message).
     #[serde(default)]
     pub name: String,
+    /// Whether the user explicitly named this session (`/rename` or `/new <name>`)
+    /// rather than letting it auto-derive from the first message. Retention's
+    /// purge phase spares user-named sessions and only ever deletes auto-named
+    /// ones. A pre-feature file has no key → `false` → treated as auto-named.
+    #[serde(default)]
+    pub named_by_user: bool,
     /// The session's file id (stem). Derived from the filename, not stored in it.
     #[serde(skip)]
     pub id: Option<String>,
@@ -104,6 +110,7 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             name: String::new(),
+            named_by_user: false,
             id: None,
             model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
             provider_unset: false,
@@ -138,6 +145,8 @@ impl<'de> Deserialize<'de> for SessionState {
         struct Raw {
             #[serde(default)]
             name: String,
+            #[serde(default)]
+            named_by_user: bool,
             /// v2: `provider://model`. v1: a bare model id.
             #[serde(default)]
             model: Option<String>,
@@ -201,6 +210,7 @@ impl<'de> Deserialize<'de> for SessionState {
         };
         Ok(SessionState {
             name: raw.name,
+            named_by_user: raw.named_by_user,
             id: None,
             model,
             provider_unset,
@@ -607,6 +617,14 @@ pub fn session_file_path(cwd: &str, id: &str) -> PathBuf {
     session_dir(cwd).join(format!("{}.json", sanitize_name(id)))
 }
 
+/// The session id (file stem) for a path, handling both `<id>.json` and the
+/// compressed `<id>.json.zst`: `file_stem()` alone leaves `<id>.json` on the
+/// compressed form, so strip a trailing `.json` too.
+fn session_id_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(stem.strip_suffix(".json").unwrap_or(stem).to_string())
+}
+
 /// Why [`Session::open_path`] couldn't take ownership of a session.
 #[derive(Debug)]
 pub enum OpenError {
@@ -719,6 +737,13 @@ impl Session {
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
         hrdr_agent::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
+        // If retention had compressed this session, the plaintext we just wrote
+        // is now the live copy — drop the stale `<id>.json.zst` so the two don't
+        // coexist (and so a listing/load never picks the outdated compressed one).
+        let compressed = path.with_extension("json.zst");
+        if compressed.exists() {
+            let _ = std::fs::remove_file(&compressed);
+        }
         // Clean up the reservation lock left by `unique_session_id`, if any.
         // A save that was NOT preceded by a reservation (e.g. an autosave of an
         // already-assigned id) has no lock to clean up; `remove_file` is benign.
@@ -754,20 +779,35 @@ impl Session {
             .metadata()
             .with_context(|| format!("reading metadata for {}", path.display()))?
             .len();
-        if len > MAX_SESSION_FILE_BYTES {
-            anyhow::bail!(
-                "session file {} is {:.1} MiB, exceeds the {:.1} MiB limit",
-                path.display(),
-                len as f64 / (1024.0 * 1024.0),
-                MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
-            );
+        // A `.json.zst` file is zstd-compressed (retention compressed an idle
+        // session); decode it through the same output cap. The limit for a
+        // plaintext file is on its own length; for a compressed one it is on the
+        // *decompressed* bytes (a small archive can expand past the cap), so both
+        // paths read through `take(limit + 1)` and check the resulting length.
+        let is_compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
+        let mut data = String::new();
+        if is_compressed {
+            let dec = zstd::stream::read::Decoder::new(f)
+                .with_context(|| format!("opening zstd stream for {}", path.display()))?;
+            dec.take(MAX_SESSION_FILE_BYTES + 1)
+                .read_to_string(&mut data)
+                .with_context(|| format!("decompressing {}", path.display()))?;
+        } else {
+            if len > MAX_SESSION_FILE_BYTES {
+                anyhow::bail!(
+                    "session file {} is {:.1} MiB, exceeds the {:.1} MiB limit",
+                    path.display(),
+                    len as f64 / (1024.0 * 1024.0),
+                    MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
+                );
+            }
+            data.reserve(1024.min(len as usize));
+            // Read through a limit so a file that grew between metadata and read
+            // cannot OOM the process.
+            f.take(MAX_SESSION_FILE_BYTES + 1)
+                .read_to_string(&mut data)
+                .with_context(|| format!("reading {}", path.display()))?;
         }
-        let mut data = String::with_capacity(1024.min(len as usize));
-        // Read through a limit so a file that grew between metadata and read
-        // cannot OOM the process.
-        f.take(MAX_SESSION_FILE_BYTES + 1)
-            .read_to_string(&mut data)
-            .with_context(|| format!("reading {}", path.display()))?;
         // Reject the data if more bytes were present than allowed (take()
         // silently truncates past the limit, so we must check).
         if data.len() as u64 > MAX_SESSION_FILE_BYTES {
@@ -779,10 +819,7 @@ impl Session {
         }
         let mut session: Session =
             serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
-        session.state.id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string);
+        session.state.id = session_id_from_path(path);
         // A load always knows the true `created` for this path — remember it,
         // so a later `save` (an autosave, a rename, …) doesn't have to re-read
         // the file just to preserve it.
@@ -989,7 +1026,13 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        // A session lives as `<id>.json` or, once retention compressed it, as
+        // `<id>.json.zst`. Skip anything else (lock files, the `subagents/` dir).
+        let is_session = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.ends_with(".json") || n.ends_with(".json.zst"));
+        if !is_session {
             continue;
         }
         let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
@@ -1004,11 +1047,7 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
                 continue;
             }
         }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        let id = session_id_from_path(&path).unwrap_or_default();
         match Session::load_path(&path) {
             Ok(s) => {
                 let meta = SessionMeta {
@@ -1063,6 +1102,128 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.updated));
     out
+}
+
+// ── retention: compress idle sessions, purge old auto-named ones ──────────────
+//
+// See `docs/session-retention.md`. A background worker calls [`sweep_sessions`]
+// every hour. It is peer-safe: multiple hrdr instances can run at once, and the
+// sweep acts on a session only if it can take that session's open-lock — which
+// fails (skipped) when a live instance is using it or another sweeper is on it.
+
+/// One retention pass over every stored session. `compress_after` /
+/// `purge_after` are ages in seconds; `None` or `0` disables that phase.
+///
+/// - A session whose file mtime is older than `compress_after` and is still
+///   plaintext (`<id>.json`) is zstd-compressed to `<id>.json.zst`, preserving
+///   its mtime so the purge clock is not reset.
+/// - A session whose file mtime is older than `purge_after` is deleted — but
+///   ONLY if it was not named by the user (`named_by_user == false`).
+///
+/// Best-effort throughout: any per-file error (a busy lock, an unreadable file)
+/// skips that file and the sweep continues. Cheap to call when nothing is due —
+/// it decides by `stat` mtime and only opens a file it is about to act on.
+pub fn sweep_sessions(compress_after: Option<u64>, purge_after: Option<u64>) {
+    let compress_after = compress_after.filter(|&t| t > 0);
+    let purge_after = purge_after.filter(|&t| t > 0);
+    if compress_after.is_none() && purge_after.is_none() {
+        return;
+    }
+    let base = sessions_dir();
+    // Legacy flat layout, then each per-cwd subdirectory. `subagents/` sits under
+    // a cwd dir (not a direct child of base) and holds `.jsonl` files, so it is
+    // never treated as a session dir nor swept.
+    sweep_dir(&base, compress_after, purge_after);
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sweep_dir(&path, compress_after, purge_after);
+            }
+        }
+    }
+}
+
+/// Sweep one directory of session files (non-recursive), acting on each that is
+/// past a threshold. See [`sweep_sessions`].
+fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) {
+    let now = hrdr_tools::unix_now();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let is_json = name.ends_with(".json");
+        if !is_json && !name.ends_with(".json.zst") {
+            continue;
+        }
+        let Some(mtime) = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        else {
+            continue;
+        };
+        let age = now.saturating_sub(mtime);
+        let want_purge = purge_after.is_some_and(|t| age > t);
+        let want_compress = is_json && compress_after.is_some_and(|t| age > t);
+        if !want_purge && !want_compress {
+            continue;
+        }
+        let Some(id) = session_id_from_path(&path) else {
+            continue;
+        };
+        // Take the session's open-lock. Busy → a live instance is using it, or
+        // another sweeper is on it; either way, skip. Held for the whole action.
+        let Ok(_lock) = acquire_open_lock(dir, &id) else {
+            continue;
+        };
+        if want_purge {
+            match Session::load_path(&path) {
+                // Auto-named and old enough → purge outright.
+                Ok(s) if !s.state.named_by_user => {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                // User-named → keep. It may still be a compression candidate below.
+                Ok(_) => {}
+                // Unparseable → leave it for `/doctor` rather than delete blindly.
+                Err(_) => continue,
+            }
+        }
+        if want_compress {
+            let _ = compress_session_file(&path);
+        }
+    }
+}
+
+/// Compress a plaintext `<id>.json` to `<id>.json.zst` (zstd level 3), atomically
+/// and preserving the original mtime, then remove the plaintext. The caller must
+/// hold the session's open-lock. Returns an error without touching the plaintext
+/// if any step before the swap fails.
+fn compress_session_file(json_path: &Path) -> Result<()> {
+    let orig_mtime = std::fs::metadata(json_path)
+        .and_then(|m| m.modified())
+        .with_context(|| format!("reading mtime for {}", json_path.display()))?;
+    let data =
+        std::fs::read(json_path).with_context(|| format!("reading {}", json_path.display()))?;
+    // Level 3 is zstd's default — strong ratio for very little CPU.
+    let compressed = zstd::encode_all(&data[..], 3)
+        .with_context(|| format!("compressing {}", json_path.display()))?;
+    let zst_path = json_path.with_extension("json.zst");
+    hrdr_agent::write_atomic(&zst_path, &compressed)
+        .with_context(|| format!("writing {}", zst_path.display()))?;
+    // Keep the compressed file's mtime equal to the plaintext's, so compression
+    // does not reset the "last used" clock the purge phase reads.
+    let _ = filetime::set_file_mtime(&zst_path, filetime::FileTime::from_system_time(orig_mtime));
+    // Only now drop the plaintext: the compressed copy is fully written.
+    std::fs::remove_file(json_path).with_context(|| format!("removing {}", json_path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1483,6 +1644,150 @@ mod tests {
             Session::new(state("small", &cwd)).save("small").unwrap();
             let loaded = Session::load(&cwd, "small").unwrap();
             assert_eq!(loaded.state.name, "small");
+        });
+    }
+
+    // ── retention: compress / purge sweep ─────────────────────────────────────
+
+    /// Backdate a file's mtime by `secs_old` seconds so the sweep sees it as idle.
+    fn age_file(path: &Path, secs_old: u64) {
+        let ts = hrdr_tools::unix_now().saturating_sub(secs_old) as i64;
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(ts, 0)).unwrap();
+    }
+
+    #[test]
+    fn compress_then_load_round_trips_and_preserves_mtime() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state("Chat", &cwd);
+            st.named_by_user = true;
+            Session::new(st).save("rt").unwrap();
+            let json = session_file_path(&cwd, "rt");
+            age_file(&json, 100_000);
+            let before = std::fs::metadata(&json).unwrap().modified().unwrap();
+
+            compress_session_file(&json).unwrap();
+
+            let zst = json.with_extension("json.zst");
+            assert!(!json.exists(), "plaintext removed");
+            assert!(zst.exists(), "compressed written");
+            let after = std::fs::metadata(&zst).unwrap().modified().unwrap();
+            assert_eq!(
+                before
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                after
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "compression preserves mtime (the purge clock)"
+            );
+            // Decodes transparently; id is derived without the `.json.zst` tail.
+            let loaded = Session::load_path(&zst).unwrap();
+            assert_eq!(loaded.state.name, "Chat");
+            assert!(loaded.state.named_by_user);
+            assert_eq!(loaded.state.id.as_deref(), Some("rt"));
+        });
+    }
+
+    #[test]
+    fn sweep_compresses_idle_and_purges_old_auto_named() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let week = 7 * 24 * 60 * 60;
+            let month = 30 * 24 * 60 * 60;
+
+            // (a) auto-named, older than a month → purged.
+            Session::new(state("old-auto", &cwd))
+                .save("old-auto")
+                .unwrap();
+            age_file(&session_file_path(&cwd, "old-auto"), month + 1000);
+            // (b) user-named, older than a month → kept, but compressed.
+            let mut named = state("kept", &cwd);
+            named.named_by_user = true;
+            Session::new(named).save("old-named").unwrap();
+            age_file(&session_file_path(&cwd, "old-named"), month + 1000);
+            // (c) auto-named, older than a week but not a month → compressed only.
+            Session::new(state("weekish", &cwd))
+                .save("weekish")
+                .unwrap();
+            age_file(&session_file_path(&cwd, "weekish"), week + 1000);
+            // (d) fresh → untouched.
+            Session::new(state("fresh", &cwd)).save("fresh").unwrap();
+
+            sweep_sessions(Some(week), Some(month));
+
+            let p = |id: &str| session_file_path(&cwd, id);
+            let z = |id: &str| p(id).with_extension("json.zst");
+            assert!(
+                !p("old-auto").exists() && !z("old-auto").exists(),
+                "old auto-named session purged"
+            );
+            assert!(
+                !p("old-named").exists() && z("old-named").exists(),
+                "old user-named session kept but compressed"
+            );
+            assert!(
+                !p("weekish").exists() && z("weekish").exists(),
+                "week-old session compressed, not purged"
+            );
+            assert!(
+                p("fresh").exists() && !z("fresh").exists(),
+                "fresh session untouched"
+            );
+            assert_eq!(
+                Session::load_path(&z("old-named")).unwrap().state.name,
+                "kept"
+            );
+        });
+    }
+
+    #[test]
+    fn save_drops_a_stale_compressed_copy() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state("Chat", &cwd);
+            st.named_by_user = true;
+            Session::new(st.clone()).save("resume").unwrap();
+            let json = session_file_path(&cwd, "resume");
+            compress_session_file(&json).unwrap();
+            assert!(json.with_extension("json.zst").exists());
+            // Resuming then autosaving rewrites plaintext and drops the stale `.zst`.
+            Session::new(st).save("resume").unwrap();
+            assert!(json.exists(), "plaintext rewritten");
+            assert!(
+                !json.with_extension("json.zst").exists(),
+                "stale compressed copy dropped"
+            );
+        });
+    }
+
+    #[test]
+    fn sweep_skips_a_session_held_by_a_live_lock() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let month = 30 * 24 * 60 * 60;
+            Session::new(state("busy", &cwd)).save("busy").unwrap();
+            let json = session_file_path(&cwd, "busy");
+            age_file(&json, month + 1000);
+            // A live instance holds the open-lock; the sweep must not touch it.
+            let _lock = acquire_open_lock(&session_dir(&cwd), "busy").unwrap();
+            sweep_sessions(Some(month / 4), Some(month));
+            assert!(json.exists(), "a busy session is skipped");
+            assert!(!json.with_extension("json.zst").exists());
         });
     }
 
@@ -1954,6 +2259,7 @@ mod roundtrip_audit {
 
         let state = SessionState {
             name: "Chat".into(),
+            named_by_user: true, // round-trips through the file like any other field
             id: Some("chat".into()), // NOT persisted: it is the file name
             model: "go://m".parse().unwrap(),
             provider_unset: false,
