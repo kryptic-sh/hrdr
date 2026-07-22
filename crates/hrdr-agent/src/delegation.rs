@@ -128,6 +128,12 @@ fn spawn_background(
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
     let usage_for_live = subagent_usage(&cfg);
+    // The sub-agent's own identity for its `SessionState` snapshot, captured
+    // before `cfg` is moved into `Agent::new` below. Persisting this state file
+    // is the same core save the main agent uses — only the destination differs.
+    let sub_model = cfg.model.clone();
+    let sub_cwd = cfg.cwd.display().to_string();
+    let sub_base_url = cfg.base_url.clone();
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
@@ -187,6 +193,13 @@ fn spawn_background(
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|t| t.path().to_path_buf()));
+    // The sub-agent's own `SessionState` snapshot lives next to its `.jsonl`
+    // crash-trail: the sibling `<stem>.json`. No transcript dir (best-effort,
+    // same rule the jsonl uses) means no snapshot. This is the resumable/revivable
+    // artifact; the jsonl stays as the fine-grained record.
+    let sub_json_path = transcript_path.as_ref().map(|p| p.with_extension("json"));
+    // The label names the snapshot's session (auto-derived, never user-named).
+    let label_for_state = label.clone();
     if let Ok(mut g) = transcript.lock()
         && let Some(t) = g.as_mut()
     {
@@ -245,6 +258,11 @@ fn spawn_background(
             // context; `out` (and the durable transcript) still exist so a
             // run that ends mid-tool-call with no closing text has a fallback.
             let mut final_segment = String::new();
+            // The sub-agent's display transcript, built in-loop by the shared
+            // reducer exactly as a pane/frontend would — the snapshot's
+            // `transcript` field. Declared out here so the completion-time final
+            // persist (below the loop) can still read it.
+            let mut sub_transcript: Vec<crate::Entry> = Vec::new();
             let result: anyhow::Result<()> = async {
                 // Open its record with the task it was given, so its transcript shows
                 // the question and not just the answer.
@@ -266,6 +284,31 @@ fn spawn_background(
                             && let Some(rec) = subagent_transcript::Record::from_event(&ev)
                         {
                             t.write(&rec);
+                        }
+                        // Build the sub-agent's display transcript in-loop (the
+                        // same shared reducer a pane uses — do NOT re-read the
+                        // jsonl each round), and on every committed round (a
+                        // `History` event, emitted with no dangling tool calls)
+                        // snapshot its full `SessionState` next to the jsonl.
+                        // Best-effort: a failed save must never break the run,
+                        // exactly like the jsonl writes above.
+                        crate::apply_event(&mut sub_transcript, &ev);
+                        if let AgentEvent::History(messages) = &ev
+                            && let Some(path) = &sub_json_path
+                        {
+                            let state = crate::SessionState {
+                                name: label_for_state.clone(),
+                                named_by_user: false,
+                                model: sub_model.clone(),
+                                base_url: sub_base_url.clone(),
+                                cwd: sub_cwd.clone(),
+                                messages: messages.clone(),
+                                transcript: sub_transcript.clone(),
+                                usage: usage_live.usage(live_key).unwrap_or_default(),
+                                todos: Vec::new(),
+                                ..Default::default()
+                            };
+                            let _ = crate::Session::new(state.persisted()).save_to_path(path);
                         }
                         let chunk = match ev {
                             AgentEvent::Text(t) => {
@@ -299,6 +342,27 @@ fn spawn_background(
                 Ok(())
             }
             .await;
+            // Final `SessionState` snapshot from the agent's settled history: the
+            // closing assistant text lands AFTER the last `History` event, so the
+            // in-loop saves above miss it. Read the retained agent's final messages
+            // (the method the main agent's autosave uses) and rebuild the state the
+            // same way. Best-effort, like the jsonl writes.
+            if let Some(path) = &sub_json_path {
+                let messages = sub.lock().await.messages_owned();
+                let state = crate::SessionState {
+                    name: label_for_state.clone(),
+                    named_by_user: false,
+                    model: sub_model.clone(),
+                    base_url: sub_base_url.clone(),
+                    cwd: sub_cwd.clone(),
+                    messages,
+                    transcript: sub_transcript.clone(),
+                    usage: live.usage(live_key).unwrap_or_default(),
+                    todos: Vec::new(),
+                    ..Default::default()
+                };
+                let _ = crate::Session::new(state.persisted()).save_to_path(path);
+            }
             match result {
                 Ok(()) => {
                     let o = out.trim().to_string();

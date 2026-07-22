@@ -9370,6 +9370,10 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
+                // The sub-agent now writes a sibling `<stem>.json` state snapshot
+                // next to its `<stem>.jsonl` crash-trail; this helper reads the
+                // jsonl record stream only.
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
                 .collect();
             assert_eq!(files.len(), 1, "exactly one transcript file: {files:?}");
             let body = std::fs::read_to_string(&files[0]).unwrap();
@@ -9674,6 +9678,78 @@ mod tests {
             assert_eq!(
                 result, "the report",
                 "only the text after the last tool call is delivered"
+            );
+        }
+
+        /// A delegated sub-agent persists its OWN `SessionState` next to its jsonl
+        /// crash-trail: the sibling `<stem>.json` loads back with the sub-agent's
+        /// turn in `messages` AND a `Tool` entry (with non-empty args) in
+        /// `transcript` — the full, non-lossy snapshot, written through the same
+        /// core save the main agent uses.
+        #[tokio::test]
+        async fn background_subagent_persists_its_own_session_state() {
+            use hrdr_tools::Tool;
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let file_path = test_file.to_string_lossy().to_string();
+            let args_json = serde_json::to_string(&json!({"path": file_path})).unwrap();
+
+            let server = MockServer::start(vec![
+                // Turn 1: a tool round (read the file) — emits a `History` event.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 2: the closing report text (lands after the last History,
+                // so only the completion-time final persist captures it).
+                MockResp::Sse(vec![
+                    text_chunk("c2", "sub turn done"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+            let ts_dir = tempfile::tempdir().unwrap();
+            let tool = transcript_tool(server.base_url(), dir.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(dir.path());
+            let args = json!({"prompt": "read the file and report", "description": "probe"});
+
+            tool.execute(args, &ctx).await.unwrap();
+            let result = await_background(&tool, &ctx).await;
+            assert!(result.contains("sub turn done"), "delivered: {result}");
+
+            // The sibling `<stem>.json` snapshot exists next to the jsonl.
+            let json_path = std::fs::read_dir(ts_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .expect("a sibling <stem>.json state file was written");
+
+            let session = crate::Session::load_path(&json_path).expect("the snapshot loads back");
+            // The sub-agent's own turn is in the model-facing history.
+            assert!(
+                session
+                    .state
+                    .messages
+                    .iter()
+                    .any(|m| m.role == hrdr_llm::Role::Assistant),
+                "the sub-agent's turn is in messages: {:?}",
+                session.state.messages
+            );
+            // The full display transcript carries the tool call WITH its args —
+            // proof the snapshot is the complete stream, not a lossy summary.
+            assert!(
+                session.state.transcript.iter().any(|e| matches!(
+                    &e.kind,
+                    crate::EntryKind::Tool { name, args, .. }
+                        if name == "read" && !args.is_empty()
+                )),
+                "a Tool entry with non-empty args is in the transcript: {:?}",
+                session.state.transcript
             );
         }
 

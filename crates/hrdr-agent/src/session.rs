@@ -758,6 +758,41 @@ impl Session {
         Ok(path)
     }
 
+    /// Write this session's state atomically to an explicit path (used for a
+    /// sub-agent's own state file, a child artifact of its parent session — so
+    /// no cwd-slug id scheme and no open-lock, unlike [`Self::save`]). Creates
+    /// parent dirs. Preserves `created` across rewrites via the same
+    /// created-cache [`Self::save`] uses.
+    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // Keep the original creation time from any file being overwritten — from
+        // the in-process cache when known (see `created_cache`), else one fallback
+        // read. Mirrors `save`'s created-time preservation exactly.
+        let cached = created_cache()
+            .lock()
+            .ok()
+            .and_then(|c| c.get(path).copied());
+        let created = match cached {
+            Some(c) => c,
+            None => {
+                let c = Self::load_path(path).map_or(self.created, |prev| prev.created);
+                if let Ok(mut cache) = created_cache().lock() {
+                    cache.entry(path.to_path_buf()).or_insert(c);
+                }
+                c
+            }
+        };
+        let mut snap = self.clone();
+        snap.created = created;
+        let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
+        crate::write_atomic(path, json.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
     /// Load `<cwd-slug>/<id>.json`; if that doesn't exist, try the compressed
     /// `<cwd-slug>/<id>.json.zst` (retention may have compressed an idle session).
     pub fn load(cwd: &str, id: &str) -> Result<Session> {
@@ -1407,6 +1442,43 @@ mod tests {
             notices(&resumed.persisted()),
             0,
             "warnings do not accrete across resume cycles"
+        );
+    }
+
+    /// `save_to_path` writes to an explicit file (creating parent dirs) and the
+    /// state round-trips back through `load_path` unchanged — the sub-agent
+    /// snapshot primitive.
+    #[test]
+    fn save_to_path_round_trips_through_load_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("subagents").join("000-probe.json");
+        let mut s = state("Sub Agent", "/tmp/proj");
+        s.transcript = vec![Entry::now(EntryKind::Tool {
+            id: "call_1".into(),
+            name: "read".into(),
+            args: "{\"path\":\"x\"}".into(),
+            result: "ok".into(),
+            ok: true,
+            done: true,
+            expanded: false,
+        })];
+        Session::new(s.clone())
+            .save_to_path(&path)
+            .expect("save_to_path writes the file and creates parent dirs");
+        assert!(path.exists(), "the explicit-path file was written");
+
+        let loaded = Session::load_path(&path).expect("round-trips back");
+        assert_eq!(loaded.state.name, "Sub Agent");
+        assert_eq!(loaded.state.cwd, "/tmp/proj");
+        assert_eq!(loaded.state.messages.len(), 1);
+        assert_eq!(loaded.state.messages[0].role, MessageRole::User);
+        assert!(
+            loaded
+                .state
+                .transcript
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::Tool { args, .. } if !args.is_empty())),
+            "the transcript's tool entry (with args) survives the round-trip"
         );
     }
 
