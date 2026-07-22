@@ -474,7 +474,7 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
             for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
                 let selected = i == sel.selected;
                 let detail = truncate_chars(&c.detail, (inner_w / 2).max(1));
-                let label = format!("{}  ({})", c.label, c.name);
+                let label = c.label.clone();
                 let avail = inner_w.saturating_sub(detail.chars().count() + 1).max(1);
                 let label = truncate_chars(&label, avail);
                 let pad = inner_w

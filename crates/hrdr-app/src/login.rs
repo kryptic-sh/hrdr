@@ -53,8 +53,8 @@ fn parse_provider_pick(line: &str, choices: &[LoginProviderChoice]) -> ProviderP
 /// [`login_provider_choices`]).
 fn provider_label(name: &str) -> &'static str {
     match name {
-        "zen" => "OpenCode Zen",
-        "go" => "OpenCode Go",
+        "zen" => "OpenCode Zen/Go",
+        "go" => "OpenCode Zen/Go",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
         "claude" => "Anthropic (Claude)",
@@ -109,14 +109,14 @@ pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
             "openai" => {
                 out.push(LoginProviderChoice {
                     name: "openai".to_string(),
-                    label: "OpenAI (API key)".to_string(),
-                    detail: "API key".to_string(),
+                    label: "OpenAI/ChatGPT".to_string(),
+                    detail: "API Key".to_string(),
                     route: LoginRoute::Key,
                 });
                 out.push(LoginProviderChoice {
                     name: "openai".to_string(),
-                    label: "ChatGPT subscription (browser login)".to_string(),
-                    detail: "browser login".to_string(),
+                    label: "OpenAI/ChatGPT".to_string(),
+                    detail: "OAuth".to_string(),
                     route: LoginRoute::Browser,
                 });
             }
@@ -125,23 +125,36 @@ pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
             "openrouter" => {
                 out.push(LoginProviderChoice {
                     name: "openrouter".to_string(),
-                    label: "OpenRouter (API key)".to_string(),
-                    detail: "API key".to_string(),
+                    label: "OpenRouter".to_string(),
+                    detail: "API Key".to_string(),
                     route: LoginRoute::Key,
                 });
                 out.push(LoginProviderChoice {
                     name: "openrouter".to_string(),
-                    label: "OpenRouter (browser login)".to_string(),
-                    detail: "browser login".to_string(),
+                    label: "OpenRouter".to_string(),
+                    detail: "OAuth".to_string(),
                     route: LoginRoute::Browser,
                 });
             }
+            // OpenCode Zen and Go share one account (the same `OPENCODE_API_KEY`),
+            // so they collapse to a SINGLE login row on the `zen` slot — logging in
+            // there authenticates both. `go` therefore emits no row of its own.
+            "go" => {}
             other => {
                 let keyless = hrdr_agent::builtin_provider(other).is_some_and(|p| !p.remote);
+                let (label, detail) = match other {
+                    "zen" => ("OpenCode Zen/Go", "API Key"),
+                    "claude" => ("Anthropic (Claude)", "API key"),
+                    "local" => ("self-hosted, no key (local)", "no key needed"),
+                    _ => (
+                        provider_label(other),
+                        if keyless { "no key needed" } else { "API key" },
+                    ),
+                };
                 out.push(LoginProviderChoice {
                     name: other.to_string(),
-                    label: provider_label(other).to_string(),
-                    detail: if keyless { "no key needed" } else { "API key" }.to_string(),
+                    label: label.to_string(),
+                    detail: detail.to_string(),
                     route: if keyless {
                         LoginRoute::Keyless
                     } else {
@@ -267,10 +280,13 @@ fn login_dispatch(name: &str, route: LoginRoute, host: &mut dyn CommandHost) -> 
 /// Apply a keyless (self-hosted) endpoint and persist it as the default provider.
 fn apply_keyless(name: &str, host: &mut dyn CommandHost) {
     match apply_provider_or_pick(host, name) {
-        Ok(p) => {
-            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
+        Ok((p, reference)) => {
+            host.persist_setting(
+                "model",
+                hrdr_agent::ConfigValue::Str(&reference.to_string()),
+            );
             host.info(format!(
-                "✓ using {name} ({}). No API key needed; set as your default provider.",
+                "✓ using {name} ({}). No API key needed; set {reference} as your default.",
                 p.base_url
             ));
         }
@@ -303,18 +319,22 @@ pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
         }
     };
     match apply_provider_or_pick(host, name) {
-        Ok(p) => {
-            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
+        Ok((p, reference)) => {
+            host.persist_setting(
+                "model",
+                hrdr_agent::ConfigValue::Str(&reference.to_string()),
+            );
             host.info(format!(
-                "✓ logged in to {name} ({}). Key saved to {saved}; set as your default \
-                 provider.",
+                "✓ logged in to {name} ({}). Key saved to {saved}; set {reference} as your \
+                 default.",
                 p.base_url
             ));
         }
         // `NeedsModel` is not a failure — the picker is already open on this
-        // provider's models, and the key is saved either way.
+        // provider's models, and the key is saved either way. The model isn't
+        // chosen yet, so nothing is persisted here; picking one with the default
+        // shortcut records it as `provider://model`.
         Err(crate::ProviderSwitchError::NeedsModel { .. }) => {
-            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
             host.info(format!("✓ logged in to {name}. Key saved to {saved}."));
         }
         Err(e) => host.info(format!("key saved to {saved}, but the switch failed: {e}")),
@@ -529,16 +549,25 @@ fn browser_login_provider(name: &str) -> Option<&'static str> {
 /// TUI additionally performs a live switch + model refresh.
 pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
     if outcome.token_saved {
-        // Seed a usable default model before persisting, so the next start (this
-        // path does no live switch) lands on a talkable model rather than stalling.
+        // Seed a usable default model, so the next start (this path does no live
+        // switch) lands on a talkable model rather than stalling.
         record_oauth_default_model(&outcome.provider);
-        let _ = hrdr_agent::persist_setting(
-            "provider",
-            hrdr_agent::ConfigValue::Str(&outcome.provider),
-        );
+        // Persist the default as one `provider://model` value — never a separate
+        // `provider` key (the config loader rejects the old split layout). A
+        // provider with a known default model (ChatGPT) is persisted; one without
+        // (OpenRouter) is left for the user's `/model` pick to record.
+        if outcome.provider == "openai" {
+            let _ = hrdr_agent::persist_setting(
+                "model",
+                hrdr_agent::ConfigValue::Str(&format!(
+                    "openai://{}",
+                    hrdr_agent::CHATGPT_DEFAULT_MODEL
+                )),
+            );
+        }
         match outcome.provider.as_str() {
-            "openrouter" => "✓ logged in to OpenRouter. Key saved and set as your default \
-                             — pick a model with /model to use it now."
+            "openrouter" => "✓ logged in to OpenRouter. Key saved — pick a model with /model \
+                             to use it now."
                 .to_string(),
             _ => format!(
                 "✓ signed in with ChatGPT. Tokens saved and set as your default (model \
@@ -789,17 +818,17 @@ mod tests {
                 key.unwrap_or_else(|| panic!("{provider} has a key row")),
                 browser.unwrap_or_else(|| panic!("{provider} has a browser row")),
             );
-            assert_eq!(key.detail, "API key");
-            assert_eq!(browser.detail, "browser login");
+            assert_eq!(key.detail, "API Key");
+            assert_eq!(browser.detail, "OAuth");
             assert_ne!(
-                key.label, browser.label,
-                "{provider} rows are labelled apart"
+                key.detail, browser.detail,
+                "{provider} rows are distinguished by their auth method"
             );
         }
         // Single-route built-ins keep exactly one row, with their existing route.
+        // `go` is intentionally absent — it shares the `zen` OpenCode login row.
         for (provider, route) in [
             ("zen", LoginRoute::Key),
-            ("go", LoginRoute::Key),
             ("claude", LoginRoute::Key),
             ("local", LoginRoute::Keyless),
         ] {
@@ -808,6 +837,14 @@ mod tests {
             assert_eq!(rows.len(), 1, "{provider} offers exactly one row");
             assert_eq!(rows[0].route, route, "{provider} route");
         }
+        // `go` shares OpenCode's key with `zen`, so it emits no login row of its
+        // own; the single `zen` row is labelled for both.
+        assert!(
+            !choices.iter().any(|c| c.name == "go"),
+            "go has no separate login row"
+        );
+        let zen = choices.iter().find(|c| c.name == "zen").unwrap();
+        assert_eq!(zen.label, "OpenCode Zen/Go");
     }
 
     /// A browser login for `openai` (and the ChatGPT aliases a typed name may use)
@@ -899,7 +936,7 @@ mod tests {
             assert!(p.contains(&line), "prompt should list row: {line}\n{p}");
         }
         assert!(
-            p.contains("browser login") && p.contains("API key"),
+            p.contains("OAuth") && p.contains("API Key"),
             "both auth methods are shown"
         );
         assert!(p.contains("/cancel"), "prompt should note how to abort");

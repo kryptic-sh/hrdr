@@ -4655,7 +4655,7 @@ async fn login_modal_flow_masks_the_key_entry() {
     let screen = h.render();
     assert!(screen.contains("OpenAI"), "providers listed:\n{screen}");
     assert!(
-        screen.contains("browser login"),
+        screen.contains("OAuth"),
         "auth-method column:\n{screen}"
     );
 

@@ -664,8 +664,12 @@ impl super::App {
         };
         self.close_model_selector();
         if set_default {
-            self.persist_setting("provider", hrdr_agent::ConfigValue::Str(&c.provider));
-            self.persist_setting("model", hrdr_agent::ConfigValue::Str(&c.model));
+            // One `provider://model` value — never a separate `provider` key, and
+            // never a bare model that loses which provider it's on.
+            self.persist_setting(
+                "model",
+                hrdr_agent::ConfigValue::Str(&format!("{}://{}", c.provider, c.model)),
+            );
         }
         // Scope the host borrow so the confirmation line can be pushed after.
         let line = {
@@ -1009,12 +1013,19 @@ impl super::App {
         hrdr_app::record_oauth_default_model(&outcome.provider);
         {
             let mut host = TuiHost { app: self };
-            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&outcome.provider));
             match hrdr_app::apply_provider_or_pick(&mut host, &outcome.provider) {
-                Ok(p) => host.info(format!(
-                    "✓ signed in to {} ({}). Switched — loading models…",
-                    outcome.provider, p.base_url
-                )),
+                Ok((p, reference)) => {
+                    // Persist the resolved identity as one `provider://model` value
+                    // (never a separate `provider` key the config loader rejects).
+                    host.persist_setting(
+                        "model",
+                        hrdr_agent::ConfigValue::Str(&reference.to_string()),
+                    );
+                    host.info(format!(
+                        "✓ signed in to {} ({}). Switched — loading models…",
+                        outcome.provider, p.base_url
+                    ))
+                }
                 // `NeedsModel` opened the picker on this provider's models: the sign-in
                 // worked, and picking a model is the next step, not an error.
                 Err(hrdr_app::ProviderSwitchError::NeedsModel { .. }) => host.info(format!(

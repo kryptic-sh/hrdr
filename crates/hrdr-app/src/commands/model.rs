@@ -44,7 +44,7 @@ impl std::fmt::Display for ProviderSwitchError {
 pub fn apply_provider(
     host: &mut dyn CommandHost,
     name: &str,
-) -> Result<hrdr_agent::ResolvedProvider, ProviderSwitchError> {
+) -> Result<(hrdr_agent::ResolvedProvider, ModelRef), ProviderSwitchError> {
     let Some(p) = host.resolve_provider(name) else {
         return Err(ProviderSwitchError::Unknown(format!(
             "unknown provider '{name}'"
@@ -60,8 +60,11 @@ pub fn apply_provider(
             message: format!("{e:#}"),
         }
     })?;
-    apply_reference(host, reference, p.context_window, true);
-    Ok(p)
+    apply_reference(host, reference.clone(), p.context_window, true);
+    // Hand the resolved `provider://model` identity back so callers persist it as
+    // the default in that single form — never a separate, now-defunct `provider`
+    // key (config rejects the old split provider/model layout).
+    Ok((p, reference))
 }
 
 /// Switch to provider `name`, and when it cannot name a model, **ask** — open the
@@ -72,7 +75,7 @@ pub fn apply_provider(
 pub fn apply_provider_or_pick(
     host: &mut dyn CommandHost,
     name: &str,
-) -> Result<hrdr_agent::ResolvedProvider, ProviderSwitchError> {
+) -> Result<(hrdr_agent::ResolvedProvider, ModelRef), ProviderSwitchError> {
     let outcome = apply_provider(host, name);
     if let Err(ProviderSwitchError::NeedsModel { provider, message }) = &outcome {
         host.info(format!("{message} — pick one:"));
