@@ -7989,17 +7989,36 @@ mod tests {
 
         impl MockServer {
             async fn start(responses: Vec<MockResp>) -> Self {
+                Self::start_with_hook(responses, |_| {}).await
+            }
+
+            /// Like [`Self::start`], but `on_request(idx)` fires the instant the
+            /// `idx`th request has been read — BEFORE its response is written. That
+            /// gives a test a real happens-before edge at a precise point in the
+            /// exchange: the hook runs to completion before the client can observe
+            /// the response, hence before that turn's `run` returns. (Requests are
+            /// sequential — the agent awaits each response before issuing the next —
+            /// so accept order is request order.)
+            async fn start_with_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
+            where
+                H: Fn(usize) + Send + Sync + 'static,
+            {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = listener.local_addr().unwrap().port();
                 let queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(
                     responses.into_iter().map(MockResp::into_bytes).collect(),
                 ));
+                let on_request = Arc::new(on_request);
                 let handle = tokio::spawn(async move {
+                    let mut req_idx = 0usize;
                     loop {
                         let Ok((mut stream, _)) = listener.accept().await else {
                             break;
                         };
                         let queue = queue.clone();
+                        let on_request = on_request.clone();
+                        let idx = req_idx;
+                        req_idx += 1;
                         tokio::spawn(async move {
                             // Read request headers (up to \r\n\r\n).
                             let mut buf = Vec::new();
@@ -8033,8 +8052,10 @@ mod tests {
                                 let mut body_buf = vec![0u8; remaining];
                                 let _ = stream.read_exact(&mut body_buf).await;
                             }
-                            // Send the next queued response.
+                            // Send the next queued response. Fire the hook first:
+                            // it happens-before the client can observe this reply.
                             if let Some(resp_bytes) = queue.lock().await.pop_front() {
+                                on_request(idx);
                                 let _ = stream.write_all(&resp_bytes).await;
                             }
                         });
@@ -9896,6 +9917,121 @@ mod tests {
                     subagent_transcript::Record::Text { chunk } if chunk.contains("steered reply")
                 )),
                 "the steered reply persists after the run's End: {events:?}"
+            );
+        }
+
+        /// The delegation loop's CONTINUE branch (`continue_or_finish` → true): a
+        /// message that lands on the sub-agent's steering queue AFTER a turn's last
+        /// drain drives a SECOND delegated turn rather than folding into the first.
+        ///
+        /// Made deterministic by the mock's request hook, which enqueues the
+        /// follow-up the instant turn 1's request arrives: that is strictly AFTER
+        /// `run`'s only `drain_steering` for a single-step text turn (the drain
+        /// precedes the request) and BEFORE the response is written (so it
+        /// happens-before `run` returns, hence before `continue_or_finish` reads the
+        /// queue). A text turn never drains again after its request, so the queued
+        /// message can only be consumed as the NEXT turn's opener — exactly the
+        /// continue branch. (The finish branch is covered by the completion tests
+        /// above; the branch decision itself by `continue_or_finish`'s unit tests.)
+        #[tokio::test]
+        async fn a_message_queued_after_a_turn_drives_a_second_delegated_turn() {
+            use super::super::LiveSubagents;
+            use hrdr_tools::Tool;
+
+            let live = LiveSubagents::new();
+            let live_hook = live.clone();
+            let server = MockServer::start_with_hook(
+                vec![
+                    // Turn 1 (the delegated task): one text turn, then stop.
+                    MockResp::Sse(vec![
+                        text_chunk("c1", "delegated answer"),
+                        stop_chunk("c1"),
+                        "[DONE]".to_string(),
+                    ]),
+                    // Turn 2 (the continuation): the reply to the queued follow-up.
+                    MockResp::Sse(vec![
+                        text_chunk("c2", "continuation answer"),
+                        stop_chunk("c2"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |req_idx| {
+                    // On turn 1's request only — after `run`'s sole drain, before its
+                    // response is written — queue a follow-up for the same sub-agent.
+                    if req_idx == 0
+                        && let Some(key) = live_hook.with(|v| v.first().map(|e| e.key))
+                    {
+                        live_hook.enqueue(key, crate::Steer::plain("and now summarise"));
+                    }
+                },
+            )
+            .await;
+
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                ts_dir.path().to_path_buf(),
+            ))));
+            let mut cfg = test_cfg(server.base_url(), cwd.path());
+            cfg.read_only = true;
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                cell,
+                live.clone(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            tool.execute(
+                json!({"prompt": "do the sub task", "description": "probe"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let result = await_background(&tool, &ctx).await;
+
+            // Turn 2 runs ONLY if `continue_or_finish` saw the queued message and
+            // returned true. The mock serves the "continuation answer" response
+            // exactly once — on that second request — so its delivery is the proof
+            // the continue branch fired (a single turn makes a single request).
+            assert!(
+                result.contains("continuation answer"),
+                "the continuation turn ran and its answer was delivered: {result}"
+            );
+
+            let (_, events) = read_events(ts_dir.path());
+            // The follow-up opened turn 2 — recorded as that turn's Steered opener.
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    subagent_transcript::Record::Steered { text } if text == "and now summarise"
+                )),
+                "the queued follow-up opened a second turn: {events:?}"
+            );
+            // Both turns' answers are in the one durable transcript.
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    subagent_transcript::Record::Text { chunk } if chunk.contains("delegated answer")
+                )),
+                "turn 1's answer persists: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    subagent_transcript::Record::Text { chunk }
+                        if chunk.contains("continuation answer")
+                )),
+                "turn 2's answer persists: {events:?}"
             );
         }
 

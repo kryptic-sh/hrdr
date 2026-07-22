@@ -1010,6 +1010,64 @@ mod tests {
         );
     }
 
+    /// `continue_or_finish` is the delegation loop's turn-boundary decision. With
+    /// an EMPTY queue it FINISHES the turn: returns `false`, marks the agent idle,
+    /// and stops its clock.
+    #[test]
+    fn continue_or_finish_finishes_an_empty_queue() {
+        let live = LiveSubagents::new();
+        live.register(entry(1)); // `entry` starts running
+        // The loop leaves the clock ticking before each `run`; start it so the
+        // finish path has something to stop.
+        live.begin_turn(1);
+
+        assert!(
+            !live.continue_or_finish(1),
+            "an empty queue finishes the turn"
+        );
+        assert!(!live.is_running(1), "the agent is marked idle");
+        assert!(
+            !live.turn(1).unwrap().inferring(),
+            "and its turn clock is stopped"
+        );
+    }
+
+    /// With a message already QUEUED it CONTINUES: returns `true`, leaves the agent
+    /// running, and does NOT pop the message — the next `run` drains it as its own
+    /// opener, so it must still be waiting.
+    #[test]
+    fn continue_or_finish_continues_when_a_message_is_queued() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        live.begin_turn(1);
+        live.enqueue(1, crate::Steer::plain("next"));
+
+        assert!(
+            live.continue_or_finish(1),
+            "a queued message keeps the agent running for another turn"
+        );
+        assert!(live.is_running(1), "it stays running");
+        assert!(
+            live.turn(1).unwrap().inferring(),
+            "its turn clock is not stopped"
+        );
+        assert_eq!(
+            live.pending(1),
+            vec!["next".to_string()],
+            "the message is left for the next run to drain, not popped here"
+        );
+    }
+
+    /// An absent key is a no-op: no continuation, and no panic.
+    #[test]
+    fn continue_or_finish_on_an_unknown_key_is_false() {
+        let live = LiveSubagents::new();
+        assert!(
+            !live.continue_or_finish(999),
+            "no entry means no continuation"
+        );
+    }
+
     #[tokio::test]
     async fn handle_exposes_the_retained_agent_and_its_steering_queue() {
         let live = LiveSubagents::new();

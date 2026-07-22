@@ -745,6 +745,58 @@ async fn reasoning_entry_appended_to_transcript() {
     assert!(has_text, "EntryKind::Assistant missing from transcript");
 }
 
+/// The unified input path folds the `Steered` event into a SINGLE user entry —
+/// it does not `push_entry(Entry::user)` one itself. Guards BOTH regressions at
+/// once: a dropped push (0 entries) and a double one (push + fold = 2 entries).
+#[tokio::test]
+async fn a_submitted_message_appears_as_exactly_one_user_entry() {
+    let mut h = Harness::new(vec![MockReply::Text("ack".into())]).await;
+    h.submit("wire up the parser").await;
+
+    let user_entries = h
+        .app
+        .transcript()
+        .iter()
+        .filter(|e| matches!(&e.kind, EntryKind::User(t) if t == "wire up the parser"))
+        .count();
+    assert_eq!(
+        user_entries, 1,
+        "exactly one user entry — not zero (dropped) and not two (double-pushed)"
+    );
+}
+
+/// `/init` runs a HIDDEN turn via `launch_hidden`: the init prompt is pushed
+/// into the model's history as a note, not shown as something the user typed.
+/// The opener-less turn path deliberately emits no `Steered`, so no visible user
+/// entry is folded in — yet the turn still runs and the model replies.
+#[tokio::test]
+async fn init_runs_a_hidden_turn_without_a_visible_user_entry() {
+    let mut h = Harness::new(vec![MockReply::Text("wrote AGENTS.md".into())]).await;
+    h.submit("/init").await;
+    assert!(!h.app.running(), "the hidden turn settled");
+
+    // No user entry at all: neither the `/init` command nor the hidden init
+    // prompt appears as something the user said.
+    let user_entries = h
+        .app
+        .transcript()
+        .iter()
+        .filter(|e| matches!(&e.kind, EntryKind::User(_)))
+        .count();
+    assert_eq!(
+        user_entries, 0,
+        "the hidden init prompt is never shown as a user entry"
+    );
+
+    // But a turn DID run against it: the model's reply is in the transcript.
+    let replied = h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.contains("wrote AGENTS.md")));
+    assert!(replied, "the hidden turn ran and the model replied");
+}
+
 #[tokio::test]
 async fn reasoning_hidden_in_render_after_toggle() {
     // After /reasoning, reasoning text must not appear in the rendered buffer even
