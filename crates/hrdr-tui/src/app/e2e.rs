@@ -3093,6 +3093,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
     h.app.sync_panes();
 
@@ -3166,6 +3167,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
     h.app.sync_panes();
     h.app.focus_pane(hrdr_app::PaneId::Sub(1));
@@ -3267,6 +3269,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
 
     // Its output arrives as ToolOutput on the `task` call that spawned it.
@@ -3420,6 +3423,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         done: true,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
 
     let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -4044,6 +4048,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
 
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -5649,6 +5654,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
     h.app.sync_panes();
 
@@ -5722,6 +5728,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
         done: false,
         delivered: false,
         pinned: false,
+        transcript: None,
     });
     h.app.sync_panes();
 

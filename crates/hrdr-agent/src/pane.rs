@@ -840,6 +840,7 @@ mod tests {
                 done: true,
                 delivered: true,
                 pinned: false,
+                transcript: None,
             });
         }
         live

@@ -158,6 +158,18 @@ fn spawn_background(
     sub.ctx.lsp = lsp;
     let steering = steering_queue();
     let sub = Arc::new(tokio::sync::Mutex::new(sub));
+    // Open the durable transcript first, so a clone can ride on the live-registry
+    // entry (from where `record` writes every event — the delegated run AND any
+    // later steered turn) and its path can go onto the background-task row as a
+    // `task_output` fallback. `None` when it could not be opened (no session dir
+    // yet, or an unwritable one) — best-effort, like every transcript write.
+    let transcript: Option<Arc<Mutex<subagent_transcript::SubagentTranscript>>> =
+        resolve_subagent_dir(&transcript_dir)
+            .and_then(|dir| open_next_subagent_transcript(&dir, &label))
+            .map(|t| Arc::new(Mutex::new(t)));
+    let transcript_path = transcript
+        .as_ref()
+        .and_then(|ts| ts.lock().ok().map(|g| g.path().to_path_buf()));
     live.register(LiveSubagent {
         key: live_key,
         bg_id: Some(id),
@@ -181,18 +193,12 @@ fn spawn_background(
         done: false,
         delivered: false,
         pinned: false,
+        // Every event `record`ed against this agent is appended here — its
+        // delegated run below, and any steered turn driven later via
+        // `send_prompt`, which also goes through `record`. The framing
+        // (`Start`/`End`/`Error`) is written directly, from this scope.
+        transcript: transcript.clone(),
     });
-    // Open the durable transcript first, so its path can go onto the registry
-    // entry as a `task_output` fallback. Shared so the inner task records events
-    // and the outer guard can still write a terminal `End` on panic/cancel.
-    let transcript = Arc::new(Mutex::new(
-        resolve_subagent_dir(&transcript_dir)
-            .and_then(|dir| open_next_subagent_transcript(&dir, &label)),
-    ));
-    let transcript_path = transcript
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|t| t.path().to_path_buf()));
     // The sub-agent's own `SessionState` snapshot lives next to its `.jsonl`
     // crash-trail: the sibling `<stem>.json`. No transcript dir (best-effort,
     // same rule the jsonl uses) means no snapshot. This is the resumable/revivable
@@ -200,8 +206,10 @@ fn spawn_background(
     let sub_json_path = transcript_path.as_ref().map(|p| p.with_extension("json"));
     // The label names the snapshot's session (auto-derived, never user-named).
     let label_for_state = label.clone();
-    if let Ok(mut g) = transcript.lock()
-        && let Some(t) = g.as_mut()
+    // The `Start` frame is written synchronously here, BEFORE the run task is
+    // spawned, so it precedes every event `record` appends for the run.
+    if let Some(ts) = &transcript
+        && let Ok(mut t) = ts.lock()
     {
         t.write(&subagent_transcript::Record::Start {
             model: model_for_live.clone(),
@@ -273,13 +281,13 @@ fn spawn_background(
                         // spent. This is the *only* way a background sub-agent's work
                         // reaches a frontend: its `task` call returned the instant it was
                         // spawned, so there is no live tool call left to stream through.
+                        // `record` also appends the event to this agent's durable
+                        // transcript (it holds the writer), so the jsonl is written
+                        // exactly once, in order, here — and equally for a steered turn,
+                        // which drives `record` through `send_prompt` instead. The
+                        // `Start`/`End`/`Error` framing stays written directly, from the
+                        // spawn scope, around this run.
                         usage_live.record(live_key, &ev);
-                        if let Ok(mut g) = ts_inner.lock()
-                            && let Some(t) = g.as_mut()
-                            && let Some(rec) = subagent_transcript::Record::from_event(&ev)
-                        {
-                            t.write(&rec);
-                        }
                         // On every committed round (a `History` event, emitted with
                         // no dangling tool calls) snapshot the sub-agent's
                         // `SessionState` next to the jsonl. The snapshot carries the
@@ -363,8 +371,8 @@ fn spawn_background(
             match result {
                 Ok(()) => {
                     let o = out.trim().to_string();
-                    if let Ok(mut g) = ts_inner.lock()
-                        && let Some(t) = g.as_mut()
+                    if let Some(ts) = &ts_inner
+                        && let Ok(mut t) = ts.lock()
                     {
                         // The transcript is the durable full record — its byte
                         // count is the whole run, not the (possibly narrower)
@@ -399,8 +407,8 @@ fn spawn_background(
                     }
                 }
                 Err(e) => {
-                    if let Ok(mut g) = ts_inner.lock()
-                        && let Some(t) = g.as_mut()
+                    if let Some(ts) = &ts_inner
+                        && let Ok(mut t) = ts.lock()
                     {
                         t.write(&subagent_transcript::Record::Error {
                             msg: format!("{e:#}"),
@@ -424,8 +432,8 @@ fn spawn_background(
                     .copied()
                     .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("(unknown panic)");
-                if let Ok(mut g) = ts_outer.lock()
-                    && let Some(t) = g.as_mut()
+                if let Some(ts) = &ts_outer
+                    && let Ok(mut t) = ts.lock()
                 {
                     t.write(&subagent_transcript::Record::End {
                         status: subagent_transcript::EndStatus::Panicked,

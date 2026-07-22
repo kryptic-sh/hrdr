@@ -4748,6 +4748,7 @@ mod tests {
                 done: false,
                 delivered: false,
                 pinned: false,
+                transcript: None,
             });
         });
 
@@ -6095,6 +6096,7 @@ mod tests {
                     done: false,
                     delivered: false,
                     pinned: false,
+                    transcript: None,
                 });
             });
             // Also register the main entry so we can verify it survives.
@@ -6226,6 +6228,7 @@ mod tests {
                     done: bg_id == id2,
                     delivered: false,
                     pinned: false,
+                    transcript: None,
                 });
             };
             agent.live_subagents.with(|v| {
@@ -9759,6 +9762,112 @@ mod tests {
                         if name == "read" && !args.is_empty()
                 )),
                 "a Tool entry with non-empty args is in the rebuilt transcript: {rebuilt:?}"
+            );
+        }
+
+        /// A STEERED turn on a finished sub-agent persists to the SAME durable
+        /// jsonl, AFTER the delegated run's `End`.
+        ///
+        /// Regression: the per-event writer used to live inside the delegated
+        /// run's `sub.run(...)` callback, so only the delegated run was written —
+        /// a later steered turn (driven through `send_prompt`, a different task)
+        /// vanished from the on-disk transcript. The writer now rides on the live
+        /// registry entry and is driven from `record`, which BOTH paths call, so
+        /// the durable transcript is complete regardless of which drove the turn.
+        #[tokio::test]
+        async fn a_steered_turn_persists_to_the_durable_transcript() {
+            use super::super::{LiveSubagents, PromptDelivery};
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![
+                // Delegated run: one text turn, then stop.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "delegated answer"),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Steered turn: the reply to a further prompt on the same agent.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "steered reply"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            // Build the tool by hand (not via `transcript_tool`) so the test keeps
+            // a handle on the live registry — it needs it to drive the steered turn.
+            let live = LiveSubagents::new();
+            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                ts_dir.path().to_path_buf(),
+            ))));
+            let mut cfg = test_cfg(server.base_url(), cwd.path());
+            cfg.read_only = true;
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                cell,
+                live.clone(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            // Delegated run to completion.
+            tool.execute(
+                json!({"prompt": "do the sub task", "description": "probe"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let result = await_background(&tool, &ctx).await;
+            assert!(result.contains("delegated answer"), "delivered: {result}");
+
+            // The sub-agent is idle and still registered — drive a FURTHER turn on
+            // it. `send_prompt` spawns the turn; the closure signals when its
+            // `TurnDone` lands, so the assertions run only after the reply is
+            // recorded (and flushed).
+            let key = live.with(|v| v[0].key);
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let mut tx = Some(tx);
+            let delivery = live.send_prompt(key, crate::Steer::plain("now summarise"), move |ev| {
+                if matches!(ev, crate::AgentEvent::TurnDone)
+                    && let Some(tx) = tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            });
+            assert_eq!(delivery, Some(PromptDelivery::StartedTurn));
+            rx.await.expect("the steered turn runs to completion");
+
+            // The jsonl now carries the steered turn AFTER the delegated run's End
+            // — one file, appended to by both paths.
+            let (_, events) = read_events(ts_dir.path());
+            let end_at = events
+                .iter()
+                .position(|e| matches!(e, subagent_transcript::Record::End { .. }))
+                .expect("the delegated run wrote an End frame");
+            let tail = &events[end_at + 1..];
+            assert!(
+                tail.iter().any(|e| matches!(
+                    e,
+                    subagent_transcript::Record::Steered { text } if text == "now summarise"
+                )),
+                "the steered prompt persists after the run's End: {events:?}"
+            );
+            assert!(
+                tail.iter().any(|e| matches!(
+                    e,
+                    subagent_transcript::Record::Text { chunk } if chunk.contains("steered reply")
+                )),
+                "the steered reply persists after the run's End: {events:?}"
             );
         }
 

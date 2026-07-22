@@ -197,6 +197,12 @@ pub struct LiveSubagent {
     /// A frontend is displaying it, so it must be kept even once finished and
     /// delivered. The frontend clears this when it stops showing it.
     pub pinned: bool,
+    /// This agent's durable transcript writer (append-only jsonl), when it has
+    /// one. Every event recorded against this agent — its delegated run OR a
+    /// steered turn — is appended here, so the on-disk transcript is complete
+    /// regardless of which path drove the turn.
+    pub transcript:
+        Option<std::sync::Arc<std::sync::Mutex<crate::subagent_transcript::SubagentTranscript>>>,
 }
 
 impl LiveSubagent {
@@ -280,6 +286,10 @@ impl LiveSubagents {
                 done: false,
                 delivered: false,
                 pinned: true,
+                // The main agent's durable transcript is not written through
+                // this registry (its `.json` session snapshot is its record);
+                // only delegated sub-agents carry a writer here.
+                transcript: None,
             });
         });
     }
@@ -306,6 +316,33 @@ impl LiveSubagents {
             e.turn.record(ev);
             if let Ok(mut log) = e.events.lock() {
                 log.push(ev.clone());
+            }
+            // Append to the agent's durable transcript, if it has one. This is
+            // what makes the on-disk jsonl complete across BOTH a sub-agent's
+            // delegated run and any later steered turn: every event travels
+            // through here, so it is written exactly once, in order, regardless
+            // of which task drove it. Best-effort — a poisoned lock or a failed
+            // write must never break recording.
+            if let Some(ts) = &e.transcript
+                && let Some(rec) = crate::subagent_transcript::Record::from_event(ev)
+            {
+                let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                w.write(&rec);
+            }
+        });
+    }
+
+    /// Append a directly-pushed entry (frontend chrome that persists — a slash
+    /// command's System output, a /diff, a per-turn Stats line) to agent `key`'s
+    /// durable transcript, if it has a writer. The event path is `record`; this is
+    /// its counterpart for entries that never were AgentEvents.
+    pub fn record_pushed(&self, key: u64, entry: &crate::Entry) {
+        self.update(key, |e| {
+            if let Some(ts) = &e.transcript
+                && let Some(rec) = crate::subagent_transcript::Record::pushed(entry)
+            {
+                let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                w.write(&rec);
             }
         });
     }
@@ -665,6 +702,7 @@ mod tests {
             done: false,
             delivered: false,
             pinned: false,
+            transcript: None,
         }
     }
 
@@ -948,6 +986,42 @@ mod tests {
             "one sub-agent's tokens are not another's"
         );
         assert!(live.usage(99).is_none());
+    }
+
+    /// The durable-transcript writer rides on the registry entry, and BOTH
+    /// `record` (event path) and `record_pushed` (directly-pushed chrome) append
+    /// to it. This is what lets a steered turn — which drives `record` from a
+    /// different task than the delegated run — land in the same on-disk jsonl.
+    #[test]
+    fn record_and_record_pushed_write_to_the_durable_transcript() {
+        use crate::subagent_transcript;
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(Mutex::new(
+            subagent_transcript::SubagentTranscript::create(dir.path(), "000-x").unwrap(),
+        ));
+        let path = writer.lock().unwrap().path().to_path_buf();
+
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        // Give the entry a real writer, as a spawned sub-agent's does.
+        live.update(1, |e| e.transcript = Some(writer.clone()));
+
+        live.record(1, &crate::AgentEvent::Text("steered reply".into()));
+        live.record_pushed(1, &crate::Entry::system("a note"));
+
+        let entries = subagent_transcript::read_transcript(&path);
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.kind, crate::EntryKind::Assistant(s) if s == "steered reply")),
+            "the recorded event landed in the jsonl: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.kind, crate::EntryKind::System(s) if s == "a note")),
+            "the pushed entry landed in the jsonl: {entries:?}"
+        );
     }
 
     #[tokio::test]
