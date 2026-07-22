@@ -56,6 +56,8 @@ pub use subagent_live::{
     age_completed_todos, event_log,
 };
 mod subagent_transcript;
+mod transcript;
+pub use transcript::*;
 mod turn;
 pub use turn::TurnStats;
 mod budget;
