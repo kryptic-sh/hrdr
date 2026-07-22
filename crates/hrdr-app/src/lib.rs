@@ -40,15 +40,17 @@ pub use highlight::*;
 pub use history::*;
 pub use login::*;
 pub use palette::*;
-pub use pane::{Pane, PaneId, PaneRow, PaneSet, PaneStatus, PaneView, pane_row_marker, pane_rows};
-// Session persistence moved into hrdr-agent (the core crate). Re-export every
-// moved public item so downstream `hrdr_app::…` uses keep compiling.
+pub use pane::{PaneRow, pane_row_marker, pane_rows};
+// Session persistence and the pane conversation-management core moved into
+// hrdr-agent (the core crate). Re-export every moved public item so downstream
+// `hrdr_app::…` uses keep compiling.
 pub use hrdr_agent::{
     MAX_SESSION_FILE_BYTES, OpenError, Reservation, SaveOutcome, Session, SessionBusy, SessionLock,
     SessionMeta, SessionState, SessionUsage, acquire_open_lock, acquire_session_lock,
     list_sessions, resolve_session, sanitize_name, save_session, session_file_path,
     session_name_from, sessions_dir, subagent_transcript_dir, sweep_sessions, unique_session_id,
 };
+pub use hrdr_agent::{Pane, PaneId, PaneSet, PaneStatus, PaneView};
 pub use sessions::*;
 pub use skills::*;
 pub use status::*;

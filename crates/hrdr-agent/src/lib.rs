@@ -60,6 +60,8 @@ mod transcript;
 pub use transcript::*;
 mod session;
 pub use session::*;
+mod pane;
+pub use pane::*;
 mod turn;
 pub use turn::TurnStats;
 mod budget;
