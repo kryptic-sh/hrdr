@@ -759,9 +759,17 @@ impl Session {
         Ok(path)
     }
 
-    /// Load `<cwd-slug>/<id>.json`.
+    /// Load `<cwd-slug>/<id>.json`; if that doesn't exist, try the compressed
+    /// `<cwd-slug>/<id>.json.zst` (retention may have compressed an idle session).
     pub fn load(cwd: &str, id: &str) -> Result<Session> {
-        Self::load_path(&session_dir(cwd).join(format!("{}.json", sanitize_name(id))))
+        let stem = sanitize_name(id);
+        let json = session_dir(cwd).join(format!("{}.json", stem));
+        let zst = session_dir(cwd).join(format!("{}.json.zst", stem));
+        if json.exists() {
+            Self::load_path(&json)
+        } else {
+            Self::load_path(&zst)
+        }
     }
 
     /// Load a session directly from a file path. The file id isn't stored in the
@@ -967,12 +975,14 @@ pub fn unique_session_id(cwd: &str, name: &str) -> (String, Reservation) {
             format!("{slug}-{i}")
         };
         let json_path = dir.join(format!("{cand}.json"));
+        let zst_path = dir.join(format!("{cand}.json.zst"));
 
         match try_reserve(&dir, &cand) {
             Ok(res) => {
                 // The session may have appeared before this reservation.
-                // Check only after owning the lock — no TOCTOU race.
-                if json_path.exists() {
+                // Check only after owning the lock — no TOCTOU race.  Both
+                // plaintext and retention-compressed forms occupy the id.
+                if json_path.exists() || zst_path.exists() {
                     drop(res); // releases the lock
                     continue;
                 }
