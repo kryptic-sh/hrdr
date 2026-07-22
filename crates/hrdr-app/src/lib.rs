@@ -24,7 +24,6 @@ mod history;
 mod login;
 mod palette;
 mod pane;
-mod session;
 mod sessions;
 mod skills;
 mod status;
@@ -42,7 +41,14 @@ pub use history::*;
 pub use login::*;
 pub use palette::*;
 pub use pane::{Pane, PaneId, PaneRow, PaneSet, PaneStatus, PaneView, pane_row_marker, pane_rows};
-pub use session::*;
+// Session persistence moved into hrdr-agent (the core crate). Re-export every
+// moved public item so downstream `hrdr_app::…` uses keep compiling.
+pub use hrdr_agent::{
+    MAX_SESSION_FILE_BYTES, OpenError, Reservation, SaveOutcome, Session, SessionBusy, SessionLock,
+    SessionMeta, SessionState, SessionUsage, acquire_open_lock, acquire_session_lock,
+    list_sessions, resolve_session, sanitize_name, save_session, session_file_path,
+    session_name_from, sessions_dir, subagent_transcript_dir, sweep_sessions, unique_session_id,
+};
 pub use sessions::*;
 pub use skills::*;
 pub use status::*;

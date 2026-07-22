@@ -58,6 +58,8 @@ pub use subagent_live::{
 mod subagent_transcript;
 mod transcript;
 pub use transcript::*;
+mod session;
+pub use session::*;
 mod turn;
 pub use turn::TurnStats;
 mod budget;

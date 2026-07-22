@@ -13,8 +13,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::Entry;
+use crate::{DEFAULT_MODEL_REF, Message, MessageRole, ModelRef, ModelSpec, cwd_slug};
 use anyhow::{Context, Result};
-use hrdr_agent::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use hrdr_tools::TodoItem;
 use serde::{Deserialize, Serialize};
 
@@ -37,10 +37,10 @@ const SESSION_VERSION: u32 = 2;
 ///
 /// These belong to the **agent**, not to the session — every agent makes its own
 /// calls, fills its own window, and costs its own money — so the type lives in
-/// `hrdr-agent` ([`hrdr_agent::AgentUsage`]) where a sub-agent's counters are
+/// `hrdr-agent` ([`crate::AgentUsage`]) where a sub-agent's counters are
 /// kept with no frontend attached. This alias is the name the session file and
 /// the status bar know it by.
-pub use hrdr_agent::AgentUsage as SessionUsage;
+pub use crate::AgentUsage as SessionUsage;
 
 /// Everything about **one agent's** conversation that outlives the process: what
 /// the user saw, what the model saw, which endpoint/model it ran on, and the
@@ -51,7 +51,7 @@ pub use hrdr_agent::AgentUsage as SessionUsage;
 /// nothing else. Loading is an assignment; saving is a serialize. There is no
 /// lossy rebuild step, and no parallel vectors to keep in sync.
 ///
-/// Every [`crate::Pane`] owns one, main and sub-agent alike: a delegated
+/// Every Pane owns one, main and sub-agent alike: a delegated
 /// sub-agent has a name, a model, a provider, a history and a token bill exactly
 /// as the main agent does, and the only thing that made the main one special was
 /// that it was the one the frontend happened to store.
@@ -188,11 +188,11 @@ impl<'de> Deserialize<'de> for SessionState {
             // A session file never names a provider with no model: it records what an
             // agent RAN on, which is always complete. Treat it as naming nothing.
             (Some(ModelSpec::ProviderOnly(p)), _) => (
-                ModelRef::new(p, hrdr_agent::DEFAULT_MODEL).unwrap_or(default),
+                ModelRef::new(p, crate::DEFAULT_MODEL).unwrap_or(default),
                 false,
             ),
             (Some(ModelSpec::ModelOnly(m)), Some(p)) => (
-                ModelRef::new(hrdr_agent::ProviderName::new(p), &m).unwrap_or(default),
+                ModelRef::new(crate::ProviderName::new(p), &m).unwrap_or(default),
                 false,
             ),
             // v1, model only: the provider is whatever this process is on.
@@ -202,8 +202,7 @@ impl<'de> Deserialize<'de> for SessionState {
                 true,
             ),
             (None, Some(p)) => (
-                ModelRef::new(hrdr_agent::ProviderName::new(p), hrdr_agent::DEFAULT_MODEL)
-                    .unwrap_or(default),
+                ModelRef::new(crate::ProviderName::new(p), crate::DEFAULT_MODEL).unwrap_or(default),
                 false,
             ),
             (None, None) => (default, true),
@@ -242,7 +241,7 @@ impl<'de> Deserialize<'de> for SessionState {
 /// affects the encode side, and both fields are `#[serde(default)]`.
 mod persisted_messages {
     use super::Message;
-    use hrdr_agent::MessageOrigin;
+    use crate::MessageOrigin;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(messages: &[Message], s: S) -> Result<S::Ok, S::Error> {
@@ -314,7 +313,7 @@ impl SessionState {
     pub fn is_saveable(&self) -> bool {
         self.messages
             .iter()
-            .any(|m| m.role == hrdr_agent::MessageRole::User)
+            .any(|m| m.role == crate::MessageRole::User)
     }
 
     /// Adopt a loaded session, settling any tool call that was mid-run when it
@@ -735,7 +734,7 @@ impl Session {
         let mut snap = self.clone();
         snap.created = created;
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
-        hrdr_agent::write_atomic(&path, json.as_bytes())
+        crate::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         // If retention had compressed this session, the plaintext we just wrote
         // is now the live copy — drop the stale `<id>.json.zst` so the two don't
@@ -1226,7 +1225,7 @@ fn compress_session_file(json_path: &Path) -> Result<()> {
     let compressed = zstd::encode_all(&data[..], 3)
         .with_context(|| format!("compressing {}", json_path.display()))?;
     let zst_path = json_path.with_extension("json.zst");
-    hrdr_agent::write_atomic(&zst_path, &compressed)
+    crate::write_atomic(&zst_path, &compressed)
         .with_context(|| format!("writing {}", zst_path.display()))?;
     // Keep the compressed file's mtime equal to the plaintext's, so compression
     // does not reset the "last used" clock the purge phase reads.
@@ -1234,6 +1233,82 @@ fn compress_session_file(json_path: &Path) -> Result<()> {
     // Only now drop the plaintext: the compressed copy is fully written.
     std::fs::remove_file(json_path).with_context(|| format!("removing {}", json_path.display()))?;
     Ok(())
+}
+
+// ── save_session: persistence shared by the frontends ─────────────────────────
+
+/// The result of an auto-save: the session's file id, and whether this call was
+/// the one that first assigned it (so the frontend can notify once).
+pub struct SaveOutcome {
+    pub id: String,
+    pub first_save: bool,
+    /// The freshly-minted session's open-lock, present only on `first_save`. The
+    /// frontend must hold it for as long as the session is active (see
+    /// [`crate::SessionLock`]) so another instance's auto-resume can't adopt this
+    /// brand-new session and collide. `None` on every subsequent save, and on the
+    /// (near-impossible) case that the minted id's open-lock was already held.
+    pub open_lock: Option<crate::SessionLock>,
+}
+
+/// Persist a conversation as a session. Returns `Ok(None)` when there's nothing
+/// worth saving yet (no user message); filesystem failures are returned so a
+/// frontend never claims an unsaved conversation is durable.
+///
+/// `state` is the frontend's whole session state, written as-is apart from the
+/// ephemeral session-chrome notices ([`SessionState::persisted`]). The file id
+/// comes from `state.id` when the session already has one, otherwise a fresh
+/// collision-free id is derived from its name (see [`crate::unique_session_id`])
+/// and reported back as `first_save`.
+pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
+    if !state.is_saveable() {
+        return Ok(None);
+    }
+    let (id, first_save, _reservation, open_lock) = if let Some(id) = &state.id {
+        (id.clone(), false, None, None)
+    } else {
+        let (id, res) = crate::unique_session_id(&state.cwd, &state.name);
+        // Take the per-session open-lock for the freshly-minted id, keyed by the
+        // same directory the file lands in. `.ok()` degrades gracefully: the
+        // brand-new id is unique, so a live open-lock for it is near-impossible;
+        // if the acquire somehow can't take it we still save (just without the
+        // extra guard) rather than erroring the user's first turn.
+        let lock = crate::acquire_session_lock(&state.cwd, &id).ok();
+        (id, true, Some(res), lock)
+    };
+    Session::new(state.persisted()).save(&id)?;
+    // `_reservation` is dropped here. If `save` failed above, the drop
+    // removes the lock file that `unique_session_id` created — no stale
+    // lock is left behind. If `save` succeeded, `save()` already removed
+    // the reservation lock (`.{id}.lock`, distinct from the open-lock); the
+    // second `remove_file` in `Reservation::drop` is benign. `open_lock` is
+    // NOT dropped — it is handed to the caller to hold.
+    Ok(Some(SaveOutcome {
+        id,
+        first_save,
+        open_lock,
+    }))
+}
+
+/// A short session name derived from the first user message (first line, trimmed,
+/// capped at 60 chars). Falls back to `"untitled"` when there's no usable text.
+pub fn session_name_from(msgs: &[Message]) -> String {
+    msgs.iter()
+        .find(|m| m.role == MessageRole::User)
+        .and_then(|m| m.content.as_deref())
+        // The user turn's content carries an immutable model-facing timestamp
+        // prefix; a session name is for humans, so strip it first.
+        .map(crate::strip_user_timestamp)
+        .map(|c| {
+            c.lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "untitled".to_string())
 }
 
 #[cfg(test)]
@@ -2229,24 +2304,6 @@ mod tests {
             assert!(bad.cwd.is_empty(), "corrupt entry has no cwd");
         });
     }
-
-    /// `session_diagnostics` returns only the corrupt entries.
-    #[test]
-    fn session_diagnostics_returns_only_corrupt_files() {
-        with_test_env(|tmp| {
-            let cwd = tmp.path().join("p");
-            std::fs::create_dir(&cwd).unwrap();
-            let cwd = cwd.to_str().unwrap().to_string();
-
-            Session::new(state("valid", &cwd)).save("valid").unwrap();
-            let dir = session_dir(&cwd);
-            std::fs::write(dir.join("broken.json"), "{{{").unwrap();
-
-            let diags = crate::session_diagnostics();
-            assert_eq!(diags.len(), 1);
-            assert!(diags[0].0.ends_with("broken.json"), "path: {}", diags[0].0);
-        });
-    }
 }
 
 #[cfg(test)]
@@ -2478,11 +2535,11 @@ mod roundtrip_audit {
             .to_string();
 
         let steer = Message {
-            origin: hrdr_agent::MessageOrigin::Steering,
+            origin: crate::MessageOrigin::Steering,
             ..Message::user("steer")
         };
         let bg = Message {
-            origin: hrdr_agent::MessageOrigin::BackgroundResult,
+            origin: crate::MessageOrigin::BackgroundResult,
             ..Message::user("bg result")
         };
 
@@ -2511,17 +2568,17 @@ mod roundtrip_audit {
         assert_eq!(back.messages.len(), 3);
         assert_eq!(
             back.messages[0].origin,
-            hrdr_agent::MessageOrigin::User,
+            crate::MessageOrigin::User,
             "default-origin messages retain User"
         );
         assert_eq!(
             back.messages[1].origin,
-            hrdr_agent::MessageOrigin::Steering,
+            crate::MessageOrigin::Steering,
             "Steering origin survives session file"
         );
         assert_eq!(
             back.messages[2].origin,
-            hrdr_agent::MessageOrigin::BackgroundResult,
+            crate::MessageOrigin::BackgroundResult,
             "BackgroundResult origin survives session file"
         );
 
@@ -2530,7 +2587,7 @@ mod roundtrip_audit {
         let parsed: Session = serde_json::from_str(old).unwrap();
         assert_eq!(
             parsed.state.messages[0].origin,
-            hrdr_agent::MessageOrigin::User,
+            crate::MessageOrigin::User,
             "a message without an origin field defaults to User"
         );
     }
@@ -2647,7 +2704,7 @@ mod migration_tests {
         let back: Session = serde_json::from_str(json).unwrap();
         assert_eq!(
             back.state.model.to_string(),
-            hrdr_agent::DEFAULT_MODEL_REF,
+            crate::DEFAULT_MODEL_REF,
             "missing model gets the default"
         );
         assert!(

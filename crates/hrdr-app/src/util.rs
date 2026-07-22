@@ -3,7 +3,7 @@
 //! and small argument parsers (`/goto` durations, `/copy` message ranges,
 //! fenced-code extraction). No UI, no rendering — pure logic + filesystem.
 
-use hrdr_agent::{Message, MessageRole, Todo};
+use hrdr_agent::Todo;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -34,28 +34,6 @@ pub fn age_completed_todos(
             .iter()
             .any(|t| (t.status == "completed" || t.status == "cancelled") && &t.content == content)
     });
-}
-
-/// A short session name derived from the first user message (first line, trimmed,
-/// capped at 60 chars). Falls back to `"untitled"` when there's no usable text.
-pub fn session_name_from(msgs: &[Message]) -> String {
-    msgs.iter()
-        .find(|m| m.role == MessageRole::User)
-        .and_then(|m| m.content.as_deref())
-        // The user turn's content carries an immutable model-facing timestamp
-        // prefix; a session name is for humans, so strip it first.
-        .map(hrdr_agent::strip_user_timestamp)
-        .map(|c| {
-            c.lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .chars()
-                .take(60)
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "untitled".to_string())
 }
 
 /// Expand `@file` mentions in `input` by appending the referenced files'

@@ -28,6 +28,8 @@ glob.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 chrono.workspace = true
+zstd.workspace = true
+filetime.workspace = true
 
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).

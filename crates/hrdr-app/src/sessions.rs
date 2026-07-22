@@ -5,59 +5,7 @@
 //! Resuming itself is per-frontend (it swaps in the saved
 //! [`crate::SessionState`]), so that stays in the frontends.
 
-use crate::{Session, SessionState};
-
-/// The result of an auto-save: the session's file id, and whether this call was
-/// the one that first assigned it (so the frontend can notify once).
-pub struct SaveOutcome {
-    pub id: String,
-    pub first_save: bool,
-    /// The freshly-minted session's open-lock, present only on `first_save`. The
-    /// frontend must hold it for as long as the session is active (see
-    /// [`crate::SessionLock`]) so another instance's auto-resume can't adopt this
-    /// brand-new session and collide. `None` on every subsequent save, and on the
-    /// (near-impossible) case that the minted id's open-lock was already held.
-    pub open_lock: Option<crate::SessionLock>,
-}
-
-/// Persist a conversation as a session. Returns `Ok(None)` when there's nothing
-/// worth saving yet (no user message); filesystem failures are returned so a
-/// frontend never claims an unsaved conversation is durable.
-///
-/// `state` is the frontend's whole session state, written as-is apart from the
-/// ephemeral session-chrome notices ([`SessionState::persisted`]). The file id
-/// comes from `state.id` when the session already has one, otherwise a fresh
-/// collision-free id is derived from its name (see [`crate::unique_session_id`])
-/// and reported back as `first_save`.
-pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
-    if !state.is_saveable() {
-        return Ok(None);
-    }
-    let (id, first_save, _reservation, open_lock) = if let Some(id) = &state.id {
-        (id.clone(), false, None, None)
-    } else {
-        let (id, res) = crate::unique_session_id(&state.cwd, &state.name);
-        // Take the per-session open-lock for the freshly-minted id, keyed by the
-        // same directory the file lands in. `.ok()` degrades gracefully: the
-        // brand-new id is unique, so a live open-lock for it is near-impossible;
-        // if the acquire somehow can't take it we still save (just without the
-        // extra guard) rather than erroring the user's first turn.
-        let lock = crate::acquire_session_lock(&state.cwd, &id).ok();
-        (id, true, Some(res), lock)
-    };
-    Session::new(state.persisted()).save(&id)?;
-    // `_reservation` is dropped here. If `save` failed above, the drop
-    // removes the lock file that `unique_session_id` created — no stale
-    // lock is left behind. If `save` succeeded, `save()` already removed
-    // the reservation lock (`.{id}.lock`, distinct from the open-lock); the
-    // second `remove_file` in `Reservation::drop` is benign. `open_lock` is
-    // NOT dropped — it is handed to the caller to hold.
-    Ok(Some(SaveOutcome {
-        id,
-        first_save,
-        open_lock,
-    }))
-}
+use crate::{SaveOutcome, Session, SessionState, save_session};
 
 /// Async wrapper over [`save_session`]: refresh the state's mirrors of the
 /// agent-owned data (chat messages, TODOs, cwd) under the lock, then persist.
@@ -187,6 +135,65 @@ pub fn filter_sessions(sessions: &[crate::SessionMeta], query: &str) -> Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hrdr_agent::Message;
+    use std::sync::Mutex;
+
+    /// Global lock so env-var-dependent session tests don't race on HOME / XDG
+    /// vars (`std::env::set_var` is not thread-safe in Rust tests). A local copy
+    /// of the helper that lived in `session.rs` before its move to hrdr-agent —
+    /// duplicated here (rather than shared through a re-export) because a
+    /// `#[cfg(test)]` module in one crate is invisible to another crate's tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
+    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+        f(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    /// A saveable state: one user message, named, rooted at `cwd`.
+    fn state(name: &str, cwd: &str) -> SessionState {
+        SessionState {
+            name: name.to_string(),
+            model: "local://model".parse().unwrap(),
+            base_url: "http://x/v1".to_string(),
+            cwd: cwd.to_string(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        }
+    }
+
+    /// `session_diagnostics` returns only the corrupt entries. Relocated here
+    /// from `session.rs`'s test module (which moved to hrdr-agent) because it
+    /// exercises `session_diagnostics`, which stays in hrdr-app.
+    #[test]
+    fn session_diagnostics_returns_only_corrupt_files() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("p");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_str().unwrap().to_string();
+
+            Session::new(state("valid", &cwd)).save("valid").unwrap();
+            // Derive the session directory from a public path helper (the private
+            // `session_dir` used before the move now lives in hrdr-agent).
+            let dir = crate::session_file_path(&cwd, "valid")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::write(dir.join("broken.json"), "{{{").unwrap();
+
+            let diags = session_diagnostics();
+            assert_eq!(diags.len(), 1);
+            assert!(diags[0].0.ends_with("broken.json"), "path: {}", diags[0].0);
+        });
+    }
 
     /// System/assistant-only histories aren't worth persisting → no id, and
     /// (importantly) no file is written.

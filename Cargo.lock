@@ -1216,6 +1216,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "filetime",
  "futures-util",
  "glob",
  "hjkl-xdg",
@@ -1234,6 +1235,7 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit",
  "which",
+ "zstd",
 ]
 
 [[package]]
