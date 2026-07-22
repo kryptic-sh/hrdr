@@ -448,7 +448,6 @@ pub struct GitTool;
 
 #[derive(Deserialize)]
 struct GitArgs {
-    subcommand: String,
     #[serde(default)]
     args: Vec<String>,
 }
@@ -467,59 +466,61 @@ impl Tool for GitTool {
 
     fn description(&self) -> &'static str {
         "Inspect the git repository: status, diff, log, show, blame, branch, describe, \
-         remote, shortlog. Read-only — it cannot commit, checkout, reset or push. Pass the \
-         subcommand's own flags in `args`, e.g. subcommand=\"log\", args=[\"-5\", \"--oneline\"], \
-         or subcommand=\"diff\", args=[\"--staged\"]."
+         remote, shortlog. Read-only — it cannot commit, checkout, reset or push. The first \
+         element of `args` is the subcommand; the rest are its flags, e.g. \
+         args=[\"log\", \"-5\", \"--oneline\"], or args=[\"diff\", \"--staged\"]."
     }
 
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "subcommand": {
-                    "type": "string",
-                    "enum": ALLOWED,
-                    "description": "The read-only git subcommand to run."
-                },
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Arguments for the subcommand, one per element (not a single joined string)."
+                    "description": "The read-only git subcommand as the first element, followed by its arguments — one per element (not a single joined string)."
                 }
             },
-            "required": ["subcommand"]
+            "required": ["args"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: GitArgs = crate::tool_args("git", args)?;
-        let sub = a.subcommand.trim();
+        if a.args.is_empty() {
+            bail!(
+                "`args` must have at least one element — the subcommand. Allowed: {}",
+                ALLOWED.join(", ")
+            );
+        }
+        let sub = a.args[0].as_str().trim();
         if !ALLOWED.contains(&sub) {
             bail!(
                 "`git {sub}` is not available — this tool is read-only. Allowed: {}",
                 ALLOWED.join(", ")
             );
         }
-        if let Some(bad) = forbidden_flag(sub, &a.args) {
+        let sub_args = &a.args[1..];
+        if let Some(bad) = forbidden_flag(sub, sub_args) {
             bail!("`{bad}` is not allowed: it can modify the repository or run a program");
         }
-        if let Some(bad) = escaping_path_arg(sub, &a.args, &ctx.cwd) {
+        if let Some(bad) = escaping_path_arg(sub, sub_args, &ctx.cwd) {
             bail!(
                 "`{bad}` is not allowed: `git {sub}` only reads paths inside the workspace \
                  (no absolute paths, no `..` escapes)"
             );
         }
         if sub == "remote"
-            && let Err(msg) = check_remote_args(&a.args)
+            && let Err(msg) = check_remote_args(sub_args)
         {
             bail!(msg);
         }
         if sub == "branch"
-            && let Err(msg) = check_branch_args(&a.args)
+            && let Err(msg) = check_branch_args(sub_args)
         {
             bail!(msg);
         }
-        if let Some((bad, reason)) = secret_content_operand(sub, &a.args) {
+        if let Some((bad, reason)) = secret_content_operand(sub, sub_args) {
             bail!(
                 "`{bad}` would reveal {reason} — the git tool won't dump a \
                  credential/secret file's content"
@@ -528,7 +529,7 @@ impl Tool for GitTool {
 
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(sub)
-            .args(&a.args)
+            .args(sub_args)
             .current_dir(&ctx.cwd)
             // A pager would hang waiting for a terminal that isn't there.
             .env("GIT_PAGER", "cat")
@@ -614,7 +615,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
 
         let log = GitTool
-            .execute(json!({"subcommand": "log", "args": ["--oneline"]}), &ctx)
+            .execute(json!({"args": ["log", "--oneline"]}), &ctx)
             .await
             .unwrap();
         assert!(log.contains("first"), "{log}");
@@ -622,12 +623,12 @@ mod tests {
         // An unstaged change shows up in status and diff.
         std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
         let status = GitTool
-            .execute(json!({"subcommand": "status", "args": ["--short"]}), &ctx)
+            .execute(json!({"args": ["status", "--short"]}), &ctx)
             .await
             .unwrap();
         assert!(status.contains("a.txt"), "{status}");
         let diff = GitTool
-            .execute(json!({"subcommand": "diff"}), &ctx)
+            .execute(json!({"args": ["diff"]}), &ctx)
             .await
             .unwrap();
         assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
@@ -641,7 +642,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         for sub in ["commit", "checkout", "reset", "push", "clean", "rm"] {
             let err = GitTool
-                .execute(json!({"subcommand": sub}), &ctx)
+                .execute(json!({"args": [sub]}), &ctx)
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("read-only"), "{sub}: {err}");
@@ -656,17 +657,14 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         // `git branch -D main` deletes a branch.
         let err = GitTool
-            .execute(
-                json!({"subcommand": "branch", "args": ["-D", "main"]}),
-                &ctx,
-            )
+            .execute(json!({"args": ["branch", "-D", "main"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
         // `-c` sets config for the invocation, which can point at a program.
         let err = GitTool
             .execute(
-                json!({"subcommand": "log", "args": ["-c", "core.pager=sh -c evil"]}),
+                json!({"args": ["log", "-c", "core.pager=sh -c evil"]}),
                 &ctx,
             )
             .await
@@ -683,7 +681,7 @@ mod tests {
         let marker = dir.path().join("pwned");
         let injected = format!("; touch {}", marker.display());
         let err = GitTool
-            .execute(json!({"subcommand": "log", "args": [injected]}), &ctx)
+            .execute(json!({"args": ["log", injected]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("git log failed"), "{err}");
@@ -696,7 +694,7 @@ mod tests {
         let dir = repo().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(json!({"subcommand": "show", "args": ["nosuchref"]}), &ctx)
+            .execute(json!({"args": ["show", "nosuchref"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("git show failed"), "{err}");
@@ -710,10 +708,7 @@ mod tests {
         let dir = repo().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(
-                json!({"subcommand": "branch", "args": ["-fD", "main"]}),
-                &ctx,
-            )
+            .execute(json!({"args": ["branch", "-fD", "main"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
@@ -728,7 +723,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
             .execute(
-                json!({"subcommand": "diff", "args": ["--no-index", "/etc/passwd", "a.txt"]}),
+                json!({"args": ["diff", "--no-index", "/etc/passwd", "a.txt"]}),
                 &ctx,
             )
             .await
@@ -737,7 +732,7 @@ mod tests {
 
         let err = GitTool
             .execute(
-                json!({"subcommand": "blame", "args": ["--contents", "/etc/passwd", "a.txt"]}),
+                json!({"args": ["blame", "--contents", "/etc/passwd", "a.txt"]}),
                 &ctx,
             )
             .await
@@ -767,16 +762,13 @@ mod tests {
         let dir = repo().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(json!({"subcommand": "diff", "args": ["/etc/passwd"]}), &ctx)
+            .execute(json!({"args": ["diff", "/etc/passwd"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("workspace"), "{err}");
 
         let err = GitTool
-            .execute(
-                json!({"subcommand": "blame", "args": ["../../etc/passwd"]}),
-                &ctx,
-            )
+            .execute(json!({"args": ["blame", "../../etc/passwd"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("workspace"), "{err}");
@@ -800,8 +792,9 @@ mod tests {
             vec!["prune"],
             vec!["set-head", "origin", "-a"],
         ] {
+            let full: Vec<&str> = std::iter::once("remote").chain(args.clone()).collect();
             let err = GitTool
-                .execute(json!({"subcommand": "remote", "args": args.clone()}), &ctx)
+                .execute(json!({"args": full}), &ctx)
                 .await
                 .unwrap_err();
             assert!(
@@ -815,8 +808,11 @@ mod tests {
             vec!["-v".to_string()],
             vec!["show".to_string(), "-n".to_string()],
         ] {
+            let full: Vec<String> = std::iter::once("remote".to_string())
+                .chain(args.clone())
+                .collect();
             GitTool
-                .execute(json!({"subcommand": "remote", "args": args.clone()}), &ctx)
+                .execute(json!({"args": full}), &ctx)
                 .await
                 .unwrap_or_default(); // no remotes configured — empty output is fine
         }
@@ -829,16 +825,13 @@ mod tests {
         let dir = repo().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(
-                json!({"subcommand": "branch", "args": ["new-branch"]}),
-                &ctx,
-            )
+            .execute(json!({"args": ["branch", "new-branch"]}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("only lists branches"), "{err}");
         // Listing (no args, or flags only) still works.
         GitTool
-            .execute(json!({"subcommand": "branch", "args": ["-a"]}), &ctx)
+            .execute(json!({"args": ["branch", "-a"]}), &ctx)
             .await
             .unwrap();
     }
@@ -870,7 +863,7 @@ mod tests {
         let dir = repo_with_secret().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(json!({"subcommand": "show", "args": ["HEAD:.env"]}), &ctx)
+            .execute(json!({"args": ["show", "HEAD:.env"]}), &ctx)
             .await
             .unwrap_err()
             .to_string();
@@ -890,7 +883,7 @@ mod tests {
         let dir = repo_with_secret().await;
         let ctx = ToolContext::new(dir.path());
         let err = GitTool
-            .execute(json!({"subcommand": "blame", "args": [".env"]}), &ctx)
+            .execute(json!({"args": ["blame", ".env"]}), &ctx)
             .await
             .unwrap_err()
             .to_string();
@@ -910,7 +903,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
 
         let out = GitTool
-            .execute(json!({"subcommand": "diff", "args": []}), &ctx)
+            .execute(json!({"args": ["diff"]}), &ctx)
             .await
             .unwrap();
         assert!(
@@ -933,7 +926,7 @@ mod tests {
         let dir = repo_with_secret().await;
         let ctx = ToolContext::new(dir.path());
         let out = GitTool
-            .execute(json!({"subcommand": "show", "args": ["HEAD:a.txt"]}), &ctx)
+            .execute(json!({"args": ["show", "HEAD:a.txt"]}), &ctx)
             .await
             .unwrap();
         assert!(out.contains("one"), "{out}");
@@ -965,10 +958,7 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path());
         let out = GitTool
-            .execute(
-                json!({"subcommand": "show", "args": ["HEAD:big.txt"]}),
-                &ctx,
-            )
+            .execute(json!({"args": ["show", "HEAD:big.txt"]}), &ctx)
             .await
             .unwrap();
         // The model gets a pointer to the saved file, not the whole flood.
@@ -1028,7 +1018,7 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path());
         let out = GitTool
-            .execute(json!({"subcommand": "diff", "args": []}), &ctx)
+            .execute(json!({"args": ["diff"]}), &ctx)
             .await
             .unwrap();
         assert!(
@@ -1051,13 +1041,23 @@ mod tests {
             vec!["--src-prefix=x/".to_string()],
             vec!["--dst-prefix=y/".to_string()],
         ] {
+            let diff_args = {
+                let mut full = vec!["diff".to_string()];
+                full.extend(args.clone());
+                full
+            };
             let err = GitTool
-                .execute(json!({"subcommand": "diff", "args": args.clone()}), &ctx)
+                .execute(json!({"args": diff_args}), &ctx)
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("not allowed"), "{args:?}: {err}");
+            let log_args = {
+                let mut full = vec!["log".to_string()];
+                full.extend(args.clone());
+                full
+            };
             let err = GitTool
-                .execute(json!({"subcommand": "log", "args": args.clone()}), &ctx)
+                .execute(json!({"args": log_args}), &ctx)
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("not allowed"), "{args:?}: {err}");
@@ -1073,7 +1073,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         for arg in [":(top).env", ":/.env"] {
             let err = GitTool
-                .execute(json!({"subcommand": "show", "args": [arg]}), &ctx)
+                .execute(json!({"args": ["show", arg]}), &ctx)
                 .await
                 .unwrap_err()
                 .to_string();

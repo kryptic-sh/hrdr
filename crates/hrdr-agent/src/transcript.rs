@@ -344,21 +344,20 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
         // normalization performed by the tool.
         "todo" => plain(String::new()),
         // Git: show the subcommand and its args inline, like `git status --short`,
-        // rather than rendering each field as a separate details row.
+        // rather than rendering each field as a separate details row. The first
+        // element of `args` is the subcommand; the rest are its flags.
         "git" => {
-            let sub = arg_str(&v, "subcommand").unwrap_or_default();
-            let args_str: String = v
+            let parts: Vec<&str> = v
                 .get("args")
                 .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" {s}"))
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
+            let sub = parts.first().copied().unwrap_or_default();
+            let args_str = if parts.len() > 1 {
+                format!(" {}", parts[1..].join(" "))
+            } else {
+                String::new()
+            };
             plain(format!("{sub}{args_str}"))
         }
         // `task` and every MCP tool: their arguments, one per row.
@@ -809,24 +808,21 @@ mod tool_display_tests {
 
     #[test]
     fn git_shows_subcommand_and_args_inline() {
-        let d = tool_display(
-            "git",
-            r#"{"subcommand":"status","args":["--short","--branch"]}"#,
-        );
+        let d = tool_display("git", r#"{"args":["status","--short","--branch"]}"#);
         assert_eq!(d.headline, "status --short --branch");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_without_args_shows_only_subcommand() {
-        let d = tool_display("git", r#"{"subcommand":"log"}"#);
+        let d = tool_display("git", r#"{"args":["log"]}"#);
         assert_eq!(d.headline, "log");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_with_empty_args_array_shows_only_subcommand() {
-        let d = tool_display("git", r#"{"subcommand":"status","args":[]}"#);
+        let d = tool_display("git", r#"{"args":["status"]}"#);
         assert_eq!(d.headline, "status");
         assert_eq!(d.body, ToolBody::Text);
     }
