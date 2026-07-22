@@ -4654,10 +4654,7 @@ async fn login_modal_flow_masks_the_key_entry() {
     );
     let screen = h.render();
     assert!(screen.contains("OpenAI"), "providers listed:\n{screen}");
-    assert!(
-        screen.contains("OAuth"),
-        "auth-method column:\n{screen}"
-    );
+    assert!(screen.contains("OAuth"), "auth-method column:\n{screen}");
 
     // Narrow to OpenAI (remote, key-based) and continue → the key phase.
     h.type_str("openai");

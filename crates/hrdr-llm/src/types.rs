@@ -341,10 +341,14 @@ pub struct Usage {
     #[serde(default)]
     pub completion_tokens: u32,
     /// OpenAI-style breakdown of the prompt (`cached_tokens` = prompt-cache hits).
-    #[serde(default)]
+    /// `null_as_default`: some backends (e.g. GLM) send the key explicitly as
+    /// `null` rather than omitting it — `#[serde(default)]` alone only fills an
+    /// *absent* field, so a present `null` would fail to deserialize the struct.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub prompt_tokens_details: TokenDetails,
-    /// OpenAI-style breakdown of the completion (`reasoning_tokens`).
-    #[serde(default)]
+    /// OpenAI-style breakdown of the completion (`reasoning_tokens`). Same
+    /// `null_as_default` handling as `prompt_tokens_details` above.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub completion_tokens_details: TokenDetails,
 }
 
@@ -667,6 +671,31 @@ mod tests {
             serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5}"#).unwrap();
         assert_eq!(plain.cached_tokens(), None);
         assert_eq!(plain.reasoning_tokens(), None);
+        // Some backends (GLM) send the details key EXPLICITLY as `null` rather
+        // than omitting it — `#[serde(default)]` alone only covers a missing key,
+        // so without `null_as_default` this whole chunk failed to decode.
+        let nulled: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":18894,"completion_tokens":27,"total_tokens":18921,
+                "prompt_tokens_details":null}"#,
+        )
+        .unwrap();
+        assert_eq!(nulled.prompt_tokens, 18894);
+        assert_eq!(nulled.cached_tokens(), None);
+        assert_eq!(nulled.reasoning_tokens(), None);
+    }
+
+    #[test]
+    fn chat_chunk_tolerates_glm_terminal_tool_calls_chunk() {
+        // The exact terminal chunk GLM-5.2 emits: finish_reason=tool_calls with an
+        // empty/null delta and a usage block whose `prompt_tokens_details` is null.
+        let data = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1784680698,
+            "model":"glm-5.2","choices":[{"index":0,"finish_reason":"tool_calls","logprobs":null,
+            "delta":{"role":"assistant","content":"","reasoning_content":null,"tool_calls":null}}],
+            "usage":{"prompt_tokens":18894,"completion_tokens":27,"total_tokens":18921,
+            "prompt_tokens_details":null}}"#;
+        let c: ChatChunk = serde_json::from_str(data).expect("GLM terminal chunk decodes");
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(c.usage.unwrap().prompt_tokens, 18894);
     }
 
     #[test]
