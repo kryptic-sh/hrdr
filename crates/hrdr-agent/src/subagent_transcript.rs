@@ -43,7 +43,7 @@ pub enum EndStatus {
 /// results — plus the `Start`/`End`/`Error` framing needed for orphan
 /// detection. Serialized with a `t` discriminator so a reader can dispatch on
 /// the record kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Record {
     Start {
@@ -90,6 +90,10 @@ pub enum Record {
         /// never collected. A size hint only; it gates nothing.
         bytes: usize,
     },
+    /// A transcript entry pushed directly (not derived from an AgentEvent):
+    /// slash-command System output, a /diff Diff, a per-turn Stats line, the
+    /// Header marker. Logged verbatim and replayed as-is on read.
+    Pushed(Box<crate::Entry>),
 }
 
 impl Record {
@@ -129,6 +133,18 @@ impl Record {
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TurnDone => None,
         }
+    }
+
+    /// A record for a directly-pushed entry, or `None` if it must never be
+    /// persisted (`EntryKind::Notice` — ephemeral session chrome).
+    // The main-agent write site (a later slice) is its non-test consumer; for
+    // now only the round-trip test exercises it.
+    #[allow(dead_code)]
+    pub fn pushed(entry: &crate::Entry) -> Option<Record> {
+        if matches!(entry.kind, crate::EntryKind::Notice(_)) {
+            return None;
+        }
+        Some(Record::Pushed(Box::new(entry.clone())))
     }
 
     /// Map this record back to the `AgentEvent` the shared reducer expects, if
@@ -171,6 +187,8 @@ impl Record {
             Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
             Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
             Record::End { .. } => None,
+            // A pushed entry is replayed verbatim, not through the event fold.
+            Record::Pushed(_) => None,
         }
     }
 }
@@ -267,10 +285,24 @@ pub fn read_transcript(path: &Path) -> Vec<crate::Entry> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(rec) = serde_json::from_str::<Record>(&line)
-            && let Some(ev) = rec.as_event()
-        {
-            crate::apply_event(&mut entries, &ev);
+        let Ok(rec) = serde_json::from_str::<Record>(&line) else {
+            continue;
+        };
+        match rec {
+            // A directly-pushed entry replays as-is, preserving log order.
+            // `content_hash` is `#[serde(skip)]`, so rebuild it after the push.
+            Record::Pushed(entry) => {
+                entries.push(*entry);
+                if let Some(last) = entries.last_mut() {
+                    last.refresh_hash();
+                }
+            }
+            // Everything else folds through the shared event reducer.
+            other => {
+                if let Some(ev) = other.as_event() {
+                    crate::apply_event(&mut entries, &ev);
+                }
+            }
         }
     }
     entries
@@ -481,6 +513,131 @@ mod tests {
             bytes: 9,
         });
         assert!(is_complete(&path), "End line => complete");
+    }
+
+    /// A main-agent transcript interleaves two record sources: entries derived
+    /// from the `AgentEvent` stream (folded through the shared reducer) and
+    /// entries pushed directly by the frontend (`System`/`Diff`/`Stats`/`Header`,
+    /// logged verbatim). A `Pushed(Entry::notice(..))` is ephemeral chrome and
+    /// must never be persisted. This round-trips a mixed sequence and asserts the
+    /// folded transcript reconstructs in log order, losslessly, minus the notice.
+    #[test]
+    fn read_transcript_round_trips_pushed_and_event_records_in_order() {
+        use crate::{AgentEvent, EntryKind};
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = SubagentTranscript::create(dir.path(), "004-main").unwrap();
+
+        // Written order: user turn, slash-command output, assistant reply, a
+        // tool call (args + result), a /diff, a per-turn stats line, and a
+        // notice that must be dropped.
+        t.write(&Record::from_event(&AgentEvent::Steered("audit the config".into())).unwrap());
+        t.write(&Record::pushed(&crate::Entry::system("/help output")).unwrap());
+        t.write(&Record::from_event(&AgentEvent::Text("looking now".into())).unwrap());
+        t.write(
+            &Record::from_event(&AgentEvent::ToolStart {
+                id: "call-1".into(),
+                name: "read".into(),
+                args: r#"{"path":"config.toml"}"#.into(),
+            })
+            .unwrap(),
+        );
+        t.write(
+            &Record::from_event(&AgentEvent::ToolEnd {
+                id: "call-1".into(),
+                name: "read".into(),
+                result: "port = 8080".into(),
+                ok: true,
+            })
+            .unwrap(),
+        );
+        t.write(&Record::pushed(&crate::Entry::diff("@@ -1 +1 @@\n-a\n+b")).unwrap());
+        t.write(&Record::pushed(&crate::Entry::stats("1 tool · 0.4s")).unwrap());
+        // Ephemeral chrome: `pushed` refuses it, so nothing is written.
+        assert!(
+            Record::pushed(&crate::Entry::notice("chrome")).is_none(),
+            "a Notice entry must never yield a record"
+        );
+
+        let entries = read_transcript(&dir.path().join("004-main.jsonl"));
+
+        // The pushed System/Diff/Stats entries survive with their text.
+        let system = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::System(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("pushed System entry present");
+        assert_eq!(system, "/help output");
+        let diff = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::Diff(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("pushed Diff entry present");
+        assert!(diff.contains("+b"), "diff text survives: {diff}");
+        let stats = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::Stats(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("pushed Stats entry present");
+        assert_eq!(stats, "1 tool · 0.4s");
+
+        // The event-derived tool entry carries its args AND result.
+        let tool = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::Tool { args, result, .. } => Some((args.clone(), result.clone())),
+                _ => None,
+            })
+            .expect("folded Tool entry present");
+        assert!(
+            tool.0.contains("config.toml"),
+            "tool args survive: {}",
+            tool.0
+        );
+        assert!(tool.1.contains("8080"), "tool result survives: {}", tool.1);
+
+        // The assistant text folded from the event stream is present.
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::Assistant(s) if s == "looking now")),
+            "assistant text present"
+        );
+
+        // The Notice was never logged, so it can't come back.
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::Notice(_))),
+            "an ephemeral Notice must be absent"
+        );
+
+        // Overall ordering matches the written sequence.
+        let kinds: Vec<&EntryKind> = entries.iter().map(|e| &e.kind).collect();
+        assert!(
+            matches!(kinds.as_slice(),
+                [
+                    EntryKind::User(u),
+                    EntryKind::System(_),
+                    EntryKind::Assistant(_),
+                    EntryKind::Tool { .. },
+                    EntryKind::Diff(_),
+                    EntryKind::Stats(_),
+                ] if u == "audit the config"
+            ),
+            "reconstructed in log order: {kinds:?}"
+        );
+
+        // Every entry (pushed included) has its skipped content_hash rebuilt.
+        assert!(
+            entries.iter().all(|e| e.content_hash != 0),
+            "pushed entries get their content_hash refreshed on read"
+        );
     }
 
     #[test]
