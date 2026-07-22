@@ -519,7 +519,7 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
 ///
 /// Performs a blocking `getaddrinfo` for hostnames, so async callers must run
 /// it on the blocking pool (`spawn_blocking`) rather than on a runtime worker.
-fn is_blocked_host(url: &str) -> bool {
+pub(crate) fn is_blocked_host(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) => u.host_str().is_some_and(is_internal_host),
         Err(_) => false,
@@ -529,7 +529,7 @@ fn is_blocked_host(url: &str) -> bool {
 /// The non-blocking half of the host check on an already-parsed URL — used by
 /// the redirect policy, whose closure is synchronous and must not block on DNS.
 /// See [`is_internal_host_literal`].
-fn is_blocked_url_literal(url: &reqwest::Url) -> bool {
+pub(crate) fn is_blocked_url_literal(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(is_internal_host_literal)
 }
 

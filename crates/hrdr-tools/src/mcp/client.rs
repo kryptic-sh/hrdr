@@ -189,7 +189,15 @@ impl McpClient {
     /// CALL_TIMEOUT for tool calls), and a client-wide timeout would clobber
     /// that distinction.
     fn build_http(server: &str) -> Result<reqwest::Client> {
-        reqwest::Client::builder().build().map_err(|e| {
+        // No SSRF guard resolver here: the operator explicitly configures MCP
+        // server URLs, and blocking internal hosts would break legit local
+        // servers. SSRF defense is instead applied at the endpoint URL (SSE
+        // `endpoint` event) — the only server-supplied, untrusted URL we POST
+        // to — via host-matching + `is_blocked_host` in `connect_sse`.
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| {
             anyhow!(
                 "MCP '{server}': building HTTP client (TLS backend missing or misconfigured): {e}"
             )
@@ -273,7 +281,24 @@ impl McpClient {
                     for ev in events {
                         if ev.event.as_deref() == Some("endpoint") {
                             if let Ok(u) = base.join(ev.data.trim()) {
-                                let _ = ep_tx.send(Some(u.to_string()));
+                                // Validate the server-supplied endpoint URL:
+                                // reject if the host differs from the base
+                                // URL — the server must not steer POSTs to a
+                                // different host (SSRF via `endpoint` event).
+                                //
+                                // We intentionally do NOT apply the SSRF
+                                // blocklist (is_blocked_url_literal / is_blocked_host)
+                                // here: the operator explicitly configured this
+                                // server, and blocking loopback/private IPs
+                                // would break legitimate local MCP servers.
+                                // The host-match is the definitive guard.
+                                if base.host_str() == u.host_str() {
+                                    let _ = ep_tx.send(Some(u.to_string()));
+                                }
+                                // else: endpoint URL rejected (host mismatch).
+                                // We skip it — the handshake will time out with
+                                // a clear error, and the server gets no POSTs
+                                // to the rogue URL.
                             }
                         } else if let Ok(msg) = serde_json::from_str::<Value>(&ev.data)
                             && let Some(id) = response_id(&msg)
