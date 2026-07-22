@@ -258,11 +258,6 @@ fn spawn_background(
             // context; `out` (and the durable transcript) still exist so a
             // run that ends mid-tool-call with no closing text has a fallback.
             let mut final_segment = String::new();
-            // The sub-agent's display transcript, built in-loop by the shared
-            // reducer exactly as a pane/frontend would — the snapshot's
-            // `transcript` field. Declared out here so the completion-time final
-            // persist (below the loop) can still read it.
-            let mut sub_transcript: Vec<crate::Entry> = Vec::new();
             let result: anyhow::Result<()> = async {
                 // Open its record with the task it was given, so its transcript shows
                 // the question and not just the answer.
@@ -285,14 +280,15 @@ fn spawn_background(
                         {
                             t.write(&rec);
                         }
-                        // Build the sub-agent's display transcript in-loop (the
-                        // same shared reducer a pane uses — do NOT re-read the
-                        // jsonl each round), and on every committed round (a
-                        // `History` event, emitted with no dangling tool calls)
-                        // snapshot its full `SessionState` next to the jsonl.
-                        // Best-effort: a failed save must never break the run,
-                        // exactly like the jsonl writes above.
-                        crate::apply_event(&mut sub_transcript, &ev);
+                        // On every committed round (a `History` event, emitted with
+                        // no dangling tool calls) snapshot the sub-agent's
+                        // `SessionState` next to the jsonl. The snapshot carries the
+                        // model-facing `messages` (which the jsonl does not hold) plus
+                        // metadata; the `transcript` is left EMPTY on purpose — it is
+                        // the sibling jsonl, folded back with `read_transcript` on
+                        // load — so a round does not re-serialize the whole transcript
+                        // it already appended one line of. Best-effort: a failed save
+                        // must never break the run, like the jsonl writes above.
                         if let AgentEvent::History(messages) = &ev
                             && let Some(path) = &sub_json_path
                         {
@@ -303,7 +299,7 @@ fn spawn_background(
                                 base_url: sub_base_url.clone(),
                                 cwd: sub_cwd.clone(),
                                 messages: messages.clone(),
-                                transcript: sub_transcript.clone(),
+                                transcript: Vec::new(),
                                 usage: usage_live.usage(live_key).unwrap_or_default(),
                                 todos: Vec::new(),
                                 ..Default::default()
@@ -345,8 +341,9 @@ fn spawn_background(
             // Final `SessionState` snapshot from the agent's settled history: the
             // closing assistant text lands AFTER the last `History` event, so the
             // in-loop saves above miss it. Read the retained agent's final messages
-            // (the method the main agent's autosave uses) and rebuild the state the
-            // same way. Best-effort, like the jsonl writes.
+            // (the method the main agent's autosave uses); the transcript stays in
+            // the jsonl (rebuilt on load), so the snapshot is messages + metadata.
+            // Best-effort, like the jsonl writes.
             if let Some(path) = &sub_json_path {
                 let messages = sub.lock().await.messages_owned();
                 let state = crate::SessionState {
@@ -356,7 +353,7 @@ fn spawn_background(
                     base_url: sub_base_url.clone(),
                     cwd: sub_cwd.clone(),
                     messages,
-                    transcript: sub_transcript.clone(),
+                    transcript: Vec::new(),
                     usage: live.usage(live_key).unwrap_or_default(),
                     todos: Vec::new(),
                     ..Default::default()

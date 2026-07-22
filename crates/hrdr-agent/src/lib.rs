@@ -9740,16 +9740,25 @@ mod tests {
                 "the sub-agent's turn is in messages: {:?}",
                 session.state.messages
             );
-            // The full display transcript carries the tool call WITH its args —
-            // proof the snapshot is the complete stream, not a lossy summary.
+            // The snapshot does NOT duplicate the transcript — that lives in the
+            // sibling jsonl (folded back with `read_transcript` on load), so a round
+            // never re-serializes it.
             assert!(
-                session.state.transcript.iter().any(|e| matches!(
+                session.state.transcript.is_empty(),
+                "the snapshot omits the transcript (rebuilt from the jsonl): {:?}",
+                session.state.transcript
+            );
+            // Rebuilt from the jsonl, the transcript carries the tool call WITH its
+            // args — proof the record is the complete stream, not a lossy summary.
+            let rebuilt =
+                crate::subagent_transcript::read_transcript(&json_path.with_extension("jsonl"));
+            assert!(
+                rebuilt.iter().any(|e| matches!(
                     &e.kind,
                     crate::EntryKind::Tool { name, args, .. }
                         if name == "read" && !args.is_empty()
                 )),
-                "a Tool entry with non-empty args is in the transcript: {:?}",
-                session.state.transcript
+                "a Tool entry with non-empty args is in the rebuilt transcript: {rebuilt:?}"
             );
         }
 
