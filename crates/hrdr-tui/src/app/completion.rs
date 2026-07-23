@@ -12,6 +12,9 @@ impl super::App {
     /// token is being typed. Both feed the same popup; only how the accepted
     /// item is inserted differs (see [`CompletionKind`]).
     pub(crate) fn active_completions(&mut self) -> Option<Completions> {
+        if self.suppress_completions {
+            return None;
+        }
         let content = self.editor.content();
         let slash = slash_completions(&content);
         if !slash.is_empty() {

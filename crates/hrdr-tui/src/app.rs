@@ -355,6 +355,10 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     /// Selected row in the completion popup (slash command or `@file`).
     pub(crate) completion_idx: usize,
+    /// When true, `active_completions()` returns `None` so Up/Down keys
+    /// fall through to history navigation instead of being intercepted
+    /// by the completion popup. Set by history recall, cleared on typing.
+    suppress_completions: bool,
     /// Submitted-input history + Up/Down browsing (from the shared core).
     history: hrdr_app::HistoryBrowser,
     /// Cached relative file paths under the cwd, for `@file` completion.
@@ -632,6 +636,7 @@ impl App {
             config_mtime: current_config_mtime(),
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
+            suppress_completions: false,
             history: hrdr_app::HistoryBrowser::load(),
             file_index: Vec::new(),
             file_index_cwd: None,
@@ -1026,6 +1031,7 @@ impl App {
             return self.submit_input(input);
         }
 
+        self.suppress_completions = false;
         self.editor.feed_key(ekey);
         Action::None
     }
@@ -2080,6 +2086,7 @@ impl App {
 
     /// Recall the previous (older) submission into the input.
     fn history_prev(&mut self) {
+        self.suppress_completions = true;
         let current = self.editor.content();
         if let Some(text) = self.history.recall_prev(&current) {
             self.editor.set_content(&text);
@@ -2088,6 +2095,7 @@ impl App {
 
     /// Move toward newer submissions; past the newest, restore the draft.
     fn history_next(&mut self) {
+        self.suppress_completions = true;
         if let Some(text) = self.history.recall_next() {
             self.editor.set_content(&text);
         }
