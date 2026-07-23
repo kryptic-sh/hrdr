@@ -308,6 +308,10 @@ mod tests {
         // A degraded high-context model ends its turn on a promise instead of
         // doing the work — the prompt names that pattern and forbids stopping there.
         assert!(p.contains("Before ending your turn, check your last paragraph"));
+        // A new instruction mid-task is queued, not a replacement: ack, finish the
+        // current work, then take it up — unless told to stop the current work.
+        assert!(p.contains("is ADDITIONAL work, not a"));
+        assert!(p.contains("unless the user explicitly tells you to stop it"));
         assert!(
             p.contains("that\n  work is not done: do it now, with tool calls, in this same turn")
         );
