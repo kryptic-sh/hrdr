@@ -1951,16 +1951,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    /// A complete identity from its wire form — what a config carries now.
-    fn r(s: &str) -> super::ModelRef {
-        s.parse().expect("a valid provider://model")
-    }
-
-    /// What a `--model` / `task.model` / profile `model` names: a whole identity or
-    /// a bare model id on the provider in force.
-    fn spec(s: &str) -> super::ModelSpec {
-        s.parse().expect("a valid model spec")
-    }
+    use crate::model_ref::{r, spec};
 
     /// A new conversation starts from the `AGENTS.md` that is on disk *now*, and
     /// says so when that differs from what was in the prompt.
@@ -10625,10 +10616,7 @@ mod tests {
 #[cfg(test)]
 mod one_key_identity_tests {
     use super::*;
-
-    fn spec(s: &str) -> ModelSpec {
-        s.parse().expect("a valid model spec")
-    }
+    use crate::model_ref::spec;
 
     /// A config still carrying the split keys does not start — and the refusal names
     /// the file, echoes the values the user actually wrote, and prints the ONE line
@@ -10771,10 +10759,7 @@ mod one_key_identity_tests {
 #[cfg(test)]
 mod provider_only_policy_tests {
     use super::*;
-
-    fn spec(s: &str) -> ModelSpec {
-        s.parse().expect("a valid model spec")
-    }
+    use crate::model_ref::spec;
 
     fn cfg_on(model: &str) -> AgentConfig {
         AgentConfig {

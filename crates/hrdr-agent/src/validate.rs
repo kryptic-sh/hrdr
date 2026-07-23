@@ -335,12 +335,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::model_ref::r;
     use crate::{CHATGPT_CODEX_BASE_URL, ProviderConfig, resolve};
     use serde_json::json;
-
-    fn r(s: &str) -> ModelRef {
-        s.parse().unwrap()
-    }
 
     fn cfg() -> AgentConfig {
         AgentConfig::default()

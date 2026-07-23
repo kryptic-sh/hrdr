@@ -446,16 +446,13 @@ fn scalar_element_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_ref::spec;
 
     /// Parse a file that must parse, and must carry a profile.
     fn parse(text: &str, stem: &str) -> SubagentProfile {
         parse_agent_file(text, stem)
             .expect("parses")
             .expect("a profile")
-    }
-
-    fn spec(s: &str) -> crate::ModelSpec {
-        s.parse().expect("a valid model spec")
     }
 
     #[test]

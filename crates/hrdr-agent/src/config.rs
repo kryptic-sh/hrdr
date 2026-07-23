@@ -422,7 +422,7 @@ pub struct AgentConfig {
 /// delegate to, so a sub-agent can run on a different model — or a different
 /// **provider** — than the main agent (e.g. Opus on Anthropic manages, a model on
 /// another provider implements).
-#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
 pub struct SubagentProfile {
     /// Name the model refers to (the `task` tool's `agent` argument).
     pub name: String,
@@ -487,7 +487,7 @@ impl SubagentProfile {
 }
 
 /// A user-defined provider from `[providers.<name>]` in config.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct ProviderConfig {
     /// OpenAI-compatible base URL (including the `/v1` suffix).
     pub base_url: String,

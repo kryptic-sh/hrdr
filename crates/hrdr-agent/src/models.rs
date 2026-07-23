@@ -561,6 +561,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::model_ref::r;
+
     /// The whole promise, tested the way it will be broken: a test that calls the real
     /// state-writing code with **no fixture, no harness, no helper** — exactly what a
     /// new contributor writes — and cannot reach the developer's files anyway.
@@ -579,11 +581,6 @@ mod tests {
         hrdr_test_support::assert_sandboxed(&path);
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("a-model-nobody-uses"));
-    }
-
-    /// A `provider://model` identity, for the tests that speak in them.
-    fn r(s: &str) -> ModelRef {
-        s.parse().unwrap()
     }
 
     fn catalog() -> Value {

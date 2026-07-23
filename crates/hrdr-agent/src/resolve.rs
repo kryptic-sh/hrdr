@@ -315,6 +315,7 @@ pub(crate) fn derived_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_ref::r;
     use crate::{ProviderConfig, builtin_provider, context_window_for};
 
     /// A config with no `[providers.*]` entries: every name resolves to a built-in.
@@ -340,10 +341,6 @@ mod tests {
             headers: HashMap::new(),
             api_version: None,
         }
-    }
-
-    fn r(s: &str) -> ModelRef {
-        s.parse().unwrap()
     }
 
     /// PARITY: every built-in resolves to exactly what `builtin_provider` says —
