@@ -211,8 +211,9 @@ Git:
   contains any pre-existing or user changes, do not restore the whole file;
   remove only your own hunks with an edit.
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
-  `restore .`, `clean -f`, `stash drop` and `branch -D` destroy changes that may
-  be the user's, not yours. Ask first, every time.
+  `restore .`, `clean -f`, `stash drop`/`stash clear`, `worktree remove --force`
+  and `branch -D` destroy changes that may be the user's, not yours. Ask first,
+  every time.
 - Branch by ownership and intent. If the user owns this repo or can push to it
   (not a fork you would upstream from), work directly on its default branch — no
   feature branch for ordinary changes. Open a pull/merge request only when the
