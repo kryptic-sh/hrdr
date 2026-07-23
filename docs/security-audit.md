@@ -42,44 +42,11 @@ that fixed it. Items with a residual left after the fix are tracked in **Open**.
 | L8  | Catalog cache not `0600` — `OpenOptionsExt::mode(0o600)`      | `910ccee` | —        |
 | L9  | Hooks docs misleading — noted they bypass the guardrails      | `e314853` | —        |
 | L10 | Windows hook path quotes unescaped — `"` → `""`               | `e314853` | O5       |
+| O1  | Force-push guardrail bypass via `'"--force` mid-command quote  | `5a2f644` | —        |
 
 ---
 
 ## Open findings (from the 2026-07-23 remediation re-review, most-severe first)
-
-### O1 — MEDIUM: M3 remediation is ineffective; the force-push quote bypass still fires
-
-**`crates/hrdr-tools/src/guardrails.rs`** — `strip_unbalanced_quotes` (~L428),
-force-push rule (L54: `\bgit\s+push\b[^&|;]*\s(--force(\s|$|['\x22;&|])|…)`)
-
-The M3 fix (commit `e314853`) replaced the unbalanced-quote fallback with
-`strip_unbalanced_quotes`, which only strips quote characters at the **string
-edges**. The bypass M3 documented, `git push '"--force`, has the quotes
-**mid-command** (right after `git push `), so stripping the edges changes
-nothing. Verified empirically:
-
-```
-git push '"--force  →  shell_words split_ok=false
-                       strip_unbalanced_quotes = "git push '\"--force" (unchanged)
-                       check_guardrails = None  (NOT blocked)
-```
-
-The force regex needs whitespace immediately before `--force`; here it is
-preceded by `"`, so it never matches. The added tests only cover **balanced**
-quoting (`git push "--force"`), which tokenization already handled — there is no
-test for the actual M3 example, which is why the ineffective fix passed CI. (The
-fix _does_ help a leading-quote-on-whole-command variant, `"git push --force`,
-which is not what M3 describes.)
-
-**Scenario:** unchanged from M3 — the model writes `git push '"--force`; the
-guardrail still does not fire. Guardrails are a "safety net against model
-mistakes, not a security boundary," but the fix claims to close a hole it does
-not.
-
-**Fix:** on the `shell_words::split` error path, strip **all** quote characters
-(or match a quote-removed copy) rather than only edge quotes —
-`git push '"--force` → `git push --force` → matches. Add a test asserting the
-exact `git push '"--force` (and the single-quote mirror) is blocked.
 
 ---
 

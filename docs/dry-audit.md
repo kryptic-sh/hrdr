@@ -59,43 +59,27 @@ split explicitly.
 `cfg()`/`cfg_with()` are duplicated across `validate.rs` and `resolve.rs` (both
 in `hrdr-agent`). `lib.rs` tests have no equivalent at all.
 
-### 4a. `fn r(s: &str) -> ModelRef` — 4 identical copies (WET)
+### 4a. `fn r(s: &str) -> ModelRef` — 4 identical copies → DRY ✅
 
-| File          | Line |
-| ------------- | ---- |
-| `models.rs`   | 585  |
-| `resolve.rs`  | 345  |
-| `validate.rs` | 341  |
-| `lib.rs`      | 1955 |
+**Fixed** (`56b76ab`): one `pub(crate) fn r` in `model_ref.rs` (#[cfg(test)]),
+removed 4 copies from `models.rs`, `resolve.rs`, `validate.rs`, `lib.rs`.
 
-Each: `s.parse().unwrap()` (or `.expect(…)`). Test-only — one `pub(crate)` in
-`model_ref.rs` or a shared test-helper module would replace all four.
+### 4b. `fn spec(s: &str) -> ModelSpec` — 4 copies → DRY ✅
 
-### 4b. `fn spec(s: &str) -> ModelSpec` — 3 copies in `lib.rs` alone (WET)
+**Fixed** (`56b76ab`): one `pub(crate) fn spec` in `model_ref.rs` (#[cfg(test)]),
+removed 3 copies from `lib.rs` and 1 from `agents_dir.rs`.
 
-`lib.rs:1961`, `lib.rs:10629`, `lib.rs:10775` — three `#[cfg(test)]` modules
-that can't see each other. Identical body:
-`s.parse().expect("a valid model spec")`.
+### 4c. `ProviderConfig` — no `Default` impl → DRY ✅
 
-### 4c. `ProviderConfig` — no `Default` impl (WET)
+**Fixed** (`56b76ab`): `ProviderConfig` now derives `Default`.
 
-`ProviderConfig` (`config.rs:491`) has `#[serde(default)]` on 8/9 fields, but no
-`Default` impl. Every test construction must list all 9 fields — **25+ sites**
-across `lib.rs`, `resolve.rs`, `validate.rs`, `models.rs`. Most use identical
-defaults (`key_env: None, api_key: None, model: None, remote: None, …`). Only
-`base_url` (required) and occasionally `api_key`/`model` differ.
+### 4d. `SubagentProfile` — no `Default` impl → DRY ✅
 
-`resolve.rs:332` has a `provider_config(base_url)` helper with all defaults —
-but it's module-private. `validate.rs:349` does the same thing inline.
+**Fixed** (`56b76ab`): `SubagentProfile` now derives `Default`.
 
-### 4d. `SubagentProfile` — no `Default` impl (WET)
-
-`SubagentProfile` (`config.rs:426`) has `#[serde(default)]` on 9/10 fields but
-no `Default`. **~11 test sites** set most fields to `None`.
-
-**Fix**: Add `Default` for `ProviderConfig` (with `base_url: String::new()`) and
-a `SubagentProfile::new(name)` constructor. `hrdr-tui` tests would need a
-`test-utils` feature gate.
+**Remaining**: `cfg()`/`cfg_with()` duplication across `validate.rs` and
+`resolve.rs`; `lib.rs` test modules have no equivalent helper. `AgentConfig`
+inline constructions (~60 sites) not yet consolidated.
 
 ## 5. Session management layering — DRY ✅
 
