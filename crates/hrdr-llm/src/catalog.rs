@@ -24,6 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use crate::capped_read::MAX_STRUCTURED_JSON_BYTES;
+
 /// Where the catalog is fetched from, unless `HRDR_MODELS_URL` says otherwise.
 const DEFAULT_URL: &str = "https://models.dev";
 
@@ -292,7 +294,9 @@ async fn fetch() -> Option<Value> {
     if !resp.status().is_success() {
         return None;
     }
-    resp.json::<Value>().await.ok()
+    crate::capped_read::read_capped_json(resp, MAX_STRUCTURED_JSON_BYTES)
+        .await
+        .ok()
 }
 
 /// Write the catalog to `path` via a temporary file in the same directory, so a
@@ -310,9 +314,21 @@ fn write_cache(path: &std::path::Path, v: &Value) {
         return;
     }
     let tmp = crate::unique_sibling_path(path, "hrdr-tmp");
-    if serde_json::to_string(v)
+    let Some(s) = serde_json::to_string(v).ok() else { return; };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if opts
+        .open(&tmp)
         .ok()
-        .and_then(|s| std::fs::write(&tmp, s).ok())
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(s.as_bytes()).ok()
+        })
         .is_some()
     {
         let _ = std::fs::rename(&tmp, path);

@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
@@ -452,7 +453,10 @@ impl Client {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let backend = detect_backend(&base_url);
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("reqwest client"),
             base_url,
             api_key,
             model: model.into(),
@@ -607,6 +611,11 @@ impl Client {
     /// request builder: `x-api-key` + `anthropic-version` for the native
     /// Anthropic backend, else `Bearer`.
     fn auth(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        // Apply operator-configured extra headers first so the auth header
+        // (applied next) always wins — avoids ambiguity from header ordering.
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
         if let Some(key) = &self.api_key {
             req = match self.backend {
                 Backend::Anthropic => req
@@ -619,9 +628,6 @@ impl Client {
                 // this only covers the best-effort `/models` + `/props` GETs.
                 Backend::OpenAi | Backend::Codex => req.bearer_auth(key),
             };
-        }
-        for (k, v) in &self.extra_headers {
-            req = req.header(k, v);
         }
         req
     }
