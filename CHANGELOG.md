@@ -6,18 +6,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-23
+
 ### Added
 
-- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing a
-  pasted error — parses the error, traces backward to the root cause, applies
-  the minimal fix, and verifies it.
-- **`:test` built-in skill.** New `:test` skill for writing tests against the
-  current change and iterating until green — discovers the project's test
-  framework and conventions, covers happy-path, edge cases, and regression
-  paths.
-- **`:todo` built-in skill.** New `:todo` skill for reporting what remains to be
-  done from the current session context — unfinished items, deferred decisions,
-  half-finished work, and scratch files.
+- **Session retention.** A peer-aware background worker zstd-compresses idle
+  sessions after a week and purges auto-named (never user-named) ones after a
+  month. Compression and purge ages are configurable via config,
+  `HRDR_SESSION_COMPRESS_AFTER` / `HRDR_SESSION_PURGE_AFTER`, and CLI flags.
+- **Per-session open lock.** Only one hrdr instance may hold a session open at a
+  time; a second instance resuming the same session is refused and can instead
+  open an independent forked copy of it.
+- **`:plan` built-in skill.** Produces an implementation plan for a task.
+- **`:tidy` built-in skill.** Simplifies and cleans code without changing
+  behavior.
+- **`:fix` built-in skill.** Root-causes and fixes a pasted error — parses it,
+  traces backward to the root cause, applies the minimal fix, and verifies it.
+- **`:test` built-in skill.** Writes tests against the current change and
+  iterates until green — discovers the project's test framework and conventions
+  and covers happy-path, edge, and regression cases.
+- **`:todo` built-in skill.** Reports what remains from the current session —
+  unfinished items, deferred decisions, half-finished work, and scratch files.
+- **Skills accept trailing free text as extra context** after a declared arg.
+- **Key-or-browser login for `openai` and `openrouter`.** `/login` now offers an
+  API-key entry and a browser login for each: for `openai` the browser route is
+  the ChatGPT subscription OAuth flow (stored as OAuth); for `openrouter` a PKCE
+  flow that mints an API key. A successful ChatGPT login seeds `gpt-5.5` as the
+  default so the session is immediately usable.
+- **Environment-key warning.** hrdr warns when an API key is read from the
+  environment rather than from the stored credential.
+- **`grep` hints literal/multiline mode** when a pattern fails to parse as
+  regex.
+
+### Changed
+
+- **Sharper sub-agent delegation.** Prompt guidance for PR/MR branching by
+  repository ownership, committing at each checkpoint, and rebasing before
+  fast-forwarding sub-agent work back into the parent tree; a write brief that
+  names the parent checkout's absolute path is now rewritten to project-relative
+  paths (which resolve inside the sub-agent's worktree) instead of being
+  rejected.
+- **`:simplify` renamed to `:tidy`.**
+- **TODO panel yields to active sub-agents.** The TUI hides the TODO list while
+  any delegated sub-agent is running, then restores it when all sub-agents are
+  idle or finished.
+
+### Fixed
+
+- **GLM streaming.** Usage chunks carrying explicit `null` token-details now
+  decode instead of erroring the stream.
+- **Login persists the model as `provider://model`** and consolidates the
+  `/login` provider list into one entry per provider.
+- **Size caps on AGENTS.md, agent profiles, and skill discovery** (silent
+  truncation under the TUI), so a large project doc can't blow the context
+  budget.
+- **Input history** up/down no longer gets stuck on slash-command entries.
+- **Delegated-output duplication and bare merge messages** in sub-agent runs.
+- **Wire-log paths reject pre-existing symlinks.** `HRDR_LOG_REQUESTS` refuses
+  symbolic links and other non-regular targets before initial open and rotation
+  reopen, preventing accidental writes through an existing link.
+- **Plain input wraps at word boundaries,** hard-wrapping oversized words and
+  keeping Unicode-aware row counts and cursor placement aligned with rendering.
+
+### Security
+
+- **Security & correctness audit remediated** (see `docs/security-audit.md`):
+  MCP SSE endpoint host validation (SSRF); LSP path-escape fallback;
+  `read`/`write`/`edit` secret-file TOCTOU and secret-target guards; shell
+  guardrail nesting-depth and unbalanced-quote bypasses; `git` tool subcommand
+  hardening; OAuth token `Debug` leaks, expiry-arithmetic overflow, and
+  non-constant-time CSRF `state` comparison; HTTP client default timeout, header
+  precedence, and bounded JSON reads.
 
 ### Breaking
 
@@ -37,41 +96,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   old files are not read or converted; re-run `/login` to repopulate.
   `auth.json` is on the read-tool secret deny-list. Public credential APIs are
   unchanged.
-
-### Added
-
-- **Key-or-browser login for `openai` and `openrouter`.** `/login` now offers
-  two routes for each: an API-key entry and a browser login. For `openai` the
-  browser route is the ChatGPT subscription OAuth flow (stored as OAuth); for
-  `openrouter` it is the PKCE flow that mints an API key. A successful ChatGPT
-  login seeds `gpt-5.5` as the default so the session is immediately usable.
-- **`:fix` built-in skill.** New `:fix` skill for root-causing and fixing a
-  pasted error — parses the error, traces backward to the root cause, applies
-  the minimal fix, and verifies it.
-- **`:test` built-in skill.** New `:test` skill for writing tests against the
-  current change and iterating until green — discovers the project's test
-  framework and conventions, covers happy-path, edge cases, and regression
-  paths.
-- **`:todo` built-in skill.** New `:todo` skill for reporting what remains to be
-  done from the current session context — unfinished items, deferred decisions,
-  half-finished work, and scratch files.
-
-### Changed
-
-- **TODO panel yields to active sub-agents.** The TUI hides the TODO list while
-  any delegated sub-agent is running, then restores it when all sub-agents are
-  idle or finished.
-
-### Fixed
-
-- **Wire-log paths reject pre-existing symlinks.** `HRDR_LOG_REQUESTS` now
-  refuses symbolic links and other non-regular targets before initial open and
-  rotation reopen, preventing accidental writes and permission changes through
-  an existing link.
-- **Plain input wraps at word boundaries.** The non-Vim input box now moves
-  whole words when they fit on the next visual row, hard-wraps oversized words,
-  and keeps Unicode-aware row counts and cursor placement aligned with
-  rendering.
 
 ### Removed
 
@@ -3147,7 +3171,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/kryptic-sh/hrdr/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/kryptic-sh/hrdr/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/hrdr/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kryptic-sh/hrdr/compare/v0.5.2...v0.6.0
