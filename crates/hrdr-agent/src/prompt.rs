@@ -862,6 +862,18 @@ mod tests {
         assert!(p.contains("New behaviour ships with its test"));
     }
 
+    /// The prompt tells the agent it has durable memory and to use it proactively
+    /// — recall it, save corrections/preferences/decisions, prune what's wrong —
+    /// so the `memory` tool is actually used unprompted.
+    #[test]
+    fn the_prompt_encourages_durable_memory() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, None, false).unwrap();
+        assert!(p.contains("durable memory that persists across sessions"));
+        assert!(p.contains("Save durable, reusable facts with the `memory` tool"));
+        assert!(p.contains("Do NOT save what the repo"));
+    }
+
     /// A shell-capable agent gets the verify loop, and is told to let the
     /// formatter/linter auto-fix (write mode) rather than run them check-only.
     #[test]
