@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -50,20 +52,52 @@ impl Tool for ReadTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ReadArgs = crate::tool_args("read", args)?;
         let path = ctx.resolve(&a.path);
+
+        // Open the file first so the handle is fixed before any path resolution —
+        // this closes the TOCTOU window between secret-file validation and reading.
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+
+        // Validate the path is not a secret file.
         crate::guard_secret_read(&path)?;
-        if let Ok(meta) = tokio::fs::metadata(&path).await
-            && meta.len() > MAX_READ_BYTES
+
+        // On Unix, prove the opened descriptor is the same object that
+        // canonicalization validated. If any path component was swapped between
+        // open and validation, reject it.
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::MetadataExt;
+            let opened = file.metadata()?;
+            let canon = crate::canonicalize_nearest(&path);
+            let validated = std::fs::metadata(&canon)
+                .with_context(|| format!("statting canonical {}", canon.display()))?;
+            if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
+                bail!(
+                    "{} changed while it was being validated — re-read the file",
+                    path.display()
+                );
+            }
+        }
+
+        // Check file size from the open handle (not a separate stat).
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("statting {}", path.display()))?
+            .len();
+        if file_len > MAX_READ_BYTES {
             bail!(
                 "{} is {} bytes, over this tool's {MAX_READ_BYTES}-byte cap — it's too large to \
                  load whole; use `grep` to search it or `bash` (`sed`/`head`/`tail`) to slice out \
                  the range you need",
                 path.display(),
-                meta.len()
+                file_len
             );
         }
-        let text = match tokio::fs::read_to_string(&path).await {
-            Ok(t) => t,
+
+        // Read from the already-opened handle.
+        let mut text = String::new();
+        match file.read_to_string(&mut text) {
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 bail!(
                     "{} is not a text file (invalid UTF-8) — this tool only reads text; \
@@ -74,7 +108,7 @@ impl Tool for ReadTool {
             Err(e) => {
                 return Err(e).with_context(|| format!("reading {}", path.display()));
             }
-        };
+        }
         let start = a.offset.unwrap_or(1).max(1);
         let limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
         let total_lines = text.lines().count();

@@ -42,6 +42,13 @@ impl Tool for WriteTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: WriteArgs = crate::tool_args("write", args)?;
         let path = ctx.resolve(&a.path);
+        if let Some(reason) = crate::secret_file_reason(&crate::canonicalize_nearest(&path)) {
+            bail!(
+                "refusing to write to {}: {reason} — secret/credential files are off-limits to \
+                 the write/edit tools; if the user genuinely needs this, they must provide it",
+                path.display()
+            );
+        }
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         if existed {
             // A `write` replaces the whole file, so the model must have seen the

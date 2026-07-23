@@ -2,8 +2,9 @@
 //!
 //! * **File hooks** ([`Hook`], [`run_file_hooks`]) — run after `edit`/`write`
 //!   mutate a matching file. Formatters, mostly (`cargo fmt`,
-//!   `prettier --write`). Mechanical like the guardrails: a config rule the
-//!   model can't forget. The mutating tool re-reads the file *after* hooks
+//!   `prettier --write`). Like the guardrails, a config rule the model can't
+//!   forget — but hooks are operator-configured and intentionally bypass the
+//!   command guardrails. The mutating tool re-reads the file *after* hooks
 //!   run, so the diff the model sees (and the text its next `old_string`
 //!   must match) is the post-hook content.
 //! * **Lifecycle hooks** ([`EventHook`], [`run_event_hooks`]) — run on agent
@@ -56,7 +57,7 @@ impl Hook {
 /// Substitute `{path}` with the shell-quoted file path.
 fn render_command(template: &str, path: &Path) -> String {
     let quoted = if cfg!(windows) {
-        format!("\"{}\"", path.display())
+        format!("\"{}\"", path.display().to_string().replace('"', "\"\""))
     } else {
         // POSIX single-quote escaping: ' -> '\''.
         format!("'{}'", path.display().to_string().replace('\'', r"'\''"))

@@ -227,12 +227,16 @@ fn extract_shell_c_args(cmd: &str) -> Vec<String> {
 /// appears inside a quoted string *argument* (e.g. `rg 'git add -A'`) does not
 /// false-positive, while a quoted *flag* (`git push "--force"`) is still caught.
 /// Nested `sh -c '...'` payloads are extracted and re-scanned recursively
-/// (depth ≤ 4) so a model cannot bypass the rules by wrapping them in a subshell.
+/// (capped by cumulative payload size, not depth) so a model cannot bypass the
+/// rules by wrapping them in a subshell.
 pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a str> {
     check_guardrails_depth(command, rails, 0)
 }
 
-/// hrdr's `task_*` tools. They are hrdr tools, not executables, so a shell can
+/// Maximum cumulative byte length of extracted nested shell `-c` payloads
+/// before the guardrails recursion stops. This bounds work without an arbitrary
+/// depth limit that 5+ levels of `sh -c` nesting would defeat.
+const MAX_NESTED_PAYLOAD_BYTES: usize = 64 * 1024;
 /// never run them — a model that shells one out is (wrongly) trying to poll a
 /// background task, which just errors in a loop.
 const TASK_TOOLS: &[&str] = &[
@@ -350,7 +354,11 @@ fn is_env_assignment(word: &str) -> bool {
     }
 }
 
-fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) -> Option<&'a str> {
+fn check_guardrails_depth<'a>(
+    command: &str,
+    rails: &'a [Guardrail],
+    accumulated: usize,
+) -> Option<&'a str> {
     // A `task_*` hrdr tool shelled out (a background-task poll) — parsed with
     // quote/operator awareness rather than a regex, so a quoted or argument
     // mention doesn't false-positive. `&'static` coerces to the rails lifetime.
@@ -372,9 +380,12 @@ fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) 
     // wrapping them in a subshell (e.g. `bash -c 'git add -A'`). Legitimate
     // nested shells are rare; re-scanning is preferred over blanket-blocking
     // (which would reject valid `ssh host 'sh -c ...'`-style uses).
-    if depth < 4 {
+    // Bounded by cumulative payload size, not depth, so 5+ levels of nesting
+    // can't defeat the re-scan as long as the total stays under the limit.
+    let new_accumulated = accumulated + command.len();
+    if new_accumulated <= MAX_NESTED_PAYLOAD_BYTES {
         for payload in extract_shell_c_args(command) {
-            if let Some(msg) = check_guardrails_depth(&payload, rails, depth + 1) {
+            if let Some(msg) = check_guardrails_depth(&payload, rails, new_accumulated) {
                 return Some(msg);
             }
         }
@@ -396,7 +407,8 @@ fn check_guardrails_depth<'a>(command: &str, rails: &'a [Guardrail], depth: u8) 
 ///
 /// Falls back to the raw command when the line can't be word-split (unbalanced
 /// quotes — malformed, and the shell would reject it too; err toward matching so
-/// a real command isn't hidden behind a stray quote).
+/// a real command isn't hidden behind a stray quote). Before falling back, strips
+/// leading/trailing unmatched quote characters that could defeat the regex match.
 fn tokenized_for_match(cmd: &str) -> String {
     match shell_words::split(cmd) {
         Ok(words) => words
@@ -404,8 +416,32 @@ fn tokenized_for_match(cmd: &str) -> String {
             .map(|w| w.replace(char::is_whitespace, "\u{1}"))
             .collect::<Vec<_>>()
             .join(" "),
-        Err(_) => cmd.to_string(),
+        Err(_) => strip_unbalanced_quotes(cmd),
     }
+}
+
+/// Strip leading and trailing quote characters (`"`, `'`) from `s` when the
+/// total count of that quote character is odd — i.e. the opener or closer
+/// has no mate. This addresses the concrete bypass where an unmatched quote
+/// before a flag (`'"--force`) defeats the whitespace-anchored regex after
+/// `shell_words::split` errors out.
+fn strip_unbalanced_quotes(s: &str) -> String {
+    let trimmed = s.trim();
+    let mut result = trimmed.to_string();
+
+    // Unmatched double quotes: odd total count -> strip from edges.
+    if result.chars().filter(|&c| c == '"').count() % 2 != 0 {
+        result = result.trim_start_matches('"').to_string();
+        result = result.trim_end_matches('"').to_string();
+    }
+
+    // Unmatched single quotes: odd total count -> strip from edges.
+    if result.chars().filter(|&c| c == '\'').count() % 2 != 0 {
+        result = result.trim_start_matches('\'').to_string();
+        result = result.trim_end_matches('\'').to_string();
+    }
+
+    result
 }
 
 #[cfg(test)]
