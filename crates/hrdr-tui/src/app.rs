@@ -22,11 +22,11 @@ use crate::theme::Theme;
 
 mod commands;
 mod completion;
+use completion::CompletionKind;
 mod selector;
 mod session;
 mod util;
 
-use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{display_dir, git_branch, is_known_command, is_quit_command};
@@ -874,9 +874,13 @@ impl App {
             return Action::None;
         }
 
-        // Completion popup (slash command or `@` mention): Tab accepts the
-        // selection, Up/Down move it, Enter accepts; a slash Enter then
-        // submits, an `@` mention Enter just inserts and keeps editing.
+        // Completion popup (slash command, `@` mention, argument): Tab and Enter
+        // both accept the selection into the input; Up/Down move it. Neither
+        // submits — accepting the completion and sending the message are two
+        // distinct presses, so Enter here just fills the box and the *next* Enter
+        // (with nothing left to accept) sends it. Tab keeps the popup live so a
+        // command's argument completions can follow; Enter suppresses it so the
+        // next Enter submits — typing anything clears that and completions return.
         if key.modifiers.is_empty()
             && let Some(comp) = self.active_completions()
         {
@@ -896,11 +900,19 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Enter => {
-                    self.apply_completion(&comp, self.completion_idx.min(last), false);
-                    self.completion_idx = 0;
-                    // A mention just inserts; a slash command falls through
-                    // to the submit path below so it runs.
-                    if matches!(comp.kind, CompletionKind::Mention { .. }) {
+                    let idx = self.completion_idx.min(last);
+                    // A mention is part of composing a message, and a suggestion
+                    // the user has not yet typed in full is something to accept —
+                    // in both cases Enter fills the input and does NOT submit; the
+                    // next Enter (popup now suppressed) sends it. Only a command or
+                    // argument the user already typed in full has nothing left to
+                    // accept, so Enter there submits in one press, as before.
+                    let accept_only = matches!(comp.kind, CompletionKind::Mention { .. })
+                        || !self.completion_is_exact(&comp, idx);
+                    if accept_only {
+                        self.apply_completion(&comp, idx, true);
+                        self.completion_idx = 0;
+                        self.suppress_completions = true;
                         return Action::None;
                     }
                 }

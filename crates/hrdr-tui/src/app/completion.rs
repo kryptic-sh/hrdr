@@ -80,8 +80,9 @@ impl super::App {
         None
     }
     /// Apply the selected completion. `trailing_space` adds a space after the
-    /// inserted text (Tab keeps editing; a slash Enter omits it so the bare
-    /// command submits).
+    /// inserted text — Tab and Enter both pass `true` (accept into the input and
+    /// keep editing); the `false` path is kept for callers that want the bare
+    /// token with no trailing space.
     pub(super) fn apply_completion(
         &mut self,
         comp: &Completions,
@@ -115,6 +116,42 @@ impl super::App {
             }
         }
     }
+    /// Whether the highlighted completion is one the user has already typed in
+    /// full — so there is nothing left to accept and Enter should submit rather
+    /// than re-insert it. Compares the chosen label against the token already in
+    /// the input, per completion kind.
+    pub(super) fn completion_is_exact(&self, comp: &Completions, idx: usize) -> bool {
+        let chosen = comp.items[idx].0.as_str();
+        let content = self.editor.content();
+        match comp.kind {
+            // A command/skill is "already typed in full" when it dispatches as-is
+            // — NOT merely when it equals the highlighted suggestion. `/clear` is a
+            // real command even though the popup surfaces its canonical `/new`, so
+            // comparing against the suggestion would wrongly treat it as partial.
+            CompletionKind::Slash => hrdr_app::is_known_command(content.trim()),
+            CompletionKind::Skill => {
+                let name = content.trim().trim_start_matches(':');
+                !name.is_empty()
+                    && self
+                        .skills
+                        .iter()
+                        .any(|s| s.name.eq_ignore_ascii_case(name))
+            }
+            CompletionKind::Arg { token_start } => {
+                content.get(token_start..).map(str::trim) == Some(chosen)
+            }
+            // Mentions never reach this (Enter always accepts them), but keep the
+            // arm total: the `@…` token minus its sigil, already fully typed.
+            CompletionKind::Mention { token_start } => {
+                content
+                    .get(token_start..)
+                    .and_then(|t| t.strip_prefix('@'))
+                    .map(str::trim)
+                    == Some(chosen)
+            }
+        }
+    }
+
     /// Build (and cache) the list of files under the cwd, then rank by `query`.
     fn file_completion_items(&mut self, query: &str) -> Vec<(String, String)> {
         self.ensure_file_index();

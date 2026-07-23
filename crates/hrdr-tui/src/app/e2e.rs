@@ -5625,6 +5625,57 @@ async fn argument_completion_offers_values_and_tab_fills_the_argument() {
     assert_eq!(h.app.editor.content(), "/theme dracula ");
 }
 
+/// Enter on the popup ACCEPTS the highlighted suggestion into the input — it
+/// does not submit. Accepting a completion and sending are two distinct presses:
+/// the first Enter fills the box (and suppresses the popup), the second sends it.
+#[tokio::test]
+async fn enter_accepts_a_partial_completion_then_a_second_enter_submits() {
+    let mut h = Harness::new(vec![]).await;
+    // A partial slash command: the popup completes to /timestamps.
+    h.type_str("/timestamp");
+    assert!(
+        h.render().contains("/timestamps"),
+        "popup offers /timestamps"
+    );
+
+    // First Enter accepts the suggestion into the input; it does NOT submit
+    // (submitting would clear the box).
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app.editor.content(),
+        "/timestamps ",
+        "Enter filled the command into the box without sending it"
+    );
+
+    // The popup is suppressed, so the second Enter submits — the input clears.
+    h.press(KeyCode::Enter);
+    assert!(
+        h.app.editor.content().is_empty(),
+        "the second Enter sent the message"
+    );
+}
+
+/// A command the user has already typed in full still submits on the FIRST
+/// Enter — there is nothing left to accept. This holds even when the popup
+/// surfaces the command's canonical alias (`/clear` → suggestion `/new`): the
+/// typed command dispatches as-is rather than being replaced by the suggestion.
+#[tokio::test]
+async fn enter_submits_a_fully_typed_command_in_one_press_despite_an_alias_suggestion() {
+    let mut h = Harness::new(vec![MockReply::Text("answer".to_string())]).await;
+    h.submit("remember this").await;
+    assert!(h.render().contains("answer"));
+
+    // `/clear` is complete (its popup row is the canonical `/new`); one Enter runs it.
+    h.type_str("/clear");
+    h.press(KeyCode::Enter);
+    h.pump().await;
+    let screen = h.render();
+    assert!(
+        screen.contains("conversation cleared"),
+        "a fully-typed command submits in one Enter:\n{screen}"
+    );
+}
+
 /// The completion popup shows at most 5 rows plus a "… N more" hint, and
 /// slides its window to keep the selection visible.
 #[tokio::test]
