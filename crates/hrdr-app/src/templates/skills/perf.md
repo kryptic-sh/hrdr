@@ -8,10 +8,12 @@ review (that's `:review`) or a quality pass (that's `:tidy`). Investigate and
 report only; change nothing. Scope: the pending diff by default, or the target
 named in arguments if given: $ARGUMENTS
 
-1. Collect the scope. With no arguments, take the pending changes (staged,
-   unstaged, and untracked); on a feature branch also diff against the
-   merge-base with the default branch. If arguments name a file, module, or
-   area, use that instead.
+1. Collect the scope:
+   - If arguments name a file, module, or area, use that.
+   - Otherwise take the pending changes (staged, unstaged, and untracked); on a
+     feature branch also diff against the merge-base with the default branch.
+   - If there are no arguments and `git status` is clean (nothing pending) — or
+     you are not in a git repo — take the entire codebase.
 2. Read the code together with what it touches — the callers, the data sizes it
    runs on, and how often the path runs — so you judge cost where it matters,
    not in the abstract. A slow line on a cold path that runs once is not a
@@ -40,9 +42,9 @@ named in arguments if given: $ARGUMENTS
    / large N / per-request), and the concrete fix. Then route it by where you're
    working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
-     `docs/perf-review.md`.
+     `docs/performance-review.md`.
    - **Inside a git repo with no `docs/` directory** → write it to
-     `perf-review.md` at the repo root.
+     `performance-review.md` at the repo root.
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 

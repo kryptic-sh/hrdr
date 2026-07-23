@@ -8,9 +8,14 @@ Audit the codebase for security vulnerabilities, bugs, and correctness issues.
 Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high`
 — broader coverage, may include uncertain findings clearly marked as such).
 
-1. Map the attack surface: entry points (HTTP handlers, CLI args, file parsers,
-   IPC, environment reads), trust boundaries, and where untrusted input flows
-   through the system.
+1. Determine the scope, then map the attack surface within it:
+   - **Scope** — if the working tree has pending changes (staged, unstaged, or
+     untracked), audit only those (on a feature branch, also diff against the
+     merge-base with the default branch). If `git status` is clean (nothing
+     pending), or you are not in a git repo, audit the entire codebase.
+   - **Attack surface** — entry points (HTTP handlers, CLI args, file parsers,
+     IPC, environment reads), trust boundaries, and where untrusted input flows
+     through the system.
 2. Hunt for each class systematically — don't skim, walk through the checklist:
    - Injection: SQL/command/template/path injection, XSS, header injection.
    - Memory & resource: use-after-free, double-free, buffer overflows, integer
@@ -37,9 +42,9 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
    top 1-3 things to fix first.
 5. Route the report by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
-     `docs/security-audit.md`.
+     `docs/security-review.md`.
    - **Inside a git repo with no `docs/` directory** → write it to
-     `security-audit.md` at the repo root.
+     `security-review.md` at the repo root.
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 

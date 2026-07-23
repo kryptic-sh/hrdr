@@ -8,8 +8,12 @@ Review the pending changes for bugs. Depth: $ARGUMENTS (default `low` — report
 only high-confidence findings; `high` — broader coverage, may include uncertain
 findings clearly marked as such).
 
-1. Collect the full pending diff: staged, unstaged, and untracked files. On a
-   feature branch, also diff against the merge-base with the default branch.
+1. Determine the scope:
+   - If the working tree has **pending changes** (staged, unstaged, or
+     untracked), review only those. On a feature branch, also diff against the
+     merge-base with the default branch.
+   - If `git status` is **clean** (nothing pending), or you are not in a git
+     repo, review the **entire codebase**.
 2. Hunt for correctness problems only: logic errors, broken edge cases (empty,
    zero, unicode, concurrent), error paths that swallow or corrupt state,
    resource leaks, API misuse, behavior changes callers don't expect. Skip

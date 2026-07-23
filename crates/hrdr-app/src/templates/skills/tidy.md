@@ -7,10 +7,12 @@ Report cleanups for the change — a quality pass, NOT a bug hunt. Investigate a
 report only; change nothing. Scope: the pending diff by default, or the target
 named in arguments if given: $ARGUMENTS
 
-1. Collect the scope. With no arguments, take the pending changes (staged,
-   unstaged, and untracked); on a feature branch also diff against the
-   merge-base with the default branch. If arguments name a file, module, or
-   area, use that instead.
+1. Collect the scope:
+   - If arguments name a file, module, or area, use that.
+   - Otherwise take the pending changes (staged, unstaged, and untracked); on a
+     feature branch also diff against the merge-base with the default branch.
+   - If there are no arguments and `git status` is clean (nothing pending) — or
+     you are not in a git repo — take the entire codebase.
 2. Read the code together with what it touches — the helpers it calls, the
    callers it has, and the siblings it sits beside — so a proposed cleanup
    reuses what already exists rather than reinventing it.
@@ -36,9 +38,9 @@ named in arguments if given: $ARGUMENTS
    concrete action (call helper X, delete unused fn Y, drop wrapper Z), then
    route it by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
-     `docs/tidy-report.md`.
+     `docs/tidy-review.md`.
    - **Inside a git repo with no `docs/` directory** → write it to
-     `tidy-report.md` at the repo root.
+     `tidy-review.md` at the repo root.
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 
