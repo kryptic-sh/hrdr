@@ -392,6 +392,18 @@ impl From<ModelRef> for ModelSpec {
     }
 }
 
+/// Shorthand: parse a `provider://model` string into a [`ModelRef`].
+#[cfg(test)]
+pub(crate) fn r(s: &str) -> ModelRef {
+    s.parse().expect("a valid provider://model")
+}
+
+/// Shorthand: parse a model spec string into a [`ModelSpec`].
+#[cfg(test)]
+pub(crate) fn spec(s: &str) -> ModelSpec {
+    s.parse().expect("a valid model spec")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,16 +782,4 @@ mod tests {
             Some(200_000)
         );
     }
-}
-
-/// Shorthand: parse a `provider://model` string into a [`ModelRef`].
-#[cfg(test)]
-pub(crate) fn r(s: &str) -> ModelRef {
-    s.parse().expect("a valid provider://model")
-}
-
-/// Shorthand: parse a model spec string into a [`ModelSpec`].
-#[cfg(test)]
-pub(crate) fn spec(s: &str) -> ModelSpec {
-    s.parse().expect("a valid model spec")
 }

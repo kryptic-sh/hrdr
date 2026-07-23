@@ -314,7 +314,9 @@ fn write_cache(path: &std::path::Path, v: &Value) {
         return;
     }
     let tmp = crate::unique_sibling_path(path, "hrdr-tmp");
-    let Some(s) = serde_json::to_string(v).ok() else { return; };
+    let Some(s) = serde_json::to_string(v).ok() else {
+        return;
+    };
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
