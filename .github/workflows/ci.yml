@@ -76,6 +76,20 @@ jobs:
           tool: cargo-deny
       - run: cargo deny --all-features check
 
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Plain `cargo audit` fails only on real vulnerabilities; unmaintained /
+      # yanked advisories are warnings (exit 0), matching deny.toml's policy for
+      # the syntect-transitive `bincode`/`yaml-rust` crates. Do NOT add
+      # `--deny warnings` or those would block the release too.
+      - run: cargo audit
+
   test:
     name: test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -353,7 +367,7 @@ jobs:
 
   publish-github-release:
     name: Publish GitHub Release
-    needs: [build, fmt, clippy, deny, machete, leak-guard, smoke, test]
+    needs: [build, fmt, clippy, deny, audit, machete, leak-guard, smoke, test]
     if: >-
       github.event_name == 'workflow_dispatch' || (github.event_name == 'push'
       && startsWith(github.ref, 'refs/tags/v'))
