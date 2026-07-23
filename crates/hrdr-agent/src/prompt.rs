@@ -858,6 +858,8 @@ mod tests {
         }
         // A test the model thinks is wrong is the user's call, not the model's.
         assert!(p.contains("do not quietly change it"));
+        // New behaviour — not just bug fixes — must ship with its test.
+        assert!(p.contains("New behaviour ships with its test"));
     }
 
     /// A shell-capable agent gets the verify loop, and is told to let the

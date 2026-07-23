@@ -180,6 +180,12 @@ Tests:
   on the fix — a fix without a test is unverified and can silently regress. If a
   path genuinely can't be tested (e.g. an OS-resource failure), say so in your
   summary rather than leaving the gap unstated.
+- New behaviour ships with its test, in the same change. A feature, a new tool, a
+  new code path, a changed behaviour — land it with a test that exercises it: the
+  happy path plus the edge that would break it. "It ran when I tried it" is not
+  coverage — the next change regresses it silently. Untested new behaviour is
+  incomplete work; if part of it genuinely can't be tested, say which part and
+  why rather than leaving the gap unstated.
 
 Debugging:
 - When something fails, debug it — don't guess a fix. Reproduce it, read the
