@@ -261,7 +261,19 @@ impl ToolContext {
     /// spellings of the same file agree; the file's current signature is captured
     /// so a later change on disk is detectable.
     pub fn mark_read(&self, path: &std::path::Path) {
-        self.record_read(path, true);
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let sig = file_sig(&canon);
+        let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        // Fully known: seen to the end, no unseen clipped line.
+        map.insert(
+            canon,
+            ReadRecord {
+                covered_through: usize::MAX,
+                total: 0,
+                clipped: false,
+                sig,
+            },
+        );
     }
 
     /// Like [`mark_read`](Self::mark_read), but records a **partial** read
@@ -269,19 +281,63 @@ impl ToolContext {
     /// which re-read the file and operate on its live content, but not for a
     /// `write` that would overwrite the unseen remainder.
     pub fn mark_read_partial(&self, path: &std::path::Path) {
-        self.record_read(path, false);
-    }
-
-    fn record_read(&self, path: &std::path::Path, complete: bool) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let sig = file_sig(&canon);
-        // Recover a poisoned lock, mirroring the readers (`was_read`,
-        // `read_state`) below: the map itself isn't corrupted by an unrelated
-        // panic, so honor it rather than silently dropping this insert. If we
-        // instead skipped on poison, a single panic-while-locked would make
-        // every read-before-mutate check fail forever after.
         let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(canon, ReadRecord { complete, sig });
+        // Seen something, but not to the end (`covered_through` below `total`).
+        map.insert(
+            canon,
+            ReadRecord {
+                covered_through: 0,
+                total: usize::MAX,
+                clipped: false,
+                sig,
+            },
+        );
+    }
+
+    /// Record that lines `[first, last]` (1-based, inclusive) of a `total`-line
+    /// file were just read, extending the contiguous-from-line-1 coverage when
+    /// this read is adjacent to or overlaps what was already seen. `clipped` marks
+    /// that a line over `MAX_LINE` was truncated in this read (so the file needs a
+    /// `full` read to become fully seen). This is what lets a big file paged
+    /// start-to-finish end up fully read — safe for `write`/`delete`.
+    ///
+    /// A signature change since the last record voids the old coverage: the file
+    /// changed on disk, so what was seen no longer describes it.
+    pub fn record_read(
+        &self,
+        path: &std::path::Path,
+        first: usize,
+        last: usize,
+        total: usize,
+        clipped: bool,
+    ) {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let sig = file_sig(&canon);
+        // Poison-tolerant, like the readers below.
+        let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(canon).or_insert(ReadRecord {
+            covered_through: 0,
+            total,
+            clipped: false,
+            sig,
+        });
+        if entry.sig != sig {
+            *entry = ReadRecord {
+                covered_through: 0,
+                total,
+                clipped: false,
+                sig,
+            };
+        }
+        entry.total = total;
+        entry.clipped |= clipped;
+        // Extend the contiguous prefix only when this read reaches it (adjacent or
+        // overlapping); a read that starts past a gap leaves the gap unseen.
+        if entry.covered_through != usize::MAX && first <= entry.covered_through + 1 {
+            entry.covered_through = entry.covered_through.max(last);
+        }
     }
 
     /// Whether the model has read `path` at all this session (any read, partial
@@ -325,10 +381,16 @@ impl ToolContext {
         {
             return ReadState::Stale;
         }
-        if !rec.complete {
-            return ReadState::Partial;
+        // Fully read when no clipped line remains unseen AND the contiguous
+        // coverage reaches the end — either authored/`full` (`usize::MAX`) or
+        // paged all the way through (`covered_through >= total`).
+        let complete =
+            !rec.clipped && (rec.covered_through == usize::MAX || rec.covered_through >= rec.total);
+        if complete {
+            ReadState::Fresh
+        } else {
+            ReadState::Partial
         }
-        ReadState::Fresh
     }
 }
 
@@ -353,10 +415,20 @@ fn file_sig(path: &std::path::Path) -> FileSig {
 /// [`ToolContext`].
 #[derive(Clone, Copy, Debug)]
 pub struct ReadRecord {
-    /// The recorded read covered the whole file (line 1 to EOF, no per-line or
-    /// output-byte truncation). A partial read is not enough to safely `write`
-    /// (full overwrite) — the unread tail would be dropped.
-    complete: bool,
+    /// Contiguous lines seen from line 1 (1-based, inclusive high-water mark).
+    /// `usize::MAX` means "fully known" — the model authored the file (write/edit)
+    /// or read it with `full: true` — so the whole content is seen regardless of
+    /// length. Paging accumulates this: reading lines 1–500 then 501–1000 reaches
+    /// 1000, so a file paged start-to-finish becomes fully read (safe to `write`).
+    covered_through: usize,
+    /// The file's line count when last recorded — the target `covered_through`
+    /// must reach for the file to count as fully read. Ignored when
+    /// `covered_through == usize::MAX`.
+    total: usize,
+    /// A read clipped a line over `MAX_LINE`, so that line was never seen whole:
+    /// the file can't be marked fully read by paging alone — only a `full` read
+    /// (or authoring the file) clears this.
+    clipped: bool,
     /// The file's signature at read time; a mismatch now means it changed on
     /// disk since.
     sig: FileSig,

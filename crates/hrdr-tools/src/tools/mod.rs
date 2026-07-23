@@ -19,6 +19,14 @@ pub(crate) mod write;
 /// Hard cap on a rendered source line, so one minified file can't blow context.
 pub(crate) const MAX_LINE: usize = 2_000;
 pub(crate) const DEFAULT_READ_LIMIT: usize = 2_000;
+/// The `read` output budget as a multiple of the shared `max_output` cap. The
+/// shared cap is sized to tame *unbounded* tool output (a `cargo build` wall, a
+/// huge grep) which spills to a file; a file `read` is different — the model
+/// asked for the content, usually needs the whole file, and often is reading an
+/// overflow a `shell`/`grep`/`git` call just spilled — so reads get far more
+/// room. `full: true` ignores the budget entirely (bounded only by the 50 MB
+/// load cap).
+pub(crate) const READ_BUDGET_FACTOR: usize = 20;
 /// Hard cap on the file size `read` will load into memory. Past this, even
 /// `offset`/`limit` paging isn't worth it — `read_to_string` would buffer the
 /// whole file first regardless of how few lines are requested, so a

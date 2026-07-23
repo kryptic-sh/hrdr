@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Tool, ToolContext, truncate};
+use crate::{Tool, ToolContext};
 
 use super::{DEFAULT_READ_LIMIT, MAX_LINE, MAX_READ_BYTES};
 
@@ -59,8 +59,10 @@ impl Tool for ReadTool {
     fn description(&self) -> &'static str {
         "Read a file from disk (50 MB cap). Returns 1-based line-numbered content (the `N: ` \
          prefix is display-only — never include it in edit strings). Use `offset`/`limit` to \
-         page through large files. A read that doesn't cover the whole file — `offset`/`limit` \
-         short of EOF, or any line over 2000 bytes (clipped) — marks the file partially-read; \
+         page through large files; paging accumulates, so reading a file start-to-finish \
+         marks it fully read (then `write`/`delete` are allowed). A read that doesn't yet \
+         cover the whole file — `offset`/`limit` short of EOF, or any line over 2000 bytes \
+         (clipped) — marks the file partially-read; \
          `edit` still works against it, but `write` refuses to overwrite a file that \
          hasn't been read in full. You must read a file before editing it. To rewrite a large \
          file, or one with a line over 2000 bytes (which a normal read clips every time so it \
@@ -148,10 +150,19 @@ impl Tool for ReadTool {
             }
         }
         let total_lines = text.lines().count();
-        // `full` reads the whole file with no per-line clip (ignoring
-        // offset/limit), so a file with a line over `MAX_LINE` can still be read
-        // in full and marked complete — the legitimate path to a `write` rewrite.
-        // Otherwise page with offset/limit and clip over-long lines for economy.
+        // `full` reads the whole file with no per-line clip and no output budget
+        // (ignoring offset/limit), so a file with a line over `MAX_LINE` or one
+        // simply larger than the budget can still be read whole and marked fully
+        // read — the legitimate path to a `write` rewrite. A normal read pages with
+        // offset/limit, clips over-long lines, and stops at the read budget.
+        //
+        // The read budget is a generous multiple of the shared tool-output cap
+        // (`ctx.max_output`, which is sized for taming *unbounded* output —
+        // build walls, huge greps). A file read is different: the model asked for
+        // this content, and often needs the whole file (or is reading an output a
+        // `shell`/`grep`/`git` overflow just spilled to disk), so reads get far
+        // more room — see `READ_BUDGET_FACTOR`.
+        let read_budget = ctx.max_output.saturating_mul(super::READ_BUDGET_FACTOR);
         let start = if a.full {
             1
         } else {
@@ -164,6 +175,11 @@ impl Tool for ReadTool {
         };
         let mut out = String::new();
         let mut any_line_truncated = false;
+        // The last line number actually emitted (0 = none) and whether the read
+        // stopped at the budget rather than EOF/limit — drives the coverage record
+        // and the "more to read" hint.
+        let mut last_line = start.saturating_sub(1);
+        let mut budget_stopped = false;
         for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
             let n = i + 1;
             let cut = if a.full {
@@ -174,42 +190,44 @@ impl Tool for ReadTool {
             if cut < line.len() {
                 any_line_truncated = true;
             }
-            out.push_str(&format!("{n:>6}: {}\n", &line[..cut]));
+            let rendered = format!("{n:>6}: {}\n", &line[..cut]);
+            // A normal read stops at the budget on a line boundary, so the model
+            // sees whole lines and the recorded coverage is exact. Always emit at
+            // least the first line, however long, so a read never returns nothing
+            // useful.
+            if !a.full && !out.is_empty() && out.len() + rendered.len() > read_budget {
+                budget_stopped = true;
+                break;
+            }
+            out.push_str(&rendered);
+            last_line = n;
         }
         if out.is_empty() {
             out.push_str("(file is empty or offset past end)");
         }
-        // The read covered the whole file only if it started at line 1, its
-        // window reached EOF, no line was clipped to `MAX_LINE`, and the output
-        // wasn't byte-truncated below. A partial read is recorded as such so a
-        // later `write` (full overwrite) is refused rather than dropping the
-        // unseen remainder.
-        //
-        // Note: a file with any line over `MAX_LINE` is *permanently* partial
-        // — no offset/limit combination ever sees that line whole, so this
-        // never flips to `complete` no matter how many times it's re-read.
-        // `write`'s refusal message says as much and points at `edit`/`bash`
-        // instead, so the model doesn't loop on read-then-write retries that
-        // can never succeed.
-        // A `full` read bypasses the per-call output budget: it returns the whole
-        // file (already bounded by the 50 MB load cap) so the model actually sees
-        // everything and the file can be marked complete. A normal read stays
-        // capped, and output over the budget makes it partial.
-        let byte_truncated = !a.full && out.len() > ctx.max_output;
-        let complete = start == 1
-            && start - 1 + limit >= total_lines
-            && !any_line_truncated
-            && !byte_truncated;
-        if complete {
+        // Record what was seen. A `full` read (or an authored file) is fully known;
+        // a normal read records its `[start, last_line]` range, which accumulates
+        // across pages so a file read start-to-finish becomes fully read. A clipped
+        // line keeps it partial until a `full` read sees that line whole.
+        if a.full {
             ctx.mark_read(&path);
         } else {
-            ctx.mark_read_partial(&path);
+            ctx.record_read(&path, start, last_line, total_lines, any_line_truncated);
         }
-        if a.full {
-            Ok(out)
-        } else {
-            Ok(truncate(&out, ctx.max_output))
+        // Tell the model when there's more to read, and how to get it.
+        if !a.full && last_line < total_lines {
+            out.push_str(&format!(
+                "\n… [showing lines {start}–{last_line} of {total_lines}{}; \
+                 read with offset {} to continue, or full: true for the whole file]",
+                if budget_stopped {
+                    " (stopped at the output budget)"
+                } else {
+                    ""
+                },
+                last_line + 1
+            ));
         }
+        Ok(out)
     }
 }
 
@@ -312,14 +330,20 @@ mod tests {
         let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&path, &body).unwrap();
         let mut ctx = ToolContext::new(cwd.path().to_path_buf());
-        ctx.max_output = 512; // a conservative budget, like a default config
+        // Small budget so the 500-line file overflows even the 20x read budget
+        // (200 * 20 = 4000 bytes, well under the file's rendered size).
+        ctx.max_output = 200;
 
-        // A normal read is capped at the budget and recorded partial.
-        ReadTool
+        // A single normal read stops at the budget and is recorded partial.
+        let paged = ReadTool
             .execute(serde_json::json!({"path": "big.txt"}), &ctx)
             .await
             .unwrap();
         assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+        assert!(
+            paged.contains("stopped at the output budget"),
+            "the read hints there's more: {paged}"
+        );
 
         // Full read returns everything and marks the file complete.
         let whole = ReadTool
@@ -330,6 +354,55 @@ mod tests {
             whole.contains("line 499"),
             "full read returns the whole file, past the budget"
         );
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
+    }
+
+    /// The paging contract the model relies on: reading a big file start-to-finish
+    /// with `offset`/`limit` accumulates coverage, so once the last page lands the
+    /// file is fully read and `write`/`delete` are unblocked — no `full` needed.
+    #[tokio::test]
+    async fn paging_start_to_finish_marks_the_file_fully_read() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("big.txt");
+        // 1000 short lines, no over-long line.
+        let body: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+
+        let page = |off: usize, lim: usize| serde_json::json!({"path": "big.txt", "offset": off, "limit": lim});
+        // Page 1: lines 1–400 → still partial (tail unseen).
+        ReadTool.execute(page(1, 400), &ctx).await.unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+        // Page 2: lines 401–800 → contiguous, still short of the end.
+        ReadTool.execute(page(401, 400), &ctx).await.unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+        // Page 3: lines 801–1000 → coverage now spans the whole file → fully read.
+        ReadTool.execute(page(801, 400), &ctx).await.unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
+    }
+
+    /// Coverage is the contiguous run from line 1: paging that leaves a GAP is not
+    /// fully read (a skipped middle is genuinely unseen), and an out-of-order tail
+    /// read does not count until the prefix reaches it — so completing means
+    /// reading contiguously through the gap to the end.
+    #[tokio::test]
+    async fn paging_with_a_gap_stays_partial_until_covered_contiguously() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("big.txt");
+        let body: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+        let page = |off: usize, lim: usize| serde_json::json!({"path": "big.txt", "offset": off, "limit": lim});
+
+        ReadTool.execute(page(1, 400), &ctx).await.unwrap(); // 1–400
+        ReadTool.execute(page(601, 400), &ctx).await.unwrap(); // 601–1000, skips 401–600
+        assert_eq!(
+            ctx.read_state(&path),
+            crate::ReadState::Partial,
+            "a gap in coverage is not fully read"
+        );
+        // Reading from the gap through the end extends the contiguous run to EOF.
+        ReadTool.execute(page(401, 600), &ctx).await.unwrap(); // 401–1000
         assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
     }
 
