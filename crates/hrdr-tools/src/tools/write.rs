@@ -141,8 +141,9 @@ mod tests {
     async fn an_over_long_line_file_is_rewritable_after_a_full_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big_line.txt");
-        // One line comfortably over MAX_LINE, so a normal `read` always clips it.
-        let long_line = "x".repeat(MAX_LINE + 500);
+        // One line over MAX_LINE *and* the whole file over the default output
+        // budget (5120), so a normal read is defeated on both counts.
+        let long_line = "x".repeat(MAX_LINE + 5000);
         std::fs::write(&path, format!("{long_line}\n")).unwrap();
         let ctx = ToolContext::new(dir.path());
 

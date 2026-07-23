@@ -38,12 +38,12 @@ struct ReadArgs {
         alias = "max_lines"
     )]
     limit: Option<usize>,
-    /// Read the whole file WITHOUT clipping long lines (and ignoring
-    /// `offset`/`limit`), so a file with a line over `MAX_LINE` bytes can still be
-    /// marked fully read — the escape hatch for a full rewrite via `write`. Costs
-    /// tokens (nothing is clipped), so it is opt-in; the 50 MB file cap still
-    /// applies, and if the unclipped content overflows the output budget the read
-    /// is still recorded as partial.
+    /// Read the whole file WITHOUT clipping long lines AND without the per-call
+    /// output budget (ignoring `offset`/`limit`), so it can be marked fully read —
+    /// the escape hatch for a full rewrite via `write`, whether the obstacle is a
+    /// line over `MAX_LINE` bytes or simply a file larger than the output budget.
+    /// Returns the whole content (bounded only by the 50 MB file cap), so it costs
+    /// tokens; opt-in.
     #[serde(default, alias = "raw", alias = "whole", alias = "no_clip")]
     full: bool,
 }
@@ -62,10 +62,10 @@ impl Tool for ReadTool {
          page through large files. A read that doesn't cover the whole file — `offset`/`limit` \
          short of EOF, or any line over 2000 bytes (clipped) — marks the file partially-read; \
          `edit` still works against it, but `write` refuses to overwrite a file that \
-         hasn't been read in full. You must read a file before editing it. To rewrite a file \
-         that has a line over 2000 bytes — which a normal read clips every time, so it can \
-         never be marked fully read — read it once with `full: true` (whole file, no clipping) \
-         first."
+         hasn't been read in full. You must read a file before editing it. To rewrite a large \
+         file, or one with a line over 2000 bytes (which a normal read clips every time so it \
+         can never be marked fully read), read it once with `full: true` (whole file, no \
+         clipping and no output-size cap) first."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -74,7 +74,7 @@ impl Tool for ReadTool {
                 "path": {"type": "string", "description": "File path, absolute or relative to cwd."},
                 "offset": {"type": "integer", "description": "1-based line to start at (default 1)."},
                 "limit": {"type": "integer", "description": "Max lines to return (default 2000)."},
-                "full": {"type": "boolean", "description": "Read the entire file with NO line clipping (ignores offset/limit). Use this to fully read a file that has a very long line so a subsequent `write` rewrite is accepted. Costs more tokens; the 50 MB file cap still applies. Default false."}
+                "full": {"type": "boolean", "description": "Read the entire file with NO line clipping and NO output-size cap (ignores offset/limit); returns the whole file, bounded only by the 50 MB load cap. Use it to fully read a file — large, or with a very long line — so a subsequent `write` rewrite is accepted. Costs more tokens. Default false."}
             },
             "required": ["path"]
         })
@@ -191,7 +191,11 @@ impl Tool for ReadTool {
         // `write`'s refusal message says as much and points at `edit`/`bash`
         // instead, so the model doesn't loop on read-then-write retries that
         // can never succeed.
-        let byte_truncated = out.len() > ctx.max_output;
+        // A `full` read bypasses the per-call output budget: it returns the whole
+        // file (already bounded by the 50 MB load cap) so the model actually sees
+        // everything and the file can be marked complete. A normal read stays
+        // capped, and output over the budget makes it partial.
+        let byte_truncated = !a.full && out.len() > ctx.max_output;
         let complete = start == 1
             && start - 1 + limit >= total_lines
             && !any_line_truncated
@@ -201,7 +205,11 @@ impl Tool for ReadTool {
         } else {
             ctx.mark_read_partial(&path);
         }
-        Ok(truncate(&out, ctx.max_output))
+        if a.full {
+            Ok(out)
+        } else {
+            Ok(truncate(&out, ctx.max_output))
+        }
     }
 }
 
@@ -288,6 +296,39 @@ mod tests {
         assert!(
             whole.contains(&long),
             "full read returns the whole line: {whole}"
+        );
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
+    }
+
+    /// `full: true` also bypasses the per-call output budget (not just line
+    /// clipping), so a file merely LARGER than the budget — no long line — can be
+    /// read whole and marked complete, where a normal read caps out partial. This
+    /// is what lets `write` rewrite a large file at all.
+    #[tokio::test]
+    async fn full_read_bypasses_the_output_budget() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("big.txt");
+        // Many normal lines, comfortably over a small output budget.
+        let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let mut ctx = ToolContext::new(cwd.path().to_path_buf());
+        ctx.max_output = 512; // a conservative budget, like a default config
+
+        // A normal read is capped at the budget and recorded partial.
+        ReadTool
+            .execute(serde_json::json!({"path": "big.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+
+        // Full read returns everything and marks the file complete.
+        let whole = ReadTool
+            .execute(serde_json::json!({"path": "big.txt", "full": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            whole.contains("line 499"),
+            "full read returns the whole file, past the budget"
         );
         assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
     }
