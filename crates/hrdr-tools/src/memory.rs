@@ -510,6 +510,24 @@ fn list_scope(scope: &str, root: &Path) -> String {
     out
 }
 
+/// Case-insensitive relevance of one memory to an already-lowercased `needle`:
+/// substring match against name + description (weighted high) and body (weighted
+/// low). `0` means no match. The weighting shared by `search` (whole-query
+/// substring) and `recall` (per query token).
+fn relevance_score(mem: &Memory, needle: &str) -> i32 {
+    let mut score = 0;
+    if mem.name.to_lowercase().contains(needle) {
+        score += 3;
+    }
+    if mem.description.to_lowercase().contains(needle) {
+        score += 3;
+    }
+    if mem.body.to_lowercase().contains(needle) {
+        score += 1;
+    }
+    score
+}
+
 /// Rank memories by case-insensitive substring match of `query` against name +
 /// description (weighted high) and body (weighted low). Returns pointers, best
 /// first, or `(no matches)`.
@@ -517,16 +535,7 @@ fn search(root: &Path, query: &str) -> String {
     let q = query.to_lowercase();
     let mut hits: Vec<(i32, String, String, String)> = Vec::new(); // (score, name, description, stem)
     for (stem, mem) in load_memories(root) {
-        let mut score = 0;
-        if mem.name.to_lowercase().contains(&q) {
-            score += 3;
-        }
-        if mem.description.to_lowercase().contains(&q) {
-            score += 3;
-        }
-        if mem.body.to_lowercase().contains(&q) {
-            score += 1;
-        }
+        let score = relevance_score(&mem, &q);
         if score > 0 {
             hits.push((score, mem.name, mem.description, stem));
         }
@@ -541,6 +550,146 @@ fn search(root: &Path, query: &str) -> String {
         out.push_str(&format!("- {name} — {description} — {stem}.md\n"));
     }
     out
+}
+
+/// The one-line prefix that opens an injected recall block, so both the model
+/// and readers can tell where recalled memory begins.
+const RECALL_HEADER: &str = "[relevant memory]\n";
+
+/// Format one recalled memory for injection: its `name` + `description` header
+/// followed by the full body, then a blank-line separator.
+fn format_recall_entry(mem: &Memory) -> String {
+    let mut s = format!("## {}", mem.name);
+    let desc = mem.description.trim();
+    if !desc.is_empty() {
+        s.push_str(" — ");
+        s.push_str(desc);
+    }
+    s.push('\n');
+    let body = mem.body.trim();
+    if !body.is_empty() {
+        s.push_str(body);
+        s.push('\n');
+    }
+    s.push('\n'); // separator between entries
+    s
+}
+
+/// Common function words dropped when tokenizing a recall query, so a
+/// natural-language message ("how do I deploy the widget service?") matches on
+/// its meaningful terms ("deploy", "widget", "service") rather than on "how" or
+/// "the". Kept small and lowercase.
+const RECALL_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "how", "what", "why", "who", "does", "did", "can", "with", "from",
+    "this", "that", "your", "are", "was", "will", "have", "has", "not", "but", "get", "got", "use",
+    "using", "into", "when", "where", "which", "should", "would", "could", "about", "there",
+    "then", "them", "they", "our", "out", "any", "all", "its", "let", "run",
+];
+
+/// Split a recall query into deduplicated, lowercased match tokens: alphanumeric
+/// runs of length ≥ 3 that aren't stopwords. Empty when the query has no
+/// meaningful terms (so recall returns nothing rather than matching noise).
+fn recall_tokens(query: &str) -> Vec<String> {
+    let mut toks: Vec<String> = Vec::new();
+    for raw in query.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        if raw.len() < 3 || RECALL_STOPWORDS.contains(&raw) {
+            continue;
+        }
+        if !toks.iter().any(|t| t == raw) {
+            toks.push(raw.to_string());
+        }
+    }
+    toks
+}
+
+/// Score a memory against the recall query's tokens by summing the shared
+/// name/description/body weighting over each token — so a full-sentence message
+/// matches memories that share its meaningful words. `0` means no token hit.
+fn recall_score(mem: &Memory, tokens: &[String]) -> i32 {
+    tokens.iter().map(|t| relevance_score(mem, t)).sum()
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
+fn truncate_on_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Rank the project + global memories by relevance to `query` and return the
+/// full text of the top matches, bounded to `max_bytes`, formatted for injection
+/// — or `None` when memory is disabled/empty or nothing matches.
+///
+/// This is per-turn **relevance recall**: the always-loaded pointer index tells
+/// the model *what* it knows; this hands it the full facts most relevant to the
+/// current message. Ranking reuses the same case-insensitive name/description/body
+/// weighting as the `search` action, applied per meaningful query token so a
+/// full-sentence user message matches the memories sharing its terms (an actual
+/// token match is required — unrelated memories are never returned). Best-effort
+/// throughout: an unreadable/unparsable file is skipped, never fails recall.
+pub fn recall(
+    project: Option<&Path>,
+    global: Option<&Path>,
+    query: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if max_bytes <= RECALL_HEADER.len() {
+        return None;
+    }
+    let tokens = recall_tokens(query);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Collect matches across BOTH scopes; `load_memories` already skips the
+    // generated index files and swallows per-file read errors.
+    let mut hits: Vec<(i32, Memory)> = Vec::new();
+    for root in [project, global].into_iter().flatten() {
+        for (_, mem) in load_memories(root) {
+            let score = recall_score(&mem, &tokens);
+            if score > 0 {
+                hits.push((score, mem));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    // Best first; ties broken by name for a stable order.
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+    let mut out = String::from(RECALL_HEADER);
+    let mut wrote = false;
+    for (_, mem) in &hits {
+        let entry = format_recall_entry(mem);
+        if out.len() + entry.len() <= max_bytes {
+            out.push_str(&entry);
+            wrote = true;
+        } else {
+            // Truncate the last entry to whatever budget remains and stop; drop
+            // it if nothing meaningful fits. Never exceed `max_bytes`.
+            let budget = max_bytes - out.len();
+            let piece = truncate_on_boundary(&entry, budget);
+            if !piece.trim().is_empty() {
+                out.push_str(piece);
+                wrote = true;
+            }
+            break;
+        }
+    }
+    if !wrote {
+        return None;
+    }
+    let trimmed = out.trim_end();
+    if trimmed.len() <= RECALL_HEADER.trim_end().len() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -839,5 +988,100 @@ mod tests {
         let tool = MemoryTool;
         let r = tool.execute(json!({"action": "view"}), &ctx).await;
         assert!(r.is_err());
+    }
+
+    /// Write a memory file directly into `root` (bypassing the tool), for recall
+    /// tests that don't care about the pointer index.
+    fn seed(root: &Path, name: &str, description: &str, body: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let mem = Memory {
+            name: name.to_string(),
+            description: description.to_string(),
+            mem_type: MemType::Reference,
+            body: body.to_string(),
+        };
+        std::fs::write(root.join(format!("{name}.md")), emit_memory(&mem)).unwrap();
+    }
+
+    #[test]
+    fn recall_ranks_match_ahead_of_nonmatch_and_returns_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        seed(
+            &proj,
+            "deploy",
+            "how to deploy the service",
+            "Run the deploy script with the staging flag.",
+        );
+        seed(&proj, "lunch", "favorite lunch spots", "Tacos on Tuesdays.");
+
+        let block = recall(Some(&proj), None, "how do I deploy this", 4096).unwrap();
+        assert!(block.starts_with("[relevant memory]"), "{block}");
+        // The matching memory's body is surfaced in full.
+        assert!(
+            block.contains("Run the deploy script with the staging flag."),
+            "{block}"
+        );
+        // The unrelated memory is not returned.
+        assert!(!block.contains("Tacos on Tuesdays."), "{block}");
+    }
+
+    #[test]
+    fn recall_respects_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        seed(&proj, "alpha", "the alpha topic", &"A".repeat(500));
+        seed(&proj, "alphabeta", "the alpha topic too", &"B".repeat(500));
+
+        // Both match "alpha"; a tight budget must not be exceeded and must still
+        // return something non-empty.
+        let block = recall(Some(&proj), None, "alpha", 200).unwrap();
+        assert!(block.len() <= 200, "over budget: {} bytes", block.len());
+        assert!(block.contains("[relevant memory]"), "{block}");
+    }
+
+    #[test]
+    fn recall_returns_none_on_no_match_disabled_or_empty_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        seed(&proj, "deploy", "how to deploy", "steps here");
+
+        // No match.
+        assert!(recall(Some(&proj), None, "unrelated-xyz", 4096).is_none());
+        // Empty query.
+        assert!(recall(Some(&proj), None, "   ", 4096).is_none());
+        // Disabled (no roots).
+        assert!(recall(None, None, "deploy", 4096).is_none());
+        // Budget too small even for the header.
+        assert!(recall(Some(&proj), None, "deploy", 4).is_none());
+    }
+
+    #[test]
+    fn recall_searches_both_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        let glob = dir.path().join("global");
+        seed(
+            &proj,
+            "proj-note",
+            "widget configuration",
+            "in project scope",
+        );
+        seed(
+            &glob,
+            "glob-note",
+            "database credentials",
+            "in global scope",
+        );
+
+        // A query hitting only the global memory's terms recalls from global…
+        let from_global = recall(Some(&proj), Some(&glob), "database credentials", 4096).unwrap();
+        assert!(from_global.contains("in global scope"), "{from_global}");
+        assert!(!from_global.contains("in project scope"), "{from_global}");
+
+        // …and a query hitting only the project memory's terms recalls from project.
+        let from_project = recall(Some(&proj), Some(&glob), "widget configuration", 4096).unwrap();
+        assert!(from_project.contains("in project scope"), "{from_project}");
+        assert!(!from_project.contains("in global scope"), "{from_project}");
     }
 }

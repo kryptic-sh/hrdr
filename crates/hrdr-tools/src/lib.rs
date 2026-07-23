@@ -25,7 +25,7 @@ mod guardrails;
 mod hooks;
 mod lsp;
 mod mcp;
-mod memory;
+pub mod memory;
 mod proc;
 mod tools;
 mod web;

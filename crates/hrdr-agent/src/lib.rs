@@ -2004,6 +2004,77 @@ mod tests {
         );
     }
 
+    /// Relevance recall injects a matching memory's **body** into the
+    /// model-facing history on the OPENING turn only, while the transcript
+    /// (`Steered`) still shows just what the user typed. A mid-turn steer never
+    /// recalls.
+    #[tokio::test]
+    async fn opening_turn_recalls_matching_memory_body_into_model_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join("mem-project");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("deploy.md"),
+            "---\nname: deploy\ndescription: how to deploy the widget service\ntype: project\n---\n\
+             DEPLOY_MARKER: run ./deploy.sh --prod after tagging.\n",
+        )
+        .unwrap();
+
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.ctx.memory_project = Some(mem_dir);
+
+        // Opening turn whose text matches the memory.
+        let typed = "how do I deploy the widget service?";
+        let mut events = Vec::new();
+        agent
+            .deliver_user_message(
+                crate::Steer::plain(typed),
+                /*opening*/ true,
+                &mut |e| events.push(e),
+            )
+            .await
+            .unwrap();
+
+        // The model-facing history carries the recalled body.
+        let content = agent.messages().last().unwrap().content.clone().unwrap();
+        assert!(
+            content.contains("DEPLOY_MARKER: run ./deploy.sh --prod after tagging."),
+            "opening turn must inject the recalled body: {content}"
+        );
+        assert!(content.contains("[relevant memory]"), "{content}");
+
+        // The transcript/display shows only what the user typed.
+        let steered: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Steered(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, vec![typed]);
+        assert!(!steered.iter().any(|s| s.contains("DEPLOY_MARKER")));
+
+        // A mid-turn steer with the SAME matching text does not recall.
+        agent
+            .deliver_user_message(
+                crate::Steer::plain(typed),
+                /*opening*/ false,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let steer_content = agent.messages().last().unwrap().content.clone().unwrap();
+        assert!(
+            !steer_content.contains("[relevant memory]"),
+            "a mid-turn steer must not recall: {steer_content}"
+        );
+        assert!(!steer_content.contains("DEPLOY_MARKER"), "{steer_content}");
+    }
+
     use super::SubagentDirCell;
     use super::{
         Agent, AgentConfig, AgentEvent, ConfigDiagnostics, DEFAULT_BASE_URL,

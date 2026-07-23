@@ -27,6 +27,12 @@ const UI_STREAM_CAP: usize = 1024;
 /// without executing (small models loop on verbatim retries).
 const REPEAT_REFUSE_AFTER: u32 = 2;
 
+/// Byte budget for per-turn **relevance recall** injected alongside the opening
+/// user message (the full text of the most relevant memories). 4 KiB stays small
+/// next to the always-loaded pointer index (~25 KB) while giving the model room
+/// for a few complete facts; recall truncates/drops entries to never exceed it.
+const MEMORY_RECALL_BUDGET: usize = 4 * 1024;
+
 /// Anti-loop breaker: tracks the last failed call and how many times the
 /// *exact same* call (tool + raw args) has failed in a row. Any intervening
 /// different call — or a success — resets it, so a legitimate
@@ -709,6 +715,9 @@ impl Agent {
         on_event: &mut F,
     ) -> Result<()> {
         let mut sent = msg.sent;
+        // The user's original text, before any hook/recall augmentation — recall
+        // keys on what the user actually typed, not the expanded form.
+        let query = sent.clone();
         // `user_prompt` hooks see the message before the turn starts: a block
         // (exit 2) fails the turn before anything enters history; hook stdout
         // rides along as extra context for the model (the frontend still displays
@@ -742,6 +751,26 @@ impl Agent {
                 sent.push_str("\n\n[hook context]\n");
                 sent.push_str(&out.context.join("\n"));
             }
+        }
+        // Relevance recall (opening only, same shape as the hook context above):
+        // surface the full text of the memories most relevant to the user's
+        // original message into the model-facing `sent`, so it has the facts, not
+        // just the always-loaded pointer index. Keyed on `query` (what the user
+        // typed), never the hook-augmented text. `recall` is sync `std::fs` over
+        // small files and best-effort — safe to call here without `spawn_blocking`.
+        // The transcript/`Steered` display stays `msg.display`; a mid-turn steer
+        // never recalls (guarded on `opening`, exactly like the hook).
+        if opening
+            && !query.trim().is_empty()
+            && let Some(block) = hrdr_tools::memory::recall(
+                self.ctx.memory_project.as_deref(),
+                self.ctx.memory_global.as_deref(),
+                &query,
+                MEMORY_RECALL_BUDGET,
+            )
+        {
+            sent.push_str("\n\n");
+            sent.push_str(&block);
         }
         // The model reads the expanded (`sent`) form; the transcript shows what was
         // typed (`display`). A real opener is a `User` turn; a mid-turn correction
