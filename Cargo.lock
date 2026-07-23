@@ -1244,7 +1244,6 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
- "filetime",
  "hjkl-clipboard",
  "hjkl-theme",
  "hjkl-xdg",
@@ -1260,7 +1259,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
- "zstd",
 ]
 
 [[package]]
