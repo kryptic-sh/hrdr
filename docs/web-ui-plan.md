@@ -24,6 +24,10 @@ Serve an hrdr session over a web endpoint so it can be driven from a browser
   `hrdr-web` is an **embeddable library** (see below), the transport is plain
   localhost WS (identical in a browser and a webview), and the client avoids
   browser-only APIs.
+- **FE = Rust → WASM (decided).** The client is WebAssembly — **Dioxus**
+  recommended, **Leptos** the smaller-WASM alternative — embedded in `hrdr-web`
+  for the web build and reused for the desktop/mobile shells. See _Rust
+  implementation_.
 
 ## Why this is feasible (the leverage)
 
@@ -87,7 +91,31 @@ hrdr-app / hrdr-agent  (the same core the TUI drives)
 - **Rendering single-source-of-truth.** To avoid drift, the server computes the
   display model (reusing `tool_display`/`ToolBody`, diff classification, etc.)
   and the client renders it dumbly — don't re-implement fold/classify logic in
-  JS.
+  the client.
+
+Concretely, the messages are shared serde types in `hrdr-protocol` (sketch):
+
+```rust
+// server → client
+enum ServerMsg {
+    Snapshot { transcript: Vec<Entry>, status: Status, panes: Vec<PaneMeta>,
+               active: PaneId, todos: Vec<TodoItem>, turn: TurnStats, cursor: u64 },
+    Entries  { pane: PaneId, from: u64, entries: Vec<Entry> }, // fold deltas
+    Status(Status), Turn(TurnStats), Panes { panes: Vec<PaneMeta>, active: PaneId },
+    Todos(Vec<TodoItem>), Notice(String),
+}
+// client → server
+enum ClientMsg {
+    Submit { pane: PaneId, text: String },   // → steering queue (a Steer)
+    Command { pane: PaneId, line: String },  // → CommandHost dispatch
+    Cancel { pane: PaneId }, SwitchPane(PaneId),
+    Resume { cursor: u64 },                  // reconnect: replay from cursor
+}
+```
+
+`Entry`/`PaneId`/`TurnStats`/`TodoItem` are re-exported from `hrdr-agent`, so
+the same types serialize on both ends. `Entries` carries `apply_event`-folded
+deltas keyed to the reader cursor — the reconnect/replay primitive.
 
 ## Reuse as a native GUI app
 
@@ -122,32 +150,71 @@ native shell (window, tray, notifications, OS integration)
 
 ## Rust implementation (FE framework + desktop/mobile shell)
 
-The FE is Rust: one codebase targets web, desktop, and mobile, and it **shares
-protocol types with the server** (no client/server serde drift). Everything
-below uses the **system webview** — WebKitGTK on Linux, WebView2 on Windows,
-WKWebView on macOS — **not Electron** — so binaries stay small (single-digit MB)
-and run on Linux/Windows/macOS.
+The FE is a Rust → **WebAssembly** app (**decided**): it compiles to WASM,
+embedded in `hrdr-web` for the web build, and the _same_ codebase renders the
+desktop/mobile apps. It **shares serde protocol types with the server** (no
+client/server drift). Every target runs in the **system webview** — WebKitGTK on
+Linux, WebView2 on Windows, WKWebView on macOS — **not Electron** — so binaries
+stay small (single-digit MB) on Linux/Windows/macOS. The framework choice is
+**Dioxus vs Leptos** (both Rust→WASM); the shell is `dioxus-desktop`/`wry` (with
+Dioxus) or Tauri 2 (with Leptos). Canvas UIs (`egui`/`iced`) are out — a second
+UI, weak for mobile/text.
 
-### Recommended: Dioxus
+### Framework: Dioxus (recommended)
 
-- **One Rust UI codebase → web** (WASM served by `hrdr-web`), **desktop**
-  (native window via `wry`, the system webview), **mobile**. Lightweight; no
-  bundled browser engine.
-- React-like components + signals, **DOM-based** — right for a
-  text/markdown/code, mobile-friendly, accessible chat UI. (Canvas UIs like
-  `egui`/`iced` are wrong for this _and_ would be a second UI, breaking the
-  one-codebase goal.)
-- Talks to `hrdr-web` over localhost WS on every target — one transport, one
-  client.
+Recommended because it gives **one Rust codebase → web + desktop + mobile** from
+its own `dx` tooling (build, bundle, hot-reload every target) — the direct
+realization of "the web FE is the GUI," with no separate shell project.
 
-### Alternative: Tauri 2 + Leptos
+**Pros**
 
-- **Tauri 2** is the most battle-tested, smallest cross-platform shell (Linux/
-  Windows/macOS, plus mobile), also system-webview based. **Leptos** produces
-  the smallest WASM of the Rust web frameworks. Choose this to maximize
-  lightweight/proven, at the cost of Dioxus's single-codebase ergonomics
-  (desktop = Tauri wrapping the Leptos web build). A JS/TS SPA + Tauri is the
-  fastest-to-build fallback but drops Rust type-sharing.
+- One codebase to all targets via `dx`; React-like (RSX + components + signals),
+  low ramp, good hot-reload.
+- Rust end-to-end → shares protocol types with `hrdr-web`, reuses Rust crates.
+- Actively developed and funded.
+
+**Cons**
+
+- **Heavier WASM than Leptos** — Dioxus uses a virtual DOM + runtime; Leptos's
+  fine-grained signals compile to smaller bundles and less work per DOM update.
+  This is the "lightweight" tension; needs `wasm-opt` + compression +
+  code-splitting to keep first-load small (esp. mobile), and batching for a fast
+  token stream.
+- **Pre-1.0 churn** (0.4 → 0.5 → 0.6 broke APIs) — expect upgrade friction.
+- **Mobile is its least-mature target** (tooling / signing / deploy).
+- **Smaller ecosystem than JS** — markdown/highlighting/etc. come from Rust
+  crates (`pulldown-cmark`, `syntect`) or JS interop, not off-the-shelf
+  components.
+- **General WASM costs:** JS↔WASM boundary for DOM/browser APIs, harder
+  debugging, and an initial fetch + compile of the WASM binary.
+- **Linux WebKitGTK is the weakest of the three system webviews** (older WebKit,
+  occasional CSS/JS gaps) — the lowest-common-denominator to test against.
+
+### Framework alternative: Leptos (+ Tauri 2 shell)
+
+Pick Leptos if **smallest/fastest WASM** is the priority — fine-grained
+reactivity → smaller bundles and less per-update work (better for a fast token
+stream). Trade-off: desktop/mobile is **Tauri 2 wrapping the Leptos web build**
+rather than one Dioxus codebase; Tauri is the most battle-tested cross-platform
+shell. (A JS/TS SPA + Tauri is the fastest-to-build fallback but drops Rust
+type-sharing.)
+
+**Decision rule:** one-codebase-multiplatform → **Dioxus**; smallest-WASM /
+most-proven-shell → **Leptos + Tauri**. Both share types with the server.
+
+### WASM build, size & embedding
+
+- **Build:** `dx build --platform web` (Dioxus) or `trunk` (Leptos) → `.wasm` +
+  JS glue + assets; embed into `hrdr-web` via `rust-embed` so `hrdr serve` ships
+  one binary.
+- **Size discipline** (matters most on mobile first-load): release +
+  `wasm-opt -Oz`, `opt-level = "z"` + `lto`, strip, serve **Brotli/gzip-
+  compressed** WASM; lazy-load heavy bits (syntax highlighter, rarely-used
+  pickers). Track the gzipped WASM size in CI as a budget.
+- **Rendering deps:** markdown via `pulldown-cmark` → sanitized HTML; code
+  highlighting via a Rust highlighter or a small JS lib through interop. Keep
+  the server as the single source of the _display model_ (fold/classify via
+  `apply_event`/`tool_display`) so the client only formats.
 
 ### Cross-platform webview caveats (document for users + CI)
 
