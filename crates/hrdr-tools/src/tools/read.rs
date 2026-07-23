@@ -15,10 +15,28 @@ pub struct ReadTool;
 
 #[derive(Deserialize)]
 struct ReadArgs {
+    // Accept the names other agents' read tools use, so a model trained on
+    // `file_path` (Claude's native Read), `file`, etc. still lands the call
+    // instead of erroring on a "missing field `path`".
+    #[serde(
+        alias = "file_path",
+        alias = "filepath",
+        alias = "file",
+        alias = "filename",
+        alias = "file_name",
+        alias = "path_to_file"
+    )]
     path: String,
-    #[serde(default)]
+    // Common synonyms for the paging window, for the same reason.
+    #[serde(default, alias = "start", alias = "start_line", alias = "line")]
     offset: Option<usize>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "count",
+        alias = "lines",
+        alias = "num_lines",
+        alias = "max_lines"
+    )]
     limit: Option<usize>,
 }
 
@@ -50,7 +68,15 @@ impl Tool for ReadTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ReadArgs = crate::tool_args("read", args)?;
+        let a: ReadArgs = crate::tool_args("read", args).map_err(|e| {
+            // Append the exact shape so a malformed call self-corrects on the next
+            // try rather than guessing at what was wrong.
+            anyhow::anyhow!(
+                "{e}\nread expects {{\"path\": \"<file>\" (required), \
+                 \"offset\": <1-based start line, optional>, \"limit\": <max lines, optional>}}. \
+                 The path may also be given as \"file_path\"."
+            )
+        })?;
         let path = ctx.resolve(&a.path);
 
         // Open the file first so the handle is fixed before any path resolution —
@@ -168,5 +194,53 @@ mod tests {
             .await
             .expect("reads are not confined to cwd");
         assert!(out.contains("data"), "got: {out}");
+    }
+
+    /// A model trained on `file_path` (Claude's native Read) — or another common
+    /// alias — still lands the call instead of erroring on a missing `path`.
+    #[tokio::test]
+    async fn read_accepts_file_path_and_other_path_aliases() {
+        let cwd = tempfile::tempdir().unwrap();
+        let target = cwd.path().join("notes.txt");
+        std::fs::write(&target, "line one\nline two\nline three\n").unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+
+        for key in ["file_path", "filepath", "file", "filename", "path_to_file"] {
+            let out = ReadTool
+                .execute(serde_json::json!({ key: target.to_str().unwrap() }), &ctx)
+                .await
+                .unwrap_or_else(|e| panic!("alias {key:?} should resolve to path: {e}"));
+            assert!(
+                out.contains("line one"),
+                "alias {key:?} read the file: {out}"
+            );
+        }
+
+        // `offset`/`limit` synonyms page the same way.
+        let out = ReadTool
+            .execute(
+                serde_json::json!({"file_path": target.to_str().unwrap(), "start": 2, "count": 1}),
+                &ctx,
+            )
+            .await
+            .expect("offset/limit synonyms resolve");
+        assert!(
+            out.contains("line two") && !out.contains("line one"),
+            "paged: {out}"
+        );
+    }
+
+    /// A call with no path at all gets an instructive error naming the exact
+    /// shape, not just a bare "missing field `path`".
+    #[tokio::test]
+    async fn read_without_a_path_explains_the_expected_shape() {
+        let ctx = ToolContext::new(tempfile::tempdir().unwrap().path().to_path_buf());
+        let err = ReadTool
+            .execute(serde_json::json!({"offset": 10, "limit": 5}), &ctx)
+            .await
+            .expect_err("a path-less read must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"path\""), "names the required field: {msg}");
+        assert!(msg.contains("file_path"), "mentions the alias: {msg}");
     }
 }
