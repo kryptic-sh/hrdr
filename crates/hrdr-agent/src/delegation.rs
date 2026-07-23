@@ -1241,6 +1241,11 @@ impl hrdr_tools::Tool for SubagentTool {
                 .map_err(|e| anyhow::anyhow!("subagent '{}': {e:#}", profile.name))?;
         }
         cfg.cwd = ctx.cwd.clone();
+        // Inherit the parent's resolved memory roots, so the sub-agent shares the
+        // repo's PROJECT memory. Set here, before a write sub-agent's cwd is
+        // repointed at its worktree below — otherwise its project scope would key
+        // by the worktree slug and resolve to a throwaway, empty store.
+        cfg.memory_roots = ctx.memory_project.clone().zip(ctx.memory_global.clone());
         // ONE argument for the one identity: a bare model id (same provider) or a
         // whole `provider://model`.
         let model_arg = args

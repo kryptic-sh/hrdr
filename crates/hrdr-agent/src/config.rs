@@ -390,6 +390,13 @@ pub struct AgentConfig {
     /// `global/` scope subdirectories still apply beneath it. Config
     /// `memory_dir`, `--memory-dir`, `$HRDR_MEMORY_DIR`.
     pub memory_dir: Option<PathBuf>,
+    /// Explicit `(project, global)` memory roots that override the cwd-derived
+    /// ones. Set for a delegated sub-agent so it shares the **parent's** project
+    /// memory rather than keying the project scope by its own cwd — a write
+    /// sub-agent runs in a worktree, whose slug would otherwise resolve to a
+    /// throwaway, empty project scope instead of the repo's. `None` = derive from
+    /// cwd (the main agent's path). Runtime-only; not read from config.
+    pub memory_roots: Option<(PathBuf, PathBuf)>,
     /// Default model for delegated sub-agents. A bare id is that model on the main
     /// agent's provider/endpoint — the "Opus drives, Sonnet implements" knob; a
     /// `provider://model` moves them to another provider entirely. `None` reuses the
@@ -855,6 +862,7 @@ impl Default for AgentConfig {
             todo_ttl: DEFAULT_TODO_TTL,
             is_subagent: false,
             memory_dir: None,
+            memory_roots: None,
             subagent_model: None,
             subagent_profiles: Vec::new(),
             agent_prompt: None,

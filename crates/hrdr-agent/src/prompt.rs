@@ -862,16 +862,24 @@ mod tests {
         assert!(p.contains("New behaviour ships with its test"));
     }
 
-    /// The prompt tells the agent it has durable memory and to use it proactively
-    /// — recall it, save corrections/preferences/decisions, prune what's wrong —
-    /// so the `memory` tool is actually used unprompted.
+    /// The prompt tells the agent it has durable memory and to use it: the
+    /// "recall it" half is unconditional (a read-only agent benefits too), while
+    /// the "save with the `memory` tool" half is `can_write`-gated — `memory` is
+    /// a write tool a read-only agent does not have.
     #[test]
     fn the_prompt_encourages_durable_memory() {
         let tools = ToolRegistry::with_defaults();
-        let p = render_system(&tools, None, false).unwrap();
-        assert!(p.contains("durable memory that persists across sessions"));
-        assert!(p.contains("Save durable, reusable facts with the `memory` tool"));
-        assert!(p.contains("Do NOT save what the repo"));
+        let write = render_system(&tools, None, false).unwrap();
+        assert!(write.contains("durable memory that persists across sessions"));
+        assert!(write.contains("Save durable, reusable facts with the `memory` tool"));
+
+        // A read-only agent still gets the recall half, but not the save half.
+        let mut ro_tools = ToolRegistry::with_defaults();
+        let ro_names = ro_tools.read_only_names();
+        ro_tools.retain_only(&ro_names);
+        let ro = render_system(&ro_tools, None, false).unwrap();
+        assert!(ro.contains("durable memory that persists across sessions"));
+        assert!(!ro.contains("Save durable, reusable facts with the `memory` tool"));
     }
 
     /// A shell-capable agent gets the verify loop, and is told to let the

@@ -1138,9 +1138,17 @@ impl Agent {
         // Memory: expose the `memory` tool (registered before scoping so a
         // read-only sub-agent drops the writer) and resolve its storage roots
         // (used for the `ctx` below and the auto-loaded index).
+        // Prefer explicit roots (a delegated sub-agent inherits the parent's, so
+        // it shares the repo's project memory instead of keying by its worktree
+        // cwd); otherwise derive from cwd (the main agent's path).
         let mem_dirs = config
             .memory
-            .then(|| memory_dirs(&config.cwd, config.memory_dir.as_deref()))
+            .then(|| {
+                config
+                    .memory_roots
+                    .clone()
+                    .or_else(|| memory_dirs(&config.cwd, config.memory_dir.as_deref()))
+            })
             .flatten();
         // Any agent may keep memories — a sub-agent is still an agent. What it may
         // *do* is bounded by its type and permissions, not by whether it was
@@ -3952,6 +3960,25 @@ mod tests {
         };
         assert!(has_memory(true));
         assert!(!has_memory(false));
+    }
+
+    /// Explicit `memory_roots` override the cwd-derived scope — a delegated
+    /// sub-agent inherits the parent's roots, so it shares the repo's project
+    /// memory instead of keying the project scope by its (worktree) cwd.
+    #[test]
+    fn explicit_memory_roots_override_cwd_derivation() {
+        let proj = std::path::PathBuf::from("/parent/repo/.mem/project");
+        let glob = std::path::PathBuf::from("/parent/repo/.mem/global");
+        let cfg = AgentConfig {
+            memory: true,
+            memory_roots: Some((proj.clone(), glob.clone())),
+            cwd: std::path::PathBuf::from("/some/worktree"),
+            ..Default::default()
+        };
+        let agent = Agent::new(cfg).unwrap();
+        // The project scope is the inherited root, NOT projects/<worktree-slug>.
+        assert_eq!(agent.ctx.memory_project.as_deref(), Some(proj.as_path()));
+        assert_eq!(agent.ctx.memory_global.as_deref(), Some(glob.as_path()));
     }
 
     #[test]
