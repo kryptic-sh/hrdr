@@ -63,9 +63,11 @@ hrdr-app / hrdr-agent  (the same core the TUI drives)
   (isolated here; does not bloat the core or TUI). The library shape is what
   lets a native GUI shell embed the server in-process (see _Reuse as a native
   GUI_).
-- **Client SPA** — responsive HTML/CSS/JS, **embedded in the binary** (e.g.
-  `rust-embed`/`include_dir`) so `hrdr serve` is self-contained. Keep it
-  buildless or with a compile-time bundle step so a release ships one binary.
+- **Client FE — a Rust UI** (see _Rust implementation_ below), compiled to WASM
+  for the web build and **embedded in the binary** (e.g. `rust-embed`) so
+  `hrdr serve` is self-contained; the _same_ codebase renders the desktop/mobile
+  apps. Being Rust, it shares the protocol types with the server (no serde
+  drift).
 - **The `Session` abstraction is the seam.** Model the server around a shareable
   session (event stream + steering queue + command dispatch), decoupled from the
   TUI's `App` view-state. Headless mode owns the session directly; attach-mode
@@ -117,6 +119,67 @@ native shell (window, tray, notifications, OS integration)
   everything in one toolchain and can embed `hrdr-web` directly; a mobile app
   wraps a `WebView`/`WKWebView` over the embedded (or remote) server. Either way
   the SPA and protocol are unchanged.
+
+## Rust implementation (FE framework + desktop/mobile shell)
+
+The FE is Rust: one codebase targets web, desktop, and mobile, and it **shares
+protocol types with the server** (no client/server serde drift). Everything
+below uses the **system webview** — WebKitGTK on Linux, WebView2 on Windows,
+WKWebView on macOS — **not Electron** — so binaries stay small (single-digit MB)
+and run on Linux/Windows/macOS.
+
+### Recommended: Dioxus
+
+- **One Rust UI codebase → web** (WASM served by `hrdr-web`), **desktop**
+  (native window via `wry`, the system webview), **mobile**. Lightweight; no
+  bundled browser engine.
+- React-like components + signals, **DOM-based** — right for a
+  text/markdown/code, mobile-friendly, accessible chat UI. (Canvas UIs like
+  `egui`/`iced` are wrong for this _and_ would be a second UI, breaking the
+  one-codebase goal.)
+- Talks to `hrdr-web` over localhost WS on every target — one transport, one
+  client.
+
+### Alternative: Tauri 2 + Leptos
+
+- **Tauri 2** is the most battle-tested, smallest cross-platform shell (Linux/
+  Windows/macOS, plus mobile), also system-webview based. **Leptos** produces
+  the smallest WASM of the Rust web frameworks. Choose this to maximize
+  lightweight/proven, at the cost of Dioxus's single-codebase ergonomics
+  (desktop = Tauri wrapping the Leptos web build). A JS/TS SPA + Tauri is the
+  fastest-to-build fallback but drops Rust type-sharing.
+
+### Cross-platform webview caveats (document for users + CI)
+
+- **Linux:** WebKitGTK (`webkit2gtk`) is a runtime system dependency — package
+  or document it per distro.
+- **Windows:** WebView2 (Evergreen runtime) — ship the bootstrapper or rely on
+  the near-ubiquitous runtime.
+- **macOS:** WKWebView is built in — nothing to ship.
+- hrdr already builds 6 target triples in CI; add the desktop-shell targets.
+
+### Shared protocol types
+
+The WS message enums + a re-export of `Entry` live in one crate
+(`hrdr-protocol`, or a `pub mod` in `hrdr-web`) used by **both** server and
+client, so the JSON contract can't drift.
+
+### Workspace layout
+
+- `hrdr-protocol` — WS message types + `Entry` re-export (tiny, shared).
+- `hrdr-web` — server library (axum HTTP+WS; hosts a `Session`; serves the built
+  WASM FE) + the `hrdr serve` binary.
+- `hrdr-ui` — the Dioxus FE. Build targets: **web** (WASM → embedded in
+  `hrdr-web`) and **desktop/mobile** (native shell that launches embedded
+  `hrdr-web` and opens the UI in the system webview).
+
+### Desktop/mobile app = `hrdr-ui` + embedded `hrdr-web`
+
+The desktop binary starts `hrdr_web::serve(session, config)` on
+`127.0.0.1:<ephemeral>` and opens the Dioxus UI in the system webview,
+connecting over WS. Native niceties (notifications, file dialogs, tray) come
+from the shell via an optional capability layer — never required for the
+web-only path.
 
 ## Authentication & security (primary constraint)
 
@@ -194,9 +257,11 @@ lose the stream.
 
 ## Open questions
 
-- **Client stack:** buildless vanilla JS vs a light framework with a
-  compile-time bundle — trade simplicity of embedding against parity/mobile
-  ergonomics.
+- **Client stack:** recommendation is **Dioxus** (one Rust codebase → web +
+  desktop + mobile via the system webview; shares protocol types with the
+  server). Open sub-decision: Dioxus vs **Tauri 2 + Leptos** (smaller WASM /
+  more-proven shell, but desktop = Tauri wrapping the web build). See _Rust
+  implementation_.
 - **Rendering model shape:** exact JSON the server sends per `EntryKind` (how
   much the server pre-renders vs the client formats).
 - **Multi-session:** does one `hrdr serve` host a single session or a session
