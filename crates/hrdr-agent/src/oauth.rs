@@ -224,6 +224,21 @@ async fn write_response(stream: &mut TcpStream, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Constant-time string comparison to avoid timing side-channels on the CSRF
+/// state. A timing difference that leaks the length of `a` is acceptable here
+/// because the expected state has a fixed length and that length is already
+/// obvious from the URL.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Parse an OAuth callback request line into the authorization `code`, verifying
 /// the returned `state` matches `expected_state`.
 ///
@@ -236,7 +251,7 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
     let params = parse_query(query);
 
     let state = params.get("state").map(String::as_str).unwrap_or("");
-    if state != expected_state {
+    if !constant_time_eq(state, expected_state) {
         // Do NOT echo `expected_state` — this message is written into the HTML
         // page returned to whoever hit the localhost port and into the
         // transcript, so disclosing our own CSRF token to a local prober is
@@ -340,7 +355,7 @@ pub async fn openrouter_exchange(code: &str, verifier: &str) -> Result<String> {
 // ── OpenAI (Codex) flow ─────────────────────────────────────────────────────
 
 /// Tokens returned by the OpenAI token endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct OpenAiTokens {
     pub access_token: String,
     pub refresh_token: String,
@@ -459,6 +474,12 @@ pub fn parse_account_id(id_token_or_access: &str) -> Option<String> {
 }
 
 /// Decode the payload (middle segment) of a `header.payload.signature` JWT.
+///
+/// Does NOT verify the HMAC/RSA signature — this is deliberate. The extracted
+/// `chatgpt_account_id` is used as a routing hint (the `ChatGPT-Account-Id`
+/// header), not as an authentication mechanism. The real security boundary is
+/// the `access_token` Bearer header, validated by OpenAI's API server-side.
+/// Mirrors `codex.ts`'s `extractAccountIdFromClaims`.
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     let (_, payload, _sig) = (parts.next()?, parts.next()?, parts.next()?);
@@ -477,7 +498,7 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
 /// This is the public type callers use. In the unified store it is persisted as
 /// an [`AuthEntry::Oauth`](crate::auth_store) `oauth` entry, with a lossless
 /// conversion in both directions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct OAuthCreds {
     pub access: String,
     pub refresh: String,
@@ -606,7 +627,7 @@ async fn refresh_to_creds(refresh_token: &str, prev_account: Option<String>) -> 
     Ok(OAuthCreds {
         access: tokens.access_token,
         refresh: tokens.refresh_token,
-        expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
+        expires_ms: now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000)),
         account_id,
     })
 }

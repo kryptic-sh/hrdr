@@ -677,7 +677,7 @@ async fn chatgpt_exchange_and_save(
     let creds = hrdr_agent::OAuthCreds {
         access: tokens.access_token,
         refresh: tokens.refresh_token,
-        expires_ms: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
+        expires_ms: now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000)),
         account_id,
     };
     hrdr_agent::save_oauth_for(

@@ -216,10 +216,7 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         let back: AuthEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back, e);
-        assert_eq!(
-            back.as_oauth(),
-            Some(oauth("acc", "ref", 123, Some("acct")))
-        );
+        assert!(back.as_oauth() == Some(oauth("acc", "ref", 123, Some("acct"))));
     }
 
     #[test]
@@ -228,7 +225,7 @@ mod tests {
         // with `account_id: None`.
         let json = r#"{"type":"oauth","access":"a","refresh":"r","expires_ms":9}"#;
         let e: AuthEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(e.as_oauth(), Some(oauth("a", "r", 9, None)));
+        assert!(e.as_oauth() == Some(oauth("a", "r", 9, None)));
     }
 
     #[test]
@@ -270,10 +267,10 @@ mod tests {
         let path = dir.path().join("auth.json");
         let creds = oauth("acc", "ref", 42, Some("acct"));
         save_oauth_entry_at(&path, "chatgpt", &creds).unwrap();
-        assert_eq!(load_oauth_entry_at(&path, "chatgpt"), Some(creds));
+        assert!(load_oauth_entry_at(&path, "chatgpt") == Some(creds));
         // A key entry is not returned as OAuth, and vice-versa.
         save_key_at(&path, "openai", "sk-oai").unwrap();
-        assert_eq!(load_oauth_entry_at(&path, "openai"), None);
+        assert!(load_oauth_entry_at(&path, "openai").is_none());
         assert_eq!(load_keys_at(&path).get("chatgpt"), None);
     }
 
@@ -296,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         assert!(load_keys_at(&path).is_empty());
-        assert_eq!(load_oauth_entry_at(&path, "chatgpt"), None);
+        assert!(load_oauth_entry_at(&path, "chatgpt").is_none());
     }
 
     #[test]
