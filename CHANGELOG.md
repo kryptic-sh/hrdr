@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-23
+
+### Added
+
+- **Structured, LLM-managed memory.** The `memory` tool is reworked into
+  one-file-per-memory with YAML frontmatter (`name`/`description`/`type`:
+  user/feedback/project/reference) plus a tool-generated `MEMORY.md` pointer
+  index that is rebuilt on every mutation, and `write`/`edit`/`delete`/`search`/
+  `view` actions. Schema-less Claude Code / OKF files still list as `reference`.
+- **Per-turn relevance recall.** When you open a turn, the memories most
+  relevant to your message are surfaced in full to the model — the index stays
+  the map, the relevant facts arrive with the query.
+- **`:perf` built-in skill.** A performance investigation-and-report pass
+  (algorithmic complexity, hot-path allocations, redundant work, per-item I/O,
+  lock-across-`await`, wrong data structures), ranked by impact.
+
+### Changed
+
+- **Investigation skills write to disk.** `:audit`, `:review`, `:plan`, and
+  `:tidy` now write their findings/plan/report to `docs/<name>.md` (or the repo
+  root, or straight to you when not in a git repo), returning a high-level
+  summary + the path when written.
+- **`:tidy` is investigate-and-report only.** It reports behavior-preserving
+  cleanups instead of applying them; apply only when asked.
+- **Prompt guidance.** The agent is told it has durable memory (recall it; save
+  corrections/preferences/decisions and prune what's wrong — the save half gated
+  to write-capable agents), and that new behavior, not just bug fixes, ships
+  with a test.
+
+### Fixed
+
+- **Sub-agents share the repo's project memory.** A write sub-agent's
+  project-memory scope was keyed by its worktree cwd, resolving to a throwaway
+  empty store; it now inherits the parent agent's resolved memory roots (global
+  was already shared).
+
 ## [0.7.0] - 2026-07-23
 
 ### Added
@@ -3171,7 +3207,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/kryptic-sh/hrdr/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/kryptic-sh/hrdr/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/kryptic-sh/hrdr/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/kryptic-sh/hrdr/compare/v0.6.0...v0.6.1
