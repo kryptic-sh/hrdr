@@ -3571,6 +3571,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
 /// first thing in a fresh project left a `session.json` whose opening turn is empty.
 #[tokio::test]
 async fn an_empty_turn_does_not_mint_a_blank_session() {
+    let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     assert!(h.app.state().id.is_none(), "nothing saved yet");
 
