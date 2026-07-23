@@ -408,7 +408,7 @@ fn check_guardrails_depth<'a>(
 /// Falls back to the raw command when the line can't be word-split (unbalanced
 /// quotes — malformed, and the shell would reject it too; err toward matching so
 /// a real command isn't hidden behind a stray quote). Before falling back, strips
-/// leading/trailing unmatched quote characters that could defeat the regex match.
+/// all unmatched quote characters that could defeat the regex match.
 fn tokenized_for_match(cmd: &str) -> String {
     match shell_words::split(cmd) {
         Ok(words) => words
@@ -420,25 +420,23 @@ fn tokenized_for_match(cmd: &str) -> String {
     }
 }
 
-/// Strip leading and trailing quote characters (`"`, `'`) from `s` when the
-/// total count of that quote character is odd — i.e. the opener or closer
-/// has no mate. This addresses the concrete bypass where an unmatched quote
-/// before a flag (`'"--force`) defeats the whitespace-anchored regex after
+/// Strip **all** quote characters (`"`, `'`) from `s` when the total count
+/// of that quote character is odd — i.e. an opener or closer has no mate.
+/// This addresses the concrete bypass where an unmatched quote before a flag
+/// (`'"--force`) defeats the whitespace-anchored regex after
 /// `shell_words::split` errors out.
 fn strip_unbalanced_quotes(s: &str) -> String {
     let trimmed = s.trim();
     let mut result = trimmed.to_string();
 
-    // Unmatched double quotes: odd total count -> strip from edges.
+    // Unmatched double quotes: odd total count -> strip all of them.
     if result.chars().filter(|&c| c == '"').count() % 2 != 0 {
-        result = result.trim_start_matches('"').to_string();
-        result = result.trim_end_matches('"').to_string();
+        result = result.replace('"', "");
     }
 
-    // Unmatched single quotes: odd total count -> strip from edges.
+    // Unmatched single quotes: odd total count -> strip all of them.
     if result.chars().filter(|&c| c == '\'').count() % 2 != 0 {
-        result = result.trim_start_matches('\'').to_string();
-        result = result.trim_end_matches('\'').to_string();
+        result = result.replace('\'', "");
     }
 
     result
@@ -490,6 +488,7 @@ mod tests {
         assert!(blocked("git push --force"));
         assert!(blocked("git push -f origin main"));
         assert!(blocked("git push origin main --force"));
+        assert!(blocked(r#"git push '"--force"#));
         assert!(!blocked("git push --force-with-lease"));
         assert!(!blocked("git push origin main"));
     }
