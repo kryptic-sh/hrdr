@@ -1,7 +1,8 @@
-# hrdr `memory` tool — gap analysis vs Claude Code
+# hrdr `memory` tool — toward Claude-Code-style, LLM-managed memory
 
-Comparison of hrdr's `memory` tool against Claude Code's memory system, to scope
-a lifecycle rework. Analysis date: 2026-07-23.
+How to evolve hrdr's `memory` tool so the model can **fully manage** its own
+memory — decide what to keep, write it structured, recall the right piece,
+update and prune it — the way Claude Code does. Analysis date: 2026-07-23.
 
 **Sources.** hrdr: `crates/hrdr-tools/src/memory.rs` (the tool);
 `crates/hrdr-agent/src/lib.rs:876-960` (`read_memory_index`/`gather_memory` +
@@ -9,96 +10,126 @@ the budget constants); `crates/hrdr-agent/src/config.rs:389` (storage roots).
 Claude Code: <https://code.claude.com/docs/en/memory> and
 <https://ianlpaterson.com/blog/claude-code-memory-architecture/>.
 
-## What hrdr already matches
+## What hrdr already has
 
-- **Plain-Markdown storage** — an `MEMORY.md`/`index.md` index plus topic files,
-  OKF-flavored (`memory.rs:1-8`).
-- **Two scopes** — `project` (this cwd) and `global` (all projects). Roots are
-  supplied by the caller via `ToolContext::memory_project` / `memory_global`,
-  laid out as `<XDG data>/hrdr/memory/projects/<cwd-slug>/` and `…/global/`
-  (`config.rs:389`).
-- **Auto-loaded into the prompt at session start**, budgeted to **200 lines / 25
-  600 bytes** (`MEMORY_INDEX_MAX_LINES` / `MEMORY_INDEX_MAX_BYTES`,
-  `lib.rs:876-877`) — matches Claude Code's 200-line / 25 KB budget.
-- **CRUD via the tool** — `view` (also lists the scope when `path` is omitted),
-  `write`, `append`, `delete` (`memory.rs:58`).
-- **Reads Claude Code `MEMORY.md` and OKF `index.md` unchanged.**
+- **Plain-Markdown storage**, two scopes — `project` (this cwd) and `global`
+  (all projects) — under `<XDG data>/hrdr/memory/projects/<cwd-slug>/` and
+  `…/global/` (`config.rs:389`), supplied via
+  `ToolContext::memory_project`/`memory_global`.
+- **An index auto-loaded at session start**, budgeted to **200 lines / 25 600
+  bytes** (`lib.rs:876-877`) — same budget Claude Code uses.
+- **CRUD tool** — `view`/list, `write`, `append`, `delete` (`memory.rs:58`) —
+  and it reads a Claude Code `MEMORY.md` / OKF `index.md` unchanged.
 
-## What's missing — the lifecycle layer
+Storage and load-at-startup are solid. What's missing is the **model** of memory
+and the **lifecycle** that lets the LLM own it.
 
-Storage and load-at-startup are solid; every gap is in **write / update /
-maintain**.
+## The Claude Code model (what "fully LLM-managed" means)
 
-### G1 — Auto-memory (P0)
+Four properties make Claude Code's memory manageable by the model rather than by
+a human curating a file:
 
-The agent writes memory only when told. The tool description says "save facts
-worth keeping, prune entries that become wrong," but nothing _triggers_ a write
-on a correction, a stated preference, or a repeated fact — so memory is almost
-never used unprompted. This is the biggest UX gap.
+1. **One memory = one small file.** Each fact is its own file (kebab-case slug),
+   not a line inside one growing document. That is what makes update, delete,
+   and dedup precise — you replace or remove a file, never surgically edit a
+   shared blob.
+2. **Structured frontmatter** on every file:
+   - `name` — the slug (stable id, and the `[[link]]` target).
+   - `description` — one line; this is what **recall matches against**.
+   - `type` — `user` (who the user is), `feedback` (a correction/preference,
+     with **Why** + **How to apply**), `project` (ongoing work/constraints not
+     in the repo), `reference` (a pointer to an external resource). Bodies use
+     absolute dates and link related memories with `[[name]]`.
+3. **`MEMORY.md` is a generated index of one-line pointers, not content** —
+   `- [Title](file.md) — hook`. It is the map, loaded each session; the memories
+   themselves live in the files.
+4. **Recall is relevance-based, not a dump.** The pointer index loads every
+   session; the memories whose `description` fits the current task surface **in
+   full** (Claude Code injects them in `<system-reminder>` blocks). The model
+   never has to grep, and the 200-line budget is never the ceiling on total
+   knowledge — only on the always-loaded map.
 
-_Design sketch:_ a post-turn pass (or a lightweight lifecycle hook) that detects
-a "remember this" instruction, a user correction of the agent, or a fact seen ≥N
-times, and appends a dated line to the index — gated so it doesn't accrete noise
-(dedupe against existing lines; cap writes per turn).
+The lifecycle is the model's: it writes/updates/prunes files and the pointer
+line directly, guided by rules baked into the tool's instructions — **check for
+an existing file before creating (update, don't duplicate), delete memories that
+turn out wrong, don't store what the repo/git/AGENTS.md already records or what
+only matters to this one conversation, convert relative dates to absolute.**
 
-### G2 — In-place editing: section markers → `memory edit` (P0)
+## Target design for hrdr
 
-Two facets of one feature. Today `write` overwrites the whole file, `append`
-only tacks to the end, and `delete` removes the whole file
-(`memory.rs:107/120/142`) — there is no way to change a single fact without
-`read` → edit-in-prompt → `write` back (lossy and race-prone).
+The keystone is switching from "one big index the model hand-maintains" to
+"one-file-per-memory + a pointer index the tool maintains + relevance recall."
+Everything else follows.
 
-- **Section markers** (`<!-- BEGIN <id> -->` / `<!-- END <id> -->`) are the
-  mechanism: a stable anchor a tool can find-and-replace.
-- **`memory edit`** is the action built on them: replace one block/line in
-  place.
+### 1. Structured memory files (the schema)
 
-Build the markers first; `edit` depends on them.
+Adopt the frontmatter above (`name` / `description` / `type`, body with
+`[[links]]`). hrdr already stores topic files; give them this schema. Keep
+reading schema-less Claude Code/OKF files as before (no-migration-friendly): a
+file without frontmatter is treated as `type: reference`, `description` = its
+first heading/line.
 
-### G3 — Date-stamped entries (P1)
+### 2. Tool maintains the pointer index
 
-No enforced `[YYYY-MM-DD]` prefix. Claude Code stamps entries in `/flush`; hrdr
-has no schema, so dedup and rotation later have nothing to sort or age by. A
-precondition for G4.
+When `write` / `edit` / `delete` touches a memory file, the tool updates
+`MEMORY.md`'s pointer line for it (add / rewrite `description` / remove). The
+model never edits two places or lets the index drift from the files. This is the
+single biggest reliability win — it removes the "did I update the index?" burden
+entirely.
 
-### G4 — Rotation / archival (P1)
+### 3. Operations for precise management
 
-At the cap, `read_memory_index` truncates and appends
-`"… (truncated — read the full index at <path>)"` (`lib.rs`). Content past the
-cap isn't _lost_ — the agent can still `read` the full file — but it is silently
-out of the prompt. Claude Code rotates aged entries into archive/topic files so
-the in-budget index stays high-signal; hrdr has no rotation, so a growing index
-degrades to blind truncation. Depends on G3 (needs dates to age by).
+- `write { scope, name, type, description, body }` — create or replace one
+  memory file (and its pointer).
+- `edit { scope, name, … }` — update a field or the body of one memory in place
+  (replaces the current whole-file overwrite / append-only pair). Subsumes the
+  earlier "section markers" idea — with one-file-per-memory there is no shared
+  blob to anchor into.
+- `delete { scope, name }` — remove the file and its pointer.
+- `search { scope, query }` — rank memories by `description` + body match,
+  return pointers (the model then `view`s the ones it wants). First-class recall
+  on demand, not `grep`.
+- `view` / `list` — as today.
 
-### G5 — On-demand topic loading + navigation index (P2)
+### 4. Relevance recall
 
-Topic files already exist, but only the index is auto-loaded — nothing routes to
-the relevant topic file for the current task, and there is no project → path →
-status map, so the agent falls back to `read` / `grep`. These two overlap: a
-navigation index is what makes on-demand routing possible.
+At session start, load the pointer index (as now) **plus** the full text of
+memories whose `description` matches the working context, injected the way hrdr
+already injects `<system-reminder>` context. On a cwd/topic change, refresh the
+recalled set. This is what makes the store scale past 200 lines without rotation
+gymnastics: the map stays small, the relevant memories arrive in full, and the
+rest stay on disk until searched.
 
-### G6 — `memory search` (P2)
+### 5. Auto-memory (the lifecycle triggers)
 
-No in-tool search; the agent must use `grep`, which doesn't know the memory
-roots. A `search` action scoped to project + global would be a small,
-independent add.
+Bake explicit write-triggers into the tool description so the model saves
+unprompted at the natural moments — an explicit "remember this", a user
+**correction** of the model, a stated durable **preference**, a non-obvious
+**project decision** — classified by `type`, deduped against existing files
+(update in place), and pruned when a later fact contradicts them. Gate it (cap
+writes per turn; never store conversation-only trivia or repo-derivable facts)
+so it stays high-signal.
 
-### G7 — Drift detection (P2)
+## How the earlier gaps fold in
 
-No periodic audit comparing the memory system's own docs against reality (Claude
-Code runs cron audits). Nice-to-have once G3–G5 exist.
+| Gap (old ID)                 | In the target design                                                                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| G1 auto-memory               | §5 lifecycle triggers — still the top behavioral win.                                                                                     |
+| G2 in-place edit / markers   | §3 `edit` on one-file-per-memory — markers no longer needed.                                                                              |
+| G3 date stamps               | Part of the schema (§1): absolute dates in the body.                                                                                      |
+| G4 rotation / archival       | Largely **obviated** by §4 recall (map = pointers, not content); what's left is pruning contradicted/stale memories (§5), not truncation. |
+| G5 topic routing + nav index | **Subsumed** by the pointer index (§2) + relevance recall (§4).                                                                           |
+| G6 `memory search`           | §3 `search` — a first-class operation.                                                                                                    |
+| G7 drift detection           | A periodic prune/verify pass over the files vs the index (cheap once §2 keeps them in sync).                                              |
 
 ## Priority & sequencing
 
-| Tier   | Item                               | Depends on          | Why                                       |
-| ------ | ---------------------------------- | ------------------- | ----------------------------------------- |
-| **P0** | G1 auto-memory                     | —                   | agent barely uses memory unprompted       |
-| **P0** | G2 section markers → `memory edit` | markers before edit | makes updates safe, not destructive       |
-| **P1** | G3 date stamps                     | —                   | precondition for dedup / rotation         |
-| **P1** | G4 rotation                        | G3                  | keeps the 200-line cap high-signal        |
-| **P2** | G5 topic routing + nav index       | —                   | on-demand loading of existing topic files |
-| **P2** | G6 `memory search`                 | —                   | small, independent                        |
-| **P2** | G7 drift detection                 | G3–G5               | audit once the lifecycle exists           |
-
-**Start with G2's section markers** — small, self-contained, and it unblocks
-safe editing — and **G1 auto-memory**, the highest user-facing impact.
+1. **Keystone — §1 schema + §2 tool-maintained pointer index.** Everything
+   depends on one-file-per-memory with a self-syncing index; do this first.
+2. **§4 relevance recall.** Turns the store from "an index the model reads" into
+   "memories the model is handed" — removes the truncation/routing problems (G4,
+   G5) outright.
+3. **§5 auto-memory triggers.** The highest-visibility behavior change: the
+   model starts using memory unprompted, correctly typed and deduped.
+4. **§3 `edit` / `search` / prune.** Precise management + on-demand recall +
+   drift-free maintenance (G2, G6, G7).
