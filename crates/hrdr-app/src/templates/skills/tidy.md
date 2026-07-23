@@ -28,4 +28,16 @@ default, or the target named in arguments if given: $ARGUMENTS
    behavior, leave it and note it rather than making it.
 5. Run the project's format, lint, and tests; confirm they pass and behavior is
    unchanged.
-6. Report what you tidied and why, and anything you deliberately left alone.
+6. Write up what you tidied and why, and anything you deliberately left alone,
+   then route that report by where you're working:
+   - **Inside a git repo with a `docs/` directory** → write it to
+     `docs/tidy-report.md`.
+   - **Inside a git repo with no `docs/` directory** → write it to
+     `tidy-report.md` at the repo root.
+   - **Not inside a git repo** (working on something git doesn't track) → do NOT
+     write to disk.
+
+   When you write the report to disk, tell the user only a high-level summary
+   plus the path you wrote; when you do NOT, give the user the full report in
+   your reply. This routes the _report_ only — the code cleanups from step 4 are
+   applied to the code regardless.
