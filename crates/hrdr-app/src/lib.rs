@@ -48,7 +48,8 @@ pub use hrdr_agent::{
     MAX_SESSION_FILE_BYTES, OpenError, Reservation, SaveOutcome, Session, SessionBusy, SessionLock,
     SessionMeta, SessionState, SessionUsage, acquire_open_lock, acquire_session_lock,
     list_sessions, resolve_session, sanitize_name, save_session, session_file_path,
-    session_name_from, sessions_dir, subagent_transcript_dir, sweep_sessions, unique_session_id,
+    session_name_from, session_transcript_path, sessions_dir, subagent_transcript_dir,
+    sweep_sessions, unique_session_id,
 };
 pub use hrdr_agent::{Pane, PaneId, PaneSet, PaneStatus, PaneView};
 pub use sessions::*;

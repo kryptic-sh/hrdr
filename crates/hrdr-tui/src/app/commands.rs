@@ -113,6 +113,10 @@ impl super::App {
         if let Ok(mut cell) = self.subagent_dir.lock() {
             *cell = None;
         }
+        // Detach the main agent's transcript writer for the same reason: the next
+        // session mints a fresh id and `refresh_subagent_dir` opens its own jsonl.
+        // Without this the new conversation would append onto the one we just left.
+        self.live_subagents.detach_transcript(hrdr_agent::MAIN_KEY);
         self.state_mut().name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;

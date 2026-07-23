@@ -1155,6 +1155,14 @@ impl App {
             "user-shell-{}",
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // Mint the session id — and with it attach the main transcript writer —
+        // before the tool block opens, so a `!command` run as the very first
+        // action in a brand-new session still records to the durable jsonl. The
+        // same reservation a normal turn makes in `spawn_turn`; a no-op once the
+        // session already has an id. Without it, the ToolStart/ToolEnd below fire
+        // through `record(MAIN_KEY)` while no writer is attached, and the block is
+        // absent from the transcript on resume.
+        self.reserve_session_id(&format!("! {command}"));
         // Open the tool block immediately (synchronously, so it lands before
         // any streamed output). It renders as the `shell` tool.
         self.apply_event(AgentEvent::ToolStart {

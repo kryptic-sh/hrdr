@@ -286,9 +286,10 @@ impl LiveSubagents {
                 done: false,
                 delivered: false,
                 pinned: true,
-                // The main agent's durable transcript is not written through
-                // this registry (its `.json` session snapshot is its record);
-                // only delegated sub-agents carry a writer here.
+                // Attached later via `attach_transcript`, once the session id is
+                // assigned and its jsonl path is known — the same durable
+                // event-fold transcript a delegated sub-agent gets. `None` until
+                // then (a brand-new session before its first save has no id yet).
                 transcript: None,
             });
         });
@@ -330,6 +331,47 @@ impl LiveSubagents {
                 w.write(&rec);
             }
         });
+    }
+
+    /// Attach a durable transcript writer to agent `key` at `path`, if it does not
+    /// already have one. Opens the file in **append** mode
+    /// ([`crate::subagent_transcript::SubagentTranscript::append`]): the main
+    /// agent's id is stable across resumes, so a resumed session continues its
+    /// existing jsonl rather than starting a second one.
+    ///
+    /// This is how the main agent joins the sub-agents' durable-transcript path:
+    /// once attached, every event `record`ed against it appends to the jsonl, so
+    /// its on-disk transcript is written incrementally instead of the whole
+    /// `Vec<Entry>` being re-serialized into the session `.json` on every round.
+    ///
+    /// Best-effort and idempotent: a failed open leaves the agent without a writer
+    /// (recording still works, just not to disk) rather than breaking the turn, and
+    /// a second call while one is attached is a no-op — [`Self::detach_transcript`]
+    /// is what a session switch uses to point it at the next file.
+    pub fn attach_transcript(&self, key: u64, path: &std::path::Path) {
+        // Opening the file is done outside the registry lock; the has/​set checks
+        // are only ever driven from the single UI thread, so the window between
+        // them cannot race a second attach.
+        if self.with(|v| v.iter().any(|e| e.key == key && e.transcript.is_some())) {
+            return;
+        }
+        let Ok(writer) = crate::subagent_transcript::SubagentTranscript::append(path) else {
+            return;
+        };
+        let writer = Arc::new(Mutex::new(writer));
+        self.update(key, |e| {
+            if e.transcript.is_none() {
+                e.transcript = Some(writer);
+            }
+        });
+    }
+
+    /// Drop agent `key`'s transcript writer, so the next
+    /// [`Self::attach_transcript`] opens a different session's file. A session
+    /// switch (`/new`, `/resume`) uses this: without it, the new session's events
+    /// would append onto the one we just left.
+    pub fn detach_transcript(&self, key: u64) {
+        self.update(key, |e| e.transcript = None);
     }
 
     /// A turn is starting on agent `key`: start its clock.

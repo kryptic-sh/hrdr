@@ -1722,45 +1722,33 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
         .expect("autosave assigned a session id");
     let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
 
-    // The transcript came back verbatim — including the model's reasoning and
-    // the per-turn stats line, neither of which exists in `messages`. The only
-    // difference is the ephemeral chrome (welcome banner, "session saved as …"),
-    // which is never written. Times persist as whole seconds.
+    // The transcript is rebuilt from the sibling jsonl — the fold of the agent's
+    // event stream — so what persists is the model's own output: the user turn,
+    // its reasoning, its reply (none of which, save the user turn, exists in
+    // `messages`). Frontend chrome — the welcome Header, the per-turn Stats line,
+    // "session saved as …" notices — is display-only and never written, so it does
+    // NOT come back.
+    //
+    // Per-entry timestamps are NOT preserved: `AgentEvent`s (and so the jsonl
+    // records) carry no wall-clock time, and streaming deltas coalesce, so a
+    // rebuilt entry is stamped at fold time. Content is what the fold preserves.
     let saved = &loaded.state.transcript;
-    let live: Vec<&Entry> = h
-        .app
-        .transcript()
-        .iter()
-        .filter(|e| !matches!(e.kind, EntryKind::Notice(_)))
-        .collect();
-    assert_eq!(
-        saved.len(),
-        live.len(),
-        "one saved entry per non-notice entry"
-    );
-    for (a, b) in saved.iter().zip(&live) {
-        assert_eq!(a.kind, b.kind);
-        assert_eq!(a.time.timestamp(), b.time.timestamp());
-    }
+    let kinds: Vec<&EntryKind> = saved.iter().map(|e| &e.kind).collect();
     assert!(
-        !saved.iter().any(|e| matches!(e.kind, EntryKind::Notice(_))),
-        "no chrome on disk"
+        matches!(
+            kinds.as_slice(),
+            [EntryKind::User(u), EntryKind::Reasoning { .. }, EntryKind::Assistant(a)]
+                if u == "run it" && a.contains("done")
+        ),
+        "the event fold — user, reasoning, reply — round-trips in order: {kinds:?}"
     );
+    // None of the frontend chrome is on disk — it is not part of the event fold.
     assert!(
-        loaded
-            .state
-            .transcript
-            .iter()
-            .any(|e| matches!(e.kind, EntryKind::Reasoning { .. })),
-        "the model's thoughts are persisted"
-    );
-    assert!(
-        loaded
-            .state
-            .transcript
-            .iter()
-            .any(|e| matches!(e.kind, EntryKind::Stats(_))),
-        "the per-turn stats line is persisted"
+        !saved.iter().any(|e| matches!(
+            e.kind,
+            EntryKind::Notice(_) | EntryKind::Stats(_) | EntryKind::Header
+        )),
+        "no chrome (notice/stats/header) persisted: {kinds:?}"
     );
 
     // …as did the status bar's counters and the session's identity.

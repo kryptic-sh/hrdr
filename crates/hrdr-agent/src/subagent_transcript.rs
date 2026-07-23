@@ -138,9 +138,6 @@ impl Record {
     /// (`Steered`), matching the live path (`delegation.rs` records the prompt as
     /// a `Steered` event before the run). `Error` surfaces as a `Notice`. `End`
     /// is pure framing and folds to nothing.
-    // Used by `read_transcript` (and its test); the crash-recovery UI (a later
-    // WISHLIST item) is its non-test consumer.
-    #[allow(dead_code)]
     pub fn as_event(&self) -> Option<crate::AgentEvent> {
         use crate::AgentEvent;
         match self {
@@ -220,6 +217,40 @@ impl SubagentTranscript {
         Ok(Self { file, path })
     }
 
+    /// Open `path` for appending, creating it (and its parent dirs) if absent.
+    ///
+    /// **Non-exclusive**, unlike [`create`](Self::create): the main agent's
+    /// transcript has a *stable* id across resumes — the file survives with the
+    /// session and the process reattaches to it — so a resumed session must
+    /// continue appending to its existing jsonl, not refuse it. (A sub-agent's id
+    /// counter restarts each process, which is exactly why its runs own their
+    /// files outright.) The existing records stay put; new events land after them,
+    /// and a later [`read_transcript`] folds old and new together in order.
+    pub fn append(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            // The transcript holds the agent's full prompt and output; keep its
+            // directory owner-only (the file inherits from the mode below).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Append one record as a JSON line and flush. All errors are swallowed: a
     /// failed transcript write must never break the sub-agent run.
     pub fn write(&mut self, rec: &Record) {
@@ -255,9 +286,9 @@ pub fn is_complete(path: &Path) -> bool {
 /// Read a sub-agent transcript file and fold it into a Vec<Entry> using the
 /// SAME reducer as the main transcript, so the on-disk sub-agent record renders
 /// identically (tool args + results intact). Best-effort: unparsable lines are skipped.
-// Used by tests now; the crash-recovery UI (a later WISHLIST item) is its
-// non-test consumer.
-#[allow(dead_code)]
+///
+/// The MAIN agent's resume path ([`crate::Session::load_path`]) folds its session
+/// jsonl through here too — the transcript is no longer embedded in the `.json`.
 pub fn read_transcript(path: &Path) -> Vec<crate::Entry> {
     let mut entries = Vec::new();
     let Ok(file) = File::open(path) else {

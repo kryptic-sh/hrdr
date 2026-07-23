@@ -9881,25 +9881,21 @@ mod tests {
                 "the sub-agent's turn is in messages: {:?}",
                 session.state.messages
             );
-            // The snapshot does NOT duplicate the transcript — that lives in the
-            // sibling jsonl (folded back with `read_transcript` on load), so a round
-            // never re-serializes it.
+            // The `.json` snapshot does NOT embed the transcript — that lives in the
+            // sibling jsonl, so a round never re-serializes it. But `load_path`
+            // rebuilds it from that jsonl on the way back (the SAME path the main
+            // agent's resume takes), so the loaded state has a folded transcript,
+            // carrying the tool call WITH its args — proof the record is the
+            // complete stream, not a lossy summary. (The `.json` alone is empty:
+            // pinned by `session::tests::save_to_path_round_trips_through_load_path`.)
             assert!(
-                session.state.transcript.is_empty(),
-                "the snapshot omits the transcript (rebuilt from the jsonl): {:?}",
-                session.state.transcript
-            );
-            // Rebuilt from the jsonl, the transcript carries the tool call WITH its
-            // args — proof the record is the complete stream, not a lossy summary.
-            let rebuilt =
-                crate::subagent_transcript::read_transcript(&json_path.with_extension("jsonl"));
-            assert!(
-                rebuilt.iter().any(|e| matches!(
+                session.state.transcript.iter().any(|e| matches!(
                     &e.kind,
                     crate::EntryKind::Tool { name, args, .. }
                         if name == "read" && !args.is_empty()
                 )),
-                "a Tool entry with non-empty args is in the rebuilt transcript: {rebuilt:?}"
+                "load_path rebuilt the transcript from the sibling jsonl, tool args intact: {:?}",
+                session.state.transcript
             );
         }
 

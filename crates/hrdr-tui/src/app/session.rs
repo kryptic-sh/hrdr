@@ -29,15 +29,26 @@ impl super::App {
         }
     }
 
-    /// Point the shared sub-agent transcript cell at the current session's dir.
-    /// Called after the session id is assigned; sub-agents spawned before this
-    /// (a brand-new session's first turn) are simply not persisted.
+    /// Point the shared sub-agent transcript cell at the current session's dir,
+    /// and attach the MAIN agent's own durable transcript writer at its sibling
+    /// `<id>.jsonl`. Called after the session id is assigned; anything spawned or
+    /// emitted before this (a brand-new session's first turn) is simply not
+    /// persisted — matching the documented pre-first-save behavior.
+    ///
+    /// Attaching is idempotent (a no-op once the writer is open), so calling this
+    /// on every save is cheap; a session *switch* detaches first
+    /// (`detach_transcript`, in `clear_all` and `adopt_state`) so the writer then
+    /// re-opens against the new session's file.
     pub(super) fn refresh_subagent_dir(&self) {
         if let Some(id) = &self.state().id {
-            let dir = hrdr_app::subagent_transcript_dir(&self.current_cwd(), id);
+            let cwd = self.current_cwd();
+            let dir = hrdr_app::subagent_transcript_dir(&cwd, id);
             if let Ok(mut cell) = self.subagent_dir.lock() {
                 *cell = Some(dir);
             }
+            let jsonl = hrdr_app::session_transcript_path(&cwd, id);
+            self.live_subagents
+                .attach_transcript(hrdr_agent::MAIN_KEY, &jsonl);
         }
     }
 
@@ -331,6 +342,12 @@ impl super::App {
                 .expect("a bare model id always resolves");
             state.provider_unset = false;
         }
+        // Drop the outgoing session's transcript writer before pointing the dirs
+        // at the incoming one: `refresh_subagent_dir` then re-attaches against the
+        // adopted id (append mode — a resume continues that session's jsonl).
+        // Without this a resumed/switched session would append onto the file we
+        // just left.
+        self.live_subagents.detach_transcript(hrdr_agent::MAIN_KEY);
         self.refresh_subagent_dir();
         // The pane is rebuilt from the registry every frame, main agent included —
         // so a resumed session's model/endpoint/counters have to land there too, or

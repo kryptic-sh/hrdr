@@ -99,7 +99,16 @@ pub struct SessionState {
     pub todos: Vec<TodoItem>,
     /// The display transcript: every entry the user saw, each with its own
     /// timestamp. This — not `messages` — is what a resume renders.
-    #[serde(default)]
+    ///
+    /// **Not serialized into the `.json`.** It is written incrementally to a
+    /// sibling append-only `<id>.jsonl` (the fold of the agent's `AgentEvent`
+    /// stream — the same durable record a delegated sub-agent keeps) and rebuilt
+    /// from it on load ([`Session::load_path`]). Embedding it here meant the whole
+    /// multi-MB transcript was re-serialized on every mid-turn save — O(n²) in the
+    /// length of the conversation. It still *deserializes* (via the hand-written
+    /// `Deserialize`), so an older file that embeds one loads it as a fallback when
+    /// no sibling jsonl exists.
+    #[serde(default, skip_serializing)]
     pub transcript: Vec<Entry>,
     /// Token counters for the status bar (see [`SessionUsage`]).
     #[serde(default)]
@@ -667,6 +676,14 @@ pub fn subagent_transcript_dir(cwd: &str, id: &str) -> PathBuf {
     session_dir(cwd).join("subagents").join(sanitize_name(id))
 }
 
+/// `sessions/<cwd-slug>/<session-id>.jsonl` — the MAIN agent's durable transcript,
+/// a sibling of its `<session-id>.json` snapshot. The append-only fold of its
+/// `AgentEvent` stream, rebuilt on resume; the same shape as a sub-agent's, so
+/// both agents share one on-disk transcript format.
+pub fn session_transcript_path(cwd: &str, id: &str) -> PathBuf {
+    session_dir(cwd).join(format!("{}.jsonl", sanitize_name(id)))
+}
+
 /// Reduce an arbitrary name to a safe, length-capped, lowercase file stem.
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name
@@ -868,6 +885,19 @@ impl Session {
         let mut session: Session =
             serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
         session.state.id = session_id_from_path(path);
+        // The transcript is no longer embedded in the `.json` (see
+        // `SessionState::transcript`). Rebuild it from the sibling `<id>.jsonl` —
+        // the append-only fold of the agent's event stream — through the SAME
+        // reducer the live path uses, so a resumed transcript renders identically.
+        // `with_file_name` gives the sibling regardless of `.json` vs `.json.zst`.
+        // An older file that still carries an embedded transcript and has no jsonl
+        // keeps the one it deserialized (the fallback branch does nothing).
+        if let Some(stem) = session.state.id.as_deref() {
+            let jsonl = path.with_file_name(format!("{stem}.jsonl"));
+            if jsonl.exists() {
+                session.state.transcript = crate::subagent_transcript::read_transcript(&jsonl);
+            }
+        }
         // A load always knows the true `created` for this path — remember it,
         // so a later `save` (an autosave, a rename, …) doesn't have to re-read
         // the file just to preserve it.
@@ -1235,9 +1265,14 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
         };
         if want_purge {
             match Session::load_path(&path) {
-                // Auto-named and old enough → purge outright.
+                // Auto-named and old enough → purge outright, together with the
+                // session's derived data: its sibling transcript jsonl and its
+                // sub-agents' transcript dir. Otherwise deleting the `.json` orphans
+                // them under `sessions/<cwd>/`.
                 Ok(s) if !s.state.named_by_user => {
                     let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(dir.join(format!("{id}.jsonl")));
+                    let _ = std::fs::remove_dir_all(dir.join("subagents").join(&id));
                     continue;
                 }
                 // User-named → keep. It may still be a compression candidate below.
@@ -1452,13 +1487,17 @@ mod tests {
     }
 
     /// `save_to_path` writes to an explicit file (creating parent dirs) and the
-    /// state round-trips back through `load_path` unchanged — the sub-agent
-    /// snapshot primitive.
+    /// state round-trips back through `load_path` — the sub-agent snapshot
+    /// primitive. It carries **messages + metadata** (the model context a
+    /// `task_revive` relaunch needs); the sub-agent's *transcript* is its own
+    /// sibling jsonl, not this snapshot, so it is deliberately absent here.
     #[test]
     fn save_to_path_round_trips_through_load_path() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("subagents").join("000-probe.json");
         let mut s = state("Sub Agent", "/tmp/proj");
+        // A snapshot taken with a live in-memory transcript still writes none of it
+        // to the `.json`: the transcript is not part of the snapshot's serde shape.
         s.transcript = vec![Entry::now(EntryKind::Tool {
             id: "call_1".into(),
             name: "read".into(),
@@ -1476,15 +1515,15 @@ mod tests {
         let loaded = Session::load_path(&path).expect("round-trips back");
         assert_eq!(loaded.state.name, "Sub Agent");
         assert_eq!(loaded.state.cwd, "/tmp/proj");
+        // Model context — what a relaunch resumes from — survives verbatim.
         assert_eq!(loaded.state.messages.len(), 1);
         assert_eq!(loaded.state.messages[0].role, MessageRole::User);
+        // The transcript is NOT in the snapshot; no sibling jsonl exists here, so
+        // it loads empty. (Its own round-trip is pinned by the subagent_transcript
+        // tests and `roundtrip_audit::transcript_rebuilds_from_the_sibling_jsonl`.)
         assert!(
-            loaded
-                .state
-                .transcript
-                .iter()
-                .any(|e| matches!(&e.kind, EntryKind::Tool { args, .. } if !args.is_empty())),
-            "the transcript's tool entry (with args) survives the round-trip"
+            loaded.state.transcript.is_empty(),
+            "the transcript is the sibling jsonl's, not the snapshot's"
         );
     }
 
@@ -1552,7 +1591,13 @@ mod tests {
             Session::new(st.clone()).save("round-trip").unwrap();
 
             let back = Session::load(&cwd, "round-trip").unwrap().state;
-            assert_eq!(back.transcript, st.transcript, "transcript verbatim");
+            // The transcript lives in the sibling jsonl, not the `.json`; `save`
+            // wrote no jsonl here, so it comes back empty. Its own round-trip is
+            // pinned by `roundtrip_audit::transcript_rebuilds_from_the_sibling_jsonl`.
+            assert!(
+                back.transcript.is_empty(),
+                "transcript is not embedded in the .json"
+            );
             assert_eq!(back.usage, st.usage, "token counters");
             assert_eq!(back.messages.len(), 1);
             assert_eq!(
@@ -2391,13 +2436,14 @@ mod roundtrip_audit {
     use crate::EntryKind;
 
     /// The audit: a `SessionState` with every field populated, encoded to the
-    /// session file's JSON and decoded back, must come out identical — except
-    /// for the two fields deliberately not persisted.
+    /// session file's JSON and decoded back, must come out identical — except for
+    /// the transcript, which is no longer embedded in the `.json` (it lives in the
+    /// sibling `<id>.jsonl`; see `transcript_rebuilds_from_the_sibling_jsonl`).
     ///
     /// This is the load-bearing property of the design ("save is a serialize,
     /// load is an assignment"), so it gets an explicit test rather than trust.
     #[test]
-    fn state_to_json_to_state_is_lossless_except_for_view_state() {
+    fn state_to_json_to_state_is_lossless_except_for_the_transcript() {
         let t = crate::time_from_unix(1_700_000_000, chrono::Local::now());
         let mut assistant = Message::assistant("hello");
         assistant.reasoning_content = Some("secret thoughts".into());
@@ -2465,20 +2511,18 @@ mod roundtrip_audit {
         assert_eq!(back.todos.len(), 1);
         assert_eq!(back.todos[0].content, "task");
         assert_eq!(back.messages.len(), 2);
-        assert_eq!(back.transcript.len(), state.transcript.len());
-        // Every entry kind and timestamp survives verbatim. The one exception is
-        // the tool block's `expanded` flag (view state), so normalise it before
-        // comparing — `the_only_lossy_fields_are_the_intended_ones` pins that.
-        let mut want = state.transcript.clone();
-        for e in &mut want {
-            if let EntryKind::Tool { expanded, .. } = &mut e.kind {
-                *expanded = false;
-            }
-        }
-        assert_eq!(back.transcript, want, "transcript round-trips");
+        // The transcript is deliberately NOT in the `.json` any more — it is
+        // written to the sibling jsonl and rebuilt on load. A bare `from_str`
+        // (no sibling file) therefore yields an empty one.
+        assert!(
+            back.transcript.is_empty(),
+            "transcript is not embedded in the .json"
+        );
     }
 
-    /// The two fields that deliberately do not survive, and why.
+    /// The fields that deliberately do not survive a bare JSON round-trip, and
+    /// why: the `id` (it is the file name) and the whole transcript (it lives in
+    /// the sibling jsonl now).
     #[test]
     fn the_only_lossy_fields_are_the_intended_ones() {
         let t = crate::time_from_unix(1_700_000_000, chrono::Local::now());
@@ -2510,11 +2554,76 @@ mod roundtrip_audit {
             "no session id key at the top level: {json}"
         );
 
-        // A tool block's expanded flag is view state: restored blocks start collapsed.
-        let EntryKind::Tool { expanded, .. } = &back.transcript[0].kind else {
-            panic!("not a tool");
-        };
-        assert!(!*expanded, "expanded is view state, not persisted");
+        // The transcript key is absent from the serialized file entirely — it is
+        // written incrementally to `<id>.jsonl`, not re-serialized here on every
+        // save (the O(n²) this design removes).
+        assert!(
+            top.get("transcript").is_none(),
+            "no transcript key in the .json: {json}"
+        );
+        assert!(back.transcript.is_empty(), "and none comes back from it");
+    }
+
+    /// The other half of the audit: the transcript round-trips through the sibling
+    /// `<id>.jsonl`, folded back through the SAME reducer the live path uses, with
+    /// tool args and results intact. This is what a resume actually rebuilds from.
+    #[test]
+    fn transcript_rebuilds_from_the_sibling_jsonl() {
+        use crate::subagent_transcript::{Record, SubagentTranscript};
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            // Save the snapshot (messages + metadata, no transcript).
+            let st = state("Jsonl Rebuild", &cwd);
+            Session::new(st).save("jsonl-rebuild").unwrap();
+
+            // Write the sibling transcript as the live path would: a user turn, a
+            // reply, and a tool call with args + result.
+            let path = session_transcript_path(&cwd, "jsonl-rebuild");
+            let mut w = SubagentTranscript::append(&path).unwrap();
+            w.write(&Record::Steered {
+                text: "audit the config".into(),
+            });
+            w.write(&Record::Text {
+                chunk: "on it".into(),
+            });
+            w.write(&Record::ToolStart {
+                id: "c1".into(),
+                name: "read".into(),
+                args: r#"{"path":"config.toml"}"#.into(),
+            });
+            w.write(&Record::ToolEnd {
+                id: "c1".into(),
+                name: "read".into(),
+                result: "port = 8080".into(),
+                ok: true,
+            });
+            drop(w);
+
+            // Load rebuilds the transcript from that jsonl.
+            let back = Session::load(&cwd, "jsonl-rebuild").unwrap().state;
+            let kinds: Vec<&EntryKind> = back.transcript.iter().map(|e| &e.kind).collect();
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [EntryKind::User(u), EntryKind::Assistant(_), EntryKind::Tool { .. }]
+                        if u == "audit the config"
+                ),
+                "folded from the jsonl in order: {kinds:?}"
+            );
+            let tool = back
+                .transcript
+                .iter()
+                .find_map(|e| match &e.kind {
+                    EntryKind::Tool { args, result, .. } => Some((args.clone(), result.clone())),
+                    _ => None,
+                })
+                .expect("a folded tool entry");
+            assert!(tool.0.contains("config.toml"), "tool args survive");
+            assert!(tool.1.contains("8080"), "tool result survives");
+        });
     }
 
     /// A session file must preserve the model's thinking, even though
