@@ -1,8 +1,8 @@
 # Security & Correctness Audit
 
-**Date:** 2026-07-22 **Depth:** High **Scope:** Full codebase — all crates
-(`hrdr-tools`, `hrdr-llm`, `hrdr-agent`, `hrdr-app`, `hrdr-editor`, `hrdr-tui`,
-`hrdr` binary) and all source files.
+**Date:** 2026-07-22 (verified 2026-07-23) **Depth:** High **Scope:** Full
+codebase — all crates (`hrdr-tools`, `hrdr-llm`, `hrdr-agent`, `hrdr-app`,
+`hrdr-editor`, `hrdr-tui`, `hrdr` binary) and all source files.
 
 ## Methodology
 
@@ -21,56 +21,21 @@ constructing concrete trigger scenarios. Uncertain findings are marked as such.
 
 ## Findings (most-severe first)
 
-### H1 — HIGH: MCP SSE `endpoint` event allows unguarded SSRF / internal port probe
+### ~~H1 — HIGH: MCP SSE `endpoint` event allows unguarded SSRF (FIXED)~~
 
-**`crates/hrdr-tools/src/mcp/client.rs:274-277`**
-
-On `connect_sse`, the server-streamed `endpoint` event data is fed straight to
-`base.join(ev.data.trim())`, and that URL becomes the POST target for every
-subsequent `tools/call`. The reqwest client built by `build_http`
-(`client.rs:191-197`) is plain — no `SsrfGuardResolver`, no redirect policy —
-unlike the guarded `HTTP_CLIENT` used by `fetch`/`ddg_search`. The joined URL is
-not re-checked for internal hosts. `Url::join` accepts absolute URLs in the
-`data` field, so the server can steer POSTs anywhere.
-
-**Scenario:** An operator points the agent at an MCP server (or a MITM of one).
-The server emits
-`event: endpoint\ndata: http://169.254.169.254/latest/meta-data/...`. Every
-subsequent `tools/call` request — a JSON-RPC envelope carrying model-supplied
-text — is POSTed to the cloud metadata endpoint (or any internal service), and
-the response body flows back to the model. An attacker who controls the MCP
-server gets a constrained SSRF primitive plus limited request-body exfiltration.
-
-**Fix:** Validate the joined endpoint URL with the same `is_blocked_host` /
-`SsrfGuardResolver` used by `fetch`, and reject any `endpoint` whose host isn't
-the configured base host. Treat MCP-server-supplied URLs as untrusted.
+> **Fixed in commit `ab2f1b7`.** `connect_sse` now validates the server-supplied
+> `endpoint` URL's host against the configured base host, rejecting cross-host
+> steering. `build_http` uses `redirect(Policy::none())`. The host-matching
+> check blocks the attack scenario; `is_blocked_host` is intentionally not used
+> (would break legitimate local MCP servers on loopback/private IPs).
 
 ---
 
-### H2 — HIGH: LSP `parse_workspace_edit` confinement bypassed by `..` for non-existent targets
+### ~~H2 — HIGH: LSP `check_confined` `..` escape bypass (FIXED)~~
 
-**`crates/hrdr-tools/src/lsp.rs:877-889`** (used by `RenameTool` at
-`tools/lsp_nav.rs:408-437`)
-
-`check_confined` falls back to a raw `path.starts_with(cwd)` when either the
-candidate path or `cwd` doesn't `canonicalize()`. `Path::starts_with` compares
-by component, and a path like `/home/u/proj/../../home/u/.bashrc` has a
-component prefix matching `[Root, "home", "u", "proj"]`, so `starts_with(cwd)`
-returns **true** — admitting the `..` escape for non-existent targets where
-`canonicalize` fails.
-
-**Scenario:** A buggy or malicious LSP server returns a `WorkspaceEdit` whose
-`changes` map keys a `file:///home/u/proj/../../home/u/.bashrc` URI for a file
-that doesn't exist yet. `uri_to_path` produces the unnormalized path;
-`check_confined` falls through to the lexical check; `RenameTool`
-`read_to_string`s and `apply_file_change`s it into `/home/u/.bashrc`. This
-forges an unbounded _write_ through a path the workspace confinement is supposed
-to forbid. Exposure is bounded by LSP servers being operator-configured.
-
-**Fix:** In the fallback branch, normalize the candidate with
-`canonicalize_nearest` (already used elsewhere for this exact `..`-escape case)
-and compare against `canonicalize_nearest(cwd)`, instead of raw
-`Path::starts_with(cwd)`.
+> **Fixed in commit `98a86b3`.** The fallback now uses
+> `canonicalize_nearest(path).starts_with(canonicalize_nearest(cwd))` — exactly
+> the fix the audit recommended.
 
 ---
 
@@ -147,21 +112,22 @@ the tokenized form (defense-in-depth).
 **`crates/hrdr-agent/src/oauth.rs:343`**
 
 `OpenAiTokens` (carrying `access_token`, `refresh_token`, `id_token`) derives
-`Debug`, unlike `OAuthCreds` which deliberately omits it (line 618-622 comment:
-_"Deliberately NO `Debug` derive: it holds a bearer token, and a `{:?}` (or
-`anyhow` context) must never leak it"_). Any future
-`tracing::debug!("{:?}", tokens)`, `anyhow` context wrapping, or
-`unwrap()`/`expect()` on a `Result<OpenAiTokens>` would print live tokens into
-logs or panic messages.
+`Debug`. `OAuthCreds` (line 480) **also** derives `Debug` — both structs that
+hold live bearer tokens leak them via `{:?}`. Only `OAuthAccess` (line 618-622)
+correctly omits `Debug` with the comment: _"Deliberately NO `Debug` derive: it
+holds a bearer token, and a `{:?}` (or `anyhow` context) must never leak it"_.
+Any future `tracing::debug!("{:?}", tokens)`, `anyhow` context wrapping, or
+`unwrap()`/`expect()` on a `Result<OpenAiTokens>` or `Result<OAuthCreds>` would
+print live tokens into logs or panic messages.
 
 **Scenario:** A future developer adds
 `.context(|| format!("got tokens: {:?}", tokens))` or `.expect("refresh ok")` on
-the `openai_refresh`/`openai_exchange` return; the bearer + refresh tokens print
-to stderr/log. No active leak path today, but the inconsistency with
-`OAuthCreds` is a latent foot-gun in security-critical code.
+the `openai_refresh`/`openai_exchange` return, or accesses `OAuthCreds` through
+a stored-credential path; the bearer + refresh tokens print to stderr/log. No
+active leak path today, but both token-bearing structs are latent foot-guns.
 
-**Fix:** Remove `Debug` from `OpenAiTokens` (or implement `Debug` manually with
-redaction), matching `OAuthCreds`.
+**Fix:** Remove `Debug` from both `OpenAiTokens` and `OAuthCreds` (or implement
+`Debug` manually with redaction).
 
 ---
 
@@ -185,14 +151,14 @@ message `read` uses.
 
 ### L2 — LOW: Integer overflow in OAuth refresh expiry arithmetic on malformed `expires_in`
 
-**`crates/hrdr-agent/src/oauth.rs:609`**
+**`crates/hrdr-agent/src/oauth.rs:609`** (same bug at `login.rs:680`)
 
 `expires_in * 1000` is plain `u64` multiplication that wraps on values >
 `u64::MAX / 1000` (~1.8e16); the subsequent `now_ms() + …` can wrap again,
 corrupting `expires_ms`. The result is either a tiny value (token treated as
 never-expiring → infinite refresh loop, local DoS wedging the
 `RefreshCoordinator`) or a huge value (token never refreshed, stale bearer until
-401).
+401). Both `oauth.rs:609` and `login.rs:680` have the unchecked arithmetic.
 
 **Scenario:** The OpenAI token endpoint (or a transparent proxy/MITM if TLS is
 bypassed) returns `"expires_in": 18446744073709551615`. The `* 1000` wraps to
@@ -200,7 +166,7 @@ garbage; `expires_ms` is corrupted. Not a privilege escalation, but a
 denial-of-service / correctness bug on untrusted token responses.
 
 **Fix:** Use `tokens.expires_in.unwrap_or(3600).saturating_mul(1000)` and
-`now_ms().checked_add(...).unwrap_or(u64::MAX)`.
+`now_ms().checked_add(...).unwrap_or(u64::MAX)` at both call sites.
 
 ---
 
@@ -224,11 +190,12 @@ compaction thresholds.
 **`crates/hrdr-llm/src/client.rs:609-625`**
 
 `auth()` applies the API key (`x-api-key` / `Bearer` / `api-key`) **then**
-iterates `extra_headers` appending them _after_; a provider-supplied
-`Authorization` or `x-api-key` header in `extra_headers` silently replaces the
-real credential. Headers come from `config.toml` (operator-configured, not
-LLM-influenced), but the precedence is the opposite of least-privilege — the
-credential should win.
+iterates `extra_headers` appending them _after_. `reqwest::header()` **appends**
+(rather than replaces), so the real credential is typically read first by
+servers. However, server behavior is not guaranteed — some read the last
+occurrence — creating ambiguity. Headers come from `config.toml`
+(operator-configured, not LLM-influenced), but the precedence is the opposite of
+least-privilege: the credential should win unambiguously.
 
 **Fix:** Apply `extra_headers` before the auth header, or skip/filter
 `Authorization` / `x-api-key` / `api-key` names in `extra_headers`.
@@ -239,16 +206,18 @@ credential should win.
 
 **`crates/hrdr-llm/src/client.rs:455`**
 
-The default `reqwest::Client` used for all chat / models requests has no
-connect/read timeout and follows reqwest's default redirect policy (up to 10).
-Reqwest strips `Authorization`/`Cookie` on cross-origin redirects (fetch spec),
-so API-key leakage to a different host is _not_ possible. The missing timeout
-means a hung/black-holed provider wedges the request indefinitely; `set_timeout`
-mitigates when the caller remembers to call it.
+The bare `reqwest::Client::new()` has no connect/read timeout and follows
+reqwest's default redirect policy (up to 10). In practice the default
+`AgentConfig` supplies `request_timeout: Some(300)` (5 min), so a timeout exists
+at the application level. Reqwest strips `Authorization`/`Cookie` on
+cross-origin redirects (fetch spec), so API-key leakage to a different host is
+_not_ possible. A hung/black-holed provider could still wedge a request for 5
+minutes.
 
-**Fix:** Build the client with a default connect/read timeout in `Client::new`;
-consider `redirect(Policy::none())` for chat-completions (always POSTs to a
-known URL, never expected to redirect).
+**Fix:** Build the client with a generous but finite default timeout in
+`Client::new` as a fallback (so a missing config key is still guarded); consider
+`redirect(Policy::none())` for chat-completions (always POSTs to a known URL,
+never expected to redirect).
 
 ---
 
@@ -294,8 +263,11 @@ enforce owner-only on Unix. The catalog data is public model metadata (not
 secret), but the temp file is created with umask-default perms and briefly
 world-readable; inconsistent with the documented `0600` discipline elsewhere.
 
-**Fix:** Use the existing `write_atomic` from `hrdr-agent`'s `auth.rs` (which
-sets `0600`) or add `OpenOptionsExt::mode(0o600)`.
+**Fix:** Use `OpenOptionsExt::mode(0o600)` directly in `write_cache` — the
+`write_atomic` function in `hrdr-agent::auth` cannot be called from `hrdr-llm`
+(wrong dependency direction; `hrdr-agent` depends on `hrdr-llm`, not the
+reverse). The `open_wire_log` at `client.rs:102-117` in the same crate already
+demonstrates the `0600` pattern.
 
 ---
 
@@ -331,13 +303,13 @@ or use `CreateProcess`-style argument escaping.
 
 ## Summary
 
-| Severity  | Count  |
-| --------- | ------ |
-| Critical  | 0      |
-| High      | 2      |
-| Medium    | 4      |
-| Low       | 10     |
-| **Total** | **16** |
+| Severity  | Count                              |
+| --------- | ---------------------------------- |
+| Critical  | 0                                  |
+| High      | 0 (2 already fixed)                |
+| Medium    | 4                                  |
+| Low       | 10                                 |
+| **Total** | **14 unfixed** (16 found, 2 fixed) |
 
 **Overall risk: Medium.** The security-critical paths are well-built:
 `fetch`/SSRF guard uses a TOCTOU-free DNS resolver; `SseDecoder` is properly
@@ -352,17 +324,18 @@ pathologies were found: no MD5/SHA1, no hardcoded secrets, no panics on
 untrusted SSE input, no buffer overflows, no data races, no unbounded allocation
 in hot paths.
 
-The gaps cluster around two areas: **operator-trusted-but-server-supplied
-surfaces** (MCP HTTP/SSE endpoint URL, LSP WorkspaceEdit paths) and **narrow
-regex/quote bypasses** of the guardrails (depth cap, unbalanced-quote fallback).
+The two HIGH findings are already fixed: MCP SSE endpoint validation (`ab2f1b7`)
+and LSP `check_confined` fallback (`98a86b3`). The remaining gaps cluster
+around: **guardrail bypasses** (depth cap M2, unbalanced-quote fallback M3),
+**secret-denylist coverage** (read TOCTOU M1, write/edit gap L1), and **OAuth
+hygiene** (Debug leaks M4, overflow L2, timing L7).
 
-**Top 3 fixes (by impact):**
+**Top 3 remaining fixes (by impact):**
 
-1. **H1 — Guard MCP SSE/HTTP endpoint URLs** with the same SSRF resolver/policy
-   `fetch` uses; treat MCP-server-supplied URLs as untrusted.
-2. **H2 — Fix `check_confined`'s fallback** to use `canonicalize_nearest`
-   instead of raw `Path::starts_with(cwd)`, preventing `..` escape in LSP rename
-   targets.
-3. **M1 — Make `read` open-then-validate-then-read** through one file
+1. **M1 — Make `read` open-then-validate-then-read** through one file
    descriptor, closing the symlink-swap TOCTOU that bypasses the secret
    denylist.
+2. **M2 — Drop the guardrail depth cap** and bound by total extracted length
+   instead, closing the 5-level `sh -c` nesting bypass.
+3. **M3 — Fix the guardrail unbalanced-quote fallback** — strip unbalanced
+   quotes before matching, or always match raw input as defense-in-depth.
