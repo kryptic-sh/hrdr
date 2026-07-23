@@ -494,6 +494,23 @@ impl Tool for GitTool {
             );
         }
         let sub = a.args[0].as_str().trim();
+        // The subcommand must be a bareword, never a flag. A model using natural
+        // git ordering (`git -C dir status`, `git -c x log`) puts a git *global*
+        // option first — and a global changes where/how git runs (`-C`,
+        // `--git-dir`, `--work-tree` re-point the repo/tree), so it is never a
+        // subcommand. Reject it explicitly, with a message that says what went
+        // wrong, instead of the misleading "`git -C` is not available". This is
+        // also the guard that keeps a directory-changing global out of git's
+        // pre-subcommand slot — the only position it takes effect — since the tool
+        // always runs `git <sub> …` with `sub` allow-listed below (git rejects
+        // such globals when they follow the subcommand).
+        if sub.starts_with('-') {
+            bail!(
+                "the first element of `args` must be the git subcommand (e.g. `status`), \
+                 not a flag like `{sub}` — git global options are not supported. Allowed: {}",
+                ALLOWED.join(", ")
+            );
+        }
         if !ALLOWED.contains(&sub) {
             bail!(
                 "`git {sub}` is not available — this tool is read-only. Allowed: {}",
@@ -646,6 +663,36 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("read-only"), "{sub}: {err}");
+        }
+    }
+
+    /// A git *global* option in the subcommand slot (natural ordering like
+    /// `git -C dir status`) is rejected with a targeted message, not the
+    /// misleading "not available". This is also what keeps a directory-changing
+    /// global (`-C`, `--git-dir`, `--work-tree`) out of git's pre-subcommand slot:
+    /// the tool only ever runs `git <allow-listed-sub> …`, and git itself refuses
+    /// these globals when they follow the subcommand.
+    #[tokio::test]
+    async fn refuses_a_leading_flag_in_the_subcommand_slot() {
+        let dir = repo().await;
+        let ctx = ToolContext::new(dir.path());
+        // `-C <dir>` would re-point git at another directory; `-c <k>=<v>` injects
+        // config; `--git-dir` names another repo. All land in `args[0]` under
+        // natural git ordering and must be refused as "not a subcommand".
+        for leading in [
+            vec!["-C", "../elsewhere", "status"],
+            vec!["-c", "core.pager=sh -c evil", "log"],
+            vec!["--git-dir=/etc/.git", "log"],
+        ] {
+            let err = GitTool
+                .execute(json!({ "args": leading }), &ctx)
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("must be the git subcommand") && msg.contains("not a flag"),
+                "leading {leading:?} → {msg}"
+            );
         }
     }
 
