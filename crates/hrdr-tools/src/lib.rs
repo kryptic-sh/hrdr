@@ -1235,6 +1235,49 @@ pub fn truncate_saved(
     truncate_saved_in(text, max_bytes, max_lines, side, label, &tool_output_dir())
 }
 
+/// The standard overflow pointer shared by every tool that spills its full output
+/// to a file: "full output (N lines, M bytes) saved to <path> — read/grep it,
+/// don't re-run", or a plain truncation marker when no file was saved. One string
+/// for `shell`, `grep`, and `git` so the model always sees the same shape.
+pub(crate) fn overflow_hint(
+    saved: Option<&std::path::Path>,
+    total_lines: usize,
+    total_bytes: usize,
+) -> String {
+    match saved {
+        Some(p) => format!(
+            "… [full output ({total_lines} lines, {total_bytes} bytes) saved to {} — `read` it \
+             (with offset/limit) or `grep` it (pattern + path) for the rest, don't re-run] …",
+            p.display()
+        ),
+        None => {
+            format!("… [output truncated — {total_lines} lines, {total_bytes} bytes total] …")
+        }
+    }
+}
+
+/// Assemble a head + overflow-pointer + tail preview — the head+tail truncation
+/// shape shared by `shell` and `truncate_saved`'s `Middle` side (the pointer
+/// bridges the elided middle; the tail is dropped when empty, giving the `Head`
+/// shape). `head`/`tail` are already-selected previews; `saved` is the
+/// full-output file, if one was written.
+pub(crate) fn overflow_preview(
+    head: &str,
+    tail: &str,
+    saved: Option<&std::path::Path>,
+    total_lines: usize,
+    total_bytes: usize,
+) -> String {
+    let hint = overflow_hint(saved, total_lines, total_bytes);
+    let head = head.trim_end();
+    let tail = tail.trim_start();
+    if tail.is_empty() {
+        format!("{head}\n\n{hint}")
+    } else {
+        format!("{head}\n\n{hint}\n\n{tail}")
+    }
+}
+
 /// [`truncate_saved`] with an explicit overflow directory (for tests).
 fn truncate_saved_in(
     text: &str,
@@ -1259,17 +1302,11 @@ fn truncate_saved_in(
             };
         }
     };
-    let hint = format!(
-        "… [full output ({} lines, {} bytes) saved to {} — `read` it (with offset/limit) or \
-         `grep` it (pattern + path) for the rest, don't re-run] …",
-        lines.len(),
-        text.len(),
-        path.display()
-    );
+    let (lines_n, bytes_n) = (lines.len(), text.len());
     match side {
         TruncateSide::Head => {
             let head = collect_lines(&lines, max_lines, max_bytes, false);
-            format!("{head}\n\n{hint}")
+            overflow_preview(&head, "", Some(&path), lines_n, bytes_n)
         }
         // ~1/5 of each budget for the head, the rest for the tail (shell errors
         // trail), with the pointer bridging the gap.
@@ -1281,7 +1318,7 @@ fn truncate_saved_in(
                 max_bytes - max_bytes / 5,
                 true,
             );
-            format!("{head}\n\n{hint}\n\n{tail}")
+            overflow_preview(&head, &tail, Some(&path), lines_n, bytes_n)
         }
     }
 }

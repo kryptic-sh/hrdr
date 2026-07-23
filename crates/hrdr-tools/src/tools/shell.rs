@@ -387,42 +387,36 @@ async fn run_streamed_command(
         return Ok(out.to_string());
     }
 
-    // Over the display cap: emit head + truncation pointer + tail.
-    // Synthesize the same format truncate_saved produces so any tests
-    // asserting on the marker string still pass.
-    let tail_str: String = tail.iter().map(|s| s.as_str()).collect();
-    let tail_str = tail_str.trim_start();
-    let hint = match &overflow_path {
-        Some(p) => format!(
-            "… [full output ({total_lines} lines, {total_bytes} bytes) saved to {} — \
-             `read` it (with offset/limit) or `grep` it (pattern + path) for the \
-             rest, don't re-run] …",
-            p.display()
-        ),
-        None => format!("… [output truncated — {total_lines} lines, {total_bytes} bytes total] …"),
-    };
-    let head_trimmed = head.trim_end();
-
+    // Over the display cap: emit head + overflow pointer + tail, via the shared
+    // `overflow_preview` so `shell`, `grep`, and `git` produce one marker format.
+    //
     // `head`/`tail` above are only bounded by the roomy 5x in-memory ring
-    // (`mem_budget`) — that headroom exists so nothing is dropped before we
-    // know whether the run will overflow, not so the *returned* text can be
-    // that big. Without a final trim here, one call could hand back
-    // ~1x (head) + ~4x (tail) = ~5x max_output, silently blowing the same
-    // budget `truncate_saved` enforces for every other tool. Re-trim head and
-    // tail to their share of the real display budget (same ~1/5 head, ~4/5
-    // tail split truncate_saved's `Middle` side uses) before returning.
+    // (`mem_budget`) — that headroom exists so nothing is dropped before we know
+    // whether the run will overflow, not so the *returned* text can be that big.
+    // Without a final trim here, one call could hand back ~1x (head) + ~4x (tail)
+    // = ~5x max_output, silently blowing the budget every other tool enforces.
+    // Re-trim head and tail to their share of the real display budget (same ~1/5
+    // head, ~4/5 tail split `truncate_saved`'s `Middle` side uses).
+    let tail_str: String = tail.iter().map(|s| s.as_str()).collect();
     let disp_head_bytes = ctx.max_output / 5;
     let disp_tail_bytes = ctx.max_output.saturating_sub(disp_head_bytes);
     let disp_head_lines = (ctx.max_output_lines / 5).max(1);
     let disp_tail_lines = ctx.max_output_lines.saturating_sub(disp_head_lines);
-    let head_trimmed = cap_display(head_trimmed, disp_head_bytes, disp_head_lines, false);
-    let tail_str = cap_display(tail_str, disp_tail_bytes, disp_tail_lines, true);
+    let head_disp = cap_display(head.trim_end(), disp_head_bytes, disp_head_lines, false);
+    let tail_disp = cap_display(
+        tail_str.trim_start(),
+        disp_tail_bytes,
+        disp_tail_lines,
+        true,
+    );
 
-    if tail_str.is_empty() {
-        Ok(format!("{head_trimmed}\n\n{hint}"))
-    } else {
-        Ok(format!("{head_trimmed}\n\n{hint}\n\n{tail_str}"))
-    }
+    Ok(crate::overflow_preview(
+        &head_disp,
+        &tail_disp,
+        overflow_path.as_deref(),
+        total_lines,
+        total_bytes,
+    ))
 }
 
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,
