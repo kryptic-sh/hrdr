@@ -38,6 +38,14 @@ struct ReadArgs {
         alias = "max_lines"
     )]
     limit: Option<usize>,
+    /// Read the whole file WITHOUT clipping long lines (and ignoring
+    /// `offset`/`limit`), so a file with a line over `MAX_LINE` bytes can still be
+    /// marked fully read — the escape hatch for a full rewrite via `write`. Costs
+    /// tokens (nothing is clipped), so it is opt-in; the 50 MB file cap still
+    /// applies, and if the unclipped content overflows the output budget the read
+    /// is still recorded as partial.
+    #[serde(default, alias = "raw", alias = "whole", alias = "no_clip")]
+    full: bool,
 }
 
 #[async_trait]
@@ -54,7 +62,10 @@ impl Tool for ReadTool {
          page through large files. A read that doesn't cover the whole file — `offset`/`limit` \
          short of EOF, or any line over 2000 bytes (clipped) — marks the file partially-read; \
          `edit` still works against it, but `write` refuses to overwrite a file that \
-         hasn't been read in full. You must read a file before editing it."
+         hasn't been read in full. You must read a file before editing it. To rewrite a file \
+         that has a line over 2000 bytes — which a normal read clips every time, so it can \
+         never be marked fully read — read it once with `full: true` (whole file, no clipping) \
+         first."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -62,7 +73,8 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {"type": "string", "description": "File path, absolute or relative to cwd."},
                 "offset": {"type": "integer", "description": "1-based line to start at (default 1)."},
-                "limit": {"type": "integer", "description": "Max lines to return (default 2000)."}
+                "limit": {"type": "integer", "description": "Max lines to return (default 2000)."},
+                "full": {"type": "boolean", "description": "Read the entire file with NO line clipping (ignores offset/limit). Use this to fully read a file that has a very long line so a subsequent `write` rewrite is accepted. Costs more tokens; the 50 MB file cap still applies. Default false."}
             },
             "required": ["path"]
         })
@@ -135,14 +147,30 @@ impl Tool for ReadTool {
                 return Err(e).with_context(|| format!("reading {}", path.display()));
             }
         }
-        let start = a.offset.unwrap_or(1).max(1);
-        let limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
         let total_lines = text.lines().count();
+        // `full` reads the whole file with no per-line clip (ignoring
+        // offset/limit), so a file with a line over `MAX_LINE` can still be read
+        // in full and marked complete — the legitimate path to a `write` rewrite.
+        // Otherwise page with offset/limit and clip over-long lines for economy.
+        let start = if a.full {
+            1
+        } else {
+            a.offset.unwrap_or(1).max(1)
+        };
+        let limit = if a.full {
+            total_lines
+        } else {
+            a.limit.unwrap_or(DEFAULT_READ_LIMIT)
+        };
         let mut out = String::new();
         let mut any_line_truncated = false;
         for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
             let n = i + 1;
-            let cut = crate::floor_char_boundary(line, MAX_LINE);
+            let cut = if a.full {
+                line.len()
+            } else {
+                crate::floor_char_boundary(line, MAX_LINE)
+            };
             if cut < line.len() {
                 any_line_truncated = true;
             }
@@ -228,6 +256,40 @@ mod tests {
             out.contains("line two") && !out.contains("line one"),
             "paged: {out}"
         );
+    }
+
+    /// `full: true` returns the whole file with no per-line clipping, so a file
+    /// with a line over `MAX_LINE` bytes comes back intact and is marked fully
+    /// read — where a normal read clips that line and records it partial.
+    #[tokio::test]
+    async fn full_read_does_not_clip_long_lines_and_marks_complete() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("big.txt");
+        let long = "y".repeat(MAX_LINE + 300);
+        std::fs::write(&path, format!("{long}\n")).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+
+        // A normal read clips the long line and records the file partial.
+        let clipped = ReadTool
+            .execute(serde_json::json!({"path": "big.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !clipped.contains(&long),
+            "a normal read clips the long line"
+        );
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
+
+        // `full: true` returns the whole line and marks the file complete.
+        let whole = ReadTool
+            .execute(serde_json::json!({"path": "big.txt", "full": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            whole.contains(&long),
+            "full read returns the whole line: {whole}"
+        );
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
     }
 
     /// A call with no path at all gets an instructive error naming the exact

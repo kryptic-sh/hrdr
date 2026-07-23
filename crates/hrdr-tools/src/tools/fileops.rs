@@ -14,9 +14,22 @@ use serde_json::json;
 use crate::{Tool, ToolContext};
 
 /// Guard a path whose current contents are about to disappear (the source of a
-/// move, or the target of a delete): the read-before-mutate gate the other
-/// tools apply — the model must have seen what it's about to destroy.
-async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> Result<()> {
+/// move, or the target of a delete): the read-before-mutate gate the other tools
+/// apply — the model must have seen what it's about to destroy.
+///
+/// `strict` raises the bar from "read at all" to "read in full", to the same
+/// [`crate::ReadState::Fresh`] `write` requires. A **delete** passes it: deleting
+/// then recreating a file is a whole-file replace, so a file the model only saw
+/// partially (a clipped long line, unpaged tail) must be fully read first — this
+/// is what closes the delete-then-write escape from `write`'s read-in-full gate.
+/// A **move** does not (`strict = false`): it preserves the content at the new
+/// path, so "did you look at what you're moving" is enough.
+async fn guard_victim(
+    ctx: &ToolContext,
+    path: &std::path::Path,
+    verb: &str,
+    strict: bool,
+) -> Result<()> {
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         bail!(
             "{} does not exist — relative paths resolve against the project root ({}); \
@@ -25,7 +38,31 @@ async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> 
             ctx.cwd.display()
         );
     }
-    if path.is_file() && !ctx.was_read(path) {
+    if !path.is_file() {
+        return Ok(());
+    }
+    if strict {
+        match ctx.read_state(path) {
+            crate::ReadState::Fresh => {}
+            crate::ReadState::Unread => bail!(
+                "{} hasn't been read — call read first so you know what you're about to {verb}",
+                path.display()
+            ),
+            crate::ReadState::Partial => bail!(
+                "you've only read part of {} — {verb} destroys it, so read it in full first \
+                 (a long-line file that a normal read keeps clipping: read it with \
+                 `full: true`, whole file, no clipping) so you aren't discarding content you \
+                 never saw. Deleting then recreating a file you only partially read loses the \
+                 same unseen lines a `write` would.",
+                path.display()
+            ),
+            crate::ReadState::Stale => bail!(
+                "{} changed on disk since you read it — re-read it before you {verb} it, so \
+                 you know what you're destroying",
+                path.display()
+            ),
+        }
+    } else if !ctx.was_read(path) {
         bail!(
             "{} hasn't been read — call read first so you know what you're about to {verb}",
             path.display()
@@ -84,7 +121,7 @@ impl Tool for MoveTool {
         let a: MoveArgs = crate::tool_args("move", args)?;
         let from = ctx.resolve(&a.from);
         let to = ctx.resolve(&a.to);
-        guard_victim(ctx, &from, "move").await?;
+        guard_victim(ctx, &from, "move", false).await?;
         if from.is_dir() {
             reject_descendant_destination(&from, &to)?;
         }
@@ -101,7 +138,7 @@ impl Tool for MoveTool {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        guard_victim(ctx, &from, "move").await?;
+        guard_victim(ctx, &from, "move", false).await?;
         rename_or_copy(&from, &to)
             .await
             .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
@@ -290,7 +327,7 @@ impl Tool for DeleteTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: DeleteArgs = crate::tool_args("delete", args)?;
         let path = ctx.resolve(&a.path);
-        guard_victim(ctx, &path, "delete").await?;
+        guard_victim(ctx, &path, "delete", true).await?;
 
         if path.is_dir() {
             if !a.recursive {
@@ -300,7 +337,7 @@ impl Tool for DeleteTool {
                 );
             }
             let count = walk_files(&path).await?.len();
-            guard_victim(ctx, &path, "delete").await?;
+            guard_victim(ctx, &path, "delete", true).await?;
             tokio::fs::remove_dir_all(&path)
                 .await
                 .with_context(|| format!("deleting {}", path.display()))?;
@@ -310,7 +347,7 @@ impl Tool for DeleteTool {
                 if count == 1 { "" } else { "s" }
             ))
         } else {
-            guard_victim(ctx, &path, "delete").await?;
+            guard_victim(ctx, &path, "delete", true).await?;
             tokio::fs::remove_file(&path)
                 .await
                 .with_context(|| format!("deleting {}", path.display()))?;
@@ -609,6 +646,50 @@ mod tests {
             .unwrap();
         assert!(out.contains("1 file"), "{out}");
         assert!(!dir.path().join("d").exists());
+    }
+
+    /// Closing the delete-then-recreate escape from `write`'s read-in-full gate:
+    /// a file the model only PARTIALLY read (a clipped long line, an unpaged tail)
+    /// cannot be deleted until it is read in full — otherwise it could be deleted
+    /// and rebuilt from the version never fully seen, losing the same content a
+    /// `write` would. `move` stays lenient (it preserves the content).
+    #[tokio::test]
+    async fn delete_refuses_a_partially_read_file_until_read_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let f = dir.path().join("a.txt");
+        write(&f, "one\ntwo\nthree\n").await;
+
+        // A partial read is not enough to delete (unlike the old `was_read` gate).
+        c.mark_read_partial(&f);
+        let err = DeleteTool
+            .execute(json!({"path": "a.txt"}), &c)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only read part") && err.contains("full: true"),
+            "the refusal points at reading it in full: {err}"
+        );
+        assert!(f.exists(), "nothing was deleted");
+
+        // Reading it in full unblocks the delete.
+        c.mark_read(&f);
+        DeleteTool
+            .execute(json!({"path": "a.txt"}), &c)
+            .await
+            .expect("delete allowed after a full read");
+        assert!(!f.exists());
+
+        // move stays lenient — it preserves the content, so a partial read is
+        // enough (a full read is not required to relocate a file).
+        let g = dir.path().join("g.txt");
+        write(&g, "x").await;
+        c.mark_read_partial(&g);
+        MoveTool
+            .execute(json!({"from": "g.txt", "to": "h.txt"}), &c)
+            .await
+            .expect("move is allowed on a partially-read file");
     }
 
     #[tokio::test]

@@ -63,11 +63,10 @@ impl Tool for WriteTool {
                 crate::ReadState::Partial => bail!(
                     "you've only read part of {} — a write replaces the whole file, so read \
                      it in full first (no offset/limit, or page to the end) or the unread \
-                     lines will be lost; use edit for a partial change. Note: if this file \
-                     has a line over {MAX_LINE} bytes, `read` clips that line every time no \
-                     matter how it's paged, so it can never be marked fully read — retrying \
-                     read then write will loop forever; use `edit` (targets known text, not \
-                     the whole file) or `shell` instead",
+                     lines will be lost; use edit for a partial change. If this file has a \
+                     line over {MAX_LINE} bytes, a normal read clips that line every time and \
+                     can never mark it fully read — read it once with `full: true` (whole \
+                     file, no clipping) to unblock the rewrite, or use `edit`/`shell`",
                     path.display()
                 ),
                 crate::ReadState::Stale => bail!(
@@ -132,28 +131,28 @@ pub(crate) fn unified_diff(path: &str, old: &str, new: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Regression (MINOR): a file with a line over `MAX_LINE` bytes is
-    /// *permanently* `Partial` (`read` clips that line every time, no matter
-    /// how it's paged — see `read.rs`), so the generic "read it in full"
-    /// advice can never be satisfied and the model would loop forever on
-    /// read-then-write. The refusal must instead point at `edit`/`shell`.
+    /// A file with a line over `MAX_LINE` bytes is `Partial` after a normal read
+    /// (which clips that line every time), so `write` refuses — but the refusal
+    /// now points at `read` with `full: true`, and reading it that way marks the
+    /// file fully read and unblocks the rewrite. Previously this was a dead end
+    /// that only `edit`/`shell` (or the delete-then-recreate hole) could work
+    /// around.
     #[tokio::test]
-    async fn write_refusal_on_an_over_long_line_points_at_edit_not_a_reread() {
+    async fn an_over_long_line_file_is_rewritable_after_a_full_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big_line.txt");
-        // One line comfortably over MAX_LINE, so `read` always clips it.
+        // One line comfortably over MAX_LINE, so a normal `read` always clips it.
         let long_line = "x".repeat(MAX_LINE + 500);
         std::fs::write(&path, format!("{long_line}\n")).unwrap();
-
         let ctx = ToolContext::new(dir.path());
-        // A full read (default offset/limit reaches EOF) still can't see the
-        // over-long line whole, so it's recorded as partial, not complete.
+
+        // A normal read clips the over-long line → Partial → write refuses,
+        // pointing at the `full: true` escape hatch (and edit/shell).
         crate::ReadTool
             .execute(serde_json::json!({"path": "big_line.txt"}), &ctx)
             .await
             .unwrap();
         assert_eq!(ctx.read_state(&path), crate::ReadState::Partial);
-
         let err = WriteTool
             .execute(
                 serde_json::json!({"path": "big_line.txt", "content": "replacement\n"}),
@@ -163,12 +162,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("edit") && err.contains("shell"),
-            "the refusal must point at a workaround that can actually succeed: {err}"
+            err.contains("full: true"),
+            "the refusal points at the escape hatch: {err}"
         );
-        assert!(
-            err.contains("never"),
-            "and explain why re-reading won't help: {err}"
-        );
+
+        // Reading it in full (no clipping) marks it fully read...
+        crate::ReadTool
+            .execute(
+                serde_json::json!({"path": "big_line.txt", "full": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
+        // ...so the rewrite now goes through instead of dead-ending.
+        WriteTool
+            .execute(
+                serde_json::json!({"path": "big_line.txt", "content": "replacement\n"}),
+                &ctx,
+            )
+            .await
+            .expect("write succeeds after a full read");
     }
 }
