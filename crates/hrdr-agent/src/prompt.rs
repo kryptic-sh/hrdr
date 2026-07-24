@@ -564,6 +564,28 @@ mod tests {
         assert!(!without_shell.contains("Verifying:") && !without_shell.contains("Shell:"));
     }
 
+    /// A write SUB-AGENT is told never to `cd`/run commands in the parent project
+    /// directory its worktree was forked from — reaching there for the parent's
+    /// build cache lands its commits on the parent's `main` and captures the
+    /// parent's (empty/stale) files instead of the worktree edits. A real failure
+    /// observed with a delegated model. Gated to write sub-agents (only they have
+    /// a worktree); the main agent, which has no worktree, does not get it.
+    #[test]
+    fn write_subagent_prompt_forbids_commands_in_the_parent_repo() {
+        let tools = ToolRegistry::with_defaults();
+        let sub = render_system(&tools, None, true).unwrap(); // is_subagent = true
+        let main = render_system(&tools, None, false).unwrap();
+        assert!(
+            sub.contains("the parent project directory your worktree was"),
+            "the parent-repo trap is named for a write sub-agent"
+        );
+        assert!(sub.contains("command, git included, from this worktree"));
+        assert!(
+            !main.contains("the parent project directory your worktree was"),
+            "the main agent has no worktree, so it doesn't get the clause"
+        );
+    }
+
     /// "cut a release" is a whole workflow, and the prompt spells it out.
     ///
     /// Left to itself a model does part of it — bumps the manifest and stops, or
