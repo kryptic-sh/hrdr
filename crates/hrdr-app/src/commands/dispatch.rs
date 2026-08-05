@@ -375,7 +375,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info("usage: /verbose [on | off]".to_string());
                 return true;
             };
-            let status = host.set_tool_expansion(if on { ExpandMode::All } else { ExpandMode::Off });
+            let status =
+                host.set_tool_expansion(if on { ExpandMode::All } else { ExpandMode::Off });
             host.info(status);
         }
         "add" => {
