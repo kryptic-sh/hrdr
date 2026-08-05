@@ -491,7 +491,7 @@ pub(crate) struct App {
     file_watcher: Option<notify::RecommendedWatcher>,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
-    /// Show every tool result in full (`/expand all`); per-entry `expanded`
+    /// Show every tool result in full (`/verbose on`); per-entry `expanded`
     /// overrides this for individual results.
     pub(crate) expand_tools: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
@@ -598,7 +598,7 @@ pub(crate) struct App {
     pub(crate) home_button: Option<HitRect>,
     /// Clickable screen rects for each visible tool block → its transcript index,
     /// set during draw. A left click toggles that tool's `expanded` (like a
-    /// per-entry `/expand`).
+    /// per-entry `/verbose`).
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
@@ -1773,7 +1773,7 @@ impl App {
     }
 
     /// Toggle the full output of the tool block under `(col, row)`, if a click
-    /// landed on one (the per-entry equivalent of `/expand`).
+    /// landed on one (the per-entry counterpart of `/verbose`).
     fn toggle_tool_at(&mut self, col: u16, row: u16) {
         let hit = self
             .tool_hits

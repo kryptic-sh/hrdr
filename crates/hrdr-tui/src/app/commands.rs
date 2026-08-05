@@ -130,7 +130,7 @@ impl super::App {
         self.skill_selector = None;
         self.expand_tools = false;
     }
-    /// Apply an `/expand` mode (shared dispatch parses the arg), returning the
+    /// Apply a `/verbose` mode (shared dispatch parses the arg), returning the
     /// status line. `expand_tools` is the sticky all-on flag; per-entry
     /// expansion lives on the Tool entries.
     pub(super) fn apply_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
@@ -147,36 +147,6 @@ impl super::App {
                     }
                 }
                 hrdr_app::expand_msg::OFF.to_string()
-            }
-            hrdr_app::ExpandMode::ToggleLast => {
-                // Keep the toggled block's top where the reader is looking; its
-                // height is about to change (see `pending_scroll_entry`).
-                let idx = self
-                    .panes
-                    .active_transcript()
-                    .iter()
-                    .rposition(|e| matches!(e.kind, EntryKind::Tool { .. }));
-                self.pending_scroll_entry = idx;
-                let last = self
-                    .panes
-                    .active_transcript_mut()
-                    .iter_mut()
-                    .rev()
-                    .find_map(|e| match &mut e.kind {
-                        EntryKind::Tool { expanded, .. } => Some(expanded),
-                        _ => None,
-                    });
-                match last {
-                    Some(expanded) => {
-                        *expanded = !*expanded;
-                        if *expanded {
-                            hrdr_app::expand_msg::LAST_EXPANDED.to_string()
-                        } else {
-                            hrdr_app::expand_msg::LAST_COLLAPSED.to_string()
-                        }
-                    }
-                    None => hrdr_app::expand_msg::NONE.to_string(),
-                }
             }
         }
     }
@@ -380,6 +350,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn show_thinking(&self) -> bool {
         self.app.show_reasoning
+    }
+    fn tool_expansion_on(&self) -> bool {
+        self.app.expand_tools
     }
     fn set_show_thinking(&mut self, on: bool) {
         self.app.show_reasoning = on;

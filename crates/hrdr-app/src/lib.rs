@@ -75,7 +75,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "list custom :skills (prompt templates)"),
     ("/prompt", "show the rendered system prompt"),
     ("/guardrails", "list active shell guardrails"),
-    ("/expand", "expand tool output (last, or 'all'/'off')"),
+    ("/verbose", "expand every tool's output (on|off; bare toggles)"),
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
@@ -127,7 +127,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Files & context",
         &[
-            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/expand", "/paste",
+            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/verbose", "/paste",
         ],
     ),
     ("Reply", &["/copy", "/export", "/cost"]),

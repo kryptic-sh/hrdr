@@ -140,7 +140,13 @@ pub trait CommandHost {
     fn read_clipboard(&self) -> Option<String> {
         None
     }
-    /// Apply an `/expand` mode to the tool-output display, returning the
+    /// Whether the tool-output mode is on (every tool block expanded). The
+    /// frontend owns the expansion state, so `/verbose` reads it back to
+    /// toggle with no argument.
+    fn tool_expansion_on(&self) -> bool {
+        false
+    }
+    /// Apply a `/verbose` mode to the tool-output display, returning the
     /// status line to show (the expansion state lives in the frontend).
     fn set_tool_expansion(&mut self, mode: ExpandMode) -> String;
 

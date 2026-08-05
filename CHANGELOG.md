@@ -355,10 +355,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Tool calls collapse to a single line until expanded.** A finished tool block
   now renders as `✓ shell cd … && rg …` — the status mark, the tool name, and a
   one-line summary (the command for shell calls, the headline otherwise) — with
-  the output and details hidden until the block is clicked or `/expand` is used.
+  the output and details hidden until the block is clicked or `/verbose` is on.
   `edit` is the exception: its diff IS the point of the call, so it keeps
   rendering in full whether collapsed or not. A running tool shows its animated
   mark on the one line; expanding a running tool still shows the live tail.
+
+- **`/expand` is now `/verbose`, a strict on/off toggle.** `/verbose on` expands
+  every tool block's full output; `/verbose off` collapses them and hands the
+  display back to per-block clicking; a bare `/verbose` flips the current state.
+  The old arg forms (`/expand all`, `/expand off`, bare `/expand` toggling the
+  last block) are gone — per-block toggling is the click, exactly as before.
 
 - **The model's `<think>` reasoning blocks are hidden by default.** Reasoning
   display was previously on out of the box; it now starts off, matching the

@@ -65,7 +65,8 @@ pub enum EntryKind {
         result: String,
         ok: bool,
         done: bool,
-        /// Show the full result instead of a truncated preview (`/expand`).
+        /// Show the full result instead of a truncated preview (per-entry
+        /// expansion, or `/verbose` for everything).
         /// View state: never persisted, so a restored block starts collapsed.
         #[serde(skip)]
         expanded: bool,

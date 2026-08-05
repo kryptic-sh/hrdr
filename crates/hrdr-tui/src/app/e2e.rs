@@ -1050,6 +1050,58 @@ async fn thinking_toggle_persists_to_config() {
     );
 }
 
+/// `/verbose` is a strict on/off toggle — the rename of `/expand`. A bare
+/// `/verbose` flips the mode, `on`/`off` set it. On expands every tool block
+/// (a collapsed entry renders in full); off collapses them all and hands the
+/// display back to per-block clicking.
+#[tokio::test]
+async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
+    let mut h = Harness::new(vec![]).await;
+    let t = |secs: i64| hrdr_app::time_from_unix(secs, chrono::Local::now());
+    // A finished tool block whose per-entry flag is collapsed. The result text
+    // appears in no collapsed form — the one-liner shows only the command — so
+    // its presence is proof the block rendered in full.
+    h.app.transcript_mut().push(Entry::at(
+        EntryKind::Tool {
+            id: "c1".into(),
+            name: "bash".into(),
+            args: r#"{"command":"echo hi"}"#.into(),
+            result: "VERBOSE-MODE-RESULT".into(),
+            ok: true,
+            done: true,
+            expanded: false,
+        },
+        t(1_700_000_000),
+    ));
+    assert!(!h.app.expand_tools, "default is manual per-block mode");
+    assert!(
+        !h.render().contains("VERBOSE-MODE-RESULT"),
+        "collapsed by default"
+    );
+
+    // Bare `/verbose` toggles on: the collapsed block renders in full.
+    h.submit("/verbose").await;
+    assert!(h.app.expand_tools, "a bare /verbose turns the mode on");
+    assert!(
+        h.render().contains("VERBOSE-MODE-RESULT"),
+        "on shows every tool's full output"
+    );
+
+    // `/verbose off` collapses everything and returns to manual mode.
+    h.submit("/verbose off").await;
+    assert!(!h.app.expand_tools, "/verbose off turns the mode off");
+    assert!(
+        !h.render().contains("VERBOSE-MODE-RESULT"),
+        "off collapses again"
+    );
+
+    // The explicit setter, then the flip back off.
+    h.submit("/verbose on").await;
+    assert!(h.app.expand_tools, "/verbose on sets the mode on");
+    h.submit("/verbose").await;
+    assert!(!h.app.expand_tools, "a bare /verbose flips back off");
+}
+
 #[tokio::test]
 async fn statusbar_slash_command_updates_state() {
     // /statusbar is a local slash command — no model turn consumed.

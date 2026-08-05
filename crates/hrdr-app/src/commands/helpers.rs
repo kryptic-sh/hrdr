@@ -13,13 +13,10 @@ pub fn busy_generic() -> String {
     "busy — try again after the current turn".to_string()
 }
 
-/// `/expand` status lines.
+/// `/verbose` status lines.
 pub mod expand_msg {
     pub const ALL: &str = "tool output expanded (all)";
     pub const OFF: &str = "tool output collapsed";
-    pub const LAST_COLLAPSED: &str = "collapsed last tool output";
-    pub const LAST_EXPANDED: &str = "expanded last tool output";
-    pub const NONE: &str = "no tool output to expand";
 }
 
 /// `/reload` + hot-reload status lines.

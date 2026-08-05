@@ -233,7 +233,7 @@ impl PaneSet {
         self.active_pane().transcript()
     }
 
-    /// Mutable access to the transcript on screen (per-entry `/expand`, etc.).
+    /// Mutable access to the transcript on screen (per-entry expansion, etc.).
     pub fn active_transcript_mut(&mut self) -> &mut Vec<Entry> {
         self.active_pane_mut().transcript_mut()
     }

@@ -247,7 +247,7 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
   OpenAI-style reasoning models, or a `thinking` budget on the native Anthropic
   backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
-  `/tools`, `/expand`, `/paste`
+  `/tools`, `/verbose`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/cost` (alias
   `/usage`; session tokens + estimated USD, priced from the models.dev catalog,
   sub-agents included)

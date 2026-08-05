@@ -43,14 +43,12 @@ pub enum LineKind {
     Diff,
 }
 
-/// What `/expand` should do to tool output (parsed by the shared dispatcher;
+/// What `/verbose` should do to tool output (parsed by the shared dispatcher;
 /// applied by the frontend, which owns the expansion state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpandMode {
     /// Show every tool result in full.
     All,
-    /// Collapse everything.
+    /// Collapse everything and hand the display back to per-block clicking.
     Off,
-    /// Toggle the most recent tool result.
-    ToggleLast,
 }

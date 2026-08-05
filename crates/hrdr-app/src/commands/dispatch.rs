@@ -361,17 +361,21 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             host.cwd_changed(&new);
             host.info(format!("cwd → {}", new.display()));
         }
-        "expand" => {
-            let mode = match arg.to_ascii_lowercase().as_str() {
-                "all" | "on" => ExpandMode::All,
-                "off" | "none" | "collapse" => ExpandMode::Off,
-                "" => ExpandMode::ToggleLast,
-                _ => {
-                    host.info("usage: /expand [all | off]".to_string());
-                    return true;
-                }
+        "verbose" => {
+            // A strict on/off toggle, mirroring `/thinking`: a bare `/verbose`
+            // flips the current state, `on`/`off` set it. On expands every tool
+            // block; off collapses them and hands the display back to per-block
+            // clicking. The frontend owns the expansion state, so it reads it
+            // back to decide which way a bare flip goes.
+            let on = if arg.is_empty() {
+                !host.tool_expansion_on()
+            } else if let Some(b) = hrdr_agent::parse_env_bool(&arg) {
+                b
+            } else {
+                host.info("usage: /verbose [on | off]".to_string());
+                return true;
             };
-            let status = host.set_tool_expansion(mode);
+            let status = host.set_tool_expansion(if on { ExpandMode::All } else { ExpandMode::Off });
             host.info(status);
         }
         "add" => {

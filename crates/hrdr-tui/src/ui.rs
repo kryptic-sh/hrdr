@@ -3140,7 +3140,7 @@ fn tool_lines(
 
 /// The collapsed-block footer hint.
 fn more_hint(extra: usize) -> String {
-    format!("… (+{extra} more lines · click or /expand)")
+    format!("… (+{extra} more lines · click or /verbose)")
 }
 
 /// Color for one unified-diff line: additions green, deletions red, hunk
@@ -3341,7 +3341,7 @@ mod subagent_tests {
 /// * **cross-entry contamination**: two entries share a cache slot and entry B's
 ///   render is served for entry A (caught by
 ///   `cached_body_different_entries_do_not_collide`).
-/// * **stale expand state**: the user runs `/expand` but the collapsed render
+/// * **stale expand state**: the user runs `/verbose` but the collapsed render
 ///   is returned because `expand_all` is not part of the hash (caught by
 ///   `entry_content_hash_tool_expand_flag_changes_hash`).
 /// * **stale rows after an edit**: an entry's content changes but its slot still
@@ -3389,7 +3389,7 @@ mod cache_tests {
     /// For `Tool` entries the effective expand state `(*expanded || expand_all)`
     /// is folded into the hash.  Changing `expand_all` must therefore invalidate
     /// the cache key, otherwise the collapsed render (showing only a preview)
-    /// would be served to the user after they run `/expand all`.
+    /// would be served to the user after they run `/verbose on`.
     #[test]
     fn entry_content_hash_tool_expand_flag_changes_hash() {
         let tool = Entry::now(EntryKind::Tool {
