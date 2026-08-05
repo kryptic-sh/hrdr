@@ -126,6 +126,17 @@ impl HistoryBrowser {
             Some(std::mem::take(&mut self.draft))
         }
     }
+
+    /// Where the browser currently stands, for a UI indicator: `Some((selected,
+    /// total))` while browsing — `selected` counts from the newest entry
+    /// (1 = the most recent), `total` is how many entries there are. `None` when
+    /// not browsing (nothing recalled yet, or the draft was restored past the
+    /// newest).
+    pub fn browsing(&self) -> Option<(usize, usize)> {
+        let total = self.entries.len();
+        let pos = self.pos?;
+        Some((total - pos, total))
+    }
 }
 
 /// Persist input history (one entry per line; multi-line entries are skipped to
@@ -255,6 +266,32 @@ mod tests {
             Some("one\n\ntwo\n")
         );
         assert_eq!(b.recall_next("one\n\ntwo\n").as_deref(), Some("draft"));
+    }
+
+    /// `browsing` reports where the walk stands, counting from the newest entry,
+    /// and clears once the draft is restored past the newest.
+    #[test]
+    fn browsing_reports_position_then_clears() {
+        let mut b = HistoryBrowser {
+            entries: vec!["one".into(), "two".into(), "three".into()],
+            ..Default::default()
+        };
+        assert_eq!(b.browsing(), None, "not browsing yet");
+        b.recall_prev("draft");
+        assert_eq!(b.browsing(), Some((1, 3)), "first Up lands on the newest");
+        b.recall_prev("three");
+        assert_eq!(b.browsing(), Some((2, 3)));
+        b.recall_prev("two");
+        assert_eq!(b.browsing(), Some((3, 3)), "clamped at the oldest");
+        b.recall_next("one");
+        assert_eq!(b.browsing(), Some((2, 3)));
+        b.recall_next("two");
+        b.recall_next("three");
+        assert_eq!(b.browsing(), None, "draft restored — no longer browsing");
+        // Empty history never browses.
+        let mut empty = HistoryBrowser::default();
+        assert_eq!(empty.recall_prev("d"), None);
+        assert_eq!(empty.browsing(), None);
     }
 
     #[cfg(unix)]

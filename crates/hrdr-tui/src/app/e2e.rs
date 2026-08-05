@@ -894,14 +894,14 @@ async fn multi_chunk_text_assembles_correctly() {
 
 #[tokio::test]
 async fn reasoning_entry_appended_to_transcript() {
-    // show_reasoning is true by default; a reasoning_content SSE delta should
-    // land as EntryKind::Reasoning alongside the normal EntryKind::Assistant.
+    // A reasoning_content SSE delta lands as EntryKind::Reasoning alongside the
+    // normal EntryKind::Assistant — stored regardless of `show_reasoning` (the
+    // toggle only gates rendering, see the render test below).
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "I am thinking.".to_string(),
         text: "Done.".to_string(),
     }])
     .await;
-    assert!(h.app.show_reasoning, "show_reasoning must default to true");
     h.submit("think").await;
     assert!(!h.app.running());
     let has_reasoning = h.app.transcript().iter().any(
@@ -973,13 +973,20 @@ async fn init_runs_a_hidden_turn_without_a_visible_user_entry() {
 
 #[tokio::test]
 async fn reasoning_hidden_in_render_after_toggle() {
-    // After /reasoning, reasoning text must not appear in the rendered buffer even
-    // though EntryKind::Reasoning is still stored (the entry is skipped at draw time).
+    // Reasoning is hidden by default now (the config default is off). After
+    // /reasoning, reasoning text must not appear in the rendered buffer even
+    // though EntryKind::Reasoning is still stored (the entry is skipped at draw
+    // time).
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "secret thought".to_string(),
         text: "visible reply".to_string(),
     }])
     .await;
+    assert!(
+        !h.app.show_reasoning,
+        "show_reasoning must default to false"
+    );
+    h.app.show_reasoning = true; // the state this test's flow assumes
     h.submit("/reasoning").await;
     assert!(
         !h.app.show_reasoning,
@@ -1001,6 +1008,31 @@ async fn reasoning_hidden_in_render_after_toggle() {
     assert!(
         h.app.show_reasoning,
         "show_reasoning should be true after second /reasoning"
+    );
+}
+
+/// `/thinking`'s choice persists to `config.toml`: the file gets the bool and a
+/// fresh `UiConfig::load()` reads it back, both directions (default is off, so
+/// a stored `true` is the proof the write happened).
+#[tokio::test]
+async fn thinking_toggle_persists_to_config() {
+    let mut h = Harness::new(vec![]).await;
+    assert!(!h.app.show_reasoning, "default off");
+
+    h.submit("/thinking on").await;
+    assert!(h.app.show_reasoning, "the toggle applied");
+    let cfg = hrdr_app::UiConfig::load();
+    assert!(
+        cfg.show_thinking,
+        "/thinking on must write show_thinking = true to config.toml"
+    );
+
+    h.submit("/thinking off").await;
+    assert!(!h.app.show_reasoning, "the toggle applied again");
+    let cfg = hrdr_app::UiConfig::load();
+    assert!(
+        !cfg.show_thinking,
+        "/thinking off must write show_thinking = false to config.toml"
     );
 }
 
@@ -1628,6 +1660,88 @@ async fn ctrl_s_stashes_and_pops_drafts() {
     h.ctrl('s');
     assert_eq!(h.app.editor.content().trim(), "");
     assert!(h.app.stash.is_empty());
+}
+
+/// The input pane's top padding line is a status line for the box: blank while
+/// there is nothing to report, "N drafts stashed" while Ctrl+S drafts wait, and
+/// "history N/M" while Up/Down browse the recall list (N counting from the
+/// newest). Both can show at once.
+#[tokio::test]
+async fn input_indicator_reports_stash_and_history() {
+    let mut h = Harness::new(vec![]).await;
+
+    // Nothing to report: the padding line stays blank (its only content is the
+    // pane's left bar).
+    let screen = h.render();
+    let pad_row = h.app.input_rect.y as usize;
+    assert!(
+        screen
+            .lines()
+            .nth(pad_row)
+            .unwrap()
+            .trim_start_matches(crate::ui::BORDER_BAR)
+            .trim()
+            .is_empty(),
+        "the padding line is blank with nothing to report"
+    );
+
+    h.type_str("first thought");
+    h.ctrl('s');
+    let screen = h.render();
+    assert!(screen.contains("1 draft stashed"), "one stash: {screen:?}");
+
+    h.type_str("second thought");
+    h.ctrl('s');
+    let screen = h.render();
+    assert!(
+        screen.contains("2 drafts stashed"),
+        "two stashes: {screen:?}"
+    );
+
+    // Browsing history reports position/total, counting from the newest. The
+    // TOTAL is whatever the shared sandbox history file holds (other parallel
+    // tests record into it), so assert the selected count, which is
+    // deterministic: first Up is always 1, second Up 2.
+    h.app.history.record("entry-a");
+    h.app.history.record("entry-b");
+    h.app.editor.set_content("a draft");
+    h.press(KeyCode::Up);
+    let screen = h.render();
+    assert!(
+        screen.contains("history 1/"),
+        "first Up lands on the newest: {screen:?}"
+    );
+    h.press(KeyCode::Up);
+    let screen = h.render();
+    assert!(
+        screen.contains("history 2/"),
+        "second Up steps one further back: {screen:?}"
+    );
+
+    // Down past the newest restores the draft and leaves browsing.
+    h.press(KeyCode::Down);
+    h.press(KeyCode::Down);
+    let screen = h.render();
+    assert!(
+        !screen.contains("history 1/") && !screen.contains("history 2/"),
+        "browsing ended: {screen:?}"
+    );
+    assert!(
+        screen.contains("2 drafts stashed"),
+        "the stash indicator stays: {screen:?}"
+    );
+
+    // Popping the stash clears the indicator again.
+    h.app.editor.set_content("");
+    h.ctrl('s'); // pops "second thought"
+    h.app.editor.set_content("");
+    h.ctrl('s'); // pops "first thought"
+    assert!(h.app.stash.is_empty());
+    let screen = h.render();
+    assert!(
+        !screen.contains("draft stashed"),
+        "indicator cleared with the stash: {screen:?}"
+    );
 }
 
 /// Whatever the user is part-way through typing is newer than what was queued,
@@ -2832,6 +2946,7 @@ async fn a_thinking_block_renders_no_label() {
         text: "done".into(),
     }])
     .await;
+    h.app.show_reasoning = true; // this test renders the thought
     h.submit("go").await;
 
     let reasoning = h
@@ -2860,6 +2975,7 @@ async fn a_thinking_block_renders_no_label() {
 
     // Streaming shows no spinner label either.
     let mut h2 = Harness::new(vec![]).await;
+    h2.app.show_reasoning = true; // this half renders the thought too
     h2.app
         .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
@@ -2911,6 +3027,7 @@ async fn an_empty_text_delta_opens_no_entry() {
 #[tokio::test]
 async fn goto_finds_a_text_less_assistant_turn() {
     let mut h = Harness::new(vec![]).await;
+    h.app.show_reasoning = true; // the reasoning entry is the jump target
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
@@ -3494,6 +3611,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         })
     };
     let mut h = Harness::new(vec![]).await;
+    h.app.show_reasoning = true; // the "thought" row is an anchor below
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
@@ -3572,6 +3690,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
 #[tokio::test]
 async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     let mut h = Harness::new(vec![]).await;
+    h.app.show_reasoning = true; // the "thinking here" row is an anchor below
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));

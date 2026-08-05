@@ -38,6 +38,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The input box reports its stash and history position on its top padding
+  line.** While Ctrl+S drafts wait, the line shows how many
+  (`2 drafts stashed`); while Up/Down browse the recall list it shows where you
+  are (`history 1/12`, counting from the newest). Both can show at once, and the
+  line stays blank when there is nothing to report.
+
 - **Mouse select-to-copy works on the input box and status bar.** Drag-selecting
   text had only worked over the transcript; a press inside the input pane or the
   status bar block now starts a selection too, and releasing it copies the text
@@ -338,6 +344,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sentence is editable rather than a file dump; submitting expands it again.
 
 ### Changed
+
+- **The model's `<think>` reasoning blocks are hidden by default.** Reasoning
+  display was previously on out of the box; it now starts off, matching the
+  behavior most terminals want for a coding session. `/thinking on|off` (alias
+  `/reasoning`) still toggles it, and the choice is saved to `config.toml`
+  (`show_thinking`) so it survives a restart — as it already did for `on`.
 
 - **The hjkl editor stack and reqwest were updated.** The 14 `hjkl-*` crates
   moved `0.33 → 0.41` and `reqwest` `0.12 → 0.13` (`rustls-tls` → `rustls`, with

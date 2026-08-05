@@ -1395,6 +1395,35 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
+    // The pane's top padding row doubles as a status line: while drafts are
+    // stashed (Ctrl+S) or history is being browsed (Up/Down), it says so here
+    // instead of staying blank. Nothing to report — the row stays empty.
+    let mut bits: Vec<String> = Vec::new();
+    let stashed = app.stash.len();
+    if stashed > 0 {
+        bits.push(format!(
+            "{stashed} draft{} stashed",
+            if stashed == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some((selected, total)) = app.history.browsing() {
+        bits.push(format!("history {selected}/{total}"));
+    }
+    if !bits.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                bits.join(" · "),
+                Style::default().fg(app.theme.dim).bg(app.theme.user_bg),
+            ))),
+            Rect {
+                x: area.x + INPUT_PAD_X as u16,
+                y: area.y,
+                width: area.width.saturating_sub(INPUT_PAD_X as u16),
+                height: 1,
+            },
+        );
+    }
+
     // The banners all share the one row above the pane; a pending confirmation
     // takes it when more than one would apply. Only the scroll buttons are
     // clickable.

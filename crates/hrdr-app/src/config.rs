@@ -54,8 +54,9 @@ pub struct UiConfig {
     /// How many turns a completed TODO item stays visible before it's pruned.
     /// Default [`DEFAULT_TODO_TTL_TURNS`].
     pub todo_ttl: u64,
-    /// Show the model's `<think>` reasoning blocks. Default `true`. Toggled at
-    /// runtime by `/thinking` (aka `/reasoning`).
+    /// Show the model's `<think>` reasoning blocks. Default `false`. Toggled at
+    /// runtime by `/thinking` (aka `/reasoning`); the choice persists to
+    /// `config.toml` as `show_thinking`.
     pub show_thinking: bool,
     /// Max transcript entries kept in the scrollback buffer. Older entries are
     /// evicted from the front to keep render performance stable. Default 500.
@@ -73,7 +74,7 @@ impl Default for UiConfig {
             bell: true,
             auto_resume: true,
             todo_ttl: DEFAULT_TODO_TTL_TURNS,
-            show_thinking: true,
+            show_thinking: false,
             scrollback: 500,
         }
     }
@@ -348,7 +349,7 @@ mod tests {
         let mut d = UiConfig::default();
         d.apply_file(UiFileConfig::default());
         assert!(!d.vim_mode);
-        assert!(d.bell && d.auto_resume && d.show_thinking);
+        assert!(d.bell && d.auto_resume && !d.show_thinking);
         assert_eq!(d.todo_ttl, DEFAULT_TODO_TTL_TURNS);
     }
 

@@ -472,7 +472,7 @@ pub(crate) struct App {
     /// by the completion popup. Set by history recall, cleared on typing.
     suppress_completions: bool,
     /// Submitted-input history + Up/Down browsing (from the shared core).
-    history: hrdr_app::HistoryBrowser,
+    pub(crate) history: hrdr_app::HistoryBrowser,
     /// Cached relative file paths under the cwd, for `@file` completion.
     file_index: Vec<String>,
     /// The cwd `file_index` was built for; rebuilt when the cwd changes or a
