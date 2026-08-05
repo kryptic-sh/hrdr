@@ -71,6 +71,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Per-minute rate limits are retried again, not treated as spent billing
+  caps.** A 429/5xx whose body said "quota" — Google's canonical "Quota exceeded
+  for metric requests per minute" among them — was classified as a terminal
+  usage limit and the turn died instead of backing off. Only explicit usage
+  wording (`insufficient_quota`, billing, credit balance, spend limit) is
+  terminal now; OpenAI's real billing message still matches via "billing".
+
+- **A backgrounded process a command left running survives the tool call.** The
+  unix process-group guard SIGKILLed the whole group when its guard dropped, so
+  `bash -c 'sleep 300 </dev/null >/dev/null 2>&1 & echo ok'` reported success
+  and then killed the `sleep` milliseconds later — the same shape hit the file
+  and lifecycle hooks and `!command`. The group is now disarmed on successful
+  completion; timeouts, overflow and Esc still take the whole tree down.
+
+- **`config.toml` keeps the mode you set.** A `/theme`-style setting write
+  rebuilt the file through a plain umask-default temp and rename, silently
+  widening a `chmod 600` config — a documented home for an inline `api_key` —
+  back to 0644. Config writes now create their temp owner-only (0600 on unix),
+  like every other hrdr-owned store.
+
 - **The first Enter of a session no longer blocks the UI on a disk write.** The
   session id was minted _and_ the file written synchronously on the event loop,
   so the first message's submit froze the TUI for the duration of the serialize
