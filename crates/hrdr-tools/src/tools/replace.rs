@@ -15,11 +15,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Tool, ToolContext, truncate};
+use crate::{Tool, ToolContext};
 
 use super::edit::MAX_EDIT_OUTPUT_BYTES;
 use super::mutation::apply_file_change;
-use super::write::diff_or_summary;
+use super::write::unified_diff;
 
 /// Refuse a sweep wider than this many files: past it, the model is almost
 /// certainly matching something it didn't mean to, and a diff that large is
@@ -235,7 +235,7 @@ impl Tool for ReplaceTool {
         let mut notes = String::new();
         for (path, before, after, rel) in planned {
             if a.dry_run {
-                diffs.push_str(&diff_or_summary(&rel, &before, &after));
+                diffs.push_str(&unified_diff(&rel, &before, &after));
             } else {
                 let fc = apply_file_change(ctx, &path, "replace", &after).await?;
                 // Refresh the read baseline for every file this rewrote: the diff
@@ -248,7 +248,7 @@ impl Tool for ReplaceTool {
                 for note in &fc.notes {
                     notes.push_str(&format!("[{rel}] {note}\n"));
                 }
-                diffs.push_str(&diff_or_summary(&rel, &before, &fc.content_after));
+                diffs.push_str(&unified_diff(&rel, &before, &fc.content_after));
             }
             changed.push(rel);
         }
@@ -305,7 +305,9 @@ impl Tool for ReplaceTool {
             header.push('\n');
             header.push_str(note);
         }
-        Ok(truncate(&format!("{header}\n\n{diffs}"), ctx.max_output))
+        // The full diffs ride back uncapped — they are what the transcript
+        // shows the user; the agent abbreviates the model's copy.
+        Ok(format!("{header}\n\n{diffs}"))
     }
 }
 

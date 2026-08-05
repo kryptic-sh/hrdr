@@ -5,11 +5,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Tool, ToolContext, truncate};
+use crate::{Tool, ToolContext};
 
 use super::MAX_READ_BYTES;
 use super::mutation::apply_file_change;
-use super::write::diff_or_summary;
+use super::write::unified_diff;
 
 /// Ceiling on the projected output of a `replace_all`. A growing replacement
 /// (`old="e"`, `new=50KB`) across even a modest file can project to gigabytes —
@@ -269,13 +269,12 @@ impl Tool for EditTool {
         // edit/write this turn sees Fresh rather than a false Stale.
         ctx.mark_read(&path);
         let warn = fc.formatted_notes();
-        let diff = diff_or_summary(&path.display().to_string(), &text, &fc.content_after);
-        Ok(truncate(
-            &format!(
-                "Replaced {count} occurrence(s) in {}{warn}{stale_note}\n{diff}",
-                path.display()
-            ),
-            ctx.max_output,
+        let diff = unified_diff(&path.display().to_string(), &text, &fc.content_after);
+        // The full diff rides back uncapped — it is what the transcript shows
+        // the user; the agent abbreviates the model's copy.
+        Ok(format!(
+            "Replaced {count} occurrence(s) in {}{warn}{stale_note}\n{diff}",
+            path.display()
         ))
     }
 }

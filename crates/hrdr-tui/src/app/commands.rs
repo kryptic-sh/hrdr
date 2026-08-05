@@ -128,22 +128,22 @@ impl super::App {
         self.pending_edit = None;
         self.login_modal = None;
         self.skill_selector = None;
-        self.expand_tools = false;
+        self.verbose = false;
     }
     /// Apply a `/verbose` mode (shared dispatch parses the arg), returning the
-    /// status line. `expand_tools` is the sticky all-on flag; per-entry
+    /// status line. `verbose` is the sticky all-on flag; per-entry
     /// expansion lives on the Tool entries. On also shows the model's thinking
     /// (there is no separate `/thinking` toggle any more); off hides it again
     /// and folds every per-entry expansion back behind its summary.
     pub(super) fn apply_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
         match mode {
             hrdr_app::ExpandMode::All => {
-                self.expand_tools = true;
+                self.verbose = true;
                 self.show_reasoning = true;
                 hrdr_app::expand_msg::ALL.to_string()
             }
             hrdr_app::ExpandMode::Off => {
-                self.expand_tools = false;
+                self.verbose = false;
                 self.tool_groups.clear();
                 self.thinking_open.clear();
                 self.show_reasoning = false;
@@ -350,7 +350,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.set_active_model_ref(reference);
     }
     fn tool_expansion_on(&self) -> bool {
-        self.app.expand_tools
+        self.app.verbose
     }
     fn clear_conversation(&mut self) {
         self.app.clear_all();

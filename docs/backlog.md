@@ -1151,6 +1151,22 @@ live here:
   `tag-release status` working as intended. **Delete this entry once the RPC
   reports `0.11.0-1`.**
 
+## Deferred 2026-08-05
+
+- **Hide `Notice` transcript entries unless verbose.** Requested 2026-08-05: the
+  `EntryKind::Notice` chrome — the welcome banner, "session saved as …", config
+  reloads — should render only in `/verbose on` mode. Deferred on the first
+  attempt because slash-command output (`/help`, "unrecognized command", the
+  effort picker) shares the same `EntryKind::Notice` variant via `App::system`
+  (`hrdr-tui/src/app.rs:1903`) and the `TurnMsg::System` handler
+  (`hrdr-tui/src/app.rs:2639`, fed by `CommandHost::info`), so hiding the
+  variant hides user-requested output too. Revisit by splitting a `Command`
+  variant for the `system()` channel (always shown) from `Notice`
+  (verbose-only), then adding an
+  `EntryKind::Notice(_) if !expand_tools => continue` guard in
+  `transcript_chunks`. The guard alone was tried and reverted; it failed eight
+  e2e tests that assert slash output renders.
+
 ## Top of the list
 
 The five that were here are all shipped — see

@@ -1015,7 +1015,15 @@ impl Agent {
         // harness metadata, present on failures too. Kept out of the ToolEnd
         // display event above: `(took 0ms)` on every instant tool is just noise
         // in the transcript, and the model is what asked for the timing.
-        let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
+        //
+        // A mutation tool's full diff stays in the transcript for the user;
+        // the model gets it abbreviated to its counts.
+        let model_body = if matches!(call.function.name.as_str(), "edit" | "replace" | "write") {
+            hrdr_tools::abbreviate_mutation_result(&body)
+        } else {
+            body
+        };
+        let recorded = format!("{model_body}\n\n(took {})", format_duration(elapsed));
         self.messages
             .push(ChatMessage::tool_result(call.id.clone(), recorded));
     }

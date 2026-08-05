@@ -494,7 +494,7 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// Show every tool result in full (`/verbose on`); per-entry `expanded`
     /// overrides this for individual results.
-    pub(crate) expand_tools: bool,
+    pub(crate) verbose: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
@@ -544,6 +544,11 @@ pub(crate) struct App {
     /// collapsed: the row count changes under the reader, and `scroll_offset` is
     /// measured from the bottom, so the block would otherwise jump.
     pub(crate) pending_scroll_entry: Option<usize>,
+    /// The screen row `pending_scroll_entry` was on when clicked. The next draw
+    /// keeps that chunk's top on this row (see `draw_chunks`), so expanding or
+    /// collapsing a section holds the viewport steady on the line that was
+    /// under the cursor instead of yanking the entry to the top.
+    pub(crate) pending_scroll_row: Option<u16>,
     /// A transcript index to pull to the top of the viewport at the next draw,
     /// scrolling there if the reader is following the newest output. Set by a
     /// click on a sub-agent panel row: unlike `pending_scroll_entry`, which only
@@ -611,7 +616,7 @@ pub(crate) struct App {
     /// Thinking entries the reader opened while reasoning is hidden: a
     /// collapsed `✓ Thought for 1m 32s · 2m ago` summary shows its full block
     /// instead. Keyed by the entry's content hash (reasoning entries carry no
-    /// id); `expand_tools` (via `/verbose on`) shows every thought at once.
+    /// id); `verbose` (via `/verbose on`) shows every thought at once.
     pub(crate) thinking_open: std::collections::HashSet<u64>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
@@ -811,7 +816,7 @@ impl App {
             file_index_dirty: false,
             file_watcher: None,
             show_reasoning: false,
-            expand_tools: false,
+            verbose: false,
             pending_edit: None,
             model_selector: None,
             model_gen: 0,
@@ -832,6 +837,7 @@ impl App {
             ),
             pending_goto: None,
             pending_scroll_entry: None,
+            pending_scroll_row: None,
             find: hrdr_app::FindState::default(),
             bell,
             turn_handle: None,
@@ -1792,12 +1798,17 @@ impl App {
     /// a click on an individual block toggles that call's full output. A click
     /// on a folded thinking summary opens (or closes) that one thought.
     fn toggle_tool_at(&mut self, col: u16, row: u16) {
-        let hit = self
+        let rect = self
             .tool_hits
             .iter()
             .find(|(r, _)| r.contains(col, row))
-            .map(|(_, h)| *h);
-        let Some(hit) = hit else { return };
+            .copied();
+        let Some((rect, hit)) = rect else { return };
+        // Hold the chunk steady on the screen row it is on now: the next draw
+        // keeps its top at `rect.y` while its height changes, so the viewport
+        // does not jump to the entry (see `draw_chunks`).
+        self.pending_scroll_entry = Some(hit);
+        self.pending_scroll_row = Some(rect.y);
         let transcript = self.panes.active_transcript();
         // A hidden thought's summary toggles its own expansion, keyed by the
         // entry's content hash (reasoning entries carry no id).
@@ -1806,13 +1817,11 @@ impl App {
             if !self.thinking_open.remove(&hash) {
                 self.thinking_open.insert(hash);
             }
-            self.pending_scroll_entry = Some(hit);
             return;
         }
         // One expansion level: any click on a grouped tool — the summary
         // header or one of its rendered calls — folds or fans out the whole
         // group, keyed by the group head's tool-call id.
-        let transcript = self.panes.active_transcript();
         let Some(head) = crate::ui::tool_group_head(transcript, hit) else {
             return;
         };
@@ -1825,8 +1834,8 @@ impl App {
         {
             self.tool_groups.insert(id);
         }
-        // The group's height is about to change; keep its top where the reader
-        // is looking (see `pending_scroll_entry`).
+        // The group's height is about to change; the group chunk's top is the
+        // same chunk the click landed on.
         self.pending_scroll_entry = Some(head);
     }
 

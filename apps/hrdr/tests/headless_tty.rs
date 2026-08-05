@@ -102,7 +102,13 @@ fn run_on_a_pty(env: &[(&str, &str)]) -> String {
         cmd.env(key, value);
     }
     cmd.env("TERM", "xterm-256color");
-    for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG", "NO_COLOR"] {
+    for key in [
+        "HRDR_MODEL",
+        "HRDR_API_KEY",
+        "RUST_LOG",
+        "NO_COLOR",
+        "CLICOLOR",
+    ] {
         cmd.env_remove(key);
     }
     for (key, value) in env {

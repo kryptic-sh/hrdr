@@ -130,6 +130,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   investigate — or piles more on mid-task — every item goes on the todo list as
   it arrives, so nothing in the pile is forgotten.
 
+- **A mutation result carries the full diff of the change.** `edit`, `replace`
+  and `write` return the whole diff uncapped, so the transcript shows the user
+  exactly what the tool changed; the model's copy is still abbreviated to its
+  counts (`edit applied: +15/-8 lines across 1 hunks …`) — it wrote the text,
+  and a large diff is pure self-echo.
+
+- **Expanding or collapsing a section holds the viewport steady.** Clicking a
+  tool group's summary or a hidden thought's summary keeps that chunk on the
+  same screen row while its height changes — the view no longer jumps to put the
+  entry at the top of the viewport.
+
+- **The loader is verbose-only.** The `inferring`/`generating` line at the
+  bottom of the transcript is hidden in normal mode — the status bar carries the
+  turn state — and `/verbose on` brings it back.
+
 ### Fixed
 
 - **Per-minute rate limits are retried again, not treated as spent billing

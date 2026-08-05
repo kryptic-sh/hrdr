@@ -151,6 +151,13 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
     for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
         cmd.env_remove(key);
     }
+    // These tests assert on the escape codes the question is painted in, so
+    // color must be on regardless of the ambient environment: a machine (or a
+    // CI job) that exports NO_COLOR would otherwise strip the very output
+    // under test.
+    for key in ["NO_COLOR", "CLICOLOR"] {
+        cmd.env_remove(key);
+    }
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     drop(pty.slave);

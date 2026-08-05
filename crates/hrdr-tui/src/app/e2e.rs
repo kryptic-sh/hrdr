@@ -774,7 +774,7 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
     h.submit("read that file").await;
     // The three identical reads group behind a summary header; expand the
     // groups so the assertion can see their results.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     let screen = h.render();
     assert!(
         screen.contains("failed 2 times in a row"),
@@ -808,7 +808,7 @@ async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
     h.submit("use a bad tool").await;
     // The lone tool call collapses behind its summary; fan it out so the
     // result — where the error lives — renders.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     let screen = h.render();
     // The error is shown to the user (and was fed back to the model)…
     assert!(
@@ -1055,7 +1055,7 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
         },
         t(1_700_000_001),
     ));
-    assert!(!h.app.expand_tools, "default is folded behind the summary");
+    assert!(!h.app.verbose, "default is folded behind the summary");
     assert!(
         !h.render().contains("VERBOSE-MODE-RESULT"),
         "folded by default"
@@ -1063,7 +1063,7 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
 
     // Bare `/verbose` toggles on: the collapsed block renders in full.
     h.submit("/verbose").await;
-    assert!(h.app.expand_tools, "a bare /verbose turns the mode on");
+    assert!(h.app.verbose, "a bare /verbose turns the mode on");
     assert!(
         h.render().contains("VERBOSE-MODE-RESULT"),
         "on shows every tool's full output"
@@ -1071,7 +1071,7 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
 
     // `/verbose off` collapses everything and returns to manual mode.
     h.submit("/verbose off").await;
-    assert!(!h.app.expand_tools, "/verbose off turns the mode off");
+    assert!(!h.app.verbose, "/verbose off turns the mode off");
     assert!(
         !h.render().contains("VERBOSE-MODE-RESULT"),
         "off collapses again"
@@ -1079,9 +1079,9 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
 
     // The explicit setter, then the flip back off.
     h.submit("/verbose on").await;
-    assert!(h.app.expand_tools, "/verbose on sets the mode on");
+    assert!(h.app.verbose, "/verbose on sets the mode on");
     h.submit("/verbose").await;
-    assert!(!h.app.expand_tools, "a bare /verbose flips back off");
+    assert!(!h.app.verbose, "a bare /verbose flips back off");
     // /verbose owns the thinking display too: on shows it, off hides it.
     assert!(
         !h.app.show_reasoning,
@@ -1268,7 +1268,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     h.submit("run it").await;
     // The lone tool call collapses behind its summary; fan it out so its box —
     // the surface these assertions check — renders.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4096,9 +4096,87 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
 
     let after = header_row(&term).expect("the summary is still on screen");
     let screen = buffer_to_string(term.backend().buffer());
+    assert_eq!(
+        after, before,
+        "collapsing must keep the summary on the same screen row, not jump it:\n{screen}"
+    );
+}
+
+/// Expanding a collapsed group must not scroll the view: the top of the
+/// viewport stays focused on the same line, and the summary the click landed
+/// on stays on the same screen row while the calls fan out beneath it.
+///
+/// Regression: the toggle pinned the entry's top to the TOP of the viewport,
+/// so clicking a summary mid-viewport yanked the whole view up to it.
+#[tokio::test]
+async fn expanding_a_tool_group_keeps_the_viewport_on_the_same_line() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "shell".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: "LONG-RESULT".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c2".into(),
+        name: "read".into(),
+        args: r#"{"path":"x"}"#.into(),
+        result: String::new(),
+        ok: true,
+        done: true,
+    }));
+    // Enough filler that the transcript overflows the viewport.
+    for i in 0..20 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    // Scroll up: the summary sits mid-viewport, not at the top.
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let row_of = |term: &Terminal<TestBackend>, needle: &str| -> u16 {
+        let buf = term.backend().buffer();
+        (0..20)
+            .find(|&y| {
+                (0..39)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    };
+    let before = row_of(&term, "ran 1 command · read 1 file");
     assert!(
-        after <= 1,
-        "the folded group should sit at the top of the viewport, got row {after}:\n{screen}"
+        before > 2,
+        "the summary should be mid-viewport for this test, got row {before}"
+    );
+    assert!(h.app.scroll_offset > 0, "the reader is scrolled up");
+
+    // Click the summary: the group expands, and the summary stays put.
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    assert!(rect.contains(2, before));
+    click_at(&mut h.app, 2, before);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let after = row_of(&term, "ran 1 command · read 1 file");
+    let screen = buffer_to_string(term.backend().buffer());
+    assert_eq!(
+        after, before,
+        "expanding must keep the summary on the same screen row:\n{screen}"
+    );
+    assert!(
+        screen.contains("LONG-RESULT"),
+        "the call fanned out below the summary:\n{screen}"
     );
 }
 
@@ -5029,7 +5107,7 @@ async fn tool_runs_merge_across_invisible_turn_markers() {
 
     // Expanded: every call renders inside the group, in order, and the turn
     // markers' `#N assistant` labels sit between their calls.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     let mut term = Terminal::new(TestBackend::new(60, 120)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
@@ -6286,6 +6364,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
 #[tokio::test]
 async fn the_loader_belongs_to_the_agent_on_screen() {
     let mut h = Harness::new(vec![]).await;
+    h.app.verbose = true; // the loader is verbose-only chrome; this test is about it
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
@@ -6362,6 +6441,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
 #[tokio::test]
 async fn the_generating_line_closes_the_transcript() {
     let mut h = Harness::new(vec![]).await;
+    h.app.verbose = true; // the loader is verbose-only chrome; this test is about it
     h.type_str("draft");
     // A panel between the loader and the input, so "top-most" is a real claim.
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
@@ -6428,6 +6508,27 @@ async fn the_generating_line_closes_the_transcript() {
     );
 }
 
+/// The loader — the "inferring"/"generating" line — is verbose-only chrome:
+/// normal mode hides it (the status bar carries the turn state), `/verbose on`
+/// brings it back.
+#[tokio::test]
+async fn the_loader_shows_only_in_verbose_mode() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.resume_inference_for_test();
+    assert!(!h.app.verbose, "normal mode is the default");
+    assert!(
+        !h.render().contains("inferring"),
+        "the loader is hidden in normal mode"
+    );
+
+    h.app.verbose = true;
+    assert!(
+        h.render().contains("inferring"),
+        "/verbose on brings the loader back"
+    );
+}
+
 /// The user's own surfaces — the prompt block and the input pane — wear a bar
 /// down their left edge, running their whole height. A tool call shares the
 /// prompt's background but not its bar; it isn't the user speaking.
@@ -6448,7 +6549,7 @@ async fn the_prompt_and_input_wear_a_left_bar() {
     }));
     // The lone tool call collapses behind its summary; fan it out so its box —
     // the surface the bar assertions check — renders.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     h.type_str("typing");
 
     let mut term = Terminal::new(TestBackend::new(54, 26)).unwrap();
@@ -7222,7 +7323,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     }
     // The lone tool call collapses behind its summary; fan it out so the
     // shell output renders.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     let screen = h.render();
     assert!(
         screen.contains("hello-from-shell"),
@@ -7312,7 +7413,7 @@ async fn colon_bang_runs_the_same_user_shell_command() {
     }
     // The lone tool call collapses behind its summary; fan it out so the
     // shell output renders.
-    h.app.expand_tools = true;
+    h.app.verbose = true;
     let screen = h.render();
     assert!(
         screen.contains("hello-from-colon-bang"),

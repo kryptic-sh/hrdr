@@ -922,15 +922,20 @@ fn draw_chunks(
         Some(clamp_u16(cum[at]))
     });
     // A tool block that was just expanded or collapsed changed height. While the
-    // reader is scrolled up, pull its top to the top of the viewport: the offset
-    // is measured from the bottom, so the block would otherwise slide by however
-    // many rows it gained or lost. Following the newest output is left alone —
-    // the bottom is already pinned.
-    let entry_top: Option<u16> = pending_entry.and_then(|idx| {
-        let at = chunks.iter().position(|c| c.tool_idx == Some(idx))?;
-        (app.scroll_offset > 0).then(|| clamp_u16(cum[at]))
-    });
-    let goto_top = goto_top.or(entry_top);
+    // reader is scrolled up, hold the block's top on the SCREEN ROW it was on
+    // when clicked (see `pending_scroll_row`): the offset is measured from the
+    // bottom, so the block would otherwise slide by however many rows it gained
+    // or lost. Following the newest output is left alone — the bottom is already
+    // pinned.
+    let entry_pin: Option<u16> =
+        pending_entry
+            .zip(app.pending_scroll_row)
+            .and_then(|(idx, row)| {
+                let at = chunks.iter().position(|c| c.tool_idx == Some(idx))?;
+                // The from-top row that puts the chunk's top at screen row `row`.
+                (app.scroll_offset > 0).then(|| clamp_u16(cum[at]).saturating_sub(row))
+            });
+    let goto_top = goto_top.or(entry_pin);
     // Total rows at this width.
     // Clamped (not truncated) to u16::MAX: ratatui's `Paragraph::scroll` only
     // takes a u16, and a long enough transcript would otherwise wrap the raw
@@ -949,9 +954,10 @@ fn draw_chunks(
         let grown = max_scroll.saturating_sub(clamp_u16(app.max_scroll));
         scroll_offset = scroll_offset.saturating_add(grown as usize);
     }
-    // A /goto puts the target message at the top of the viewport.
-    if let Some(wrapped_start) = goto_top {
-        scroll_offset = max_scroll.saturating_sub(wrapped_start) as usize;
+    // A /goto puts the target message at the top of the viewport; a toggled
+    // chunk keeps its top at the screen row it was clicked on.
+    if let Some(from_top) = goto_top {
+        scroll_offset = max_scroll.saturating_sub(from_top) as usize;
     }
     let offset = clamp_u16(scroll_offset).min(max_scroll);
     let scroll = max_scroll.saturating_sub(offset);
@@ -1255,6 +1261,11 @@ pub(crate) fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
 /// a continuation row never starts with the `·` separator. A single segment
 /// wider than the terminal still wraps at word boundaries downstream.
 fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    // The loader is chrome — the status bar already shows the turn live — so
+    // in normal mode it stays hidden; `/verbose on` brings it back.
+    if !app.verbose {
+        return None;
+    }
     // It hides while that agent's tool calls run: the model is idle then, and a
     // spinner would claim otherwise (the running tool's own block carries the
     // `…` mark), and it hides entirely when the agent you are looking at is not
@@ -2761,7 +2772,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             if head {
                 let end = tool_group_end(transcript, i);
                 let id = tool_call_id(&entry.kind).unwrap_or_default();
-                let expanded = app.expand_tools || app.tool_groups.contains(id);
+                let expanded = app.verbose || app.tool_groups.contains(id);
                 // The follower of the summary header: the entry after the
                 // group — never a member (the span extends across every
                 // absorbed entry), so only a user prompt or an edit/replace
@@ -2830,7 +2841,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // longer model name wrapping) has to be measured again.
         let base_hash = match entry.kind {
             EntryKind::Header => header_hash(app),
-            _ => entry_content_hash(entry, app.expand_tools),
+            _ => entry_content_hash(entry, app.verbose),
         };
         let base_hash = match &entry.kind {
             EntryKind::Tool { done: false, .. } => base_hash ^ frame_idx,
@@ -2853,7 +2864,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         let ck: BodyKey = (
             base_hash,
             width,
-            app.expand_tools,
+            app.verbose,
             app.show_reasoning || reasoning_open,
         );
         // Every arm produces (kind, header rows, cached body rows, footer rows)
@@ -3434,7 +3445,7 @@ fn tool_group_chunk(
                         (
                             member.content_hash ^ if *done { 0 } else { frame.frame_idx },
                             w as u16,
-                            app.expand_tools,
+                            app.verbose,
                             app.show_reasoning,
                         ),
                         || tool_lines(theme, name, args, result, *ok, *done, frame.frame),
