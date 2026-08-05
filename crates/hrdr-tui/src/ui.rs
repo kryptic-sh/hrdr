@@ -1313,9 +1313,9 @@ fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
             started,
         ]
     };
-    let style = Style::default()
-        .fg(app.theme.warn)
-        .add_modifier(Modifier::BOLD);
+    // Warn-colored, normal weight: the loader is a status row, not a heading,
+    // and the spinner already carries the animation's emphasis.
+    let style = Style::default().fg(app.theme.warn);
     Some(
         pack_loader_segments(&segments, width as usize)
             .into_iter()

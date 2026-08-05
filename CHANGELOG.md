@@ -375,9 +375,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   between its `·`-delimited segments when it does not fit the width, so a
   wrapped continuation never starts with the separator — and each wrapped row is
   indented one cell, lining up under the spinner instead of starting flush at
-  the terminal's edge. The shell-command and detail-row text of a tool block
-  also renders muted now, matching the `read` tool's path — every detail that
-  follows a tool name uses the same dim color.
+  the terminal's edge. The line renders at normal weight, not bold — it is a
+  status row, and the spinner carries the animation's emphasis. The
+  shell-command and detail-row text of a tool block also renders muted now,
+  matching the `read` tool's path — every detail that follows a tool name uses
+  the same dim color.
 
 - **Tool calls collapse to a single line until expanded.** A finished tool block
   now renders as `✓ shell cd … && rg …` — the status mark, the tool name, and a
