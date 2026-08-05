@@ -824,6 +824,7 @@ mod tests {
             "deps_poetry",
             "deps_pip",
             "deps_go",
+            "deps_zig",
             "deps_composer",
             "deps_bundler",
         ] {

@@ -351,9 +351,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   regenerate and commit the lockfile with the manifest, fix the code the bumps
   break, and run the project's whole gate. `:deps_cargo`, `:deps_npm`,
   `:deps_pnpm`, `:deps_yarn`, `:deps_bun`, `:deps_uv`, `:deps_poetry`,
-  `:deps_pip`, `:deps_go`, `:deps_composer` and `:deps_bundler` each hold the
-  exact commands, frozen-lockfile gate, verification and gotchas for that
-  manager, checked against the current upstream docs.
+  `:deps_pip`, `:deps_go`, `:deps_zig`, `:deps_composer` and `:deps_bundler`
+  each hold the exact commands, frozen-lockfile gate, verification and gotchas
+  for that manager, checked against the current upstream docs.
 
 - **Built-in skills are registered by `build.rs`, not by hand.** Each `*.md` in
   `crates/hrdr-agent/src/templates/skills/` is baked into the binary by a

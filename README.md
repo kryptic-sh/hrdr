@@ -191,8 +191,8 @@ hrdr ships built-in skills that work with zero setup:
 - `:deps` — update project dependencies to their latest stable versions (generic
   runner; it points at the matching per-manager run book)
 - `:deps_cargo` / `:deps_npm` / `:deps_pnpm` / `:deps_yarn` / `:deps_bun` /
-  `:deps_uv` / `:deps_poetry` / `:deps_pip` / `:deps_go` / `:deps_composer` /
-  `:deps_bundler` — one run book per package manager
+  `:deps_uv` / `:deps_poetry` / `:deps_pip` / `:deps_go` / `:deps_zig` /
+  `:deps_composer` / `:deps_bundler` — one run book per package manager
 - `:fix` — root-cause and fix a pasted error
 - `:perf` — report performance problems: hot paths, allocations, complexity
 - `:plan` — explore read-only and produce an implementation plan
