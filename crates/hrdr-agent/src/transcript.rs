@@ -341,7 +341,9 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
                 },
             }
         }
-        "edit" => ToolDisplay {
+        // `edit` and `replace` return the patch they applied — the diff IS the
+        // point of the call, so both render in full whether collapsed or not.
+        "edit" | "replace" => ToolDisplay {
             headline: arg_str(&v, "path").unwrap_or_else(|| "?".into()),
             body: ToolBody::Diff,
         },

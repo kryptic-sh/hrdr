@@ -274,20 +274,26 @@ pub fn turn_stats_line(stats: TurnStatsLine) -> Option<String> {
 /// classification the renderer maps onto its theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
-    /// `+++`/`---` file headers and unclassified context: dim.
-    Meta,
+    /// `+++` file header (the new file): success green.
+    FileAdd,
+    /// `---` file header (the old file): error red.
+    FileRemove,
     /// `@@` hunk headers: user accent.
     Hunk,
     /// Added line: success green.
     Add,
     /// Removed line: error red.
     Remove,
+    /// Unclassified context: dim.
+    Meta,
 }
 
 /// Classify one line of a unified diff (see [`DiffLineKind`]).
 pub fn classify_diff_line(line: &str) -> DiffLineKind {
-    if line.starts_with("+++") || line.starts_with("---") {
-        DiffLineKind::Meta
+    if line.starts_with("+++") {
+        DiffLineKind::FileAdd
+    } else if line.starts_with("---") {
+        DiffLineKind::FileRemove
     } else if line.starts_with('@') {
         DiffLineKind::Hunk
     } else if line.starts_with('+') {
@@ -306,8 +312,8 @@ mod stats_tests {
     #[test]
     fn diff_line_classification() {
         use DiffLineKind::*;
-        assert_eq!(classify_diff_line("+++ b/x.rs"), Meta);
-        assert_eq!(classify_diff_line("--- a/x.rs"), Meta);
+        assert_eq!(classify_diff_line("+++ b/x.rs"), FileAdd);
+        assert_eq!(classify_diff_line("--- a/x.rs"), FileRemove);
         assert_eq!(classify_diff_line("@@ -1,2 +1,3 @@"), Hunk);
         assert_eq!(classify_diff_line("+added"), Add);
         assert_eq!(classify_diff_line("-removed"), Remove);

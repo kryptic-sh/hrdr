@@ -370,6 +370,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The edit and replace tools color their patch like the code it describes.**
+  The `+++`/`---` file headers carry the file's own side — green for the new
+  file, red for the old — instead of both rendering dim; the edit summary's
+  `+N/-N` pair splits into `+N` green, `/` in the line color, `-N` red; and the
+  trailing `[lsp]` diagnostics block (header and `path:line:col` rows) renders
+  in the error color until the diff resumes. `replace` also now renders its
+  patch in full whether collapsed or not, the same always-full treatment `edit`
+  already had — both tools return the diff they applied, so it is never hidden
+  behind the one-line summary.
+
 - **The agent prompt now requires the verification gate before every commit.**
   The `Committing:` guidance leads with: run the project's gate (the `verify`
   tool when present, the project's own commands otherwise) before each commit —

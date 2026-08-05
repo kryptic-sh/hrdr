@@ -123,6 +123,8 @@ pub fn ctx_level_slot(level: CtxLevel) -> ThemeSlot {
 /// [`crate::classify_diff_line`].
 pub fn diff_kind_slot(kind: crate::DiffLineKind) -> ThemeSlot {
     match kind {
+        crate::DiffLineKind::FileAdd => ThemeSlot::Success,
+        crate::DiffLineKind::FileRemove => ThemeSlot::Error,
         crate::DiffLineKind::Hunk => ThemeSlot::User,
         crate::DiffLineKind::Add => ThemeSlot::Success,
         crate::DiffLineKind::Remove => ThemeSlot::Error,

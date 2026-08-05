@@ -3042,12 +3042,13 @@ fn markdown_lines(
 /// shell calls, the file contents for `write`, the diff for `edit`,
 /// the tail of the file for `read`, plain output otherwise.
 ///
-/// Collapsed (not expanded), every tool except `edit` renders as ONE line —
-/// the mark, the name, and a one-line summary (the command for shell calls, the
-/// headline otherwise) — with the detail and result hidden until the block is
-/// expanded. `edit` is the exception: its diff IS the point of the call, so it
-/// keeps rendering its detail collapsed or not. `inner` is the content width
-/// the summary is truncated to, so the collapsed line never wraps.
+/// Collapsed (not expanded), every tool except `edit` and `replace` renders as
+/// ONE line — the mark, the name, and a one-line summary (the command for
+/// shell calls, the headline otherwise) — with the detail and result hidden
+/// until the block is expanded. `edit` and `replace` are the exceptions: their
+/// patch IS the point of the call, so they keep rendering their diff collapsed
+/// or not. `inner` is the content width the summary is truncated to, so the
+/// collapsed line never wraps.
 #[allow(clippy::too_many_arguments)]
 fn tool_lines(
     theme: &Theme,
@@ -3083,7 +3084,7 @@ fn tool_lines(
         }
         spans
     };
-    if !expanded && name != "edit" {
+    if !expanded && !matches!(name, "edit" | "replace") {
         // Collapsed: one line — mark, name, and a one-line summary. Shell calls
         // summarize to their command (newlines collapsed, truncated); everything
         // else to its headline, or the first detail row where there is no
@@ -3176,16 +3177,19 @@ fn tool_lines(
         // Finished: show the head of the result (or all of it when expanded).
         let shown = if expanded { lines.len() } else { preview };
         let extra = lines.len().saturating_sub(shown);
+        // The edit result's trailing `[lsp]` diagnostics block runs until the
+        // diff resumes — state threaded across the lines of one result.
+        let mut in_lsp = false;
         for line in &lines[..shown.min(lines.len())] {
-            let color = if is_diff {
-                diff_line_color(line, theme)
+            let spans = if is_diff {
+                diff_line_spans(line, theme, bg, &mut in_lsp)
             } else {
-                theme.dim
+                vec![Span::styled(
+                    expand_tabs(line),
+                    Style::default().fg(theme.dim).bg(bg),
+                )]
             };
-            out.push(Line::from(Span::styled(
-                expand_tabs(line),
-                Style::default().fg(color).bg(bg),
-            )));
+            out.push(Line::from(spans));
         }
         if extra > 0 {
             out.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
@@ -3212,13 +3216,87 @@ fn more_hint(extra: usize) -> String {
 }
 
 /// Color for one unified-diff line: additions green, deletions red, hunk
-/// headers in the accent color, file headers and context dim.
+/// headers in the accent color, `+++`/`---` file headers green/red, context dim.
 fn diff_line_color(line: &str, theme: &Theme) -> Color {
     // Shared classification + color semantics.
     slot_color(
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,
     )
+}
+
+/// Styled spans for one line of an edit result. Diff lines get their unified
+/// colors ([`diff_line_color`]); the edit tool's `[lsp]` diagnostics block —
+/// its header and the indented `path:line:col message` rows that follow — is
+/// rendered in the error color, and the block ends where the diff resumes
+/// (a non-space line that is not itself the `[lsp]` header). The edit
+/// summary's `+N/-N` pair is split green/red so the two counts read at a
+/// glance. `in_lsp` is threaded across the lines of one result.
+fn diff_line_spans(line: &str, theme: &Theme, bg: Color, in_lsp: &mut bool) -> Vec<Span<'static>> {
+    let text = expand_tabs(line);
+    // A non-space line that isn't the `[lsp]` header is the diff resuming
+    // (`---`, `+++`, `@@`, `+`, `-`); the diagnostics block ends there.
+    if !text.starts_with(' ') && !text.starts_with("[lsp]") {
+        *in_lsp = false;
+    }
+    if text.starts_with("[lsp]") || *in_lsp {
+        *in_lsp = true;
+        return vec![Span::styled(text, Style::default().fg(theme.error).bg(bg))];
+    }
+    split_add_remove(&text, diff_line_color(line, theme), theme, bg)
+}
+
+/// Style the `+N/-N` pair of an edit summary line (`edit applied: +131/-0
+/// lines across …`): the added count in success green, the removed count in
+/// error red, the `/` and the surrounding text in the line's base color. The
+/// whole line is one span when it holds no such pair (a hunk header's
+/// `-1,2 +3,4` has no slash between the counts and passes through whole).
+fn split_add_remove(text: &str, base: Color, theme: &Theme, bg: Color) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut rest = text;
+    loop {
+        let Some(plus) = rest.find('+') else {
+            if !rest.is_empty() {
+                spans.push(Span::styled(
+                    rest.to_string(),
+                    Style::default().fg(base).bg(bg),
+                ));
+            }
+            break;
+        };
+        let tail = &rest[plus..];
+        let add_n = tail[1..].bytes().take_while(u8::is_ascii_digit).count();
+        let rem_n = tail[1 + add_n..]
+            .strip_prefix("/-")
+            .map(|r| r.bytes().take_while(u8::is_ascii_digit).count())
+            .unwrap_or(0);
+        if add_n == 0 || rem_n == 0 {
+            // Not a `+N/-N` pair — a lone `+` in a hunk header like
+            // `@@ -1,2 +3,4 @@` must not fragment the line: emit it whole.
+            spans.push(Span::styled(
+                rest.to_string(),
+                Style::default().fg(base).bg(bg),
+            ));
+            break;
+        }
+        let rem_at = 1 + add_n + 1; // index of the `-` in `tail`
+        let end = rem_at + 1 + rem_n;
+        spans.push(Span::styled(
+            rest[..plus].to_string(),
+            Style::default().fg(base).bg(bg),
+        ));
+        spans.push(Span::styled(
+            format!("+{}", &tail[1..1 + add_n]),
+            Style::default().fg(theme.success).bg(bg),
+        ));
+        spans.push(Span::styled("/", Style::default().fg(base).bg(bg)));
+        spans.push(Span::styled(
+            format!("-{}", &tail[rem_at + 1..end]),
+            Style::default().fg(theme.error).bg(bg),
+        ));
+        rest = &tail[end..];
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -4517,6 +4595,97 @@ mod block_tests {
         let color = |i: usize| lines[i].spans[0].style.fg;
         assert_eq!(color(2), Some(t.error), "deletion is red");
         assert_eq!(color(3), Some(t.success), "addition is green");
+    }
+
+    /// `replace` gets the same always-full treatment as `edit`: its patch
+    /// renders even while the block is collapsed, colored as a unified diff.
+    #[test]
+    fn replace_tool_renders_its_patch_while_collapsed() {
+        let t = Theme::default();
+        let lines = tool_lines(
+            &t,
+            "replace",
+            r#"{"pattern":"a","replace":"b"}"#,
+            "@@ -1 +1 @@\n-a\n+b",
+            true,
+            true,
+            false,
+            "",
+            80,
+        );
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert!(rows.len() > 1, "not collapsed to one line: {rows:?}");
+        assert!(rows[0].contains("replace"), "the name leads: {rows:?}");
+        assert_eq!(rows[2], "-a", "the deletion is shown: {rows:?}");
+        assert_eq!(lines[2].spans[0].style.fg, Some(t.error), "deletion red");
+        assert_eq!(
+            lines[3].spans[0].style.fg,
+            Some(t.success),
+            "addition green"
+        );
+    }
+
+    /// The `+++`/`---` file headers carry the file's own side: green for the
+    /// new file, red for the old — no longer both dim. And the edit summary's
+    /// `+N/-N` pair splits so the two counts read at a glance.
+    #[test]
+    fn diff_headers_and_summary_are_colored_by_side() {
+        let t = Theme::default();
+        assert_eq!(diff_line_color("--- a/x.rs", &t), t.error, "old file red");
+        assert_eq!(
+            diff_line_color("+++ b/x.rs", &t),
+            t.success,
+            "new file green"
+        );
+        assert_eq!(diff_line_color(" context", &t), t.dim, "context stays dim");
+
+        let spans = split_add_remove(
+            "edit applied: +131/-0 lines across 1 hunks",
+            t.dim,
+            &t,
+            Color::Reset,
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "edit applied: +131/-0 lines across 1 hunks");
+        assert_eq!(spans[0].style.fg, Some(t.dim), "the lead is the line color");
+        assert_eq!(spans[1].style.fg, Some(t.success), "+131 is green");
+        assert_eq!(
+            spans[2].style.fg,
+            Some(t.dim),
+            "the slash is the line color"
+        );
+        assert_eq!(spans[3].style.fg, Some(t.error), "-0 is red");
+
+        // A hunk header's `-1,2 +3,4` has no slash between counts: whole line.
+        let hunk = split_add_remove("@@ -1,2 +3,4 @@", t.user, &t, Color::Reset);
+        assert_eq!(hunk.len(), 1, "no split: {hunk:?}");
+        assert_eq!(hunk[0].style.fg, Some(t.user));
+    }
+
+    /// The `[lsp]` diagnostics block of an edit result renders in the error
+    /// color — header and indented rows — and ends where the diff resumes.
+    #[test]
+    fn lsp_diagnostics_block_renders_in_error_color() {
+        let t = Theme::default();
+        let result = concat!(
+            "Replaced 1 occurrence(s) in a.rs\n",
+            "[lsp] 1 error in a.rs:\n",
+            "  a.rs:3:5 expected &mut [u8], found &mut [u8; 32]\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+        );
+        let mut in_lsp = false;
+        let lines: Vec<Vec<Span>> = result
+            .lines()
+            .map(|l| diff_line_spans(l, &t, Color::Reset, &mut in_lsp))
+            .collect();
+        let fg = |i: usize| lines[i][0].style.fg;
+        assert_eq!(fg(0), Some(t.dim), "the replaced line is dim");
+        assert_eq!(fg(1), Some(t.error), "the [lsp] header is error-colored");
+        assert_eq!(fg(2), Some(t.error), "a diagnostic row is too");
+        assert_eq!(fg(3), Some(t.error), "the --- header resumes red");
+        assert_eq!(fg(4), Some(t.success), "the +++ header is green");
+        assert_eq!(lines[4].len(), 1, "the resumed diff is not lsp-colored");
     }
 
     /// Collapsed results are ONE line (no preview); expanding shows every line
