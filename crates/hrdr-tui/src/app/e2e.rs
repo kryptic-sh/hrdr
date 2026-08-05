@@ -4433,7 +4433,7 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
 }
 
 /// A hidden thought's summary updates in place too: settling from
-/// `⠹ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
+/// `⠹ Thinking for 1s` to `✓ Thought for 1m 32s` rewrites the summary
 /// row and nothing else, so the render cannot jump while the thought finishes.
 #[tokio::test]
 async fn a_thinking_summary_update_rewrites_only_its_own_row() {
@@ -4487,8 +4487,8 @@ fn changed_rows(a: &Buffer, b: &Buffer) -> Vec<u16> {
         .collect()
 }
 
-/// A hidden thought folds behind a summary entry — `✓ Thought for 1m 32s ·
-/// now` — that expands to the full thought on click and folds back behind the
+/// A hidden thought folds behind a summary entry — `✓ Thought for 1m 32s` —
+/// that expands to the full thought on click and folds back behind the
 /// summary on a second click, exactly like a tool group's summary.
 #[tokio::test]
 async fn a_hidden_thought_folds_behind_a_summary_and_expands_on_click() {
@@ -4582,8 +4582,8 @@ async fn an_open_streaming_thought_stays_open_as_it_streams() {
 }
 
 /// While a thought is still streaming it reads `⠹ Thinking for 1s` with the
-/// loader mark and no age; once it settles the mark becomes ✓ and the summary
-/// reads `✓ Thought for 1m 32s · now` — the same verb change and marks a tool
+/// loader mark; once it settles the mark becomes ✓ and the summary reads
+/// `✓ Thought for 1m 32s` — the same verb change and marks a tool
 /// group's summary uses.
 #[tokio::test]
 async fn a_running_thought_reads_thinking_with_the_loader_mark() {
@@ -8885,4 +8885,114 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(screen.contains("main task"), "still listed:\n{screen}");
+}
+
+/// The todo panel sits off the block above it with exactly one blank row
+/// between — the block's own bottom pad — and no extra separator of its own,
+/// so the list spaces exactly like a transcript entry. Regression: the panel
+/// used to emit a separator of its own, leaving two stacked blanks above the
+/// todo list.
+#[tokio::test]
+async fn the_todo_panel_sits_one_blank_row_off_the_block_above() {
+    const WIDTH: u16 = 60;
+    let mut h = Harness::new(vec![]).await;
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "SHIP IT NOW".to_string(),
+        id: 7,
+        status: "in_progress".to_string(),
+        evidence: None,
+    }];
+    h.app.push_entry(Entry::assistant("hello there"));
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    // The content band only — the scrollbar column is not block content.
+    let rect = h.app.transcript_rect;
+    let row_text = |y: u16| -> String {
+        (rect.x..rect.x + rect.w)
+            .filter_map(|x| {
+                buf.cell(ratatui::layout::Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let content_y = (0..24)
+        .find(|&y| row_text(y).contains("hello there"))
+        .expect("the block content renders");
+    let todo_y = (0..24)
+        .find(|&y| row_text(y).contains("SHIP IT NOW"))
+        .expect("the todo renders");
+    // Between the block's content and the todo's content there is exactly ONE
+    // entirely-blank row — the block's own bottom pad — then the todo's ┃ pad
+    // row. The panel no longer emits a separator of its own (two stacked
+    // blanks above the todo list was the reported extra line).
+    let blanks: Vec<u16> = (content_y + 1..todo_y)
+        .filter(|&y| row_text(y).trim().is_empty())
+        .collect();
+    assert_eq!(
+        blanks,
+        vec![content_y + 1, content_y + 2],
+        "exactly two blank rows in the band — the block's bottom pad and the \
+         todo's own top pad, no separator of its own: rows {content_y}..{todo_y}"
+    );
+    let full_row = |y: u16| -> String {
+        (0..WIDTH)
+            .filter_map(|x| {
+                buf.cell(ratatui::layout::Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    assert!(
+        full_row(todo_y - 1).starts_with(crate::ui::BORDER_BAR),
+        "the row above the todo content is its ┃ pad: {:?}",
+        full_row(todo_y - 1)
+    );
+}
+
+/// A `/compact` typed while the agent is mid-turn is queued, not refused and
+/// not steered: it runs after the turn ends. The queued request keeps its
+/// summary-steering message, and the queue drains only once the agent is idle.
+#[tokio::test]
+async fn a_compact_queued_while_busy_runs_after_the_turn_ends() {
+    // Reply 1: the turn. Reply 2: the compaction's summary call (a tiny
+    // history means the pass reports "nothing to compact yet", still proving
+    // it RAN — a model call is only made when there is a head to summarize).
+    let mut h = Harness::new(vec![
+        MockReply::Text("first turn done".to_string()),
+        MockReply::Text("summary".to_string()),
+    ])
+    .await;
+
+    // Start the turn without pumping: the agent is busy.
+    h.type_str("hello");
+    h.press(KeyCode::Enter);
+    assert!(h.app.running(), "the turn is in flight");
+
+    // The model is busy, so `/compact {msg}` queues instead of running.
+    h.type_str("/compact keep the file paths");
+    h.press(KeyCode::Enter);
+    assert!(
+        h.app.pending_compaction.is_some(),
+        "the request is queued, not run"
+    );
+    let screen = h.render();
+    assert!(
+        screen.contains("compact queued"),
+        "the queue notice is in the transcript:\n{screen}"
+    );
+
+    // The turn ends; the queued compaction runs and reports.
+    h.pump().await;
+    assert!(!h.app.running(), "the turn is over");
+    assert!(
+        h.app.pending_compaction.is_none(),
+        "the queue drained once the agent was idle"
+    );
+    let screen = h.render();
+    assert!(
+        screen.contains("nothing to compact yet"),
+        "the compaction ran and reported:\n{screen}"
+    );
 }

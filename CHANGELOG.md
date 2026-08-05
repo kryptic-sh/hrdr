@@ -61,11 +61,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/compact` accepts a message to steer the summary — and queues while the
+  agent is busy.** `/compact keep the file paths` appends the message to the
+  summary request as additional instructions ("follow them closely"), so the
+  model keeps what the user names. Typed mid-turn it no longer refuses with a
+  busy notice: the compaction is queued and runs once the turn ends — never
+  delivered to the model the way a steer is.
+
 - **A hidden thought folds behind a summary entry instead of disappearing.**
   With thinking folded (`/verbose off`, the default), a thought reads
-  `⠹ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
-  it settles — the same spinner/check marks a tool group's summary uses.
-  Clicking the summary opens the full thought; clicking again folds it back.
+  `⠹ Thinking for 12s` while it streams and `✓ Thought for 1m 32s` once it
+  settles — the same spinner/check marks a tool group's summary uses. Clicking
+  the summary opens the full thought; clicking again folds it back.
 
 - **A tool call collapses behind its group's summary even on its own.** Every
   collapsible call (`edit`/`replace` always render) folds into a
@@ -140,6 +147,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no UI attached and a sub-agent's are its own.
 
 ### Changed
+
+- **The folded thinking summary no longer shows its age.**
+  `✓ Thought for 1m 32s · 2m ago` reads `✓ Thought for 1m 32s` — the age was the
+  last timestamp still rendered inside a transcript entry, and a static
+  checkmark line no longer needs a per-frame clock.
+
+- **The todo/task panels, the input pane and the popups all wear the same box
+  chrome as a transcript entry.** The todo list's extra blank separator row is
+  gone — it now sits one pad row off the block above, like every other entry —
+  the input pane's rule is built from the same primitive as a transcript block,
+  and the picker/completion popups gain the `┃` left edge, drawn inside their
+  background in the status bar's cwd color.
 
 - **Steering the model resets its tool-round budget.** A mid-turn steer is the
   user piling on more work, so the round counter restarts: the model gets a

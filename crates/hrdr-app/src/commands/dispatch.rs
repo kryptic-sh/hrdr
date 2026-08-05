@@ -323,11 +323,17 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
         }
         "compact" => {
+            // A message after `/compact` steers the summary's focus. While the
+            // agent is mid-turn the compaction is queued, not refused and not
+            // steered: it runs after the turn ends (the frontend drains the
+            // queue at turn completion), so the model is never interrupted with
+            // it the way a steer would be.
+            let instructions = (!arg.is_empty()).then(|| arg.clone());
             if host.is_busy() {
-                host.info(busy_guard("compact"));
-                return true;
+                host.queue_compaction(instructions);
+            } else {
+                host.start_compaction(instructions);
             }
-            host.start_compaction((!arg.is_empty()).then(|| arg.clone()));
         }
         "init" => {
             if host.is_busy() {
@@ -647,6 +653,10 @@ mod tests {
         busy: bool,
         model: hrdr_agent::ModelRef,
         input: String,
+        /// `/compact` runs started (idle dispatch), in order.
+        started_compactions: Vec<Option<String>>,
+        /// `/compact` requests queued (busy dispatch), in order.
+        queued_compactions: Vec<Option<String>>,
         /// Session prompt-cache figures, as `session_cache` reports them.
         cache: Option<(f64, usize, usize)>,
     }
@@ -670,6 +680,8 @@ mod tests {
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
+                started_compactions: Vec::new(),
+                queued_compactions: Vec::new(),
                 cache: None,
             }
         }
@@ -726,7 +738,12 @@ mod tests {
         fn set_tool_expansion(&mut self, _mode: ExpandMode) -> String {
             String::new()
         }
-        fn start_compaction(&mut self, _instructions: Option<String>) {}
+        fn start_compaction(&mut self, instructions: Option<String>) {
+            self.started_compactions.push(instructions);
+        }
+        fn queue_compaction(&mut self, instructions: Option<String>) {
+            self.queued_compactions.push(instructions);
+        }
     }
 
     /// `/add` applies the same attach-size cap as `@file` mentions
@@ -1256,5 +1273,55 @@ mod tests {
             "{:?}",
             host.info_log
         );
+    }
+
+    /// `/compact` with an idle agent starts a compaction, carrying the message
+    /// after the command as the summary-steering instructions.
+    #[tokio::test]
+    async fn compact_idle_starts_with_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        assert!(dispatch(&mut host, "/compact keep the file paths"));
+        assert_eq!(
+            host.started_compactions,
+            vec![Some("keep the file paths".to_string())]
+        );
+        assert!(host.queued_compactions.is_empty());
+        assert!(
+            host.info_log.is_empty(),
+            "no busy refusal when idle: {:?}",
+            host.info_log
+        );
+    }
+
+    /// `/compact` while the agent is mid-turn is QUEUED, not refused and not
+    /// started — it runs after the turn ends, so it never reaches the model
+    /// like a steer.
+    #[tokio::test]
+    async fn compact_while_busy_is_queued_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        host.busy = true;
+        assert!(dispatch(&mut host, "/compact drop the build details"));
+        assert_eq!(
+            host.queued_compactions,
+            vec![Some("drop the build details".to_string())]
+        );
+        assert!(host.started_compactions.is_empty());
+        assert!(
+            host.info_log.iter().all(|l| !l.contains("busy")),
+            "no busy-guard refusal — the request queues: {:?}",
+            host.info_log
+        );
+    }
+
+    /// A bare `/compact` with no message carries `None` instructions either way.
+    #[tokio::test]
+    async fn compact_without_a_message_carries_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        assert!(dispatch(&mut host, "/compact"));
+        assert_eq!(host.started_compactions, vec![None]);
+        assert!(host.queued_compactions.is_empty());
     }
 }

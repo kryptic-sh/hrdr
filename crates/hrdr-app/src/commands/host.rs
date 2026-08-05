@@ -199,6 +199,12 @@ pub trait CommandHost {
     /// the compaction in progress.
     fn start_compaction(&mut self, instructions: Option<String>);
 
+    /// Queue a `/compact` requested while the agent is mid-turn: it runs after
+    /// the current turn ends, instead of refusing or reaching the model like a
+    /// steer. A host without a queue drops it (the default); the TUI implements
+    /// the queue and announces it.
+    fn queue_compaction(&mut self, _instructions: Option<String>) {}
+
     /// Turns a completed TODO stays visible before pruning.
     fn todo_ttl(&self) -> u64 {
         crate::DEFAULT_TODO_TTL_TURNS

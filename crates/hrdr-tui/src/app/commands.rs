@@ -331,6 +331,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn start_compaction(&mut self, instructions: Option<String>) {
         self.app.spawn_compaction(instructions);
     }
+    fn queue_compaction(&mut self, instructions: Option<String>) {
+        self.app.queue_compaction(instructions);
+    }
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
         // The TUI version also suppresses the config hot-reload it would cause.
         self.app.persist_setting(key, value);

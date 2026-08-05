@@ -592,6 +592,11 @@ pub(crate) struct App {
     /// request — i.e. right after a round's tool results — so a queued message
     /// rides in with them. Empty when no turn is running.
     steering: hrdr_agent::SteeringQueue,
+    /// A `/compact` typed while the agent was busy: the pane it was requested
+    /// for and the summary-steering message, run once the turn ends. Deliberately
+    /// NOT a steer — a steer reaches the model mid-turn; a compaction must wait
+    /// for the turn to finish so the summary sees the whole conversation.
+    pending_compaction: Option<(hrdr_app::PaneId, Option<String>)>,
     /// Screen rect of the "↓ Press END ↓" button (jump to newest output), set
     /// during draw while scrolled up so mouse clicks can hit-test against it.
     /// `None` when following.
@@ -854,6 +859,7 @@ impl App {
             todo_completed_at: HashMap::new(),
             todo_ttl,
             steering: hrdr_agent::steering_queue(),
+            pending_compaction: None,
             end_button: None,
             tool_hits: Vec::new(),
             tool_groups: std::collections::HashSet::new(),
@@ -2541,16 +2547,45 @@ impl App {
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
     fn spawn_compaction(&mut self, instructions: Option<String>) {
+        let pane = self.panes.active();
+        self.spawn_compaction_for(pane, instructions);
+    }
+
+    /// The queued-`/compact` entry point: remember the request (and the pane it
+    /// was made on) and announce it. The turn-end handler runs it via
+    /// [`Self::drain_pending_compaction`] once the agent is idle.
+    fn queue_compaction(&mut self, instructions: Option<String>) {
+        let pane = self.panes.active();
+        self.pending_compaction = Some((pane, instructions));
+        self.system("compact queued — runs after the current turn ends".to_string());
+    }
+
+    /// If a `/compact` was queued while the agent was busy and nothing is
+    /// running any more, run it now. Called at the end of turn and compaction
+    /// completion, AFTER any queued-steer relaunch — a fresh turn keeps the
+    /// compaction queued, because it must see the whole conversation.
+    fn drain_pending_compaction(&mut self) {
+        if self.running() || self.compacting() || self.turn_handle.is_some() {
+            return; // still busy — the queued compaction waits
+        }
+        let Some((pane, instructions)) = self.pending_compaction.take() else {
+            return;
+        };
+        self.spawn_compaction_for(pane, instructions);
+    }
+
+    /// Run a compaction pass on the background task for a specific pane,
+    /// reporting via `TurnMsg`.
+    fn spawn_compaction_for(&mut self, id: hrdr_app::PaneId, instructions: Option<String>) {
         // Compaction acts on the conversation you are looking at. `run_compaction`
         // takes any agent — a sub-agent's history fills a context window like any
         // other, and it is the agent's own to manage.
-        let pane = self.panes.active();
         // Summarizing is the model working: its own clock, no tools — on the agent
         // doing the work, so the pane that shows busy is the one being summarized.
         // Keyed to main regardless, this said a sub-agent's `/compact` was the main
         // conversation working.
-        self.registry.begin_turn(pane.key());
-        let agent = self.agent_for(pane);
+        self.registry.begin_turn(id.key());
+        let agent = self.agent_for(id);
         let tx = self.tx.clone();
         // Compaction's model calls are recorded on the agent's own registry
         // entry, exactly as a turn's are (see `AgentRegistry::start_turn`) —
@@ -2561,10 +2596,10 @@ impl App {
         let live = self.registry.clone();
         let handle = tokio::spawn(async move {
             let res = hrdr_app::run_compaction(agent, instructions, &mut |ev| {
-                live.record(pane.key(), &ev);
+                live.record(id.key(), &ev);
             })
             .await;
-            let _ = tx.send(TurnMsg::Compacted(pane, res)).await;
+            let _ = tx.send(TurnMsg::Compacted(id, res)).await;
         });
         self.turn_handle = Some(handle);
     }
@@ -2713,6 +2748,11 @@ impl App {
                 if has_pending {
                     self.launch_turn();
                 }
+                // A `/compact` queued while the turn ran waits for a quiet moment:
+                // this one, unless the relaunch above made the agent busy again
+                // (then it waits for that turn too — a compaction must see the
+                // whole conversation, and the steer that just started is part of it).
+                self.drain_pending_compaction();
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;
@@ -2794,6 +2834,9 @@ impl App {
                 if has_pending {
                     self.launch_turn();
                 }
+                // Another `/compact` typed while this one ran: run it now that the
+                // agent is idle (or wait, if the relaunch above started a turn).
+                self.drain_pending_compaction();
             }
         }
     }

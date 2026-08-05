@@ -247,10 +247,30 @@ fn modal_frame(
         .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
+    // The popup wears the same ┃ left edge as every other surface — drawn on
+    // the background box, inside it, in the status bar's cwd color.
+    f.render_widget(
+        Paragraph::new(popup_bar(theme, rect.height)),
+        Rect { width: 1, ..rect },
+    );
     if inner.height < min_h || inner.width < 6 {
         return None;
     }
     Some(inner)
+}
+
+/// The ┃ left edge a popup wears inside its background box: one bar per row,
+/// in the status bar's cwd color (`theme.user`) on the popup's background —
+/// the same chrome every other surface carries.
+fn popup_bar(theme: &Theme, height: u16) -> Vec<Line<'static>> {
+    (0..height)
+        .map(|_| {
+            Line::from(Span::styled(
+                BORDER_BAR,
+                Style::default().fg(theme.user).bg(theme.user_bg),
+            ))
+        })
+        .collect()
 }
 
 /// Render the shared two-column picker body into `inner`: an optionally-prefixed
@@ -776,12 +796,17 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     };
     f.render_widget(Clear, rect);
     // Same chrome as the transcript blocks: solid background, two columns of
-    // padding either side and one padded row above and below, no border.
+    // padding either side and one padded row above and below, plus the ┃ left
+    // edge inside the box, in the status bar's cwd color.
     let block = Block::default()
         .style(Style::default().bg(theme.user_bg))
         .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
+    f.render_widget(
+        Paragraph::new(popup_bar(theme, rect.height)),
+        Rect { width: 1, ..rect },
+    );
 
     let mut lines: Vec<Line> = shown
         .iter()
@@ -1426,25 +1451,23 @@ fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
     out
 }
 
-/// One live panel: the blank row that keeps it off the block above (the spacer
-/// its layout section used to supply), then the panel itself — `bg` behind it, a
-/// `rule`-colored left edge, and `hits` saying what a click on each of its body
-/// rows does.
+/// One live panel: the panel itself — `bg` behind it, a `rule`-colored left
+/// edge — and `hits` saying what a click on each of its body rows does. The
+/// block wears the same chrome as every transcript entry (`render_block`
+/// supplies its own pad row above and below), so a panel's spacing matches the
+/// blocks around it exactly; there is no extra separator row of its own.
 fn panel(
     body: Vec<Line<'static>>,
     width: usize,
     bg: Color,
     rule: Color,
     hits: Vec<(usize, RowHit)>,
-) -> [Chunk<'static>; 2] {
-    [
-        separator(),
-        Chunk {
-            rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
-            tool_idx: None,
-            row_hits: hits,
-        },
-    ]
+) -> [Chunk<'static>; 1] {
+    [Chunk {
+        rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
+        tool_idx: None,
+        row_hits: hits,
+    }]
 }
 
 /// Paint a pane wearing the chrome of the user's own surfaces: the prompt's
@@ -1452,20 +1475,24 @@ fn panel(
 /// row above and below), and a `bar`-colored rule down the left edge. Returns
 /// the inner rect for the caller's content.
 ///
-/// The input pane and the todo list share this so they can't drift apart; the
-/// bar's color is all that tells them apart.
+/// The chrome is built from the same primitive every transcript block uses
+/// ([`pad_line`] with the shared [`BORDER_BAR`] and [`BLOCK_PAD_X`]), so the
+/// input pane cannot drift from the blocks above it. The input pane is the one
+/// surface wearing this chrome (the todo/task panels render through
+/// [`render_block`] directly); the bar's color is what tells the surfaces
+/// apart.
 fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
     let bg = theme.user_bg;
-    let block = Block::default()
-        .style(Style::default().bg(bg))
-        .padding(Padding::new(INPUT_PAD_X as u16, INPUT_PAD_X as u16, 1, 1));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let rule: Vec<Line> = (0..area.height)
-        .map(|_| Line::from(Span::styled(BORDER_BAR, Style::default().fg(bar).bg(bg))))
+    let inner = Rect {
+        x: area.x + BLOCK_PAD_X as u16,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2 * BLOCK_PAD_X as u16),
+        height: area.height.saturating_sub(2),
+    };
+    let rows: Vec<Line> = (0..area.height)
+        .map(|_| pad_line(Vec::new(), area.width as usize, bg, Some(bar)))
         .collect();
-    f.render_widget(Paragraph::new(rule), Rect { width: 1, ..area });
+    f.render_widget(Paragraph::new(rows), area);
     inner
 }
 
@@ -2883,7 +2910,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             }
             // Hidden via /verbose (the default): the thought folds behind a
             // one-line summary — `{mark} Thinking for 12s` while it streams,
-            // `{mark} Thought for 1m 32s · 2m ago` once it settles — with the
+            // `{mark} Thought for 1m 32s` once it settles — with the
             // same spinner/check marks a tool group's summary uses. A click on
             // it opens the full thought (see `thinking_open`). The body is
             // Animated because the mark and the clock tick every frame, but
@@ -3266,11 +3293,11 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
 }
 
 /// The folded summary of a hidden thought: `{mark} Thinking for 12s` while the
-/// block streams, `{mark} Thought for 1m 32s · 2m ago` once it settles — the
-/// same spinner/check marks a tool group's summary uses, so a hidden thought
-/// reads like a quiet tool call. One line, rebuilt every frame (the mark
-/// animates and the clock ticks) with a stable row structure, so an update
-/// never moves anything else on screen.
+/// block streams, `{mark} Thought for 1m 32s` once it settles — the same
+/// spinner/check marks a tool group's summary uses, so a hidden thought reads
+/// like a quiet tool call. One line, rebuilt every frame (the mark animates
+/// while streaming) with a stable row structure, so an update never moves
+/// anything else on screen.
 fn thinking_summary_lines(
     entry: &Entry,
     took_ms: Option<u64>,
@@ -3283,11 +3310,7 @@ fn thinking_summary_lines(
         Some(ms) => (
             "✓",
             theme.success,
-            format!(
-                "Thought for {} · {}",
-                human_duration(ms),
-                hrdr_app::relative_time_since(entry.time, now)
-            ),
+            format!("Thought for {}", human_duration(ms)),
         ),
         None => (
             frame,
@@ -4890,8 +4913,8 @@ mod block_tests {
     }
 
     /// The folded thinking summary reads `{mark} Thinking for 1m 32s` while
-    /// the block streams and `{mark} Thought for 1m 32s · ago` once it
-    /// settles — mark, verb and age all changing on one line.
+    /// the block streams and `{mark} Thought for 1m 32s` once it settles —
+    /// mark and verb changing on one line, no age.
     #[test]
     fn thinking_summary_lines_settled_and_running() {
         let theme = Theme::default();
@@ -4903,17 +4926,9 @@ mod block_tests {
         let settled = thinking_summary_lines(&entry, Some(92_000), now, "⠋", &theme, 80);
         assert_eq!(settled.len(), 1, "one line, however the clock ticks");
         let line = settled[0].to_string();
-        assert!(
-            line.contains("✓"),
-            "the settled mark is the check: {line:?}"
-        );
-        assert!(
-            line.contains("Thought for 1m 32s"),
-            "the settled verb and duration: {line:?}"
-        );
-        assert!(
-            line.contains("ago") || line.contains("now"),
-            "the age is on the line: {line:?}"
+        assert_eq!(
+            line, "✓ Thought for 1m 32s",
+            "the settled summary is exactly mark + verb + duration, no age: {line:?}"
         );
 
         // While streaming: the loader mark, the progressive verb, no age.
