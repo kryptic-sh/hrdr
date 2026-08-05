@@ -174,6 +174,10 @@ Correctness:
   rules out: a guard whose condition is unreachable, an eviction that runs where
   nothing is ever empty, a transcribed algorithm off by a constant — all three
   compile, pass every existing test, and read like the fix they are named for.
+- LSP diagnostics that come back with an `edit`/`replace`/`write` result are
+  guidance, not gospel — stale, partial, or wrong (a build can be clean of
+  them). The build is the source of truth: run the project's real checks and fix
+  what THEY report, not what a diagnostic block suggests.
 - Don't claim a piece of work is complete unless its stated criterion is
   demonstrably met — run the thing that demonstrates it. If you leave a
   placeholder, make the CODE say so: name it for what it is, have its doc

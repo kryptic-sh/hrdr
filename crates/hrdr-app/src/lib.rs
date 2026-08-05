@@ -80,8 +80,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "expand every tool's output (on|off; bare toggles)",
     ),
     ("/init", "analyze the project and write an AGENTS.md"),
-    ("/add", "attach a file (or type @path inline)"),
-    ("/diff", "show git diff of the working tree"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
     ("/todo-ttl", "turns a finished todo stays shown"),
     ("/reload", "reload AGENTS.md + config"),
@@ -95,7 +93,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/prev", "jump to previous /find match"),
     ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
-    ("/edit", "open a file in $EDITOR"),
     ("/help", "list commands"),
     ("/exit", "quit"),
     // Aliases for users switching from other agents (resolved by resolve_alias).
@@ -124,9 +121,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Files & context",
-        &[
-            "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/verbose", "/paste",
-        ],
+        &["/init", "/cwd", "/tools", "/verbose", "/paste"],
     ),
     ("Reply", &["/export", "/cost"]),
     ("Appearance", &["/theme", "/statusbar", "/todo-ttl"]),

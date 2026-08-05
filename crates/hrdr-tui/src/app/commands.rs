@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::theme::Theme;
-use hrdr_app::{CommandHost, resolve_alias, resolve_under};
+use hrdr_app::{CommandHost, resolve_alias};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -19,7 +19,6 @@ impl super::App {
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so every frontend runs one implementation).
         match cmd {
-            "edit" => self.edit_file_cmd(arg),
             "reload" => self.reload_cmd(),
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),
@@ -124,7 +123,6 @@ impl super::App {
         self.state_mut().name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
-        self.pending_edit = None;
         self.login_modal = None;
         self.skill_selector = None;
         self.verbose = false;
@@ -197,23 +195,6 @@ impl super::App {
         }
     }
     // These read *the conversation on screen*, like every other command.
-    /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
-    fn edit_file_cmd(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.system("usage: /edit <file>");
-            return;
-        }
-        if self.running() {
-            self.system(hrdr_app::busy_guard("/edit"));
-            return;
-        }
-        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
-            return;
-        };
-        let path = resolve_under(&cwd, arg);
-        // Consumed by the run loop (it owns the terminal needed to suspend).
-        self.pending_edit = Some(path);
-    }
 }
 
 /// Tips appended to the shared `/help` body (TUI-specific). The input

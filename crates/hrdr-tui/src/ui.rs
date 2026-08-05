@@ -150,8 +150,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // Last, over everything: the mouse selection (which reads the cells the rest
-    // of the frame just painted) and the toast stack.
+    // of the frame just painted), the hover tooltip, and the toast stack.
     draw_selection(f, app);
+    draw_tooltip(f, app);
     hjkl_holler_tui::render_active(
         f,
         area,
@@ -186,6 +187,41 @@ fn draw_selection(f: &mut Frame, app: &mut App) {
     if std::mem::take(&mut app.pending_copy) {
         app.copy_selection(&text);
     }
+}
+
+/// The hover hint for the transcript row under the pointer, drawn over
+/// everything near the cursor: what a click there does. Nothing when the
+/// pointer isn't over a clickable row, or when a modal owns the screen.
+fn draw_tooltip(f: &mut Frame, app: &mut App) {
+    if app.model_selector.is_some()
+        || app.session_selector.is_some()
+        || app.theme_selector.is_some()
+        || app.effort_selector.is_some()
+        || app.skill_selector.is_some()
+        || app.login_modal.is_some()
+        || app.active_completions().is_some()
+    {
+        return;
+    }
+    let Some((col, row)) = app.hover else { return };
+    let Some((_, text)) = app.tooltip_hits.iter().find(|(r, _)| r.contains(col, row)) else {
+        return;
+    };
+    // The hint floats one row below and two columns right of the pointer,
+    // clamped so it never runs off the screen.
+    let w = text.len() as u16 + 4;
+    if w >= f.area().width {
+        return;
+    }
+    let x = col.saturating_add(2).min(f.area().width.saturating_sub(w));
+    let y = row.saturating_add(1).min(f.area().height.saturating_sub(1));
+    let area = Rect::new(x, y, w, 1);
+    f.render_widget(Clear, area);
+    let tip = Paragraph::new(Line::from(Span::styled(
+        format!("  {text}  "),
+        Style::default().fg(Color::White).bg(app.theme.command_bg),
+    )));
+    f.render_widget(tip, area);
 }
 
 /// Reverse-video the cells the selection covers and return their text, one row
@@ -874,6 +910,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.max_scroll = frame.max_scroll;
     app.tool_hits = frame.tool_hits;
     app.row_hits = frame.row_hits;
+    app.tooltip_hits = frame.tooltips;
 
     draw_scrollbar(f, app, area, frame.max_scroll, frame.scroll_offset);
 }
@@ -887,6 +924,8 @@ struct TranscriptFrame {
     tool_hits: Vec<(HitRect, usize)>,
     /// Visible live-panel rows → what clicking one does.
     row_hits: Vec<(HitRect, RowHit)>,
+    /// Visible rows → the hover hint for what a click there does.
+    tooltips: Vec<(HitRect, &'static str)>,
 }
 
 /// Lay the transcript out, place the viewport in it, and paint the rows it lands
@@ -971,11 +1010,18 @@ fn draw_chunks(
     // back to u16.
     let mut tool_hits = Vec::new();
     let mut row_hits = Vec::new();
+    let mut tooltips = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         // A live panel's rows: each one is a single screen row, one below the
-        // block's top padding row.
+        // block's top padding row. A chunk whose hits count from its first row
+        // (the tool-group chunk, whose summary is row 0) maps without that pad.
+        let base = if c.hits_from_first_row {
+            cum[i]
+        } else {
+            cum[i] + 1
+        };
         for (row, hit) in &c.row_hits {
-            let at = cum[i] + 1 + row;
+            let at = base + row;
             if (scroll_us..view_end).contains(&at) {
                 row_hits.push((
                     HitRect {
@@ -985,6 +1031,21 @@ fn draw_chunks(
                         h: 1,
                     },
                     *hit,
+                ));
+            }
+        }
+        // Hover hints map the same way, so a tooltip tracks the row it names.
+        for (row, tip) in &c.tooltips {
+            let at = base + row;
+            if (scroll_us..view_end).contains(&at) {
+                tooltips.push((
+                    HitRect {
+                        x: text_area.x,
+                        y: text_area.y + (at - scroll_us) as u16,
+                        w: text_area.width,
+                        h: 1,
+                    },
+                    *tip,
                 ));
             }
         }
@@ -1052,6 +1113,7 @@ fn draw_chunks(
         max_scroll: max_scroll as usize,
         tool_hits,
         row_hits,
+        tooltips,
     }
 }
 
@@ -1437,6 +1499,8 @@ fn panel(
             rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
             tool_idx: None,
             row_hits: hits,
+            tooltips: Vec::new(),
+            hits_from_first_row: false,
         },
     ]
 }
@@ -1880,8 +1944,10 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
 
 /// Cache key for an entry's rendered *body* — the markdown/tool render, before
 /// the block chrome around it.
-/// Fields: (content_fingerprint, render_width, expand_all, show_reasoning).
-type BodyKey = (u64, u16, bool, bool);
+/// Fields: (content_fingerprint, render_width, expand_all, show_reasoning,
+/// full_body). The last distinguishes a grouped call's preview (tail/head
+/// truncation) from its full body — the two share a cache slot otherwise.
+type BodyKey = (u64, u16, bool, bool, bool);
 
 /// Cache key for a finished *block* — the body plus the chrome that frames it,
 /// which the body key can't see: the block kind, the timestamp/stats rows lent to
@@ -2434,6 +2500,15 @@ struct Chunk<'a> {
     /// this — they ride in the transcript, so their click targets scroll like
     /// everything else.
     row_hits: Vec<(usize, RowHit)>,
+    /// A hover hint for one of this chunk's rows, by row index: what a click
+    /// on that row does. Feeds the tooltip drawn over the cursor.
+    tooltips: Vec<(usize, &'static str)>,
+    /// Whether [`row_hits`](Self::row_hits)/[`tooltips`](Self::tooltips) row
+    /// indices count from the chunk's very first row, instead of from the
+    /// first row inside its chrome top pad (the default, which `draw_chunks`
+    /// maps with a `+1`). The tool-group chunk has no chrome pad — its summary
+    /// IS row 0 — so it sets this.
+    hits_from_first_row: bool,
 }
 
 impl<'a> Chunk<'a> {
@@ -2443,6 +2518,8 @@ impl<'a> Chunk<'a> {
             rows,
             tool_idx,
             row_hits: Vec::new(),
+            tooltips: Vec::new(),
+            hits_from_first_row: false,
         }
     }
 }
@@ -2454,6 +2531,12 @@ pub(crate) enum RowHit {
     Agent(hrdr_app::PaneId),
     /// Unfold (or fold) the finished TODO items.
     ToggleDoneTodos,
+    /// Toggle a tool group's expansion — the summary section, or a gap between
+    /// its calls. Carries the group head's transcript index.
+    ToggleToolGroup(usize),
+    /// Expand or collapse one call inside a group (its preview → full body, or
+    /// back). Carries the call's transcript index.
+    ToggleToolCall(usize),
 }
 
 /// A chunk's rows — laid out already, or laid out only if they are looked at.
@@ -2747,7 +2830,10 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             _ => entry_content_hash(entry, app.verbose),
         };
         let base_hash = match &entry.kind {
-            EntryKind::Tool { done: false, .. } => base_hash ^ frame_idx,
+            // `+1` keeps a running body's key off the done body's (`^ 0`) even
+            // on the first frame — a tool that renders while running and then
+            // settles must not serve its stale spinner body from the cache.
+            EntryKind::Tool { done: false, .. } => base_hash ^ (frame_idx + 1),
             _ => base_hash,
         };
         // A hidden thought the reader opened (`thinking_open`) renders its full
@@ -2769,6 +2855,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             width,
             app.verbose,
             app.show_reasoning || reasoning_open,
+            // Standalone blocks (edit/replace, which never group) always render
+            // in full; only a grouped call's chunk toggles preview vs full.
+            true,
         );
         // Every arm produces (kind, header rows, cached body rows) and is then
         // funneled through the one `render_block` call below — no entry paints
@@ -2869,7 +2958,18 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 ..
             } => {
                 let body = cached_body(i, ck, || {
-                    tool_lines(theme, name, args, result, *ok, *done, frame)
+                    tool_lines(
+                        theme,
+                        name,
+                        args,
+                        result,
+                        ToolState {
+                            ok: *ok,
+                            done: *done,
+                            preview: false,
+                            frame,
+                        },
+                    )
                 });
                 (BlockKind::Tool, BodySource::Cached(body))
             }
@@ -3162,17 +3262,28 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
     }
     let mut sections = Vec::new();
     for (name, n) in counts {
-        let section = match tool_action(&name) {
-            Some((past, prog, noun, for_)) => {
-                let verb = if running { prog } else { past };
-                let noun = plural(noun, n);
-                if for_ {
-                    format!("{verb} for {n} {noun}")
-                } else {
-                    format!("{verb} {n} {noun}")
-                }
+        let section = if name == "verify" {
+            // The verify tool reads as the named action — `ran verify tool`
+            // (one), `ran 2 verify tools` — not a counted `verify 1`.
+            let verb = if running { "running" } else { "ran" };
+            if n == 1 {
+                format!("{verb} verify tool")
+            } else {
+                format!("{verb} {n} verify tools")
             }
-            None => format!("{name} {n}"),
+        } else {
+            match tool_action(&name) {
+                Some((past, prog, noun, for_)) => {
+                    let verb = if running { prog } else { past };
+                    let noun = plural(noun, n);
+                    if for_ {
+                        format!("{verb} for {n} {noun}")
+                    } else {
+                        format!("{verb} {n} {noun}")
+                    }
+                }
+                None => format!("{name} {n}"),
+            }
         };
         sections.push(section);
     }
@@ -3262,13 +3373,20 @@ struct GroupFrame {
 }
 
 /// The block for a tool group: the summary section on the page background —
-/// the packed `{mark} called N tools · read 2 files` line(s) — and, when
-/// expanded, the group's tool calls rendered in full as child items on the
-/// tool background, flush with the transcript's content column. The mark
+/// the packed `{mark} called N tools · read 2 files` line(s) — and the calls
+/// below it. Expanded, every call renders as a padded box on the tool
+/// background, flush with the transcript's content column — each settled call
+/// as a preview (its tail, or its head for a mutation) until opened in full —
+/// while a collapsed group with a call still running streams that call's live
+/// preview below the summary and folds it back the moment it settles. The mark
 /// reflects the whole group — the spinner frame while any call runs, ✓/✗ by
 /// the group's outcome once it settles. Built fresh every frame (its content
-/// depends on the whole group, so the per-entry body cache cannot serve it);
-/// a click anywhere on it toggles the group via `tool_idx`.
+/// depends on the whole group, so the per-entry body cache cannot serve it).
+///
+/// Clicks are per row: the summary toggles the group, a call's rows toggle
+/// that one call between preview and full body, and the padding gaps between
+/// the boxes fold the group back to its summary. Hover hints on each row name
+/// what the click does.
 fn tool_group_chunk(
     app: &App,
     members: &[Entry],
@@ -3296,9 +3414,16 @@ fn tool_group_chunk(
     let dim = Style::default().fg(theme.dim).bg(page);
 
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row_hits: Vec<(usize, RowHit)> = Vec::new();
+    let mut tooltips: Vec<(usize, &'static str)> = Vec::new();
     // The summary line is the container's first row — no pad above it, and one
     // blank row below it, so an expanded group's first tool call never sits
     // flush against the summary.
+    let group_tip = if frame.expanded {
+        "Click to collapse"
+    } else {
+        "Click to show tool details"
+    };
     for (i, text) in packed.into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
@@ -3310,18 +3435,26 @@ fn tool_group_chunk(
         spans.push(Span::styled(text, dim));
         for row in wrap_spans(spans, inner) {
             rows.push(pad_row(row, w, page));
+            tooltips.push((rows.len() - 1, group_tip));
         }
     }
     if frame.expanded {
-        // The children: one tool box per call (or a turn label), each on the
-        // normal tool background and flush with the transcript's own content
-        // column — the same padding as every other block, no extra inset. A
-        // single blank row separates the summary from the first item and every
-        // item from the next; the boxes carry no padding of their own, so that
-        // one row is the whole gap.
+        // The children: one padded tool box per call, each on the normal tool
+        // background and flush with the transcript's own content column — the
+        // same padding as every other block. A box carries its own top and
+        // bottom padding (one blank row above and below its text), so nothing
+        // extra separates box from box; the summary above the first is
+        // separated by that first box's own top pad.
+        //
+        // A settled call renders as a *preview* — its tail (the newest output,
+        // like a running call's live tail) or, for a mutation, its head — and
+        // expands to the full body only when opened (`tool_open`); `verbose`
+        // shows every call in full. Clicking a call's rows toggles that one
+        // call; clicking the padding gaps between the boxes folds the whole
+        // group back to its summary.
         for (j, member) in members.iter().enumerate() {
-            rows.push(pad_row(Vec::new(), w, page));
             let EntryKind::Tool {
+                id,
                 name,
                 args,
                 result,
@@ -3332,28 +3465,135 @@ fn tool_group_chunk(
             else {
                 continue; // an absorbed empty-assistant turn renders nothing
             };
+            let full = app.verbose || app.tool_open.contains(id);
             // The body is cached per entry like a standalone tool's, so an
             // unchanged call costs a refcount bump per frame, not a re-render
             // (syntax highlighting included). Running calls key on the spinner
-            // frame, animating their mark.
+            // frame, animating their mark; `full` keeps the preview and the
+            // full body in separate cache slots.
             let body = cached_body(
                 head_idx + j,
                 (
-                    member.content_hash ^ if *done { 0 } else { frame.frame_idx },
+                    member.content_hash ^ if *done { 0 } else { frame.frame_idx + 1 },
                     w as u16,
                     app.verbose,
                     app.show_reasoning,
+                    full,
                 ),
-                || tool_lines(theme, name, args, result, *ok, *done, frame.frame),
+                || {
+                    tool_lines(
+                        theme,
+                        name,
+                        args,
+                        result,
+                        ToolState {
+                            ok: *ok,
+                            done: *done,
+                            preview: !full,
+                            frame: frame.frame,
+                        },
+                    )
+                },
             );
             if body.is_empty() {
                 continue;
             }
             // The call's own rows, filled to the width on the tool background —
-            // content at the same column as every other transcript entry.
+            // content at the same column as every other transcript entry — with
+            // one blank row above and below for the box's padding.
+            rows.push(pad_row(Vec::new(), w, bg));
+            let gap = rows.len() - 1;
+            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
+            tooltips.push((gap, "Click to collapse"));
             for row in body.as_ref().iter() {
                 rows.push(pad_row(row.spans.clone(), w, bg));
+                let r = rows.len() - 1;
+                row_hits.push((r, RowHit::ToggleToolCall(head_idx + j)));
+                tooltips.push((
+                    r,
+                    if full {
+                        "Click to collapse"
+                    } else {
+                        "Click to expand"
+                    },
+                ));
             }
+            rows.push(pad_row(Vec::new(), w, bg));
+            let gap = rows.len() - 1;
+            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
+            tooltips.push((gap, "Click to collapse"));
+        }
+    } else if let Some((live, id, name, args, result, ok)) =
+        members.iter().enumerate().rev().find_map(|(j, m)| {
+            let EntryKind::Tool {
+                id,
+                name,
+                args,
+                result,
+                ok,
+                done,
+                ..
+            } = &m.kind
+            else {
+                return None;
+            };
+            (!*done).then_some((j, id, name, args, result, *ok))
+        })
+    {
+        // A running call streams its live preview below the summary — the same
+        // padded box an expanded child gets — so the newest output stays
+        // visible while the call runs, and it folds behind the summary the
+        // moment it settles. When several calls run at once, only the newest
+        // shows; the rest stay folded until they are the last one running.
+        // Clicking the preview toggles that one call to its full body; the
+        // padding around it toggles the group.
+        let full = app.verbose || app.tool_open.contains(id);
+        let body = cached_body(
+            head_idx + live,
+            (
+                members[live].content_hash ^ (frame.frame_idx + 1),
+                w as u16,
+                app.verbose,
+                app.show_reasoning,
+                full,
+            ),
+            || {
+                tool_lines(
+                    theme,
+                    name,
+                    args,
+                    result,
+                    ToolState {
+                        ok,
+                        done: false,
+                        preview: !full,
+                        frame: frame.frame,
+                    },
+                )
+            },
+        );
+        if !body.is_empty() {
+            rows.push(pad_row(Vec::new(), w, bg));
+            let gap = rows.len() - 1;
+            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
+            tooltips.push((gap, group_tip));
+            for row in body.as_ref().iter() {
+                rows.push(pad_row(row.spans.clone(), w, bg));
+                let r = rows.len() - 1;
+                row_hits.push((r, RowHit::ToggleToolCall(head_idx + live)));
+                tooltips.push((
+                    r,
+                    if full {
+                        "Click to collapse"
+                    } else {
+                        "Click to expand"
+                    },
+                ));
+            }
+            rows.push(pad_row(Vec::new(), w, bg));
+            let gap = rows.len() - 1;
+            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
+            tooltips.push((gap, group_tip));
         }
     }
     // The section's own bottom padding, unless the follower brings its own.
@@ -3363,7 +3603,11 @@ fn tool_group_chunk(
     Chunk {
         rows: ChunkRows::Ready(Rc::new(rows)),
         tool_idx: Some(head_idx),
-        row_hits: Vec::new(),
+        row_hits,
+        tooltips,
+        // The summary is the chunk's first row — no chrome pad above it — so
+        // the hit rows are the chunk rows themselves.
+        hits_from_first_row: true,
     }
 }
 
@@ -3380,30 +3624,68 @@ fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> 
     pad_line(spans, width, bg, None)
 }
 
+/// Whether a tool's output is a *change* (a diff or written content), whose
+/// interesting part is at the front — the preview of such a call shows the
+/// head, not the tail.
+fn is_mutation_tool(name: &str) -> bool {
+    matches!(name, "edit" | "replace" | "write")
+}
+
+/// The head of a mutation's preview: the first [`TOOL_RESULT_PREVIEW_LINES`]
+/// rows, plus a dim `⋮ (N more)` marker when any were cut.
+fn preview_head(rows: Vec<Line<'static>>, dim_bg: Style) -> Vec<Line<'static>> {
+    let total = rows.len();
+    if total <= TOOL_RESULT_PREVIEW_LINES {
+        return rows;
+    }
+    let mut out: Vec<Line<'static>> = rows.into_iter().take(TOOL_RESULT_PREVIEW_LINES).collect();
+    out.push(Line::from(Span::styled(
+        format!("⋮ ({} more line(s))", total - TOOL_RESULT_PREVIEW_LINES),
+        dim_bg,
+    )));
+    out
+}
+
+/// How one tool call's body renders: its outcome (`ok`/`done` pick the mark
+/// and the full-vs-live-tail result), whether the result is capped to the
+/// preview size, and the spinner frame while the call runs.
+#[derive(Clone, Copy)]
+struct ToolState {
+    ok: bool,
+    done: bool,
+    preview: bool,
+    frame: &'static str,
+}
+
 /// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +
 /// headline) followed by tool-specific detail — the command and its output for
 /// shell calls, the file contents for `write`, the diff for `edit`,
 /// the tail of the file for `read`, plain output otherwise.
 ///
-/// A tool call has ONE expansion level: either it is folded into its group's
-/// `called N tools` summary (the chunk [`tool_group_chunk`] renders), or it is
-/// fully expanded — every detail and the whole result. `edit`/`replace` never
-/// group and always render in full. A finished call shows all of its result; a
-/// running one shows the live tail so the newest output stays visible.
+/// A tool call has TWO display levels: folded behind its group's `called N
+/// tools` summary (the chunk [`tool_group_chunk`] renders) — while a running
+/// call's live preview shows in full below that summary — or rendered, either
+/// as a preview (a running call's live tail, or the head/tail of a finished
+/// call) or fully expanded: every detail and the whole result. `edit`/`replace`
+/// never group and always render in full. A finished call shows all of its
+/// result; a running one shows the live tail so the newest output stays
+/// visible.
+///
+/// `preview` caps the result at [`TOOL_RESULT_PREVIEW_LINES`]: the tail for a
+/// finished call (the newest output, like a running call's live tail), or the
+/// head for a mutation (`edit`/`replace`/`write` — the change is at the front).
 fn tool_lines(
     theme: &Theme,
     name: &str,
     args: &str,
     result: &str,
-    ok: bool,
-    done: bool,
-    frame: &'static str,
+    st: ToolState,
 ) -> Vec<Line<'static>> {
     let bg = BlockKind::Tool.bg(theme);
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
-    let mark = if !done {
-        (frame, theme.warn)
-    } else if ok {
+    let mark = if !st.done {
+        (st.frame, theme.warn)
+    } else if st.ok {
         ("✓", theme.success)
     } else {
         ("✗", theme.error)
@@ -3429,11 +3711,17 @@ fn tool_lines(
     // Rendered raw — no gutter, no width fill, no language bar: the block's own
     // padding is the only indent, so the contents read as the file's own text.
     if let hrdr_app::ToolBody::Code { lang, content } = &disp.body {
-        let code = highlight_lines(lang, content, bg);
+        // A preview of a mutation shows the head of the written content — the
+        // change is at the front — with a marker where it was cut.
+        let code = if st.preview && is_mutation_tool(name) {
+            preview_head(highlight_lines(lang, content, bg), dim_bg)
+        } else {
+            highlight_lines(lang, content, bg)
+        };
         out.extend(code);
         // Only the failure is worth showing; the success diff duplicates the
         // contents we just rendered.
-        if done && !ok {
+        if st.done && !st.ok {
             out.extend(text_lines(result, Style::default().fg(theme.error).bg(bg)));
         }
         return out;
@@ -3479,9 +3767,39 @@ fn tool_lines(
     }
     let is_diff = disp.body == hrdr_app::ToolBody::Diff;
     let lines: Vec<&str> = result.lines().collect();
-    if done {
-        // Finished: the whole result — a tool call is either its group's
-        // summary (when grouped and collapsed) or fully expanded.
+    if st.done && st.preview {
+        // A settled call's preview: the tail for most tools (the newest output,
+        // same shape as a running call's live tail), the head for a mutation —
+        // the change is at the front of the diff.
+        if is_mutation_tool(name) {
+            let keep = lines.len().min(TOOL_RESULT_PREVIEW_LINES);
+            for line in &lines[..keep] {
+                out.push(Line::from(Span::styled(
+                    expand_tabs(line),
+                    Style::default().fg(theme.dim).bg(bg),
+                )));
+            }
+            if keep < lines.len() {
+                out.push(Line::from(Span::styled(
+                    format!("⋮ ({} more line(s))", lines.len() - keep),
+                    dim_bg,
+                )));
+            }
+        } else {
+            let start = lines.len().saturating_sub(TOOL_RESULT_PREVIEW_LINES);
+            if start > 0 {
+                out.push(Line::from(Span::styled(
+                    format!("⋮ ({} earlier line(s))", start),
+                    dim_bg,
+                )));
+            }
+            for line in &lines[start..] {
+                out.push(Line::from(Span::styled(expand_tabs(line), dim_bg)));
+            }
+        }
+    } else if st.done {
+        // Finished, in full: a tool call is either its group's summary (when
+        // grouped and collapsed) or fully expanded.
         // The edit result's trailing `[lsp]` diagnostics block runs until the
         // diff resumes — state threaded across the lines of one result.
         let mut in_lsp = false;
@@ -3860,7 +4178,7 @@ mod cache_tests {
     fn cached_body_warm_hit_equals_cold_render() {
         BODY_CACHE.with(|c| c.borrow_mut().clear());
 
-        let key = (0xdead_beef_cafe_0001, 80, false, false);
+        let key = (0xdead_beef_cafe_0001, 80, false, false, true);
         let expected = vec![Line::from(Span::raw("cold render content"))];
 
         // Cold miss — closure must be invoked and its result stored.
@@ -3886,8 +4204,8 @@ mod cache_tests {
     fn cached_body_different_entries_do_not_collide() {
         BODY_CACHE.with(|c| c.borrow_mut().clear());
 
-        let key_a = (0xaaaa, 80, false, false);
-        let key_b = (0xbbbb, 80, false, false);
+        let key_a = (0xaaaa, 80, false, false, true);
+        let key_b = (0xbbbb, 80, false, false, true);
         let lines_a = vec![Line::from(Span::raw("entry A — unique content"))];
         let lines_b = vec![Line::from(Span::raw("entry B — unique content"))];
 
@@ -3915,11 +4233,11 @@ mod cache_tests {
         let before = vec![Line::from(Span::raw("hello"))];
         let after = vec![Line::from(Span::raw("hello world"))];
 
-        let old = cached_body(3, (0x1111, 80, false, false), || before.clone());
+        let old = cached_body(3, (0x1111, 80, false, false, true), || before.clone());
         assert_eq!(*old, before);
 
         // Same entry, new content → new key → the slot is re-rendered.
-        let new = cached_body(3, (0x2222, 80, false, false), || after.clone());
+        let new = cached_body(3, (0x2222, 80, false, false, true), || after.clone());
         assert_eq!(*new, after, "a changed key must not serve the stale render");
 
         BODY_CACHE.with(|c| {
@@ -3943,7 +4261,7 @@ mod cache_tests {
     fn cached_block_keys_on_the_chrome_around_the_body() {
         BLOCK_CACHE.with(|c| c.borrow_mut().clear());
 
-        let body_key = (0x3333, 80, false, false);
+        let body_key = (0x3333, 80, false, false, true);
         let none: &[Lent] = &[];
         let h = chrome_hash(BlockKind::User, none, false);
         assert_ne!(
@@ -4204,7 +4522,7 @@ mod block_tests {
             kind,
             body: BodySource::Cached(Rc::new(vec![Line::from(Span::raw("x"))])),
             lent: Vec::new(),
-            body_key: (0, 10, false, false),
+            body_key: (0, 10, false, false, true),
             tool_idx: None,
             msgs: 0,
         }
@@ -4373,7 +4691,18 @@ mod block_tests {
     fn tool_header_mark_tracks_call_status() {
         let t = Theme::default();
         let head = |ok, done| {
-            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, "⠋");
+            let lines = tool_lines(
+                &t,
+                "ls",
+                r#"{"path":"src"}"#,
+                "",
+                ToolState {
+                    ok,
+                    done,
+                    preview: false,
+                    frame: "⠋",
+                },
+            );
             text(&lines[0])
         };
         assert!(
@@ -4399,7 +4728,18 @@ mod block_tests {
         let indented = "fn main() {\n\tlet x = 1;\n}";
 
         // A finished tool result (a `read`, a shell run, a diff).
-        let result = tool_lines(&t, "read", r#"{"path":"a.rs"}"#, indented, true, true, "⠋");
+        let result = tool_lines(
+            &t,
+            "read",
+            r#"{"path":"a.rs"}"#,
+            indented,
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "⠋",
+            },
+        );
         let body = result.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    let x = 1;"), "result lines: {body}");
         assert!(!body.contains('\t'), "no raw tab survives: {body}");
@@ -4410,9 +4750,12 @@ mod block_tests {
             "shell",
             "{\"command\":\"if true; then\\n\\techo hi\\nfi\"}",
             "",
-            true,
-            true,
-            "⠋",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "⠋",
+            },
         );
         let body = shell.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    echo hi"), "shell command rows: {body}");
@@ -4423,9 +4766,12 @@ mod block_tests {
             "shell",
             r#"{"command":"x"}"#,
             indented,
-            false,
-            false,
-            "⠋",
+            ToolState {
+                ok: false,
+                done: false,
+                preview: false,
+                frame: "⠋",
+            },
         );
         let body = live.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    let x = 1;"), "live tail: {body}");
@@ -4448,9 +4794,12 @@ mod block_tests {
             "shell",
             r#"{"command":"ls\nwc -l"}"#,
             "a.rs\nb.rs",
-            true,
-            true,
-            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert_eq!(rows[0].trim(), "✓ shell", "no args preview on the header");
@@ -4467,10 +4816,21 @@ mod block_tests {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {}\n"}"#;
         let diff_result = "--- a/a.rs\n+++ b/a.rs\n+fn main() {}";
-        let rows: Vec<String> = tool_lines(&t, "write", args, diff_result, true, true, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "write",
+            args,
+            diff_result,
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
         assert!(rows[0].contains("write a.rs"));
         // Contents render raw: no gutter, no width fill, no language bar. The
         // block's own padding is the only indent the reader sees.
@@ -4485,16 +4845,73 @@ mod block_tests {
         );
     }
 
+    /// A preview of a mutation (`write`) shows the *head* of the written
+    /// content, not the tail — the change is at the front — with a marker
+    /// where it was cut.
+    #[test]
+    fn a_write_preview_shows_the_head_of_the_content() {
+        let t = Theme::default();
+        let content: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The content rides in JSON, so its newlines must be escaped for the
+        // `write` args to parse (or the body falls back to empty).
+        let escaped = content
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let args = format!(r#"{{"path":"a.rs","content":"{escaped}"}}"#);
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "write",
+            &args,
+            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: true,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("line 0")),
+            "the preview starts at the head:\n{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("line 19")),
+            "the tail is cut:\n{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("more line(s)")),
+            "the cut is marked:\n{rows:?}"
+        );
+    }
+
     /// Indented file contents keep their own indentation exactly — the renderer
     /// must not add to it, or every written file reads as over-indented.
     #[test]
     fn write_tool_preserves_the_files_own_indentation() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {\n    let x = 1;\n}"}"#;
-        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "write",
+            args,
+            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
         assert_eq!(rows[1], "fn main() {");
         assert_eq!(rows[2], "    let x = 1;", "4 spaces, not 5 or 6");
         assert_eq!(rows[3], "}");
@@ -4508,10 +4925,21 @@ mod block_tests {
     fn a_task_call_shows_aligned_detail_rows_under_its_name() {
         let t = Theme::default();
         let args = r#"{"agent":"explore","description":"Explore hrdr-editor","prompt":"line one\nline two"}"#;
-        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "task",
+            args,
+            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
 
         assert_eq!(rows[0], "✓ task", "no args on the header line");
         // Keys padded to the widest ("description"), values aligned after it.
@@ -4572,6 +5000,16 @@ mod block_tests {
         // A lone skill call reads `used 1 skill`, not a bare tool name.
         let (sections, ..) = tool_group_summary(&[entry("s", "skill", true, true)]);
         assert_eq!(sections, vec!["used 1 skill"]);
+
+        // The verify tool reads as the named action, without a count.
+        let (sections, ..) = tool_group_summary(&[entry("v", "verify", true, true)]);
+        assert_eq!(sections, vec!["ran verify tool"]);
+        let (sections, running, _) = tool_group_summary(&[
+            entry("v1", "verify", true, false),
+            entry("v2", "verify", true, false),
+        ]);
+        assert!(running);
+        assert_eq!(sections, vec!["running 2 verify tools"]);
 
         // Pluralization: 2 of each, and `directory` → `directories`.
         let (sections, ..) = tool_group_summary(&[
@@ -4762,10 +5200,21 @@ mod block_tests {
         let prompt = "x".repeat(150);
         let args = format!(r#"{{"prompt":"{prompt}"}}"#);
 
-        let rows: Vec<String> = tool_lines(&t, "task", &args, "", true, true, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "task",
+            &args,
+            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
         assert!(
             rows.iter().any(|r| r.contains(&prompt)),
             "the value row is whole: {rows:?}"
@@ -4777,10 +5226,21 @@ mod block_tests {
     fn failed_write_shows_the_error_result() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"x"}"#;
-        let rows: Vec<String> = tool_lines(&t, "write", args, "Error: denied", false, true, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "write",
+            args,
+            "Error: denied",
+            ToolState {
+                ok: false,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
         assert!(rows.iter().any(|r| r.contains("Error: denied")), "{rows:?}");
     }
 
@@ -4790,7 +5250,18 @@ mod block_tests {
     fn edit_tool_colors_the_patch() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","old_string":"a","new_string":"b"}"#;
-        let lines = tool_lines(&t, "edit", args, "@@ -1 +1 @@\n-a\n+b", true, true, "");
+        let lines = tool_lines(
+            &t,
+            "edit",
+            args,
+            "@@ -1 +1 @@\n-a\n+b",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
+        );
         assert!(text(&lines[0]).contains("edit a.rs"));
         let color = |i: usize| lines[i].spans[0].style.fg;
         assert_eq!(color(2), Some(t.error), "deletion is red");
@@ -4807,9 +5278,12 @@ mod block_tests {
             "replace",
             r#"{"pattern":"a","replace":"b"}"#,
             "@@ -1 +1 @@\n-a\n+b",
-            true,
-            true,
-            "",
+            ToolState {
+                ok: true,
+                done: true,
+                preview: false,
+                frame: "",
+            },
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert!(rows.len() > 1, "not collapsed to one line: {rows:?}");
@@ -4893,11 +5367,21 @@ mod block_tests {
         let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 2)
             .map(|i| format!("line {i}\n"))
             .collect();
-        let rows: Vec<String> =
-            tool_lines(&t, "bash", r#"{"command":"x"}"#, &result, false, false, "⠋")
-                .iter()
-                .map(text)
-                .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "bash",
+            r#"{"command":"x"}"#,
+            &result,
+            ToolState {
+                ok: false,
+                done: false,
+                preview: false,
+                frame: "⠋",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
         // 10 result lines, 8 shown live: the 2 oldest are summarized instead.
         assert!(rows[2].contains("live · 2 earlier line(s)"), "{rows:?}");
         assert_eq!(rows[3], "line 2", "{rows:?}");

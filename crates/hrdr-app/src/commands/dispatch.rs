@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::conversation::export_conversation;
-use super::helpers::{RESUME_BUSY_MSG, busy_generic, busy_guard, git_working_diff};
+use super::helpers::{RESUME_BUSY_MSG, busy_generic, busy_guard};
 use super::host::CommandHost;
 use super::model::endpoint_health_warning;
 use super::types::ExpandMode;
@@ -161,16 +161,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             host.autosave();
             host.info(format!("session renamed → {arg}"));
         }
-        "diff" => {
-            let cwd = host.cwd();
-            host.spawn_diff(Box::pin(async move {
-                match git_working_diff(&cwd).await {
-                    Ok(d) if d.trim().is_empty() => "git diff: no changes".to_string(),
-                    Ok(d) => d,
-                    Err(e) => format!("git diff failed: {e}"),
-                }
-            }));
-        }
         "temp" | "temperature" => {
             if arg.is_empty() {
                 let agent = host.agent();
@@ -314,38 +304,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.set_tool_expansion(if on { ExpandMode::All } else { ExpandMode::Off });
             host.info(status);
         }
-        "add" => {
-            if arg.is_empty() {
-                host.info("usage: /add <file>".to_string());
-                return true;
-            }
-            let content = match hrdr_tools::read_attach_file(
-                &arg,
-                &host.cwd(),
-                Some(crate::MAX_ATTACH_BYTES),
-            ) {
-                Ok(content) => content,
-                Err(e) => {
-                    host.info(format!("can't add {arg}: {e}"));
-                    return true;
-                }
-            };
-            // `expand_mentions` (`@file`) caps attached content at
-            // `MAX_ATTACH_BYTES` and truncates; `/add` names one file
-            // explicitly, so silently truncating it would be more confusing
-            // than useful — reject it with a clear error instead.
-            if content.len() > crate::MAX_ATTACH_BYTES {
-                host.info(format!(
-                    "{arg} is {} KiB, over the {} KiB /add limit — too large to attach",
-                    content.len() / 1024,
-                    crate::MAX_ATTACH_BYTES / 1024,
-                ));
-                return true;
-            }
-            let n = content.lines().count();
-            host.prepend_input(format!("`{arg}`:\n```\n{content}\n```\n\n"));
-            host.info(format!("added {arg} ({n} lines) to the input"));
-        }
+
         "paste" => {
             let Some(text) = host.read_clipboard().filter(|t| !t.is_empty()) else {
                 host.info("clipboard unavailable or empty".to_string());
@@ -368,7 +327,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(busy_guard("compact"));
                 return true;
             }
-            host.compact((!arg.is_empty()).then(|| arg.clone()));
+            host.start_compaction((!arg.is_empty()).then(|| arg.clone()));
         }
         "init" => {
             if host.is_busy() {
@@ -424,18 +383,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 }
             }
         }
-        "edit" => {
-            if arg.is_empty() {
-                host.info("usage: /edit <file>".to_string());
-                return true;
-            }
-            let path = crate::resolve_under(&host.cwd(), &arg);
-            if !path.exists() {
-                host.info(format!("file not found: {}", path.display()));
-                return true;
-            }
-            host.open_editor(path);
-        }
+
         "statusbar" => {
             use crate::StatusBarMode;
             let mode = match arg.to_ascii_lowercase().as_str() {
@@ -782,40 +730,6 @@ mod tests {
     }
 
     /// `/add` applies the same attach-size cap as `@file` mentions
-    /// (`MAX_ATTACH_BYTES`), but errors clearly instead of silently
-    /// truncating — the user named this one file explicitly.
-    #[tokio::test]
-    async fn add_rejects_a_file_over_the_attach_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("huge.txt"),
-            "x".repeat(crate::MAX_ATTACH_BYTES + 1),
-        )
-        .unwrap();
-        let mut host = TestHost::new(dir.path().to_path_buf());
-
-        assert!(dispatch(&mut host, "/add huge.txt"));
-        assert!(
-            host.info_log.iter().any(|l| l.contains("byte limit")),
-            "{:?}",
-            host.info_log
-        );
-        assert!(
-            host.input.is_empty(),
-            "the oversized file must not be attached"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_attaches_a_file_within_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("small.txt"), "hello from small").unwrap();
-        let mut host = TestHost::new(dir.path().to_path_buf());
-
-        assert!(dispatch(&mut host, "/add small.txt"));
-        assert!(host.input.contains("hello from small"), "{:?}", host.input);
-    }
-
     /// `/model` always opens the picker — an argument no longer switches
     /// directly (the picker's fuzzy filter covers that), so the displayed
     /// model must not change from dispatch alone.
@@ -901,62 +815,6 @@ mod tests {
 
     /// `/add` attaches files outside the working directory (full-access default):
     /// a `..` escape and an absolute path both go through. Only secret/credential
-    /// files stay off-limits (see `add_rejects_secret_file`).
-    #[tokio::test]
-    async fn add_allows_paths_outside_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(&root).unwrap();
-        let outside = dir.path().join("leak.txt");
-        std::fs::write(&outside, "data").unwrap();
-
-        // Relative `..` escape.
-        let mut host = TestHost::new(root.clone());
-        assert!(dispatch(&mut host, "/add ../leak.txt"));
-        assert!(
-            !host.input.is_empty(),
-            "a path above cwd must attach, got info_log: {:?}",
-            host.info_log
-        );
-
-        // Absolute path outside cwd.
-        let mut host = TestHost::new(root);
-        assert!(dispatch(&mut host, &format!("/add {}", outside.display())));
-        assert!(!host.input.is_empty(), "info_log: {:?}", host.info_log);
-    }
-
-    /// `/add` rejects secret/credential files
-    #[tokio::test]
-    async fn add_rejects_secret_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
-        let mut host = TestHost::new(root);
-
-        assert!(dispatch(&mut host, "/add .env"));
-        assert!(
-            host.info_log.iter().any(|l| l.contains("secret")),
-            "expected secret-file error, got: {:?}",
-            host.info_log
-        );
-        assert!(host.input.is_empty());
-    }
-
-    /// `/add` accepts a valid nested file
-    #[tokio::test]
-    async fn add_accepts_nested_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        let sub = root.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("nested.txt"), "nested content").unwrap();
-        let mut host = TestHost::new(root);
-
-        assert!(dispatch(&mut host, "/add sub/nested.txt"));
-        assert!(host.input.contains("nested content"), "{:?}", host.input);
-    }
-
     /// `cmd.exe` treats `&` as a command separator even when the argument
     /// itself isn't shell-quoted, so an OAuth URL's query string
     /// (`...&state=...`) would get truncated by `cmd /C start "" <url>` on

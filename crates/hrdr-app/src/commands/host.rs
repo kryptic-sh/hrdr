@@ -193,12 +193,11 @@ pub trait CommandHost {
     /// input queues behind it, cancel aborts it). When it lands the frontend
     /// shows [`compaction_message`], resets stale context usage, autosaves on
     /// success, and resumes queued sends — same semantics in both.
+    ///
+    /// No "compacting…" announcement precedes it: the frontend's own loader
+    /// (the spinner line that replaces the generating message) already shows
+    /// the compaction in progress.
     fn start_compaction(&mut self, instructions: Option<String>);
-    /// `/compact`: announce and start (shared line + [`run_compaction`] core).
-    fn compact(&mut self, instructions: Option<String>) {
-        self.info("compacting conversation…".to_string());
-        self.start_compaction(instructions);
-    }
 
     /// Turns a completed TODO stays visible before pruning.
     fn todo_ttl(&self) -> u64 {

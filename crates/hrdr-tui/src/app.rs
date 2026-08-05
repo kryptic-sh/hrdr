@@ -602,16 +602,20 @@ pub(crate) struct App {
     /// when following.
     pub(crate) home_button: Option<HitRect>,
     /// Clickable screen rects for each visible tool block → the transcript
-    /// entry it toggles, set during draw. A tool call has one expansion level —
-    /// the group's summary or fully expanded — so any click on a grouped tool
-    /// (the summary header or one of its rendered calls) folds or fans out the
-    /// whole group.
+    /// entry it toggles, set during draw. A click on a tool GROUP's summary
+    /// toggles the whole group; a click on a standalone block (or a hidden
+    /// thought's summary) toggles that entry. The group chunk's own calls and
+    /// gaps are row-level targets, handled via [`Self::row_hits`].
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
     /// Tool groups the reader opened (keyed by the head tool-call id). While a
     /// group is open its calls render as child items inside its summary; a
     /// click on the summary toggles it. Session-lifetime view state — never
     /// persisted.
     pub(crate) tool_groups: std::collections::HashSet<String>,
+    /// Individual calls inside an expanded group that the reader opened in
+    /// full (keyed by the tool-call id): every other call shows its preview
+    /// (tail/head) until clicked. `verbose` shows every call in full at once.
+    pub(crate) tool_open: std::collections::HashSet<String>,
     /// Thinking entries the reader opened while reasoning is hidden: a
     /// collapsed `✓ Thought for 1m 32s · 2m ago` summary shows its full block
     /// instead. Keyed by the entry's content hash (reasoning entries carry no
@@ -627,6 +631,13 @@ pub(crate) struct App {
     /// each one does. They scroll with the transcript, so the frame recomputes
     /// them every draw, exactly like [`Self::tool_hits`].
     pub(crate) row_hits: Vec<(HitRect, crate::ui::RowHit)>,
+    /// Visible transcript rows → the hover hint for a click on that row, set
+    /// during draw like [`Self::row_hits`]. The tooltip the pointer is over is
+    /// drawn on top of the frame.
+    pub(crate) tooltip_hits: Vec<(HitRect, &'static str)>,
+    /// The pointer's last known position (screen cells), `None` when it is not
+    /// over the terminal (or nothing has moved it). Set by mouse-motion events.
+    pub(crate) hover: Option<(u16, u16)>,
     /// Screen rect of the transcript, set during draw: the region a drag may
     /// select from, and the frame the selected text is read back out of.
     pub(crate) transcript_rect: HitRect,
@@ -852,6 +863,7 @@ impl App {
             end_button: None,
             tool_hits: Vec::new(),
             tool_groups: std::collections::HashSet::new(),
+            tool_open: std::collections::HashSet::new(),
             thinking_open: std::collections::HashSet::new(),
             transcript_rect: HitRect {
                 x: 0,
@@ -876,6 +888,8 @@ impl App {
             toasts: HollerBus::new(),
             background_tasks,
             row_hits: Vec::new(),
+            tooltip_hits: Vec::new(),
+            hover: None,
             show_done_todos: false,
             quit_armed: false,
             cancel_armed: false,
@@ -1626,6 +1640,11 @@ impl App {
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
         self.disarm();
+        // Anything but a pointer move dismisses the hover tooltip — a click,
+        // a drag or a scroll is about to move the pointer's target anyway.
+        if !matches!(m.kind, MouseEventKind::Moved) {
+            self.hover = None;
+        }
         // The `/model` selector owns the mouse while open: the wheel scrolls its
         // list (moving the highlight, which the view follows); other events are
         // swallowed so they don't reach the transcript beneath the modal.
@@ -1681,6 +1700,12 @@ impl App {
             return;
         }
         match m.kind {
+            MouseEventKind::Moved => {
+                // Hover only aims the tooltip; a move that lands nowhere still
+                // tracks the pointer so the hint disappears when it leaves a
+                // target.
+                self.hover = Some((m.column, m.row));
+            }
             MouseEventKind::ScrollUp => {
                 // The rows under a selection are about to be different rows.
                 self.selection = None;
@@ -1783,6 +1808,8 @@ impl App {
                 crate::ui::RowHit::ToggleDoneTodos => {
                     self.show_done_todos = !self.show_done_todos;
                 }
+                crate::ui::RowHit::ToggleToolGroup(head) => self.toggle_tool_group_at(head, row),
+                crate::ui::RowHit::ToggleToolCall(idx) => self.toggle_tool_call_at(idx, row),
             }
             return;
         }
@@ -1834,6 +1861,47 @@ impl App {
         // The group's height is about to change; the group chunk's top is the
         // same chunk the click landed on.
         self.pending_scroll_entry = Some(head);
+    }
+
+    /// A click on a tool group's summary section (or a padding gap between its
+    /// calls): fold or fan out the whole group, keyed by the group head's
+    /// tool-call id, holding the chunk steady on its current screen row.
+    fn toggle_tool_group_at(&mut self, head: usize, row: u16) {
+        let transcript = self.panes.active_transcript();
+        let Some(id) = transcript
+            .get(head)
+            .and_then(|e| crate::ui::tool_call_id(&e.kind))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.pending_scroll_entry = Some(head);
+        self.pending_scroll_row = Some(row);
+        if !self.tool_groups.remove(&id) {
+            self.tool_groups.insert(id);
+        }
+    }
+
+    /// A click on one call inside a group (its preview, or its full body):
+    /// expand that one call to its full output or fold it back to its preview,
+    /// holding the group chunk steady on its current screen row.
+    fn toggle_tool_call_at(&mut self, idx: usize, row: u16) {
+        let transcript = self.panes.active_transcript();
+        let Some(head) = crate::ui::tool_group_head(transcript, idx) else {
+            return;
+        };
+        let Some(id) = transcript
+            .get(idx)
+            .and_then(|e| crate::ui::tool_call_id(&e.kind))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.pending_scroll_entry = Some(head);
+        self.pending_scroll_row = Some(row);
+        if !self.tool_open.remove(&id) {
+            self.tool_open.insert(id);
+        }
     }
 
     /// The screen rect of the pane a mouse selection is anchored in — the band
@@ -1911,14 +1979,6 @@ impl App {
     /// Like [`Self::with_agent`], but emits the standard "busy" system line when
     /// the agent is locked, so callers can `let Some(x) = …_or_busy(…) else {
     /// return; }`.
-    fn with_agent_or_busy<T>(&mut self, f: impl FnOnce(&mut Agent) -> T) -> Option<T> {
-        let result = self.with_agent(f);
-        if result.is_none() {
-            self.system("busy — try again after the current turn");
-        }
-        result
-    }
-
     /// Append a transcript entry. Each entry carries its own timestamp, set when
     /// it was constructed.
     /// The main agent's transcript — the session's conversation, and the very one

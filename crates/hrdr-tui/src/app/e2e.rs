@@ -4096,13 +4096,11 @@ async fn expanding_a_tool_group_keeps_the_viewport_on_the_same_line() {
     );
 }
 
-/// A tool call that streams in while the previous group is still going joins
-/// that group: the summary counts it (`calling N tools`) and the call itself
-/// stays folded behind the summary — it is never full-rendered while the group
-/// is collapsed. Only expanding the group reveals the newest call, as a child
-/// item like every other.
+/// A running call streams its live preview below the summary — the newest
+/// output stays visible while the call runs — and folds behind the summary
+/// once it completes. When several calls run at once, only the newest shows.
 #[tokio::test]
-async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
+async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
@@ -4115,14 +4113,15 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
             result: if done {
                 format!("result-{id}")
             } else {
-                String::new()
+                format!("partial-{id}")
             },
             ok: true,
             done,
         })
     };
 
-    // The first call lands and runs: it is its own summary, not a full block.
+    // The first call lands and runs: it is its own summary AND a live preview,
+    // so the streaming output is visible while it works.
     h.app.push_entry(tool("a", "shell", false));
     let screen = h.render();
     assert!(
@@ -4130,11 +4129,12 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
         "a running lone call gets a summary:\n{screen}"
     );
     assert!(
-        !screen.contains("✓ shell"),
-        "the running call is not full-rendered:\n{screen}"
+        screen.contains("partial-a"),
+        "the running call's live output is visible:\n{screen}"
     );
 
-    // A second call arrives while the first still runs: it joins the summary.
+    // A second call arrives while the first still runs: both join the summary,
+    // but only the newest shows its preview — the earlier one folds.
     h.app.push_entry(tool("b", "read", false));
     let screen = h.render();
     assert!(
@@ -4142,11 +4142,15 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
         "the new call updates the summary, it does not open a new entry:\n{screen}"
     );
     assert!(
-        !screen.contains("✓ shell") && !screen.contains("✓ read"),
-        "no call is full-rendered while the group is folded:\n{screen}"
+        screen.contains("partial-b"),
+        "the newest running call shows its live preview:\n{screen}"
+    );
+    assert!(
+        !screen.contains("partial-a"),
+        "an earlier running call folds while a newer one previews:\n{screen}"
     );
 
-    // The calls finish; the summary settles with the merged sections intact.
+    // The calls finish; the previews fold behind the settled summary.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, result, .. } = &mut e.kind {
             *done = true;
@@ -4160,7 +4164,7 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
     );
     assert!(
         !screen.contains("done"),
-        "finished calls still fold behind the summary:\n{screen}"
+        "finished calls fold behind the summary:\n{screen}"
     );
 
     // Expanding reveals every call — the newest included — as a child item.
@@ -4172,11 +4176,12 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
     );
 }
 
-/// A summary update rewrites only its own row: when a new call joins an open
-/// group — or the group settles — every other row of the buffer is untouched,
-/// so the render cannot jump or flicker while the summary counts up. (The
-/// group chunk is rebuilt fresh each frame; the guarantee is that the rebuild
-/// is layout-stable.)
+/// A summary update rewrites only the rows it owns: when a new call joins an
+/// open group — or the group settles — the summary row and the live preview's
+/// own row are the only ones that change; every other row of the buffer is
+/// untouched, so the render cannot jump or flicker while the summary counts
+/// up. (The group chunk is rebuilt fresh each frame; the guarantee is that
+/// the rebuild is layout-stable.)
 #[tokio::test]
 async fn a_tool_summary_update_rewrites_only_its_own_row() {
     let mut h = Harness::new(vec![]).await;
@@ -4204,32 +4209,306 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let before = term.backend().buffer().clone();
 
-    // A second call joins the group: the summary counts it, in place.
+    // A second call joins the group: the summary counts it in place, and the
+    // live preview switches to the newest running call — nothing else moves.
+    // The preview box's header is exactly two rows below the summary (its top
+    // pad between them), so the two changed rows are fixed relative to it.
     h.app.push_entry(tool("b", "read", false));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let after = term.backend().buffer().clone();
+    let joined = term.backend().buffer().clone();
     let summary_row = screen_row_of(&term, "running 1 command · reading 1 file")
         .expect("the summary is on screen");
     assert_eq!(
-        changed_rows(&before, &after),
-        vec![summary_row],
-        "a merged call must touch only the summary row"
+        changed_rows(&before, &joined),
+        vec![summary_row, summary_row + 2],
+        "a merged running call must touch only the summary and the preview row"
     );
 
-    // Settling rewrites the same single row: progressive → past, spinner → ✓.
+    // A completed call joining folds instead: the summary counts it, and
+    // nothing else moves at all — the height is unchanged.
+    h.app.push_entry(tool("c", "shell", true));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let joined2 = term.backend().buffer().clone();
+    let summary_row = screen_row_of(&term, "running 2 commands · reading 1 file")
+        .expect("the summary is on screen");
+    assert_eq!(
+        changed_rows(&joined, &joined2),
+        vec![summary_row],
+        "a folded merge must touch only the summary row"
+    );
+
+    // Settling: the summary goes past tense and the preview folds — the group
+    // shrinks back to its one line, so the view re-anchors to the new bottom.
+    // The row-exact guarantee only covers height-preserving updates; assert the
+    // summary settled and no running preview remains.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, .. } = &mut e.kind {
             *done = true;
         }
     });
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let after = term.backend().buffer().clone();
-    let summary_row = screen_row_of(&term, "ran 1 command · read 1 file")
-        .expect("the settled summary is on screen");
-    assert_eq!(
-        changed_rows(&before, &after),
-        vec![summary_row],
-        "settling must touch only the summary row"
+    let settled = buffer_to_string(term.backend().buffer());
+    assert!(
+        settled.contains("ran 2 commands · read 1 file"),
+        "the settled summary keeps the merged sections:\n{settled}"
+    );
+    assert!(
+        !settled.contains("⠋"),
+        "settling folds the live preview:\n{settled}"
+    );
+}
+
+/// An expanded group's settled calls render as *previews*, capped at the same
+/// size as a running call's live preview: the tail of the result (the newest
+/// output) for a normal call, the head for a mutation — the change is at the
+/// front. A short result fits the preview whole.
+#[tokio::test]
+async fn an_expanded_group_previews_calls_until_clicked() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // 20 result lines: the 8-line preview shows only the tail.
+    let long: String = (0..20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: long,
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: r#"{"path":"x"}"#.into(),
+        result: "SHORT".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.tool_groups.insert("a".to_string());
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("line 19"),
+        "the preview shows the newest output:\n{screen}"
+    );
+    assert!(
+        !screen.contains("line 0"),
+        "the head of a long result is cut:\n{screen}"
+    );
+    assert!(
+        screen.contains("12 earlier line(s)"),
+        "the cut is marked:\n{screen}"
+    );
+    assert!(screen.contains("SHORT"), "a short result fits the preview");
+}
+
+/// Clicking one call's preview expands that one call to its full body; clicking
+/// the full body folds it back. The other calls stay previews either way.
+#[tokio::test]
+async fn clicking_a_call_preview_expands_just_that_call() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let long: String = (0..20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: long,
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: r#"{"path":"x"}"#.into(),
+        result: "SHORT".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.tool_groups.insert("a".to_string());
+
+    let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    // The preview's tail row is the click target for call "a".
+    let preview_row = screen_row_of(&term, "line 19").expect("the preview tail on screen");
+    click_at(&mut h.app, 5, preview_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("line 0"),
+        "clicking the preview expands the full body:\n{screen}"
+    );
+    assert!(
+        h.app.tool_open.contains("a"),
+        "the clicked call is marked open"
+    );
+    assert!(
+        screen.contains("SHORT"),
+        "the other call stays a preview:\n{screen}"
+    );
+
+    // Click a full-body row: the call folds back to its preview.
+    let full_row = screen_row_of(&term, "line 0").expect("the full body on screen");
+    click_at(&mut h.app, 5, full_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("line 0"),
+        "clicking the full body folds it back to the preview:\n{screen}"
+    );
+    assert!(
+        h.app.tool_open.is_empty(),
+        "the call is no longer marked open"
+    );
+}
+
+/// Clicking a padding gap between an expanded group's call boxes — not a call,
+/// not the summary — folds the whole group back to its summary line.
+#[tokio::test]
+async fn clicking_a_gap_between_previews_collapses_the_group() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: "{}".into(),
+        result: "RESULT-A".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: "{}".into(),
+        result: "RESULT-B".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.tool_groups.insert("a".to_string());
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        buffer_to_string(term.backend().buffer()).contains("RESULT-A"),
+        "the group is expanded"
+    );
+    // The summary is the first row of the chunk; the row below it is the
+    // first box's top padding — a gap between the summary and the call.
+    let summary_row =
+        screen_row_of(&term, "ran 1 command · read 1 file").expect("the summary on screen");
+    click_at(&mut h.app, 5, summary_row + 1);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(h.app.tool_groups.is_empty(), "a gap click folds the group");
+    assert!(
+        !screen.contains("RESULT-A"),
+        "the calls fold behind the summary:\n{screen}"
+    );
+}
+
+/// Hovering a clickable surface shows what a click there does: the summary
+/// offers its details (or collapse when open), a call's preview offers to
+/// expand, a full call offers to collapse.
+#[tokio::test]
+async fn hover_shows_what_a_click_does() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: "{}".into(),
+        result: "RESULT-A".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: "{}".into(),
+        result: "RESULT-B".into(),
+        ok: true,
+        done: true,
+    }));
+    let hover = |app: &mut App, column: u16, row: u16| {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    };
+
+    // Collapsed: hovering the summary offers the details.
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let summary_row =
+        screen_row_of(&term, "ran 1 command · read 1 file").expect("the summary on screen");
+    hover(&mut h.app, 5, summary_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        buffer_to_string(term.backend().buffer()).contains("Click to show tool details"),
+        "the collapsed summary hints at its click"
+    );
+
+    // Expand, then hover a preview: it offers to expand.
+    h.app.tool_groups.insert("a".to_string());
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let preview_row = screen_row_of(&term, "RESULT-A").expect("the preview on screen");
+    hover(&mut h.app, 5, preview_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("Click to expand"),
+        "a preview offers to expand:\n{screen}"
+    );
+
+    // Open the call: the same row now offers to collapse.
+    h.app.tool_open.insert("a".to_string());
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let full_row = screen_row_of(&term, "RESULT-A").expect("the full call on screen");
+    hover(&mut h.app, 5, full_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("Click to collapse"),
+        "a full call offers to collapse:\n{screen}"
+    );
+
+    // Hovering the summary while the group is open offers to collapse too.
+    let summary_row =
+        screen_row_of(&term, "ran 1 command · read 1 file").expect("the summary still on screen");
+    hover(&mut h.app, 5, summary_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("Click to collapse"),
+        "an open group's summary offers to collapse:\n{screen}"
+    );
+
+    // A move off the surfaces dismisses the hint.
+    hover(&mut h.app, 5, 29);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("Click to"),
+        "no hint away from the surfaces:\n{screen}"
     );
 }
 
@@ -5131,12 +5410,13 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // The call's box has no padding of its own: the section's bottom pad and
-    // the row past it follow directly, both on the page background.
+    // The box carries its own bottom padding — one blank row on the tool
+    // background — and the section's page-background pad closes the scrollback
+    // after it, so the tinted surface never butts up against the input.
     assert_eq!(
         bg_at(last_content + 1),
-        Color::Reset,
-        "summary section bottom pad:\n{screen}"
+        h.app.theme.user_bg,
+        "the box's own bottom pad:\n{screen}"
     );
     assert_eq!(
         bg_at(last_content + 2),

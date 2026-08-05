@@ -18,6 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   …" segment is always relative. The LSP diagnostics cap is raised to ten lines
   (`…and N more` after that).
 
+- **`/add`, `/edit` and `/diff` are removed.** `@path` still attaches a file to
+  the next message, an edit happens in a regular shell or the user's own editor,
+  and a diff renders in the transcript via `!git diff` / `:!git diff` — while
+  the transcript already shows every mutation's full diff regardless.
+
 - **The `/thinking` command and its `show_thinking` setting are gone; `/verbose`
   owns the thinking display.** There is no separate show/hide for reasoning any
   more: `/verbose on` expands every tool block _and_ shows the model's thinking,
@@ -72,14 +77,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `edit`/`replace` call or a visible entry (a user prompt, rendered text or
   reasoning, stats, a notice) breaks a run.
 
-- **Expanding a tool group's summary renders its calls inside it as nested child
-  items.** The summary keeps its header — its first row, with one blank row
+- **Expanding a tool group's summary renders its calls inside it as padded child
+  boxes.** The summary keeps its header — its first row, with one blank row
   beneath it so the first call never sits flush against it — and the calls fan
-  out below, each keeping the same padding as every other block and only the
-  calls carrying a background. The summary section itself reads on the page like
-  a thought or the model's output — the tool boxes are the only tinted surface.
-  Absorbed tool-only turns keep their `#N assistant` `/goto` labels at their
-  transcript positions inside the group.
+  out below, each a box with its own top and bottom padding and only the calls
+  carrying a background; the summary section itself reads on the page like a
+  thought or the model's output.
+
+  A settled call renders as a _preview_ capped at the same size as a running
+  call's live preview: the tail of the result (the newest output) for most
+  tools, the head for a mutation (`edit`/`replace`/`write`, where the change is
+  at the front), with a `⋮` marker where it was cut. Clicking a call's preview
+  expands that one call to its full body; clicking the full body folds it back.
+  Clicking the padding gaps between the boxes — not a call, not the summary —
+  folds the whole group back to its summary line. `verbose` shows every call in
+  full at once.
+
+- **Hovering a tool-group surface shows what a click there does.** The pointer
+  over the summary offers `Click to show tool details` (or `Click to collapse`
+  when the group is open), over a call's preview `Click to expand`, over a full
+  call `Click to collapse`. The hint floats beside the cursor and vanishes when
+  the pointer leaves the surfaces or the mouse acts.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes
@@ -154,6 +172,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The loader is verbose-only.** The `inferring`/`generating` line at the
   bottom of the transcript is hidden in normal mode — the status bar carries the
   turn state — and `/verbose on` brings it back.
+
+- **A `verify` run reads as `ran verify tool`, not `verify 1`.** The verify tool
+  is one named action the user asks for, so its summary section names it instead
+  of counting it: `✓ ran verify tool` once it settles (and `ran 2 verify tools`
+  for a run that called it again), `⠋ running verify tool` while it streams.
+
+- **`/compact` no longer posts a "compacting conversation…" notice.** The
+  spinner loader line — the one that replaces the generating message — already
+  shows `compacting context — summarizing the conversation…` while the pass
+  runs, so the notice was the same information twice in two places.
 
 ### Fixed
 
