@@ -1323,9 +1323,12 @@ pub(crate) fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
 /// a continuation row never starts with the `·` separator. A single segment
 /// wider than the terminal still wraps at word boundaries downstream.
 fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    let pane = app.panes.active_pane();
     // The loader is chrome — the status bar already shows the turn live — so
-    // in normal mode it stays hidden; `/verbose on` brings it back.
-    if !app.verbose {
+    // in normal mode it stays hidden; `/verbose on` brings it back. The one
+    // exception is compaction: nothing else on screen announces that the
+    // conversation is being summarized, so its indicator shows either way.
+    if !app.verbose && !pane.compacting {
         return None;
     }
     // It hides while that agent's tool calls run: the model is idle then, and a
@@ -1334,14 +1337,13 @@ fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
     // working — even if another one is. Compaction is the agent's, like the turn
     // clock: a sub-agent summarizing itself says so on its own pane rather than
     // looking hung.
-    if !(app.panes.active_pane().turn.inferring() || app.panes.active_pane().compacting) {
+    if !(pane.turn.inferring() || pane.compacting) {
         return None;
     }
     // The loader describes **the agent you are looking at**, and the clock it reads
     // is that agent's own. Watching a sub-agent work used to show the *main* agent's
     // spinner, throughput and elapsed time — and a sub-agent grinding away under an
     // idle main agent showed no loader at all.
-    let pane = app.panes.active_pane();
     let turn = &pane.turn;
     // The model's own working time: the tool calls it waited on don't count, so
     // the clock freezes while they run rather than inflating the turn.

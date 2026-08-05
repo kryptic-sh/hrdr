@@ -169,9 +169,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same screen row while its height changes — the view no longer jumps to put the
   entry at the top of the viewport.
 
-- **The loader is verbose-only.** The `inferring`/`generating` line at the
-  bottom of the transcript is hidden in normal mode — the status bar carries the
-  turn state — and `/verbose on` brings it back.
+- **The loader is verbose-only — except compaction.** The
+  `inferring`/`generating` line at the bottom of the transcript is hidden in
+  normal mode — the status bar carries the turn state — and `/verbose on` brings
+  it back. The compacting indicator
+  (`compacting context — summarizing the conversation…`) shows either way:
+  nothing else on screen says the conversation is being summarized.
 
 - **A `verify` run reads as `ran verify tool`, not `verify 1`.** The verify tool
   is one named action the user asks for, so its summary section names it instead

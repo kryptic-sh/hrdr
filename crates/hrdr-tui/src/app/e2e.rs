@@ -6480,6 +6480,36 @@ async fn the_scroll_buttons_float_above_the_input_and_are_clickable() {
     assert_eq!(h.app.scroll_offset, 0, "the END click resumed following");
 }
 
+/// Compaction is the one loader that shows in normal mode: nothing else on
+/// screen says the conversation is being summarized, so its indicator is not
+/// gated behind `/verbose` the way the inference loader is.
+#[tokio::test]
+async fn the_compacting_indicator_shows_even_in_normal_mode() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .registry
+        .update(hrdr_agent::MAIN_KEY, |e| e.compacting = true);
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("compacting context — summarizing the conversation"),
+        "the compacting indicator shows without /verbose:\n{screen}"
+    );
+
+    // With compaction over, the inference loader is still verbose-only.
+    h.app
+        .registry
+        .update(hrdr_agent::MAIN_KEY, |e| e.compacting = false);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("inferring") && !screen.contains("generating"),
+        "the inference loader stays verbose-only:\n{screen}"
+    );
+}
+
 /// The loader tracks the *model*, not the turn: it hides while the model's tool
 /// calls run, because the model is idle then — and its clock stops with it, so a
 /// slow tool doesn't inflate the turn's reported inference time.
