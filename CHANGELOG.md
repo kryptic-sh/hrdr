@@ -233,6 +233,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now probed once for mtime granularity, and a coarse root bypasses the cache
   entirely (every load re-reads the files), so a same-tick edit is always seen.
 
+- **`:release` is now model-invocable.** The built-in release skill used to
+  carry `model_invocable: false` — it was kept out of the model's listing and
+  refused by the `skill` tool because its last step pushes a tag. It is now
+  loadable by the model like every other built-in (the owner's reversal), so
+  "cut a release" reaches the complete procedure instead of stopping at the
+  partial always-on copy; the skill's own preflight (clean tree, right branch,
+  ask before deciding) is the guard.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to

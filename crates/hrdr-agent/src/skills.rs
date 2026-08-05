@@ -70,9 +70,9 @@ pub struct Skill {
     pub args: Vec<String>,
     /// The model may load this itself (frontmatter `model_invocable:`, default
     /// `true`). `false` keeps it out of the prompt listing and makes the `skill`
-    /// tool refuse it: the user's `:name` stays the only way in. For procedures
-    /// whose *last* step is outward-facing and hard to reverse — `:release`
-    /// pushes a tag — deciding to run it is the user's call, not the model's.
+    /// tool refuse it: the user's `:name` stays the only way in — for a
+    /// procedure whose last step is outward-facing and hard to reverse, deciding
+    /// to run it is the user's call, not the model's.
     pub model_invocable: bool,
 }
 
@@ -466,7 +466,7 @@ impl hrdr_tools::Tool for SkillTool {
         // `model_invocable: false` — the user's `:name` is the only way in (it is
         // also absent from the prompt listing, so this is reachable only by a model
         // that guessed the name). Point at the user rather than refusing flatly:
-        // asking them to run `:release` is the useful next move, and is exactly why
+        // asking them to run `:{name}` is the useful next move, and is exactly why
         // the skill is marked.
         if !skill.model_invocable {
             anyhow::bail!(
@@ -944,8 +944,7 @@ mod tests {
 
     /// `model_invocable: false` is a boundary, not a hint: the tool refuses even
     /// when the model guesses the name (the listing never showed it), and points
-    /// at the user's `:name` instead. `:release` ships marked because its last
-    /// step pushes a tag.
+    /// at the user's `:name` instead.
     #[tokio::test]
     async fn skill_tool_refuses_a_user_only_skill() {
         use hrdr_tools::Tool;
@@ -964,7 +963,8 @@ mod tests {
         assert!(shown.contains("`:release`"), "points at the user: {shown}");
         assert!(!shown.contains("Bump, tag, push"), "no body leaks: {shown}");
 
-        // The shipped `:release` carries the marking; every other built-in does not.
+        // Every shipped built-in is model-invocable, `:release` included — the
+        // user's 2026-08-05 reversal of the marking it used to carry.
         let builtins = builtin_skills();
         let flag = |name: &str| {
             builtins
@@ -973,9 +973,8 @@ mod tests {
                 .unwrap()
                 .model_invocable
         };
-        assert!(!flag("release"), "`:release` is the user's call");
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "review", "test", "tidy", "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
         ] {
             assert!(flag(name), "{name} stays model-invocable");
         }

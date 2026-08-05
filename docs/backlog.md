@@ -1867,8 +1867,11 @@ items — they are rules.
   - _`model_invocable: false` is a boundary._ Such a skill is unlisted **and**
     refused by the tool, with an error telling the model to ask the user to run
     `:name`. Only a literal `false` opts out (a typo fails open, visibly, rather
-    than silently hiding a skill). Built-in `:release` carries it because its
-    last step pushes a tag.
+    than silently hiding a skill). Built-in `:release` used to carry it because
+    its last step pushes a tag — **reversed 2026-08-05 by the owner**: every
+    built-in, `:release` included, is now model-invocable, and the model is
+    expected to follow the skill's own preflight (clean tree, right branch, ask
+    before deciding) rather than being barred from loading it.
   - _The prompt section is gated on the tool._ A profile whose `tools:`
     allow-list drops `skill` gets no listing: naming a tool an agent lacks is
     the defect the pi comparison found, not a pattern to repeat.

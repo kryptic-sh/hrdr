@@ -3708,19 +3708,15 @@ mod tests {
     fn the_builtin_listing_stays_cheap() {
         let s = skills_section(&tools_with_skill(), &crate::builtin_skills());
         assert!(
-            s.len() < 1600,
+            s.len() < 1800,
             "the built-in skills list in {} bytes:\n{s}",
             s.len()
         );
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "review", "test", "tidy", "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
         ] {
             assert!(s.contains(&format!("\n- {name} — ")), "{name} is listed");
         }
-        assert!(
-            !says(&s, "release"),
-            "`:release` ships `model_invocable: false` — the user starts a release"
-        );
     }
 
     /// A `description:` block scalar is legal YAML, so a description can arrive
