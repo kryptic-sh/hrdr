@@ -73,7 +73,11 @@ pub(crate) fn configure(cmd: &mut tokio::process::Command) {
 /// The returned [`GroupKill`] is the one place the explicit tree-kill is
 /// written; call [`GroupKill::kill`] on whatever path decides to stop the child
 /// early (a timeout elapsing, an output cap overflowing). The
-/// dropped-future path needs no call — the guard's `Drop` covers it.
+/// dropped-future path needs no call — the guard's `Drop` covers it. A path
+/// that completes *normally* must [`disarm`](GroupKill::disarm) the guard
+/// first: the drop SIGKILLs the whole group, and a descendant the command
+/// backgrounded on purpose (stdio redirected away from the caller's pipes)
+/// legitimately outlives the leader.
 ///
 /// The spawn is deliberately *outside* the caller's timeout race: the pid and
 /// group handle have to be captured while the `Child` is still in hand, and the
@@ -136,6 +140,25 @@ impl GroupKill {
         if let Some(group) = &self.group {
             group.kill(self.pid);
         }
+    }
+
+    /// Disarm the guard: from here on both [`kill`](GroupKill::kill) and the
+    /// guard's `Drop` are no-ops. A caller that completed *normally* must call
+    /// this before the guard drops — a command can background a child on
+    /// purpose (stdio redirected away from the caller's pipes), and the
+    /// drop's group-kill would SIGKILL it milliseconds after the leader exits.
+    ///
+    /// The group is taken out and forgotten rather than set to `None`: the
+    /// guard's own `Drop` IS the kill, so dropping it here would fire exactly
+    /// the signal this is meant to prevent. On unix the forgotten value is a
+    /// bare pgid — nothing leaks. On windows it is the job handle, left open
+    /// deliberately so the kill-on-close never fires (one leaked handle per
+    /// disarmed command — the price of not killing).
+    pub(crate) fn disarm(&mut self) {
+        if let Some(group) = self.group.take() {
+            std::mem::forget(group);
+        }
+        self.pid = None;
     }
 }
 
@@ -200,8 +223,15 @@ impl Drop for ProcessGroup {
         // drops this guard's locals without calling `kill()`. `kill_on_drop`
         // only reaps the leader; this takes the whole group down, so "Esc stops
         // everything" holds on unix too (matching the Windows job-handle-close
-        // behaviour). Harmless on the normal path — the group is already empty
-        // (ESRCH), which we ignore.
+        // behaviour).
+        //
+        // NOT harmless on the normal path: a descendant that outlives the
+        // leader (a child the command backgrounded with stdio redirected away
+        // from the caller's pipes) is still in the group and is SIGKILLed
+        // here. A caller that completed normally MUST call
+        // [`GroupKill::disarm`] before dropping the guard so such a child
+        // survives; this drop is the cancellation backstop, for the paths
+        // where the task was torn down without an explicit `kill()`.
         if let Some(pgid) = self.pgid {
             unix_group_kill(pgid);
         }

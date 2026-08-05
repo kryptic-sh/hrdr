@@ -110,12 +110,22 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
         // can hold the group needed to kill the whole tree on timeout.
         // Best-effort: a hook whose group couldn't be set up still runs.
         let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
-            Ok((child, group)) => {
+            Ok((child, mut group)) => {
                 let ran = tokio::time::timeout(timeout, child.wait_with_output()).await;
                 if ran.is_err() {
                     // The timer won: kill in full, so a formatter that shelled
                     // out to something goes with it.
                     group.kill();
+                }
+                // A hook that ran to completion with success owns its
+                // descendants: it may have left a backgrounded child (stdio
+                // redirected away from our pipes) on purpose, and the guard's
+                // drop-kill must not SIGKILL it. Failure and timeout keep the
+                // armed guard — its drop-kill is the backstop there.
+                if let Ok(Ok(out)) = &ran
+                    && out.status.success()
+                {
+                    group.disarm();
                 }
                 ran
             }
@@ -272,7 +282,7 @@ pub async fn run_event_hooks(
         // also feeds the payload to stdin) so we can hold the group needed to
         // kill the whole tree on timeout. Best-effort, as in `run_file_hooks`.
         let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
-            Ok((mut child, group)) => {
+            Ok((mut child, mut group)) => {
                 let ran = tokio::time::timeout(timeout, async {
                     if let Some(mut stdin) = child.stdin.take() {
                         use tokio::io::AsyncWriteExt;
@@ -288,6 +298,15 @@ pub async fn run_event_hooks(
                     // The timer won: kill in full, so a hung hook that forked
                     // something (a background watcher, say) goes with it.
                     group.kill();
+                }
+                // Same disarm-on-success as `run_file_hooks`: a hook that ran
+                // to completion with success owns its descendants, and the
+                // guard's drop-kill must not take down a backgrounded child it
+                // left on purpose. Failure and timeout keep the armed guard.
+                if let Ok(Ok(o)) = &ran
+                    && o.status.success()
+                {
+                    group.disarm();
                 }
                 ran
             }

@@ -501,7 +501,7 @@ pub(crate) async fn run_streamed_command(
     cmd.stdin(Stdio::null());
     // Cancelled future → child must not linger.
     cmd.kill_on_drop(true);
-    let (mut child, group) = crate::proc::spawn_group(&mut cmd).context("spawning command")?;
+    let (mut child, mut group) = crate::proc::spawn_group(&mut cmd).context("spawning command")?;
     let stdout = child.stdout.take().context("capturing stdout")?;
     let stderr = child.stderr.take().context("capturing stderr")?;
     let mut out_reader = BufReader::new(stdout);
@@ -730,6 +730,14 @@ pub(crate) async fn run_streamed_command(
             None
         }
     };
+    // A successful exit owns its descendants: the command may have backgrounded
+    // a child on purpose (stdio redirected away from our pipes — a `dev/null`
+    // daemon), and the guard's drop-kill must not SIGKILL it milliseconds after
+    // the leader exits. Disarm on success only; the guard stays armed on
+    // timeout/cancel/error, where the whole tree must still die.
+    if status.is_some_and(|s| s.success()) {
+        group.disarm();
+    }
     // `None` only ever means the deadline fired — every other path waits for an
     // exit status. Kept as its own flag because it decides `Ok` vs `Err` below,
     // and `status` is consumed by the exit-code notes in between.
@@ -1405,6 +1413,54 @@ mod tests {
         assert!(
             !marker.exists(),
             "the grandchild's sleep completed — it was never actually killed"
+        );
+    }
+
+    /// The mirror of the timeout test above: a command that finishes *normally*
+    /// owns its descendants. One that backgrounded a child with stdio fully
+    /// redirected away from the tool's pipes (a `dev/null` daemon) reports
+    /// success and returns — and the guard's drop must NOT SIGKILL the
+    /// backgrounded child milliseconds after the leader exits. Only the cancel
+    /// path (timeout/abort/error) may take the whole tree down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backgrounded_child_survives_a_successful_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        // Background a `sleep` with stdio redirected away from the tool's
+        // pipes, echo its pid, and exit 0 — a normal, successful run, exactly
+        // the shape that used to get the child SIGKILLed on the guard's drop.
+        let command = "sleep 60 </dev/null >/dev/null 2>&1 & echo $!";
+        let out = run_streamed_command(
+            Shell::Bash.command(command),
+            command,
+            Duration::from_secs(60),
+            false,
+            &ctx,
+        )
+        .await
+        .expect("the run completed normally");
+        assert!(
+            out.passed,
+            "a successful run reports success: {}",
+            out.output
+        );
+        let pid: i32 = out
+            .output
+            .lines()
+            .find_map(|line| line.trim().parse().ok())
+            .expect("the command echoed the backgrounded pid");
+        // Give the old drop-kill a moment to land and be reaped, so a killed
+        // child can't linger as a zombie and read as alive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        // Clean up before asserting: never leak a `sleep`, even when the
+        // assertion below fails.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(
+            alive,
+            "backgrounded child pid {pid} was killed by the guard's drop after its \
+             leader's run finished normally — disarm-on-success is missing"
         );
     }
 
