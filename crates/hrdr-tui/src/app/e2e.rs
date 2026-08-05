@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::{App, Entry, EntryKind, StatusBarMode, TimestampStyle, TurnMsg};
+use super::{App, Entry, EntryKind, StatusBarMode, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
@@ -1122,32 +1122,6 @@ async fn statusbar_slash_command_updates_state() {
     assert!(!h.app.running());
 }
 
-#[tokio::test]
-async fn timestamps_slash_command_updates_state() {
-    // /timestamps is a local slash command — no model turn consumed.
-    let mut h = Harness::new(vec![]).await;
-    assert!(
-        h.app.timestamp_style == TimestampStyle::Relative,
-        "timestamp_style should default to Relative"
-    );
-    h.submit("/timestamps exact").await;
-    assert!(
-        h.app.timestamp_style == TimestampStyle::Exact,
-        "/timestamps exact did not set Exact style"
-    );
-    h.submit("/timestamps none").await;
-    assert!(
-        h.app.timestamp_style == TimestampStyle::None,
-        "/timestamps none did not set None style"
-    );
-    h.submit("/timestamps relative").await;
-    assert!(
-        h.app.timestamp_style == TimestampStyle::Relative,
-        "/timestamps relative did not set Relative style"
-    );
-    assert!(!h.app.running());
-}
-
 // ---------------------------------------------------------------------------
 // Scroll-offset preservation (Task 27 regression guard)
 // ---------------------------------------------------------------------------
@@ -1302,42 +1276,22 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     for x in 0..59 {
         assert_eq!(bg_at(x, user_y), theme.user_bg, "user row bg at x={x}");
     }
-    // The `#1 you · now` meta row closes the block: it's a block body row (not
-    // chrome outside the block), sitting on the block background below the
-    // message text, separated from it by a blank row.
-    let meta_y = user_y + 2;
-    assert!(row_text(meta_y).contains("#1 you · "), "meta row");
-    assert_eq!(
-        bg_at(0, meta_y),
-        theme.user_bg,
-        "meta row is inside the block"
-    );
-    assert_eq!(
-        without_bar(&row_text(meta_y - 1)),
-        "",
-        "blank row before the meta row"
-    );
-    assert_eq!(
-        bg_at(0, meta_y - 1),
-        theme.user_bg,
-        "that blank row is inside the block too"
-    );
-    // Blank padded rows above the text and below the meta row.
+    // Blank padded rows above and below the text close the block.
     assert_eq!(bg_at(0, user_y - 1), theme.user_bg, "top pad row");
-    assert_eq!(bg_at(0, meta_y + 1), theme.user_bg, "bottom pad row");
+    assert_eq!(bg_at(0, user_y + 1), theme.user_bg, "bottom pad row");
     assert_eq!(
         without_bar(&row_text(user_y - 1)),
         "",
         "top pad row is blank"
     );
     assert_eq!(
-        without_bar(&row_text(meta_y + 1)),
+        without_bar(&row_text(user_y + 1)),
         "",
         "bottom pad row is blank"
     );
 
     // A blank separator row (terminal bg) sits between blocks.
-    assert_ne!(bg_at(0, meta_y + 2), theme.user_bg, "separator row");
+    assert_ne!(bg_at(0, user_y + 2), theme.user_bg, "separator row");
 
     // The tool box: status mark + name on the header, command below it, on the
     // tool background — flush with the transcript's own content column, like
@@ -3090,42 +3044,6 @@ async fn an_empty_text_delta_opens_no_entry() {
     );
 }
 
-/// The borrowed label is a real jump point: `/goto 2` scrolls to the block that
-/// carries it, even though the assistant turn painted no block of its own.
-#[tokio::test]
-async fn goto_finds_a_text_less_assistant_turn() {
-    let mut h = Harness::new(vec![]).await;
-    h.app.show_reasoning = true; // the reasoning entry is the jump target
-    h.app
-        .transcript_mut()
-        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
-    h.app.push_entry(Entry::user("go"));
-    // Enough filler that the target is off-screen before the jump.
-    for i in 0..12 {
-        h.app.push_entry(Entry::system(format!("filler {i}")));
-    }
-    h.app
-        .push_entry(Entry::reasoning("thought about something"));
-    h.app.push_entry(Entry::assistant("")); // message #2
-    h.app
-        .push_entry(Entry::tool_running("c1", "shell", r#"{"command":"ls"}"#));
-
-    let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-
-    h.type_str("/goto 2");
-    h.press(KeyCode::Enter);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
-
-    // The jump puts the target message's block at the top of the viewport.
-    let first_rows: String = screen.lines().take(3).collect::<Vec<_>>().join("\n");
-    assert!(
-        first_rows.contains("thought about something"),
-        "/goto 2 landed elsewhere:\n{screen}"
-    );
-}
-
 /// The click rect for a tool block is derived from where it lands on screen,
 /// which the group chunk build must keep accurate. A lone tool call is its own
 /// group of one: collapsed, the hit rect covers the summary row that heads it;
@@ -3733,7 +3651,6 @@ async fn the_stats_line_rides_on_the_turns_block() {
 
     let reply_y = row_of("all done");
     let stats_y = row_of("tok/s");
-    let label_y = row_of("#2 assistant");
 
     // Inside the reply's block: same background, no separator between them.
     assert_eq!(
@@ -3742,9 +3659,8 @@ async fn the_stats_line_rides_on_the_turns_block() {
         "stats share the block:\n{screen}"
     );
     assert_ne!(bg_at(stats_y), h.app.theme.stats_bg, "no block of its own");
-    // Ordering: reply, stats, then the label that closes the block.
+    // Ordering: the reply, then the stats that close its block.
     assert!(reply_y < stats_y, "stats follow the reply");
-    assert!(stats_y < label_y, "the label still closes the block");
     // A user prompt block sits above, on its own background.
     assert_ne!(bg_at(reply_y), bg_at(row_of("run it")));
 }
@@ -3931,7 +3847,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
     let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
 
     // Anchor on each block's *last* content row and the next block's first.
-    let (prompt_end, a_end, b_end) = (row_of("#1 you"), row_of("res-a"), row_of("res-b"));
+    let (prompt_end, a_end, b_end) = (row_of("prompt"), row_of("res-a"), row_of("res-b"));
     let (thought, c_end) = (row_of("thought"), row_of("res-c"));
 
     // Tinted → tinted: both blocks' pads, plus a separator row between them.
@@ -4022,7 +3938,7 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     // Untinted → tinted: the summary's first row IS the tool summary now (no
     // pad above it), so only the assistant block's own bottom pad separates it.
     assert_eq!(
-        gap(row_of("#1 assistant"), row_of("listed 1 directory")),
+        gap(row_of("the output"), row_of("listed 1 directory")),
         1,
         "output → tool:\n{screen}"
     );
@@ -5105,8 +5021,8 @@ async fn tool_runs_merge_across_invisible_turn_markers() {
         );
     }
 
-    // Expanded: every call renders inside the group, in order, and the turn
-    // markers' `#N assistant` labels sit between their calls.
+    // Expanded: every call renders inside the group, in order — the turn
+    // markers between the rounds render nothing of their own now.
     h.app.verbose = true;
     let mut term = Terminal::new(TestBackend::new(60, 120)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5129,15 +5045,14 @@ async fn tool_runs_merge_across_invisible_turn_markers() {
         screen.contains("result-a0") && screen.contains("result-c5"),
         "every call renders:\n{screen}"
     );
+    // The runs' calls stay in order across the invisible turn markers.
     assert!(
-        row_of("result-a2") < row_of("#1 assistant")
-            && row_of("#1 assistant") < row_of("result-b0"),
-        "the first turn marker sits between its calls:\n{screen}"
+        row_of("result-a2") < row_of("result-b0") && row_of("result-b1") < row_of("result-c0"),
+        "each round's calls stay in order:\n{screen}"
     );
     assert!(
-        row_of("result-b1") < row_of("#2 assistant")
-            && row_of("#2 assistant") < row_of("result-c0"),
-        "the second turn marker sits between its calls:\n{screen}"
+        !screen.contains("assistant"),
+        "the turn markers render nothing:\n{screen}"
     );
 }
 
@@ -8302,11 +8217,11 @@ async fn effort_picker_lists_levels_default_first_and_applies() {
 #[tokio::test]
 async fn argument_completion_offers_values_and_tab_fills_the_argument() {
     let mut h = Harness::new(vec![]).await;
-    h.type_str("/timestamps rel");
+    h.type_str("/statusbar tr");
     let screen = h.render();
-    assert!(screen.contains("relative"), "candidate offered:\n{screen}");
+    assert!(screen.contains("truncate"), "candidate offered:\n{screen}");
     h.press(KeyCode::Tab);
-    assert_eq!(h.app.editor.content(), "/timestamps relative ");
+    assert_eq!(h.app.editor.content(), "/statusbar truncate ");
 
     // Theme names complete too (built-ins are always registered).
     h.app.editor.set_content("");
@@ -8322,19 +8237,16 @@ async fn argument_completion_offers_values_and_tab_fills_the_argument() {
 #[tokio::test]
 async fn enter_accepts_a_partial_completion_then_a_second_enter_submits() {
     let mut h = Harness::new(vec![]).await;
-    // A partial slash command: the popup completes to /timestamps.
-    h.type_str("/timestamp");
-    assert!(
-        h.render().contains("/timestamps"),
-        "popup offers /timestamps"
-    );
+    // A partial slash command: the popup completes to /statusbar.
+    h.type_str("/statusba");
+    assert!(h.render().contains("/statusbar"), "popup offers /statusbar");
 
     // First Enter accepts the suggestion into the input; it does NOT submit
     // (submitting would clear the box).
     h.press(KeyCode::Enter);
     assert_eq!(
         h.app.editor.content(),
-        "/timestamps ",
+        "/statusbar ",
         "Enter filled the command into the box without sending it"
     );
 

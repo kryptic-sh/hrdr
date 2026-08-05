@@ -176,11 +176,6 @@ pub fn arg_completions(
             .collect()
     } else {
         match resolve_alias(cmd) {
-            "timestamps" | "ts" => set(&[
-                ("none", "no timestamps"),
-                ("relative", "5m ago"),
-                ("exact", "HH:MM"),
-            ]),
             "statusbar" => set(&[
                 ("none", "hide the status bar"),
                 ("truncate", "one line"),
@@ -190,14 +185,7 @@ pub fn arg_completions(
                 ("on", "expand every tool block and show thinking"),
                 ("off", "collapse them"),
             ]),
-            "goto" => set(&[("top", "first message"), ("end", "follow the newest")]),
             "find" => set(&[("clear", "drop the search")]),
-            "copy" => set(&[
-                ("reply", "the last reply"),
-                ("code", "the last code block"),
-                ("all", "the whole transcript"),
-                ("msg", "msg N or N-M"),
-            ]),
             "theme" => {
                 let mut rows: Vec<(String, String)> = crate::theme_choices()
                     .into_iter()
@@ -278,10 +266,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names("/he").first(), Some(&"/help"));
-        // Name-prefix matches rank first (/compact, /cwd, /copy all start
-        // with c); /compact is the earliest such canonical in registry order.
+        // Name-prefix matches rank first (/compact, /cwd start with c);
+        // /compact is the earliest such canonical in registry order.
         assert_eq!(names("/c").first(), Some(&"/compact"));
-        assert!(names("/c").contains(&"/copy") && names("/c").contains(&"/cwd"));
+        assert!(names("/c").contains(&"/cwd"));
         // Description match: "/list" surfaces "/help" ("list commands").
         assert!(names("/list").contains(&"/help"));
         assert!(!names("/list").contains(&"/new"));
@@ -352,9 +340,7 @@ mod tests {
         };
         // Enum arguments: prefix match, and the empty partial lists all.
         assert_eq!(vals("/statusbar tr"), vec!["truncate"]);
-        assert_eq!(vals("/timestamps ").len(), 3);
         // Dispatch-level alt names and registry aliases both resolve.
-        assert_eq!(vals("/ts ex"), vec!["exact"]);
         assert_eq!(vals("/verbose o").len(), 2); // on, off
         // Theme names come from the registry (built-ins are always there).
         assert!(vals("/theme dra").contains(&"dracula".to_string()));
@@ -368,8 +354,8 @@ mod tests {
         assert!(arg_completions("/statusbar zz", &skills).is_none());
         assert!(arg_completions("hello there", &skills).is_none());
         // The offset points at the argument, past the whitespace run.
-        let (start, _) = arg_completions("/goto   to", &skills).unwrap();
-        assert_eq!(&"/goto   to"[start..], "to");
+        let (start, _) = arg_completions("/verbose   off", &skills).unwrap();
+        assert_eq!(&"/verbose   off"[start..], "off");
     }
 
     #[test]

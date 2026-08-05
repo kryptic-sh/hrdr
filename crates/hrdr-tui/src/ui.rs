@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Entry, EntryKind, HitRect, SelectionSpan, StatusBarMode, TimestampStyle};
+use crate::app::{App, Entry, EntryKind, HitRect, SelectionSpan, StatusBarMode};
 use crate::theme::Theme;
 use hrdr_app::relative_time;
 
@@ -1299,13 +1299,9 @@ fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
         None => "ctx —".to_string(),
     };
 
-    // "started …" segment, respecting the timestamp style (omitted when off).
+    // "started …" segment, in relative terms.
     let started_at = turn.started_at.map(hrdr_app::time_from_system);
-    let started = match (app.timestamp_style, started_at) {
-        (TimestampStyle::None, _) | (_, None) => String::new(),
-        (TimestampStyle::Relative, Some(t)) => format!("started {}", relative_time(t)),
-        (TimestampStyle::Exact, Some(t)) => format!("started {}", t.format("%H:%M")),
-    };
+    let started = started_at.map_or(String::new(), |t| format!("started {}", relative_time(t)));
     // Compaction is the session's agent summarizing itself — not something a
     // sub-agent's pane should claim to be doing.
     let segments: Vec<String> = if pane.compacting {
@@ -2404,26 +2400,18 @@ pub(crate) fn block_cache_ptr(idx: usize) -> Option<usize> {
 
 /// Fingerprint the parts of a block that its body key can't see: the kind (which
 /// picks the background and border), the rows lent to it by a following entry (a
-/// text-less turn's `#N` label, a stats line), its own timestamp footer, and
-/// whether its bottom pad is dropped.
-fn chrome_hash(
-    kind: BlockKind,
-    lent: &[Lent],
-    footer: &Option<MetaSpec>,
-    drop_bottom: bool,
-) -> u64 {
+/// stats line), and whether its bottom pad is dropped.
+fn chrome_hash(kind: BlockKind, lent: &[Lent], drop_bottom: bool) -> u64 {
     let mut h = DefaultHasher::new();
     (kind as u8).hash(&mut h);
     drop_bottom.hash(&mut h);
-    footer.hash(&mut h);
     lent.len().hash(&mut h);
     for l in lent {
         // Scalars only — never the rendered text. This runs for every entry on
         // every frame, and hashing the rows would put the transcript's *bytes* back
         // in the frame's path, which is the cost this design exists to avoid.
         match l {
-            Lent::Meta(meta) => (0u8, meta).hash(&mut h),
-            Lent::Stats(key, _) => (1u8, key).hash(&mut h),
+            Lent::Stats(key, _) => (0u8, key).hash(&mut h),
         }
     }
     h.finish()
@@ -2503,74 +2491,26 @@ impl ChunkRows<'_> {
     }
 }
 
-/// A message's closing `#N you · 2m ago` label — as a *recipe*, not as rows.
-///
-/// The label is the one part of a block that changes on its own, without the entry
-/// changing: a relative timestamp ticks over. Formatting it costs a clock read and
-/// an allocation, and a frame has one per message — so the frame keys the block
-/// cache on this (all scalars: `bucket` stands in for the rendered time, see
-/// [`hrdr_app::relative_time_bucket`]) and only builds the rows when the block
-/// itself has to be laid out again.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct MetaSpec {
-    /// The message's `#N`.
-    num: usize,
-    role: &'static str,
-    style: TimestampStyle,
-    /// What the time reads as now, without saying it in words.
-    bucket: u64,
-    /// When the entry landed — read only when the rows are actually built.
-    time: chrono::DateTime<chrono::Local>,
-}
-
-impl MetaSpec {
-    /// The blank row and the label itself, on the block's own background.
-    fn rows(&self, now: chrono::DateTime<chrono::Local>, theme: &Theme) -> Vec<Line<'static>> {
-        if self.style == TimestampStyle::None {
-            return Vec::new();
-        }
-        let time = if self.style == TimestampStyle::Relative {
-            hrdr_app::relative_time_since(self.time, now)
-        } else {
-            self.time.format("%H:%M").to_string()
-        };
-        let (num, role) = (self.num, self.role);
-        vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                format!("#{num} {role} · {time}"),
-                Style::default().fg(theme.dim),
-            )),
-        ]
-    }
-}
-
 /// Rows a *following* entry lends to the block above it, because it has no block
-/// of its own: a text-less turn's `#N assistant` jump label, or the stats line
-/// that closes the turn.
+/// of its own: the stats line that closes the turn.
 #[derive(Clone)]
 enum Lent {
-    Meta(MetaSpec),
     /// Already rendered and cached under its own entry's body key — which is what
     /// the block hashes, rather than walking the rows.
     Stats(BodyKey, Rows),
 }
 
 /// A block whose parts are gathered but which is not yet rendered. Held for one
-/// iteration so a text-less assistant turn — which has no block of its own — can
-/// lend its `#N assistant` jump label to it, and so the block after it can say
-/// whether the two need a separator between them.
+/// iteration so the block after it can say whether the two need a separator
+/// between them.
 struct PendingBlock<'a> {
     /// Transcript index — the cache slot this block owns.
     idx: usize,
     kind: BlockKind,
     /// The entry's own content.
     body: BodySource<'a>,
-    /// What a following entry lent this block. Sits below the body, above the
-    /// block's own footer.
+    /// What a following entry lent this block. Sits below the body.
     lent: Vec<Lent>,
-    /// This block's closing `#N you · 2m ago` label.
-    footer: Option<MetaSpec>,
     /// The body's cache key, extended with the chrome hash to key the block.
     body_key: BodyKey,
     tool_idx: Option<usize>,
@@ -2617,7 +2557,6 @@ fn flush<'a>(
     pending: Option<PendingBlock<'a>>,
     next_bg: Option<Color>,
     width: usize,
-    now: chrono::DateTime<chrono::Local>,
     theme: &Theme,
 ) {
     let Some(block) = pending else { return };
@@ -2634,12 +2573,11 @@ fn flush<'a>(
 
     let key = (
         block.body_key,
-        chrome_hash(block.kind, &block.lent, &block.footer, drop_bottom),
+        chrome_hash(block.kind, &block.lent, drop_bottom),
     );
-    let theme = theme.clone();
-    // Lay the block out: the body, then whatever a following entry lent it, then
-    // its own label — all through the one `render_block` call, so no entry paints
-    // its own chrome.
+    // Lay the block out: the body, then whatever a following entry lent it —
+    // all through the one `render_block` call, so no entry paints its own
+    // chrome.
     let render = move || -> Rows {
         let mut body: Vec<Line<'static>> = Vec::with_capacity(8);
         match &block.body {
@@ -2647,17 +2585,10 @@ fn flush<'a>(
             BodySource::Animated(build) => body.extend(build()),
         }
         for lent in &block.lent {
-            match lent {
-                Lent::Meta(meta) => body.extend(meta.rows(now, &theme)),
-                // The stats line sits a blank row below the turn it closes.
-                Lent::Stats(_, rows) => {
-                    body.push(Line::raw(""));
-                    body.extend(rows.iter().cloned());
-                }
-            }
-        }
-        if let Some(footer) = &block.footer {
-            body.extend(footer.rows(now, &theme));
+            // The stats line sits a blank row below the turn it closes.
+            let Lent::Stats(_, rows) = lent;
+            body.push(Line::raw(""));
+            body.extend(rows.iter().cloned());
         }
         let mut rows = render_block(body, width, bg, border);
         if drop_bottom {
@@ -2715,23 +2646,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     let md_theme = theme.md_theme();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut msg_at: Vec<usize> = Vec::new();
-    // Number user/assistant messages so `/copy msg N` lines up with the display.
-    let mut msg_num = 0usize;
-    // One clock read for the whole frame. Reading it per message — which is what
-    // formatting a relative time does — is a timezone lookup and an allocation per
-    // entry, every frame, for a label that changes at most once a minute.
+    // One clock read for the whole frame — the folded thinking summary's
+    // elapsed time and age read it.
     let now = chrono::Local::now();
-    // The `#N you · 2m ago` row that closes a message block, as a recipe: the rows
-    // are built only if the block has to be laid out again ([`MetaSpec`]).
-    let meta = |e: &Entry, num: usize, role: &'static str| -> MetaSpec {
-        MetaSpec {
-            num,
-            role,
-            style: app.timestamp_style,
-            bucket: hrdr_app::relative_time_bucket(e.time, now),
-            time: e.time,
-        }
-    };
     // Block width and the width its content is laid out at (minus padding).
     let w = width as usize;
     let inner = inner_width(w);
@@ -2780,18 +2697,14 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 let drop_bottom = transcript
                     .get(end)
                     .is_some_and(|e| !entry_is_tinted(&e.kind));
-                // Absorbed empty-assistant turns still count as messages and
-                // keep their `#N assistant` `/goto` labels, rendered inside
-                // the group at their transcript positions.
-                let mut metas: Vec<Option<MetaSpec>> = Vec::new();
+                // Absorbed empty-assistant turns still count as messages (for
+                // `/find` jumps to them), landing on the group chunk.
+                let mut absorbed = 0usize;
                 for e in &transcript[i..end] {
                     if let EntryKind::Assistant(text) = &e.kind
                         && text.trim().is_empty()
                     {
-                        msg_num += 1;
-                        metas.push(Some(meta(e, msg_num, "assistant")));
-                    } else {
-                        metas.push(None);
+                        absorbed += 1;
                     }
                 }
                 flush(
@@ -2800,25 +2713,20 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                     pending.take(),
                     Some(BlockKind::Tool.bg(theme)),
                     w,
-                    now,
                     theme,
                 );
-                // The absorbed labels' `/goto` targets are the group chunk, as
-                // a normal message's target is its own block.
-                for _ in metas.iter().flatten() {
+                for _ in 0..absorbed {
                     msg_at.push(chunks.len());
                 }
                 chunks.push(tool_group_chunk(
                     app,
                     &transcript[i..end],
-                    &metas,
                     i,
                     w,
                     GroupFrame {
                         frame,
                         frame_idx,
                         expanded,
-                        now,
                         drop_bottom,
                     },
                 ));
@@ -2862,10 +2770,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             app.verbose,
             app.show_reasoning || reasoning_open,
         );
-        // Every arm produces (kind, header rows, cached body rows, footer rows)
-        // and is then funneled through the one `render_block` call below — no
-        // entry paints its own chrome.
-        let mut footer: Option<MetaSpec> = None;
+        // Every arm produces (kind, header rows, cached body rows) and is then
+        // funneled through the one `render_block` call below — no entry paints
+        // its own chrome.
         // Numbered messages starting at the block this entry produces.
         let mut msg_here = 0usize;
         let (kind, body) = match &entry.kind {
@@ -2879,16 +2786,13 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 })),
             ),
             // An assistant turn that only called tools has no text, so it gets no
-            // block of its own — but its `#N assistant` label is a `/goto` jump
-            // point, so it rides along on the previous block instead.
+            // block of its own; it still counts as a message for `/find` jumps.
             EntryKind::Assistant(text) if text.trim().is_empty() => {
-                msg_num += 1;
                 if let Some(block) = pending.as_mut() {
-                    block.lend(Lent::Meta(meta(entry, msg_num, "assistant")));
                     block.msgs += 1;
                 } else {
-                    // Nothing to append to (it opens the transcript): the label
-                    // has nowhere to live, so the message keeps no jump point.
+                    // Nothing to append to (it opens the transcript): the
+                    // message keeps no jump point.
                     msg_at.push(chunks.len());
                 }
                 continue;
@@ -2898,9 +2802,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // A user prompt renders exactly like the model's output — same
             // markdown, same colors. Only the block's background differs.
             EntryKind::User(text) => {
-                msg_num += 1;
                 msg_here += 1;
-                footer = Some(meta(entry, msg_num, "you"));
                 let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::User.bg(theme), inner)
                 });
@@ -2910,9 +2812,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
             // out and syntax-highlighted with syntect.
             EntryKind::Assistant(text) => {
-                msg_num += 1;
                 msg_here += 1;
-                footer = Some(meta(entry, msg_num, "assistant"));
                 let body = cached_body(i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Assistant.bg(theme), inner)
                 });
@@ -3019,7 +2919,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             pending.take(),
             Some(kind.bg(theme)),
             w,
-            now,
             theme,
         );
         pending = Some(PendingBlock {
@@ -3027,7 +2926,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             kind,
             body,
             lent: Vec::new(),
-            footer,
             body_key: ck,
             tool_idx: (matches!(entry.kind, EntryKind::Tool { .. }) || thinking_hidden)
                 .then_some(i),
@@ -3045,7 +2943,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         pending.take(),
         queued_bg,
         w,
-        now,
         theme,
     );
 
@@ -3352,26 +3249,22 @@ fn human_duration(ms: u64) -> String {
 
 /// The per-frame state a tool-group chunk renders with: the spinner frame (and
 /// its index, which keys the running members' body cache so their marks
-/// animate), whether the group is expanded, and the clock the absorbed turn
-/// labels read.
+/// animate), whether the group is expanded, and whether its bottom pad drops.
 #[derive(Clone, Copy)]
 struct GroupFrame {
     frame: &'static str,
     frame_idx: u64,
     expanded: bool,
-    now: chrono::DateTime<chrono::Local>,
     /// Drop the section's bottom pad when the entry after the group is
     /// untinted — that entry's own top pad is then the one blank row between
     /// them, instead of two.
     drop_bottom: bool,
 }
 
-/// The block for a tool group: a container on the dimmer group background
-/// whose header is the packed `{mark} called N tools · read 2 files` line(s),
-/// and — when expanded — the group's tool calls rendered in full as child
-/// items inside it, each on the normal tool background so the boxes read as
-/// nested in the summary section. Absorbed empty-assistant turns render their
-/// `#N assistant` `/goto` labels at their transcript positions. The mark
+/// The block for a tool group: the summary section on the page background —
+/// the packed `{mark} called N tools · read 2 files` line(s) — and, when
+/// expanded, the group's tool calls rendered in full as child items on the
+/// tool background, flush with the transcript's content column. The mark
 /// reflects the whole group — the spinner frame while any call runs, ✓/✗ by
 /// the group's outcome once it settles. Built fresh every frame (its content
 /// depends on the whole group, so the per-entry body cache cannot serve it);
@@ -3379,7 +3272,6 @@ struct GroupFrame {
 fn tool_group_chunk(
     app: &App,
     members: &[Entry],
-    metas: &[Option<MetaSpec>],
     head_idx: usize,
     w: usize,
     frame: GroupFrame,
@@ -3429,49 +3321,38 @@ fn tool_group_chunk(
         // one row is the whole gap.
         for (j, member) in members.iter().enumerate() {
             rows.push(pad_row(Vec::new(), w, page));
-            match &member.kind {
-                EntryKind::Tool {
-                    name,
-                    args,
-                    result,
-                    ok,
-                    done,
-                    ..
-                } => {
-                    // The body is cached per entry like a standalone tool's, so
-                    // an unchanged call costs a refcount bump per frame, not a
-                    // re-render (syntax highlighting included). Running calls
-                    // key on the spinner frame, animating their mark.
-                    let body = cached_body(
-                        head_idx + j,
-                        (
-                            member.content_hash ^ if *done { 0 } else { frame.frame_idx },
-                            w as u16,
-                            app.verbose,
-                            app.show_reasoning,
-                        ),
-                        || tool_lines(theme, name, args, result, *ok, *done, frame.frame),
-                    );
-                    if body.is_empty() {
-                        continue;
-                    }
-                    // The call's own rows, filled to the width on the tool
-                    // background — content at the same column as every other
-                    // transcript entry.
-                    for row in body.as_ref().iter() {
-                        rows.push(pad_row(row.spans.clone(), w, bg));
-                    }
-                }
-                _ => {
-                    // An absorbed empty-assistant turn's `/goto` label.
-                    let Some(meta) = metas.get(j).and_then(Option::as_ref) else {
-                        continue;
-                    };
-                    let Some(label) = meta.rows(frame.now, theme).into_iter().last() else {
-                        continue; // timestamps hidden — no label to render
-                    };
-                    rows.push(pad_row(label.spans, w, page));
-                }
+            let EntryKind::Tool {
+                name,
+                args,
+                result,
+                ok,
+                done,
+                ..
+            } = &member.kind
+            else {
+                continue; // an absorbed empty-assistant turn renders nothing
+            };
+            // The body is cached per entry like a standalone tool's, so an
+            // unchanged call costs a refcount bump per frame, not a re-render
+            // (syntax highlighting included). Running calls key on the spinner
+            // frame, animating their mark.
+            let body = cached_body(
+                head_idx + j,
+                (
+                    member.content_hash ^ if *done { 0 } else { frame.frame_idx },
+                    w as u16,
+                    app.verbose,
+                    app.show_reasoning,
+                ),
+                || tool_lines(theme, name, args, result, *ok, *done, frame.frame),
+            );
+            if body.is_empty() {
+                continue;
+            }
+            // The call's own rows, filled to the width on the tool background —
+            // content at the same column as every other transcript entry.
+            for row in body.as_ref().iter() {
+                rows.push(pad_row(row.spans.clone(), w, bg));
             }
         }
     }
@@ -3912,8 +3793,8 @@ mod subagent_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, MetaSpec, Rc, TimestampStyle,
-        cached_block, cached_body, chrome_hash, entry_content_hash,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, Rc, cached_block, cached_body,
+        chrome_hash, entry_content_hash,
     };
     use crate::app::{Entry, EntryKind};
     use ratatui::text::{Line, Span};
@@ -4052,96 +3933,38 @@ mod cache_tests {
 
     // ── cached_block ───────────────────────────────────────────────────────────
 
-    /// A block is its body *plus the chrome around it*, and the chrome can change
-    /// while the body does not: a relative timestamp ticks from `1m ago` to `2m
-    /// ago`, a text-less turn lends the block its `#N assistant` label, the block
-    /// after it turns out to be untinted so the bottom pad is dropped. All of that
-    /// is invisible to the body key, so `chrome_hash` carries it — and a block
-    /// whose chrome changed must be re-rendered.
+    /// A block is its body *plus the chrome around it*, and the chrome can
+    /// change while the body does not: the block after it turns out to be
+    /// untinted so the bottom pad is dropped, or the block kind picks a
+    /// different background. All of that is invisible to the body key, so
+    /// `chrome_hash` carries it — and a block whose chrome changed must be
+    /// re-rendered.
     #[test]
     fn cached_block_keys_on_the_chrome_around_the_body() {
         BLOCK_CACHE.with(|c| c.borrow_mut().clear());
 
         let body_key = (0x3333, 80, false, false);
-        let now = chrono::Local::now();
-        let at = |mins: i64| MetaSpec {
-            num: 1,
-            role: "you",
-            style: TimestampStyle::Relative,
-            bucket: hrdr_app::relative_time_bucket(now - chrono::Duration::minutes(mins), now),
-            time: now - chrono::Duration::minutes(mins),
-        };
         let none: &[Lent] = &[];
-        let (footer_1m, footer_2m) = (Some(at(1)), Some(at(2)));
-
-        let h_1m = chrome_hash(BlockKind::User, none, &footer_1m, false);
-        let h_2m = chrome_hash(BlockKind::User, none, &footer_2m, false);
-        assert_ne!(h_1m, h_2m, "a ticked-over timestamp must change the hash");
+        let h = chrome_hash(BlockKind::User, none, false);
         assert_ne!(
-            h_1m,
-            chrome_hash(BlockKind::User, none, &footer_1m, true),
+            h,
+            chrome_hash(BlockKind::User, none, true),
             "dropping the bottom pad must change the hash"
         );
         assert_ne!(
-            h_1m,
-            chrome_hash(BlockKind::Assistant, none, &footer_1m, false),
+            h,
+            chrome_hash(BlockKind::Assistant, none, false),
             "the block kind picks the background — it must change the hash"
-        );
-        assert_ne!(
-            h_1m,
-            chrome_hash(
-                BlockKind::User,
-                &[Lent::Meta(at(1))], // a text-less turn lent it its `#N` label
-                &footer_1m,
-                false
-            ),
-            "rows lent by a following entry must change the hash"
         );
 
         let stale = vec![Line::from(Span::raw("with 1m ago"))];
         let fresh = vec![Line::from(Span::raw("with 2m ago"))];
-        let first = cached_block(5, (body_key, h_1m), || Rc::new(stale.clone()));
+        let first = cached_block(5, (body_key, h), || Rc::new(stale.clone()));
         assert_eq!(*first, stale);
-        let second = cached_block(5, (body_key, h_2m), || Rc::new(fresh.clone()));
+        let second = cached_block(5, (body_key, h), || Rc::new(fresh.clone()));
         assert_eq!(
-            *second, fresh,
-            "same body, new chrome → the block must be re-rendered"
-        );
-    }
-
-    /// A timestamp that has not visibly changed must not re-lay-out its block.
-    ///
-    /// The block key carries a *bucket* rather than the rendered time, so two
-    /// frames a second apart — where the label still reads `5m ago` — hash the
-    /// same. If the key carried the raw instant instead, every message in the
-    /// transcript would be laid out again on every frame and the cache would buy
-    /// nothing.
-    #[test]
-    fn a_timestamp_that_reads_the_same_does_not_rebuild_the_block() {
-        let now = chrono::Local::now();
-        let then = now - chrono::Duration::minutes(5);
-        let spec = |now: chrono::DateTime<chrono::Local>| MetaSpec {
-            num: 1,
-            role: "you",
-            style: TimestampStyle::Relative,
-            bucket: hrdr_app::relative_time_bucket(then, now),
-            time: then,
-        };
-
-        let a = Some(spec(now));
-        let b = Some(spec(now + chrono::Duration::seconds(1))); // still "5m ago"
-        let c = Some(spec(now + chrono::Duration::minutes(1))); // now "6m ago"
-        let none: &[Lent] = &[];
-
-        assert_eq!(
-            chrome_hash(BlockKind::User, none, &a, false),
-            chrome_hash(BlockKind::User, none, &b, false),
-            "a frame a second later reads the same — reuse the block"
-        );
-        assert_ne!(
-            chrome_hash(BlockKind::User, none, &a, false),
-            chrome_hash(BlockKind::User, none, &c, false),
-            "the label ticked over — lay the block out again"
+            *second, stale,
+            "same body, same chrome → the block is reused"
         );
     }
 
@@ -4381,17 +4204,10 @@ mod block_tests {
             kind,
             body: BodySource::Cached(Rc::new(vec![Line::from(Span::raw("x"))])),
             lent: Vec::new(),
-            footer: None,
             body_key: (0, 10, false, false),
             tool_idx: None,
             msgs: 0,
         }
-    }
-
-    /// The clock a test frame is drawn at (no block under test carries a
-    /// timestamp, so its value never reaches the rows).
-    fn test_now() -> chrono::DateTime<chrono::Local> {
-        chrono::Local::now()
     }
 
     /// The rows a list of chunks paints, in order.
@@ -4430,7 +4246,6 @@ mod block_tests {
                 Some(test_block(first)),
                 second.map(|k| k.bg(&theme)),
                 10,
-                test_now(),
                 &theme,
             );
             let after_first: usize = chunks.iter().map(|c| c.rows.height()).sum();
@@ -4441,7 +4256,6 @@ mod block_tests {
                     Some(test_block(second)),
                     None,
                     10,
-                    test_now(),
                     &theme,
                 );
             }
@@ -4489,7 +4303,6 @@ mod block_tests {
                 Some(test_block(kind)),
                 None,
                 10,
-                test_now(),
                 &theme,
             );
             flatten(&chunks).len() - 2 // minus the content row and the top pad
@@ -4509,15 +4322,7 @@ mod block_tests {
         let mut block = test_block(BlockKind::Tool);
         block.tool_idx = Some(7);
         block.msgs = 2; // a block carrying a borrowed assistant label
-        flush(
-            &mut chunks,
-            &mut starts,
-            Some(block),
-            None,
-            10,
-            test_now(),
-            &theme,
-        );
+        flush(&mut chunks, &mut starts, Some(block), None, 10, &theme);
         assert_eq!(starts, vec![1, 1], "both messages start at the block");
         let tools: Vec<_> = chunks
             .iter()

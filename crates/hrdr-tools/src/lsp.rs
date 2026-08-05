@@ -40,7 +40,7 @@ const SETTLE_DEBOUNCE_MS: u64 = 300;
 /// time to answer anything", which expired every request instantly.
 const MIN_SEND_TIMEOUT_SECS: u64 = 2;
 /// Diagnostics lines shown per edit before "…and N more".
-const MAX_DIAG_LINES: usize = 8;
+const MAX_DIAG_LINES: usize = 10;
 /// How long a navigation request (`definition`/`references`/`rename`) may
 /// take — longer than the diagnostics wait: the model asked explicitly, and
 /// an indexing server answers when ready.
@@ -1241,7 +1241,7 @@ mod tests {
         let many: Vec<Value> = (0..12).map(|i| err(i, "boom")).collect();
         let note = format_diagnostics(root, path, &many).unwrap();
         assert!(note.contains("12 errors"), "{note}");
-        assert!(note.contains("…and 4 more"), "{note}");
+        assert!(note.contains("…and 2 more"), "{note}");
     }
 
     /// A server that re-publishes an overlapping set must not spend the model's
@@ -1303,13 +1303,13 @@ mod tests {
         assert!(listed[1].contains("first"), "{note}");
 
         // The cap counts distinct diagnostics: 10 unique errors published twice
-        // each is "10 errors" with 2 omitted, not 20 with 12.
+        // each is "10 errors" with none omitted (the cap is 10), not 20 with 12.
         let unique: Vec<Value> = (0..10).map(|i| err(i, 0, "boom", None)).collect();
         let mut doubled = unique.clone();
         doubled.extend(unique);
         let note = format_diagnostics(root, path, &doubled).unwrap();
         assert!(note.contains("10 errors"), "{note}");
-        assert!(note.contains("…and 2 more"), "{note}");
+        assert!(!note.contains("more"), "{note}");
     }
 
     /// `/doctor`'s status rows track the probe lifecycle: unprobed → "not yet

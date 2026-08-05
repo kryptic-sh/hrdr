@@ -133,52 +133,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 )
             }));
         }
-        "copy" => {
-            let lower = arg.to_ascii_lowercase();
-            let toks: Vec<&str> = lower.split_whitespace().collect();
-            let (text, label) = match toks.as_slice() {
-                [] | ["reply"] | ["last"] => (host.last_reply(), "last reply".to_string()),
-                ["code"] => (host.last_code_block(), "last code block".to_string()),
-                ["all"] | ["transcript"] => {
-                    (Some(host.transcript_text()), "transcript".to_string())
-                }
-                ["msg", spec] | ["message", spec] | ["m", spec] => {
-                    let Some((a, b)) = crate::parse_msg_range(spec) else {
-                        host.info("usage: /copy msg <N> or <N-M>".to_string());
-                        return true;
-                    };
-                    // `b` comes straight from user input and isn't bounded against
-                    // the transcript (`/copy msg 1-99999999999999`), so don't walk
-                    // the whole `a..=b` range: `nth_message_text` scans the
-                    // transcript per call, and a huge upper bound would freeze the
-                    // UI thread doing that once per (mostly out-of-range) number.
-                    // Stop at the first miss instead — message numbers are dense,
-                    // so the first `None` means every later `n` would miss too.
-                    let mut parts: Vec<String> = Vec::new();
-                    for n in a..=b {
-                        match host.nth_message_text(n) {
-                            Some(t) => parts.push(t),
-                            None => break,
-                        }
-                    }
-                    let label = if a == b {
-                        format!("message #{a}")
-                    } else {
-                        format!("messages #{a}-{b}")
-                    };
-                    ((!parts.is_empty()).then(|| parts.join("\n\n")), label)
-                }
-                _ => {
-                    host.info("usage: /copy [code | all | msg N[-M]]".to_string());
-                    return true;
-                }
-            };
-            let line = match text {
-                Some(t) if !t.is_empty() => host.copy_to_clipboard(&t, &label),
-                _ => format!("nothing to copy ({label})"),
-            };
-            host.info(line);
-        }
         "export" => {
             let agent = host.agent();
             let cwd = host.cwd();
@@ -423,39 +377,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             host.info("/init — exploring the project to write AGENTS.md…".to_string());
             host.send_prompt(INIT_PROMPT.to_string(), false);
-        }
-        "timestamps" | "ts" => {
-            use crate::TimestampStyle;
-            let style = match arg.to_ascii_lowercase().as_str() {
-                // No arg toggles between off and relative.
-                "" => {
-                    if host.timestamp_style() == TimestampStyle::None {
-                        TimestampStyle::Relative
-                    } else {
-                        TimestampStyle::None
-                    }
-                }
-                "none" | "off" | "hidden" => TimestampStyle::None,
-                "relative" | "rel" | "on" => TimestampStyle::Relative,
-                "exact" | "absolute" | "abs" => TimestampStyle::Exact,
-                _ => {
-                    host.info("usage: /timestamps [none | relative | exact]".to_string());
-                    return true;
-                }
-            };
-            host.set_timestamp_style(style);
-            host.persist_setting(
-                "timestamps",
-                hrdr_agent::ConfigValue::Str(style.as_config_str()),
-            );
-            host.info(
-                match style {
-                    TimestampStyle::None => "timestamps: off",
-                    TimestampStyle::Relative => "timestamps: relative",
-                    TimestampStyle::Exact => "timestamps: exact (HH:MM)",
-                }
-                .to_string(),
-            );
         }
         "todo-ttl" | "todottl" | "todos" => {
             if arg.is_empty() {
@@ -778,13 +699,6 @@ mod tests {
         busy: bool,
         model: hrdr_agent::ModelRef,
         input: String,
-        /// Fake transcript for `nth_message_text` (1-based, like the real thing).
-        messages: Vec<String>,
-        /// Counts `nth_message_text` calls — used to prove `/copy msg` bounds
-        /// its scan instead of walking the whole requested range.
-        nth_calls: std::cell::Cell<usize>,
-        /// What the last `copy_to_clipboard` call was asked to copy.
-        clipboard: Option<String>,
         /// Session prompt-cache figures, as `session_cache` reports them.
         cache: Option<(f64, usize, usize)>,
     }
@@ -808,9 +722,6 @@ mod tests {
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
-                messages: Vec::new(),
-                nth_calls: std::cell::Cell::new(0),
-                clipboard: None,
                 cache: None,
             }
         }
@@ -845,23 +756,6 @@ mod tests {
         fn set_session_label(&mut self, _name: String) {}
         fn autosave(&mut self) {}
         fn resume(&mut self, _id: String, _session: Session) {}
-        fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
-            self.clipboard = Some(text.to_string());
-            format!("copied {label}")
-        }
-        fn last_reply(&self) -> Option<String> {
-            None
-        }
-        fn transcript_text(&self) -> String {
-            String::new()
-        }
-        fn nth_message_text(&self, n: usize) -> Option<String> {
-            self.nth_calls.set(self.nth_calls.get() + 1);
-            if n == 0 {
-                return None;
-            }
-            self.messages.get(n - 1).cloned()
-        }
         fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send> {
             let log = self.async_log.clone();
             Box::new(move |_, line| {
@@ -1061,38 +955,6 @@ mod tests {
 
         assert!(dispatch(&mut host, "/add sub/nested.txt"));
         assert!(host.input.contains("nested content"), "{:?}", host.input);
-    }
-
-    /// A normal `/copy msg` range is unaffected by the bounded-scan fix.
-    #[tokio::test]
-    async fn copy_msg_range_valid_returns_expected_text() {
-        let mut host = TestHost::new(std::env::temp_dir());
-        host.messages = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-
-        assert!(dispatch(&mut host, "/copy msg 1-2"));
-        assert_eq!(host.clipboard.as_deref(), Some("one\n\ntwo"));
-    }
-
-    /// `/copy msg N-M` with an upper bound far past the transcript must not
-    /// call `nth_message_text` once per number in the requested range — each
-    /// call scans the transcript, and a huge range (`/copy msg
-    /// 1-99999999999999`) used to do that once per number, freezing the UI
-    /// thread. It must stop scanning at the first miss instead, so the total
-    /// work stays bounded by the real message count.
-    #[tokio::test]
-    async fn copy_msg_huge_upper_bound_does_not_scan_unbounded_range() {
-        let mut host = TestHost::new(std::env::temp_dir());
-        host.messages = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-
-        assert!(dispatch(&mut host, "/copy msg 1-99999999999999"));
-
-        assert_eq!(host.clipboard.as_deref(), Some("one\n\ntwo\n\nthree"));
-        assert!(
-            host.nth_calls.get() <= host.messages.len() + 1,
-            "nth_message_text was called {} times for a 3-message transcript \
-             with an absurd upper bound — the scan must stop at the first miss",
-            host.nth_calls.get()
-        );
     }
 
     /// `cmd.exe` treats `&` as a command separator even when the argument

@@ -823,7 +823,7 @@ pub(crate) struct FileConfig {
     // always ignored the other's keys — but `deny_unknown_fields` cannot tell
     // "a key that belongs to the other layer" from "a typo", and turning it on
     // made every display setting a fatal startup error: a config with
-    // `timestamps = "relative"` in it refused to start, naming a list of valid
+    // `statusbar = "truncate"` in it refused to start, naming a list of valid
     // keys that did not include the one the user had written.
     //
     // So they are declared, and ignored. That keeps `deny_unknown_fields`
@@ -838,8 +838,6 @@ pub(crate) struct FileConfig {
     pub(crate) _ui_theme: Option<toml::Value>,
     #[serde(default, rename = "icons")]
     pub(crate) _ui_icons: Option<toml::Value>,
-    #[serde(default, rename = "timestamps")]
-    pub(crate) _ui_timestamps: Option<toml::Value>,
     #[serde(default, rename = "statusbar")]
     pub(crate) _ui_statusbar: Option<toml::Value>,
     #[serde(default, rename = "bell")]

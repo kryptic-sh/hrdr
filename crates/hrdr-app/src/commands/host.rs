@@ -78,22 +78,6 @@ pub trait CommandHost {
     /// Restore a resolved session (rebuild the transcript, adopt id/model/label).
     fn resume(&mut self, id: String, session: Session);
 
-    /// Copy `text` to the OS clipboard, returning a status line.
-    fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String;
-    /// The most recent assistant reply, if any.
-    fn last_reply(&self) -> Option<String>;
-    /// The whole transcript as plain text (for `/copy all`).
-    fn transcript_text(&self) -> String;
-    /// The Nth (1-based) user/assistant message's text (for `/copy msg N[-M]`).
-    fn nth_message_text(&self, n: usize) -> Option<String>;
-    /// The most recent fenced code block (for `/copy code`). Default: from the
-    /// last reply only; frontends may search further back.
-    fn last_code_block(&self) -> Option<String> {
-        self.last_reply()
-            .as_deref()
-            .and_then(crate::last_fenced_block)
-    }
-
     /// A `Send`able closure that delivers an async result line onto the UI
     /// thread through the frontend's channel — the one primitive behind the
     /// [`spawn_line`](Self::spawn_line)/[`spawn_diff`](Self::spawn_diff)
@@ -216,15 +200,6 @@ pub trait CommandHost {
         self.start_compaction(instructions);
     }
 
-    /// Current per-message timestamp style (frontends with timestamp rendering
-    /// override the pair).
-    fn timestamp_style(&self) -> crate::TimestampStyle {
-        crate::TimestampStyle::Relative
-    }
-    /// Apply a timestamp style (persistence is dispatch's job).
-    fn set_timestamp_style(&mut self, style: crate::TimestampStyle) {
-        let _ = style;
-    }
     /// Turns a completed TODO stays visible before pruning.
     fn todo_ttl(&self) -> u64 {
         crate::DEFAULT_TODO_TTL_TURNS

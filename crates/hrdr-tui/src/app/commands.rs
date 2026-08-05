@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::theme::Theme;
-use hrdr_app::{CommandHost, last_fenced_block, resolve_alias, resolve_under};
+use hrdr_app::{CommandHost, resolve_alias, resolve_under};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -21,7 +21,6 @@ impl super::App {
         match cmd {
             "edit" => self.edit_file_cmd(arg),
             "reload" => self.reload_cmd(),
-            "goto" => self.goto_cmd(arg),
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),
             "prev" | "previous" => self.find_cycle(false),
@@ -166,15 +165,6 @@ impl super::App {
             hrdr_agent::ProjectInstructions::Load,
         );
     }
-    /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
-    /// number, to the message nearest a relative time ago, or to top/bottom
-    /// (shared [`hrdr_app::goto_action`] core; only the scrolling is local).
-    fn goto_cmd(&mut self, arg: &str) {
-        let act = hrdr_app::goto_action(arg, self.display_message_count(), |cutoff| {
-            self.first_message_since(cutoff)
-        });
-        self.apply_find_action(act);
-    }
     /// `/find <text>` — search the transcript and jump to the next match
     /// (case-insensitive). No arg cycles to the next match of the current query;
     /// `/find clear` (or `off`/`discard`) drops the search + highlight.
@@ -196,7 +186,7 @@ impl super::App {
         self.find = st;
         self.apply_find_action(act);
     }
-    /// Route a resolved find/goto action to the TUI's scroll primitives.
+    /// Route a resolved find action to the TUI's scroll primitives.
     fn apply_find_action(&mut self, act: hrdr_app::FindAction) {
         match act {
             hrdr_app::FindAction::Info(line) => self.system(line),
@@ -204,57 +194,9 @@ impl super::App {
                 self.pending_goto = Some(msg);
                 self.system(line);
             }
-            hrdr_app::FindAction::Bottom { line } => {
-                self.scroll_offset = 0; // follow newest
-                self.system(line);
-            }
         }
     }
-    // These read *the conversation on screen*, like every other command: `/copy
-    // msg 3` in a sub-agent's view means that agent's third message.
-    /// Number of user/assistant messages in the transcript.
-    fn display_message_count(&self) -> usize {
-        hrdr_app::message_count(self.panes.active_transcript())
-    }
-    /// The number of the first user/assistant message sent at/after `cutoff`.
-    fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
-        hrdr_app::first_message_since(self.panes.active_transcript(), cutoff)
-    }
-    /// The text of the Nth (1-based) user/assistant message in the transcript.
-    fn nth_message_text(&self, n: usize) -> Option<String> {
-        hrdr_app::nth_message_text(self.panes.active_transcript(), n)
-    }
-    /// Write `text` to the system clipboard, returning a status line (used by the
-    /// shared `/copy` via [`hrdr_app::CommandHost`]).
-    pub(super) fn clipboard_status(&mut self, text: &str, label: &str) -> String {
-        hrdr_app::clipboard_copy_status(&mut self.clipboard, text, label)
-    }
-    /// The most recent assistant message text.
-    fn last_assistant_text(&self) -> Option<String> {
-        self.panes
-            .active_transcript()
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
-                EntryKind::Assistant(s) => Some(s.clone()),
-                _ => None,
-            })
-    }
-    /// The most recent fenced code block across assistant messages.
-    fn last_code_block(&self) -> Option<String> {
-        self.panes
-            .active_transcript()
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
-                EntryKind::Assistant(s) => last_fenced_block(s),
-                _ => None,
-            })
-    }
-    /// A plain-text rendering of the conversation for `/copy all`.
-    fn transcript_text(&self) -> String {
-        hrdr_app::transcript_to_text(self.panes.active_transcript())
-    }
+    // These read *the conversation on screen*, like every other command.
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
     fn edit_file_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
@@ -377,22 +319,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let path = hrdr_app::session_file_path(&session.state.cwd, &id);
         self.app.resume_locked_path(id, &path);
     }
-    fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
-        self.app.clipboard_status(text, label)
-    }
-    fn last_reply(&self) -> Option<String> {
-        self.app.last_assistant_text()
-    }
-    fn transcript_text(&self) -> String {
-        self.app.transcript_text()
-    }
-    fn nth_message_text(&self, n: usize) -> Option<String> {
-        self.app.nth_message_text(n)
-    }
-    fn last_code_block(&self) -> Option<String> {
-        // Richer than the default: searches back across assistant messages.
-        self.app.last_code_block()
-    }
     fn supports_command(&self, _cmd: &str) -> bool {
         true // the TUI implements the full registry
     }
@@ -475,12 +401,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
         self.app.arm_file_watcher(new);
         self.app.skills = hrdr_app::discover_skills(new, hrdr_agent::ProjectInstructions::Load);
-    }
-    fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
-        self.app.timestamp_style
-    }
-    fn set_timestamp_style(&mut self, style: hrdr_app::TimestampStyle) {
-        self.app.timestamp_style = style;
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl

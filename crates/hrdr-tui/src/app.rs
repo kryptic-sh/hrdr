@@ -97,7 +97,7 @@ pub(crate) enum LoginModal {
 
 // The display-mode enums live in the shared `hrdr-app` core so every frontend
 // resolve/persist these settings identically.
-pub(crate) use hrdr_app::{StatusBarMode, TimestampStyle};
+pub(crate) use hrdr_app::StatusBarMode;
 
 /// What a key press asks the driver to do (for actions needing the terminal).
 /// Returned by [`App::on_key`] so the render/terminal layer stays outside `App`.
@@ -449,7 +449,6 @@ pub(crate) struct App {
     /// re-anchoring per frame would pin the animation's tick at 0.
     pub(crate) header_anchor: Instant,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
-    pub(crate) timestamp_style: TimestampStyle,
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
     pub(crate) statusbar_mode: StatusBarMode,
     // ---- status bar info ----
@@ -707,7 +706,6 @@ impl App {
         let bell = ui.bell;
         let todo_ttl = ui.todo_ttl;
         let scrollback = ui.scrollback;
-        let timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
         let statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
@@ -799,7 +797,6 @@ impl App {
             theme,
             logo,
             header_anchor: Instant::now(),
-            timestamp_style,
             statusbar_mode,
             dir,
             branch,
@@ -2261,7 +2258,6 @@ impl App {
         });
         self.bell = ui.bell;
         self.todo_ttl = ui.todo_ttl;
-        self.timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
         self.statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
         self.icon_mode = ui
             .icons

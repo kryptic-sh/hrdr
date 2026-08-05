@@ -82,7 +82,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
-    ("/timestamps", "set timestamps (none|relative|exact)"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
     ("/todo-ttl", "turns a finished todo stays shown"),
     ("/reload", "reload AGENTS.md + config"),
@@ -91,11 +90,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "session info"),
     ("/cost", "session token usage"),
     ("/doctor", "check health: endpoint, deps, config"),
-    ("/goto", "jump to message N or time (5m/1h/top/end)"),
     ("/find", "jump to text (or 'clear' to drop search)"),
     ("/next", "jump to next /find match"),
     ("/prev", "jump to previous /find match"),
-    ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
     ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
@@ -118,7 +115,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Session",
         &[
-            "/new", "/resume", "/rename", "/compact", "/status", "/goto", "/find", "/next", "/prev",
+            "/new", "/resume", "/rename", "/compact", "/status", "/find", "/next", "/prev",
         ],
     ),
     (
@@ -131,11 +128,8 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/init", "/add", "/edit", "/diff", "/cwd", "/tools", "/verbose", "/paste",
         ],
     ),
-    ("Reply", &["/copy", "/export", "/cost"]),
-    (
-        "Appearance",
-        &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
-    ),
+    ("Reply", &["/export", "/cost"]),
+    ("Appearance", &["/theme", "/statusbar", "/todo-ttl"]),
     (
         "Other",
         &["/skills", "/reload", "/help", "/doctor", "/exit"],

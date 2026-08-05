@@ -6,7 +6,7 @@
 //!
 //! # Validation policy
 //!
-//! The enum-like display settings (`icons`, `timestamps`, `statusbar`) are
+//! The enum-like display settings (`icons`, `statusbar`) are
 //! validated by [`UiConfig::validate`]: an unrecognized value produces a
 //! **warning** that names the valid options, rather than silently falling back
 //! to the default. These are cosmetic per-frontend preferences — a typo should
@@ -39,9 +39,6 @@ pub struct UiConfig {
     /// Icon set for the TUI: `nerd` (default), `unicode`, or `ascii`. `None`
     /// resolves to nerd (there's no portable way to probe the terminal font).
     pub icons: Option<String>,
-    /// Per-message timestamp style: `none`, `relative` (default), or `exact`
-    /// (see [`TimestampStyle`]).
-    pub timestamps: Option<String>,
     /// Status-bar mode: `none`, `truncate` (default), or `wrap` (see
     /// [`StatusBarMode`]).
     pub statusbar: Option<String>,
@@ -65,7 +62,6 @@ impl Default for UiConfig {
             vim_mode: false,
             theme: None,
             icons: None,
-            timestamps: None,
             statusbar: None,
             bell: true,
             auto_resume: true,
@@ -83,7 +79,6 @@ struct UiFileConfig {
     vim: Option<bool>,
     theme: Option<String>,
     icons: Option<String>,
-    timestamps: Option<String>,
     statusbar: Option<String>,
     bell: Option<bool>,
     auto_resume: Option<bool>,
@@ -113,7 +108,7 @@ impl UiConfig {
     }
 
     /// Warn about unrecognized enum-like settings, naming the valid options for
-    /// each (`icons`, `timestamps`, `statusbar`). A warning, not an error: the
+    /// each (`icons`, `statusbar`). A warning, not an error: the
     /// setting falls back to its default (see the [module docs](self)). Checks
     /// the resolved value, so it covers both the config file and `HRDR_*` env.
     pub fn validate(&self) -> Vec<String> {
@@ -147,15 +142,6 @@ impl UiConfig {
         );
         check(
             &mut warnings,
-            "timestamps",
-            self.timestamps.as_deref(),
-            &[
-                "none", "off", "hidden", "false", "0", "relative", "exact", "absolute", "abs",
-            ],
-            "none, relative, exact",
-        );
-        check(
-            &mut warnings,
             "statusbar",
             self.statusbar.as_deref(),
             &["none", "off", "hidden", "truncate", "wrap"],
@@ -173,9 +159,6 @@ impl UiConfig {
         }
         if let Some(v) = fc.icons {
             self.icons = Some(v);
-        }
-        if let Some(v) = fc.timestamps {
-            self.timestamps = Some(v);
         }
         if let Some(v) = fc.statusbar {
             self.statusbar = Some(v);
@@ -209,7 +192,6 @@ type UiEnvSetter = fn(&mut UiConfig, String);
 const UI_ENV_SETTERS: &[(&str, UiEnvSetter)] = &[
     ("HRDR_THEME", |c, v| c.theme = Some(v)),
     ("HRDR_ICONS", |c, v| c.icons = Some(v)),
-    ("HRDR_TIMESTAMPS", |c, v| c.timestamps = Some(v)),
     ("HRDR_STATUSBAR", |c, v| c.statusbar = Some(v)),
     ("HRDR_BELL", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
@@ -232,38 +214,6 @@ const UI_ENV_SETTERS: &[(&str, UiEnvSetter)] = &[
         }
     }),
 ];
-
-/// Per-message timestamp display style.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum TimestampStyle {
-    /// No timestamps/numbers.
-    None,
-    /// Relative (`now`, `2m ago`, `3h ago`).
-    Relative,
-    /// Exact local time (`HH:MM`).
-    Exact,
-}
-
-impl TimestampStyle {
-    /// Resolve from a config string; anything unrecognized (incl. `None`) is
-    /// `Relative` — the default.
-    pub fn from_config(s: Option<&str>) -> Self {
-        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
-            Some("none" | "off" | "hidden" | "false" | "0") => Self::None,
-            Some("exact" | "absolute" | "abs") => Self::Exact,
-            _ => Self::Relative,
-        }
-    }
-
-    /// Canonical config string, for persistence (round-trips `from_config`).
-    pub fn as_config_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Relative => "relative",
-            Self::Exact => "exact",
-        }
-    }
-}
 
 /// How the status bar behaves when it doesn't fit the terminal width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -308,7 +258,6 @@ mod tests {
             vim = true
             theme = "dark"
             icons = "ascii"
-            timestamps = "exact"
             statusbar = "wrap"
             bell = false
             auto_resume = false
@@ -324,7 +273,6 @@ mod tests {
         assert!(cfg.vim_mode);
         assert_eq!(cfg.theme.as_deref(), Some("dark"));
         assert_eq!(cfg.icons.as_deref(), Some("ascii"));
-        assert_eq!(cfg.timestamps.as_deref(), Some("exact"));
         assert_eq!(cfg.statusbar.as_deref(), Some("wrap"));
         assert!(!cfg.bell);
         assert!(!cfg.auto_resume);
@@ -343,7 +291,7 @@ mod tests {
     /// The regression this exists for: `deny_unknown_fields` went onto the
     /// agent's `FileConfig` to make a typo fail loudly, and made every *display*
     /// setting fail loudly too. A config that had worked for months —
-    /// `timestamps = "relative"`, `theme = "tokyonight"` — refused to start, and
+    /// `statusbar = "truncate"`, `theme = "tokyonight"` — refused to start, and
     /// the error helpfully listed the valid keys, none of which was the one the
     /// user had written. The two layers cannot see each other's structs (the
     /// dependency runs one way), so this walks every key the UI parses through
@@ -356,7 +304,6 @@ mod tests {
             vim = true
             theme = "tokyonight"
             icons = "nerd"
-            timestamps = "relative"
             statusbar = "truncate"
             bell = true
             auto_resume = true
@@ -367,7 +314,7 @@ mod tests {
         let ui: UiFileConfig = toml::from_str(UI_KEYS).expect("the UI parses its own keys");
         let mut cfg = UiConfig::default();
         cfg.apply_file(ui);
-        assert_eq!(cfg.timestamps.as_deref(), Some("relative"));
+        assert_eq!(cfg.statusbar.as_deref(), Some("truncate"));
 
         // …and the AGENT accepts the same file rather than refusing to start.
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -390,43 +337,19 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_style_from_config() {
-        assert_eq!(
-            TimestampStyle::from_config(Some("off")),
-            TimestampStyle::None
-        );
-        assert_eq!(
-            TimestampStyle::from_config(Some("ABS")),
-            TimestampStyle::Exact
-        );
-        assert_eq!(TimestampStyle::from_config(None), TimestampStyle::Relative);
-        assert_eq!(
-            TimestampStyle::from_config(Some("garbage")),
-            TimestampStyle::Relative
-        );
-    }
-
-    #[test]
     fn unknown_enum_values_warn_naming_valid_options() {
         let mut cfg = UiConfig {
             icons: Some("nerdfont".to_string()),
-            timestamps: Some("fuzzy".to_string()),
             statusbar: Some("compact".to_string()),
             ..Default::default()
         };
         let warnings = cfg.validate();
         // Every bad enum is reported together, each naming its valid options.
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings
                 .iter()
                 .any(|w| w.contains("icons") && w.contains("nerd, unicode, ascii")),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("timestamps") && w.contains("none, relative, exact")),
             "{warnings:?}"
         );
         assert!(
@@ -439,7 +362,6 @@ mod tests {
         // Recognized values (including aliases and case/whitespace) warn about
         // nothing; unset fields are silent.
         cfg.icons = Some("ASCII".to_string());
-        cfg.timestamps = Some(" abs ".to_string());
         cfg.statusbar = None;
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
@@ -459,13 +381,6 @@ mod tests {
 
     #[test]
     fn config_strings_round_trip() {
-        for s in [
-            TimestampStyle::None,
-            TimestampStyle::Relative,
-            TimestampStyle::Exact,
-        ] {
-            assert_eq!(TimestampStyle::from_config(Some(s.as_config_str())), s);
-        }
         for m in [
             StatusBarMode::None,
             StatusBarMode::Truncate,

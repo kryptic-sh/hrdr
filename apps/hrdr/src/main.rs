@@ -223,10 +223,6 @@ struct Cli {
     #[arg(long, global = true)]
     icons: Option<String>,
 
-    /// Per-message timestamp style: none, relative (default), or exact.
-    #[arg(long, global = true)]
-    timestamps: Option<String>,
-
     /// Status-bar mode: none, truncate (default), or wrap.
     #[arg(long, global = true)]
     statusbar: Option<String>,
@@ -695,9 +691,6 @@ async fn main() -> Result<()> {
     }
     if let Some(i) = cli.icons {
         ui.icons = Some(i);
-    }
-    if let Some(t) = cli.timestamps {
-        ui.timestamps = Some(t);
     }
     if let Some(s) = cli.statusbar {
         ui.statusbar = Some(s);

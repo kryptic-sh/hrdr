@@ -472,41 +472,6 @@ pub fn find_hits(entries: &[Entry], query: &str) -> Vec<usize> {
     hits
 }
 
-/// Number of user/assistant messages in the transcript.
-pub fn message_count(entries: &[Entry]) -> usize {
-    entries
-        .iter()
-        .filter(|e| e.message_text().is_some())
-        .count()
-}
-
-/// The text of the Nth (1-based) user/assistant message, if any.
-pub fn nth_message_text(entries: &[Entry], n: usize) -> Option<String> {
-    if n == 0 {
-        return None;
-    }
-    entries
-        .iter()
-        .filter_map(Entry::message_text)
-        .nth(n - 1)
-        .map(str::to_string)
-}
-
-/// The number of the first user/assistant message stamped at/after `cutoff`.
-/// `times` is parallel to `entries` (index i is entry i's local timestamp).
-pub fn first_message_since(entries: &[Entry], cutoff: DateTime<Local>) -> Option<usize> {
-    let mut num = 0;
-    for e in entries {
-        if e.message_text().is_some() {
-            num += 1;
-            if e.time >= cutoff {
-                return Some(num);
-            }
-        }
-    }
-    None
-}
-
 /// The transcript as Markdown-ish text (user/assistant/system/diff/tool lines;
 /// reasoning and stats are omitted). Used by `/copy all` and `/export`.
 pub fn transcript_to_text(entries: &[Entry]) -> String {
@@ -747,23 +712,6 @@ mod tests {
             Entry::assistant("Done — it was an off-by-one."),
             Entry::user("thanks"),
         ]
-    }
-
-    #[test]
-    fn message_count_and_nth_skip_non_messages() {
-        let e = sample();
-        assert_eq!(message_count(&e), 3); // 2 user + 1 assistant
-        assert_eq!(
-            nth_message_text(&e, 1).as_deref(),
-            Some("Fix the parser bug")
-        );
-        assert_eq!(
-            nth_message_text(&e, 2).as_deref(),
-            Some("Done — it was an off-by-one.")
-        );
-        assert_eq!(nth_message_text(&e, 3).as_deref(), Some("thanks"));
-        assert_eq!(nth_message_text(&e, 0), None);
-        assert_eq!(nth_message_text(&e, 4), None);
     }
 
     #[test]

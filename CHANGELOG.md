@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **`/goto`, `/copy` and `/timestamps` are removed, along with the message
+  numbers and timestamp labels they depended on.** Message footers
+  (`#97 assistant · 2m ago`, `#N you · …`) no longer render — the user and
+  assistant surfaces are already distinct by color — so there is nothing on
+  screen to reference a number or a timestamp against. `/find`/`/next`/`/prev`
+  stay (they search by text, not number). The `timestamps` config key,
+  `$HRDR_TIMESTAMPS` and `--timestamps` are gone too, and the loader's "started
+  …" segment is always relative. The LSP diagnostics cap is raised to ten lines
+  (`…and N more` after that).
+
 - **The `/thinking` command and its `show_thinking` setting are gone; `/verbose`
   owns the thinking display.** There is no separate show/hide for reasoning any
   more: `/verbose on` expands every tool block _and_ shows the model's thinking,

@@ -1008,18 +1008,6 @@ mod tests {
         fn set_session_label(&mut self, _name: String) {}
         fn autosave(&mut self) {}
         fn resume(&mut self, _id: String, _session: crate::Session) {}
-        fn copy_to_clipboard(&mut self, _text: &str, _label: &str) -> String {
-            String::new()
-        }
-        fn last_reply(&self) -> Option<String> {
-            None
-        }
-        fn transcript_text(&self) -> String {
-            String::new()
-        }
-        fn nth_message_text(&self, _n: usize) -> Option<String> {
-            None
-        }
         fn line_poster(&self) -> Box<dyn Fn(crate::commands::LineKind, String) + Send> {
             Box::new(|_, _| {})
         }
