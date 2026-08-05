@@ -1001,10 +1001,6 @@ mod tests {
         fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
             self.model = reference;
         }
-        fn show_thinking(&self) -> bool {
-            false
-        }
-        fn set_show_thinking(&mut self, _on: bool) {}
         fn clear_conversation(&mut self) {}
         fn session_id(&self) -> Option<String> {
             None

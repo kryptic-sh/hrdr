@@ -489,7 +489,8 @@ pub(crate) struct App {
     /// invalidate the `@file` index. `None` when no watcher could be
     /// established — completion then refreshes only on cwd changes.
     file_watcher: Option<notify::RecommendedWatcher>,
-    /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
+    /// Whether to render the model's reasoning (`<think>`) blocks in full
+    /// (`/verbose on`; otherwise a folded summary entry).
     pub(crate) show_reasoning: bool,
     /// Show every tool result in full (`/verbose on`); per-entry `expanded`
     /// overrides this for individual results.
@@ -602,11 +603,16 @@ pub(crate) struct App {
     /// (the summary header or one of its rendered calls) folds or fans out the
     /// whole group.
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
-    /// Tool ids of group heads whose tool group is EXPANDED (showing each call
-    /// as its one-liner). A multi-tool group collapses behind a single
-    /// `called N tools · read 2 files` summary line until toggled — view state,
-    /// keyed by the stable tool-call id of the group's first entry.
+    /// Tool groups the reader opened (keyed by the head tool-call id). While a
+    /// group is open its calls render as child items inside its summary; a
+    /// click on the summary toggles it. Session-lifetime view state — never
+    /// persisted.
     pub(crate) tool_groups: std::collections::HashSet<String>,
+    /// Thinking entries the reader opened while reasoning is hidden: a
+    /// collapsed `✓ Thought for 1m 32s · 2m ago` summary shows its full block
+    /// instead. Keyed by the entry's content hash (reasoning entries carry no
+    /// id); `expand_tools` (via `/verbose on`) shows every thought at once.
+    pub(crate) thinking_open: std::collections::HashSet<u64>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
     /// Shared registry of *detached background* sub-agents (a clone of the
@@ -695,7 +701,6 @@ impl App {
         let auto_resume = ui.auto_resume;
         let bell = ui.bell;
         let todo_ttl = ui.todo_ttl;
-        let show_thinking = ui.show_thinking;
         let scrollback = ui.scrollback;
         let timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
         let statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
@@ -805,7 +810,7 @@ impl App {
             file_index_building: false,
             file_index_dirty: false,
             file_watcher: None,
-            show_reasoning: show_thinking,
+            show_reasoning: false,
             expand_tools: false,
             pending_edit: None,
             model_selector: None,
@@ -844,6 +849,7 @@ impl App {
             end_button: None,
             tool_hits: Vec::new(),
             tool_groups: std::collections::HashSet::new(),
+            thinking_open: std::collections::HashSet::new(),
             transcript_rect: HitRect {
                 x: 0,
                 y: 0,
@@ -1783,7 +1789,8 @@ impl App {
     /// Toggle the expansion of the tool block under `(col, row)`, if a click
     /// landed on one. A click on a tool GROUP's summary header toggles the
     /// whole group (the `called N tools` line appears or the calls fan out);
-    /// a click on an individual block toggles that call's full output.
+    /// a click on an individual block toggles that call's full output. A click
+    /// on a folded thinking summary opens (or closes) that one thought.
     fn toggle_tool_at(&mut self, col: u16, row: u16) {
         let hit = self
             .tool_hits
@@ -1791,6 +1798,17 @@ impl App {
             .find(|(r, _)| r.contains(col, row))
             .map(|(_, h)| *h);
         let Some(hit) = hit else { return };
+        let transcript = self.panes.active_transcript();
+        // A hidden thought's summary toggles its own expansion, keyed by the
+        // entry's content hash (reasoning entries carry no id).
+        if let EntryKind::Reasoning { .. } = &transcript[hit].kind {
+            let hash = transcript[hit].content_hash;
+            if !self.thinking_open.remove(&hash) {
+                self.thinking_open.insert(hash);
+            }
+            self.pending_scroll_entry = Some(hit);
+            return;
+        }
         // One expansion level: any click on a grouped tool — the summary
         // header or one of its rendered calls — folds or fans out the whole
         // group, keyed by the group head's tool-call id.
@@ -2236,7 +2254,6 @@ impl App {
         self.todo_ttl = ui.todo_ttl;
         self.timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
         self.statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
-        self.show_reasoning = ui.show_thinking;
         self.icon_mode = ui
             .icons
             .as_deref()

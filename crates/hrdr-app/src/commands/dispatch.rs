@@ -217,25 +217,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 }
             }));
         }
-        "thinking" | "reasoning" | "think" => {
-            let on = if arg.is_empty() {
-                !host.show_thinking()
-            } else if let Some(b) = hrdr_agent::parse_env_bool(&arg) {
-                b
-            } else {
-                host.info("usage: /thinking [on | off]".to_string());
-                return true;
-            };
-            host.set_show_thinking(on);
-            host.info(
-                if on {
-                    "thinking shown"
-                } else {
-                    "thinking hidden"
-                }
-                .to_string(),
-            );
-        }
         "temp" | "temperature" => {
             if arg.is_empty() {
                 let agent = host.agent();
@@ -362,11 +343,11 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             host.info(format!("cwd → {}", new.display()));
         }
         "verbose" => {
-            // A strict on/off toggle, mirroring `/thinking`: a bare `/verbose`
-            // flips the current state, `on`/`off` set it. On expands every tool
-            // block; off collapses them and hands the display back to per-block
-            // clicking. The frontend owns the expansion state, so it reads it
-            // back to decide which way a bare flip goes.
+            // A strict on/off toggle: a bare `/verbose` flips the current
+            // state, `on`/`off` set it. On expands every tool block and shows
+            // the model's thinking; off collapses them and hands the display
+            // back to per-block clicking. The frontend owns the expansion
+            // state, so it reads it back to decide which way a bare flip goes.
             let on = if arg.is_empty() {
                 !host.tool_expansion_on()
             } else if let Some(b) = hrdr_agent::parse_env_bool(&arg) {
@@ -857,10 +838,6 @@ mod tests {
         fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
             self.model = reference;
         }
-        fn show_thinking(&self) -> bool {
-            false
-        }
-        fn set_show_thinking(&mut self, _on: bool) {}
         fn clear_conversation(&mut self) {}
         fn session_id(&self) -> Option<String> {
             None

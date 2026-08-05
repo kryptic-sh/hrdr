@@ -245,10 +245,6 @@ struct Cli {
     #[arg(long, global = true)]
     session_purge_after: Option<u64>,
 
-    /// Show the model's `<think>` reasoning: on/off/1/0 (default on).
-    #[arg(long = "show-thinking", global = true, value_name = "on|off")]
-    show_thinking: Option<String>,
-
     /// Print shell completions to stdout and exit
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
     completions: Option<CompletionShell>,
@@ -717,13 +713,6 @@ async fn main() -> Result<()> {
     }
     if let Some(n) = cli.session_purge_after {
         config.session_purge_after = Some(n);
-    }
-    if let Some(v) = cli
-        .show_thinking
-        .as_deref()
-        .and_then(hrdr_agent::parse_env_bool)
-    {
-        ui.show_thinking = v;
     }
 
     if remote_provider && config.has_default_model() {

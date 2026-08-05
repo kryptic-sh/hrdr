@@ -132,16 +132,21 @@ impl super::App {
     }
     /// Apply a `/verbose` mode (shared dispatch parses the arg), returning the
     /// status line. `expand_tools` is the sticky all-on flag; per-entry
-    /// expansion lives on the Tool entries.
+    /// expansion lives on the Tool entries. On also shows the model's thinking
+    /// (there is no separate `/thinking` toggle any more); off hides it again
+    /// and folds every per-entry expansion back behind its summary.
     pub(super) fn apply_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
         match mode {
             hrdr_app::ExpandMode::All => {
                 self.expand_tools = true;
+                self.show_reasoning = true;
                 hrdr_app::expand_msg::ALL.to_string()
             }
             hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
                 self.tool_groups.clear();
+                self.thinking_open.clear();
+                self.show_reasoning = false;
                 hrdr_app::expand_msg::OFF.to_string()
             }
         }
@@ -344,16 +349,8 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn set_model_ref(&mut self, reference: hrdr_agent::ModelRef) {
         self.app.set_active_model_ref(reference);
     }
-    fn show_thinking(&self) -> bool {
-        self.app.show_reasoning
-    }
     fn tool_expansion_on(&self) -> bool {
         self.app.expand_tools
-    }
-    fn set_show_thinking(&mut self, on: bool) {
-        self.app.show_reasoning = on;
-        self.app
-            .persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
     }
     fn clear_conversation(&mut self) {
         self.app.clear_all();

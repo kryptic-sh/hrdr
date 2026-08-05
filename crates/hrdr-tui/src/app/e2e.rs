@@ -978,11 +978,10 @@ async fn init_runs_a_hidden_turn_without_a_visible_user_entry() {
 }
 
 #[tokio::test]
-async fn reasoning_hidden_in_render_after_toggle() {
-    // Reasoning is hidden by default now (the config default is off). After
-    // /reasoning, reasoning text must not appear in the rendered buffer even
-    // though EntryKind::Reasoning is still stored (the entry is skipped at draw
-    // time).
+async fn reasoning_hidden_shows_a_summary_until_verbose() {
+    // Reasoning is hidden by default (there is no /thinking toggle any more):
+    // the thought is stored as EntryKind::Reasoning but renders as a folded
+    // summary line — never the raw text — until /verbose on shows it.
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "secret thought".to_string(),
         text: "visible reply".to_string(),
@@ -992,12 +991,6 @@ async fn reasoning_hidden_in_render_after_toggle() {
         !h.app.show_reasoning,
         "show_reasoning must default to false"
     );
-    h.app.show_reasoning = true; // the state this test's flow assumes
-    h.submit("/reasoning").await;
-    assert!(
-        !h.app.show_reasoning,
-        "show_reasoning should be false after first /reasoning"
-    );
     h.submit("think aloud").await;
     assert!(!h.app.running());
     let screen = h.render();
@@ -1006,39 +999,27 @@ async fn reasoning_hidden_in_render_after_toggle() {
         "reasoning leaked into render when disabled:\n{screen}"
     );
     assert!(
+        screen.contains("Thought for"),
+        "the hidden thought leaves a summary entry:\n{screen}"
+    );
+    assert!(
         screen.contains("visible reply"),
         "text reply missing from render:\n{screen}"
     );
-    // Toggling again re-enables display.
-    h.submit("/reasoning").await;
+    // /verbose on shows the thinking in full — there is no separate toggle.
+    h.submit("/verbose on").await;
+    assert!(h.app.show_reasoning, "/verbose on shows reasoning");
+    let screen = h.render();
     assert!(
-        h.app.show_reasoning,
-        "show_reasoning should be true after second /reasoning"
+        screen.contains("secret thought"),
+        "/verbose on must render the thinking:\n{screen}"
     );
-}
-
-/// `/thinking`'s choice persists to `config.toml`: the file gets the bool and a
-/// fresh `UiConfig::load()` reads it back, both directions (default is off, so
-/// a stored `true` is the proof the write happened).
-#[tokio::test]
-async fn thinking_toggle_persists_to_config() {
-    let mut h = Harness::new(vec![]).await;
-    assert!(!h.app.show_reasoning, "default off");
-
-    h.submit("/thinking on").await;
-    assert!(h.app.show_reasoning, "the toggle applied");
-    let cfg = hrdr_app::UiConfig::load();
+    // /verbose off folds it back behind the summary.
+    h.submit("/verbose off").await;
+    assert!(!h.app.show_reasoning, "/verbose off hides reasoning");
     assert!(
-        cfg.show_thinking,
-        "/thinking on must write show_thinking = true to config.toml"
-    );
-
-    h.submit("/thinking off").await;
-    assert!(!h.app.show_reasoning, "the toggle applied again");
-    let cfg = hrdr_app::UiConfig::load();
-    assert!(
-        !cfg.show_thinking,
-        "/thinking off must write show_thinking = false to config.toml"
+        !h.render().contains("secret thought"),
+        "reasoning leaked after /verbose off"
     );
 }
 
@@ -1101,6 +1082,18 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
     assert!(h.app.expand_tools, "/verbose on sets the mode on");
     h.submit("/verbose").await;
     assert!(!h.app.expand_tools, "a bare /verbose flips back off");
+    // /verbose owns the thinking display too: on shows it, off hides it.
+    assert!(
+        !h.app.show_reasoning,
+        "a bare /verbose flip-off also hides reasoning"
+    );
+    h.submit("/verbose on").await;
+    assert!(
+        h.app.show_reasoning,
+        "/verbose on shows reasoning as well as tools"
+    );
+    h.submit("/verbose off").await;
+    assert!(!h.app.show_reasoning, "/verbose off hides reasoning again");
 }
 
 #[tokio::test]
@@ -3173,7 +3166,13 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
                 .contains("called 1 tool")
         })
         .expect("tool summary rendered");
-    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    let (rect, _) = h
+        .app
+        .tool_hits
+        .iter()
+        .copied()
+        .find(|(r, _)| r.contains(2, summary_y))
+        .expect("a tool hit rect on the summary");
     assert!(
         rect.contains(2, summary_y),
         "the tool hit rect misses the summary at row {summary_y}"
@@ -3195,7 +3194,13 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
                 .contains("✓ bash")
         })
         .expect("tool header rendered after expansion");
-    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    let (rect, _) = h
+        .app
+        .tool_hits
+        .iter()
+        .copied()
+        .find(|(r, _)| r.contains(2, header_y))
+        .expect("a tool hit rect on the header");
     assert!(
         rect.contains(2, header_y),
         "the tool hit rect misses the tool header at row {header_y}"
@@ -3540,20 +3545,14 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
         modifiers: crossterm::event::KeyModifiers::empty(),
     };
 
-    // Press on the tool header, drag two cells along it, release.
-    h.app.on_mouse(mouse(
-        MouseEventKind::Down(MouseButton::Left),
-        2,
-        rect.y + 1,
-    ));
-    h.app.on_mouse(mouse(
-        MouseEventKind::Drag(MouseButton::Left),
-        12,
-        rect.y + 1,
-    ));
+    // Press on the tool summary row, drag two cells along it, release.
+    h.app
+        .on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, rect.y));
+    h.app
+        .on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, rect.y));
     assert!(h.app.selection.is_some(), "the drag started a selection");
     h.app
-        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, rect.y + 1));
+        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, rect.y));
     assert!(h.app.pending_copy, "releasing a drag queues the copy");
     assert!(
         h.app.tool_groups.is_empty(),
@@ -4020,11 +4019,11 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
         1,
         "thought → output:\n{screen}"
     );
-    // Untinted → tinted is unchanged: the two blocks' own pads. The lone tool
-    // call collapses behind its summary, which is the tinted block.
+    // Untinted → tinted: the summary's first row IS the tool summary now (no
+    // pad above it), so only the assistant block's own bottom pad separates it.
     assert_eq!(
         gap(row_of("#1 assistant"), row_of("called 1 tool")),
-        2,
+        1,
         "output → tool:\n{screen}"
     );
 }
@@ -4177,6 +4176,334 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
         screen.contains("✓ shell") && screen.contains("✓ read"),
         "expanding shows the calls inside the summary:\n{screen}"
     );
+}
+
+/// A summary update rewrites only its own row: when a new call joins an open
+/// group — or the group settles — every other row of the buffer is untouched,
+/// so the render cannot jump or flicker while the summary counts up. (The
+/// group chunk is rebuilt fresh each frame; the guarantee is that the rebuild
+/// is layout-stable.)
+#[tokio::test]
+async fn a_tool_summary_update_rewrites_only_its_own_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str, done: bool| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done,
+        })
+    };
+    for i in 0..6 {
+        h.app
+            .push_entry(Entry::assistant(format!("filler {i}\nline\nline\nline")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    h.app.push_entry(tool("a", "shell", false));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = term.backend().buffer().clone();
+
+    // A second call joins the group: the summary counts it, in place.
+    h.app.push_entry(tool("b", "read", false));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = term.backend().buffer().clone();
+    let summary_row = screen_row_of(&term, "calling 2 tools").expect("the summary is on screen");
+    assert_eq!(
+        changed_rows(&before, &after),
+        vec![summary_row],
+        "a merged call must touch only the summary row"
+    );
+
+    // Settling rewrites the same single row: `calling` → `called`, spinner → ✓.
+    h.app.transcript_mut().iter_mut().for_each(|e| {
+        if let EntryKind::Tool { done, .. } = &mut e.kind {
+            *done = true;
+        }
+    });
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = term.backend().buffer().clone();
+    let summary_row =
+        screen_row_of(&term, "called 2 tools").expect("the settled summary is on screen");
+    assert_eq!(
+        changed_rows(&before, &after),
+        vec![summary_row],
+        "settling must touch only the summary row"
+    );
+}
+
+/// A hidden thought's summary updates in place too: settling from
+/// `⠋ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
+/// row and nothing else, so the render cannot jump while the thought finishes.
+#[tokio::test]
+async fn a_thinking_summary_update_rewrites_only_its_own_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    for i in 0..6 {
+        h.app
+            .push_entry(Entry::assistant(format!("filler {i}\nline\nline\nline")));
+    }
+    h.app.push_entry(Entry::now(EntryKind::Reasoning {
+        text: "a private thought\nsecond line".into(),
+        took_ms: None,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = term.backend().buffer().clone();
+    assert!(
+        screen_row_of(&term, "Thinking for").is_some(),
+        "the running summary is on screen"
+    );
+
+    // Settle the thought: the summary flips to the check form, in place.
+    h.app.transcript_mut().iter_mut().for_each(|e| {
+        if let EntryKind::Reasoning { took_ms, .. } = &mut e.kind {
+            *took_ms = Some(92_000);
+        }
+    });
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = term.backend().buffer().clone();
+    let summary_row =
+        screen_row_of(&term, "Thought for 1m 32s").expect("the settled summary is on screen");
+    assert_eq!(
+        changed_rows(&before, &after),
+        vec![summary_row],
+        "settling a thought must touch only its summary row"
+    );
+}
+
+/// The rows whose cell contents differ between two rendered buffers.
+fn changed_rows(a: &Buffer, b: &Buffer) -> Vec<u16> {
+    (0..a.area.height.min(b.area.height))
+        .filter(|&y| {
+            (0..a.area.width.min(b.area.width)).any(|x| {
+                a.cell(Position::new(x, y)).map(|c| c.symbol())
+                    != b.cell(Position::new(x, y)).map(|c| c.symbol())
+            })
+        })
+        .collect()
+}
+
+/// A hidden thought folds behind a summary entry — `✓ Thought for 1m 32s ·
+/// now` — that expands to the full thought on click and folds back behind the
+/// summary on a second click, exactly like a tool group's summary.
+#[tokio::test]
+async fn a_hidden_thought_folds_behind_a_summary_and_expands_on_click() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Reasoning {
+        text: "SECRET-THOUGHT".into(),
+        took_ms: Some(92_000),
+    }));
+    h.app.push_entry(Entry::assistant("the answer"));
+
+    // Level 0: one summary line — the thought itself stays hidden.
+    let screen = h.render();
+    let summary_row = line_index_of(&screen, "Thought for 1m 32s")
+        .unwrap_or_else(|| panic!("the summary line:\n{screen}"));
+    assert!(
+        !screen.contains("SECRET-THOUGHT"),
+        "the thought stays folded:\n{screen}"
+    );
+
+    // Click the summary: the full thought replaces it (the same block
+    // `/verbose on` would render), and a click anywhere on it folds it back.
+    click_at(&mut h.app, 2, summary_row);
+    let screen = h.render();
+    assert!(
+        screen.contains("SECRET-THOUGHT"),
+        "clicking the summary opens the thought:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thought for 1m 32s"),
+        "the block replaces the summary while open, like /verbose on:\n{screen}"
+    );
+
+    // Click it again: folded back behind the summary.
+    let thought_row = line_index_of(&screen, "SECRET-THOUGHT")
+        .unwrap_or_else(|| panic!("the open thought:\n{screen}"));
+    click_at(&mut h.app, 2, thought_row);
+    let screen = h.render();
+    assert!(
+        !screen.contains("SECRET-THOUGHT"),
+        "a second click folds the thought back:\n{screen}"
+    );
+}
+
+/// While a thought is still streaming it reads `⠋ Thinking for 1s` with the
+/// loader mark and no age; once it settles the mark becomes ✓ and the summary
+/// reads `✓ Thought for 1m 32s · now` — the same verb change and marks a tool
+/// group's summary uses.
+#[tokio::test]
+async fn a_running_thought_reads_thinking_with_the_loader_mark() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Reasoning {
+        text: "a thought".into(),
+        took_ms: None,
+    }));
+    let screen = h.render();
+    assert!(
+        screen.contains("Thinking for"),
+        "running reads Thinking, not Thought:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thought for"),
+        "the settled form appears only after the block ends:\n{screen}"
+    );
+    assert!(
+        !screen.contains("✓ Thinking"),
+        "the running mark is the loader, not the check:\n{screen}"
+    );
+
+    // Settle it: the check appears and the verb flips.
+    h.app.transcript_mut().iter_mut().for_each(|e| {
+        if let EntryKind::Reasoning { took_ms, .. } = &mut e.kind {
+            *took_ms = Some(92_000);
+        }
+    });
+    let screen = h.render();
+    assert!(
+        screen.contains("✓ Thought for 1m 32s"),
+        "settled reads ✓ Thought for …:\n{screen}"
+    );
+}
+
+/// The tool summary is the group's first row — no pad above it — with exactly
+/// one blank row under it, so an expanded group's first call never sits flush
+/// against the summary line.
+#[tokio::test]
+async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::assistant("context"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: "{}".into(),
+        result: "RESULT-A".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: "{}".into(),
+        result: "RESULT-B".into(),
+        ok: true,
+        done: true,
+    }));
+
+    // Collapsed: the summary is the group's first row, one blank under it.
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let row_of = |needle: &str| -> u16 {
+        (0..30)
+            .find(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    };
+    let blank = |y: u16| {
+        (0..59)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect::<String>()
+            .trim()
+            .is_empty()
+    };
+    let summary = row_of("called 2 tools");
+    // The row above the summary is the previous block's own bottom pad — and
+    // text above that — so the group adds no pad of its own above the line.
+    assert!(
+        blank(summary - 1),
+        "one pad row above the summary:\n{}",
+        buffer_to_string(buf)
+    );
+    assert!(
+        !blank(summary - 2),
+        "the row above that is the previous block's text — no group pad:\n{}",
+        buffer_to_string(buf)
+    );
+    assert!(!blank(summary), "the summary row itself holds text");
+    assert!(
+        blank(summary + 1),
+        "one blank row under the summary:\n{}",
+        buffer_to_string(buf)
+    );
+
+    // Expanded: summary, one blank, then the first call's box.
+    h.app.tool_groups.insert("a".to_string());
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let row_of = |needle: &str| -> u16 {
+        (0..30)
+            .find(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    };
+    let blank = |y: u16| {
+        (0..59)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect::<String>()
+            .trim()
+            .is_empty()
+    };
+    let summary = row_of("called 2 tools");
+    let result_a = row_of("RESULT-A");
+    assert!(
+        blank(summary + 1),
+        "one blank row under the summary:\n{}",
+        buffer_to_string(buf)
+    );
+    assert!(
+        result_a > summary + 1,
+        "the first call starts below the blank, not flush against the summary:\n{}",
+        buffer_to_string(buf)
+    );
+}
+
+/// The screen row of the first line containing `needle`, in a `render()`-style
+/// newline-joined buffer string.
+fn line_index_of(screen: &str, needle: &str) -> Option<u16> {
+    screen
+        .lines()
+        .position(|l| l.contains(needle))
+        .map(|i| i as u16)
 }
 
 /// The screen row of the first row containing `needle` in the terminal's

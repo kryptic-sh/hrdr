@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **The `/thinking` command and its `show_thinking` setting are gone; `/verbose`
+  owns the thinking display.** There is no separate show/hide for reasoning any
+  more: `/verbose on` expands every tool block _and_ shows the model's thinking,
+  `/verbose off` folds both back. The `show_thinking` `config.toml` key,
+  `$HRDR_SHOW_THINKING` and the `--show-thinking` CLI flag are all removed, and
+  a config file still setting `show_thinking` fails at startup rather than being
+  ignored — delete the line.
+
 - **A session file holding a `Steering` or `BackgroundResult` message no longer
   loads.** The internal `MessageOrigin` marker — which tells a real user turn
   apart from user-role context the harness injected — now has one variant per
@@ -38,6 +46,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A hidden thought folds behind a summary entry instead of disappearing.**
+  With thinking folded (`/verbose off`, the default), a thought reads
+  `⠋ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
+  it settles — the same spinner/check marks a tool group's summary uses.
+  Clicking the summary opens the full thought; clicking again folds it back.
+
 - **A tool call collapses behind its group's summary even on its own.** Every
   collapsible call (`edit`/`replace` always render) folds into a
   `✓ called N tools · ran 2 commands` line from the first call, and a run stays
@@ -48,11 +62,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reasoning, stats, a notice) breaks a run.
 
 - **Expanding a tool group's summary renders its calls inside it as nested child
-  items.** The summary keeps its header and the calls fan out beneath it, each
-  on the normal tool background, on a group background that is slightly dimmer
-  than the tool entries' — so the boxes read as items of the section rather than
-  blocks of their own. Absorbed tool-only turns keep their `#N assistant`
-  `/goto` labels at their transcript positions inside the group.
+  items.** The summary keeps its header — its first row, with one blank row
+  beneath it so the first call never sits flush against it — and the calls fan
+  out below, each on the normal tool background, on a group background that is
+  slightly dimmer than the tool entries' — so the boxes read as items of the
+  section rather than blocks of their own. Absorbed tool-only turns keep their
+  `#N assistant` `/goto` labels at their transcript positions inside the group.
+
+- **A summary update rewrites only its own row.** A tool group counting up as
+  new calls join, or a thought settling from `Thinking` to `Thought`, changes
+  the summary row in place and touches nothing else on screen — the viewport
+  cannot jump while the summaries stream.
 
 - **The input box reports its stash and history position on its top padding
   line.** While Ctrl+S drafts wait, the line shows how many

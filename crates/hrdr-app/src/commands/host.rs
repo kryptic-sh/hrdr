@@ -66,11 +66,6 @@ pub trait CommandHost {
         self.model_ref().provider().to_string()
     }
 
-    /// Whether `<think>` reasoning is shown.
-    fn show_thinking(&self) -> bool;
-    /// Toggle reasoning display (persisting if the frontend supports it).
-    fn set_show_thinking(&mut self, on: bool);
-
     /// Reset to a fresh conversation (clear transcript + agent history + session).
     fn clear_conversation(&mut self);
 

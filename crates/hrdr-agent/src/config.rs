@@ -848,8 +848,6 @@ pub(crate) struct FileConfig {
     pub(crate) _ui_auto_resume: Option<toml::Value>,
     #[serde(default, rename = "todo_ttl")]
     pub(crate) _ui_todo_ttl: Option<toml::Value>,
-    #[serde(default, rename = "show_thinking")]
-    pub(crate) _ui_show_thinking: Option<toml::Value>,
     #[serde(default, rename = "scrollback")]
     pub(crate) _ui_scrollback: Option<toml::Value>,
 }

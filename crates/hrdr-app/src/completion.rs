@@ -176,9 +176,6 @@ pub fn arg_completions(
             .collect()
     } else {
         match resolve_alias(cmd) {
-            "thinking" | "reasoning" | "think" => {
-                set(&[("on", "show model reasoning"), ("off", "hide it")])
-            }
             "timestamps" | "ts" => set(&[
                 ("none", "no timestamps"),
                 ("relative", "5m ago"),
@@ -189,7 +186,10 @@ pub fn arg_completions(
                 ("truncate", "one line"),
                 ("wrap", "as many lines as needed"),
             ]),
-            "expand" => set(&[("all", "expand every tool block"), ("off", "collapse them")]),
+            "verbose" => set(&[
+                ("on", "expand every tool block and show thinking"),
+                ("off", "collapse them"),
+            ]),
             "goto" => set(&[("top", "first message"), ("end", "follow the newest")]),
             "find" => set(&[("clear", "drop the search")]),
             "copy" => set(&[
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(vals("/timestamps ").len(), 3);
         // Dispatch-level alt names and registry aliases both resolve.
         assert_eq!(vals("/ts ex"), vec!["exact"]);
-        assert_eq!(vals("/reasoning o").len(), 2); // on, off
+        assert_eq!(vals("/verbose o").len(), 2); // on, off
         // Theme names come from the registry (built-ins are always there).
         assert!(vals("/theme dra").contains(&"dracula".to_string()));
         assert!(vals("/theme re").contains(&"reset".to_string()));

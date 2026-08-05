@@ -2836,7 +2836,26 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             EntryKind::Tool { done: false, .. } => base_hash ^ frame_idx,
             _ => base_hash,
         };
-        let ck: BodyKey = (base_hash, width, app.expand_tools, app.show_reasoning);
+        // A hidden thought the reader opened (`thinking_open`) renders its full
+        // block — the same rows `/verbose on` shows — so its lazy-height slot
+        // must not collide with the collapsed summary's. The last key element
+        // doubles as "this reasoning block renders in full": `show_reasoning`
+        // covers every block at once, `reasoning_open` one at a time.
+        let reasoning_open = matches!(
+            &entry.kind,
+            EntryKind::Reasoning { .. }
+                if !app.show_reasoning && app.thinking_open.contains(&entry.content_hash)
+        );
+        // A hidden thought is always clickable — collapsed, clicking it opens
+        // the block; open, clicking it folds it back.
+        let thinking_hidden =
+            matches!(&entry.kind, EntryKind::Reasoning { .. } if !app.show_reasoning);
+        let ck: BodyKey = (
+            base_hash,
+            width,
+            app.expand_tools,
+            app.show_reasoning || reasoning_open,
+        );
         // Every arm produces (kind, header rows, cached body rows, footer rows)
         // and is then funneled through the one `render_block` call below — no
         // entry paints its own chrome.
@@ -2893,7 +2912,31 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 });
                 (BlockKind::Assistant, BodySource::Cached(body))
             }
-            EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
+            // Hidden via /verbose (the default): the thought folds behind a
+            // one-line summary — `{mark} Thinking for 12s` while it streams,
+            // `{mark} Thought for 1m 32s · 2m ago` once it settles — with the
+            // same spinner/check marks a tool group's summary uses. A click on
+            // it opens the full thought (see `thinking_open`). The body is
+            // Animated because the mark and the clock tick every frame, but
+            // its height is stable at any width, so `lazy_height` still places
+            // the viewport without building the block it can't see.
+            EntryKind::Reasoning { text, took_ms, .. } if !app.show_reasoning => {
+                let body = BodySource::Animated(Box::new(move || {
+                    if reasoning_open {
+                        // The full thought: the same dimmed markdown a
+                        // `/verbose on` block renders.
+                        markdown_lines(
+                            text,
+                            &theme.md_theme_dim(),
+                            BlockKind::Reasoning.bg(theme),
+                            inner,
+                        )
+                    } else {
+                        thinking_summary_lines(entry, *took_ms, now, frame, theme, inner)
+                    }
+                }));
+                (BlockKind::Reasoning, body)
+            }
             // No `⠋ Thinking` / `Thought: 1.2s` label: the dimmer text already
             // says it's the model thinking, and the loader above the input shows
             // that a turn is running. (`took_ms` is still recorded — it's the
@@ -2980,7 +3023,8 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             lent: Vec::new(),
             footer,
             body_key: ck,
-            tool_idx: matches!(entry.kind, EntryKind::Tool { .. }).then_some(i),
+            tool_idx: (matches!(entry.kind, EntryKind::Tool { .. }) || thinking_hidden)
+                .then_some(i),
             msgs: msg_here,
         });
     }
@@ -3236,6 +3280,74 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
     (sections, running, all_ok)
 }
 
+/// The folded summary of a hidden thought: `{mark} Thinking for 12s` while the
+/// block streams, `{mark} Thought for 1m 32s · 2m ago` once it settles — the
+/// same spinner/check marks a tool group's summary uses, so a hidden thought
+/// reads like a quiet tool call. One line, rebuilt every frame (the mark
+/// animates and the clock ticks) with a stable row structure, so an update
+/// never moves anything else on screen.
+fn thinking_summary_lines(
+    entry: &Entry,
+    took_ms: Option<u64>,
+    now: chrono::DateTime<chrono::Local>,
+    frame: &'static str,
+    theme: &Theme,
+    inner: u16,
+) -> Vec<Line<'static>> {
+    let (mark, color, text) = match took_ms {
+        Some(ms) => (
+            "✓",
+            theme.success,
+            format!(
+                "Thought for {} · {}",
+                human_duration(ms),
+                hrdr_app::relative_time_since(entry.time, now)
+            ),
+        ),
+        None => (
+            frame,
+            theme.warn,
+            format!(
+                "Thinking for {}",
+                human_duration((now - entry.time).num_milliseconds().max(0) as u64)
+            ),
+        ),
+    };
+    wrap_spans(
+        vec![
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(text, Style::default().fg(theme.dim)),
+        ],
+        usize::from(inner),
+    )
+    .into_iter()
+    .map(Line::from)
+    .collect()
+}
+
+/// `92_000` ms → `1m 32s`, `9_500` → `9s`, `7_200_000` → `2h` — the compound
+/// form [`hrdr_app::relative_time_since`] uses, for how long a thought took.
+fn human_duration(ms: u64) -> String {
+    let secs = ms.div_ceil(1000);
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let (m, s) = (secs / 60, secs % 60);
+        if m >= 60 {
+            let (h, m) = (m / 60, m % 60);
+            if m > 0 {
+                format!("{h}h {m}m")
+            } else {
+                format!("{h}h")
+            }
+        } else if s > 0 {
+            format!("{m}m {s}s")
+        } else {
+            format!("{m}m")
+        }
+    }
+}
+
 /// The per-frame state a tool-group chunk renders with: the spinner frame (and
 /// its index, which keys the running members' body cache so their marks
 /// animate), whether the group is expanded, and the clock the absorbed turn
@@ -3282,8 +3394,9 @@ fn tool_group_chunk(
     let dim = Style::default().fg(theme.dim).bg(group_bg);
 
     let mut rows: Vec<Line<'static>> = Vec::new();
-    // The container's own top padding.
-    rows.push(pad_row(Vec::new(), w, group_bg));
+    // The summary line is the container's first row — no pad above it, and one
+    // blank row below it, so an expanded group's first tool call never sits
+    // flush against the summary.
     for (i, text) in packed.into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
@@ -3301,9 +3414,10 @@ fn tool_group_chunk(
         // The children: one tool box per call (or a turn label), each on the
         // normal tool background, inset inside the dimmer container so it
         // reads as an item of the summary section rather than a block of its
-        // own. A blank group-background row separates the items.
-        let mut first = true;
+        // own. A blank group-background row separates the summary from the
+        // first item and every item from the next.
         for (j, member) in members.iter().enumerate() {
+            rows.push(pad_row(Vec::new(), w, group_bg));
             match &member.kind {
                 EntryKind::Tool {
                     name,
@@ -3330,10 +3444,6 @@ fn tool_group_chunk(
                     if body.is_empty() {
                         continue;
                     }
-                    if !first {
-                        rows.push(pad_row(Vec::new(), w, group_bg));
-                    }
-                    first = false;
                     // The box is laid out at the container's inner width, then
                     // inset by the container's own padding.
                     for row in render_block(body.as_ref().clone(), inner, bg, None) {
@@ -3348,10 +3458,6 @@ fn tool_group_chunk(
                     let Some(label) = meta.rows(frame.now, theme).into_iter().last() else {
                         continue; // timestamps hidden — no label to render
                     };
-                    if !first {
-                        rows.push(pad_row(Vec::new(), w, group_bg));
-                    }
-                    first = false;
                     rows.push(pad_row(label.spans, w, group_bg));
                 }
             }
@@ -4675,6 +4781,59 @@ mod block_tests {
             sections,
             vec!["called 3 tools", "ran 1 command", "listed 2 directories"]
         );
+    }
+
+    /// `human_duration` — the thought's length in the folded summary — uses
+    /// the same compound units as `relative_time_since`, rounding up to a
+    /// whole second.
+    #[test]
+    fn human_duration_formats_compound_units() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(500), "1s"); // rounds up
+        assert_eq!(human_duration(9_000), "9s");
+        assert_eq!(human_duration(9_500), "10s"); // rounds up
+        assert_eq!(human_duration(60_000), "1m");
+        assert_eq!(human_duration(92_000), "1m 32s");
+        assert_eq!(human_duration(3_600_000), "1h");
+        assert_eq!(human_duration(5_520_000), "1h 32m");
+    }
+
+    /// The folded thinking summary reads `{mark} Thinking for 1m 32s` while
+    /// the block streams and `{mark} Thought for 1m 32s · ago` once it
+    /// settles — mark, verb and age all changing on one line.
+    #[test]
+    fn thinking_summary_lines_settled_and_running() {
+        let theme = Theme::default();
+        let entry = Entry::now(EntryKind::Reasoning {
+            text: "secret".into(),
+            took_ms: Some(92_000),
+        });
+        let now = chrono::Local::now();
+        let settled = thinking_summary_lines(&entry, Some(92_000), now, "⠋", &theme, 80);
+        assert_eq!(settled.len(), 1, "one line, however the clock ticks");
+        let line = settled[0].to_string();
+        assert!(
+            line.contains("✓"),
+            "the settled mark is the check: {line:?}"
+        );
+        assert!(
+            line.contains("Thought for 1m 32s"),
+            "the settled verb and duration: {line:?}"
+        );
+        assert!(
+            line.contains("ago") || line.contains("now"),
+            "the age is on the line: {line:?}"
+        );
+
+        // While streaming: the loader mark, the progressive verb, no age.
+        let running = thinking_summary_lines(&entry, None, now, "⠋", &theme, 80);
+        let line = running[0].to_string();
+        assert!(
+            line.starts_with('⠋'),
+            "the loader marks a running thought: {line:?}"
+        );
+        assert!(line.contains("Thinking for"), "progressive verb: {line:?}");
+        assert!(!line.contains("Thought"), "not the settled verb: {line:?}");
     }
 
     /// A tool run spans consecutive collapsible calls AND the invisible entries

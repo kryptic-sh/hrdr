@@ -54,10 +54,6 @@ pub struct UiConfig {
     /// How many turns a completed TODO item stays visible before it's pruned.
     /// Default [`DEFAULT_TODO_TTL_TURNS`].
     pub todo_ttl: u64,
-    /// Show the model's `<think>` reasoning blocks. Default `false`. Toggled at
-    /// runtime by `/thinking` (aka `/reasoning`); the choice persists to
-    /// `config.toml` as `show_thinking`.
-    pub show_thinking: bool,
     /// Max transcript entries kept in the scrollback buffer. Older entries are
     /// evicted from the front to keep render performance stable. Default 500.
     pub scrollback: usize,
@@ -74,7 +70,6 @@ impl Default for UiConfig {
             bell: true,
             auto_resume: true,
             todo_ttl: DEFAULT_TODO_TTL_TURNS,
-            show_thinking: false,
             scrollback: 500,
         }
     }
@@ -93,7 +88,6 @@ struct UiFileConfig {
     bell: Option<bool>,
     auto_resume: Option<bool>,
     todo_ttl: Option<u64>,
-    show_thinking: Option<bool>,
     scrollback: Option<usize>,
 }
 
@@ -195,9 +189,6 @@ impl UiConfig {
         if let Some(v) = fc.todo_ttl {
             self.todo_ttl = v;
         }
-        if let Some(v) = fc.show_thinking {
-            self.show_thinking = v;
-        }
         if let Some(v) = fc.scrollback {
             self.scrollback = v;
         }
@@ -233,11 +224,6 @@ const UI_ENV_SETTERS: &[(&str, UiEnvSetter)] = &[
     ("HRDR_TODO_TTL", |c, v| {
         if let Ok(n) = v.parse() {
             c.todo_ttl = n;
-        }
-    }),
-    ("HRDR_SHOW_THINKING", |c, v| {
-        if let Some(b) = parse_env_bool(&v) {
-            c.show_thinking = b;
         }
     }),
     ("HRDR_SCROLLBACK", |c, v| {
@@ -327,7 +313,6 @@ mod tests {
             bell = false
             auto_resume = false
             todo_ttl = 10
-            show_thinking = false
             # agent-side keys are ignored, not an error:
             model = "qwen3"
             temperature = 0.5
@@ -344,12 +329,11 @@ mod tests {
         assert!(!cfg.bell);
         assert!(!cfg.auto_resume);
         assert_eq!(cfg.todo_ttl, 10);
-        assert!(!cfg.show_thinking);
         // Empty file keeps defaults.
         let mut d = UiConfig::default();
         d.apply_file(UiFileConfig::default());
         assert!(!d.vim_mode);
-        assert!(d.bell && d.auto_resume && !d.show_thinking);
+        assert!(d.bell && d.auto_resume);
         assert_eq!(d.todo_ttl, DEFAULT_TODO_TTL_TURNS);
     }
 
@@ -377,7 +361,6 @@ mod tests {
             bell = true
             auto_resume = true
             todo_ttl = 10
-            show_thinking = true
             scrollback = 500
         "#;
         // The UI reads them all…
