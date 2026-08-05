@@ -181,9 +181,10 @@ pub(crate) fn set_client_warning(msg: String) {
 /// `pub(crate)` because the wire log is a promise about *every* backend, and the
 /// native Anthropic/Codex paths build and send their own requests — they have to
 /// be able to log them (see [`crate::anthropic::chat_stream`],
-/// [`crate::codex::chat_stream`]). Returns before touching `fields` when the log
-/// is off, so a call site costs only the `json!` it hands in.
-pub(crate) fn log_wire(kind: &str, fields: serde_json::Value) {
+/// [`crate::codex::chat_stream`]). `fields` is a closure that is only called
+/// once the log is confirmed live, so when it is off the call site's `json!`
+/// never runs at all.
+pub(crate) fn log_wire(kind: &str, fields: impl FnOnce() -> serde_json::Value) {
     use std::sync::atomic::Ordering::Relaxed;
 
     let Some(wire) = request_log() else {
@@ -193,6 +194,7 @@ pub(crate) fn log_wire(kind: &str, fields: serde_json::Value) {
     if REQUEST_LOG_STOPPED.load(Relaxed) {
         return;
     }
+    let fields = fields();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -325,7 +327,7 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> anyhow::Erro
     let status_u16 = status.as_u16();
     log_wire(
         "error_response",
-        serde_json::json!({"status": status_u16, "body": text}),
+        || serde_json::json!({"status": status_u16, "body": text}),
     );
     let mut kind = classify_status(status_u16);
     // A 429 can be a rate limit (retryable) or a spent quota/billing cap
@@ -1223,13 +1225,12 @@ impl Client {
         // validates against instead of a placeholder it 404s.
         let model = self.wire_model().await;
         let body = self.body_json(&self.request(model, messages, tools, true));
-        log_wire(
-            "request",
+        log_wire("request", || {
             serde_json::json!({
                 "url": self.url("chat/completions"),
                 "body": body,
-            }),
-        );
+            })
+        });
         let resp = self
             .post(&body)
             .send()
@@ -1302,12 +1303,10 @@ impl Client {
                     if data.is_empty() {
                         continue;
                     }
-                    log_wire("sse", serde_json::json!({"data": data}));
+                    log_wire("sse", || serde_json::json!({"data": data}));
                     if data == "[DONE]" {
                         return;
                     }
-                    let value: serde_json::Value = serde_json::from_str(data)
-                        .with_context(|| format!("decoding stream event: {data}"))?;
                     // A mid-stream error object (`{"error":{"message":"..."}}`) would
                     // otherwise deserialize as an empty `ChatChunk` (every field is
                     // `#[serde(default)]`), silently swallowing the server's real
@@ -1315,53 +1314,65 @@ impl Client {
                     // "incomplete stream" retryable classification below. Surface it
                     // here instead, as a terminal (non-retryable) error carrying the
                     // server's message — mirrors the native Anthropic `"error"` event
-                    // handling in `anthropic::map_event`.
-                    if let Some(err_obj) = value.get("error").filter(|e| !e.is_null()) {
-                        let msg = err_obj
-                            .get("message")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown error");
-                        // Gateways (OpenRouter, LiteLLM, …) deliver rate-limit and
-                        // overload conditions as mid-stream error objects. Classify
-                        // them Transient by code/type so the retry loop catches
-                        // them, matching the native Anthropic path.
-                        let code = err_obj
-                            .get("code")
-                            .and_then(|c| c.as_u64())
-                            .map(|c| c as u16)
-                            .or_else(|| {
-                                err_obj.get("status").and_then(|c| c.as_u64()).map(|c| c as u16)
-                            });
-                        let type_str = err_obj
-                            .get("type")
-                            .or_else(|| err_obj.get("code"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        let transient = code.map(classify_status)
-                            == Some(ChatErrorKind::Transient)
-                            || type_str.contains("rate_limit")
-                            || type_str.contains("overloaded")
-                            || type_str.contains("server_error");
-                        // A spent quota/billing cap is terminal, whatever the
-                        // embedded code says — `insufficient_quota` or a quota
-                        // message must not ride the `code == 429` transient path.
-                        let kind = if crate::retry::is_usage_limit_text(&format!("{type_str} {msg}")) {
-                            ChatErrorKind::UsageLimit
-                        } else if transient {
-                            ChatErrorKind::Transient
-                        } else {
-                            ChatErrorKind::Other
-                        };
-                        Err(ChatError {
-                            status: None,
-                            retry_after: None,
-                            kind,
-                            message: format!("mid-stream error: {msg}"),
-                        })?;
+                    // handling in `anthropic::map_event`. The `contains("\"error\"")`
+                    // pre-check cannot miss a real error object (any `{"error": …}`
+                    // payload contains that literal); a false positive in a content
+                    // delta just takes this slower path with identical results, so
+                    // the common case parses `data` straight into `ChatChunk`.
+                    if data.contains("\"error\"") {
+                        let value: serde_json::Value = serde_json::from_str(data)
+                            .with_context(|| format!("decoding stream event: {data}"))?;
+                        if let Some(err_obj) = value.get("error").filter(|e| !e.is_null()) {
+                            let msg = err_obj
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown error");
+                            // Gateways (OpenRouter, LiteLLM, …) deliver rate-limit and
+                            // overload conditions as mid-stream error objects. Classify
+                            // them Transient by code/type so the retry loop catches
+                            // them, matching the native Anthropic path.
+                            let code = err_obj
+                                .get("code")
+                                .and_then(|c| c.as_u64())
+                                .map(|c| c as u16)
+                                .or_else(|| {
+                                    err_obj.get("status").and_then(|c| c.as_u64()).map(|c| c as u16)
+                                });
+                            let type_str = err_obj
+                                .get("type")
+                                .or_else(|| err_obj.get("code"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let transient = code.map(classify_status)
+                                == Some(ChatErrorKind::Transient)
+                                || type_str.contains("rate_limit")
+                                || type_str.contains("overloaded")
+                                || type_str.contains("server_error");
+                            // A spent quota/billing cap is terminal, whatever the
+                            // embedded code says — `insufficient_quota` or a quota
+                            // message must not ride the `code == 429` transient path.
+                            let kind = if crate::retry::is_usage_limit_text(&format!("{type_str} {msg}")) {
+                                ChatErrorKind::UsageLimit
+                            } else if transient {
+                                ChatErrorKind::Transient
+                            } else {
+                                ChatErrorKind::Other
+                            };
+                            Err(ChatError {
+                                status: None,
+                                retry_after: None,
+                                kind,
+                                message: format!("mid-stream error: {msg}"),
+                            })?;
+                        }
+                        let parsed: ChatChunk = serde_json::from_value(value)
+                            .with_context(|| format!("decoding stream event: {data}"))?;
+                        yield parsed;
+                    } else {
+                        let parsed: ChatChunk = serde_json::from_str(data)
+                            .with_context(|| format!("decoding stream event: {data}"))?;
+                        yield parsed;
                     }
-                    let parsed: ChatChunk = serde_json::from_value(value)
-                        .with_context(|| format!("decoding stream event: {data}"))?;
-                    yield parsed;
                 }
                 if at_eof {
                     break;
@@ -2524,9 +2535,11 @@ mod tests {
                  data: {\"type\":\"error\",\"code\":429,\"message\":\"rate limit reached\"}\n\n",
                 ChatErrorKind::Other,
             ),
-            // Spent quota/billing: terminal on all three, whatever the code says
-            // — even `rate_limit_exceeded`/`rate_limit_error`, whose type alone
-            // would have made them retryable.
+            // Spent quota/billing: terminal, whatever the code says — even
+            // `rate_limit_exceeded`/`rate_limit_error`, whose type alone would
+            // have made them retryable. Only explicit usage wording counts
+            // (`insufficient_quota`, billing, credit/spend caps); the Codex row
+            // below shows a bare "usage quota" message no longer does.
             (
                 "usage limit",
                 Backend::OpenAi,
@@ -2540,12 +2553,15 @@ mod tests {
                  data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Your credit balance is too low to access the API\"}}\n\n",
                 ChatErrorKind::UsageLimit,
             ),
+            // The mirror image: a `rate_limit_exceeded` whose message only
+            // names "usage quota" (no billing / credit / spend /
+            // insufficient_quota marker) is a rate limit, not a spent cap.
             (
-                "usage limit",
+                "rate limit with quota wording",
                 Backend::Codex,
                 "event: error\n\
                  data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"you have reached your usage quota\"}\n\n",
-                ChatErrorKind::UsageLimit,
+                ChatErrorKind::Transient,
             ),
         ] {
             // The server's own message text for this situation; every payload in
@@ -2554,12 +2570,12 @@ mod tests {
             // them and matches any.
             let needle: &[&str] = match situation {
                 "rate limit" | "rate limit named only by HTTP status" => &["rate limit reached"],
+                "rate limit with quota wording" => &["you have reached your usage quota"],
                 "server overload" => &["upstream overloaded"],
                 "bad credential" => &["Incorrect API key"],
                 "usage limit" => &[
                     "You exceeded your current quota",
                     "Your credit balance is too low",
-                    "you have reached your usage quota",
                 ],
                 other => panic!("no expected message text for {other:?}"),
             };
@@ -3540,14 +3556,15 @@ mod tests {
                 ChatErrorKind::Transient,
                 Some(Duration::from_secs(12)),
             ),
-            // Same status, spent-quota body: the body decides, not the status —
-            // a quota-exhausted 429 must not be retried for six minutes.
+            // Same status, quota-only body: bare "quota" wording is a rate
+            // limit, so the 429 stays retryable — only explicit usage wording
+            // (billing / credit / spend / insufficient_quota) flips it.
             (
                 "429 Too Many Requests",
                 "",
                 r#"{"error":{"message":"You exceeded your current quota"}}"#,
                 429,
-                ChatErrorKind::UsageLimit,
+                ChatErrorKind::Transient,
                 None,
             ),
             (

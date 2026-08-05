@@ -611,7 +611,7 @@ pub(crate) async fn chat_stream(
     // the wire log exists to explain (a 401, a 400 on a malformed tool block).
     // Only the body goes in — the credential is a header (`x-api-key`), and
     // `build_body` never sees it.
-    crate::client::log_wire("request", json!({"url": url, "body": body}));
+    crate::client::log_wire("request", || json!({"url": url, "body": body}));
     let resp = req.send().await.context("chat stream request failed")?;
     if !resp.status().is_success() {
         return Err(crate::client::error_from_response(resp).await);
@@ -690,7 +690,7 @@ pub(crate) async fn chat_stream(
                 if data.is_empty() { continue; }
                 // Raw line, before parsing: a payload we fail to decode is the
                 // one worth having in the log.
-                crate::client::log_wire("sse", json!({"data": data}));
+                crate::client::log_wire("sse", || json!({"data": data}));
                 let ev: Value = serde_json::from_str(data)
                     .with_context(|| format!("decoding stream event: {data}"))?;
                 if let Some(out) = map_event(

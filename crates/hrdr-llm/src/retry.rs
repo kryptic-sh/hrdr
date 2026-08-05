@@ -189,10 +189,11 @@ fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
 /// Phrases that mean a USAGE/quota limit rather than a rate limit: retrying
 /// cannot help until the billing window resets. Deliberately disjoint from
 /// rate-limit wording — a false positive here stops a retry that would have
-/// succeeded, so only unambiguous usage/billing words match ("rate limit",
-/// "too many requests", "throttl" match none of these).
+/// succeeded. A bare "quota" is a rate-limit word, not usage wording: cloud
+/// providers use it overwhelmingly for per-minute/per-day REQUEST quotas,
+/// which a retry clears. Only the explicit usage forms count:
+/// `insufficient_quota`, `billing`, `credit balance`, `spend limit`.
 const USAGE_LIMIT_PHRASES: &[&str] = &[
-    "quota",
     "insufficient_quota",
     "billing",
     "credit balance",
@@ -634,6 +635,11 @@ mod tests {
             "too many requests",
             "throttled: slow down",
             "chat endpoint returned 429: slow down",
+            // Bare "quota" is a rate-limit word (per-minute/per-day REQUEST
+            // quota), not usage wording — none of these carry a billing /
+            // credit / spend / insufficient_quota marker.
+            "quota exceeded for metric requests per minute: limit 60.0",
+            "too many requests for the per-day quota",
         ] {
             assert!(
                 !is_usage_limit_text(msg),
@@ -660,10 +666,11 @@ mod tests {
         });
         assert!(is_transient(&rate));
 
-        // Untyped: the phrase scan decides, before the `returned 429` needle.
+        // Untyped: bare "quota" wording is a rate limit, so the `returned 429`
+        // needle decides and the error stays retryable.
         let quota_untyped = anyhow::anyhow!("chat endpoint returned 429: quota exceeded");
-        assert!(!is_transient(&quota_untyped));
-        assert!(is_usage_limit(&quota_untyped));
+        assert!(is_transient(&quota_untyped));
+        assert!(!is_usage_limit(&quota_untyped));
 
         let rate_untyped = anyhow::anyhow!("chat endpoint returned 429: rate limited");
         assert!(is_transient(&rate_untyped));
