@@ -12,16 +12,22 @@ pub use hrdr_agent::{ProjectInstructions, Skill, builtin_skills, discover_skills
 /// query's characters must appear in order within `"name description source"`.
 /// Returns matching indices in input order; an empty query matches everything.
 pub fn filter_skills(skills: &[Skill], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
+    if query.trim().is_empty() {
         return (0..skills.len()).collect();
     }
     skills
         .iter()
         .enumerate()
         .filter_map(|(i, sk)| {
-            let hay = format!("{} {} {}", sk.name, sk.description, sk.source).to_lowercase();
-            crate::is_subsequence(&q, &hay).then_some(i)
+            hrdr_agent::fuzzy_match(
+                query,
+                &[
+                    sk.name.as_str(),
+                    sk.description.as_str(),
+                    sk.source.as_str(),
+                ],
+            )
+            .then_some(i)
         })
         .collect()
 }

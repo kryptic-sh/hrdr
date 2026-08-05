@@ -167,16 +167,18 @@ pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
 
 /// Case-insensitive fuzzy filter over login choices (name + label + detail).
 pub fn filter_login_providers(choices: &[LoginProviderChoice], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
+    if query.trim().is_empty() {
         return (0..choices.len()).collect();
     }
     choices
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let hay = format!("{} {} {}", c.name, c.label, c.detail).to_lowercase();
-            crate::is_subsequence(&q, &hay).then_some(i)
+            hrdr_agent::fuzzy_match(
+                query,
+                &[c.name.as_str(), c.label.as_str(), c.detail.as_str()],
+            )
+            .then_some(i)
         })
         .collect()
 }

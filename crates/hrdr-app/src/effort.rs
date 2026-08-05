@@ -90,22 +90,22 @@ pub fn choices_from(values: &[String]) -> Vec<EffortChoice> {
 /// must appear in order within `"label value detail"`. Returns matching
 /// indices in input order; an empty query matches everything.
 pub fn filter_effort_choices(choices: &[EffortChoice], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
+    if query.trim().is_empty() {
         return (0..choices.len()).collect();
     }
     choices
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let hay = format!(
-                "{} {} {}",
-                c.label,
-                c.value.as_deref().unwrap_or("default"),
-                c.detail
+            hrdr_agent::fuzzy_match(
+                query,
+                &[
+                    c.label.as_str(),
+                    c.value.as_deref().unwrap_or("default"),
+                    c.detail.as_str(),
+                ],
             )
-            .to_lowercase();
-            crate::is_subsequence(&q, &hay).then_some(i)
+            .then_some(i)
         })
         .collect()
 }

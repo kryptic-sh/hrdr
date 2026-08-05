@@ -2,8 +2,8 @@
 //! sharing one popup.
 
 use hrdr_app::{
-    active_file_token, arg_completions, rank_agent_matches, rank_file_matches, resolve_alias,
-    skill_completions, slash_completions,
+    active_file_token, arg_completions, command_arg_offset, rank_agent_matches, rank_file_matches,
+    resolve_alias, skill_completions, slash_completions,
 };
 
 impl super::App {
@@ -236,8 +236,7 @@ fn file_arg_token(input: &str) -> Option<(usize, String)> {
     if !matches!(resolve_alias(&rest[..ws]), "edit" | "add") {
         return None;
     }
-    let after = &rest[ws..];
-    let arg_start = 1 + ws + (after.len() - after.trim_start().len());
+    let arg_start = command_arg_offset(rest)?;
     let partial = &input[arg_start..];
     // A path argument has no spaces; once one appears, stand down.
     if partial.chars().any(char::is_whitespace) {

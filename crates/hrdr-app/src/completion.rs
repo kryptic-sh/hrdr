@@ -129,6 +129,16 @@ pub fn rank_file_matches(files: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Byte offset of the argument start, given the command text AFTER the sigil
+/// (what follows `/` or `:`). The first whitespace run ends the command name;
+/// the argument starts at the first non-whitespace byte after it. `None` when
+/// the text has no whitespace at all (nothing typed after the command name).
+pub fn command_arg_offset(rest: &str) -> Option<usize> {
+    let ws = rest.find(char::is_whitespace)?;
+    let after = &rest[ws..];
+    Some(1 + ws + (after.len() - after.trim_start().len()))
+}
+
 /// Argument completion for a slash (`/cmd partial…`) or skill
 /// (`:name partial…`) input: candidates for the argument being typed, matched
 /// against everything after the command name (so multi-word values like
@@ -147,9 +157,7 @@ pub fn arg_completions(
     // Split "cmd" from the argument: the first whitespace run ends the name.
     let ws = rest.find(char::is_whitespace)?;
     let cmd = &rest[..ws];
-    let after = &rest[ws..];
-    let arg_offset = after.len() - after.trim_start().len();
-    let arg_start = 1 + ws + arg_offset;
+    let arg_start = command_arg_offset(rest)?;
     let partial = &input[arg_start..];
 
     let set = |vals: &[(&str, &str)]| -> Vec<(String, String)> {

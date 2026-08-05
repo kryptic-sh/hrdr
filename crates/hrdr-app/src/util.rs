@@ -5,6 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// Strip trailing punctuation that may follow a token in running prose
+/// (`, . ; : ) ] }`) — an `@mention`, a `todo#N`/`task#N` reference — leaving
+/// the resolvable name intact.
+fn trim_token(s: &str) -> &str {
+    s.trim_end_matches([',', '.', ';', ':', ')', ']', '}'])
+}
+
 /// Expand `@path` mentions in `input` (resolved under `cwd`) for sending to the
 /// model: a **file** contributes its contents, truncated at
 /// [`MAX_ATTACH_BYTES`] on a char boundary; a **directory** contributes a
@@ -40,7 +47,7 @@ pub fn extract_agent_mention(input: &str, names: &[String]) -> Option<(String, S
         let Some(tok) = raw.strip_prefix('@') else {
             continue;
         };
-        let tok = tok.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        let tok = trim_token(tok);
         if tok.is_empty() {
             continue;
         }
@@ -114,7 +121,7 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
         };
         // A trailing `/` is how a directory is spelled (and what completion
         // inserts); strip it for resolution but keep the label honest below.
-        let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        let rel = trim_token(rel);
         let rel = rel.strip_suffix('/').unwrap_or(rel);
         if rel.is_empty()
             || attached
@@ -235,7 +242,7 @@ pub fn expand_todo_refs(input: &str, todos: &[hrdr_tools::TodoItem]) -> String {
         else {
             continue;
         };
-        let num = num.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        let num = trim_token(num);
         let Ok(id) = num.parse::<u64>() else {
             continue;
         };
@@ -276,13 +283,6 @@ pub use hrdr_tools::resolve_under;
 /// with it, and the agent owns skill discovery; re-exported so the frontends
 /// (chrome, pickers) render paths identically.
 pub use hrdr_agent::display_dir;
-
-/// Whether `needle`'s chars appear in order within `haystack` — the fuzzy
-/// match shared by the picker filters (sessions, themes).
-pub(crate) fn is_subsequence(needle: &[char], haystack: &str) -> bool {
-    let mut it = haystack.chars();
-    needle.iter().all(|&c| it.any(|h| h == c))
-}
 
 /// Modified-time of the user config file, for hot-reload dedup guards.
 pub fn config_mtime() -> Option<std::time::SystemTime> {

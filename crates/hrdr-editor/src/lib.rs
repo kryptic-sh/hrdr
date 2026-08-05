@@ -82,22 +82,31 @@ pub trait EditorEngine {
     /// character as a key event (works for any insert-mode engine); engines may
     /// override for a faster/correct direct insertion.
     fn paste(&mut self, text: &str) {
-        for c in text.chars() {
-            if c == '\r' {
-                continue;
-            }
-            let key = match c {
-                '\n' => EditorKeyCode::Enter,
-                '\t' => EditorKeyCode::Tab,
-                other => EditorKeyCode::Char(other),
-            };
-            self.feed_key(EditorKey {
-                key,
-                ctrl: false,
-                alt: false,
-                shift: false,
-            });
+        paste_as_keys(self, text);
+    }
+}
+
+/// Feed pasted text to an insert-mode engine one character at a time: newline
+/// and tab become their key codes, carriage returns are skipped. The body of
+/// the [`EditorEngine::paste`] default, shared with the insert-mode arm of
+/// [`VimEngine`]'s override so the two stay in lockstep (both produce the same
+/// key sequence).
+fn paste_as_keys<E: EditorEngine + ?Sized>(engine: &mut E, text: &str) {
+    for c in text.chars() {
+        if c == '\r' {
+            continue;
         }
+        let key = match c {
+            '\n' => EditorKeyCode::Enter,
+            '\t' => EditorKeyCode::Tab,
+            other => EditorKeyCode::Char(other),
+        };
+        engine.feed_key(EditorKey {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
     }
 }
 
@@ -368,19 +377,7 @@ impl EditorEngine for VimEngine {
         // Insert directly into the buffer instead; in Insert mode the default
         // is fine (and keeps the cursor trailing the paste).
         if self.is_insert() {
-            for c in text.chars().filter(|&c| c != '\r') {
-                let key = match c {
-                    '\n' => EditorKeyCode::Enter,
-                    '\t' => EditorKeyCode::Tab,
-                    other => EditorKeyCode::Char(other),
-                };
-                self.feed_key(EditorKey {
-                    key,
-                    ctrl: false,
-                    alt: false,
-                    shift: false,
-                });
-            }
+            paste_as_keys(self, text);
         } else {
             self.editor.insert_str(&text.replace('\r', ""));
         }

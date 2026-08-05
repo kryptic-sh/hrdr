@@ -87,16 +87,14 @@ pub fn theme_choices() -> Vec<ThemeChoice> {
 /// must appear in order within `"name source"`. Returns matching indices in
 /// input order; an empty query matches everything.
 pub fn filter_themes(choices: &[ThemeChoice], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
+    if query.trim().is_empty() {
         return (0..choices.len()).collect();
     }
     choices
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let hay = format!("{} {}", c.name, c.source).to_lowercase();
-            crate::is_subsequence(&q, &hay).then_some(i)
+            hrdr_agent::fuzzy_match(query, &[c.name.as_str(), c.source.as_str()]).then_some(i)
         })
         .collect()
 }

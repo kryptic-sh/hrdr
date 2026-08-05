@@ -18,14 +18,21 @@ impl super::App {
             }
             Err(error) => {
                 let error = error.to_string();
-                if self.session_save_error.as_deref() != Some(&error) {
-                    self.push_entry(Entry::notice(format!(
-                        "session autosave failed — conversation is not safely stored: {error}"
-                    )));
-                    self.session_save_error = Some(error);
-                }
+                self.note_save_error(error);
                 None
             }
+        }
+    }
+
+    /// Surface a session-save failure once per distinct error: push a notice
+    /// entry and remember the error so a retry failing the same way stays
+    /// silent (the notice is already on screen).
+    fn note_save_error(&mut self, error: String) {
+        if self.session_save_error.as_deref() != Some(&error) {
+            self.push_entry(Entry::notice(format!(
+                "session autosave failed — conversation is not safely stored: {error}"
+            )));
+            self.session_save_error = Some(error);
         }
     }
 
@@ -267,12 +274,7 @@ impl super::App {
                 // sync path did and leave the id unset — the first autosave
                 // retries the mint + write.
                 let error = format!("{error:#}");
-                if self.session_save_error.as_deref() != Some(&error) {
-                    self.push_entry(Entry::notice(format!(
-                        "session autosave failed — conversation is not safely stored: {error}"
-                    )));
-                    self.session_save_error = Some(error);
-                }
+                self.note_save_error(error);
             }
         }
         // The write itself goes off-thread; without a minted id there is nothing
@@ -394,12 +396,7 @@ impl super::App {
         match result {
             Ok(_) => self.session_save_error = None,
             Err(error) => {
-                if self.session_save_error.as_deref() != Some(&error) {
-                    self.push_entry(Entry::notice(format!(
-                        "session autosave failed — conversation is not safely stored: {error}"
-                    )));
-                    self.session_save_error = Some(error);
-                }
+                self.note_save_error(error);
             }
         }
         self.promote_pending_save();

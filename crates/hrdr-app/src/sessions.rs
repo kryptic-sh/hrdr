@@ -118,16 +118,15 @@ pub fn session_diagnostics() -> Vec<(String, String)> {
 /// [`crate::list_sessions`]'s newest-first list); an empty query matches
 /// everything.
 pub fn filter_sessions(sessions: &[crate::SessionMeta], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
+    if query.trim().is_empty() {
         return (0..sessions.len()).collect();
     }
     sessions
         .iter()
         .enumerate()
         .filter_map(|(i, m)| {
-            let hay = format!("{} {} {}", m.id, m.name, m.cwd).to_lowercase();
-            crate::is_subsequence(&q, &hay).then_some(i)
+            hrdr_agent::fuzzy_match(query, &[m.id.as_str(), m.name.as_str(), m.cwd.as_str()])
+                .then_some(i)
         })
         .collect()
 }
