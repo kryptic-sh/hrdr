@@ -772,6 +772,13 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
     ])
     .await;
     h.submit("read that file").await;
+    // The nudge and refusal text live in the tool result, which is collapsed by
+    // default — expand the blocks so the assertion can see it.
+    for e in h.app.transcript_mut() {
+        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
+            *expanded = true;
+        }
+    }
     let screen = h.render();
     assert!(
         screen.contains("failed 2 times in a row"),
@@ -803,6 +810,13 @@ async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
     ])
     .await;
     h.submit("use a bad tool").await;
+    // The error text lives in the tool result, collapsed by default — expand so
+    // the assertion can see it.
+    for e in h.app.transcript_mut() {
+        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
+            *expanded = true;
+        }
+    }
     let screen = h.render();
     // The error is shown to the user (and was fed back to the model)…
     assert!(
@@ -1206,6 +1220,13 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     ])
     .await;
     h.submit("run it").await;
+    // Tool results are collapsed by default now — expand so the block renders
+    // with its command and output for the layout assertions below.
+    for e in h.app.transcript_mut() {
+        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
+            *expanded = true;
+        }
+    }
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3607,7 +3628,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
             result: format!("res-{id}"),
             ok: true,
             done: true,
-            expanded: false,
+            expanded: true, // the results are the row anchors below
         })
     };
     let mut h = Harness::new(vec![]).await;
@@ -3778,6 +3799,11 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
         expanded: true, // long and open
     }));
     h.app.push_entry(Entry::assistant("after"));
+    // Enough filler that the transcript still overflows the viewport AFTER the
+    // collapse — the pin-keeps-top behavior only exists for a scrolled-up view.
+    for i in 0..20 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
 
     let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3862,7 +3888,7 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         result: "res".into(),
         ok: true,
         done: true,
-        expanded: false,
+        expanded: true, // the result row is the layout anchor below
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();

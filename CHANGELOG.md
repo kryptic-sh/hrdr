@@ -345,6 +345,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tool calls collapse to a single line until expanded.** A finished tool block
+  now renders as `✓ shell cd … && rg …` — the status mark, the tool name, and a
+  one-line summary (the command for shell calls, the headline otherwise) — with
+  the output and details hidden until the block is clicked or `/expand` is used.
+  `edit` is the exception: its diff IS the point of the call, so it keeps
+  rendering in full whether collapsed or not. A running tool shows its animated
+  mark on the one line; expanding a running tool still shows the live tail.
+
 - **The model's `<think>` reasoning blocks are hidden by default.** Reasoning
   display was previously on out of the box; it now starts off, matching the
   behavior most terminals want for a coding session. `/thinking on|off` (alias

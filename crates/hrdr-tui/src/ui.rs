@@ -1878,8 +1878,6 @@ const HEADER_GAP: usize = 4;
 /// Width of the details column's key field; values start after it, so they all
 /// line up regardless of key length.
 const DETAIL_KEY_W: usize = 9;
-/// Width a tool-call detail value is clipped to while its block is collapsed.
-const DETAIL_VALUE_W: usize = 100;
 
 /// The cursor path the splash animation traces through `art`: every glyph cell,
 /// column by column, so the highlight sweeps left-to-right across the letters.
@@ -2771,6 +2769,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         *done,
                         *expanded || app.expand_tools,
                         frame,
+                        inner,
                     )
                 });
                 (BlockKind::Tool, BodySource::Cached(body))
@@ -2942,6 +2941,13 @@ fn markdown_lines(
 /// headline) followed by tool-specific detail — the command and its output for
 /// shell calls, the file contents for `write`, the diff for `edit`,
 /// the tail of the file for `read`, plain output otherwise.
+///
+/// Collapsed (not expanded), every tool except `edit` renders as ONE line —
+/// the mark, the name, and a one-line summary (the command for shell calls, the
+/// headline otherwise) — with the detail and result hidden until the block is
+/// expanded. `edit` is the exception: its diff IS the point of the call, so it
+/// keeps rendering its detail collapsed or not. `inner` is the content width
+/// the summary is truncated to, so the collapsed line never wraps.
 #[allow(clippy::too_many_arguments)]
 fn tool_lines(
     theme: &Theme,
@@ -2952,6 +2958,7 @@ fn tool_lines(
     done: bool,
     expanded: bool,
     frame: &'static str,
+    inner: u16,
 ) -> Vec<Line<'static>> {
     let bg = BlockKind::Tool.bg(theme);
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
@@ -2963,28 +2970,48 @@ fn tool_lines(
         ("✗", theme.error)
     };
     let disp = hrdr_app::tool_display(name, args);
-    let mut header = vec![
-        Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
-        Span::styled(
-            name.to_string(),
-            Style::default().fg(theme.warn).bg(bg).bold(),
-        ),
-    ];
-    if !disp.headline.is_empty() {
-        header.push(Span::styled(format!(" {}", disp.headline), dim_bg));
+    let mark_name = |summary: &str| {
+        let mut spans = vec![
+            Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
+            Span::styled(
+                name.to_string(),
+                Style::default().fg(theme.warn).bg(bg).bold(),
+            ),
+        ];
+        if !summary.is_empty() {
+            spans.push(Span::styled(format!(" {summary}"), dim_bg));
+        }
+        spans
+    };
+    if !expanded && name != "edit" {
+        // Collapsed: one line — mark, name, and a one-line summary. Shell calls
+        // summarize to their command (newlines collapsed, truncated); everything
+        // else to its headline, or the first detail row where there is no
+        // headline (task, MCP tools). The detail body and result stay hidden
+        // until the block is expanded.
+        let summary = match &disp.body {
+            hrdr_app::ToolBody::Shell { command } => command.clone(),
+            hrdr_app::ToolBody::Details(rows) => rows
+                .first()
+                .map(|(k, v)| format!("{k} {v}"))
+                .unwrap_or_default(),
+            _ => disp.headline.clone(),
+        };
+        // The mark + name + spaces already consume part of the line; truncate
+        // the summary to what remains so the collapsed line never wraps.
+        let prefix_w = mark.0.chars().count() + 1 + name.chars().count() + 1;
+        let budget = usize::from(inner).saturating_sub(prefix_w);
+        let summary = hrdr_tools::truncate_inline(&summary, budget);
+        return vec![Line::from(mark_name(&summary))];
     }
+    let header = mark_name(&disp.headline);
     let mut out: Vec<Line<'static>> = vec![Line::from(header)];
 
     // The `write` body is the file contents from the args, not the result diff.
     // Rendered raw — no gutter, no width fill, no language bar: the block's own
     // padding is the only indent, so the contents read as the file's own text.
     if let hrdr_app::ToolBody::Code { lang, content } = &disp.body {
-        let mut code = highlight_lines(lang, content, bg);
-        if !expanded && code.len() > DIFF_PREVIEW_LINES {
-            let extra = code.len() - DIFF_PREVIEW_LINES;
-            code.truncate(DIFF_PREVIEW_LINES);
-            code.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
-        }
+        let code = highlight_lines(lang, content, bg);
         out.extend(code);
         // Only the failure is worth showing; the success diff duplicates the
         // contents we just rendered.
@@ -3018,15 +3045,10 @@ fn tool_lines(
                     dim_bg,
                 ));
             }
-            // A long value (a `task` prompt) is clipped until the block is
-            // expanded, when it wraps in full like any other block content.
-            let text = if expanded {
-                value.clone()
-            } else {
-                hrdr_tools::truncate_inline(value, DETAIL_VALUE_W)
-            };
+            // A long value (a `task` prompt) wraps in full — the collapsed
+            // one-liner above already summarized the call.
             spans.push(Span::styled(
-                text,
+                value.clone(),
                 Style::default().fg(theme.assistant).bg(bg),
             ));
             out.push(Line::from(spans));
@@ -3037,7 +3059,6 @@ fn tool_lines(
         return out;
     }
     let is_diff = disp.body == hrdr_app::ToolBody::Diff;
-    let is_read = disp.body == hrdr_app::ToolBody::Read;
     // A diff is the point of an edit block, so it gets a taller preview.
     let preview = if is_diff {
         DIFF_PREVIEW_LINES
@@ -3047,20 +3068,9 @@ fn tool_lines(
     let lines: Vec<&str> = result.lines().collect();
     if done {
         // Finished: show the head of the result (or all of it when expanded).
-        // For read tools, show the tail (the actual content read, not preamble).
         let shown = if expanded { lines.len() } else { preview };
         let extra = lines.len().saturating_sub(shown);
-        // read shows the tail, so its hidden lines are *above* the preview —
-        // the hint goes there too. Everything else hides its tail.
-        let (start, end) = if is_read {
-            (extra, lines.len())
-        } else {
-            (0, shown.min(lines.len()))
-        };
-        if extra > 0 && is_read {
-            out.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
-        }
-        for line in &lines[start..end] {
+        for line in &lines[..shown.min(lines.len())] {
             let color = if is_diff {
                 diff_line_color(line, theme)
             } else {
@@ -3071,7 +3081,7 @@ fn tool_lines(
                 Style::default().fg(color).bg(bg),
             )));
         }
-        if extra > 0 && !is_read {
+        if extra > 0 {
             out.push(Line::from(Span::styled(more_hint(extra), dim_bg)));
         }
     } else {
@@ -3606,6 +3616,10 @@ mod cache_tests {
 mod block_tests {
     use super::*;
 
+    /// The old per-row clip width, still used to build a detail value long
+    /// enough to overflow the collapsed one-liner.
+    const DETAIL_VALUE_W: usize = 100;
+
     /// Total display width of a rendered line.
     fn w(line: &Line<'_>) -> usize {
         line.spans.iter().map(Span::width).sum()
@@ -3984,7 +3998,7 @@ mod block_tests {
     fn tool_header_mark_tracks_call_status() {
         let t = Theme::default();
         let head = |ok, done| {
-            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, false, "⠋");
+            let lines = tool_lines(&t, "ls", r#"{"path":"src"}"#, "", ok, done, false, "⠋", 80);
             text(&lines[0])
         };
         assert!(
@@ -4019,6 +4033,7 @@ mod block_tests {
             true,
             true,
             "⠋",
+            80,
         );
         let body = result.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    let x = 1;"), "result lines: {body}");
@@ -4034,6 +4049,7 @@ mod block_tests {
             true,
             true,
             "⠋",
+            80,
         );
         let body = shell.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    echo hi"), "shell command rows: {body}");
@@ -4048,6 +4064,7 @@ mod block_tests {
             false,
             true,
             "⠋",
+            80,
         );
         let body = live.iter().map(text).collect::<Vec<_>>().join("\n");
         assert!(body.contains("    let x = 1;"), "live tail: {body}");
@@ -4072,8 +4089,9 @@ mod block_tests {
             "a.rs\nb.rs",
             true,
             true,
-            false,
+            true,
             "",
+            80,
         );
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert_eq!(rows[0].trim(), "✓ shell", "no args preview on the header");
@@ -4090,10 +4108,11 @@ mod block_tests {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {}\n"}"#;
         let diff_result = "--- a/a.rs\n+++ b/a.rs\n+fn main() {}";
-        let rows: Vec<String> = tool_lines(&t, "write", args, diff_result, true, true, false, "")
-            .iter()
-            .map(text)
-            .collect();
+        let rows: Vec<String> =
+            tool_lines(&t, "write", args, diff_result, true, true, true, "", 80)
+                .iter()
+                .map(text)
+                .collect();
         assert!(rows[0].contains("write a.rs"));
         // Contents render raw: no gutter, no width fill, no language bar. The
         // block's own padding is the only indent the reader sees.
@@ -4114,7 +4133,7 @@ mod block_tests {
     fn write_tool_preserves_the_files_own_indentation() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"fn main() {\n    let x = 1;\n}"}"#;
-        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, false, "")
+        let rows: Vec<String> = tool_lines(&t, "write", args, "", true, true, true, "", 80)
             .iter()
             .map(text)
             .collect();
@@ -4131,7 +4150,7 @@ mod block_tests {
     fn a_task_call_shows_aligned_detail_rows_under_its_name() {
         let t = Theme::default();
         let args = r#"{"agent":"explore","description":"Explore hrdr-editor","prompt":"line one\nline two"}"#;
-        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, false, "")
+        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, true, "", 80)
             .iter()
             .map(text)
             .collect();
@@ -4144,18 +4163,65 @@ mod block_tests {
         assert_eq!(rows.len(), 4);
     }
 
-    /// A long detail value is clipped while collapsed and shown whole when the
-    /// block is expanded.
+    /// Collapsed shell calls summarize to one line: mark + name + the command
+    /// inline (newlines collapsed, truncated to the block width) — the output
+    /// stays hidden until the block is expanded.
+    #[test]
+    fn collapsed_shell_call_is_one_line() {
+        let t = Theme::default();
+        let args = r#"{"command":"cd /x && rg foo\n&& echo done"}"#;
+        let lines = tool_lines(
+            &t,
+            "shell",
+            args,
+            "lots of output",
+            true,
+            true,
+            false,
+            "",
+            40,
+        );
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows.len(), 1, "one line, no output: {rows:?}");
+        let row = &rows[0];
+        assert!(row.starts_with("✓ shell "), "mark + name lead: {row}");
+        assert!(
+            row.contains("cd /x && rg foo && echo done"),
+            "the command inline, newlines collapsed: {row}"
+        );
+        assert!(!row.contains("lots of output"), "output hidden: {row}");
+        assert!(
+            row.chars().count() <= 40,
+            "the collapsed line fits its width: {row}"
+        );
+    }
+
+    /// A collapsed tool call is one line — the first detail row summarized and
+    /// clipped; expanded shows the full value row.
     #[test]
     fn a_long_detail_value_is_clipped_until_expanded() {
         let t = Theme::default();
         let prompt = "x".repeat(DETAIL_VALUE_W + 50);
         let args = format!(r#"{{"prompt":"{prompt}"}}"#);
-        let row = |expanded| text(&tool_lines(&t, "task", &args, "", true, true, expanded, "")[1]);
 
-        let collapsed = row(false);
-        assert!(collapsed.len() < prompt.len(), "clipped: {collapsed}");
-        assert!(row(true).contains(&prompt), "expanded shows it whole");
+        let collapsed: Vec<String> = tool_lines(&t, "task", &args, "", true, true, false, "", 80)
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(collapsed.len(), 1, "collapsed is one line: {collapsed:?}");
+        assert!(
+            collapsed[0].contains("prompt ") && collapsed[0].len() < prompt.len(),
+            "the first row summarizes, clipped: {collapsed:?}"
+        );
+
+        let expanded: Vec<String> = tool_lines(&t, "task", &args, "", true, true, true, "", 80)
+            .iter()
+            .map(text)
+            .collect();
+        assert!(
+            expanded[1].contains(&prompt),
+            "expanded shows the value whole"
+        );
     }
 
     /// A failed `write` still surfaces the error the tool returned.
@@ -4163,11 +4229,20 @@ mod block_tests {
     fn failed_write_shows_the_error_result() {
         let t = Theme::default();
         let args = r#"{"path":"a.rs","content":"x"}"#;
-        let rows: Vec<String> =
-            tool_lines(&t, "write", args, "Error: denied", false, true, false, "")
-                .iter()
-                .map(text)
-                .collect();
+        let rows: Vec<String> = tool_lines(
+            &t,
+            "write",
+            args,
+            "Error: denied",
+            false,
+            true,
+            true,
+            "",
+            80,
+        )
+        .iter()
+        .map(text)
+        .collect();
         assert!(rows.iter().any(|r| r.contains("Error: denied")), "{rows:?}");
     }
 
@@ -4186,6 +4261,7 @@ mod block_tests {
             true,
             false,
             "",
+            80,
         );
         assert!(text(&lines[0]).contains("edit a.rs"));
         let color = |i: usize| lines[i].spans[0].style.fg;
@@ -4193,8 +4269,8 @@ mod block_tests {
         assert_eq!(color(3), Some(t.success), "addition is green");
     }
 
-    /// Collapsed results are capped at a preview and advertise the remainder;
-    /// expanding shows every line with no hint.
+    /// Collapsed results are ONE line (no preview); expanding shows every line
+    /// with no hint.
     #[test]
     fn long_results_are_previewed_until_expanded() {
         let t = Theme::default();
@@ -4203,26 +4279,24 @@ mod block_tests {
             .collect();
         let args = r#"{"path":"src"}"#;
 
-        let collapsed = tool_lines(&t, "ls", args, &result, true, true, false, "");
+        let collapsed = tool_lines(&t, "ls", args, &result, true, true, false, "", 80);
         let rows: Vec<String> = collapsed.iter().map(text).collect();
-        assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 1, "{rows:?}");
-        assert!(rows.last().unwrap().contains("+5 more lines"), "{rows:?}");
+        assert_eq!(rows.len(), 1, "collapsed is one line, no preview: {rows:?}");
 
-        let expanded = tool_lines(&t, "ls", args, &result, true, true, true, "");
+        let expanded = tool_lines(&t, "ls", args, &result, true, true, true, "", 80);
         let rows: Vec<String> = expanded.iter().map(text).collect();
         assert_eq!(rows.len(), 1 + TOOL_RESULT_PREVIEW_LINES + 5, "{rows:?}");
         assert!(!rows.last().unwrap().contains("more lines"), "{rows:?}");
     }
 
-    /// `read` previews the *tail* of its result — the file content, not the
-    /// preamble the tool prints above it.
+    /// `read`'s result is hidden while collapsed; expanded shows it in full.
     #[test]
-    fn read_tool_previews_the_tail_of_its_result() {
+    fn read_tool_hides_its_result_until_expanded() {
         let t = Theme::default();
         let result: String = (0..TOOL_RESULT_PREVIEW_LINES + 3)
             .map(|i| format!("line {i}\n"))
             .collect();
-        let rows: Vec<String> = tool_lines(
+        let collapsed: Vec<String> = tool_lines(
             &t,
             "read",
             r#"{"path":"a.rs"}"#,
@@ -4231,18 +4305,39 @@ mod block_tests {
             true,
             false,
             "",
+            80,
         )
         .iter()
         .map(text)
         .collect();
-        // 11 result lines, 8 previewed: lines 3..=10, with the hint above them
-        // (for `read` the hidden lines are the ones scrolled off the top).
-        assert!(rows[1].contains("+3 more lines"), "hint above: {rows:?}");
-        assert_eq!(rows[2], "line 3", "{rows:?}");
-        assert_eq!(rows.last().unwrap(), "line 10", "tail is last: {rows:?}");
+        assert_eq!(collapsed.len(), 1, "collapsed is one line: {collapsed:?}");
         assert!(
-            !rows.iter().any(|r| r == "line 0"),
-            "head dropped: {rows:?}"
+            !collapsed[0].contains("line"),
+            "no result leaks into the collapsed line: {collapsed:?}"
+        );
+
+        let expanded: Vec<String> = tool_lines(
+            &t,
+            "read",
+            r#"{"path":"a.rs"}"#,
+            &result,
+            true,
+            true,
+            true,
+            "",
+            80,
+        )
+        .iter()
+        .map(text)
+        .collect();
+        assert_eq!(
+            expanded.last().unwrap(),
+            "line 10",
+            "full result: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|r| r == "line 0"),
+            "head present when expanded: {expanded:?}"
         );
     }
 
@@ -4260,8 +4355,9 @@ mod block_tests {
             &result,
             false,
             false,
-            false,
+            true,
             "⠋",
+            80,
         )
         .iter()
         .map(text)
