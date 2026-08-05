@@ -773,7 +773,9 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
     .await;
     h.submit("read that file").await;
     // The nudge and refusal text live in the tool result, which is collapsed by
-    // default — expand the blocks so the assertion can see it.
+    // default — expand the blocks so the assertion can see it. The three
+    // identical reads also group behind a summary header; expand the groups too.
+    h.app.expand_tools = true;
     for e in h.app.transcript_mut() {
         if let EntryKind::Tool { expanded, .. } = &mut e.kind {
             *expanded = true;
@@ -3861,11 +3863,11 @@ async fn fenced_code_has_no_extra_indent_or_language_row() {
 ///        ↑blank ↑blank ↑         ↑      ↑
 #[tokio::test]
 async fn separator_rows_appear_only_between_tinted_blocks() {
-    let tool = |id: &str, name: &str| {
+    let tool = |id: &str, name: &str, args: &str| {
         Entry::now(EntryKind::Tool {
             id: id.into(),
             name: name.into(),
-            args: "{}".into(),
+            args: args.into(),
             result: format!("res-{id}"),
             ok: true,
             done: true,
@@ -3878,12 +3880,15 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("prompt"));
-    h.app.push_entry(tool("a", "ls"));
-    h.app.push_entry(tool("b", "cat"));
+    // The adjacent tool pair is `edit` + `cat`: `edit` always renders (it never
+    // groups), so the two stay separate blocks — the fixture is about the
+    // separator rows between them, not about tool grouping.
+    h.app.push_entry(tool("a", "edit", r#"{"path":"edit-me"}"#));
+    h.app.push_entry(tool("b", "cat", "{}"));
     h.app.push_entry(Entry::reasoning("thought"));
-    h.app.push_entry(tool("c", "grep"));
+    h.app.push_entry(tool("c", "grep", "{}"));
     h.app.push_entry(Entry::assistant("output"));
-    h.app.push_entry(tool("d", "wc"));
+    h.app.push_entry(tool("d", "wc", "{}"));
 
     let mut term = Terminal::new(TestBackend::new(40, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3924,7 +3929,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
 
     // Tinted → tinted: both blocks' pads, plus a separator row between them.
     assert_eq!(
-        gap(prompt_end, row_of("ls")),
+        gap(prompt_end, row_of("edit-me")),
         3,
         "prompt → tool needs a separator:\n{screen}"
     );
@@ -4078,6 +4083,105 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     assert!(
         after <= 1,
         "the collapsed block should sit at the top of the viewport, got row {after}:\n{screen}"
+    );
+}
+
+/// A run of tool calls groups behind one `{mark} called N tools · read 2
+/// files` summary line — the first of the two expansion levels. Clicking the
+/// summary fans the calls out as one-liners; clicking a one-liner expands
+/// that call in full; clicking the summary again folds the group back.
+#[tokio::test]
+async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "a".into(),
+        name: "shell".into(),
+        args: r#"{"command":"ls -la"}"#.into(),
+        result: "RESULT-A".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "b".into(),
+        name: "read".into(),
+        args: r#"{"path":"x.rs"}"#.into(),
+        result: "RESULT-B".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+
+    // Level 0: one summary line — the calls themselves are hidden.
+    let screen = h.render();
+    assert!(
+        screen.contains("called 2 tools · shell 1 · read 1"),
+        "the summary leads with the counts:\n{screen}"
+    );
+    assert!(
+        !screen.contains("RESULT-A") && !screen.contains("RESULT-B"),
+        "no call bodies while collapsed:\n{screen}"
+    );
+
+    // Click the summary → level 1: each call as a one-liner.
+    let (rect, hit) = h
+        .app
+        .tool_hits
+        .iter()
+        .find(|(_, t)| t.group)
+        .copied()
+        .expect("the group summary is clickable");
+    assert_eq!(hit.idx, 0, "the summary belongs to the group head");
+    click_at(&mut h.app, rect.x + 2, rect.y + 1);
+    let screen = h.render();
+    assert!(
+        screen.contains("shell ls -la") && screen.contains("read x.rs"),
+        "the calls fan out as one-liners:\n{screen}"
+    );
+    assert!(
+        !screen.contains("RESULT-A"),
+        "still one-liners, not full bodies:\n{screen}"
+    );
+
+    // Click the shell one-liner → level 2: that call in full.
+    let (rect, _) = h
+        .app
+        .tool_hits
+        .iter()
+        .find(|(_, t)| !t.group && t.idx == 0)
+        .copied()
+        .expect("the head's one-liner is clickable");
+    click_at(&mut h.app, rect.x + 2, rect.y + 1);
+    let screen = h.render();
+    assert!(
+        screen.contains("RESULT-A"),
+        "the clicked call expands in full:\n{screen}"
+    );
+    assert!(
+        !screen.contains("RESULT-B"),
+        "the other call stays a one-liner:\n{screen}"
+    );
+
+    // Click the summary again → back to level 0.
+    let (rect, _) = h
+        .app
+        .tool_hits
+        .iter()
+        .find(|(_, t)| t.group)
+        .copied()
+        .expect("the summary is still clickable");
+    click_at(&mut h.app, rect.x + 2, rect.y + 1);
+    let screen = h.render();
+    assert!(
+        screen.contains("called 2 tools"),
+        "the group folds back behind the summary:\n{screen}"
+    );
+    assert!(
+        !screen.contains("RESULT-A"),
+        "the calls hide again:\n{screen}"
     );
 }
 

@@ -370,6 +370,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tool calls group behind a summary line — two expansion levels.** A run of
+  consecutive tool calls (everything except `edit`/`replace`, which always
+  render in full) folds into one `✓ called 4 tools · read 2 · shell 2` block:
+  the counts are `·`-separated and wrap by section exactly like the live loader,
+  and the mark reflects the group (spinner while any call runs, ✓/✗ once it
+  settles). Clicking the summary fans the calls out as one-liners; clicking a
+  one-liner expands that call in full; clicking the summary again folds the
+  group back. `/verbose on` shows every group expanded, `/verbose off` folds
+  them all.
+
 - **The edit and replace tools color their patch like the code it describes.**
   The `+++`/`---` file headers carry the file's own side — green for the new
   file, red for the old — instead of both rendering dim; the edit summary's

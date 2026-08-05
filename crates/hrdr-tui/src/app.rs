@@ -120,6 +120,17 @@ pub(crate) struct HitRect {
     pub h: u16,
 }
 
+/// What a click on a tool block does: toggle that tool's own expansion, or
+/// toggle the whole group it heads (the `called N tools` summary line).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ToolHit {
+    /// Transcript index of the tool entry the click landed on.
+    pub idx: usize,
+    /// The block was the group's summary header — the click expands/collapses
+    /// the group rather than the entry.
+    pub group: bool,
+}
+
 impl From<ratatui::layout::Rect> for HitRect {
     fn from(r: ratatui::layout::Rect) -> Self {
         Self {
@@ -596,10 +607,16 @@ pub(crate) struct App {
     /// session), the sibling of [`end_button`](Self::end_button). `None`
     /// when following.
     pub(crate) home_button: Option<HitRect>,
-    /// Clickable screen rects for each visible tool block → its transcript index,
-    /// set during draw. A left click toggles that tool's `expanded` (like a
-    /// per-entry `/verbose`).
-    pub(crate) tool_hits: Vec<(HitRect, usize)>,
+    /// Clickable screen rects for each visible tool block → the entry it
+    /// toggles, set during draw. A left click toggles that tool's `expanded`
+    /// (like a per-entry `/verbose`); a click on a tool GROUP's summary header
+    /// (`ToolHit.group`) toggles the group instead.
+    pub(crate) tool_hits: Vec<(HitRect, ToolHit)>,
+    /// Tool ids of group heads whose tool group is EXPANDED (showing each call
+    /// as its one-liner). A multi-tool group collapses behind a single
+    /// `called N tools · read 2 files` summary line until toggled — view state,
+    /// keyed by the stable tool-call id of the group's first entry.
+    pub(crate) tool_groups: std::collections::HashSet<String>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
     /// Shared registry of *detached background* sub-agents (a clone of the
@@ -836,6 +853,7 @@ impl App {
             steering: hrdr_agent::steering_queue(),
             end_button: None,
             tool_hits: Vec::new(),
+            tool_groups: std::collections::HashSet::new(),
             transcript_rect: HitRect {
                 x: 0,
                 y: 0,
@@ -1772,25 +1790,44 @@ impl App {
         self.toggle_tool_at(col, row);
     }
 
-    /// Toggle the full output of the tool block under `(col, row)`, if a click
-    /// landed on one (the per-entry counterpart of `/verbose`).
+    /// Toggle the expansion of the tool block under `(col, row)`, if a click
+    /// landed on one. A click on a tool GROUP's summary header toggles the
+    /// whole group (the `called N tools` line appears or the calls fan out);
+    /// a click on an individual block toggles that call's full output.
     fn toggle_tool_at(&mut self, col: u16, row: u16) {
         let hit = self
             .tool_hits
             .iter()
             .find(|(r, _)| r.contains(col, row))
-            .map(|(_, i)| *i);
-        if let Some(idx) = hit
-            && let Some(EntryKind::Tool { expanded, .. }) = self
+            .map(|(_, h)| *h);
+        let Some(hit) = hit else { return };
+        if hit.group {
+            // The summary header: expand/collapse the group, keyed by the
+            // group head's tool-call id.
+            let id = self
                 .panes
-                .active_transcript_mut()
-                .get_mut(idx)
-                .map(|e| &mut e.kind)
+                .active_transcript()
+                .get(hit.idx)
+                .and_then(|e| crate::ui::tool_call_id(&e.kind))
+                .map(str::to_owned);
+            if let Some(id) = id
+                && !self.tool_groups.remove(&id)
+            {
+                self.tool_groups.insert(id);
+            }
+            // The group's height is about to change; keep its top where the
+            // reader is looking (see `pending_scroll_entry`).
+            self.pending_scroll_entry = Some(hit.idx);
+        } else if let Some(EntryKind::Tool { expanded, .. }) = self
+            .panes
+            .active_transcript_mut()
+            .get_mut(hit.idx)
+            .map(|e| &mut e.kind)
         {
             *expanded = !*expanded;
             // The block's height just changed; keep its top where the reader is
             // looking instead of letting it slide.
-            self.pending_scroll_entry = Some(idx);
+            self.pending_scroll_entry = Some(hit.idx);
         }
     }
 

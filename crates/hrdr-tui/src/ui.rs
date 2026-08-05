@@ -885,8 +885,9 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 struct TranscriptFrame {
     scroll_offset: usize,
     max_scroll: usize,
-    /// Visible tool blocks → the transcript index each one expands.
-    tool_hits: Vec<(HitRect, usize)>,
+    /// Visible tool blocks → the transcript index each one toggles (with the
+    /// group-summary flag where the block is a group's header).
+    tool_hits: Vec<(HitRect, crate::app::ToolHit)>,
     /// Visible live-panel rows → what clicking one does.
     row_hits: Vec<(HitRect, RowHit)>,
 }
@@ -995,7 +996,10 @@ fn draw_chunks(
                     w: text_area.width,
                     h: (vis_end - vis_start) as u16,
                 },
-                idx,
+                crate::app::ToolHit {
+                    idx,
+                    group: c.group,
+                },
             ));
         }
     }
@@ -1431,6 +1435,7 @@ fn panel(
         Chunk {
             rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
             tool_idx: None,
+            group: false,
             row_hits: hits,
         },
     ]
@@ -2462,6 +2467,10 @@ struct Chunk<'a> {
     rows: ChunkRows<'a>,
     /// Transcript index, when this chunk is a tool call (for click-to-expand).
     tool_idx: Option<usize>,
+    /// This chunk is a tool GROUP's summary header — a click toggles the group
+    /// (expands it into its calls, or collapses it back to the summary) rather
+    /// than one call's own expansion.
+    group: bool,
     /// What a click on one of this chunk's *body* rows does, by row index
     /// (0 = the first row inside the block's padding). Only the live panels use
     /// this — they ride in the transcript, so their click targets scroll like
@@ -2475,6 +2484,7 @@ impl<'a> Chunk<'a> {
         Self {
             rows,
             tool_idx,
+            group: false,
             row_hits: Vec::new(),
         }
     }
@@ -2757,16 +2767,62 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     let w = width as usize;
     let inner = inner_width(w);
     let mut pending: Option<PendingBlock> = None;
-    for (i, entry) in app.panes.active_transcript().iter().enumerate() {
+    let transcript = app.panes.active_transcript();
+    // Members of a collapsed tool group are hidden; `skip_until` is one past
+    // the last skipped member.
+    let mut skip_until: Option<usize> = None;
+    for (i, entry) in transcript.iter().enumerate() {
+        if skip_until.is_some_and(|s| i < s) {
+            continue;
+        }
+        skip_until = None;
+        // For unfinished tool entries the current spinner frame is mixed into the
+        // hash so the cached block invalidates on each tick, animating the
+        // marker — and the tool-group summary header uses the same frame.
+        let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
+        let frame = SPINNER[frame_idx as usize % SPINNER.len()];
+        // Tool groups: consecutive collapsible calls (everything but
+        // `edit`/`replace`, which always render and never group) collapse
+        // behind one `{mark} called N tools · read 2 files` summary line. The
+        // group's first call heads it; the summary header chunk always opens
+        // the group (it is the control that collapses it back), and the calls
+        // render as one-liners beneath it when the group is expanded.
+        if is_collapsible_tool(&entry.kind) {
+            let head = i == 0 || !is_collapsible_tool(&transcript[i - 1].kind);
+            if head {
+                let end = tool_group_end(transcript, i);
+                if end - i >= 2 {
+                    let id = tool_call_id(&entry.kind).unwrap_or_default();
+                    let expanded = app.expand_tools || app.tool_groups.contains(id);
+                    flush(
+                        &mut chunks,
+                        &mut msg_at,
+                        pending.take(),
+                        Some(BlockKind::Tool.bg(theme)),
+                        w,
+                        now,
+                        theme,
+                    );
+                    chunks.push(tool_group_chunk(
+                        &transcript[i..end],
+                        i,
+                        theme,
+                        w,
+                        inner,
+                        frame,
+                    ));
+                    if !expanded {
+                        skip_until = Some(end);
+                        continue;
+                    }
+                }
+            }
+        }
         // Body cache key shared by all arms (Reasoning skip happens before this).
         // The header has no content of its own to hash — it reads live session
         // state — so it hashes what it *displays*. Its rows are never cached, but
         // its height is, and a header that grew a row (an effort field appearing, a
         // longer model name wrapping) has to be measured again.
-        // For unfinished tool entries the current spinner frame is mixed into the
-        // hash so the cached block invalidates on each tick, animating the marker.
-        let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
-        let frame = SPINNER[frame_idx as usize % SPINNER.len()];
         let base_hash = match entry.kind {
             EntryKind::Header => header_hash(app),
             _ => entry_content_hash(entry, app.expand_tools),
@@ -3035,6 +3091,118 @@ fn markdown_lines(
         buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));
     }
     buf
+}
+
+/// Tools that always render in full, whatever the collapse state: they return
+/// the patch they applied, so the diff is never hidden behind a summary.
+fn is_always_full_tool(name: &str) -> bool {
+    matches!(name, "edit" | "replace")
+}
+
+/// A tool call that participates in grouping — everything but the always-full
+/// pair above.
+fn is_collapsible_tool(kind: &EntryKind) -> bool {
+    matches!(kind, EntryKind::Tool { name, .. } if !is_always_full_tool(name))
+}
+
+/// The tool-call id of an entry, when it is a tool call — the stable key the
+/// group-expansion state is held under (see `App::tool_groups`).
+pub(crate) fn tool_call_id(kind: &EntryKind) -> Option<&str> {
+    match kind {
+        EntryKind::Tool { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+/// Where a tool group ends: one past the run of consecutive collapsible tool
+/// calls beginning at `start`. An always-full call (`edit`/`replace`) or any
+/// non-tool entry ends the run.
+fn tool_group_end(transcript: &[Entry], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < transcript.len() && is_collapsible_tool(&transcript[end].kind) {
+        end += 1;
+    }
+    end
+}
+
+/// The summary for a tool group: `called N tools` plus one section per
+/// distinct tool name in the order the calls appear, plus whether any call is
+/// still running and whether every finished call succeeded. The sections are
+/// ` · `-joined and wrapped by [`pack_loader_segments`] exactly like the live
+/// loader, so a narrow terminal wraps by section with indented continuation
+/// rows.
+fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut total = 0usize;
+    let mut running = false;
+    let mut all_ok = true;
+    for e in members {
+        if let EntryKind::Tool { name, ok, done, .. } = &e.kind {
+            total += 1;
+            running |= !done;
+            all_ok &= ok;
+            match counts.iter_mut().find(|(n, _)| n == name) {
+                Some((_, c)) => *c += 1,
+                None => counts.push((name.clone(), 1)),
+            }
+        }
+    }
+    let mut sections = vec![format!(
+        "called {total} tool{}",
+        if total == 1 { "" } else { "s" }
+    )];
+    for (name, n) in counts {
+        sections.push(format!("{name} {n}"));
+    }
+    (sections, running, all_ok)
+}
+
+/// The block for a tool group's summary header: a tool block whose body is the
+/// packed `{mark} called N tools · read 2 files` line(s). The mark reflects the
+/// whole group — the spinner frame while any call runs, ✓/✗ by the group's
+/// outcome once it settles. Built fresh every frame (its content depends on
+/// the whole group, so the per-entry body cache cannot serve it), and a click
+/// on it toggles the group via `ToolHit.group`.
+fn tool_group_chunk(
+    members: &[Entry],
+    head_idx: usize,
+    theme: &Theme,
+    w: usize,
+    inner: u16,
+    frame: &'static str,
+) -> Chunk<'static> {
+    let bg = BlockKind::Tool.bg(theme);
+    let (sections, running, all_ok) = tool_group_summary(members);
+    let packed = pack_loader_segments(&sections, usize::from(inner));
+    let (mark, color) = if running {
+        (frame, theme.warn)
+    } else if all_ok {
+        ("✓", theme.success)
+    } else {
+        ("✗", theme.error)
+    };
+    let dim = Style::default().fg(theme.dim).bg(bg);
+    let body: Vec<Line<'static>> = packed
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let mut spans = Vec::new();
+            if i == 0 {
+                spans.push(Span::styled(
+                    format!("{} ", mark),
+                    Style::default().fg(color).bg(bg),
+                ));
+            }
+            spans.push(Span::styled(text, dim));
+            Line::from(spans)
+        })
+        .collect();
+    Chunk {
+        rows: ChunkRows::Ready(Rc::new(render_block(body, w, bg, None))),
+        tool_idx: Some(head_idx),
+        group: true,
+        row_hits: Vec::new(),
+    }
 }
 
 /// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +
@@ -4345,6 +4513,63 @@ mod block_tests {
         assert_eq!(rows[2], "description  Explore hrdr-editor");
         assert_eq!(rows[3], "prompt       line one line two", "one row per arg");
         assert_eq!(rows.len(), 4);
+    }
+
+    /// The group summary counts the calls and breaks them down by tool name in
+    /// the order they appear, and flags a still-running call (spinner) and a
+    /// failed one (✗) for the header's mark.
+    #[test]
+    fn tool_group_summary_counts_and_flags() {
+        let entry = |id: &str, name: &str, ok: bool, done: bool| {
+            Entry::now(EntryKind::Tool {
+                id: id.into(),
+                name: name.into(),
+                args: "{}".into(),
+                result: String::new(),
+                ok,
+                done,
+                expanded: false,
+            })
+        };
+        let (sections, running, all_ok) = tool_group_summary(&[
+            entry("a", "shell", true, true),
+            entry("b", "read", true, true),
+            entry("c", "shell", false, true),
+        ]);
+        assert_eq!(
+            sections,
+            vec!["called 3 tools", "shell 2", "read 1"],
+            "total first, then per-name counts in first-seen order"
+        );
+        assert!(!running, "nothing is unfinished");
+        assert!(!all_ok, "a failed call fails the group");
+
+        let (_, running, _) = tool_group_summary(&[entry("a", "shell", true, false)]);
+        assert!(running, "an unfinished call shows the spinner");
+    }
+
+    /// A lone tool call is its own group of one — no summary line — and an
+    /// always-full call (`edit`/`replace`) breaks a run rather than joining it.
+    #[test]
+    fn a_single_tool_call_is_not_summarized() {
+        let entry = |id: &str, name: &str| {
+            Entry::now(EntryKind::Tool {
+                id: id.into(),
+                name: name.into(),
+                args: "{}".into(),
+                result: String::new(),
+                ok: true,
+                done: true,
+                expanded: false,
+            })
+        };
+        let mut t = vec![entry("a", "shell"), entry("b", "read")];
+        assert_eq!(tool_group_end(&t, 0), 2, "the run spans both calls");
+        assert_eq!(tool_group_end(&t, 1), 2, "a member ends the same run");
+
+        t.push(entry("c", "edit"));
+        assert_eq!(tool_group_end(&t, 0), 2, "edit breaks the group");
+        assert_eq!(tool_group_end(&t, 2), 3, "edit is its own run of one");
     }
 
     /// Loader stats pack into width-bounded lines, breaking between ` · `-joined

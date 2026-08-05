@@ -141,6 +141,7 @@ impl super::App {
             }
             hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
+                self.tool_groups.clear();
                 for e in self.panes.active_transcript_mut().iter_mut() {
                     if let EntryKind::Tool { expanded, .. } = &mut e.kind {
                         *expanded = false;
