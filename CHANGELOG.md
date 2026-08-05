@@ -54,25 +54,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A tool call collapses behind its group's summary even on its own.** Every
   collapsible call (`edit`/`replace` always render) folds into a
-  `✓ called N tools · ran 2 commands` line from the first call, and a run stays
-  one group across the invisible entries between its calls — an empty
+  `✓ ran 2 commands` line from the first call — one verb section per tool kind
+  (`used 1 skill`, `read 3 files`), with no `called N tools` total — and a run
+  stays one group across the invisible entries between its calls — an empty
   tool-only-turn marker or an empty thinking block — so a new call that streams
   in updates the open summary's counts instead of opening another entry. Only an
   `edit`/`replace` call or a visible entry (a user prompt, rendered text or
   reasoning, stats, a notice) breaks a run.
 
 - **Expanding a tool group's summary renders its calls inside it as nested child
-  items.** The summary keeps its header — its first row, with one blank row
-  beneath it so the first call never sits flush against it — and the calls fan
-  out below, each on the normal tool background, on a group background that is
-  slightly dimmer than the tool entries' — so the boxes read as items of the
-  section rather than blocks of their own. Absorbed tool-only turns keep their
-  `#N assistant` `/goto` labels at their transcript positions inside the group.
+  items.** The summary keeps its header — its first row (a leading space sets it
+  apart), with one blank row beneath it so the first call never sits flush
+  against it — and the calls fan out below, flush with the transcript's own
+  content column (no extra box padding), each on the normal tool background,
+  over a group background that is slightly dimmer than the tool entries' — so
+  the calls read as items of the section rather than blocks of their own.
+  Absorbed tool-only turns keep their `#N assistant` `/goto` labels at their
+  transcript positions inside the group.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes
   the summary row in place and touches nothing else on screen — the viewport
   cannot jump while the summaries stream.
+
+- **`/verbose` announces itself by name.** On and off report `verbose mode on` /
+  `verbose mode off` instead of `tool output expanded (all)` /
+  `tool output collapsed`.
 
 - **The input box reports its stash and history position on its top padding
   line.** While Ctrl+S drafts wait, the line shows how many
@@ -110,6 +117,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `AgentUsage` carries the counters (`cache_read_tokens`, `cache_write_tokens`,
   `cache_measured_tokens`, and `cache_hit_rate()`), so they exist per agent with
   no UI attached and a sub-agent's are its own.
+
+### Changed
+
+- **Steering the model resets its tool-round budget.** A mid-turn steer is the
+  user piling on more work, so the round counter restarts: the model gets a
+  fresh `max_steps` of tool rounds from the steer on, instead of running out
+  against the original budget part-way through the new work.
+
+- **The system prompt tells the model to track a growing pile of requests in
+  `todo`.** When the user starts handing over several things to work on or
+  investigate — or piles more on mid-task — every item goes on the todo list as
+  it arrives, so nothing in the pile is forgotten.
 
 ### Fixed
 

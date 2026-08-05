@@ -1036,7 +1036,7 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
     h.app.transcript_mut().push(Entry::at(
         EntryKind::Tool {
             id: "c1".into(),
-            name: "bash".into(),
+            name: "shell".into(),
             args: r#"{"command":"echo hi"}"#.into(),
             result: "VERBOSE-MODE-RESULT".into(),
             ok: true,
@@ -1354,7 +1354,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
         "the box itself shares the prompt bg"
     );
     assert!(
-        row_text(tool_y + 1).starts_with(&format!("{pad}{pad}echo hi")),
+        row_text(tool_y + 1).starts_with(&format!("{pad}echo hi")),
         "command line"
     );
     assert!(
@@ -1388,7 +1388,7 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
         Entry::at(
             EntryKind::Tool {
                 id: "c1".into(),
-                name: "bash".into(),
+                name: "shell".into(),
                 args: r#"{"command":"echo hi"}"#.into(),
                 result: "hi".into(),
                 ok: true,
@@ -1426,7 +1426,7 @@ async fn resume_settles_a_tool_call_that_was_still_running() {
     let state = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
         messages: vec![hrdr_agent::Message::system("sys")],
-        transcript: vec![Entry::tool_running("c1", "bash", "{}")],
+        transcript: vec![Entry::tool_running("c1", "shell", "{}")],
         ..Default::default()
     };
     h.app
@@ -1445,7 +1445,7 @@ async fn resume_settles_a_tool_call_that_was_still_running() {
 async fn autosave_persists_every_transcript_entry() {
     let mut h = Harness::new(vec![
         MockReply::ToolCall {
-            name: "bash".into(),
+            name: "shell".into(),
             args: r#"{"command":"echo hi"}"#.into(),
         },
         MockReply::Text("all done".into()),
@@ -1463,7 +1463,7 @@ async fn autosave_persists_every_transcript_entry() {
     assert!(
         kinds
             .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Tool { name, .. } if name == "bash")),
+            .any(|e| matches!(&e.kind, EntryKind::Tool { name, .. } if name == "shell")),
         "the tool call is part of the state"
     );
     assert!(
@@ -1976,7 +1976,7 @@ async fn queued_messages_merge_and_come_back_together() {
 async fn every_transcript_row_is_rendered_through_the_block_path() {
     let mut h = Harness::new(vec![
         MockReply::ToolCall {
-            name: "bash".into(),
+            name: "shell".into(),
             args: r#"{"command":"echo hi"}"#.into(),
         },
         MockReply::Text("done".into()),
@@ -3108,7 +3108,7 @@ async fn goto_finds_a_text_less_assistant_turn() {
         .push_entry(Entry::reasoning("thought about something"));
     h.app.push_entry(Entry::assistant("")); // message #2
     h.app
-        .push_entry(Entry::tool_running("c1", "bash", r#"{"command":"ls"}"#));
+        .push_entry(Entry::tool_running("c1", "shell", r#"{"command":"ls"}"#));
 
     let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3143,7 +3143,7 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
     h.app.push_entry(Entry::assistant("")); // borrows its label from the thought
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: r#"{"command":"ls"}"#.into(),
         result: long_output,
         ok: true,
@@ -3163,7 +3163,7 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
                         .map(|c| c.symbol().to_string())
                 })
                 .collect::<String>()
-                .contains("called 1 tool")
+                .contains("ran 1 command")
         })
         .expect("tool summary rendered");
     let (rect, _) = h
@@ -3191,7 +3191,7 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
                         .map(|c| c.symbol().to_string())
                 })
                 .collect::<String>()
-                .contains("✓ bash")
+                .contains("✓ shell")
         })
         .expect("tool header rendered after expansion");
     let (rect, _) = h
@@ -3528,7 +3528,7 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: r#"{"command":"ls"}"#.into(),
         result: "SELECTABLE".into(),
         ok: true,
@@ -4022,7 +4022,7 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     // Untinted → tinted: the summary's first row IS the tool summary now (no
     // pad above it), so only the assistant block's own bottom pad separates it.
     assert_eq!(
-        gap(row_of("#1 assistant"), row_of("called 1 tool")),
+        gap(row_of("#1 assistant"), row_of("listed 1 directory")),
         1,
         "output → tool:\n{screen}"
     );
@@ -4044,7 +4044,7 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: r#"{"command":"ls"}"#.into(),
         result: long,
         ok: true,
@@ -4082,7 +4082,7 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
                         .map(|c| c.symbol().to_string())
                 })
                 .collect::<String>()
-                .contains("called 2 tools")
+                .contains("ran 1 command · read 1 file")
         })
     };
     let before = header_row(&term).expect("group summary on screen");
@@ -4132,7 +4132,7 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
     h.app.push_entry(tool("a", "shell", false));
     let screen = h.render();
     assert!(
-        screen.contains("calling 1 tool"),
+        screen.contains("running 1 command"),
         "a running lone call gets a summary:\n{screen}"
     );
     assert!(
@@ -4144,7 +4144,7 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
     h.app.push_entry(tool("b", "read", false));
     let screen = h.render();
     assert!(
-        screen.contains("calling 2 tools"),
+        screen.contains("running 1 command · reading 1 file"),
         "the new call updates the summary, it does not open a new entry:\n{screen}"
     );
     assert!(
@@ -4152,7 +4152,7 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
         "no call is full-rendered while the group is folded:\n{screen}"
     );
 
-    // The calls finish; the summary settles with the merged count intact.
+    // The calls finish; the summary settles with the merged sections intact.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, result, .. } = &mut e.kind {
             *done = true;
@@ -4161,8 +4161,8 @@ async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
     });
     let screen = h.render();
     assert!(
-        screen.contains("called 2 tools"),
-        "the settled summary keeps the merged count:\n{screen}"
+        screen.contains("ran 1 command · read 1 file"),
+        "the settled summary keeps the merged sections:\n{screen}"
     );
     assert!(
         !screen.contains("done"),
@@ -4214,14 +4214,15 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
     h.app.push_entry(tool("b", "read", false));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let after = term.backend().buffer().clone();
-    let summary_row = screen_row_of(&term, "calling 2 tools").expect("the summary is on screen");
+    let summary_row = screen_row_of(&term, "running 1 command · reading 1 file")
+        .expect("the summary is on screen");
     assert_eq!(
         changed_rows(&before, &after),
         vec![summary_row],
         "a merged call must touch only the summary row"
     );
 
-    // Settling rewrites the same single row: `calling` → `called`, spinner → ✓.
+    // Settling rewrites the same single row: progressive → past, spinner → ✓.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, .. } = &mut e.kind {
             *done = true;
@@ -4229,8 +4230,8 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
     });
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let after = term.backend().buffer().clone();
-    let summary_row =
-        screen_row_of(&term, "called 2 tools").expect("the settled summary is on screen");
+    let summary_row = screen_row_of(&term, "ran 1 command · read 1 file")
+        .expect("the settled summary is on screen");
     assert_eq!(
         changed_rows(&before, &after),
         vec![summary_row],
@@ -4436,7 +4437,7 @@ async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
             .trim()
             .is_empty()
     };
-    let summary = row_of("called 2 tools");
+    let summary = row_of("ran 1 command · read 1 file");
     // The row above the summary is the previous block's own bottom pad — and
     // text above that — so the group adds no pad of its own above the line.
     assert!(
@@ -4483,7 +4484,7 @@ async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
             .trim()
             .is_empty()
     };
-    let summary = row_of("called 2 tools");
+    let summary = row_of("ran 1 command · read 1 file");
     let result_a = row_of("RESULT-A");
     assert!(
         blank(summary + 1),
@@ -4776,8 +4777,8 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
     // Level 0: one summary line — the calls themselves are hidden.
     let screen = h.render();
     assert!(
-        screen.contains("called 2 tools · ran 1 command · read 1 file"),
-        "the summary leads with the counts:\n{screen}"
+        screen.contains("ran 1 command · read 1 file"),
+        "the summary leads with the per-call sections:\n{screen}"
     );
     assert!(
         !screen.contains("RESULT-A") && !screen.contains("RESULT-B"),
@@ -4797,7 +4798,7 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
     click_at(&mut h.app, rect.x + 2, rect.y + 1);
     let screen = h.render();
     assert!(
-        screen.contains("called 2 tools"),
+        screen.contains("ran 1 command · read 1 file"),
         "the group folds back behind the summary:\n{screen}"
     );
     assert!(
@@ -4857,7 +4858,7 @@ async fn edit_and_replace_break_the_group_into_standalone_entries() {
             })
             .collect()
     };
-    let summaries = row_of("called 6 tools · ran 6 commands");
+    let summaries = row_of("ran 6 commands");
     assert_eq!(
         summaries.len(),
         2,
@@ -4953,13 +4954,13 @@ async fn visible_entries_bound_a_tool_group() {
         "both replace calls render as their own entries:\n{screen}"
     );
     assert_eq!(
-        rows_with("called 6 tools").len(),
+        rows_with("ran 6 commands").len(),
         1,
         "the six calls fold into one summary:\n{screen}"
     );
     assert!(
-        row_of("thinking about it") < row_of("called 6 tools")
-            && row_of("called 6 tools") < row_of("✓ edit")
+        row_of("thinking about it") < row_of("ran 6 commands")
+            && row_of("ran 6 commands") < row_of("✓ edit")
             && row_of("✓ edit") < replaces[0]
             && replaces[0] < replaces[1]
             && replaces[1] < row_of("thinking again")
@@ -4970,11 +4971,11 @@ async fn visible_entries_bound_a_tool_group() {
 
 /// Tool-only turns leave an empty assistant marker in the transcript; the
 /// marker renders nothing, so the tool runs on either side of it merge into
-/// one group — 3 + 2 + 6 calls become a single `called 11 tools · ran 7
-/// commands · read 4 files` summary rather than three. Only an
-/// `edit`/`replace` (or a visible entry) breaks a run, and the absorbed turn
-/// markers keep their `#N assistant` `/goto` labels at their transcript
-/// positions when the group is expanded.
+/// one group — 3 + 2 + 6 calls become a single `ran 7 commands · read 4
+/// files` summary rather than three. Only an `edit`/`replace` (or a visible
+/// entry) breaks a run, and the absorbed turn markers keep their `#N
+/// assistant` `/goto` labels at their transcript positions when the group is
+/// expanded.
 #[tokio::test]
 async fn tool_runs_merge_across_invisible_turn_markers() {
     let mut h = Harness::new(vec![]).await;
@@ -5016,10 +5017,10 @@ async fn tool_runs_merge_across_invisible_turn_markers() {
     // Collapsed: one merged summary, with the runs' own counts gone.
     let screen = h.render();
     assert!(
-        screen.contains("called 11 tools · ran 7 commands · read 4 files"),
+        screen.contains("ran 7 commands · read 4 files"),
         "the three runs merge into one summary:\n{screen}"
     );
-    for split in ["called 3 tools", "called 2 tools", "called 6 tools"] {
+    for split in ["ran 3 commands", "ran 2 commands", "ran 6 commands"] {
         assert!(
             !screen.contains(split),
             "no per-run summary {split:?}:\n{screen}"
@@ -5074,7 +5075,7 @@ async fn collapsing_while_following_stays_at_the_bottom() {
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: r#"{"command":"ls"}"#.into(),
         result: long,
         ok: true,
@@ -5108,7 +5109,7 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: "{}".into(),
         result: "res".into(),
         ok: true,
@@ -5137,20 +5138,15 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // Its own bottom pad (tinted), then the group container's bottom pad
-    // (dimmer), then a blank row on the terminal background.
+    // The group container's bottom pad (dimmer), then a blank row on the
+    // terminal background — the child box itself has no padding of its own.
     assert_eq!(
         bg_at(last_content + 1),
-        h.app.theme.user_bg,
-        "child bottom pad:\n{screen}"
-    );
-    assert_eq!(
-        bg_at(last_content + 2),
         h.app.theme.group_bg,
         "summary container bottom pad:\n{screen}"
     );
     assert_eq!(
-        bg_at(last_content + 3),
+        bg_at(last_content + 2),
         Color::Reset,
         "a blank row closes the scrollback:\n{screen}"
     );
@@ -6234,12 +6230,12 @@ async fn the_loader_stops_while_the_models_tools_run() {
     // A tool round opens: the model handed off and is now idle.
     h.inject(AgentEvent::ToolStart {
         id: "a".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: "{}".into(),
     });
     h.inject(AgentEvent::ToolStart {
         id: "b".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: "{}".into(),
     });
     assert!(!turn(&h).inferring(), "idle while its tools run");
@@ -6259,7 +6255,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
     // One of two tools returning is not enough — the model is still waiting.
     let end = |id: &str| AgentEvent::ToolEnd {
         id: id.into(),
-        name: "bash".into(),
+        name: "shell".into(),
         result: "ok".into(),
         ok: true,
     };
@@ -6444,7 +6440,7 @@ async fn the_prompt_and_input_wear_a_left_bar() {
     h.app.push_entry(Entry::user("prompt here"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "a".into(),
-        name: "bash".into(),
+        name: "shell".into(),
         args: r#"{"command":"echo hi"}"#.into(),
         result: "hi".into(),
         ok: true,
@@ -6479,7 +6475,7 @@ async fn the_prompt_and_input_wear_a_left_bar() {
     }
 
     // The tool block shares the background but wears no bar.
-    let tool_y = row_of("✓ bash");
+    let tool_y = row_of("✓ shell");
     assert_eq!(
         cell(tool_y).symbol(),
         " ",

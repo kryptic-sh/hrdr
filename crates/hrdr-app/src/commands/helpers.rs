@@ -15,8 +15,8 @@ pub fn busy_generic() -> String {
 
 /// `/verbose` status lines.
 pub mod expand_msg {
-    pub const ALL: &str = "tool output expanded (all)";
-    pub const OFF: &str = "tool output collapsed";
+    pub const ALL: &str = "verbose mode on";
+    pub const OFF: &str = "verbose mode off";
 }
 
 /// `/reload` + hot-reload status lines.

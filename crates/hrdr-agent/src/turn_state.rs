@@ -35,17 +35,21 @@ impl Agent {
         &mut self,
         steering: &SteeringQueue,
         on_event: &mut F,
-    ) {
+    ) -> bool {
         let pending: Vec<Steer> = steering
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
+        // Whether anything was delivered: the turn loop resets its round
+        // budget on a steer (see `Agent::run`).
+        let delivered = !pending.is_empty();
         for msg in pending {
             // `opening = false`: no hook, so this never returns `Err`.
             let _ = self
                 .deliver_user_message(msg, /*opening*/ false, on_event)
                 .await;
         }
+        delivered
     }
 
     /// Whether the steering queue has any undelivered messages.

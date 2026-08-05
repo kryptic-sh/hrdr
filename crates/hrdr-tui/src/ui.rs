@@ -3215,6 +3215,7 @@ fn tool_action(name: &str) -> Option<(&'static str, &'static str, &'static str, 
         "shell" => Some(("ran", "running", "command", false)),
         "read" => Some(("read", "reading", "file", false)),
         "write" => Some(("wrote", "writing", "file", false)),
+        "skill" => Some(("used", "using", "skill", false)),
         "grep" | "find" => Some(("searched", "searching", "pattern", true)),
         "ls" | "tree" => Some(("listed", "listing", "directory", false)),
         _ => None,
@@ -3233,22 +3234,20 @@ fn plural(noun: &str, n: usize) -> String {
     }
 }
 
-/// The summary for a tool group: `called N tools` (or `calling N tools` while
-/// any call is still running), one verb section per distinct tool name in the
-/// order the calls appear (`ran 2 commands`, `reading 3 files`, `searching for
-/// 2 patterns`, `listing 3 directories`). The sections are ` · `-joined and
+/// The summary for a tool group: one verb section per distinct tool name in
+/// the order the calls appear (`ran 2 commands`, `used 1 skill`, `searching
+/// for 2 patterns`, `listing 3 directories`) — no `called N tools` total, the
+/// sections themselves are the summary. The sections are ` · `-joined and
 /// wrapped by [`pack_loader_segments`] exactly like the live loader, so a
 /// narrow terminal wraps by section with indented continuation rows. Also
 /// reports whether any call is still running and whether every finished call
 /// succeeded.
 fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
     let mut counts: Vec<(String, usize)> = Vec::new();
-    let mut total = 0usize;
     let mut running = false;
     let mut all_ok = true;
     for e in members {
         if let EntryKind::Tool { name, ok, done, .. } = &e.kind {
-            total += 1;
             running |= !done;
             all_ok &= ok;
             match counts.iter_mut().find(|(n, _)| n == name) {
@@ -3257,11 +3256,7 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
             }
         }
     }
-    let mut sections = vec![format!(
-        "{} {total} tool{}",
-        if running { "calling" } else { "called" },
-        if total == 1 { "" } else { "s" }
-    )];
+    let mut sections = Vec::new();
     for (name, n) in counts {
         let section = match tool_action(&name) {
             Some((past, prog, noun, for_)) => {
@@ -3400,6 +3395,9 @@ fn tool_group_chunk(
     for (i, text) in packed.into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
+            // A leading space sets the summary apart from the children's first
+            // column; the mark then follows it.
+            spans.push(Span::styled(" ", Style::default().bg(group_bg)));
             spans.push(Span::styled(
                 format!("{} ", mark),
                 Style::default().fg(color).bg(group_bg),
@@ -3444,10 +3442,11 @@ fn tool_group_chunk(
                     if body.is_empty() {
                         continue;
                     }
-                    // The box is laid out at the container's inner width, then
-                    // inset by the container's own padding.
-                    for row in render_block(body.as_ref().clone(), inner, bg, None) {
-                        rows.push(inset_box_row(row, w, group_bg));
+                    // The call's own rows, flush to the container's inner edge
+                    // — no box padding, so its text lines up with the rest of
+                    // the transcript.
+                    for row in body.as_ref().iter() {
+                        rows.push(inset_box_row(row.clone(), inner, w, bg, group_bg));
                     }
                 }
                 _ => {
@@ -3485,17 +3484,38 @@ fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> 
     pad_line(spans, width, bg, None)
 }
 
-/// A child tool box's row (already padded to the container's inner width on
-/// the tool background) placed inside the group container: the container's own
-/// left padding column, then the box, then its right fill — so the box reads
-/// as a nested item on the dimmer group background.
-fn inset_box_row(row: Line<'static>, width: usize, group_bg: Color) -> Line<'static> {
+/// A child tool box's row inside the group container: the container's own left
+/// padding column, then the call's content — no extra padding of its own, so
+/// the text sits at the same column as the rest of the transcript — filled to
+/// the container's inner width on the tool background, then the container's
+/// right fill on the dimmer group background.
+fn inset_box_row(
+    row: Line<'static>,
+    inner: usize,
+    width: usize,
+    tool_bg: Color,
+    group_bg: Color,
+) -> Line<'static> {
+    let tool = Style::default().bg(tool_bg);
     let mut spans = vec![Span::styled(
         " ".repeat(BLOCK_PAD_X),
         Style::default().bg(group_bg),
     )];
-    spans.extend(row.spans);
-    let used: usize = spans.iter().map(Span::width).sum();
+    let mut used = BLOCK_PAD_X;
+    for mut span in row.spans {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(tool_bg);
+        }
+        used += span.width();
+        spans.push(span);
+    }
+    // The box's slab: tool background out to the container's inner edge, then
+    // the container's own fill.
+    let box_end = BLOCK_PAD_X + inner;
+    if used < box_end {
+        spans.push(Span::styled(" ".repeat(box_end - used), tool));
+        used = box_end;
+    }
     if used < width {
         spans.push(Span::styled(
             " ".repeat(width - used),
@@ -4746,8 +4766,8 @@ mod block_tests {
         ]);
         assert_eq!(
             sections,
-            vec!["called 3 tools", "ran 2 commands", "read 1 file"],
-            "total first, then verb phrases in first-seen order"
+            vec!["ran 2 commands", "read 1 file"],
+            "verb phrases in first-seen order, no tool total"
         );
         assert!(!running, "nothing is unfinished");
         assert!(!all_ok, "a failed call fails the group");
@@ -4762,7 +4782,6 @@ mod block_tests {
         assert_eq!(
             sections,
             vec![
-                "calling 4 tools",
                 "running 1 command",
                 "reading 1 file",
                 "searching for 1 pattern",
@@ -4771,16 +4790,17 @@ mod block_tests {
             "progressive while a call is still going"
         );
 
+        // A lone skill call reads `used 1 skill`, not a bare tool name.
+        let (sections, ..) = tool_group_summary(&[entry("s", "skill", true, true)]);
+        assert_eq!(sections, vec!["used 1 skill"]);
+
         // Pluralization: 2 of each, and `directory` → `directories`.
         let (sections, ..) = tool_group_summary(&[
             entry("a", "shell", true, true),
             entry("b", "ls", true, true),
             entry("c", "ls", true, true),
         ]);
-        assert_eq!(
-            sections,
-            vec!["called 3 tools", "ran 1 command", "listed 2 directories"]
-        );
+        assert_eq!(sections, vec!["ran 1 command", "listed 2 directories"]);
     }
 
     /// `human_duration` — the thought's length in the folded summary — uses

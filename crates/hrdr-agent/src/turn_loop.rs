@@ -535,10 +535,19 @@ impl Agent {
         // watched for the list *shrinking* — see `TodoShrinkWatch`.
         let mut todo_watch: Option<TodoShrinkWatch> = None;
 
-        for step in 0..self.max_steps {
+        let mut step = 0usize;
+        while step < self.max_steps {
             // Deliver any steering messages submitted since the last request — a
             // mid-turn correction reaches the model after the current tool round.
-            self.drain_steering(&steering, &mut on_event).await;
+            // A steer is the user piling on more work: reset the round budget so
+            // the model gets a fresh `max_steps` of tool rounds to take it on,
+            // instead of running out mid-way. `step` counts 1-based from here,
+            // so the round that follows a reset reads as round 1 of the fresh
+            // budget.
+            if self.drain_steering(&steering, &mut on_event).await {
+                step = 0;
+            }
+            step += 1;
             // Fold in any detached background sub-agent results that have landed.
             self.drain_background(&mut on_event);
             // Compact before the next request if this agent manages its own
@@ -788,7 +797,7 @@ impl Agent {
             // can still commit what's done and sequence what's left. Rides the
             // last tool result of the round, exactly like the wrap-up note below
             // — the model reads it with that round's results.
-            let used = step + 1;
+            let used = step;
             if !checkpoint_warned
                 && checkpoint_warning_round(self.max_steps) == Some(used)
                 && let Some(last) = self.messages.last_mut()
@@ -805,7 +814,7 @@ impl Agent {
 
             // Near the budget: tell the model so it wraps up instead of
             // getting cut off mid-plan.
-            let remaining = self.max_steps - step - 1;
+            let remaining = self.max_steps - step;
             if remaining == WRAP_UP_WARNING_ROUNDS
                 && let Some(last) = self.messages.last_mut()
                 && let Some(content) = &mut last.content

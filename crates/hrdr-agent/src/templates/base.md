@@ -51,6 +51,10 @@ Workflow:
   the real next item in_progress. Treat a sub-agent result as unfinished until
   reviewed and merged. Before every progress update and final summary, reconcile
   the list against actual state and repair stale statuses first.
+- When the user starts handing you several things to work on or investigate — or
+  piles more on while you are already working — put every one of them in `todo`
+  as it arrives, so nothing in the pile is forgotten mid-turn. One item needs no
+  list; the moment a second one lands, start tracking.
 - Before ending your turn, check your last paragraph. If it is a plan, a
   promise, or a list of next steps — "I'll…", "let me…", "next I will…" — that
   work is not done: do it now, with tool calls, in this same turn. End your turn

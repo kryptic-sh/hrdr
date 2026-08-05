@@ -10206,6 +10206,101 @@ mod tests {
             );
         }
 
+        /// A steer is the user piling on more work, so it resets the tool-round
+        /// budget: the model gets a fresh `max_steps` of rounds from the steer
+        /// on. `max_steps = 2` with a steer landing during the first round lets
+        /// the model run a THIRD tool round; without the reset, round 2 would
+        /// have been the budget's last and the tools would have been stripped
+        /// for the wrap-up.
+        #[tokio::test]
+        async fn a_steer_resets_the_tool_round_budget() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let server = MockServer::start(vec![
+                // Rounds 1-3: one read call each — the third is reachable only
+                // because the steer after round 1 reset the budget.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    tool_start_chunk("c2", "call_2", "read"),
+                    tool_args_chunk("c2", &args_json),
+                    tool_calls_stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    tool_start_chunk("c3", "call_3", "read"),
+                    tool_args_chunk("c3", &args_json),
+                    tool_calls_stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+                // The wrap-up round once the (reset) budget is exhausted.
+                MockResp::Sse(vec![
+                    text_chunk("c4", "Ran out of rounds."),
+                    stop_chunk("c4"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 2;
+            let mut agent = Agent::new(cfg).unwrap();
+            let steering = steering_queue();
+            steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::plain("read the file"));
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            let pushed = std::cell::Cell::new(false);
+            {
+                let q = steering.clone();
+                agent
+                    .run(steering.clone(), |ev| {
+                        // Submitted *while the first tool runs* — after round
+                        // 1's drain, so the reset applies to the rounds after.
+                        if matches!(&ev, AgentEvent::ToolStart { .. }) && !pushed.replace(true) {
+                            q.lock()
+                                .unwrap()
+                                .push_back(crate::Steer::plain("and pile on more work"));
+                        }
+                        events.push(ev);
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let tool_rounds = events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolStart { .. }))
+                .count();
+            assert_eq!(
+                tool_rounds, 3,
+                "the steer reset the 2-round budget, so a third tool round ran: {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Steered(s) if s == "and pile on more work")),
+                "the steer was delivered: {events:?}"
+            );
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::Notice(n) if n.contains("tool-round limit reached"))
+                ),
+                "the fresh budget was exhausted too: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
         /// A notice raised when there was no turn to carry it — the model pre-flight,
         /// at construction or on a `/model` switch — reaches the user at the top of
         /// the next turn, and exactly once.
