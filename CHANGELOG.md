@@ -38,6 +38,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A tool call collapses behind its group's summary even on its own.** Every
+  collapsible call (`edit`/`replace` always render) folds into a
+  `✓ called N tools · ran 2 commands` line from the first call, and a run stays
+  one group across the invisible entries between its calls — an empty
+  tool-only-turn marker or an empty thinking block — so a new call that streams
+  in updates the open summary's counts instead of opening another entry. Only an
+  `edit`/`replace` call or a visible entry (a user prompt, rendered text or
+  reasoning, stats, a notice) breaks a run.
+
+- **Expanding a tool group's summary renders its calls inside it as nested child
+  items.** The summary keeps its header and the calls fan out beneath it, each
+  on the normal tool background, on a group background that is slightly dimmer
+  than the tool entries' — so the boxes read as items of the section rather than
+  blocks of their own. Absorbed tool-only turns keep their `#N assistant`
+  `/goto` labels at their transcript positions inside the group.
+
 - **The input box reports its stash and history position on its top padding
   line.** While Ctrl+S drafts wait, the line shows how many
   (`2 drafts stashed`); while Up/Down browse the recall list it shows where you

@@ -16,6 +16,9 @@ pub struct Theme {
     pub user: Color,
     /// User prompt background.
     pub user_bg: Color,
+    /// Tool-group summary background: slightly dimmer than `user_bg`, so the
+    /// tool boxes nested inside the summary section read as distinct.
+    pub group_bg: Color,
     /// Assistant message text.
     pub assistant: Color,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints, scrollbar.
@@ -54,9 +57,11 @@ impl Theme {
         let c = |rgb: Option<(u8, u8, u8)>, fb: Color| {
             rgb.map(|(r, g, b)| Color::Rgb(r, g, b)).unwrap_or(fb)
         };
+        let user_bg = c(p.user_bg, Color::Rgb(0, 48, 60));
         Self {
             user: c(p.user, Color::Cyan),
-            user_bg: c(p.user_bg, Color::Rgb(0, 48, 60)),
+            user_bg,
+            group_bg: dim_color(user_bg, GROUP_BG_DIM),
             assistant: c(p.assistant, Color::White),
             dim: c(p.dim, Color::DarkGray),
             warn: c(p.warn, Color::Yellow),
@@ -103,6 +108,10 @@ impl Theme {
 
 /// How much of a color's brightness reasoning text keeps.
 const REASONING_DIM: f32 = 0.55;
+
+/// How much of `user_bg`'s brightness the tool-group summary keeps — slightly
+/// dimmer, so the tool boxes nested inside it read as distinct.
+const GROUP_BG_DIM: f32 = 0.85;
 
 /// Scale an RGB color's brightness by `factor`. Named/indexed terminal colors
 /// have no components to scale, so they pass through unchanged.
@@ -162,6 +171,29 @@ mod theme_tests {
         assert_eq!(hex(t.command_bg), "#24283b", "bg_storm");
         assert_eq!(hex(t.stats_bg), "#222436", "bg_moon");
         assert_eq!(hex(t.prompt_border), "#c099ff", "magenta (moon)");
+    }
+
+    /// The tool-group summary background is the tool background dimmed — every
+    /// channel at or below it, at least one strictly below — so the tool boxes
+    /// nested inside the summary section read as distinct. A non-RGB fallback
+    /// has no components to dim and stays equal (the boxes still differ by
+    /// nothing there, but a named color cannot be scaled).
+    #[test]
+    fn group_bg_is_user_bg_dimmed() {
+        let t = Theme::default();
+        let Color::Rgb(ur, ug, ub) = t.user_bg else {
+            panic!("default user_bg is RGB");
+        };
+        let Color::Rgb(gr, gg, gb) = t.group_bg else {
+            panic!("group_bg derives from an RGB user_bg");
+        };
+        assert!(gr <= ur && gg <= ug && gb <= ub, "no channel brightens");
+        assert!(
+            gr < ur || gg < ug || gb < ub,
+            "at least one channel dims: {:#06x} vs {:#06x}",
+            (ur as u32) << 16 | (ug as u32) << 8 | ub as u32,
+            (gr as u32) << 16 | (gg as u32) << 8 | gb as u32,
+        );
     }
 
     /// The two accents must differ.

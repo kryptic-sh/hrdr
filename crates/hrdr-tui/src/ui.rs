@@ -2726,16 +2726,19 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     let inner = inner_width(w);
     let mut pending: Option<PendingBlock> = None;
     let transcript = app.panes.active_transcript();
-    // Members of a collapsed tool group fold behind the summary — running
-    // calls included; they only appear when the group is expanded (a streaming
-    // call expands mid-flight by expanding the group). `collapsed_group_end` is
-    // one past the group when a collapsed group is in progress.
-    let mut collapsed_group_end: Option<usize> = None;
+    // Members of a tool group fold into its summary chunk — running calls
+    // included; they only appear as child items when the group is expanded (a
+    // streaming call expands mid-flight by expanding the group). The span also
+    // covers the invisible entries between the calls (a tool-only turn's empty
+    // assistant label, an empty thinking block), so a new tool call that lands
+    // after them merges into the same group instead of opening a new one.
+    // `group_members_end` is one past the group when one is in progress.
+    let mut group_members_end: Option<usize> = None;
     for (i, entry) in transcript.iter().enumerate() {
-        if collapsed_group_end.is_some_and(|end| i >= end) {
-            collapsed_group_end = None;
+        if group_members_end.is_some_and(|end| i >= end) {
+            group_members_end = None;
         }
-        if collapsed_group_end.is_some_and(|end| i < end) {
+        if group_members_end.is_some_and(|end| i < end) {
             continue;
         }
         // For unfinished tool entries the current spinner frame is mixed into the
@@ -2743,62 +2746,81 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // marker — and the tool-group summary header uses the same frame.
         let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
         let frame = SPINNER[frame_idx as usize % SPINNER.len()];
-        // Tool groups: consecutive collapsible calls — everything but
-        // `edit`/`replace`, which always render and never group — collapse
-        // behind one `{mark} called N tools · ran 2 commands` summary line.
-        // The group's first call heads it; the summary header chunk always
-        // opens the group (it is the control that collapses it back), and the
-        // calls render as one-liners beneath it when the group is expanded.
+        // Tool groups: collapsible calls — everything but `edit`/`replace`,
+        // which always render and never group — collapse behind one
+        // `{mark} called N tools · ran 2 commands` summary line, even for a
+        // group of one. The group's first call heads it; the summary header
+        // chunk always opens the group (it is the control that collapses it
+        // back), and the calls render as child items inside it when the group
+        // is expanded. Only an `edit`/`replace` or a visible entry (a user
+        // prompt, rendered text or reasoning, stats, a notice) breaks a run —
+        // so tool calls that stream in after an invisible turn marker merge
+        // into the group that is already open.
         if is_groupable_tool(&entry.kind) {
             let head = i == 0 || !is_groupable_tool(&transcript[i - 1].kind);
             if head {
                 let end = tool_group_end(transcript, i);
-                if end - i >= 2 {
-                    let id = tool_call_id(&entry.kind).unwrap_or_default();
-                    let expanded = app.expand_tools || app.tool_groups.contains(id);
-                    // The follower of the summary header: the first member when
-                    // the group is expanded (a tool block, tinted), else the
-                    // entry after the group — which is never a tool (the run
-                    // extends to every consecutive call), so only a user prompt
-                    // is tinted there.
-                    let next_tinted = if expanded {
-                        true
+                let id = tool_call_id(&entry.kind).unwrap_or_default();
+                let expanded = app.expand_tools || app.tool_groups.contains(id);
+                // The follower of the summary header: the entry after the
+                // group — never a member (the span extends across every
+                // absorbed entry), so only a user prompt or an edit/replace
+                // is tinted there.
+                let next_tinted = transcript
+                    .get(end)
+                    .is_some_and(|e| entry_is_tinted(&e.kind));
+                // Absorbed empty-assistant turns still count as messages and
+                // keep their `#N assistant` `/goto` labels, rendered inside
+                // the group at their transcript positions.
+                let mut metas: Vec<Option<MetaSpec>> = Vec::new();
+                for e in &transcript[i..end] {
+                    if let EntryKind::Assistant(text) = &e.kind
+                        && text.trim().is_empty()
+                    {
+                        msg_num += 1;
+                        metas.push(Some(meta(e, msg_num, "assistant")));
                     } else {
-                        transcript
-                            .get(end)
-                            .is_some_and(|e| entry_is_tinted(&e.kind))
-                    };
-                    flush(
-                        &mut chunks,
-                        &mut msg_at,
-                        pending.take(),
-                        Some(BlockKind::Tool.bg(theme)),
-                        w,
-                        now,
-                        theme,
-                    );
-                    chunks.push(tool_group_chunk(
-                        &transcript[i..end],
-                        i,
-                        theme,
-                        w,
-                        inner,
-                        frame,
-                    ));
-                    // The header is pushed directly, outside the pending-chain
-                    // separator logic — restore the tinted→tinted separator it
-                    // would have earned as a normal block.
-                    if next_tinted {
-                        chunks.push(separator());
-                    }
-                    if !expanded {
-                        // Collapsed: the whole group — running calls included —
-                        // folds behind the summary; expanding the group reveals
-                        // them all, mid-flight streaming included.
-                        collapsed_group_end = Some(end);
-                        continue;
+                        metas.push(None);
                     }
                 }
+                flush(
+                    &mut chunks,
+                    &mut msg_at,
+                    pending.take(),
+                    Some(BlockKind::Tool.bg(theme)),
+                    w,
+                    now,
+                    theme,
+                );
+                // The absorbed labels' `/goto` targets are the group chunk, as
+                // a normal message's target is its own block.
+                for _ in metas.iter().flatten() {
+                    msg_at.push(chunks.len());
+                }
+                chunks.push(tool_group_chunk(
+                    app,
+                    &transcript[i..end],
+                    &metas,
+                    i,
+                    w,
+                    GroupFrame {
+                        frame,
+                        frame_idx,
+                        expanded,
+                        now,
+                    },
+                ));
+                // The header is pushed directly, outside the pending-chain
+                // separator logic — restore the tinted→tinted separator it
+                // would have earned as a normal block.
+                if next_tinted {
+                    chunks.push(separator());
+                }
+                // The whole group — running calls included — is inside the
+                // chunk, expanded or collapsed alike; only the chunk's own
+                // `expanded` flag decides whether the children render.
+                group_members_end = Some(end);
+                continue;
             }
         }
         // Body cache key shared by all arms (Reasoning skip happens before this).
@@ -3094,29 +3116,50 @@ pub(crate) fn tool_call_id(kind: &EntryKind) -> Option<&str> {
     }
 }
 
-/// Where a tool group ends: one past the run of consecutive collapsible tool
-/// calls beginning at `start`. An always-full call (`edit`/`replace`) or any
-/// non-tool entry ends the run.
+/// Whether a tool run can absorb `kind`: another collapsible tool call, or an
+/// entry that renders nothing of its own — an empty assistant turn (the marker
+/// a tool-only turn leaves behind) or an empty thinking block. Anything visible
+/// — a user prompt, rendered text or reasoning, stats, a notice, an
+/// `edit`/`replace` call — ends the run.
+fn group_absorbs(kind: &EntryKind) -> bool {
+    match kind {
+        EntryKind::Tool { name, .. } => !is_always_full_tool(name),
+        EntryKind::Assistant(text) => text.trim().is_empty(),
+        EntryKind::Reasoning { text, .. } => text.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Where a tool group ends: one past the run beginning at `start` — the
+/// collapsible tool calls plus the invisible entries between them, so a tool
+/// call that arrives after an empty turn marker merges into the group already
+/// open instead of starting a new one. A visible entry (`edit`/`replace`, a
+/// user prompt, rendered text or reasoning, stats, a notice) ends the run.
 fn tool_group_end(transcript: &[Entry], start: usize) -> usize {
     let mut end = start + 1;
-    while end < transcript.len() && is_groupable_tool(&transcript[end].kind) {
+    while end < transcript.len() && group_absorbs(&transcript[end].kind) {
         end += 1;
     }
     end
 }
 
-/// The head index of the tool group `idx` belongs to, when that group holds
-/// more than one call. One expansion level means every click on a grouped tool
-/// — the summary header or one of its rendered calls — toggles the whole
-/// group, so the click handler resolves any member index back to its head.
+/// The head index of the tool group `idx` belongs to. One expansion level
+/// means every click on a grouped tool — the summary header or one of its
+/// rendered children — toggles the whole group, so the click handler resolves
+/// any member index back to its head. A group holds one call or many; only an
+/// always-full call (`edit`/`replace`) has no head.
 pub(crate) fn tool_group_head(transcript: &[Entry], idx: usize) -> Option<usize> {
     if !is_groupable_tool(&transcript[idx].kind) {
         return None;
     }
-    let head = (0..=idx)
+    // The head is the FIRST tool of the contiguous absorbable stretch `idx`
+    // sits in — the run's oldest call. Walk back through the absorbed entries
+    // (turn markers included) and take the last tool found.
+    (0..=idx)
         .rev()
-        .find(|&i| i == 0 || !is_groupable_tool(&transcript[i - 1].kind))?;
-    (tool_group_end(transcript, head) - head >= 2).then_some(head)
+        .take_while(|&i| group_absorbs(&transcript[i].kind))
+        .filter(|&i| is_groupable_tool(&transcript[i].kind))
+        .last()
 }
 
 /// The verb phrase for one tool's summary section: `(past, progressive, noun,
@@ -3193,51 +3236,167 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
     (sections, running, all_ok)
 }
 
-/// The block for a tool group's summary header: a tool block whose body is the
-/// packed `{mark} called N tools · read 2 files` line(s). The mark reflects the
-/// whole group — the spinner frame while any call runs, ✓/✗ by the group's
-/// outcome once it settles. Built fresh every frame (its content depends on
-/// the whole group, so the per-entry body cache cannot serve it), and a click
-/// on it toggles the group via `ToolHit.group`.
-fn tool_group_chunk(
-    members: &[Entry],
-    head_idx: usize,
-    theme: &Theme,
-    w: usize,
-    inner: u16,
+/// The per-frame state a tool-group chunk renders with: the spinner frame (and
+/// its index, which keys the running members' body cache so their marks
+/// animate), whether the group is expanded, and the clock the absorbed turn
+/// labels read.
+#[derive(Clone, Copy)]
+struct GroupFrame {
     frame: &'static str,
+    frame_idx: u64,
+    expanded: bool,
+    now: chrono::DateTime<chrono::Local>,
+}
+
+/// The block for a tool group: a container on the dimmer group background
+/// whose header is the packed `{mark} called N tools · read 2 files` line(s),
+/// and — when expanded — the group's tool calls rendered in full as child
+/// items inside it, each on the normal tool background so the boxes read as
+/// nested in the summary section. Absorbed empty-assistant turns render their
+/// `#N assistant` `/goto` labels at their transcript positions. The mark
+/// reflects the whole group — the spinner frame while any call runs, ✓/✗ by
+/// the group's outcome once it settles. Built fresh every frame (its content
+/// depends on the whole group, so the per-entry body cache cannot serve it);
+/// a click anywhere on it toggles the group via `tool_idx`.
+fn tool_group_chunk(
+    app: &App,
+    members: &[Entry],
+    metas: &[Option<MetaSpec>],
+    head_idx: usize,
+    w: usize,
+    frame: GroupFrame,
 ) -> Chunk<'static> {
+    let theme = &app.theme;
     let bg = BlockKind::Tool.bg(theme);
+    let group_bg = theme.group_bg;
+    let inner = usize::from(inner_width(w));
     let (sections, running, all_ok) = tool_group_summary(members);
-    let packed = pack_loader_segments(&sections, usize::from(inner));
+    let packed = pack_loader_segments(&sections, inner);
     let (mark, color) = if running {
-        (frame, theme.warn)
+        (frame.frame, theme.warn)
     } else if all_ok {
         ("✓", theme.success)
     } else {
         ("✗", theme.error)
     };
-    let dim = Style::default().fg(theme.dim).bg(bg);
-    let body: Vec<Line<'static>> = packed
-        .into_iter()
-        .enumerate()
-        .map(|(i, text)| {
-            let mut spans = Vec::new();
-            if i == 0 {
-                spans.push(Span::styled(
-                    format!("{} ", mark),
-                    Style::default().fg(color).bg(bg),
-                ));
+    let dim = Style::default().fg(theme.dim).bg(group_bg);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    // The container's own top padding.
+    rows.push(pad_row(Vec::new(), w, group_bg));
+    for (i, text) in packed.into_iter().enumerate() {
+        let mut spans = Vec::new();
+        if i == 0 {
+            spans.push(Span::styled(
+                format!("{} ", mark),
+                Style::default().fg(color).bg(group_bg),
+            ));
+        }
+        spans.push(Span::styled(text, dim));
+        for row in wrap_spans(spans, inner) {
+            rows.push(pad_row(row, w, group_bg));
+        }
+    }
+    if frame.expanded {
+        // The children: one tool box per call (or a turn label), each on the
+        // normal tool background, inset inside the dimmer container so it
+        // reads as an item of the summary section rather than a block of its
+        // own. A blank group-background row separates the items.
+        let mut first = true;
+        for (j, member) in members.iter().enumerate() {
+            match &member.kind {
+                EntryKind::Tool {
+                    name,
+                    args,
+                    result,
+                    ok,
+                    done,
+                    ..
+                } => {
+                    // The body is cached per entry like a standalone tool's, so
+                    // an unchanged call costs a refcount bump per frame, not a
+                    // re-render (syntax highlighting included). Running calls
+                    // key on the spinner frame, animating their mark.
+                    let body = cached_body(
+                        head_idx + j,
+                        (
+                            member.content_hash ^ if *done { 0 } else { frame.frame_idx },
+                            w as u16,
+                            app.expand_tools,
+                            app.show_reasoning,
+                        ),
+                        || tool_lines(theme, name, args, result, *ok, *done, frame.frame),
+                    );
+                    if body.is_empty() {
+                        continue;
+                    }
+                    if !first {
+                        rows.push(pad_row(Vec::new(), w, group_bg));
+                    }
+                    first = false;
+                    // The box is laid out at the container's inner width, then
+                    // inset by the container's own padding.
+                    for row in render_block(body.as_ref().clone(), inner, bg, None) {
+                        rows.push(inset_box_row(row, w, group_bg));
+                    }
+                }
+                _ => {
+                    // An absorbed empty-assistant turn's `/goto` label.
+                    let Some(meta) = metas.get(j).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    let Some(label) = meta.rows(frame.now, theme).into_iter().last() else {
+                        continue; // timestamps hidden — no label to render
+                    };
+                    if !first {
+                        rows.push(pad_row(Vec::new(), w, group_bg));
+                    }
+                    first = false;
+                    rows.push(pad_row(label.spans, w, group_bg));
+                }
             }
-            spans.push(Span::styled(text, dim));
-            Line::from(spans)
-        })
-        .collect();
+        }
+    }
+    // The container's own bottom padding.
+    rows.push(pad_row(Vec::new(), w, group_bg));
     Chunk {
-        rows: ChunkRows::Ready(Rc::new(render_block(body, w, bg, None))),
+        rows: ChunkRows::Ready(Rc::new(rows)),
         tool_idx: Some(head_idx),
         row_hits: Vec::new(),
     }
+}
+
+/// Pad a line of spans to the full render width on `bg`, filling any span that
+/// didn't set its own background — the row-by-row form of [`render_block`] for
+/// rows a chunk assembles by hand (the tool-group summary's container).
+fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let mut spans = spans;
+    for span in &mut spans {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(bg);
+        }
+    }
+    pad_line(spans, width, bg, None)
+}
+
+/// A child tool box's row (already padded to the container's inner width on
+/// the tool background) placed inside the group container: the container's own
+/// left padding column, then the box, then its right fill — so the box reads
+/// as a nested item on the dimmer group background.
+fn inset_box_row(row: Line<'static>, width: usize, group_bg: Color) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " ".repeat(BLOCK_PAD_X),
+        Style::default().bg(group_bg),
+    )];
+    spans.extend(row.spans);
+    let used: usize = spans.iter().map(Span::width).sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(group_bg),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +
@@ -4518,10 +4677,13 @@ mod block_tests {
         );
     }
 
-    /// A lone tool call is its own group of one — no summary line — and an
-    /// always-full call (`edit`/`replace`) breaks a run rather than joining it.
+    /// A tool run spans consecutive collapsible calls AND the invisible entries
+    /// between them — an empty assistant turn (the marker a tool-only turn
+    /// leaves behind) — so a call that arrives after one merges into the group
+    /// already open. A visible entry (an `edit`/`replace` call, a user prompt,
+    /// text, reasoning, stats) ends the run.
     #[test]
-    fn a_single_tool_call_is_not_summarized() {
+    fn a_tool_run_spans_calls_and_absorbs_turn_markers() {
         let entry = |id: &str, name: &str| {
             Entry::now(EntryKind::Tool {
                 id: id.into(),
@@ -4532,13 +4694,40 @@ mod block_tests {
                 done: true,
             })
         };
+        // [shell][read] — one run of two.
         let mut t = vec![entry("a", "shell"), entry("b", "read")];
         assert_eq!(tool_group_end(&t, 0), 2, "the run spans both calls");
         assert_eq!(tool_group_end(&t, 1), 2, "a member ends the same run");
 
-        t.push(entry("c", "edit"));
-        assert_eq!(tool_group_end(&t, 0), 2, "edit breaks the group");
-        assert_eq!(tool_group_end(&t, 2), 3, "edit is its own run of one");
+        // [shell][empty assistant turn][read][empty assistant turn][bash]
+        // — the empty turns are invisible, so all five fold into one group.
+        t.push(Entry::assistant("")); // a tool-only turn's marker
+        t.push(entry("c", "read"));
+        t.push(Entry::assistant(""));
+        t.push(entry("d", "bash"));
+        assert_eq!(
+            tool_group_end(&t, 0),
+            6,
+            "empty turn markers merge the runs"
+        );
+
+        // [shell][empty assistant][read] is the same span for a member: the
+        // run is the group's, not the call's.
+        assert_eq!(
+            tool_group_end(&t, 2),
+            6,
+            "a mid-run member ends the same run"
+        );
+
+        // An `edit`/`replace` call ends the run — it never groups.
+        t.push(entry("e", "edit"));
+        assert_eq!(tool_group_end(&t, 0), 6, "edit breaks the group");
+        assert_eq!(tool_group_end(&t, 6), 7, "edit is its own run of one");
+        t.push(entry("f", "replace"));
+        assert_eq!(tool_group_end(&t, 7), 8, "replace is its own run of one");
+        // The tool after the edit/replace opens a fresh group.
+        t.push(entry("g", "shell"));
+        assert_eq!(tool_group_end(&t, 8), 9, "a fresh group after replace");
     }
 
     /// Loader stats pack into width-bounded lines, breaking between ` · `-joined

@@ -806,6 +806,9 @@ async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
     ])
     .await;
     h.submit("use a bad tool").await;
+    // The lone tool call collapses behind its summary; fan it out so the
+    // result — where the error lives — renders.
+    h.app.expand_tools = true;
     let screen = h.render();
     // The error is shown to the user (and was fed back to the model)…
     assert!(
@@ -1270,6 +1273,9 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     ])
     .await;
     h.submit("run it").await;
+    // The lone tool call collapses behind its summary; fan it out so its box —
+    // the surface these assertions check — renders.
+    h.app.expand_tools = true;
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -1340,16 +1346,22 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     // A blank separator row (terminal bg) sits between blocks.
     assert_ne!(bg_at(0, meta_y + 2), theme.user_bg, "separator row");
 
-    // The tool block: status mark + name on the header, command below it, both
-    // on the tool background.
+    // The tool box: status mark + name on the header, command below it, on the
+    // tool background — nested inside the dimmer group summary container, so
+    // the box starts one container padding in from the block padding.
     let tool_y = find_row("✓ shell").expect("tool header rendered");
     assert_eq!(
         bg_at(0, tool_y),
+        theme.group_bg,
+        "the summary container wraps the box in its dimmer background"
+    );
+    assert_eq!(
+        bg_at(2, tool_y),
         theme.user_bg,
-        "tool blocks share the prompt bg"
+        "the box itself shares the prompt bg"
     );
     assert!(
-        row_text(tool_y + 1).starts_with(&format!("{pad}echo hi")),
+        row_text(tool_y + 1).starts_with(&format!("{pad}{pad}echo hi")),
         "command line"
     );
     assert!(
@@ -3122,8 +3134,10 @@ async fn goto_finds_a_text_less_assistant_turn() {
 }
 
 /// The click rect for a tool block is derived from where it lands on screen,
-/// which the deferred block flush must keep accurate — a lone tool (its own
-/// group of one) renders fully and its hit rect covers its header.
+/// which the group chunk build must keep accurate. A lone tool call is its own
+/// group of one: collapsed, the hit rect covers the summary row that heads it;
+/// after a click expands it, the same rect covers the tool's own header inside
+/// the summary section.
 #[tokio::test]
 async fn a_lone_tool_block_hit_rect_tracks_its_header() {
     let long_output: String = (0..5).map(|i| format!("line {i}\n")).collect();
@@ -3146,7 +3160,29 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
     let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
-    // The recorded hit rect must cover the row the tool header actually renders on.
+    // Collapsed: the recorded hit rect must cover the row the summary renders on.
+    let buf = term.backend().buffer();
+    let summary_y = (0..30)
+        .find(|&y| {
+            (0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>()
+                .contains("called 1 tool")
+        })
+        .expect("tool summary rendered");
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    assert!(
+        rect.contains(2, summary_y),
+        "the tool hit rect misses the summary at row {summary_y}"
+    );
+
+    // Expand: the same group chunk now contains the tool's own header, and the
+    // taller hit rect covers it.
+    click_at(&mut h.app, 2, summary_y);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
     let header_y = (0..30)
         .find(|&y| {
@@ -3158,7 +3194,7 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
                 .collect::<String>()
                 .contains("✓ bash")
         })
-        .expect("tool header rendered");
+        .expect("tool header rendered after expansion");
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     assert!(
         rect.contains(2, header_y),
@@ -3829,6 +3865,10 @@ async fn fenced_code_has_no_extra_indent_or_language_row() {
 /// pad row, and two is one too many between the model's thought and its output —
 /// so one is dropped.
 ///
+/// The "tool" blocks are `edit`/`replace` calls: they always render (they never
+/// group), so each is its own tinted block — the fixture is about the separator
+/// rows between blocks, not about tool grouping.
+///
 /// prompt │ tool │ tool │ thought │ tool │ output
 ///        ↑blank ↑blank ↑         ↑      ↑
 #[tokio::test]
@@ -3849,15 +3889,14 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("prompt"));
-    // The adjacent tool pair is `edit` + `cat`: `edit` always renders (it never
-    // groups, breaking the run), so the two stay separate blocks — the fixture
-    // is about the separator rows between them, not about tool grouping.
     h.app.push_entry(tool("a", "edit", r#"{"path":"edit-me"}"#));
-    h.app.push_entry(tool("b", "cat", "{}"));
+    h.app
+        .push_entry(tool("b", "replace", r#"{"path":"replace-me"}"#));
     h.app.push_entry(Entry::reasoning("thought"));
-    h.app.push_entry(tool("c", "grep", "{}"));
+    h.app.push_entry(tool("c", "edit", r#"{"path":"edit-c"}"#));
     h.app.push_entry(Entry::assistant("output"));
-    h.app.push_entry(tool("d", "wc", "{}"));
+    h.app
+        .push_entry(tool("d", "replace", r#"{"path":"replace-d"}"#));
 
     let mut term = Terminal::new(TestBackend::new(40, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3893,8 +3932,8 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
     let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
 
     // Anchor on each block's *last* content row and the next block's first.
-    let (prompt_end, ls_end, cat_end) = (row_of("#1 you"), row_of("res-a"), row_of("res-b"));
-    let (thought, grep_end) = (row_of("thought"), row_of("res-c"));
+    let (prompt_end, a_end, b_end) = (row_of("#1 you"), row_of("res-a"), row_of("res-b"));
+    let (thought, c_end) = (row_of("thought"), row_of("res-c"));
 
     // Tinted → tinted: both blocks' pads, plus a separator row between them.
     assert_eq!(
@@ -3903,19 +3942,19 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         "prompt → tool needs a separator:\n{screen}"
     );
     assert_eq!(
-        gap(ls_end, row_of("cat")),
+        gap(a_end, row_of("replace-me")),
         3,
         "tool → tool needs a separator:\n{screen}"
     );
 
     // Tinted → untinted and back: just the two pads, no separator.
-    assert_eq!(gap(cat_end, thought), 2, "tool → thought:\n{screen}");
-    assert_eq!(gap(thought, row_of("grep")), 2, "thought → tool:\n{screen}");
+    assert_eq!(gap(b_end, thought), 2, "tool → thought:\n{screen}");
     assert_eq!(
-        gap(grep_end, row_of("output")),
+        gap(thought, row_of("edit-c")),
         2,
-        "tool → output:\n{screen}"
+        "thought → tool:\n{screen}"
     );
+    assert_eq!(gap(c_end, row_of("output")), 2, "tool → output:\n{screen}");
 }
 
 /// The model's thought and the output that follows it are separated by a single
@@ -3981,9 +4020,10 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
         1,
         "thought → output:\n{screen}"
     );
-    // Untinted → tinted is unchanged: the two blocks' own pads.
+    // Untinted → tinted is unchanged: the two blocks' own pads. The lone tool
+    // call collapses behind its summary, which is the tinted block.
     assert_eq!(
-        gap(row_of("#1 assistant"), row_of("ls")),
+        gap(row_of("#1 assistant"), row_of("called 1 tool")),
         2,
         "output → tool:\n{screen}"
     );
@@ -4063,6 +4103,322 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
     );
 }
 
+/// A tool call that streams in while the previous group is still going joins
+/// that group: the summary counts it (`calling N tools`) and the call itself
+/// stays folded behind the summary — it is never full-rendered while the group
+/// is collapsed. Only expanding the group reveals the newest call, as a child
+/// item like every other.
+#[tokio::test]
+async fn streaming_tool_calls_update_the_last_summary_until_expanded() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str, done: bool| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: if done {
+                format!("result-{id}")
+            } else {
+                String::new()
+            },
+            ok: true,
+            done,
+        })
+    };
+
+    // The first call lands and runs: it is its own summary, not a full block.
+    h.app.push_entry(tool("a", "shell", false));
+    let screen = h.render();
+    assert!(
+        screen.contains("calling 1 tool"),
+        "a running lone call gets a summary:\n{screen}"
+    );
+    assert!(
+        !screen.contains("✓ shell"),
+        "the running call is not full-rendered:\n{screen}"
+    );
+
+    // A second call arrives while the first still runs: it joins the summary.
+    h.app.push_entry(tool("b", "read", false));
+    let screen = h.render();
+    assert!(
+        screen.contains("calling 2 tools"),
+        "the new call updates the summary, it does not open a new entry:\n{screen}"
+    );
+    assert!(
+        !screen.contains("✓ shell") && !screen.contains("✓ read"),
+        "no call is full-rendered while the group is folded:\n{screen}"
+    );
+
+    // The calls finish; the summary settles with the merged count intact.
+    h.app.transcript_mut().iter_mut().for_each(|e| {
+        if let EntryKind::Tool { done, result, .. } = &mut e.kind {
+            *done = true;
+            result.push_str("done");
+        }
+    });
+    let screen = h.render();
+    assert!(
+        screen.contains("called 2 tools"),
+        "the settled summary keeps the merged count:\n{screen}"
+    );
+    assert!(
+        !screen.contains("done"),
+        "finished calls still fold behind the summary:\n{screen}"
+    );
+
+    // Expanding reveals every call — the newest included — as a child item.
+    h.app.tool_groups.insert("a".to_string());
+    let screen = h.render();
+    assert!(
+        screen.contains("✓ shell") && screen.contains("✓ read"),
+        "expanding shows the calls inside the summary:\n{screen}"
+    );
+}
+
+/// The screen row of the first row containing `needle` in the terminal's
+/// current buffer, or `None` when it is off-screen.
+fn screen_row_of(term: &Terminal<TestBackend>, needle: &str) -> Option<u16> {
+    let buf = term.backend().buffer();
+    (0..buf.area.height).find(|&y| {
+        (0..buf.area.width.saturating_sub(1))
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect::<String>()
+            .contains(needle)
+    })
+}
+
+/// Scrolled up, new content streaming in must not move the viewport: the view
+/// stays on the same content rows. The `scroll_offset` compensation in
+/// `draw_chunks` adds however many rows `max_scroll` grew so the from-top
+/// position is preserved.
+///
+/// A new tool call that merges into a collapsed group below the marker changes
+/// nothing — the folded summary's height is the same whether it holds one call
+/// or three — so the marker must not budge.
+#[tokio::test]
+async fn a_merged_tool_call_keeps_the_scrolled_up_viewport() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        })
+    };
+    h.app.push_entry(Entry::assistant("PIN-MARKER"));
+    h.app.push_entry(tool("a", "shell"));
+    h.app.push_entry(tool("b", "read"));
+    for i in 0..12 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        h.app.max_scroll > 0,
+        "the transcript overflows the viewport"
+    );
+
+    // Scroll to the top: the marker is on screen, the group right below it.
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = screen_row_of(&term, "PIN-MARKER").expect("marker on screen");
+    assert!(h.app.scroll_offset > 0, "scrolled up");
+
+    // A new tool call merges into the collapsed group below the marker.
+    h.app.push_entry(tool("c", "shell"));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = screen_row_of(&term, "PIN-MARKER").expect("marker still on screen");
+    assert_eq!(
+        after,
+        before,
+        "the viewport moved:\n{}",
+        buffer_to_string(term.backend().buffer())
+    );
+}
+
+/// The same pin holds when the group is expanded and the merged call GROWS it:
+/// the growth sits between the marker and the filler, and the compensation
+/// must keep the marker on the same screen row.
+#[tokio::test]
+async fn an_expanded_group_growing_keeps_the_scrolled_up_viewport() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: format!("result-{id}"),
+            ok: true,
+            done: true,
+        })
+    };
+    h.app.push_entry(Entry::assistant("PIN-MARKER"));
+    h.app.push_entry(tool("a", "shell"));
+    h.app.push_entry(tool("b", "read"));
+    h.app.tool_groups.insert("a".to_string());
+    for i in 0..12 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        h.app.max_scroll > 0,
+        "the transcript overflows the viewport"
+    );
+
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = screen_row_of(&term, "PIN-MARKER").expect("marker on screen");
+    assert!(h.app.scroll_offset > 0, "scrolled up");
+
+    // A new tool call merges into the expanded group: it grows in place.
+    h.app.push_entry(tool("c", "shell"));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = screen_row_of(&term, "PIN-MARKER").expect("marker still on screen");
+    assert_eq!(
+        after,
+        before,
+        "the viewport moved:\n{}",
+        buffer_to_string(term.backend().buffer())
+    );
+}
+
+/// The same pin holds when a whole NEW group opens below the view (after an
+/// `edit`/`replace` boundary): content appended at the bottom grows
+/// `max_scroll`, and the compensation keeps the marker put.
+#[tokio::test]
+async fn a_new_group_streaming_in_keeps_the_scrolled_up_viewport() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        })
+    };
+    h.app.push_entry(Entry::assistant("PIN-MARKER"));
+    h.app.push_entry(tool("a", "shell"));
+    h.app.push_entry(tool("e1", "edit"));
+    for i in 0..12 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        h.app.max_scroll > 0,
+        "the transcript overflows the viewport"
+    );
+
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = screen_row_of(&term, "PIN-MARKER").expect("marker on screen");
+    assert!(h.app.scroll_offset > 0, "scrolled up");
+
+    // A new tool call lands after the edit boundary: a brand-new group opens
+    // at the bottom of the transcript.
+    h.app.push_entry(tool("c", "shell"));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let after = screen_row_of(&term, "PIN-MARKER").expect("marker still on screen");
+    assert_eq!(
+        after,
+        before,
+        "the viewport moved:\n{}",
+        buffer_to_string(term.backend().buffer())
+    );
+}
+
+/// The real event stream, not just direct pushes: a turn that calls a tool
+/// emits `ToolStart` → `ToolEnd` → `Usage` → `TurnDone` → `Done`, each applied
+/// to the app and drawn, exactly as the event loop does. Scrolled up the whole
+/// way, the viewport must not move at any step — the tool folds into its
+/// summary (constant height) and the closing stats line lands at the bottom.
+#[tokio::test]
+async fn a_real_tool_round_keeps_the_scrolled_up_viewport() {
+    use hrdr_agent::AgentEvent;
+
+    let mut h = Harness::new(vec![
+        MockReply::ToolCalls(vec![(
+            "shell".to_string(),
+            r#"{"command":"echo hi"}"#.to_string(),
+        )]),
+        MockReply::Text("done".to_string()),
+    ])
+    .await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::assistant("PIN-MARKER"));
+    for i in 0..12 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        h.app.max_scroll > 0,
+        "the transcript overflows the viewport"
+    );
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let before = screen_row_of(&term, "PIN-MARKER").expect("marker on screen");
+    assert!(h.app.scroll_offset > 0, "scrolled up");
+
+    // Launch the turn without draining the channel — the test drives it.
+    h.type_str("go");
+    h.press(KeyCode::Enter);
+    let mut saw_tool = false;
+    let mut saw_done = false;
+    while !saw_done {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), h.rx.recv())
+            .await
+            .expect("a turn event")
+            .expect("channel stays open");
+        saw_tool |= matches!(
+            msg,
+            TurnMsg::Event(AgentEvent::ToolStart { .. })
+                | TurnMsg::Event(AgentEvent::ToolEnd { .. })
+        );
+        saw_done = matches!(msg, TurnMsg::Done(_));
+        h.app.on_turn_msg(msg);
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        if let Some(row) = screen_row_of(&term, "PIN-MARKER") {
+            assert_eq!(
+                row,
+                before,
+                "the viewport moved:\n{}",
+                buffer_to_string(term.backend().buffer())
+            );
+        }
+    }
+    assert!(saw_tool, "the turn actually called a tool");
+    assert!(!h.app.running(), "the turn finished after Done");
+}
+
 /// A run of tool calls groups behind one `{mark} called N tools · ran 2
 /// commands · read 1 file` summary line — the only collapsed mode. Clicking
 /// the summary renders every call in full; clicking it again folds the group
@@ -4123,9 +4479,265 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
     );
 }
 
-/// Collapsing while following the newest output must not scroll away from the
-/// bottom: the view is already pinned there, and there's nothing to keep in
-/// place.
+/// `edit`/`replace` calls break a tool run — they always render in full — so
+/// two tool groups sandwiching one of each stay two groups, with the
+/// always-full calls as distinct standalone entries between them:
+///
+///     summary of 6 calls · edit · replace · summary of 6 calls
+///
+/// Regression: the groups must not merge across the always-full calls, and the
+/// calls must not fold into either group.
+#[tokio::test]
+async fn edit_and_replace_break_the_group_into_standalone_entries() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        })
+    };
+    for i in 0..6 {
+        h.app.push_entry(tool(&format!("a{i}"), "shell"));
+    }
+    h.app.push_entry(tool("e1", "edit"));
+    h.app.push_entry(tool("r1", "replace"));
+    for i in 0..6 {
+        h.app.push_entry(tool(&format!("b{i}"), "shell"));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row_of = |needle: &str| -> Vec<u16> {
+        (0..24)
+            .filter(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .collect()
+    };
+    let summaries = row_of("called 6 tools · ran 6 commands");
+    assert_eq!(
+        summaries.len(),
+        2,
+        "one summary per six-call run:\n{screen}"
+    );
+    let edit = row_of("✓ edit");
+    let replace = row_of("✓ replace");
+    assert_eq!(
+        edit.len(),
+        1,
+        "the edit renders as its own entry:\n{screen}"
+    );
+    assert_eq!(
+        replace.len(),
+        1,
+        "the replace renders as its own entry:\n{screen}"
+    );
+    assert!(
+        summaries[0] < edit[0] && edit[0] < replace[0] && replace[0] < summaries[1],
+        "summary · edit · replace · summary, in order:\n{screen}"
+    );
+}
+
+/// Visible entries — a thinking block, the model's output — bound a tool group
+/// exactly like an `edit`/`replace` call does; only absorbable (invisible)
+/// entries merge a run. So a turn of
+///
+///     thinking · 6 calls · edit · replace · replace · thinking · output
+///
+/// renders as thinking, the 6-call summary, the three always-full calls as
+/// their own entries, then the closing thinking and the reply.
+#[tokio::test]
+async fn visible_entries_bound_a_tool_group() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.show_reasoning = true;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        })
+    };
+    h.app.push_entry(Entry::reasoning("thinking about it"));
+    for i in 0..6 {
+        h.app.push_entry(tool(&format!("a{i}"), "shell"));
+    }
+    h.app.push_entry(tool("e1", "edit"));
+    h.app.push_entry(tool("r1", "replace"));
+    h.app.push_entry(tool("r2", "replace"));
+    h.app.push_entry(Entry::reasoning("thinking again"));
+    h.app.push_entry(Entry::assistant("the output"));
+
+    let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let row_of = |needle: &str| -> u16 {
+        (0..40)
+            .find(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    let rows_with = |needle: &str| -> Vec<u16> {
+        (0..40)
+            .filter(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .collect()
+    };
+    let replaces = rows_with("✓ replace");
+    assert_eq!(
+        replaces.len(),
+        2,
+        "both replace calls render as their own entries:\n{screen}"
+    );
+    assert_eq!(
+        rows_with("called 6 tools").len(),
+        1,
+        "the six calls fold into one summary:\n{screen}"
+    );
+    assert!(
+        row_of("thinking about it") < row_of("called 6 tools")
+            && row_of("called 6 tools") < row_of("✓ edit")
+            && row_of("✓ edit") < replaces[0]
+            && replaces[0] < replaces[1]
+            && replaces[1] < row_of("thinking again")
+            && row_of("thinking again") < row_of("the output"),
+        "thinking · summary · edit · replace · replace · thinking · output:\n{screen}"
+    );
+}
+
+/// Tool-only turns leave an empty assistant marker in the transcript; the
+/// marker renders nothing, so the tool runs on either side of it merge into
+/// one group — 3 + 2 + 6 calls become a single `called 11 tools · ran 7
+/// commands · read 4 files` summary rather than three. Only an
+/// `edit`/`replace` (or a visible entry) breaks a run, and the absorbed turn
+/// markers keep their `#N assistant` `/goto` labels at their transcript
+/// positions when the group is expanded.
+#[tokio::test]
+async fn tool_runs_merge_across_invisible_turn_markers() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: format!("result-{id}"),
+            ok: true,
+            done: true,
+        })
+    };
+    // Round 1: 1 shell + 2 reads; round 2: 1 shell + 1 read; round 3:
+    // 5 shells + 1 read — 11 calls, 7 commands, 4 files, in the user's
+    // exact mix, with an empty assistant turn between the rounds.
+    for (id, name) in [("a0", "shell"), ("a1", "read"), ("a2", "read")] {
+        h.app.push_entry(tool(id, name));
+    }
+    h.app.push_entry(Entry::assistant(""));
+    for (id, name) in [("b0", "shell"), ("b1", "read")] {
+        h.app.push_entry(tool(id, name));
+    }
+    h.app.push_entry(Entry::assistant(""));
+    for (id, name) in [
+        ("c0", "shell"),
+        ("c1", "shell"),
+        ("c2", "shell"),
+        ("c3", "shell"),
+        ("c4", "shell"),
+        ("c5", "read"),
+    ] {
+        h.app.push_entry(tool(id, name));
+    }
+
+    // Collapsed: one merged summary, with the runs' own counts gone.
+    let screen = h.render();
+    assert!(
+        screen.contains("called 11 tools · ran 7 commands · read 4 files"),
+        "the three runs merge into one summary:\n{screen}"
+    );
+    for split in ["called 3 tools", "called 2 tools", "called 6 tools"] {
+        assert!(
+            !screen.contains(split),
+            "no per-run summary {split:?}:\n{screen}"
+        );
+    }
+
+    // Expanded: every call renders inside the group, in order, and the turn
+    // markers' `#N assistant` labels sit between their calls.
+    h.app.expand_tools = true;
+    let mut term = Terminal::new(TestBackend::new(60, 120)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let row_of = |needle: &str| -> u16 {
+        (0..120)
+            .find(|&y| {
+                (0..59)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    assert!(
+        screen.contains("result-a0") && screen.contains("result-c5"),
+        "every call renders:\n{screen}"
+    );
+    assert!(
+        row_of("result-a2") < row_of("#1 assistant")
+            && row_of("#1 assistant") < row_of("result-b0"),
+        "the first turn marker sits between its calls:\n{screen}"
+    );
+    assert!(
+        row_of("result-b1") < row_of("#2 assistant")
+            && row_of("#2 assistant") < row_of("result-c0"),
+        "the second turn marker sits between its calls:\n{screen}"
+    );
+}
+
+/// Expanding or collapsing a tool group while following the newest output must
+/// not scroll away from the bottom: the view is already pinned there, and
+/// there's nothing to keep in place.
 #[tokio::test]
 async fn collapsing_while_following_stays_at_the_bottom() {
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
@@ -4146,12 +4758,16 @@ async fn collapsing_while_following_stays_at_the_bottom() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert_eq!(h.app.scroll_offset, 0, "following the newest output");
 
-    // The header is off the top of a long expanded block; click its last row.
+    // The lone call is folded behind its summary; expand it, then fold it back
+    // — either way the view stays pinned to the bottom.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     click_at(&mut h.app, 2, rect.y);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-
-    assert_eq!(h.app.scroll_offset, 0, "still following the newest output");
+    assert_eq!(h.app.scroll_offset, 0, "still following after expanding");
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    click_at(&mut h.app, 2, rect.y + 1);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert_eq!(h.app.scroll_offset, 0, "still following after collapsing");
 }
 
 /// A tinted block at the end of the scrollback gets the same blank row it would
@@ -4171,6 +4787,9 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         ok: true,
         done: true, // the result row is the layout anchor below
     }));
+    // The lone call collapses behind its summary; fan it out so its box — the
+    // surface these background assertions check — renders.
+    h.app.tool_groups.insert("c1".to_string());
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4191,14 +4810,20 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // Its own bottom pad (tinted), then a blank row on the terminal background.
+    // Its own bottom pad (tinted), then the group container's bottom pad
+    // (dimmer), then a blank row on the terminal background.
     assert_eq!(
         bg_at(last_content + 1),
         h.app.theme.user_bg,
-        "bottom pad:\n{screen}"
+        "child bottom pad:\n{screen}"
     );
     assert_eq!(
         bg_at(last_content + 2),
+        h.app.theme.group_bg,
+        "summary container bottom pad:\n{screen}"
+    );
+    assert_eq!(
+        bg_at(last_content + 3),
         Color::Reset,
         "a blank row closes the scrollback:\n{screen}"
     );
@@ -5498,6 +6123,9 @@ async fn the_prompt_and_input_wear_a_left_bar() {
         ok: true,
         done: true,
     }));
+    // The lone tool call collapses behind its summary; fan it out so its box —
+    // the surface the bar assertions check — renders.
+    h.app.expand_tools = true;
     h.type_str("typing");
 
     let mut term = Terminal::new(TestBackend::new(54, 26)).unwrap();
@@ -6269,6 +6897,9 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
             Err(_) => panic!("timed out waiting for shell events"),
         }
     }
+    // The lone tool call collapses behind its summary; fan it out so the
+    // shell output renders.
+    h.app.expand_tools = true;
     let screen = h.render();
     assert!(
         screen.contains("hello-from-shell"),
@@ -6356,6 +6987,9 @@ async fn colon_bang_runs_the_same_user_shell_command() {
             Err(_) => panic!("timed out waiting for shell events"),
         }
     }
+    // The lone tool call collapses behind its summary; fan it out so the
+    // shell output renders.
+    h.app.expand_tools = true;
     let screen = h.render();
     assert!(
         screen.contains("hello-from-colon-bang"),
