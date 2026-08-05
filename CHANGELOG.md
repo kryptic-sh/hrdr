@@ -532,6 +532,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The context gauge shows the real context remaining after `/compact`**
+  instead of clearing to zero. `CompactionReport` now carries `context_after` —
+  the estimated next-turn prompt (compacted system + summary + preserved tail +
+  the tools block) — and the TUI swaps the stale pre-compaction reading for it
+  when the pass shrank the history. A no-op compaction keeps the existing
+  reading, which is still accurate.
+
 - **The macOS Seatbelt tests can no longer skip themselves in CI.** Both the
   end-to-end test and its backend check opened with silent `return`s when
   `/usr/bin/sandbox-exec` or a shell was missing, so a run that exercised

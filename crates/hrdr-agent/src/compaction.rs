@@ -113,6 +113,15 @@ pub struct CompactionReport {
     /// History length before and after. Equal means nothing was compacted.
     pub before: usize,
     pub after: usize,
+    /// Estimated prompt tokens the next turn would send after this
+    /// compaction — the compacted system prompt + summary + preserved tail,
+    /// plus the `tools[]` block, on the same ~4 bytes/token basis as every
+    /// local figure. This is what the context gauge should show once the
+    /// history has been rewritten: the previous reading described the
+    /// pre-compaction history and must not be kept, and a cleared gauge
+    /// claimed the context was empty. `0` on a no-op compaction, which the
+    /// frontend ignores (the existing reading is still accurate).
+    pub context_after: u32,
     /// Prompt tokens the summarization request was billed for, and how many of
     /// them the provider served from its cache. `None` means the provider
     /// reported no cache figure at all — which is not the same as zero, and
@@ -144,6 +153,7 @@ impl CompactionReport {
             reason,
             before: messages,
             after: messages,
+            context_after: 0,
             prompt_tokens: 0,
             cached_prompt_tokens: None,
             output_tokens: 0,
@@ -891,10 +901,17 @@ impl Agent {
         // for the rest of the session (only `invalidate_context_window`, on a
         // model switch, used to clear this).
         self.self_compact_failed_at = None;
+        // What the next turn would actually send: the compacted system +
+        // summary + tail, plus the tools block. The pre-compaction provider
+        // reading described the history that was just replaced, so this
+        // estimate is the figure a frontend gauge should show once it lands.
+        let context_after = estimate_tokens_in_messages(&self.messages)
+            .saturating_add(estimate_tokens_in_tools(&self.tools.defs()));
         Ok(CompactionReport {
             reason,
             before,
             after: self.messages.len(),
+            context_after,
             prompt_tokens: spend.prompt_tokens,
             cached_prompt_tokens: spend.cached_prompt_tokens,
             output_tokens: spend.completion_tokens,
@@ -1310,6 +1327,7 @@ mod tests {
             reason: CompactionReason::ContextOverflow,
             before: 40,
             after: 6,
+            context_after: 0,
             prompt_tokens: 1_000,
             cached_prompt_tokens: Some(30),
             output_tokens: 900,

@@ -10527,6 +10527,59 @@ mod tests {
             );
         }
 
+        /// A successful compaction reports the context that remains — the
+        /// estimated next-turn prompt (system + summary + tail + tools) — so a
+        /// frontend can show the real post-compaction gauge. Clearing the gauge
+        /// to zero claimed the history was empty; keeping the pre-compaction
+        /// reading claimed it was still full. The report's figure is the only
+        /// one that is neither.
+        #[tokio::test]
+        async fn compacting_reports_the_context_that_remains() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the conversation so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent
+                    .messages
+                    .push(ChatMessage::user(format!("turn {i} {}", "x".repeat(400))));
+                agent.messages.push(ChatMessage::assistant(format!(
+                    "reply {i} {}",
+                    "x".repeat(400)
+                )));
+            }
+            let before = crate::compaction::estimate_tokens_in_messages(&agent.messages)
+                .saturating_add(crate::compaction::estimate_tokens_in_tools(
+                    &agent.tools.defs(),
+                ));
+            // Keep the tail budget out of the way so the pass really shrinks:
+            // only the last turn stays verbatim, the other seven summarize.
+            agent.compaction_tail_turns = 1;
+            agent.preserve_recent_tokens = 0;
+
+            let report = agent
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
+                .await
+                .expect("the summarizer succeeds");
+            assert!(report.shrank());
+
+            // The figure is the post-compaction request — system + summary +
+            // tail plus the tools block — not the pre-compaction history.
+            let after = crate::compaction::estimate_tokens_in_messages(&agent.messages);
+            let tools = crate::compaction::estimate_tokens_in_tools(&agent.tools.defs());
+            assert_eq!(report.context_after, after.saturating_add(tools));
+            assert!(
+                report.context_after < before,
+                "the summary bought real room: {} → {}",
+                before,
+                report.context_after
+            );
+        }
+
         #[tokio::test]
         async fn compaction_retries_once_without_the_unsupported_output_cap() {
             let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));

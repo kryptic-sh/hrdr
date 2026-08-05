@@ -64,6 +64,7 @@ mod tests {
             reason: hrdr_agent::CompactionReason::UserRequested,
             before,
             after,
+            context_after: 0,
             prompt_tokens: 1_000,
             cached_prompt_tokens: Some(900),
             output_tokens: 42,

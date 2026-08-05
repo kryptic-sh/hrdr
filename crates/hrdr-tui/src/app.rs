@@ -2708,12 +2708,20 @@ impl App {
             TurnMsg::Compacted(pane, res) => {
                 self.turn_handle = None;
                 self.registry.end_turn(pane.key());
-                // Context shrank; drop stale usage so the status bar refreshes
-                // on the next turn (and we don't immediately re-trigger). Through
-                // `update_chrome`, so it lands on the compacted agent's registry
-                // entry — which is what every pane, main included, is rebuilt from
-                // each frame; a write to the pane alone was undone at the next draw.
-                self.update_chrome(pane, |s| s.usage.set_last(None));
+                // The gauge's reading described the pre-compaction history.
+                // When the pass actually shrank it, swap in the report's
+                // post-compaction estimate so the bar shows how much room the
+                // summary bought — clearing it to zero claimed the context was
+                // empty. A no-op compaction leaves the reading alone: nothing
+                // changed, so it is still accurate. Through `update_chrome`,
+                // so it lands on the compacted agent's registry entry — which
+                // is what every pane, main included, is rebuilt from each
+                // frame; a write to the pane alone was undone at the next draw.
+                if let Ok(report) = &res
+                    && report.shrank()
+                {
+                    self.update_chrome(pane, |s| s.usage.set_last(Some((report.context_after, 0))));
+                }
                 self.push_entry(Entry::system(hrdr_app::compaction_message(&res)));
                 if res.is_ok() {
                     self.autosave();
@@ -2966,9 +2974,9 @@ mod tests {
     }
 
     /// Compacting a sub-agent's pane is that agent working, so its pane is the one
-    /// that shows busy and its stale context reading is the one dropped. Keyed to
-    /// `MAIN_KEY` regardless, the main conversation showed as working while a
-    /// sub-agent summarized, and the main gauge was the one reset.
+    /// that shows busy and its gauge is the one updated. Keyed to `MAIN_KEY`
+    /// regardless, the main conversation showed as working while a sub-agent
+    /// summarized, and the main gauge was the one reset.
     #[tokio::test]
     async fn compacting_a_sub_agent_pane_runs_that_panes_clock() {
         let (mut app, key, _tmp) = app_viewing_a_sub_agent();
@@ -2993,6 +3001,7 @@ mod tests {
                 reason: hrdr_agent::CompactionReason::UserRequested,
                 before: 10,
                 after: 3,
+                context_after: 42,
                 prompt_tokens: 0,
                 cached_prompt_tokens: None,
                 output_tokens: 0,
@@ -3007,13 +3016,36 @@ mod tests {
         );
         assert_eq!(
             usage_last(&live, key),
-            None,
-            "the compacted agent's stale context reading is the one dropped"
+            Some((42, 0)),
+            "the gauge shows the context the summary left, not the pre-compaction reading — and not zero"
         );
         assert_eq!(
             usage_last(&live, MAIN_KEY),
             Some((100, 5)),
             "the main conversation's context reading is untouched"
+        );
+
+        // A no-op compaction (nothing to summarize) leaves the reading alone:
+        // nothing changed, so it is still accurate.
+        app.on_turn_msg(TurnMsg::Compacted(
+            PaneId(key),
+            Ok(hrdr_agent::CompactionReport {
+                reason: hrdr_agent::CompactionReason::UserRequested,
+                before: 3,
+                after: 3,
+                context_after: 0,
+                prompt_tokens: 0,
+                cached_prompt_tokens: None,
+                output_tokens: 0,
+                cost_usd: None,
+                stage: hrdr_agent::ShrinkStage::Full,
+                attempts: 0,
+            }),
+        ));
+        assert_eq!(
+            usage_last(&live, key),
+            Some((42, 0)),
+            "a nothing-to-do pass keeps the existing reading"
         );
     }
 
