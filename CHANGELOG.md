@@ -370,6 +370,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The agent prompt now requires the verification gate before every commit.**
+  The `Committing:` guidance leads with: run the project's gate (the `verify`
+  tool when present, the project's own commands otherwise) before each commit —
+  a commit is a checkpoint the tree must be green for, and a check that cannot
+  run locally is named and explained rather than waved away. Previously the gate
+  instruction lived only in the (conditional) verification section; it now sits
+  in the committing rules every writer agent sees.
+
 - **The live "generating" line wraps by section on narrow terminals.** The
   spinner + stats row (ctx, in/out, tok/s, ttft, elapsed, started) now breaks
   between its `·`-delimited segments when it does not fit the width, so a

@@ -1193,6 +1193,9 @@ mod tests {
         assert!(says(&p, "every body paragraph at 72 columns"));
         assert!(says(&p, "physical lines, never one overlong line"));
         assert!(says(&p, "force-push"));
+        // The gate runs before every commit — the tree must be green at a
+        // checkpoint, and an unverifiable check is reported, not waved away.
+        assert!(says(&p, "verification gate before every commit"));
         // PR/branch workflow: branch by ownership/intent; when ownership or push
         // access is unknown, ask before committing or pushing.
         assert!(says(&p, "Branch by ownership and intent"));
