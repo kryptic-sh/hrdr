@@ -241,6 +241,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   partial always-on copy; the skill's own preflight (clean tree, right branch,
   ask before deciding) is the guard.
 
+- **New built-in skill `:sweep`** — one command that runs the four quality
+  passes as a single sweep. It loads `:review`, `:audit`, `:tidy` and `:perf`
+  through the `skill` tool and follows each in full rather than restating them,
+  so a change to any pass takes effect without touching the sweep; arguments
+  forward to each pass as its target scope, each pass writes its own report to
+  the backlog, and the sweep merges the findings — cross-cutting ones first.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to

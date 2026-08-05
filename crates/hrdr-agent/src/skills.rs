@@ -10,7 +10,7 @@
 //! sub-agent files: project dirs first, then user dirs, hrdr → Claude Code →
 //! opencode conventions, then hrdr's own built-in skills (`:commit`,
 //! `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`,
-//! `:tidy`, `:perf`) last — deduped by name (first source wins), so a
+//! `:tidy`, `:perf`, `:sweep`) last — deduped by name (first source wins), so a
 //! user or project file always overrides a built-in of the same name.
 //!
 //! This lives in `hrdr-agent` rather than in a frontend because the model can
@@ -39,6 +39,7 @@ const BUILTIN_FIX: &str = include_str!("templates/skills/fix.md");
 const BUILTIN_PLAN: &str = include_str!("templates/skills/plan.md");
 const BUILTIN_TIDY: &str = include_str!("templates/skills/tidy.md");
 const BUILTIN_PERF: &str = include_str!("templates/skills/perf.md");
+const BUILTIN_SWEEP: &str = include_str!("templates/skills/sweep.md");
 
 /// Max bytes for a single skill file; files larger than this are skipped.
 const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024;
@@ -192,6 +193,7 @@ pub fn builtin_skills() -> Vec<Skill> {
         (BUILTIN_PLAN, "plan"),
         (BUILTIN_TIDY, "tidy"),
         (BUILTIN_PERF, "perf"),
+        (BUILTIN_SWEEP, "sweep"),
     ]
     .into_iter()
     .filter_map(|(text, stem)| parse_skill_file(text, stem, "built-in"))
@@ -811,12 +813,13 @@ mod tests {
         let skills = builtin_skills();
         assert_eq!(
             skills.len(),
-            10,
-            "audit, commit, fix, perf, plan, release, review, test, tidy, todo"
+            11,
+            "audit, commit, fix, perf, plan, release, review, sweep, test, tidy, todo"
         );
 
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "sweep", "test", "tidy",
+            "todo",
         ] {
             let s = skills
                 .iter()
@@ -848,7 +851,7 @@ mod tests {
             skills.iter().find(|s| s.name == "audit").unwrap().args,
             vec!["low", "high"]
         );
-        for name in ["fix", "test", "todo", "plan", "tidy", "perf"] {
+        for name in ["fix", "test", "todo", "plan", "tidy", "perf", "sweep"] {
             assert!(
                 skills
                     .iter()
@@ -863,7 +866,8 @@ mod tests {
 
     /// `discover_skills` on a cwd with no skill directories at all still
     /// returns the built-ins — the whole point of shipping them is that
-    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy`/`:perf` work with zero setup.
+    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy`/`:perf`/`:sweep`
+    /// work with zero setup.
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
@@ -873,8 +877,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy",
-                "todo"
+                "audit", "commit", "fix", "perf", "plan", "release", "review", "sweep", "test",
+                "tidy", "todo"
             ]
         );
         assert!(skills.iter().all(|s| s.source == "built-in"));

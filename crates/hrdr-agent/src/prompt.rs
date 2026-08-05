@@ -3713,7 +3713,8 @@ mod tests {
             s.len()
         );
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "sweep", "test", "tidy",
+            "todo",
         ] {
             assert!(s.contains(&format!("\n- {name} — ")), "{name} is listed");
         }
