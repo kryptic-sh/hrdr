@@ -119,16 +119,6 @@ impl Tool for WriteTool {
     }
 }
 
-/// Line ceiling on a diff echoed back in a *model-facing* mutation result.
-/// Past it the body is replaced by a one-line summary (see
-/// [`abbreviate_mutation_result`]); the transcript's copy is never capped.
-///
-/// A small diff is how the model checks its anchor landed where it meant, so it
-/// stays. A large one is the model reading back text it just wrote: measured at
-/// ~170k characters of pure self-echo in a single session, for no decision it
-/// couldn't make from the summary plus a targeted re-read.
-pub(crate) const MAX_DIFF_LINES: usize = 40;
-
 /// `a/<path>` and `b/<path>` diff headers with exactly one separator — an
 /// absolute `path` must not produce `a//home/…`, which is not a path anything
 /// can act on and reads as a rendering bug.
@@ -148,73 +138,6 @@ pub(crate) fn unified_diff(path: &str, old: &str, new: &str) -> String {
         .context_radius(3)
         .header(&a, &b)
         .to_string()
-}
-
-/// The model-facing form of a mutation result: the `Replaced …`/`Wrote …`
-/// prefix and any notes stay, and every diff section longer than
-/// [`MAX_DIFF_LINES`] collapses to its headers plus a one-line count summary
-/// (`edit applied: +15/-8 lines across 1 hunks (diff omitted — …)`). The full
-/// diffs stay in the transcript — they are for the user; the model only needs
-/// to know the change landed and how big it was (it wrote the text, and a
-/// large one is pure self-echo it should re-read only if it cares).
-pub fn abbreviate_mutation_result(body: &str) -> String {
-    let mut out = String::new();
-    let mut diff = String::new();
-    let mut a: Option<&str> = None;
-    let mut b: Option<&str> = None;
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut hunks = 0usize;
-    let flush = |out: &mut String,
-                 diff: &mut String,
-                 a: Option<&str>,
-                 b: Option<&str>,
-                 added: usize,
-                 removed: usize,
-                 hunks: usize| {
-        if diff.lines().count() > MAX_DIFF_LINES {
-            out.push_str(&format!(
-                "--- {}\n+++ {}\nedit applied: +{added}/-{removed} lines across {hunks} hunks \
-                 (diff omitted — you wrote this change; re-read the file if you need to verify)\n",
-                a.unwrap_or_default(),
-                b.unwrap_or_default(),
-            ));
-        } else {
-            out.push_str(diff);
-        }
-        diff.clear();
-    };
-    for line in body.lines() {
-        if line.starts_with("--- ") {
-            // A new diff section (its `--- ` header line); the summary re-adds
-            // the header prefix, so store the bare `a/…` part.
-            flush(&mut out, &mut diff, a, b, added, removed, hunks);
-            a = Some(line.strip_prefix("--- ").unwrap_or(line));
-            b = None;
-            added = 0;
-            removed = 0;
-            hunks = 0;
-            diff.push_str(line);
-            diff.push('\n');
-        } else if a.is_some() {
-            diff.push_str(line);
-            diff.push('\n');
-            if line.starts_with("+++ ") {
-                b = Some(line.strip_prefix("+++ ").unwrap_or(line));
-            } else if line.starts_with("@@") {
-                hunks += 1;
-            } else if line.starts_with('+') {
-                added += 1;
-            } else if line.starts_with('-') {
-                removed += 1;
-            }
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    flush(&mut out, &mut diff, a, b, added, removed, hunks);
-    out
 }
 
 #[cfg(test)]
@@ -246,89 +169,37 @@ mod tests {
         assert!(unified_diff("src/f.rs", "one\n", "two\n").contains("--- a/src/f.rs"));
     }
 
-    /// A short diff is kept verbatim for the model — it is how the model checks
-    /// its anchor landed where it meant. A long one is replaced by its counts in
-    /// the MODEL-facing copy (see [`abbreviate_mutation_result`]) while the
-    /// transcript keeps the whole diff.
+    /// The mutation result is the FULL diff — no cap, no summary: the model
+    /// verifies its own edit from it, and a mistake it cannot see costs more
+    /// rounds than the tokens a summary would save.
     #[test]
-    fn a_long_diff_collapses_to_counts_while_a_short_one_stays_whole() {
-        // 3 changed lines in a 10-line file: well under the cap, kept whole.
-        let old = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
-        let new = old.replace("line 5", "LINE 5");
-        let short = abbreviate_mutation_result(&format!(
-            "Replaced 1 occurrence(s) in /tmp/f.txt\n{}",
-            unified_diff("/tmp/f.txt", &old, &new)
-        ));
-        assert!(
-            short.contains("-line 5") && short.contains("+LINE 5"),
-            "{short}"
-        );
-        assert!(!short.contains("diff omitted"), "{short}");
-
+    fn a_mutation_result_carries_the_full_diff() {
         // Every line of a 60-line file rewritten: one hunk, 60 added, 60 removed.
         let old = (1..=60).map(|n| format!("line {n}\n")).collect::<String>();
         let new = (1..=60).map(|n| format!("LINE {n}\n")).collect::<String>();
         let diff = unified_diff("/tmp/f.txt", &old, &new);
-        assert!(diff.lines().count() > MAX_DIFF_LINES, "the fixture is big");
-        let long =
-            abbreviate_mutation_result(&format!("Replaced 60 occurrence(s) in /tmp/f.txt\n{diff}"));
+        assert!(diff.lines().count() > 40, "the fixture is big: {diff}");
+        let result = format!("Replaced 60 occurrence(s) in /tmp/f.txt\n{diff}");
         assert!(
-            long.contains("edit applied: +60/-60 lines across 1 hunks"),
-            "counts must be exact: {long}"
+            result.contains("-line 1\n") && result.contains("+LINE 1"),
+            "the whole diff rides back: {result}"
         );
-        assert!(long.contains("diff omitted"), "{long}");
-        assert!(!long.contains("-line 1\n"), "the body is gone: {long}");
-        // The prefix and the headers stay, so a multi-file result still says
-        // which file each summary is for.
         assert!(
-            long.starts_with("Replaced 60 occurrence(s) in /tmp/f.txt"),
-            "the prefix survives: {long}"
+            !result.contains("diff omitted"),
+            "nothing is collapsed: {result}"
         );
-        assert!(long.contains("--- a/tmp/f.txt"), "{long}");
-        assert_eq!(
-            long.lines().count(),
-            4,
-            "prefix + headers + one summary line: {long}"
-        );
+        assert!(result.contains("--- a/tmp/f.txt"), "{result}");
 
         // An unchanged file still renders nothing at all.
         assert!(unified_diff("/tmp/f.txt", &old, &old).is_empty());
     }
 
-    /// A multi-file `replace` result carries one diff per file; each big one
-    /// collapses independently, the small ones stay whole.
-    #[test]
-    fn a_multi_file_result_collapses_each_large_diff_on_its_own() {
-        let old = (1..=60).map(|n| format!("line {n}\n")).collect::<String>();
-        let new = (1..=60).map(|n| format!("LINE {n}\n")).collect::<String>();
-        let big = unified_diff("src/a.rs", &old, &new);
-        let small = unified_diff("src/b.rs", "one\n", "two\n");
-        let body =
-            format!("Replaced 61 occurrences across 2 files:\nsrc/a.rs\nsrc/b.rs\n\n{big}{small}");
-        let out = abbreviate_mutation_result(&body);
-        assert!(
-            out.contains("--- a/src/a.rs")
-                && out.contains("edit applied: +60/-60 lines across 1 hunks"),
-            "the big diff collapses: {out}"
-        );
-        assert!(
-            out.contains("-one") && out.contains("+two"),
-            "the small diff stays whole: {out}"
-        );
-        assert!(!out.contains("-line 1\n"), "the big body is gone: {out}");
-        assert_eq!(
-            out.matches("edit applied:").count(),
-            1,
-            "exactly the big diff is summarized: {out}"
-        );
-    }
-
-    /// The summary replaces only the diff body: a hook warning (and, by the same
-    /// path, an LSP-diagnostics block) still rides back with the result — a long
-    /// edit must not bury a "this no longer builds".
+    /// The diff rides back in full even when a hook failed: a hook warning
+    /// (and, by the same path, an LSP-diagnostics block) still sits with the
+    /// result — an edit must not bury a "this no longer builds".
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_summarized_diff_still_carries_the_hook_and_edit_notes() {
+    async fn an_edit_result_carries_the_full_diff_and_the_hook_notes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many.txt");
         std::fs::write(
@@ -369,7 +240,7 @@ mod tests {
         );
         assert!(
             !out.contains("diff omitted"),
-            "the model-facing summary is the agent's job now: {out}"
+            "nothing is collapsed any more: {out}"
         );
         assert!(!out.contains("a//"), "no doubled slash: {out}");
     }

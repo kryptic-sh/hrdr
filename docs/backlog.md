@@ -1153,6 +1153,21 @@ live here:
 
 ## Deferred 2026-08-05
 
+- **Todo panel cut off 1 row at the bottom when following.** Reported
+  2026-08-05: with the transcript fully scrolled down (following, `offset 0`),
+  the todo list's last row sits one line below the visible area — the
+  scrollbar's `↓` lands on the `▸ N finished` toggle row while panel rows
+  continue beneath it, as if the transcript area ends a row early. **Not
+  reproduced** in e2e probes: following at `offset 0` at every terminal height
+  (11–30 rows), with and without a finished sub-agent panel present, the panel's
+  bottom pad renders on the transcript area's last row. The repro gap: the
+  report came from a _resumed_ session (the `resumed … (359 messages)` notice
+  was on screen), so the untried variable is the resume path — resume rebuilds
+  the transcript and the follow state, which the probes did not drive. Revisit
+  with a resume-driven repro before touching the layout; candidates if it
+  reproduces: `draw_chunks`' `scroll`/`inner_scroll` off-by-one at the bottom,
+  or the live-panel chunk heights vs the transcript area.
+
 - **Hide `Notice` transcript entries unless verbose.** Requested 2026-08-05: the
   `EntryKind::Notice` chrome — the welcome banner, "session saved as …", config
   reloads — should render only in `/verbose on` mode. Deferred on the first

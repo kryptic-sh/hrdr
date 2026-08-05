@@ -65,12 +65,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Expanding a tool group's summary renders its calls inside it as nested child
   items.** The summary keeps its header — its first row, with one blank row
   beneath it so the first call never sits flush against it — and the calls fan
-  out below, each keeping the same padding as every other block (nested one
-  level inside the dimmer container), on the normal tool background, over a
-  group background that is slightly dimmer than the tool entries' — so the calls
-  read as items of the section rather than blocks of their own. Absorbed
-  tool-only turns keep their `#N assistant` `/goto` labels at their transcript
-  positions inside the group.
+  out below, each keeping the same padding as every other block and only the
+  calls carrying a background. The summary section itself reads on the page like
+  a thought or the model's output — the tool boxes are the only tinted surface.
+  Absorbed tool-only turns keep their `#N assistant` `/goto` labels at their
+  transcript positions inside the group.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes
@@ -131,10 +130,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it arrives, so nothing in the pile is forgotten.
 
 - **A mutation result carries the full diff of the change.** `edit`, `replace`
-  and `write` return the whole diff uncapped, so the transcript shows the user
-  exactly what the tool changed; the model's copy is still abbreviated to its
-  counts (`edit applied: +15/-8 lines across 1 hunks …`) — it wrote the text,
-  and a large diff is pure self-echo.
+  and `write` return the whole diff uncapped, and it is handed to the model in
+  full as well as shown in the transcript: the diff is how the model verifies
+  its own edit landed as intended and repairs what it did wrong — the tokens an
+  abbreviated copy saves are not worth a round wasted on a mistake it could not
+  see.
 
 - **Expanding or collapsing a section holds the viewport steady.** Clicking a
   tool group's summary or a hidden thought's summary keeps that chunk on the

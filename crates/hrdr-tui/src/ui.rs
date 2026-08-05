@@ -2773,13 +2773,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 let end = tool_group_end(transcript, i);
                 let id = tool_call_id(&entry.kind).unwrap_or_default();
                 let expanded = app.verbose || app.tool_groups.contains(id);
-                // The follower of the summary header: the entry after the
-                // group — never a member (the span extends across every
-                // absorbed entry), so only a user prompt or an edit/replace
-                // is tinted there.
-                let next_tinted = transcript
-                    .get(end)
-                    .is_some_and(|e| entry_is_tinted(&e.kind));
                 // Absorbed empty-assistant turns still count as messages and
                 // keep their `#N assistant` `/goto` labels, rendered inside
                 // the group at their transcript positions.
@@ -2821,15 +2814,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         now,
                     },
                 ));
-                // The header is pushed directly, outside the pending-chain
-                // separator logic — restore the tinted→tinted separator it
-                // would have earned as a normal block.
-                if next_tinted {
-                    chunks.push(separator());
-                }
-                // The whole group — running calls included — is inside the
-                // chunk, expanded or collapsed alike; only the chunk's own
-                // `expanded` flag decides whether the children render.
+                // The summary section is untinted, so it needs no separator
+                // against a following tinted block — the blank rows either
+                // side read as the page, like a thought or an output block.
                 group_members_end = Some(end);
                 continue;
             }
@@ -3148,13 +3135,6 @@ fn is_always_full_tool(name: &str) -> bool {
     matches!(name, "edit" | "replace")
 }
 
-/// Whether an entry's block wears a tinted background (as opposed to the
-/// plain terminal background) — the separator decision the summary header
-/// inherits, since it is pushed outside the pending-chain `flush` logic.
-fn entry_is_tinted(kind: &EntryKind) -> bool {
-    matches!(kind, EntryKind::User(_) | EntryKind::Tool { .. })
-}
-
 /// A tool call that participates in grouping — everything but the always-full
 /// `edit`/`replace`, which always render and never group: they break the run
 /// and show as their own full entries.
@@ -3386,7 +3366,11 @@ fn tool_group_chunk(
 ) -> Chunk<'static> {
     let theme = &app.theme;
     let bg = BlockKind::Tool.bg(theme);
-    let group_bg = theme.group_bg;
+    // The summary section renders on the page background like thinking and
+    // output — only the child tool boxes carry a background (the tool's own),
+    // so the summary reads as part of the conversation, not a surface of its
+    // own.
+    let page = Color::Reset;
     let inner = usize::from(inner_width(w));
     let (sections, running, all_ok) = tool_group_summary(members);
     let packed = pack_loader_segments(&sections, inner);
@@ -3397,7 +3381,7 @@ fn tool_group_chunk(
     } else {
         ("✗", theme.error)
     };
-    let dim = Style::default().fg(theme.dim).bg(group_bg);
+    let dim = Style::default().fg(theme.dim).bg(page);
 
     let mut rows: Vec<Line<'static>> = Vec::new();
     // The summary line is the container's first row — no pad above it, and one
@@ -3408,22 +3392,22 @@ fn tool_group_chunk(
         if i == 0 {
             spans.push(Span::styled(
                 format!("{} ", mark),
-                Style::default().fg(color).bg(group_bg),
+                Style::default().fg(color).bg(page),
             ));
         }
         spans.push(Span::styled(text, dim));
         for row in wrap_spans(spans, inner) {
-            rows.push(pad_row(row, w, group_bg));
+            rows.push(pad_row(row, w, page));
         }
     }
     if frame.expanded {
         // The children: one tool box per call (or a turn label), each on the
-        // normal tool background, inset inside the dimmer container so it
-        // reads as an item of the summary section rather than a block of its
-        // own. A blank group-background row separates the summary from the
-        // first item and every item from the next.
+        // normal tool background, inset on the page so it reads as an item of
+        // the summary section rather than a block of its own. A blank row
+        // separates the summary from the first item and every item from the
+        // next.
         for (j, member) in members.iter().enumerate() {
-            rows.push(pad_row(Vec::new(), w, group_bg));
+            rows.push(pad_row(Vec::new(), w, page));
             match &member.kind {
                 EntryKind::Tool {
                     name,
@@ -3453,9 +3437,9 @@ fn tool_group_chunk(
                     // The box is laid out at the container's inner width, then
                     // inset by the container's own padding — the calls keep the
                     // same padding as every other block; only the summary line
-                    // itself sits flush on the container.
+                    // itself sits flush on the page.
                     for row in render_block(body.as_ref().clone(), inner, bg, None) {
-                        rows.push(inset_box_row(row, w, group_bg));
+                        rows.push(inset_box_row(row, w, page));
                     }
                 }
                 _ => {
@@ -3466,13 +3450,13 @@ fn tool_group_chunk(
                     let Some(label) = meta.rows(frame.now, theme).into_iter().last() else {
                         continue; // timestamps hidden — no label to render
                     };
-                    rows.push(pad_row(label.spans, w, group_bg));
+                    rows.push(pad_row(label.spans, w, page));
                 }
             }
         }
     }
     // The container's own bottom padding.
-    rows.push(pad_row(Vec::new(), w, group_bg));
+    rows.push(pad_row(Vec::new(), w, page));
     Chunk {
         rows: ChunkRows::Ready(Rc::new(rows)),
         tool_idx: Some(head_idx),
@@ -3496,18 +3480,18 @@ fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> 
 /// A child tool box's row (already padded to the container's inner width on
 /// the tool background) placed inside the group container: the container's own
 /// left padding column, then the box, then its right fill — so the box reads
-/// as a nested item on the dimmer group background.
-fn inset_box_row(row: Line<'static>, width: usize, group_bg: Color) -> Line<'static> {
+/// as a nested item on the page.
+fn inset_box_row(row: Line<'static>, width: usize, page: Color) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " ".repeat(BLOCK_PAD_X),
-        Style::default().bg(group_bg),
+        Style::default().bg(page),
     )];
     spans.extend(row.spans);
     let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
         spans.push(Span::styled(
             " ".repeat(width - used),
-            Style::default().bg(group_bg),
+            Style::default().bg(page),
         ));
     }
     Line::from(spans)

@@ -1340,13 +1340,13 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     assert_ne!(bg_at(0, meta_y + 2), theme.user_bg, "separator row");
 
     // The tool box: status mark + name on the header, command below it, on the
-    // tool background — nested inside the dimmer group summary container, so
-    // the box starts one container padding in from the block padding.
+    // tool background — nested on the page inside the untinted summary section,
+    // so the box starts one container padding in from the block padding.
     let tool_y = find_row("✓ shell").expect("tool header rendered");
     assert_eq!(
         bg_at(0, tool_y),
-        theme.group_bg,
-        "the summary container wraps the box in its dimmer background"
+        Color::Reset,
+        "the summary section reads on the page, only the box is tinted"
     );
     assert_eq!(
         bg_at(2, tool_y),
@@ -5216,8 +5216,8 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // Its own bottom pad (tinted), then the group container's bottom pad
-    // (dimmer), then a blank row on the terminal background.
+    // Its own bottom pad (tinted), then the summary section's bottom pad and
+    // the row past it, both on the page background like a thought or output.
     assert_eq!(
         bg_at(last_content + 1),
         h.app.theme.user_bg,
@@ -5225,8 +5225,8 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
     );
     assert_eq!(
         bg_at(last_content + 2),
-        h.app.theme.group_bg,
-        "summary container bottom pad:\n{screen}"
+        Color::Reset,
+        "summary section bottom pad:\n{screen}"
     );
     assert_eq!(
         bg_at(last_content + 3),

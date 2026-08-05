@@ -53,8 +53,7 @@ pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
     CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS, EditTool, FindTool,
     GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool,
-    WriteTool, abbreviate_mutation_result, available_shell_tools, redact_secret_diffs,
-    run_user_command,
+    WriteTool, available_shell_tools, redact_secret_diffs, run_user_command,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};

@@ -133,7 +133,6 @@ pub use todo::TodoTool;
 pub use tree::TreeTool;
 pub use verify::{DEFAULT_VERIFY_TIMEOUT_SECS, VerifyTool};
 pub use write::WriteTool;
-pub use write::abbreviate_mutation_result;
 
 #[cfg(test)]
 mod tests {

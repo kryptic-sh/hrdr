@@ -1016,14 +1016,10 @@ impl Agent {
         // display event above: `(took 0ms)` on every instant tool is just noise
         // in the transcript, and the model is what asked for the timing.
         //
-        // A mutation tool's full diff stays in the transcript for the user;
-        // the model gets it abbreviated to its counts.
-        let model_body = if matches!(call.function.name.as_str(), "edit" | "replace" | "write") {
-            hrdr_tools::abbreviate_mutation_result(&body)
-        } else {
-            body
-        };
-        let recorded = format!("{model_body}\n\n(took {})", format_duration(elapsed));
+        // The mutation result is handed to the model in full: the diff is how
+        // it verifies its own edit landed as intended and repairs what it did
+        // wrong.
+        let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
         self.messages
             .push(ChatMessage::tool_result(call.id.clone(), recorded));
     }
