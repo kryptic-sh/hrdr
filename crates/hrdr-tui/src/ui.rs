@@ -1326,20 +1326,31 @@ fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
 
 /// Pack ` · `-delimited loader segments into lines of at most `width` cells,
 /// breaking between segments so a wrapped line never leads with the `·`
-/// separator. Empty segments (an absent ttft/started) are dropped.
+/// separator. Every line after the first is indented one cell — a wrapped row
+/// lines up under the spinner instead of starting flush at the terminal's edge
+/// — and the indent counts against `width`. Empty segments (an absent
+/// ttft/started) are dropped.
 fn pack_loader_segments(segments: &[String], width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut line = String::new();
+    // The first line carries the spinner's own leading space; each line after
+    // it gets a fresh indent when it starts.
+    let mut first = true;
     for seg in segments.iter().filter(|s| !s.is_empty()) {
         if line.is_empty() {
-            line.clone_from(seg);
+            line = if first {
+                seg.clone()
+            } else {
+                format!(" {seg}")
+            };
+            first = false;
         } else {
             let joined = format!("{line} · {seg}");
             if joined.chars().count() <= width {
                 line = joined;
             } else {
                 out.push(std::mem::take(&mut line));
-                line.clone_from(seg);
+                line = format!(" {seg}");
             }
         }
     }
@@ -4245,7 +4256,8 @@ mod block_tests {
 
     /// Loader stats pack into width-bounded lines, breaking between ` · `-joined
     /// segments so a wrapped line never leads with the `·` separator, with the
-    /// full content preserved in order.
+    /// full content preserved in order — and every wrapped line indented one
+    /// cell so it lines up under the spinner instead of starting flush.
     #[test]
     fn loader_segments_pack_between_separators() {
         let segments = vec![
@@ -4258,21 +4270,48 @@ mod block_tests {
         ];
         let joined = segments.join(" · ");
 
-        // Wide enough: everything on one line.
+        // Wide enough: everything on one line — the first line keeps no indent.
         assert_eq!(pack_loader_segments(&segments, 200), vec![joined.clone()]);
 
         // Narrow: breaks between segments, each line fits and none starts with
-        // the separator, and joining the lines back reproduces the original.
+        // the separator, and stripping the indent from the wrapped rows
+        // reproduces the original content in order.
         let lines = pack_loader_segments(&segments, 60);
         assert!(lines.len() > 1, "a narrow width must wrap: {lines:?}");
-        for line in &lines {
+        assert!(
+            lines[0].starts_with(" ⠦"),
+            "the first line keeps the spinner's own space, nothing added: {:?}",
+            lines[0]
+        );
+        for (i, line) in lines.iter().enumerate() {
             assert!(line.chars().count() <= 60, "each line fits: {line}");
             assert!(
                 !line.trim_start().starts_with('·'),
                 "no wrapped line starts with the separator: {line}"
             );
+            if i > 0 {
+                assert!(
+                    line.starts_with(' '),
+                    "a wrapped line is indented one cell: {line:?}"
+                );
+            }
         }
-        assert_eq!(lines.join(" · "), joined, "no content lost or reordered");
+        let unindented: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.as_str()
+                } else {
+                    l.strip_prefix(' ').unwrap_or(l)
+                }
+            })
+            .collect();
+        assert_eq!(
+            unindented.join(" · "),
+            joined,
+            "no content lost or reordered"
+        );
 
         // Empty segments (a missing ttft/started) are dropped, not rendered bare.
         assert_eq!(
