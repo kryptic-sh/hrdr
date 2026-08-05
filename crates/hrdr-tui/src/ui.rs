@@ -2773,6 +2773,13 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 let end = tool_group_end(transcript, i);
                 let id = tool_call_id(&entry.kind).unwrap_or_default();
                 let expanded = app.verbose || app.tool_groups.contains(id);
+                // An untinted follower (an assistant block, a thought, more
+                // text) brings its own top pad; drop the section's bottom pad
+                // so the two don't stack into a double blank under the
+                // summary.
+                let drop_bottom = transcript
+                    .get(end)
+                    .is_some_and(|e| !entry_is_tinted(&e.kind));
                 // Absorbed empty-assistant turns still count as messages and
                 // keep their `#N assistant` `/goto` labels, rendered inside
                 // the group at their transcript positions.
@@ -2812,6 +2819,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         frame_idx,
                         expanded,
                         now,
+                        drop_bottom,
                     },
                 ));
                 // The summary section is untinted, so it needs no separator
@@ -3135,6 +3143,14 @@ fn is_always_full_tool(name: &str) -> bool {
     matches!(name, "edit" | "replace")
 }
 
+/// Whether an entry's block wears a tinted background (as opposed to the
+/// plain terminal background) — the summary section's bottom pad is dropped
+/// when an untinted entry follows it, so that entry's own top pad is the one
+/// blank row between them instead of two.
+fn entry_is_tinted(kind: &EntryKind) -> bool {
+    matches!(kind, EntryKind::User(_) | EntryKind::Tool { .. })
+}
+
 /// A tool call that participates in grouping — everything but the always-full
 /// `edit`/`replace`, which always render and never group: they break the run
 /// and show as their own full entries.
@@ -3344,6 +3360,10 @@ struct GroupFrame {
     frame_idx: u64,
     expanded: bool,
     now: chrono::DateTime<chrono::Local>,
+    /// Drop the section's bottom pad when the entry after the group is
+    /// untinted — that entry's own top pad is then the one blank row between
+    /// them, instead of two.
+    drop_bottom: bool,
 }
 
 /// The block for a tool group: a container on the dimmer group background
@@ -3402,10 +3422,11 @@ fn tool_group_chunk(
     }
     if frame.expanded {
         // The children: one tool box per call (or a turn label), each on the
-        // normal tool background, inset on the page so it reads as an item of
-        // the summary section rather than a block of its own. A blank row
-        // separates the summary from the first item and every item from the
-        // next.
+        // normal tool background and flush with the transcript's own content
+        // column — the same padding as every other block, no extra inset. A
+        // single blank row separates the summary from the first item and every
+        // item from the next; the boxes carry no padding of their own, so that
+        // one row is the whole gap.
         for (j, member) in members.iter().enumerate() {
             rows.push(pad_row(Vec::new(), w, page));
             match &member.kind {
@@ -3434,12 +3455,11 @@ fn tool_group_chunk(
                     if body.is_empty() {
                         continue;
                     }
-                    // The box is laid out at the container's inner width, then
-                    // inset by the container's own padding — the calls keep the
-                    // same padding as every other block; only the summary line
-                    // itself sits flush on the page.
-                    for row in render_block(body.as_ref().clone(), inner, bg, None) {
-                        rows.push(inset_box_row(row, w, page));
+                    // The call's own rows, filled to the width on the tool
+                    // background — content at the same column as every other
+                    // transcript entry.
+                    for row in body.as_ref().iter() {
+                        rows.push(pad_row(row.spans.clone(), w, bg));
                     }
                 }
                 _ => {
@@ -3455,8 +3475,10 @@ fn tool_group_chunk(
             }
         }
     }
-    // The container's own bottom padding.
-    rows.push(pad_row(Vec::new(), w, page));
+    // The section's own bottom padding, unless the follower brings its own.
+    if !frame.drop_bottom {
+        rows.push(pad_row(Vec::new(), w, page));
+    }
     Chunk {
         rows: ChunkRows::Ready(Rc::new(rows)),
         tool_idx: Some(head_idx),
@@ -3475,26 +3497,6 @@ fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> 
         }
     }
     pad_line(spans, width, bg, None)
-}
-
-/// A child tool box's row (already padded to the container's inner width on
-/// the tool background) placed inside the group container: the container's own
-/// left padding column, then the box, then its right fill — so the box reads
-/// as a nested item on the page.
-fn inset_box_row(row: Line<'static>, width: usize, page: Color) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        " ".repeat(BLOCK_PAD_X),
-        Style::default().bg(page),
-    )];
-    spans.extend(row.spans);
-    let used: usize = spans.iter().map(Span::width).sum();
-    if used < width {
-        spans.push(Span::styled(
-            " ".repeat(width - used),
-            Style::default().bg(page),
-        ));
-    }
-    Line::from(spans)
 }
 
 /// Block body for one tool call: a status header (SPINNER / ✓ / ✗ + tool name +

@@ -1340,13 +1340,13 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     assert_ne!(bg_at(0, meta_y + 2), theme.user_bg, "separator row");
 
     // The tool box: status mark + name on the header, command below it, on the
-    // tool background — nested on the page inside the untinted summary section,
-    // so the box starts one container padding in from the block padding.
+    // tool background — flush with the transcript's own content column, like
+    // every other block.
     let tool_y = find_row("✓ shell").expect("tool header rendered");
     assert_eq!(
         bg_at(0, tool_y),
-        Color::Reset,
-        "the summary section reads on the page, only the box is tinted"
+        theme.user_bg,
+        "the call's box carries the tool background"
     );
     assert_eq!(
         bg_at(2, tool_y),
@@ -1354,7 +1354,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
         "the box itself shares the prompt bg"
     );
     assert!(
-        row_text(tool_y + 1).starts_with(&format!("{pad}{pad}echo hi")),
+        row_text(tool_y + 1).starts_with(&format!("{pad}echo hi")),
         "command line"
     );
     assert!(
@@ -5216,20 +5216,15 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // Its own bottom pad (tinted), then the summary section's bottom pad and
-    // the row past it, both on the page background like a thought or output.
+    // The call's box has no padding of its own: the section's bottom pad and
+    // the row past it follow directly, both on the page background.
     assert_eq!(
         bg_at(last_content + 1),
-        h.app.theme.user_bg,
-        "child bottom pad:\n{screen}"
-    );
-    assert_eq!(
-        bg_at(last_content + 2),
         Color::Reset,
         "summary section bottom pad:\n{screen}"
     );
     assert_eq!(
-        bg_at(last_content + 3),
+        bg_at(last_content + 2),
         Color::Reset,
         "a blank row closes the scrollback:\n{screen}"
     );
