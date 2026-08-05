@@ -2781,19 +2781,31 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // marker — and the tool-group summary header uses the same frame.
         let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
         let frame = SPINNER[frame_idx as usize % SPINNER.len()];
-        // Tool groups: consecutive collapsible calls (everything but
-        // `edit`/`replace`, which always render and never group) collapse
-        // behind one `{mark} called N tools · read 2 files` summary line. The
-        // group's first call heads it; the summary header chunk always opens
-        // the group (it is the control that collapses it back), and the calls
-        // render as one-liners beneath it when the group is expanded.
-        if is_collapsible_tool(&entry.kind) {
-            let head = i == 0 || !is_collapsible_tool(&transcript[i - 1].kind);
+        // Tool groups: consecutive collapsible calls — everything but
+        // `edit`/`replace`, which always render and never group — collapse
+        // behind one `{mark} called N tools · ran 2 commands` summary line.
+        // The group's first call heads it; the summary header chunk always
+        // opens the group (it is the control that collapses it back), and the
+        // calls render as one-liners beneath it when the group is expanded.
+        if is_groupable_tool(&entry.kind) {
+            let head = i == 0 || !is_groupable_tool(&transcript[i - 1].kind);
             if head {
                 let end = tool_group_end(transcript, i);
                 if end - i >= 2 {
                     let id = tool_call_id(&entry.kind).unwrap_or_default();
                     let expanded = app.expand_tools || app.tool_groups.contains(id);
+                    // The follower of the summary header: the first member when
+                    // the group is expanded (a tool block, tinted), else the
+                    // entry after the group — which is never a tool (the run
+                    // extends to every consecutive call), so only a user prompt
+                    // is tinted there.
+                    let next_tinted = if expanded {
+                        true
+                    } else {
+                        transcript
+                            .get(end)
+                            .is_some_and(|e| entry_is_tinted(&e.kind))
+                    };
                     flush(
                         &mut chunks,
                         &mut msg_at,
@@ -2811,6 +2823,12 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         inner,
                         frame,
                     ));
+                    // The header is pushed directly, outside the pending-chain
+                    // separator logic — restore the tinted→tinted separator it
+                    // would have earned as a normal block.
+                    if next_tinted {
+                        chunks.push(separator());
+                    }
                     if !expanded {
                         skip_until = Some(end);
                         continue;
@@ -3099,9 +3117,17 @@ fn is_always_full_tool(name: &str) -> bool {
     matches!(name, "edit" | "replace")
 }
 
+/// Whether an entry's block wears a tinted background (as opposed to the
+/// plain terminal background) — the separator decision the summary header
+/// inherits, since it is pushed outside the pending-chain `flush` logic.
+fn entry_is_tinted(kind: &EntryKind) -> bool {
+    matches!(kind, EntryKind::User(_) | EntryKind::Tool { .. })
+}
+
 /// A tool call that participates in grouping — everything but the always-full
-/// pair above.
-fn is_collapsible_tool(kind: &EntryKind) -> bool {
+/// `edit`/`replace`, which always render and never group: they break the run
+/// and show as their own full entries.
+fn is_groupable_tool(kind: &EntryKind) -> bool {
     matches!(kind, EntryKind::Tool { name, .. } if !is_always_full_tool(name))
 }
 
@@ -3119,18 +3145,47 @@ pub(crate) fn tool_call_id(kind: &EntryKind) -> Option<&str> {
 /// non-tool entry ends the run.
 fn tool_group_end(transcript: &[Entry], start: usize) -> usize {
     let mut end = start + 1;
-    while end < transcript.len() && is_collapsible_tool(&transcript[end].kind) {
+    while end < transcript.len() && is_groupable_tool(&transcript[end].kind) {
         end += 1;
     }
     end
 }
 
-/// The summary for a tool group: `called N tools` plus one section per
-/// distinct tool name in the order the calls appear, plus whether any call is
-/// still running and whether every finished call succeeded. The sections are
-/// ` · `-joined and wrapped by [`pack_loader_segments`] exactly like the live
-/// loader, so a narrow terminal wraps by section with indented continuation
-/// rows.
+/// The verb phrase for one tool's summary section: `(past, progressive, noun,
+/// has-for)` — "ran 2 commands" once the group is done, "running 2 commands"
+/// while any call is still going; `has-for` inserts the "for" in "searched for
+/// 2 patterns". Unmapped tools fall back to their bare name + count.
+fn tool_action(name: &str) -> Option<(&'static str, &'static str, &'static str, bool)> {
+    match name {
+        "shell" => Some(("ran", "running", "command", false)),
+        "read" => Some(("read", "reading", "file", false)),
+        "write" => Some(("wrote", "writing", "file", false)),
+        "grep" | "find" => Some(("searched", "searching", "pattern", true)),
+        "ls" | "tree" => Some(("listed", "listing", "directory", false)),
+        _ => None,
+    }
+}
+
+/// The noun pluralized for `n` (1 stays singular; `directory` → `directories`).
+fn plural(noun: &str, n: usize) -> String {
+    if n == 1 {
+        return noun.to_string();
+    }
+    if let Some(stem) = noun.strip_suffix('y') {
+        format!("{stem}ies")
+    } else {
+        format!("{noun}s")
+    }
+}
+
+/// The summary for a tool group: `called N tools` (or `calling N tools` while
+/// any call is still running), one verb section per distinct tool name in the
+/// order the calls appear (`ran 2 commands`, `reading 3 files`, `searching for
+/// 2 patterns`, `listing 3 directories`). The sections are ` · `-joined and
+/// wrapped by [`pack_loader_segments`] exactly like the live loader, so a
+/// narrow terminal wraps by section with indented continuation rows. Also
+/// reports whether any call is still running and whether every finished call
+/// succeeded.
 fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
     let mut counts: Vec<(String, usize)> = Vec::new();
     let mut total = 0usize;
@@ -3148,11 +3203,24 @@ fn tool_group_summary(members: &[Entry]) -> (Vec<String>, bool, bool) {
         }
     }
     let mut sections = vec![format!(
-        "called {total} tool{}",
+        "{} {total} tool{}",
+        if running { "calling" } else { "called" },
         if total == 1 { "" } else { "s" }
     )];
     for (name, n) in counts {
-        sections.push(format!("{name} {n}"));
+        let section = match tool_action(&name) {
+            Some((past, prog, noun, for_)) => {
+                let verb = if running { prog } else { past };
+                let noun = plural(noun, n);
+                if for_ {
+                    format!("{verb} for {n} {noun}")
+                } else {
+                    format!("{verb} {n} {noun}")
+                }
+            }
+            None => format!("{name} {n}"),
+        };
+        sections.push(section);
     }
     (sections, running, all_ok)
 }
@@ -3252,7 +3320,7 @@ fn tool_lines(
         }
         spans
     };
-    if !expanded && !matches!(name, "edit" | "replace") {
+    if !expanded && !is_always_full_tool(name) {
         // Collapsed: one line — mark, name, and a one-line summary. Shell calls
         // summarize to their command (newlines collapsed, truncated); everything
         // else to its headline, or the first detail row where there is no
@@ -4517,7 +4585,9 @@ mod block_tests {
 
     /// The group summary counts the calls and breaks them down by tool name in
     /// the order they appear, and flags a still-running call (spinner) and a
-    /// failed one (✗) for the header's mark.
+    /// failed one (✗) for the header's mark. The wording follows the group's
+    /// state: `ran 2 commands` once settled, `running 2 commands` while any
+    /// call is still going.
     #[test]
     fn tool_group_summary_counts_and_flags() {
         let entry = |id: &str, name: &str, ok: bool, done: bool| {
@@ -4538,14 +4608,41 @@ mod block_tests {
         ]);
         assert_eq!(
             sections,
-            vec!["called 3 tools", "shell 2", "read 1"],
-            "total first, then per-name counts in first-seen order"
+            vec!["called 3 tools", "ran 2 commands", "read 1 file"],
+            "total first, then verb phrases in first-seen order"
         );
         assert!(!running, "nothing is unfinished");
         assert!(!all_ok, "a failed call fails the group");
 
-        let (_, running, _) = tool_group_summary(&[entry("a", "shell", true, false)]);
+        let (sections, running, _) = tool_group_summary(&[
+            entry("a", "shell", true, false),
+            entry("b", "read", true, true),
+            entry("c", "grep", true, true),
+            entry("d", "ls", true, true),
+        ]);
         assert!(running, "an unfinished call shows the spinner");
+        assert_eq!(
+            sections,
+            vec![
+                "calling 4 tools",
+                "running 1 command",
+                "reading 1 file",
+                "searching for 1 pattern",
+                "listing 1 directory",
+            ],
+            "progressive while a call is still going"
+        );
+
+        // Pluralization: 2 of each, and `directory` → `directories`.
+        let (sections, ..) = tool_group_summary(&[
+            entry("a", "shell", true, true),
+            entry("b", "ls", true, true),
+            entry("c", "ls", true, true),
+        ]);
+        assert_eq!(
+            sections,
+            vec!["called 3 tools", "ran 1 command", "listed 2 directories"]
+        );
     }
 
     /// A lone tool call is its own group of one — no summary line — and an

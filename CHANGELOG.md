@@ -345,6 +345,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **New `:work` skill — work the backlog, one slice at a time.** `:work` reads
+  `docs/backlog.md`, classifies each item as actionable (the decision is already
+  made — in the backlog, a plan file, or this conversation) or needing user
+  guidance, and works the actionable ones one slice at a time through delegate →
+  review → commit, deleting each from the backlog as it lands. With nothing
+  actionable it reports that plainly and summarizes what is still waiting on the
+  user; with a missing or empty backlog it asks whether to run `:sweep` to seed
+  one.
+
 - **New `:deps` and `:cli` skills.** `:deps` is a generic dependency-update
   runner: identify the package manager from the manifest/lockfile, update the
   lockfile within the current constraints, decide on constraint bumps,
@@ -371,14 +380,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **Tool calls group behind a summary line — two expansion levels.** A run of
-  consecutive tool calls (everything except `edit`/`replace`, which always
-  render in full) folds into one `✓ called 4 tools · read 2 · shell 2` block:
-  the counts are `·`-separated and wrap by section exactly like the live loader,
-  and the mark reflects the group (spinner while any call runs, ✓/✗ once it
-  settles). Clicking the summary fans the calls out as one-liners; clicking a
-  one-liner expands that call in full; clicking the summary again folds the
-  group back. `/verbose on` shows every group expanded, `/verbose off` folds
-  them all.
+  consecutive calls (everything but `edit`/`replace`, which always render in
+  full and break the run) folds into one block: the counts are `·`-separated and
+  wrap by section exactly like the live loader, and the mark reflects the group
+  (spinner while any call runs, ✓/✗ once it settles). The wording follows the
+  group's state — `called 4 tools · ran 2 commands · read 2 files` once settled,
+  `calling 4 tools · running 2 commands · reading 2 files` while a call is still
+  going; `grep`/`find` show as `searching for N patterns` and `ls`/`tree` as
+  `listing N directories`. Clicking the summary fans the calls out as
+  one-liners; clicking a one-liner expands that call in full; clicking the
+  summary again folds the group back. `/verbose on` shows every group expanded,
+  `/verbose off` folds them all.
 
 - **The edit and replace tools color their patch like the code it describes.**
   The `+++`/`---` file headers carry the file's own side — green for the new

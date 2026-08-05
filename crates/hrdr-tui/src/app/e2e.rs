@@ -3881,8 +3881,8 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("prompt"));
     // The adjacent tool pair is `edit` + `cat`: `edit` always renders (it never
-    // groups), so the two stay separate blocks — the fixture is about the
-    // separator rows between them, not about tool grouping.
+    // groups, breaking the run), so the two stay separate blocks — the fixture
+    // is about the separator rows between them, not about tool grouping.
     h.app.push_entry(tool("a", "edit", r#"{"path":"edit-me"}"#));
     h.app.push_entry(tool("b", "cat", "{}"));
     h.app.push_entry(Entry::reasoning("thought"));
@@ -4118,7 +4118,7 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
     // Level 0: one summary line — the calls themselves are hidden.
     let screen = h.render();
     assert!(
-        screen.contains("called 2 tools · shell 1 · read 1"),
+        screen.contains("called 2 tools · ran 1 command · read 1 file"),
         "the summary leads with the counts:\n{screen}"
     );
     assert!(
