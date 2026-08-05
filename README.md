@@ -202,6 +202,8 @@ hrdr ships built-in skills that work with zero setup:
 - `:test` — write tests for a change and iterate to green
 - `:tidy` — DRY up reuse, cut dead code and over-abstraction (quality, not bugs)
 - `:todo` — report what is left to work on from the session context
+- `:work` — work the actionable backlog items, one slice at a time (delegate →
+  review → commit); empty backlog → suggest `:sweep`
 
 The built-in bodies live in `crates/hrdr-agent/src/templates/skills/*.md` and
 are baked into the binary by `build.rs` — adding one is adding a file.

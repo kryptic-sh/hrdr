@@ -9,9 +9,10 @@
 //! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
 //! sub-agent files: project dirs first, then user dirs, hrdr → Claude Code →
 //! opencode conventions, then hrdr's own built-in skills (`:deps`, `:cli`,
-//! `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`,
-//! `:tidy`, `:perf`, `:sweep`, …) last — deduped by name (first source wins),
-//! so a user or project file always overrides a built-in of the same name.
+//! `:work`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
+//! `:plan`, `:tidy`, `:perf`, `:sweep`, …) last — deduped by name (first source
+//! wins), so a user or project file always overrides a built-in of the same
+//! name.
 //!
 //! This lives in `hrdr-agent` rather than in a frontend because the model can
 //! invoke a skill: the agent lists what is available in its system prompt
