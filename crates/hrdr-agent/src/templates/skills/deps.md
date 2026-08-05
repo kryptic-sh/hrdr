@@ -19,33 +19,34 @@ registry what exists right now.
    (bundler). Read the README/CONTRIBUTING too — the project's own command may
    wrap the package manager.
 
-2. **Match the manager to its run book.** The `:deps_*` skills hold the exact
-   commands, detection, lockfile handling and gotchas for each: `:deps_cargo`,
-   `:deps_npm`, `:deps_pnpm`, `:deps_yarn`, `:deps_bun`, `:deps_uv`,
-   `:deps_poetry`, `:deps_pip`, `:deps_go`, `:deps_zig`, `:deps_composer`,
-   `:deps_bundler`. Load the matching one and follow it; where two managers are
-   present (a monorepo with workspaces, a Python project with both `uv` and a
-   `requirements.txt`), run each in turn.
+2. **Learn the tool, don't recall it.** Run `:cli <manager>` and follow it:
+   confirm the tool is installed, read its help, verify the commands before
+   running them. The version on this machine is the only version that matters.
+   When two managers are present (a monorepo with workspaces, a Python project
+   with both `uv` and a `requirements.txt`), handle each in turn.
 
 3. **Update the lockfile first, within the current constraints.** The manager's
    plain update command (`cargo update`, `npm update`, `pnpm update`,
-   `bun update`, `uv lock`, `go get -u`, `composer update`, `bundle update`, …)
-   resolves everything to the newest version the existing ranges allow. Commit
-   nothing yet — this is the zero-risk half.
+   `bun update`, `go get -u`, `composer update`, `bundle update`, …) resolves
+   everything to the newest version the existing ranges allow. Commit nothing
+   yet — this is the zero-risk half. Beware the managers that do NOT roll
+   forward on their own: uv's lockfile only changes when asked
+   (`uv lock --upgrade`).
 
 4. **Then decide on constraint bumps.** "Latest stable" may need the manifest
-   ranges themselves raised (`cargo add dep@latest`, `npm install dep@latest`,
-   `pnpm add dep@latest`, `yarn up dep`, `bun add dep@latest`,
-   `uv add --upgrade dep`, `go get dep@latest`, `composer require dep:^X`,
-   `bundle update dep`, `poetry add dep@latest`). Prefer the manager's own
-   "latest" flag when it has one (`pnpm update --latest`, `bun update --latest`)
-   — it raises every range at once. Never guess a version: the manager asks the
-   registry.
+   ranges themselves raised. Prefer the manager's own "latest" flag when it has
+   one (`pnpm update --latest`, `bun update --latest`) — it raises every range
+   at once — and the manager's own add/update-with-a-version command for a
+   single package (`cargo add dep@latest`, `npm install dep@latest`,
+   `poetry add dep@latest`, `go get dep@latest`, …). Never guess a version: the
+   manager asks the registry.
 
 5. **Regenerate the lockfile with the manager's command and commit it in the
    SAME commit as the manifest.** A frozen-lockfile CI gate fails on any
    manifest change whose lockfile wasn't regenerated — and an uncommitted
-   lockfile fix is not a fix. Never hand-edit a lockfile.
+   lockfile fix is not a fix. Never hand-edit a lockfile. (Zig is the exception
+   that proves the rule: `build.zig.zon` is manifest and lock in one — the
+   `.hash` pins ARE the versions, fetched with `zig build --fetch`.)
 
 6. **Fix the code the bumps break.** Compile, then chase the errors: renamed or
    moved APIs, changed signatures, feature flags, MSRV bumps. Use the installed

@@ -345,15 +345,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **New `:deps` skills: a generic dependency-update runner plus one run book per
-  package manager.** `:deps` walks a project: identify the manager, update the
+- **New `:deps` and `:cli` skills.** `:deps` is a generic dependency-update
+  runner: identify the package manager from the manifest/lockfile, update the
   lockfile within the current constraints, decide on constraint bumps,
   regenerate and commit the lockfile with the manifest, fix the code the bumps
-  break, and run the project's whole gate. `:deps_cargo`, `:deps_npm`,
-  `:deps_pnpm`, `:deps_yarn`, `:deps_bun`, `:deps_uv`, `:deps_poetry`,
-  `:deps_pip`, `:deps_go`, `:deps_zig`, `:deps_composer` and `:deps_bundler`
-  each hold the exact commands, frozen-lockfile gate, verification and gotchas
-  for that manager, checked against the current upstream docs.
+  break, and run the project's whole gate. It learns the actual manager with the
+  new `:cli` skill rather than a curated run book: `:cli <tool>` reads what the
+  tool itself publishes on this machine (`tldr`, `--help`, `man`, the repo's own
+  scripts and CI config), verifies the discovered flags with a read-only
+  invocation before using them, and never mutates with a half- remembered flag.
+  The learned usage is always the installed version's — never outdated, never
+  mismatched — and works for any tool on the machine, not just the curated set.
+  The per-manager run books (`:deps_cargo`, `:deps_npm`, …) are gone; the
+  workflow knowledge that help text can't teach (lockfile semantics, the
+  frozen-lockfile gate, managers that don't roll forward on their own) lives in
+  `:deps` itself.
 
 - **Built-in skills are registered by `build.rs`, not by hand.** Each `*.md` in
   `crates/hrdr-agent/src/templates/skills/` is baked into the binary by a

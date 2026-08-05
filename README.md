@@ -189,10 +189,10 @@ hrdr ships built-in skills that work with zero setup:
 - `:audit [low|high]` — audit the codebase for security bugs and correctness
 - `:commit` — commit the working changes with a Conventional Commit message
 - `:deps` — update project dependencies to their latest stable versions (generic
-  runner; it points at the matching per-manager run book)
-- `:deps_cargo` / `:deps_npm` / `:deps_pnpm` / `:deps_yarn` / `:deps_bun` /
-  `:deps_uv` / `:deps_poetry` / `:deps_pip` / `:deps_go` / `:deps_zig` /
-  `:deps_composer` / `:deps_bundler` — one run book per package manager
+  runner; it learns the actual package manager with `:cli`)
+- `:cli <tool>` — learn a command-line tool's real usage from the tool itself
+  (`tldr`, `--help`, `man`, the repo's own scripts), so it never uses flags from
+  a different version
 - `:fix` — root-cause and fix a pasted error
 - `:perf` — report performance problems: hot paths, allocations, complexity
 - `:plan` — explore read-only and produce an implementation plan

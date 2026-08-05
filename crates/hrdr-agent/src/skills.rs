@@ -8,11 +8,10 @@
 //! appends any trailing text as extra context, while a skill without `args:`
 //! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
 //! sub-agent files: project dirs first, then user dirs, hrdr → Claude Code →
-//! opencode conventions, then hrdr's own built-in skills (`:deps`,
-//! `:deps_cargo`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
-//! `:plan`, `:tidy`, `:perf`, `:sweep`, …) last — deduped by name (first source
-//! wins), so a user or project file always overrides a built-in of the same
-//! name.
+//! opencode conventions, then hrdr's own built-in skills (`:deps`, `:cli`,
+//! `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`,
+//! `:tidy`, `:perf`, `:sweep`, …) last — deduped by name (first source wins),
+//! so a user or project file always overrides a built-in of the same name.
 //!
 //! This lives in `hrdr-agent` rather than in a frontend because the model can
 //! invoke a skill: the agent lists what is available in its system prompt
@@ -811,23 +810,10 @@ mod tests {
             assert!(!s.body.is_empty(), "{} body", s.name);
             assert_eq!(s.source, "built-in");
         }
-        // The dependency-update family is part of the set (the generic runner
-        // plus one run book per package manager).
-        for name in [
-            "deps",
-            "deps_cargo",
-            "deps_npm",
-            "deps_pnpm",
-            "deps_yarn",
-            "deps_bun",
-            "deps_uv",
-            "deps_poetry",
-            "deps_pip",
-            "deps_go",
-            "deps_zig",
-            "deps_composer",
-            "deps_bundler",
-        ] {
+        // The generic runner and its discovery helper anchor the dependency
+        // workflow: `:deps` routes through `:cli`, which learns any tool from
+        // the machine's own help rather than a curated run book.
+        for name in ["deps", "cli"] {
             assert!(
                 skills.iter().any(|s| s.name == name),
                 "missing built-in {name}"
