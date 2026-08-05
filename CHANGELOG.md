@@ -63,14 +63,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reasoning, stats, a notice) breaks a run.
 
 - **Expanding a tool group's summary renders its calls inside it as nested child
-  items.** The summary keeps its header — its first row (a leading space sets it
-  apart), with one blank row beneath it so the first call never sits flush
-  against it — and the calls fan out below, flush with the transcript's own
-  content column (no extra box padding), each on the normal tool background,
-  over a group background that is slightly dimmer than the tool entries' — so
-  the calls read as items of the section rather than blocks of their own.
-  Absorbed tool-only turns keep their `#N assistant` `/goto` labels at their
-  transcript positions inside the group.
+  items.** The summary keeps its header — its first row, with one blank row
+  beneath it so the first call never sits flush against it — and the calls fan
+  out below, each keeping the same padding as every other block (nested one
+  level inside the dimmer container), on the normal tool background, over a
+  group background that is slightly dimmer than the tool entries' — so the calls
+  read as items of the section rather than blocks of their own. Absorbed
+  tool-only turns keep their `#N assistant` `/goto` labels at their transcript
+  positions inside the group.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes

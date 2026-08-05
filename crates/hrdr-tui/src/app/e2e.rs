@@ -1354,7 +1354,7 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
         "the box itself shares the prompt bg"
     );
     assert!(
-        row_text(tool_y + 1).starts_with(&format!("{pad}echo hi")),
+        row_text(tool_y + 1).starts_with(&format!("{pad}{pad}echo hi")),
         "command line"
     );
     assert!(
@@ -5216,15 +5216,20 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         .expect("tool output rendered");
     let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
 
-    // The group container's bottom pad (dimmer), then a blank row on the
-    // terminal background — the child box itself has no padding of its own.
+    // Its own bottom pad (tinted), then the group container's bottom pad
+    // (dimmer), then a blank row on the terminal background.
     assert_eq!(
         bg_at(last_content + 1),
+        h.app.theme.user_bg,
+        "child bottom pad:\n{screen}"
+    );
+    assert_eq!(
+        bg_at(last_content + 2),
         h.app.theme.group_bg,
         "summary container bottom pad:\n{screen}"
     );
     assert_eq!(
-        bg_at(last_content + 2),
+        bg_at(last_content + 3),
         Color::Reset,
         "a blank row closes the scrollback:\n{screen}"
     );

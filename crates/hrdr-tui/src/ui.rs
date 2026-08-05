@@ -3406,9 +3406,6 @@ fn tool_group_chunk(
     for (i, text) in packed.into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
-            // A leading space sets the summary apart from the children's first
-            // column; the mark then follows it.
-            spans.push(Span::styled(" ", Style::default().bg(group_bg)));
             spans.push(Span::styled(
                 format!("{} ", mark),
                 Style::default().fg(color).bg(group_bg),
@@ -3453,11 +3450,12 @@ fn tool_group_chunk(
                     if body.is_empty() {
                         continue;
                     }
-                    // The call's own rows, flush to the container's inner edge
-                    // — no box padding, so its text lines up with the rest of
-                    // the transcript.
-                    for row in body.as_ref().iter() {
-                        rows.push(inset_box_row(row.clone(), inner, w, bg, group_bg));
+                    // The box is laid out at the container's inner width, then
+                    // inset by the container's own padding — the calls keep the
+                    // same padding as every other block; only the summary line
+                    // itself sits flush on the container.
+                    for row in render_block(body.as_ref().clone(), inner, bg, None) {
+                        rows.push(inset_box_row(row, w, group_bg));
                     }
                 }
                 _ => {
@@ -3495,38 +3493,17 @@ fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> 
     pad_line(spans, width, bg, None)
 }
 
-/// A child tool box's row inside the group container: the container's own left
-/// padding column, then the call's content — no extra padding of its own, so
-/// the text sits at the same column as the rest of the transcript — filled to
-/// the container's inner width on the tool background, then the container's
-/// right fill on the dimmer group background.
-fn inset_box_row(
-    row: Line<'static>,
-    inner: usize,
-    width: usize,
-    tool_bg: Color,
-    group_bg: Color,
-) -> Line<'static> {
-    let tool = Style::default().bg(tool_bg);
+/// A child tool box's row (already padded to the container's inner width on
+/// the tool background) placed inside the group container: the container's own
+/// left padding column, then the box, then its right fill — so the box reads
+/// as a nested item on the dimmer group background.
+fn inset_box_row(row: Line<'static>, width: usize, group_bg: Color) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " ".repeat(BLOCK_PAD_X),
         Style::default().bg(group_bg),
     )];
-    let mut used = BLOCK_PAD_X;
-    for mut span in row.spans {
-        if span.style.bg.is_none() {
-            span.style = span.style.bg(tool_bg);
-        }
-        used += span.width();
-        spans.push(span);
-    }
-    // The box's slab: tool background out to the container's inner edge, then
-    // the container's own fill.
-    let box_end = BLOCK_PAD_X + inner;
-    if used < box_end {
-        spans.push(Span::styled(" ".repeat(box_end - used), tool));
-        used = box_end;
-    }
+    spans.extend(row.spans);
+    let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
         spans.push(Span::styled(
             " ".repeat(width - used),
