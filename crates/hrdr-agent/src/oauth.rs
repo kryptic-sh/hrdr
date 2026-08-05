@@ -1140,6 +1140,8 @@ mod tests {
 
     #[test]
     fn readiness_valid_access_is_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
@@ -1148,6 +1150,8 @@ mod tests {
 
     #[test]
     fn readiness_expired_access_with_refresh_is_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", 1); // long past
@@ -1156,6 +1160,8 @@ mod tests {
 
     #[test]
     fn readiness_refresh_only_is_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         // Selectable with refresh-only credentials (empty access, refresh present).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
@@ -1165,6 +1171,8 @@ mod tests {
 
     #[test]
     fn readiness_expired_access_without_refresh_is_not_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "", 1); // expired, no refresh
@@ -1173,6 +1181,8 @@ mod tests {
 
     #[test]
     fn readiness_empty_tokens_is_not_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "", "", now_ms() + 3_600_000);
@@ -1181,6 +1191,8 @@ mod tests {
 
     #[test]
     fn readiness_unrelated_provider_is_not_ready() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         seed_chatgpt(&path, "acc", "ref", now_ms() + 3_600_000);
@@ -1190,6 +1202,8 @@ mod tests {
 
     #[test]
     fn custom_shadow_cannot_read_builtin_oauth_credentials() {
+        let _guard = crate::auth_store::oauth_cache_test_guard();
+        crate::auth_store::reset_oauth_cache_for_test();
         // Built-in ChatGPT creds are present in the slot...
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");

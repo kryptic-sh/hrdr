@@ -765,6 +765,19 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Whether `query`'s chars appear in order within the space-joined, lowercased
+/// `parts` — the fuzzy match shared by the picker filters. An empty query
+/// matches everything.
+pub fn fuzzy_match(query: &str, parts: &[&str]) -> bool {
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if q.is_empty() {
+        return true;
+    }
+    let hay = parts.join(" ").to_lowercase();
+    let mut it = hay.chars();
+    q.iter().all(|&c| it.any(|h| h == c))
+}
+
 /// Case-insensitive fuzzy filter over the choices: the query's characters must
 /// appear in order somewhere within `"model_label provider_label provider://model"`.
 /// Returns the matching indices in their original (sorted) order; an empty query
@@ -773,7 +786,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// The canonical `provider://model` id is part of the haystack because it is the
 /// form the user is told the identity in everywhere else — the status bar, `hrdr
 /// models`, `--model`. Filtering on the friendly labels alone meant typing the
-/// thing you were looking at (`zen://kimi`) matched nothing.
+/// thing you were looking at (`zen://kimi`) matched nothing. It is passed to
+/// [`fuzzy_match`] as ONE part so the `://` separator survives the join and the
+/// id stays searchable as typed.
 pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
     let q: Vec<char> = query.trim().to_lowercase().chars().collect();
     if q.is_empty() {
@@ -783,20 +798,18 @@ pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> 
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let hay = format!(
-                "{} {} {}://{}",
-                c.model_label, c.provider_label, c.provider, c.model
+            let id = format!("{}://{}", c.provider, c.model);
+            fuzzy_match(
+                query,
+                &[
+                    c.model_label.as_str(),
+                    c.provider_label.as_str(),
+                    id.as_str(),
+                ],
             )
-            .to_lowercase();
-            is_subsequence(&q, &hay).then_some(i)
+            .then_some(i)
         })
         .collect()
-}
-
-/// Whether `needle`'s chars appear in order within `haystack`.
-fn is_subsequence(needle: &[char], haystack: &str) -> bool {
-    let mut it = haystack.chars();
-    needle.iter().all(|&c| it.any(|h| h == c))
 }
 
 #[cfg(test)]

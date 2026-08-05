@@ -43,6 +43,7 @@
 //! validation guards the values instead.)
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -2180,6 +2181,12 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
 /// Write `doc` over `path` atomically: build it in a unique sibling temp file,
 /// then rename that onto the target.
 ///
+/// The temp is created owner-only from the start ([`hrdr_llm::owner_only_options`],
+/// `0600` on unix), like every other hrdr-owned store: `config.toml` can hold an
+/// inline `api_key` (a `[providers.*]` entry or the legacy top-level key), so a
+/// plain umask-default write renamed over the target would silently widen a
+/// user's `chmod 600` back to `0644`.
+///
 /// The temp name comes from [`hrdr_llm::unique_sibling_path`] (PID + a
 /// process-wide counter), so two writers racing on the same config never build
 /// their new contents in the same scratch file — a fixed `.tmp` name let one
@@ -2190,7 +2197,17 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
-    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
+    // `create_new` guarantees we own the temp; a failure here means someone
+    // else's temp collided, so it must not be cleaned up. Everything after gets
+    // a cleanup-on-error guard so a failed write never leaves a stray temp.
+    let mut f = hrdr_llm::owner_only_options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(doc.to_string().as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
     if let Err(e) = std::fs::rename(&tmp, path) {
         // Don't leave the scratch file behind when the rename is the thing that
         // failed (a read-only directory, a cross-device target).
@@ -2392,6 +2409,21 @@ mod persistence_tests {
             leftovers.is_empty(),
             "stray files after write: {leftovers:?}"
         );
+    }
+
+    /// A settings write must not widen a permission-tightened config: the doc is
+    /// built in an owner-only temp (`0600` on unix) and renamed over the target,
+    /// so the inode replacement never reverts a user's `chmod 600` back to the
+    /// umask-default `0644` (the file can hold an inline `api_key`).
+    #[cfg(unix)]
+    #[test]
+    fn persist_setting_writes_the_config_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        persist_setting_at(&path, "theme", ConfigValue::Str("dark")).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a fresh config must be written 0600");
     }
 
     /// A malformed config is reported, not reset: the original bytes stay on

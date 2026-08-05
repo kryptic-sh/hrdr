@@ -25,6 +25,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -173,12 +175,79 @@ pub(crate) fn save_key_at(auth_json: &Path, provider: &str, token: &str) -> Resu
 
 // ── OAuth entries ───────────────────────────────────────────────────────────
 
+/// The cached whole-map load, keyed by file path: each entry is the path's
+/// `modified()` time at read time plus the parsed map it produced.
+type OauthLoadCache = HashMap<PathBuf, (SystemTime, HashMap<String, AuthEntry>)>;
+
+/// Process-local cache for [`load_oauth_entry_at`]: the last-read whole map (per
+/// path) plus the `modified()` time of the file it came from. A hit skips the
+/// per-round `read_to_string` + parse of the whole store, which otherwise runs
+/// before every model call while ChatGPT OAuth is in force.
+///
+/// Keyed by path rather than a single global slot so the test harness's parallel
+/// `#[test]`s cannot clobber each other's entries (each test writes and reads its
+/// own tempdir `auth.json`). In production hrdr uses exactly one `auth.json`
+/// path, so the map holds one entry.
+///
+/// Coarse-clock caveat, stated honestly: on a filesystem whose mtime granularity
+/// is coarser than the write spacing, a write landing in the same tick as the
+/// last read is missed and the cache serves the pre-write map. For this path
+/// that degrades gracefully — a stale *expired* token triggers one extra
+/// refresh, a stale *unexpired* token is used for at most one round — which is
+/// why this cache does not need the `mtime_granularity_is_fine` probe that
+/// `hrdr-tools/src/memory.rs` uses for its durability-critical cache.
+static OAUTH_LOAD_CACHE: LazyLock<Mutex<OauthLoadCache>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// The stored OAuth credentials for `provider`, if the entry exists and is an
 /// OAuth (not key) entry.
+///
+/// Cached by path + mtime (see [`OAUTH_LOAD_CACHE`]): unchanged file → the
+/// cached map is served without re-reading disk. The locked read-modify-write
+/// save paths must always read fresh disk state, so the cache lives HERE, only
+/// on this read — [`load_map_at`] is never cached. A stat failure (a missing or
+/// unreadable file) is a miss, exactly the pre-cache empty-map behaviour: a
+/// deleted store means no credentials, and logout-by-delete must take effect
+/// without a restart — the cache never serves a file that is gone.
 pub(crate) fn load_oauth_entry_at(auth_json: &Path, provider: &str) -> Option<OAuthCreds> {
-    load_map_at(auth_json)
-        .get(provider)
-        .and_then(AuthEntry::as_oauth)
+    let mtime = std::fs::metadata(auth_json).and_then(|m| m.modified()).ok();
+    let mut cache = OAUTH_LOAD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((cached_mtime, map)) = cache.get(auth_json)
+        && mtime == Some(*cached_mtime)
+    {
+        return map.get(provider).and_then(AuthEntry::as_oauth);
+    }
+    let map = load_map_at(auth_json);
+    if let Some(mtime) = mtime {
+        cache.insert(auth_json.to_path_buf(), (mtime, map.clone()));
+    }
+    map.get(provider).and_then(AuthEntry::as_oauth)
+}
+
+/// Clear the process-local [`OAUTH_LOAD_CACHE`] — test isolation: a test that
+/// writes `auth.json` and then loads it must start from an empty cache, or a
+/// recycled tempdir path landing in the same coarse mtime tick as a previous
+/// test's write could serve that test's map.
+#[cfg(test)]
+pub(crate) fn reset_oauth_cache_for_test() {
+    OAUTH_LOAD_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
+/// Serialize the tests that touch [`OAUTH_LOAD_CACHE`] against each other.
+///
+/// The harness runs `#[test]`s on parallel threads, and every affected test
+/// starts with [`reset_oauth_cache_for_test`] — if two run at once, one test's
+/// reset wipes the other's freshly cached entry mid-assertion. The cache test
+/// notices first (it asserts the cache's own contents), but any of them would
+/// be nondeterministic. Hold the returned guard for the whole test body so each
+/// test's cache lifecycle is its own.
+#[cfg(test)]
+pub(crate) fn oauth_cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Store `provider`'s OAuth `creds`, preserving other entries.
@@ -268,6 +337,8 @@ mod tests {
 
     #[test]
     fn save_and_load_oauth() {
+        let _guard = oauth_cache_test_guard();
+        reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let creds = oauth("acc", "ref", 42, Some("acct"));
@@ -281,6 +352,8 @@ mod tests {
 
     #[test]
     fn keys_and_oauth_share_one_file() {
+        let _guard = oauth_cache_test_guard();
+        reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         save_key_at(&path, "openrouter", "sk-or").unwrap();
@@ -295,9 +368,55 @@ mod tests {
 
     #[test]
     fn load_missing_file_is_empty() {
+        let _guard = oauth_cache_test_guard();
+        reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         assert!(load_keys_at(&path).is_empty());
+        assert!(load_oauth_entry_at(&path, "chatgpt").is_none());
+    }
+
+    /// The cache serves only an existing, unchanged file. A rewrite (an mtime
+    /// bump) must be picked up, never served stale; a missing file is a miss —
+    /// a deleted store means no credentials (logout-by-delete must take effect
+    /// without a restart); and the test-only reset empties the cache so a later
+    /// same-path write is re-read.
+    #[test]
+    fn oauth_load_cache_hits_only_on_unchanged_files() {
+        let _guard = oauth_cache_test_guard();
+        reset_oauth_cache_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let creds = oauth("acc", "ref", 42, Some("acct"));
+        save_oauth_entry_at(&path, "chatgpt", &creds).unwrap();
+        // First load reads disk and populates the cache.
+        assert!(load_oauth_entry_at(&path, "chatgpt") == Some(creds.clone()));
+        assert!(
+            OAUTH_LOAD_CACHE.lock().unwrap().contains_key(&path),
+            "the first load populated the cache"
+        );
+        assert!(
+            load_oauth_entry_at(&path, "chatgpt") == Some(creds.clone()),
+            "an unchanged file keeps resolving from the cache"
+        );
+        // A rewrite bumps the mtime: the new credentials must come through.
+        let newer = oauth("acc2", "ref2", 43, Some("acct2"));
+        save_oauth_entry_at(&path, "chatgpt", &newer).unwrap();
+        assert!(
+            load_oauth_entry_at(&path, "chatgpt") == Some(newer),
+            "an mtime change invalidates the cache"
+        );
+        // A deleted store means no credentials — the cache must not serve a
+        // file that is gone.
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            load_oauth_entry_at(&path, "chatgpt").is_none(),
+            "a deleted auth.json reads as no credentials, not as stale cache"
+        );
+        // ...and the reset empties the cache, so a later same-path write is
+        // re-read rather than served from a recycled tempdir entry.
+        reset_oauth_cache_for_test();
+        assert!(OAUTH_LOAD_CACHE.lock().unwrap().is_empty());
         assert!(load_oauth_entry_at(&path, "chatgpt").is_none());
     }
 
