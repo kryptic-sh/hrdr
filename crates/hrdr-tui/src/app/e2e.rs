@@ -3274,6 +3274,61 @@ async fn a_selection_to_the_edge_copies_no_scrollbar_and_no_padding() {
     );
 }
 
+/// A selection that runs to the left-hand edge copies the TEXT and stops: no
+/// `┃` border column, and no block padding in front of it.
+///
+/// The regression: `transcript_rect` began at the block's left edge, where a
+/// user row draws its `┃` and its padding — so a drag across a user prompt (or
+/// any multi-row selection, whose continuation rows start at the rect's left)
+/// copied the border character into every line. The rect now begins at the
+/// first content column, the way its right edge already stops before the
+/// scrollbar column.
+#[tokio::test]
+async fn a_selection_to_the_edge_copies_no_border_bar_and_no_padding() {
+    const WIDTH: u16 = 40;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // A user prompt wears the `┃` border — the surface whose bar used to land
+    // in the copied text.
+    h.app.push_entry(Entry::user("PICKME"));
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.transcript_rect;
+    let row = (rect.y..rect.y + rect.h)
+        .find(|&row| {
+            (rect.x..rect.x + rect.w).any(|col| {
+                term.backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(col, row))
+                    .is_some_and(|c| c.symbol() == "P")
+            })
+        })
+        .expect("the reply is on screen");
+
+    let mut buf = term.backend().buffer().clone();
+    let last = rect.x + rect.w - 1;
+    let text = ui::paint_selection(&mut buf, rect, ((rect.x, row), (last, row)));
+
+    assert!(
+        text.contains("PICKME"),
+        "the reply's text is copied: {text:?}"
+    );
+    assert!(
+        !text.contains('┃'),
+        "no border bar in the copied text: {text:?}"
+    );
+    assert_eq!(
+        text,
+        text.trim(),
+        "and nothing leading or trailing it: {text:?}"
+    );
+}
+
 /// The scrollbar column is not text, so pressing on it starts no selection.
 #[tokio::test]
 async fn a_press_on_the_scrollbar_column_starts_no_selection() {
@@ -4697,18 +4752,21 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         "bottom padding:\n{screen}"
     );
 
-    // The rule, then the rest of the left padding, then the content, which
-    // leads with the item's stable `#N` reference. The in_progress marker is a
-    // braille SPINNER frame (first frame at t≈0).
+    // The rule, then the rest of the left padding, then the content. The
+    // status mark leads — the in_progress marker is a braille SPINNER frame
+    // (first frame at t≈0) — before the item's stable `#N` reference.
     let first_frame = "⠋";
     assert!(
         row(text_y).starts_with(&format!(
-            "{} #0 {first_frame} ship it",
+            "{} {first_frame} #0 ship it",
             crate::ui::BORDER_BAR
         )),
         "{screen}"
     );
-    assert!(screen.contains("  wait here"), "pending marker: {screen}");
+    assert!(
+        screen.contains("  #0 wait here"),
+        "pending marker: {screen}"
+    );
     // The two finished tasks are folded away behind one row.
     assert!(
         !screen.contains("landed"),
@@ -4773,7 +4831,10 @@ async fn clicking_the_finished_row_unfolds_the_done_todos() {
     click_at(&mut h.app, 4, toggle_y);
     assert!(h.app.show_done_todos, "the click unfolded them");
     let screen = draw(&mut h, &mut term);
-    assert!(screen.contains("✓ landed"), "now shown:\n{screen}");
+    assert!(
+        screen.contains("✓ #") && screen.contains("landed"),
+        "now shown:\n{screen}"
+    );
     assert!(
         screen.contains("▾ 1 finished — click to hide"),
         "and the row folds them back:\n{screen}"

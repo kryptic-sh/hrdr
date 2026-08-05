@@ -831,16 +831,24 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Publish the height so key handlers can compute half-page offsets, and the
     // TEXT rect — not `area` — so a mouse drag can only select cells that hold
-    // text.
+    // text. Both edges are chrome-free: the right edge stops before the
+    // scrollbar column (see `text_area` above), and the left edge starts at the
+    // first CONTENT column, past the block's `┃` border and its padding.
     //
-    // Derived from `text_area` rather than recomputed, because the two used to be
-    // worked out separately and drifted by exactly the scrollbar column: a
-    // selection harvested one column further right than anything was ever drawn,
-    // so every copied line ended in the scrollbar's `│`. That also defeated
-    // `paint_selection`'s trailing-blank trim — a box-drawing character is not
-    // whitespace, so the trim stopped at it and kept every space behind it.
+    // The two used to be worked out separately and drifted by exactly the
+    // scrollbar column: a selection harvested one column further right than
+    // anything was ever drawn, so every copied line ended in the scrollbar's
+    // `│`; and a selection starting at the block's left edge copied the user
+    // row's `┃` into every line it crossed. A box-drawing character is not
+    // whitespace, so the trailing-blank trim stopped at it and kept every space
+    // behind it — and there is no leading trim at all, so the border came
+    // through verbatim.
     app.transcript_height = area.height;
-    app.transcript_rect = crate::app::HitRect::from(text_area);
+    app.transcript_rect = crate::app::HitRect::from(Rect {
+        x: text_area.x + BLOCK_PAD_X as u16,
+        width: text_area.width.saturating_sub(BLOCK_PAD_X as u16),
+        ..text_area
+    });
 
     // A block is laid out against `app` (the header reads live session state), so
     // the frame *reads* everything it needs here and hands the writes back below —
@@ -1057,11 +1065,12 @@ fn draw_scrollbar(f: &mut Frame, app: &App, area: Rect, max_scroll: usize, offse
     f.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
 }
 
-/// One TODO panel row: `#id mark content`. The leading `#N` is the same stable
+/// One TODO panel row: `mark #id content`. The `#N` is the same stable
 /// reference the `todo` tool's render shows, so a row the user sees here can be
-/// pointed at from the input box (`todo#N` / `task#N`).
+/// pointed at from the input box (`todo#N` / `task#N`). The status mark leads —
+/// the spinner that shows the item being worked on comes before the number.
 fn todo_row(t: &hrdr_tools::TodoItem, mark: &str) -> String {
-    format!("#{} {mark} {}", t.id, t.content)
+    format!("{mark} #{} {}", t.id, t.content)
 }
 
 /// The TODO panel's rows — one per task still to do, marked by status — and the
@@ -1141,27 +1150,28 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
 mod todo_panel_tests {
     use super::todo_row;
 
-    /// The panel row leads with the stable `#N` reference — the same shape the
-    /// `todo` tool's render shows, so what the user sees and what the input box
-    /// can point at (`todo#N`) agree.
+    /// The panel row leads with the status mark — the spinner sits before the
+    /// `#N` reference, which is the same shape the `todo` tool's render shows,
+    /// so what the user sees and what the input box can point at (`todo#N`)
+    /// agree.
     #[test]
-    fn a_todo_row_leads_with_the_stable_id() {
+    fn a_todo_row_leads_with_the_status_mark_then_the_stable_id() {
         let t = hrdr_tools::TodoItem {
             content: "fix it".to_string(),
             id: 7,
             status: "in_progress".to_string(),
             evidence: None,
         };
-        assert_eq!(todo_row(&t, "⠋"), "#7 ⠋ fix it");
-        // The status mark still follows the id, and an id-less (legacy) item
-        // renders as `#0` — unassigned, but the shape is unchanged.
+        assert_eq!(todo_row(&t, "⠋"), "⠋ #7 fix it");
+        // An id-less (legacy) item renders as `#0` — unassigned, but the shape
+        // is unchanged.
         let t = hrdr_tools::TodoItem {
             content: "legacy".to_string(),
             id: 0,
             status: "completed".to_string(),
             evidence: None,
         };
-        assert_eq!(todo_row(&t, "✓"), "#0 ✓ legacy");
+        assert_eq!(todo_row(&t, "✓"), "✓ #0 legacy");
     }
 }
 

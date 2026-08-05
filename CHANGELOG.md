@@ -360,6 +360,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rendering in full whether collapsed or not. A running tool shows its animated
   mark on the one line; expanding a running tool still shows the live tail.
 
+- **The TODO panel's status mark leads each row.** The spinner (working), `✓`
+  (done) or `✗` (cancelled) now comes before the `#N` reference — `⠋ #7 fix it`
+  instead of `#7 ⠋ fix it` — so the live indicator sits at the row's start,
+  against the `┃` rule.
+
 - **`/expand` is now `/verbose`, a strict on/off toggle.** `/verbose on` expands
   every tool block's full output; `/verbose off` collapses them and hands the
   display back to per-block clicking; a bare `/verbose` flips the current state.
@@ -537,6 +542,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are also no longer published to crates.io.
 
 ### Fixed
+
+- **Click-drag copy no longer includes the `┃` border or block padding.** The
+  selectable transcript rect started at the block's left edge, where a user row
+  draws its `┃` — so a drag across a user prompt (or any multi-row selection)
+  copied the border character into every line. The rect now begins at the first
+  content column, the way its right edge already stops before the scrollbar
+  column, and a press on the border starts no selection.
 
 - **The context gauge shows the real context remaining after `/compact`**
   instead of clearing to zero. `CompactionReport` now carries `context_after` —
