@@ -3363,6 +3363,140 @@ async fn a_press_on_the_scrollbar_column_starts_no_selection() {
     );
 }
 
+/// The block chrome at the transcript's left edge is not text, so pressing on
+/// it starts no selection — the same rule as the scrollbar column on the right.
+/// Only the content band (two columns in, one short of the edge) is selectable.
+#[tokio::test]
+async fn a_press_on_the_left_padding_column_starts_no_selection() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    const WIDTH: u16 = 40;
+
+    let mut h = Harness::new(vec![]).await;
+    // A user row wears the `┃` at the very left — the chrome a press must skip.
+    h.app.push_entry(Entry::user("something to look at"));
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.transcript_rect;
+    let press = |column| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row: rect.y + 1,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+
+    h.app.on_mouse(press(0));
+    assert!(
+        h.app.selection.is_none(),
+        "the ┃ column holds no text, so a press there is not a drag"
+    );
+    h.app.on_mouse(press(1));
+    assert!(
+        h.app.selection.is_none(),
+        "the padding column holds no text either"
+    );
+    h.app.on_mouse(press(rect.x));
+    assert!(
+        h.app.selection.is_some(),
+        "the content band is where a drag starts"
+    );
+}
+
+/// Copying from the input box grabs the content only — no `┃` (the prompt's
+/// rule is at the pane's left edge), no padding — the same content band every
+/// other surface selects.
+#[tokio::test]
+async fn input_box_copy_contains_no_border_or_padding() {
+    const WIDTH: u16 = 40;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor.set_content("PICKME from the box");
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.input_rect;
+    let row = (rect.y..rect.y + rect.h)
+        .find(|&row| {
+            (rect.x..rect.x + rect.w).any(|col| {
+                term.backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(col, row))
+                    .is_some_and(|c| c.symbol() == "P")
+            })
+        })
+        .expect("the input text is on screen");
+
+    let mut buf = term.backend().buffer().clone();
+    let last = rect.x + rect.w - 1;
+    let text = ui::paint_selection(&mut buf, rect, ((rect.x, row), (last, row)));
+
+    assert!(
+        text.contains("PICKME from the box"),
+        "the input text is copied: {text:?}"
+    );
+    assert!(
+        !text.contains('┃'),
+        "the prompt's border rule stays out of the copy: {text:?}"
+    );
+    assert_eq!(
+        text,
+        text.trim(),
+        "nothing leading or trailing the text: {text:?}"
+    );
+}
+
+/// A todo-panel row copies its content only — the green rule at the panel's
+/// left edge stays out of the copy, like the scrollbar does on the right.
+#[tokio::test]
+async fn todo_panel_copy_contains_no_rule() {
+    const WIDTH: u16 = 50;
+
+    let mut h = Harness::new(vec![]).await;
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "SHIP IT NOW".to_string(),
+        id: 7,
+        status: "in_progress".to_string(),
+        evidence: None,
+    }];
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.transcript_rect;
+    let row_text = |row: u16| -> String {
+        (rect.x..rect.x + rect.w)
+            .filter_map(|col| {
+                term.backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(col, row))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let row = (rect.y..rect.y + rect.h)
+        .find(|&row| row_text(row).contains("SHIP IT NOW"))
+        .expect("the todo renders on screen");
+
+    let mut buf = term.backend().buffer().clone();
+    let last = rect.x + rect.w - 1;
+    let text = ui::paint_selection(&mut buf, rect, ((rect.x, row), (last, row)));
+
+    assert!(
+        text.contains("SHIP IT NOW"),
+        "the todo content is copied: {text:?}"
+    );
+    assert!(
+        !text.contains('┃'),
+        "the panel's green rule stays out of the copy: {text:?}"
+    );
+    assert_eq!(
+        text,
+        text.trim(),
+        "nothing leading or trailing the row: {text:?}"
+    );
+}
+
 /// Dragging across the transcript selects the cells under the pointer and, when
 /// the button comes up, copies what they say — the drag never reaches the tool
 /// block it started on, so selecting text can't toggle a block open.

@@ -821,6 +821,22 @@ fn clamp_u16(n: usize) -> u16 {
     n.min(u16::MAX as usize) as u16
 }
 
+/// The selectable content band of a pane: two columns in from its left edge
+/// (the block padding — and a user row's `┃`) and one short of its right edge
+/// (the scrollbar column, or the pane's own right padding). Like the scrollbar,
+/// what is outside the band is not text and is not selectable: a press there
+/// starts no selection, and a drag's head clamps to the band. Copies therefore
+/// never begin with the `┃` or the padding, and never harvest the scrollbar's
+/// `│`; whatever right padding the band still includes is trimmed by
+/// `paint_selection`.
+fn content_rect(area: Rect) -> crate::app::HitRect {
+    crate::app::HitRect::from(Rect {
+        x: area.x + BLOCK_PAD_X as u16,
+        width: area.width.saturating_sub(BLOCK_PAD_X as u16 + 1),
+        ..area
+    })
+}
+
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Reserve the rightmost column for the scrollbar. Left padding is applied
     // per-block via pad_line's leading bg-coloured space.
@@ -844,11 +860,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // behind it — and there is no leading trim at all, so the border came
     // through verbatim.
     app.transcript_height = area.height;
-    app.transcript_rect = crate::app::HitRect::from(Rect {
-        x: text_area.x + BLOCK_PAD_X as u16,
-        width: text_area.width.saturating_sub(BLOCK_PAD_X as u16),
-        ..text_area
-    });
+    app.transcript_rect = content_rect(area);
 
     // A block is laid out against `app` (the header reads live session state), so
     // the frame *reads* everything it needs here and hands the writes back below —
@@ -1448,8 +1460,9 @@ fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the pane rect so a mouse press here starts a select-to-copy drag
-    // instead of doing nothing.
-    app.input_rect = crate::app::HitRect::from(area);
+    // instead of doing nothing — inset to the content band like the transcript,
+    // so a copy never begins with the prompt's `┃` or the padding.
+    app.input_rect = content_rect(area);
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
@@ -1706,8 +1719,10 @@ fn draw_statusbar(
     right: &[StatusSection],
 ) {
     // Publish the block rect so a mouse press here starts a select-to-copy
-    // drag; everything else this function does with the app is a read.
-    app.status_rect = crate::app::HitRect::from(area);
+    // drag; everything else this function does with the app is a read. Inset to
+    // the content band like every other surface, so a copy doesn't lead with
+    // the padding.
+    app.status_rect = content_rect(area);
     let t = &app.theme;
     let width = area.width as usize;
     let inner = inner_width(width) as usize;

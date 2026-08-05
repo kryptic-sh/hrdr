@@ -599,12 +599,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   renders on one row no matter how long or how wide its params are. Expanding
   still shows the whole params and the full output.
 
-- **Click-drag copy no longer includes the `┃` border or block padding.** The
-  selectable transcript rect started at the block's left edge, where a user row
-  draws its `┃` — so a drag across a user prompt (or any multi-row selection)
-  copied the border character into every line. The rect now begins at the first
-  content column, the way its right edge already stops before the scrollbar
-  column, and a press on the border starts no selection.
+- **Click-drag copy selects only the content band of every surface — transcript,
+  input box and status bar.** The selectable rect now starts two columns in from
+  the pane's left edge (past the block padding and any `┃` rule) and stops one
+  column short of its right edge (past the scrollbar), exactly as the scrollbar
+  column already worked: what is outside the band is not text, a press there
+  starts no selection, and a drag clamps to it. A drag across a user prompt, the
+  todo panel's green rule, or the input box's own rule copies the content alone
+  — no border character, no padding, trailing blanks trimmed. All three panes
+  share one `content_rect` inset so they cannot drift apart again.
 
 - **The context gauge shows the real context remaining after `/compact`**
   instead of clearing to zero. `CompactionReport` now carries `context_after` —
