@@ -387,6 +387,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   moved `ctor 0.6 → 1` (the destructor is now the separate `dtor` crate).
   Lockfile regenerated.
 
+- **`windows-sys` moved `0.52 → 0.61`.** The Windows job-object tree-kill
+  (`proc.rs`) and the open-handle identity check (`lib.rs` `by_handle_info`)
+  pull the same symbols from the same modules in 0.61, and all five `Win32_*`
+  features still exist — a pure manifest+lockfile bump, no code change. (The
+  `SE_GROUP_INTEGRITY` constant and the inline low-integrity SID stay spelled
+  out locally, as they already were for exactly this reason.) Everything else in
+  the dependency set — the 14 `hjkl-*` crates, tokio, reqwest, ratatui,
+  crossterm, serde, clap, chrono, syntect, toml_edit, and the rest of the
+  workspace's direct dependencies — was already at its latest stable release,
+  confirmed by `cargo update` locking zero packages.
+
 - **`:audit` and `:tidy` write their findings into the backlog.** Both append to
   `docs/backlog.md` under a dated `## <area> audit|tidy YYYY-MM-DD` heading,
   matching `:review` and `:perf`; the `docs/security-review.md` and

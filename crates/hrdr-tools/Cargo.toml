@@ -46,13 +46,7 @@ libc = "0.2"
 # Job Objects for tree-kill on Windows (the process-group analogue, see
 # `src/proc.rs`), and GetFileInformationByHandle for the open-handle identity
 # check that closes the `read` TOCTOU window (see `guard_not_swapped`).
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
