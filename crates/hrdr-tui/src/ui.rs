@@ -1242,9 +1242,10 @@ fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hr
     Some((lines, ids))
 }
 
-/// The 8-dot braille spinner: a filled block sweeping around all eight dots —
-/// not the 6-dot circle the old frames traced.
-const SPINNER: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+/// The 4-of-8-dot braille spinner: a four-dot window sliding one dot at a time
+/// around the ring of all eight dots — light (half lit), not the heavy
+/// 7-of-8 disk of the earlier frames.
+const SPINNER: [&str; 8] = ["⠹", "⢸", "⣰", "⣤", "⣆", "⡇", "⠏", "⠛"];
 /// Spinner frame period in milliseconds. The redraw ticker in [`tui`] uses the
 /// same value so the animation and the draw loop stay in sync.
 pub(crate) const SPINNER_FRAME_MS: u64 = 120;
@@ -2905,7 +2906,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 }));
                 (BlockKind::Reasoning, body)
             }
-            // No `⣾ Thinking` / `Thought: 1.2s` label: the dimmer text already
+            // No `⠹ Thinking` / `Thought: 1.2s` label: the dimmer text already
             // says it's the model thinking, and the loader above the input shows
             // that a turn is running. (`took_ms` is still recorded — it's the
             // only trace of how long the model thought.)

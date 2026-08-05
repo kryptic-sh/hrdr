@@ -2952,7 +2952,7 @@ async fn clear_and_new_take_a_session_name() {
     );
 }
 
-/// A thinking block is just the thought: no `⣾ Thinking` spinner, no
+/// A thinking block is just the thought: no `⠹ Thinking` spinner, no
 /// `Thought: 1.2s` footer. The dimmer text already says whose voice it is, and
 /// the loader above the input says a turn is running.
 ///
@@ -4265,7 +4265,7 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
         "the settled summary keeps the merged sections:\n{settled}"
     );
     assert!(
-        !settled.contains("⣾"),
+        !settled.contains("⠹"),
         "settling folds the live preview:\n{settled}"
     );
 }
@@ -4433,7 +4433,7 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
 }
 
 /// A hidden thought's summary updates in place too: settling from
-/// `⣾ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
+/// `⠹ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
 /// row and nothing else, so the render cannot jump while the thought finishes.
 #[tokio::test]
 async fn a_thinking_summary_update_rewrites_only_its_own_row() {
@@ -4581,7 +4581,7 @@ async fn an_open_streaming_thought_stays_open_as_it_streams() {
     );
 }
 
-/// While a thought is still streaming it reads `⣾ Thinking for 1s` with the
+/// While a thought is still streaming it reads `⠹ Thinking for 1s` with the
 /// loader mark and no age; once it settles the mark becomes ✓ and the summary
 /// reads `✓ Thought for 1m 32s · now` — the same verb change and marks a tool
 /// group's summary uses.
@@ -6147,7 +6147,7 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     // The rule, then the rest of the left padding, then the content. The
     // status mark leads — the in_progress marker is a braille SPINNER frame
     // (first frame at t≈0) — before the item's stable `#N` reference.
-    let first_frame = "⣾";
+    let first_frame = "⠹";
     assert!(
         row(text_y).starts_with(&format!(
             "{} {first_frame} #0 ship it",

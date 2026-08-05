@@ -63,7 +63,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A hidden thought folds behind a summary entry instead of disappearing.**
   With thinking folded (`/verbose off`, the default), a thought reads
-  `⣾ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
+  `⠹ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
   it settles — the same spinner/check marks a tool group's summary uses.
   Clicking the summary opens the full thought; clicking again folds it back.
 
@@ -173,7 +173,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A `verify` run reads as `ran verify tool`, not `verify 1`.** The verify tool
   is one named action the user asks for, so its summary section names it instead
   of counting it: `✓ ran verify tool` once it settles (and `ran 2 verify tools`
-  for a run that called it again), `⣾ running verify tool` while it streams.
+  for a run that called it again), `⠹ running verify tool` while it streams.
 
 - **`/compact` no longer posts a "compacting conversation…" notice.** The
   spinner loader line — the one that replaces the generating message — already
