@@ -150,9 +150,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // Last, over everything: the mouse selection (which reads the cells the rest
-    // of the frame just painted), the hover tooltip, and the toast stack.
+    // of the frame just painted) and the toast stack.
     draw_selection(f, app);
-    draw_tooltip(f, app);
     hjkl_holler_tui::render_active(
         f,
         area,
@@ -187,41 +186,6 @@ fn draw_selection(f: &mut Frame, app: &mut App) {
     if std::mem::take(&mut app.pending_copy) {
         app.copy_selection(&text);
     }
-}
-
-/// The hover hint for the transcript row under the pointer, drawn over
-/// everything near the cursor: what a click there does. Nothing when the
-/// pointer isn't over a clickable row, or when a modal owns the screen.
-fn draw_tooltip(f: &mut Frame, app: &mut App) {
-    if app.model_selector.is_some()
-        || app.session_selector.is_some()
-        || app.theme_selector.is_some()
-        || app.effort_selector.is_some()
-        || app.skill_selector.is_some()
-        || app.login_modal.is_some()
-        || app.active_completions().is_some()
-    {
-        return;
-    }
-    let Some((col, row)) = app.hover else { return };
-    let Some((_, text)) = app.tooltip_hits.iter().find(|(r, _)| r.contains(col, row)) else {
-        return;
-    };
-    // The hint floats one row below and two columns right of the pointer,
-    // clamped so it never runs off the screen.
-    let w = text.len() as u16 + 4;
-    if w >= f.area().width {
-        return;
-    }
-    let x = col.saturating_add(2).min(f.area().width.saturating_sub(w));
-    let y = row.saturating_add(1).min(f.area().height.saturating_sub(1));
-    let area = Rect::new(x, y, w, 1);
-    f.render_widget(Clear, area);
-    let tip = Paragraph::new(Line::from(Span::styled(
-        format!("  {text}  "),
-        Style::default().fg(Color::White).bg(app.theme.command_bg),
-    )));
-    f.render_widget(tip, area);
 }
 
 /// Reverse-video the cells the selection covers and return their text, one row
@@ -910,7 +874,6 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.max_scroll = frame.max_scroll;
     app.tool_hits = frame.tool_hits;
     app.row_hits = frame.row_hits;
-    app.tooltip_hits = frame.tooltips;
 
     draw_scrollbar(f, app, area, frame.max_scroll, frame.scroll_offset);
 }
@@ -924,8 +887,6 @@ struct TranscriptFrame {
     tool_hits: Vec<(HitRect, usize)>,
     /// Visible live-panel rows → what clicking one does.
     row_hits: Vec<(HitRect, RowHit)>,
-    /// Visible rows → the hover hint for what a click there does.
-    tooltips: Vec<(HitRect, &'static str)>,
 }
 
 /// Lay the transcript out, place the viewport in it, and paint the rows it lands
@@ -1010,7 +971,6 @@ fn draw_chunks(
     // back to u16.
     let mut tool_hits = Vec::new();
     let mut row_hits = Vec::new();
-    let mut tooltips = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         // A live panel's rows: each one is a single screen row, one below the
         // block's top padding row. A chunk whose hits count from its first row
@@ -1031,21 +991,6 @@ fn draw_chunks(
                         h: 1,
                     },
                     *hit,
-                ));
-            }
-        }
-        // Hover hints map the same way, so a tooltip tracks the row it names.
-        for (row, tip) in &c.tooltips {
-            let at = base + row;
-            if (scroll_us..view_end).contains(&at) {
-                tooltips.push((
-                    HitRect {
-                        x: text_area.x,
-                        y: text_area.y + (at - scroll_us) as u16,
-                        w: text_area.width,
-                        h: 1,
-                    },
-                    *tip,
                 ));
             }
         }
@@ -1113,7 +1058,6 @@ fn draw_chunks(
         max_scroll: max_scroll as usize,
         tool_hits,
         row_hits,
-        tooltips,
     }
 }
 
@@ -1501,7 +1445,6 @@ fn panel(
             rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
             tool_idx: None,
             row_hits: hits,
-            tooltips: Vec::new(),
             hits_from_first_row: false,
         },
     ]
@@ -2502,14 +2445,10 @@ struct Chunk<'a> {
     /// this — they ride in the transcript, so their click targets scroll like
     /// everything else.
     row_hits: Vec<(usize, RowHit)>,
-    /// A hover hint for one of this chunk's rows, by row index: what a click
-    /// on that row does. Feeds the tooltip drawn over the cursor.
-    tooltips: Vec<(usize, &'static str)>,
-    /// Whether [`row_hits`](Self::row_hits)/[`tooltips`](Self::tooltips) row
-    /// indices count from the chunk's very first row, instead of from the
-    /// first row inside its chrome top pad (the default, which `draw_chunks`
-    /// maps with a `+1`). The tool-group chunk has no chrome pad — its summary
-    /// IS row 0 — so it sets this.
+    /// Whether [`row_hits`](Self::row_hits) row indices count from the chunk's
+    /// very first row, instead of from the first row inside its chrome top pad
+    /// (the default, which `draw_chunks` maps with a `+1`). The tool-group
+    /// chunk has no chrome pad — its summary IS row 0 — so it sets this.
     hits_from_first_row: bool,
 }
 
@@ -2520,7 +2459,6 @@ impl<'a> Chunk<'a> {
             rows,
             tool_idx,
             row_hits: Vec::new(),
-            tooltips: Vec::new(),
             hits_from_first_row: false,
         }
     }
@@ -3417,15 +3355,9 @@ fn tool_group_chunk(
 
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row_hits: Vec<(usize, RowHit)> = Vec::new();
-    let mut tooltips: Vec<(usize, &'static str)> = Vec::new();
     // The summary line is the container's first row — no pad above it, and one
     // blank row below it, so an expanded group's first tool call never sits
     // flush against the summary.
-    let group_tip = if frame.expanded {
-        "Click to collapse"
-    } else {
-        "Click to show tool details"
-    };
     for (i, text) in packed.into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
@@ -3437,16 +3369,16 @@ fn tool_group_chunk(
         spans.push(Span::styled(text, dim));
         for row in wrap_spans(spans, inner) {
             rows.push(pad_row(row, w, page));
-            tooltips.push((rows.len() - 1, group_tip));
         }
     }
     if frame.expanded {
         // The children: one padded tool box per call, each on the normal tool
         // background and flush with the transcript's own content column — the
-        // same padding as every other block. A box carries its own top and
-        // bottom padding (one blank row above and below its text), so nothing
-        // extra separates box from box; the summary above the first is
-        // separated by that first box's own top pad.
+        // same padding as every other block. A blank row on the page precedes
+        // each box (the separation between the surfaces — the box's tint starts
+        // below it), and the box itself carries a top and bottom pad inside the
+        // tint. The summary above the first is separated by that first box's
+        // page blank.
         //
         // A settled call renders as a *preview* — its tail (the newest output,
         // like a running call's live tail) or, for a mutation, its head — and
@@ -3502,28 +3434,22 @@ fn tool_group_chunk(
             }
             // The call's own rows, filled to the width on the tool background —
             // content at the same column as every other transcript entry — with
-            // one blank row above and below for the box's padding.
+            // one page blank before the tint starts, then one blank row above
+            // and below the text for the box's padding.
+            rows.push(pad_row(Vec::new(), w, page));
+            let sep = rows.len() - 1;
+            row_hits.push((sep, RowHit::ToggleToolGroup(head_idx)));
             rows.push(pad_row(Vec::new(), w, bg));
             let gap = rows.len() - 1;
             row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            tooltips.push((gap, "Click to collapse"));
             for row in body.as_ref().iter() {
                 rows.push(pad_row(row.spans.clone(), w, bg));
                 let r = rows.len() - 1;
                 row_hits.push((r, RowHit::ToggleToolCall(head_idx + j)));
-                tooltips.push((
-                    r,
-                    if full {
-                        "Click to collapse"
-                    } else {
-                        "Click to expand"
-                    },
-                ));
             }
             rows.push(pad_row(Vec::new(), w, bg));
             let gap = rows.len() - 1;
             row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            tooltips.push((gap, "Click to collapse"));
         }
     } else if let Some((live, id, name, args, result, ok)) =
         members.iter().enumerate().rev().find_map(|(j, m)| {
@@ -3575,27 +3501,20 @@ fn tool_group_chunk(
             },
         );
         if !body.is_empty() {
+            rows.push(pad_row(Vec::new(), w, page));
+            let sep = rows.len() - 1;
+            row_hits.push((sep, RowHit::ToggleToolGroup(head_idx)));
             rows.push(pad_row(Vec::new(), w, bg));
             let gap = rows.len() - 1;
             row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            tooltips.push((gap, group_tip));
             for row in body.as_ref().iter() {
                 rows.push(pad_row(row.spans.clone(), w, bg));
                 let r = rows.len() - 1;
                 row_hits.push((r, RowHit::ToggleToolCall(head_idx + live)));
-                tooltips.push((
-                    r,
-                    if full {
-                        "Click to collapse"
-                    } else {
-                        "Click to expand"
-                    },
-                ));
             }
             rows.push(pad_row(Vec::new(), w, bg));
             let gap = rows.len() - 1;
             row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            tooltips.push((gap, group_tip));
         }
     }
     // The section's own bottom padding, unless the follower brings its own.
@@ -3606,7 +3525,6 @@ fn tool_group_chunk(
         rows: ChunkRows::Ready(Rc::new(rows)),
         tool_idx: Some(head_idx),
         row_hits,
-        tooltips,
         // The summary is the chunk's first row — no chrome pad above it — so
         // the hit rows are the chunk rows themselves.
         hits_from_first_row: true,

@@ -82,7 +82,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   beneath it so the first call never sits flush against it — and the calls fan
   out below, each a box with its own top and bottom padding and only the calls
   carrying a background; the summary section itself reads on the page like a
-  thought or the model's output.
+  thought or the model's output. A blank row on the page precedes each box — the
+  separation between the surfaces, before the box's tint starts.
 
   A settled call renders as a _preview_ capped at the same size as a running
   call's live preview: the tail of the result (the newest output) for most
@@ -92,12 +93,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Clicking the padding gaps between the boxes — not a call, not the summary —
   folds the whole group back to its summary line. `verbose` shows every call in
   full at once.
-
-- **Hovering a tool-group surface shows what a click there does.** The pointer
-  over the summary offers `Click to show tool details` (or `Click to collapse`
-  when the group is open), over a call's preview `Click to expand`, over a full
-  call `Click to collapse`. The hint floats beside the cursor and vanishes when
-  the pointer leaves the surfaces or the mouse acts.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes

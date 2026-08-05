@@ -4211,8 +4211,9 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
 
     // A second call joins the group: the summary counts it in place, and the
     // live preview switches to the newest running call — nothing else moves.
-    // The preview box's header is exactly two rows below the summary (its top
-    // pad between them), so the two changed rows are fixed relative to it.
+    // The preview box's header sits three rows below the summary (its page
+    // blank and top pad between them), so the changed rows are fixed relative
+    // to it.
     h.app.push_entry(tool("b", "read", false));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let joined = term.backend().buffer().clone();
@@ -4220,7 +4221,7 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
         .expect("the summary is on screen");
     assert_eq!(
         changed_rows(&before, &joined),
-        vec![summary_row, summary_row + 2],
+        vec![summary_row, summary_row + 3],
         "a merged running call must touch only the summary and the preview row"
     );
 
@@ -4417,98 +4418,6 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
     assert!(
         !screen.contains("RESULT-A"),
         "the calls fold behind the summary:\n{screen}"
-    );
-}
-
-/// Hovering a clickable surface shows what a click there does: the summary
-/// offers its details (or collapse when open), a call's preview offers to
-/// expand, a full call offers to collapse.
-#[tokio::test]
-async fn hover_shows_what_a_click_does() {
-    use crossterm::event::{MouseEvent, MouseEventKind};
-    let mut h = Harness::new(vec![]).await;
-    h.app
-        .transcript_mut()
-        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
-    h.app.push_entry(Entry::now(EntryKind::Tool {
-        id: "a".into(),
-        name: "shell".into(),
-        args: "{}".into(),
-        result: "RESULT-A".into(),
-        ok: true,
-        done: true,
-    }));
-    h.app.push_entry(Entry::now(EntryKind::Tool {
-        id: "b".into(),
-        name: "read".into(),
-        args: "{}".into(),
-        result: "RESULT-B".into(),
-        ok: true,
-        done: true,
-    }));
-    let hover = |app: &mut App, column: u16, row: u16| {
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column,
-            row,
-            modifiers: KeyModifiers::empty(),
-        });
-    };
-
-    // Collapsed: hovering the summary offers the details.
-    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let summary_row =
-        screen_row_of(&term, "ran 1 command · read 1 file").expect("the summary on screen");
-    hover(&mut h.app, 5, summary_row);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    assert!(
-        buffer_to_string(term.backend().buffer()).contains("Click to show tool details"),
-        "the collapsed summary hints at its click"
-    );
-
-    // Expand, then hover a preview: it offers to expand.
-    h.app.tool_groups.insert("a".to_string());
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let preview_row = screen_row_of(&term, "RESULT-A").expect("the preview on screen");
-    hover(&mut h.app, 5, preview_row);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
-    assert!(
-        screen.contains("Click to expand"),
-        "a preview offers to expand:\n{screen}"
-    );
-
-    // Open the call: the same row now offers to collapse.
-    h.app.tool_open.insert("a".to_string());
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let full_row = screen_row_of(&term, "RESULT-A").expect("the full call on screen");
-    hover(&mut h.app, 5, full_row);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
-    assert!(
-        screen.contains("Click to collapse"),
-        "a full call offers to collapse:\n{screen}"
-    );
-
-    // Hovering the summary while the group is open offers to collapse too.
-    let summary_row =
-        screen_row_of(&term, "ran 1 command · read 1 file").expect("the summary still on screen");
-    hover(&mut h.app, 5, summary_row);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
-    assert!(
-        screen.contains("Click to collapse"),
-        "an open group's summary offers to collapse:\n{screen}"
-    );
-
-    // A move off the surfaces dismisses the hint.
-    hover(&mut h.app, 5, 29);
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
-    assert!(
-        !screen.contains("Click to"),
-        "no hint away from the surfaces:\n{screen}"
     );
 }
 
@@ -4767,6 +4676,21 @@ async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
     assert!(
         result_a > summary + 1,
         "the first call starts below the blank, not flush against the summary:\n{}",
+        buffer_to_string(buf)
+    );
+    // The blank before the box is on the page — the box's tint starts below
+    // it, on the box's own top pad.
+    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+    assert_eq!(
+        bg_at(summary + 1),
+        Color::Reset,
+        "the blank before the box is on the page:\n{}",
+        buffer_to_string(buf)
+    );
+    assert_eq!(
+        bg_at(summary + 2),
+        h.app.theme.user_bg,
+        "the box tint starts below the page blank:\n{}",
         buffer_to_string(buf)
     );
 }
