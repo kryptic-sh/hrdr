@@ -345,6 +345,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The live "generating" line wraps by section on narrow terminals.** The
+  spinner + stats row (ctx, in/out, tok/s, ttft, elapsed, started) now breaks
+  between its `·`-delimited segments when it does not fit the width, so a
+  wrapped continuation never starts with the separator. The shell-command and
+  detail-row text of a tool block also renders muted now, matching the `read`
+  tool's path — every detail that follows a tool name uses the same dim color.
+
 - **Tool calls collapse to a single line until expanded.** A finished tool block
   now renders as `✓ shell cd … && rg …` — the status mark, the tool name, and a
   one-line summary (the command for shell calls, the headline otherwise) — with

@@ -1229,7 +1229,12 @@ pub(crate) fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
 /// The inference loader: spinner + live stats (context size, in/out ratio,
 /// token throughput), closing the transcript while a turn runs. `None` when the
 /// agent on screen isn't working.
-fn loader_line(app: &App) -> Option<Line<'static>> {
+///
+/// The stats are packed into lines of at most `width` cells, breaking between
+/// ` · `-delimited segments: on a narrow terminal the line wraps by section, so
+/// a continuation row never starts with the `·` separator. A single segment
+/// wider than the terminal still wraps at word boundaries downstream.
+fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
     // It hides while that agent's tool calls run: the model is idle then, and a
     // spinner would claim otherwise (the running tool's own block carries the
     // `…` mark), and it hides entirely when the agent you are looking at is not
@@ -1267,20 +1272,21 @@ fn loader_line(app: &App) -> Option<Line<'static>> {
     let started_at = turn.started_at.map(hrdr_app::time_from_system);
     let started = match (app.timestamp_style, started_at) {
         (TimestampStyle::None, _) | (_, None) => String::new(),
-        (TimestampStyle::Relative, Some(t)) => format!("  ·  started {}", relative_time(t)),
-        (TimestampStyle::Exact, Some(t)) => format!("  ·  started {}", t.format("%H:%M")),
+        (TimestampStyle::Relative, Some(t)) => format!("started {}", relative_time(t)),
+        (TimestampStyle::Exact, Some(t)) => format!("started {}", t.format("%H:%M")),
     };
     // Compaction is the session's agent summarizing itself — not something a
     // sub-agent's pane should claim to be doing.
-    let text = if pane.compacting {
-        format!(
-            " {frame} compacting context — summarizing the conversation…  ·  {:.1}s{started}",
-            elapsed.as_secs_f64(),
-        )
+    let segments: Vec<String> = if pane.compacting {
+        vec![
+            format!(" {frame} compacting context — summarizing the conversation…"),
+            format!("{:.1}s", elapsed.as_secs_f64()),
+            started,
+        ]
     } else {
         // Time to first token: how long the provider took to start streaming.
         let ttft = match turn.ttft() {
-            Some(secs) => format!("  ·  ttft {secs:.2}s"),
+            Some(secs) => format!("ttft {secs:.2}s"),
             None => String::new(),
         };
         let phase = if turn.first_token_at.is_some() {
@@ -1288,18 +1294,49 @@ fn loader_line(app: &App) -> Option<Line<'static>> {
         } else {
             "inferring"
         };
-        format!(
-            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out){ttft}  ·  {:.1}s{started}",
-            turn.out_tokens(),
-            elapsed.as_secs_f64(),
-        )
+        vec![
+            format!(" {frame} {phase}"),
+            ctx,
+            format!("{speed:.1} tok/s ({} out)", turn.out_tokens()),
+            ttft,
+            format!("{:.1}s", elapsed.as_secs_f64()),
+            started,
+        ]
     };
-    Some(Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(app.theme.warn)
-            .add_modifier(Modifier::BOLD),
-    )))
+    let style = Style::default()
+        .fg(app.theme.warn)
+        .add_modifier(Modifier::BOLD);
+    Some(
+        pack_loader_segments(&segments, width as usize)
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, style)))
+            .collect(),
+    )
+}
+
+/// Pack ` · `-delimited loader segments into lines of at most `width` cells,
+/// breaking between segments so a wrapped line never leads with the `·`
+/// separator. Empty segments (an absent ttft/started) are dropped.
+fn pack_loader_segments(segments: &[String], width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for seg in segments.iter().filter(|s| !s.is_empty()) {
+        if line.is_empty() {
+            line.clone_from(seg);
+        } else {
+            let joined = format!("{line} · {seg}");
+            if joined.chars().count() <= width {
+                line = joined;
+            } else {
+                out.push(std::mem::take(&mut line));
+                line.clone_from(seg);
+            }
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 /// The live panels that close the transcript: the inference loader, the TODO
@@ -1314,14 +1351,14 @@ fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
     let w = width as usize;
     let mut out = Vec::new();
 
-    if let Some(line) = loader_line(app) {
+    if let Some(lines) = loader_line(app, width) {
         // No block chrome: the loader is a single status row on the terminal's
         // own background, as it was when it sat above the input. It heads the
         // panels — it belongs with the reply it is still writing, above the
         // lists of what is queued up around it.
         out.extend([
             separator(),
-            Chunk::plain(ChunkRows::Ready(Rc::new(vec![line])), None),
+            Chunk::plain(ChunkRows::Ready(Rc::new(lines)), None),
         ]);
     }
     if let Some((body, toggle)) = todo_lines(app) {
@@ -3027,7 +3064,7 @@ fn tool_lines(
         for line in command.lines() {
             out.push(Line::from(Span::styled(
                 expand_tabs(line),
-                Style::default().fg(theme.assistant).bg(bg),
+                Style::default().fg(theme.dim).bg(bg),
             )));
         }
     }
@@ -3046,10 +3083,11 @@ fn tool_lines(
                 ));
             }
             // A long value (a `task` prompt) wraps in full — the collapsed
-            // one-liner above already summarized the call.
+            // one-liner above already summarized the call. Muted, like every
+            // other detail that follows the tool name.
             spans.push(Span::styled(
                 value.clone(),
-                Style::default().fg(theme.assistant).bg(bg),
+                Style::default().fg(theme.dim).bg(bg),
             ));
             out.push(Line::from(spans));
         }
@@ -4161,6 +4199,44 @@ mod block_tests {
         assert_eq!(rows[2], "description  Explore hrdr-editor");
         assert_eq!(rows[3], "prompt       line one line two", "one row per arg");
         assert_eq!(rows.len(), 4);
+    }
+
+    /// Loader stats pack into width-bounded lines, breaking between ` · `-joined
+    /// segments so a wrapped line never leads with the `·` separator, with the
+    /// full content preserved in order.
+    #[test]
+    fn loader_segments_pack_between_separators() {
+        let segments = vec![
+            " ⠦ generating".to_string(),
+            "ctx 454016 tok · in/out 454016/85 (5341.4:1)".to_string(),
+            "128.2 tok/s (88631 out)".to_string(),
+            "ttft 3.70s".to_string(),
+            "1074.7s".to_string(),
+            "started 20m ago".to_string(),
+        ];
+        let joined = segments.join(" · ");
+
+        // Wide enough: everything on one line.
+        assert_eq!(pack_loader_segments(&segments, 200), vec![joined.clone()]);
+
+        // Narrow: breaks between segments, each line fits and none starts with
+        // the separator, and joining the lines back reproduces the original.
+        let lines = pack_loader_segments(&segments, 60);
+        assert!(lines.len() > 1, "a narrow width must wrap: {lines:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= 60, "each line fits: {line}");
+            assert!(
+                !line.trim_start().starts_with('·'),
+                "no wrapped line starts with the separator: {line}"
+            );
+        }
+        assert_eq!(lines.join(" · "), joined, "no content lost or reordered");
+
+        // Empty segments (a missing ttft/started) are dropped, not rendered bare.
+        assert_eq!(
+            pack_loader_segments(&[" ⠦ inferring".into(), "".into(), "3.0s".into()], 200),
+            vec![" ⠦ inferring · 3.0s"]
+        );
     }
 
     /// Collapsed shell calls summarize to one line: mark + name + the command
