@@ -184,10 +184,15 @@ and a sub-agent does the same — `skill` is read-only, so read-only profiles
 and the tool refuses it, so `:name` is the only way in. Built-in `:release`
 ships marked — its last step pushes a tag, so starting a release is your call.
 
-hrdr ships ten built-in skills that work with zero setup:
+hrdr ships built-in skills that work with zero setup:
 
 - `:audit [low|high]` — audit the codebase for security bugs and correctness
 - `:commit` — commit the working changes with a Conventional Commit message
+- `:deps` — update project dependencies to their latest stable versions (generic
+  runner; it points at the matching per-manager run book)
+- `:deps_cargo` / `:deps_npm` / `:deps_pnpm` / `:deps_yarn` / `:deps_bun` /
+  `:deps_uv` / `:deps_poetry` / `:deps_pip` / `:deps_go` / `:deps_composer` /
+  `:deps_bundler` — one run book per package manager
 - `:fix` — root-cause and fix a pasted error
 - `:perf` — report performance problems: hot paths, allocations, complexity
 - `:plan` — explore read-only and produce an implementation plan
@@ -197,6 +202,9 @@ hrdr ships ten built-in skills that work with zero setup:
 - `:test` — write tests for a change and iterate to green
 - `:tidy` — DRY up reuse, cut dead code and over-abstraction (quality, not bugs)
 - `:todo` — report what is left to work on from the session context
+
+The built-in bodies live in `crates/hrdr-agent/src/templates/skills/*.md` and
+are baked into the binary by `build.rs` — adding one is adding a file.
 
 They sit last in the discovery order, so a project or user skill file with the
 same name overrides them.

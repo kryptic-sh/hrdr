@@ -3703,20 +3703,23 @@ mod tests {
     /// What the built-ins actually cost every agent that has the `skill`
     /// tool. Pinned because this section sits in the cached prefix of every
     /// prompt: a built-in whose `description:` grows into a paragraph should
-    /// fail here, not quietly tax every session.
+    /// fail here, not quietly tax every session. The 12 `:deps*` run books
+    /// pushed the listing to ~1.9 KiB; the cap is a per-line budget, not a
+    /// head-count — one line per skill, ~60 bytes each.
     #[test]
     fn the_builtin_listing_stays_cheap() {
         let s = skills_section(&tools_with_skill(), &crate::builtin_skills());
         assert!(
-            s.len() < 1800,
+            s.len() < 2400,
             "the built-in skills list in {} bytes:\n{s}",
             s.len()
         );
-        for name in [
-            "audit", "commit", "fix", "perf", "plan", "release", "review", "sweep", "test", "tidy",
-            "todo",
-        ] {
-            assert!(s.contains(&format!("\n- {name} — ")), "{name} is listed");
+        for skill in crate::builtin_skills() {
+            assert!(
+                s.contains(&format!("\n- {} — ", skill.name)),
+                "{} is listed",
+                skill.name
+            );
         }
     }
 

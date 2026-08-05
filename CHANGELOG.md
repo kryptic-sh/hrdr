@@ -343,6 +343,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   back is what was typed, before any `@file` mention was expanded into it, so
   the sentence is editable rather than a file dump; submitting expands it again.
 
+### Added
+
+- **New `:deps` skills: a generic dependency-update runner plus one run book per
+  package manager.** `:deps` walks a project: identify the manager, update the
+  lockfile within the current constraints, decide on constraint bumps,
+  regenerate and commit the lockfile with the manifest, fix the code the bumps
+  break, and run the project's whole gate. `:deps_cargo`, `:deps_npm`,
+  `:deps_pnpm`, `:deps_yarn`, `:deps_bun`, `:deps_uv`, `:deps_poetry`,
+  `:deps_pip`, `:deps_go`, `:deps_composer` and `:deps_bundler` each hold the
+  exact commands, frozen-lockfile gate, verification and gotchas for that
+  manager, checked against the current upstream docs.
+
+- **Built-in skills are registered by `build.rs`, not by hand.** Each `*.md` in
+  `crates/hrdr-agent/src/templates/skills/` is baked into the binary by a
+  generated registry — adding a built-in skill is adding a file, with no
+  `BUILTIN_*` constant or wiring to edit. The tests that pinned the old
+  hand-written list now read the same directory the codegen reads, so they
+  follow additions automatically instead of breaking on them.
+
 ### Changed
 
 - **The live "generating" line wraps by section on narrow terminals.** The
