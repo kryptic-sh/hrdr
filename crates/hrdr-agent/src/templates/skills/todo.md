@@ -17,3 +17,13 @@ changed in this session — and report what remains to be done.
 4. Each entry: one sentence describing the item and its current state. No
    speculation, no filler — only what the context actually says.
 5. If nothing is left, say so plainly.
+6. Route the list by where you're working:
+   - **Inside a git repo with a `docs/backlog.md`** → add to `docs/backlog.md`
+     every item that is not already in it (backlog.md is the single work-item
+     file — do not create a sibling file, and do not duplicate an item the file
+     already records; follow its conventions: symbol names, not line numbers,
+     and delete an entry once the item is done).
+   - **Inside a git repo without `docs/backlog.md`** → append the list to
+     `backlog.md` at the repo root (creating the file if needed).
+   - **Not inside a git repo** (working on something git doesn't track) → do NOT
+     write to disk.
