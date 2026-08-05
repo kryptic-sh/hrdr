@@ -2140,6 +2140,33 @@ fn inner_width(width: usize) -> u16 {
     width.saturating_sub(BLOCK_PAD_X * 2).max(1) as u16
 }
 
+/// Truncate `s` to `max_w` display columns, appending `…` when cut — the
+/// width-aware counterpart of [`hrdr_tools::truncate_inline`] (which counts
+/// characters). Newlines are collapsed to spaces first, as inline previews
+/// must be one line. The renderer measures columns, so a char-count cut can
+/// still wrap when the text holds wide characters. The ellipsis is reserved: a
+/// cut string is at most `max_w` columns wide, never `max_w + 1`, and a wide
+/// character is never split.
+fn truncate_to_width(s: &str, max_w: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.width() <= max_w {
+        return s;
+    }
+    // At most `max_w - 1` columns of text, then the `…` that says it was cut.
+    let text_w = max_w.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > text_w {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    format!("{out}…")
+}
+
 /// Wrap `body` (built at [`inner_width`]) in the shared block chrome: a blank
 /// padded row above and below, and one padded column either side, all filled
 /// with `bg`. Empty bodies render nothing.
@@ -3045,10 +3072,15 @@ fn tool_lines(
             _ => disp.headline.clone(),
         };
         // The mark + name + spaces already consume part of the line; truncate
-        // the summary to what remains so the collapsed line never wraps.
-        let prefix_w = mark.0.chars().count() + 1 + name.chars().count() + 1;
+        // the summary to what remains so the collapsed line never wraps. By
+        // DISPLAY WIDTH, not char count: `wrap_spans` measures columns, so a
+        // summary of wide characters could exceed `inner` even when its char
+        // count fits. And the budget reserves the `…` that gets tacked on when
+        // the text is cut — without that, a truncated line lands at
+        // `inner + 1` columns and wraps onto a second row anyway.
+        let prefix_w = mark.0.width() + 1 + name.width() + 1;
         let budget = usize::from(inner).saturating_sub(prefix_w);
-        let summary = hrdr_tools::truncate_inline(&summary, budget);
+        let summary = truncate_to_width(&summary, budget.saturating_sub(1));
         return vec![Line::from(mark_name(&summary))];
     }
     let header = mark_name(&disp.headline);
@@ -4280,6 +4312,84 @@ mod block_tests {
             row.chars().count() <= 40,
             "the collapsed line fits its width: {row}"
         );
+    }
+
+    /// A command longer than the line truncates to the line's width — and the
+    /// `…` is reserved inside that budget, so the collapsed row is still one
+    /// line. Regression: the cut used to be char-budgeted with the ellipsis on
+    /// top, landing the row at `inner + 1` columns and wrapping it onto a
+    /// second row.
+    #[test]
+    fn a_long_command_clips_to_the_line_width_and_stays_one_line() {
+        let t = Theme::default();
+        let long = "cd /very/long/path && rg --glob '*.rs' --type rust something ".repeat(4);
+        assert!(long.len() > 200, "precondition: a long command");
+        let lines = tool_lines(
+            &t,
+            "shell",
+            &format!(r#"{{"command":"{long}"}}"#),
+            "output",
+            true,
+            true,
+            false,
+            "",
+            40,
+        );
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows.len(), 1, "one line, no wrap: {rows:?}");
+        let row = &rows[0];
+        assert!(row.ends_with('…'), "the cut is marked: {row}");
+        assert!(
+            row.width() <= 40,
+            "the collapsed line fits the render width: {row}"
+        );
+    }
+
+    /// Wide characters count by COLUMN, not by character: a summary of 2-column
+    /// glyphs would fit a char-count budget and still wrap. The clip must keep
+    /// the rendered row inside the width regardless.
+    #[test]
+    fn a_wide_summary_clips_by_columns_not_characters() {
+        let t = Theme::default();
+        // 30 two-column CJK glyphs: 30 chars but 60 columns.
+        let wide = "倉".repeat(30);
+        let lines = tool_lines(
+            &t,
+            "read",
+            &format!(r#"{{"path":"{wide}"}}"#),
+            "",
+            true,
+            true,
+            false,
+            "",
+            40,
+        );
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows.len(), 1, "one line, no wrap: {rows:?}");
+        assert!(
+            rows[0].width() <= 40,
+            "the collapsed line fits the render width: {:?}",
+            rows
+        );
+        assert!(rows[0].ends_with('…'), "the cut is marked");
+    }
+
+    /// `truncate_to_width` never exceeds the budget: an exact fit stays whole,
+    /// a cut is at most `max_w` columns wide (text + `…`), and a wide glyph at
+    /// the boundary is dropped whole rather than split.
+    #[test]
+    fn truncate_to_width_never_exceeds_the_budget() {
+        assert_eq!(truncate_to_width("abc", 3), "abc", "exact fit is whole");
+        assert_eq!(truncate_to_width("abc", 10), "abc", "room to spare");
+        let cut = truncate_to_width("abcdef", 3);
+        assert_eq!(cut, "ab…", "text up to max-1, then the ellipsis");
+        assert_eq!(cut.width(), 3);
+        // A wide glyph that would bust the row is dropped whole, not split.
+        let cut = truncate_to_width("ab倉c", 3);
+        assert_eq!(cut, "ab…", "the 2-column glyph does not half-fit");
+        assert_eq!(cut.width(), 3);
+        // A zero budget still marks the cut.
+        assert_eq!(truncate_to_width("abc", 0), "…");
     }
 
     /// A collapsed tool call is one line — the first detail row summarized and

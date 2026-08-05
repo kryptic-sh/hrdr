@@ -543,6 +543,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A collapsed tool call is exactly one line.** The one-line summary was cut to
+  a char budget with the `…` on top of it, so a truncated command landed at
+  `width + 1` columns and wrapped onto a second row. The clip now measures
+  display columns (wide characters count double, as the renderer measures them)
+  and reserves the ellipsis inside the budget, so every tool line except `edit`
+  renders on one row no matter how long or how wide its params are. Expanding
+  still shows the whole params and the full output.
+
 - **Click-drag copy no longer includes the `┃` border or block padding.** The
   selectable transcript rect started at the block's left edge, where a user row
   draws its `┃` — so a drag across a user prompt (or any multi-row selection)
