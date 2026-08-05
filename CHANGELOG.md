@@ -63,7 +63,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A hidden thought folds behind a summary entry instead of disappearing.**
   With thinking folded (`/verbose off`, the default), a thought reads
-  `⠋ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
+  `⣾ Thinking for 12s` while it streams and `✓ Thought for 1m 32s · 2m ago` once
   it settles — the same spinner/check marks a tool group's summary uses.
   Clicking the summary opens the full thought; clicking again folds it back.
 
@@ -77,22 +77,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `edit`/`replace` call or a visible entry (a user prompt, rendered text or
   reasoning, stats, a notice) breaks a run.
 
-- **Expanding a tool group's summary renders its calls inside it as padded child
-  boxes.** The summary keeps its header — its first row, with one blank row
-  beneath it so the first call never sits flush against it — and the calls fan
-  out below, each a box with its own top and bottom padding and only the calls
-  carrying a background; the summary section itself reads on the page like a
-  thought or the model's output. A blank row on the page precedes each box — the
-  separation between the surfaces, before the box's tint starts.
+- **Expanding a tool group's summary renders each call below it as an ordinary
+  tool block — the same rendering every tool call uses.** The summary is its own
+  block on the page background, like a thought or the model's output; expanded,
+  the calls fan out beneath it, each carrying the same padding and tint as a
+  standalone call, with the page blank between blocks. The summary click is the
+  only group toggle — clicking a call toggles just that call, and the padding
+  gaps between the boxes do nothing.
 
   A settled call renders as a _preview_ capped at the same size as a running
   call's live preview: the tail of the result (the newest output) for most
   tools, the head for a mutation (`edit`/`replace`/`write`, where the change is
-  at the front), with a `⋮` marker where it was cut. Clicking a call's preview
-  expands that one call to its full body; clicking the full body folds it back.
-  Clicking the padding gaps between the boxes — not a call, not the summary —
-  folds the whole group back to its summary line. `verbose` shows every call in
-  full at once.
+  at the front), with a `⋮` marker where it was cut. A call whose output fits
+  the preview renders in full with nothing to toggle; a longer one's body
+  toggles it between preview and full. `verbose` shows every call in full at
+  once.
 
 - **A summary update rewrites only its own row.** A tool group counting up as
   new calls join, or a thought settling from `Thinking` to `Thought`, changes
@@ -174,7 +173,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A `verify` run reads as `ran verify tool`, not `verify 1`.** The verify tool
   is one named action the user asks for, so its summary section names it instead
   of counting it: `✓ ran verify tool` once it settles (and `ran 2 verify tools`
-  for a run that called it again), `⠋ running verify tool` while it streams.
+  for a run that called it again), `⣾ running verify tool` while it streams.
 
 - **`/compact` no longer posts a "compacting conversation…" notice.** The
   spinner loader line — the one that replaces the generating message — already
@@ -182,6 +181,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs, so the notice was the same information twice in two places.
 
 ### Fixed
+
+- **Clicking a streaming thought's summary keeps it open as it streams.** The
+  open state was keyed by the thought's content hash, which changes with every
+  streamed token — the next chunk silently folded the thought back to its
+  summary. It now keys on the entry's transcript index.
 
 - **Per-minute rate limits are retried again, not treated as spent billing
   caps.** A 429/5xx whose body said "quota" — Google's canonical "Quota exceeded

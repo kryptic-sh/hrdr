@@ -488,11 +488,10 @@ pub(crate) struct App {
     /// invalidate the `@file` index. `None` when no watcher could be
     /// established — completion then refreshes only on cwd changes.
     file_watcher: Option<notify::RecommendedWatcher>,
-    /// Whether to render the model's reasoning (`<think>`) blocks in full
-    /// (`/verbose on`; otherwise a folded summary entry).
-    pub(crate) show_reasoning: bool,
     /// Show every tool result in full (`/verbose on`); per-entry `expanded`
-    /// overrides this for individual results.
+    /// overrides this for individual results. `verbose` also renders the
+    /// model's reasoning blocks in full — there is no separate thinking
+    /// toggle.
     pub(crate) verbose: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
@@ -618,9 +617,12 @@ pub(crate) struct App {
     pub(crate) tool_open: std::collections::HashSet<String>,
     /// Thinking entries the reader opened while reasoning is hidden: a
     /// collapsed `✓ Thought for 1m 32s · 2m ago` summary shows its full block
-    /// instead. Keyed by the entry's content hash (reasoning entries carry no
-    /// id); `verbose` (via `/verbose on`) shows every thought at once.
-    pub(crate) thinking_open: std::collections::HashSet<u64>,
+    /// instead. Keyed by the entry's transcript index — not its content hash,
+    /// which changes as a streaming thought's text grows and would silently
+    /// fold the open thought back on the next token; indices are stable for a
+    /// session (nothing truncates the transcript). `verbose` (via `/verbose on`)
+    /// shows every thought at once.
+    pub(crate) thinking_open: std::collections::HashSet<usize>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
     /// Shared registry of *detached background* sub-agents (a clone of the
@@ -816,7 +818,6 @@ impl App {
             file_index_building: false,
             file_index_dirty: false,
             file_watcher: None,
-            show_reasoning: false,
             verbose: false,
             pending_edit: None,
             model_selector: None,
@@ -1788,7 +1789,6 @@ impl App {
                 crate::ui::RowHit::ToggleDoneTodos => {
                     self.show_done_todos = !self.show_done_todos;
                 }
-                crate::ui::RowHit::ToggleToolGroup(head) => self.toggle_tool_group_at(head, row),
                 crate::ui::RowHit::ToggleToolCall(idx) => self.toggle_tool_call_at(idx, row),
             }
             return;
@@ -1815,11 +1815,11 @@ impl App {
         self.pending_scroll_row = Some(rect.y);
         let transcript = self.panes.active_transcript();
         // A hidden thought's summary toggles its own expansion, keyed by the
-        // entry's content hash (reasoning entries carry no id).
+        // entry's transcript index (its content hash moves as the text
+        // streams, which would un-key an open thought mid-stream).
         if let EntryKind::Reasoning { .. } = &transcript[hit].kind {
-            let hash = transcript[hit].content_hash;
-            if !self.thinking_open.remove(&hash) {
-                self.thinking_open.insert(hash);
+            if !self.thinking_open.remove(&hit) {
+                self.thinking_open.insert(hit);
             }
             return;
         }
@@ -1841,25 +1841,6 @@ impl App {
         // The group's height is about to change; the group chunk's top is the
         // same chunk the click landed on.
         self.pending_scroll_entry = Some(head);
-    }
-
-    /// A click on a tool group's summary section (or a padding gap between its
-    /// calls): fold or fan out the whole group, keyed by the group head's
-    /// tool-call id, holding the chunk steady on its current screen row.
-    fn toggle_tool_group_at(&mut self, head: usize, row: u16) {
-        let transcript = self.panes.active_transcript();
-        let Some(id) = transcript
-            .get(head)
-            .and_then(|e| crate::ui::tool_call_id(&e.kind))
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        self.pending_scroll_entry = Some(head);
-        self.pending_scroll_row = Some(row);
-        if !self.tool_groups.remove(&id) {
-            self.tool_groups.insert(id);
-        }
     }
 
     /// A click on one call inside a group (its preview, or its full body):

@@ -901,8 +901,8 @@ async fn multi_chunk_text_assembles_correctly() {
 #[tokio::test]
 async fn reasoning_entry_appended_to_transcript() {
     // A reasoning_content SSE delta lands as EntryKind::Reasoning alongside the
-    // normal EntryKind::Assistant — stored regardless of `show_reasoning` (the
-    // toggle only gates rendering, see the render test below).
+    // normal EntryKind::Assistant — stored regardless of `verbose` (the toggle
+    // only gates rendering, see the render test below).
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "I am thinking.".to_string(),
         text: "Done.".to_string(),
@@ -987,10 +987,7 @@ async fn reasoning_hidden_shows_a_summary_until_verbose() {
         text: "visible reply".to_string(),
     }])
     .await;
-    assert!(
-        !h.app.show_reasoning,
-        "show_reasoning must default to false"
-    );
+    assert!(!h.app.verbose, "verbose must default to false");
     h.submit("think aloud").await;
     assert!(!h.app.running());
     let screen = h.render();
@@ -1008,7 +1005,7 @@ async fn reasoning_hidden_shows_a_summary_until_verbose() {
     );
     // /verbose on shows the thinking in full — there is no separate toggle.
     h.submit("/verbose on").await;
-    assert!(h.app.show_reasoning, "/verbose on shows reasoning");
+    assert!(h.app.verbose, "/verbose on shows reasoning");
     let screen = h.render();
     assert!(
         screen.contains("secret thought"),
@@ -1016,7 +1013,7 @@ async fn reasoning_hidden_shows_a_summary_until_verbose() {
     );
     // /verbose off folds it back behind the summary.
     h.submit("/verbose off").await;
-    assert!(!h.app.show_reasoning, "/verbose off hides reasoning");
+    assert!(!h.app.verbose, "/verbose off hides reasoning");
     assert!(
         !h.render().contains("secret thought"),
         "reasoning leaked after /verbose off"
@@ -1084,16 +1081,16 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
     assert!(!h.app.verbose, "a bare /verbose flips back off");
     // /verbose owns the thinking display too: on shows it, off hides it.
     assert!(
-        !h.app.show_reasoning,
+        !h.app.verbose,
         "a bare /verbose flip-off also hides reasoning"
     );
     h.submit("/verbose on").await;
     assert!(
-        h.app.show_reasoning,
+        h.app.verbose,
         "/verbose on shows reasoning as well as tools"
     );
     h.submit("/verbose off").await;
-    assert!(!h.app.show_reasoning, "/verbose off hides reasoning again");
+    assert!(!h.app.verbose, "/verbose off hides reasoning again");
 }
 
 #[tokio::test]
@@ -2955,7 +2952,7 @@ async fn clear_and_new_take_a_session_name() {
     );
 }
 
-/// A thinking block is just the thought: no `⠋ Thinking` spinner, no
+/// A thinking block is just the thought: no `⣾ Thinking` spinner, no
 /// `Thought: 1.2s` footer. The dimmer text already says whose voice it is, and
 /// the loader above the input says a turn is running.
 ///
@@ -2968,7 +2965,7 @@ async fn a_thinking_block_renders_no_label() {
         text: "done".into(),
     }])
     .await;
-    h.app.show_reasoning = true; // this test renders the thought
+    h.app.verbose = true; // this test renders the thought in full
     h.submit("go").await;
 
     let reasoning = h
@@ -2997,7 +2994,7 @@ async fn a_thinking_block_renders_no_label() {
 
     // Streaming shows no spinner label either.
     let mut h2 = Harness::new(vec![]).await;
-    h2.app.show_reasoning = true; // this half renders the thought too
+    h2.app.verbose = true; // this half renders the thought too
     h2.app
         .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
@@ -3051,7 +3048,9 @@ async fn an_empty_text_delta_opens_no_entry() {
 /// the summary section.
 #[tokio::test]
 async fn a_lone_tool_block_hit_rect_tracks_its_header() {
-    let long_output: String = (0..5).map(|i| format!("line {i}\n")).collect();
+    // Long enough that the call's preview differs from its full body — a small
+    // call renders in full with nothing to toggle.
+    let long_output: String = (0..12).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
@@ -3096,8 +3095,9 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
         "the tool hit rect misses the summary at row {summary_y}"
     );
 
-    // Expand: the same group chunk now contains the tool's own header, and the
-    // taller hit rect covers it.
+    // Expand: the call renders below the summary as its own block. Its body is
+    // togglable, so a row hit covers the call's own header — a click there
+    // lands on the call, not the summary.
     click_at(&mut h.app, 2, summary_y);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
@@ -3114,14 +3114,14 @@ async fn a_lone_tool_block_hit_rect_tracks_its_header() {
         .expect("tool header rendered after expansion");
     let (rect, _) = h
         .app
-        .tool_hits
+        .row_hits
         .iter()
         .copied()
         .find(|(r, _)| r.contains(2, header_y))
-        .expect("a tool hit rect on the header");
+        .expect("a row hit on the call's header");
     assert!(
         rect.contains(2, header_y),
-        "the tool hit rect misses the tool header at row {header_y}"
+        "the row hit misses the tool header at row {header_y}"
     );
 }
 
@@ -3463,14 +3463,25 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
         modifiers: crossterm::event::KeyModifiers::empty(),
     };
 
-    // Press on the tool summary row, drag two cells along it, release.
-    h.app
-        .on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, rect.y));
-    h.app
-        .on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, rect.y));
+    // Press on the tool summary row, drag two cells along it, release. (The
+    // summary block's first row is its top pad; the text sits one row down.)
+    let summary_row = rect.y + 1;
+    h.app.on_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        2,
+        summary_row,
+    ));
+    h.app.on_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        12,
+        summary_row,
+    ));
     assert!(h.app.selection.is_some(), "the drag started a selection");
-    h.app
-        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, rect.y));
+    h.app.on_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        12,
+        summary_row,
+    ));
     assert!(h.app.pending_copy, "releasing a drag queues the copy");
     assert!(
         h.app.tool_groups.is_empty(),
@@ -3799,7 +3810,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
         })
     };
     let mut h = Harness::new(vec![]).await;
-    h.app.show_reasoning = true; // the "thought" row is an anchor below
+    h.app.verbose = true; // the "thought" row is an anchor below
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
@@ -3880,7 +3891,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
 #[tokio::test]
 async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     let mut h = Harness::new(vec![]).await;
-    h.app.show_reasoning = true; // the "thinking here" row is an anchor below
+    h.app.verbose = true; // the "thinking here" row is an anchor below
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
@@ -4254,7 +4265,7 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
         "the settled summary keeps the merged sections:\n{settled}"
     );
     assert!(
-        !settled.contains("⠋"),
+        !settled.contains("⣾"),
         "settling folds the live preview:\n{settled}"
     );
 }
@@ -4422,7 +4433,7 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
 }
 
 /// A hidden thought's summary updates in place too: settling from
-/// `⠋ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
+/// `⣾ Thinking for 1s` to `✓ Thought for 1m 32s · now` rewrites the summary
 /// row and nothing else, so the render cannot jump while the thought finishes.
 #[tokio::test]
 async fn a_thinking_summary_update_rewrites_only_its_own_row() {
@@ -4524,7 +4535,53 @@ async fn a_hidden_thought_folds_behind_a_summary_and_expands_on_click() {
     );
 }
 
-/// While a thought is still streaming it reads `⠋ Thinking for 1s` with the
+/// Clicking a *streaming* thought's summary opens it and keeps it open as more
+/// tokens arrive. Its content hash changes with every chunk, so the open state
+/// keys on the entry's index — keyed on the hash, the next token would silently
+/// fold the open thought back to its summary.
+#[tokio::test]
+async fn an_open_streaming_thought_stays_open_as_it_streams() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::now(EntryKind::Reasoning {
+        text: "the first words".into(),
+        took_ms: None,
+    }));
+    h.app.push_entry(Entry::assistant("the answer"));
+
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let summary_row =
+        screen_row_of(&term, "Thinking for").expect("the streaming summary on screen");
+    click_at(&mut h.app, 2, summary_row);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        buffer_to_string(term.backend().buffer()).contains("the first words"),
+        "clicking opens the streaming thought"
+    );
+
+    // More tokens arrive: the text grows and the content hash changes.
+    h.app.transcript_mut().iter_mut().for_each(|e| {
+        if let EntryKind::Reasoning { text, .. } = &mut e.kind {
+            text.push_str(", and more words keep coming");
+            e.refresh_hash();
+        }
+    });
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("and more words keep coming"),
+        "the streamed text renders:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thinking for"),
+        "the thought stays open — no summary, no auto-close:\n{screen}"
+    );
+}
+
+/// While a thought is still streaming it reads `⣾ Thinking for 1s` with the
 /// loader mark and no age; once it settles the mark becomes ✓ and the summary
 /// reads `✓ Thought for 1m 32s · now` — the same verb change and marks a tool
 /// group's summary uses.
@@ -5090,10 +5147,14 @@ async fn edit_and_replace_break_the_group_into_standalone_entries() {
 #[tokio::test]
 async fn visible_entries_bound_a_tool_group() {
     let mut h = Harness::new(vec![]).await;
-    h.app.show_reasoning = true;
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // Open both thoughts so they render as visible entries — without
+    // `/verbose`, which would also expand the tool group and push the summary
+    // off a 40-row viewport.
+    h.app.thinking_open.insert(0);
+    h.app.thinking_open.insert(10);
     let tool = |id: &str, name: &str| {
         Entry::now(EntryKind::Tool {
             id: id.into(),
@@ -5261,35 +5322,47 @@ async fn tool_runs_merge_across_invisible_turn_markers() {
 
 /// Expanding or collapsing a tool group while following the newest output must
 /// not scroll away from the bottom: the view is already pinned there, and
-/// there's nothing to keep in place.
+/// there's nothing to keep in place. (The summary is the only group toggle —
+/// clicking a call toggles just that call — so the group must stay in view for
+/// the collapse half.)
 #[tokio::test]
 async fn collapsing_while_following_stays_at_the_bottom() {
-    let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
-    h.app.push_entry(Entry::now(EntryKind::Tool {
-        id: "c1".into(),
-        name: "shell".into(),
-        args: r#"{"command":"ls"}"#.into(),
-        result: long,
-        ok: true,
-        done: true,
-    }));
+    // Filler so the transcript overflows the viewport — "following" is real.
+    for i in 0..8 {
+        h.app
+            .push_entry(Entry::assistant(format!("filler {i}\nline\nline\nline")));
+    }
+    let tool = |id: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: "shell".into(),
+            args: "{}".into(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        })
+    };
+    // The group sits at the bottom; its expanded calls fit, so the summary
+    // stays on screen while following.
+    h.app.push_entry(tool("a"));
+    h.app.push_entry(tool("b"));
 
     let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert_eq!(h.app.scroll_offset, 0, "following the newest output");
 
-    // The lone call is folded behind its summary; expand it, then fold it back
-    // — either way the view stays pinned to the bottom.
+    // Expand, then fold it back — either way the view stays pinned to the
+    // bottom.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     click_at(&mut h.app, 2, rect.y);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert_eq!(h.app.scroll_offset, 0, "still following after expanding");
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
-    click_at(&mut h.app, 2, rect.y + 1);
+    click_at(&mut h.app, 2, rect.y);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert_eq!(h.app.scroll_offset, 0, "still following after collapsing");
 }
@@ -6074,7 +6147,7 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     // The rule, then the rest of the left padding, then the content. The
     // status mark leads — the in_progress marker is a braille SPINNER frame
     // (first frame at t≈0) — before the item's stable `#N` reference.
-    let first_frame = "⠋";
+    let first_frame = "⣾";
     assert!(
         row(text_y).starts_with(&format!(
             "{} {first_frame} #0 ship it",

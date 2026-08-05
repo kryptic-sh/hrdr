@@ -136,14 +136,12 @@ impl super::App {
         match mode {
             hrdr_app::ExpandMode::All => {
                 self.verbose = true;
-                self.show_reasoning = true;
                 hrdr_app::expand_msg::ALL.to_string()
             }
             hrdr_app::ExpandMode::Off => {
                 self.verbose = false;
                 self.tool_groups.clear();
                 self.thinking_open.clear();
-                self.show_reasoning = false;
                 hrdr_app::expand_msg::OFF.to_string()
             }
         }

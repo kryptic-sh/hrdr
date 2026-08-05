@@ -973,13 +973,8 @@ fn draw_chunks(
     let mut row_hits = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         // A live panel's rows: each one is a single screen row, one below the
-        // block's top padding row. A chunk whose hits count from its first row
-        // (the tool-group chunk, whose summary is row 0) maps without that pad.
-        let base = if c.hits_from_first_row {
-            cum[i]
-        } else {
-            cum[i] + 1
-        };
+        // block's top padding row.
+        let base = cum[i] + 1;
         for (row, hit) in &c.row_hits {
             let at = base + row;
             if (scroll_us..view_end).contains(&at) {
@@ -1247,7 +1242,9 @@ fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hr
     Some((lines, ids))
 }
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The 8-dot braille spinner: a filled block sweeping around all eight dots —
+/// not the 6-dot circle the old frames traced.
+const SPINNER: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 /// Spinner frame period in milliseconds. The redraw ticker in [`tui`] uses the
 /// same value so the animation and the draw loop stay in sync.
 pub(crate) const SPINNER_FRAME_MS: u64 = 120;
@@ -1445,7 +1442,6 @@ fn panel(
             rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
             tool_idx: None,
             row_hits: hits,
-            hits_from_first_row: false,
         },
     ]
 }
@@ -1889,7 +1885,7 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
 
 /// Cache key for an entry's rendered *body* — the markdown/tool render, before
 /// the block chrome around it.
-/// Fields: (content_fingerprint, render_width, expand_all, show_reasoning,
+/// Fields: (content_fingerprint, render_width, verbose, full_reasoning,
 /// full_body). The last distinguishes a grouped call's preview (tail/head
 /// truncation) from its full body — the two share a cache slot otherwise.
 type BodyKey = (u64, u16, bool, bool, bool);
@@ -2445,11 +2441,6 @@ struct Chunk<'a> {
     /// this — they ride in the transcript, so their click targets scroll like
     /// everything else.
     row_hits: Vec<(usize, RowHit)>,
-    /// Whether [`row_hits`](Self::row_hits) row indices count from the chunk's
-    /// very first row, instead of from the first row inside its chrome top pad
-    /// (the default, which `draw_chunks` maps with a `+1`). The tool-group
-    /// chunk has no chrome pad — its summary IS row 0 — so it sets this.
-    hits_from_first_row: bool,
 }
 
 impl<'a> Chunk<'a> {
@@ -2459,7 +2450,6 @@ impl<'a> Chunk<'a> {
             rows,
             tool_idx,
             row_hits: Vec::new(),
-            hits_from_first_row: false,
         }
     }
 }
@@ -2471,9 +2461,6 @@ pub(crate) enum RowHit {
     Agent(hrdr_app::PaneId),
     /// Unfold (or fold) the finished TODO items.
     ToggleDoneTodos,
-    /// Toggle a tool group's expansion — the summary section, or a gap between
-    /// its calls. Carries the group head's transcript index.
-    ToggleToolGroup(usize),
     /// Expand or collapse one call inside a group (its preview → full body, or
     /// back). Carries the call's transcript index.
     ToggleToolCall(usize),
@@ -2537,6 +2524,11 @@ struct PendingBlock<'a> {
     /// The body's cache key, extended with the chrome hash to key the block.
     body_key: BodyKey,
     tool_idx: Option<usize>,
+    /// What a click on one of this block's *content* rows does, by body-row
+    /// index (0 = the first content row, below the chrome top pad). Only the
+    /// grouped-call blocks use this: their body rows toggle the call between
+    /// its preview and full output. The chrome pads around them have no hits.
+    row_hits: Vec<(usize, RowHit)>,
     /// How many numbered messages start at this block. Usually 1 (or 0 for blocks
     /// that aren't messages); a block carrying a lent assistant label counts that
     /// message too.
@@ -2641,7 +2633,11 @@ fn flush<'a>(
     for _ in 0..msgs {
         msg_at.push(chunks.len());
     }
-    chunks.push(Chunk::plain(rows, tool_idx));
+    chunks.push(Chunk {
+        rows,
+        tool_idx,
+        row_hits: block.row_hits,
+    });
     if separate {
         chunks.push(separator());
     }
@@ -2699,11 +2695,13 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         let frame = SPINNER[frame_idx as usize % SPINNER.len()];
         // Tool groups: collapsible calls — everything but `edit`/`replace`,
         // which always render and never group — collapse behind one
-        // `{mark} called N tools · ran 2 commands` summary line, even for a
-        // group of one. The group's first call heads it; the summary header
-        // chunk always opens the group (it is the control that collapses it
-        // back), and the calls render as child items inside it when the group
-        // is expanded. Only an `edit`/`replace` or a visible entry (a user
+        // `{mark} ran 2 commands · read 1 file` summary line, even for a group
+        // of one. The summary renders as its own block on the page, like a
+        // thought or the model's output, and clicking it toggles the calls'
+        // visibility: expanded, every call renders below it as an ordinary
+        // tool block — the same path every tool call uses — and a collapsed
+        // group with a call still running shows that call's live preview the
+        // same way. Only an `edit`/`replace` or a visible entry (a user
         // prompt, rendered text or reasoning, stats, a notice) breaks a run —
         // so tool calls that stream in after an invisible turn marker merge
         // into the group that is already open.
@@ -2713,15 +2711,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 let end = tool_group_end(transcript, i);
                 let id = tool_call_id(&entry.kind).unwrap_or_default();
                 let expanded = app.verbose || app.tool_groups.contains(id);
-                // An untinted follower (an assistant block, a thought, more
-                // text) brings its own top pad; drop the section's bottom pad
-                // so the two don't stack into a double blank under the
-                // summary.
-                let drop_bottom = transcript
-                    .get(end)
-                    .is_some_and(|e| !entry_is_tinted(&e.kind));
+                let tool_bg = BlockKind::Tool.bg(theme);
                 // Absorbed empty-assistant turns still count as messages (for
-                // `/find` jumps to them), landing on the group chunk.
+                // `/find` jumps to them), landing on the summary block.
                 let mut absorbed = 0usize;
                 for e in &transcript[i..end] {
                     if let EntryKind::Assistant(text) = &e.kind
@@ -2734,28 +2726,71 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                     &mut chunks,
                     &mut msg_at,
                     pending.take(),
-                    Some(BlockKind::Tool.bg(theme)),
+                    Some(Color::Reset), // the summary reads on the page
                     w,
                     theme,
                 );
-                for _ in 0..absorbed {
-                    msg_at.push(chunks.len());
+                // The summary block opens the group; the visible calls follow
+                // it as their own blocks.
+                let members = &transcript[i..end];
+                pending = Some(tool_group_summary_block(app, members, i, w, frame));
+                // Which calls are visible: every call when expanded, otherwise
+                // only the newest running one, streaming its live preview.
+                let mut visible: Vec<usize> = Vec::new();
+                if expanded {
+                    visible = members
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| is_groupable_tool(&m.kind))
+                        .map(|(j, _)| i + j)
+                        .collect();
+                } else if let Some(live) = members.iter().enumerate().rev().find_map(|(j, m)| {
+                    matches!(&m.kind, EntryKind::Tool { done: false, .. }).then_some(j)
+                }) {
+                    visible.push(i + live);
                 }
-                chunks.push(tool_group_chunk(
-                    app,
-                    &transcript[i..end],
-                    i,
-                    w,
-                    GroupFrame {
-                        frame,
-                        frame_idx,
-                        expanded,
-                        drop_bottom,
-                    },
-                ));
-                // The summary section is untinted, so it needs no separator
-                // against a following tinted block — the blank rows either
-                // side read as the page, like a thought or an output block.
+                // The summary chunk's index is where the group's absorbed turns
+                // jump to; it is the first chunk the visible calls' flushes
+                // emit, so capture it there, or force it out when none render.
+                let mut summary_chunk: Option<usize> = None;
+                for j in visible {
+                    flush(
+                        &mut chunks,
+                        &mut msg_at,
+                        pending.take(),
+                        Some(tool_bg),
+                        w,
+                        theme,
+                    );
+                    if summary_chunk.is_none() {
+                        summary_chunk = Some(chunks.len().saturating_sub(1));
+                    }
+                    pending = Some(tool_call_block(app, &transcript[j], j, w, frame, frame_idx));
+                }
+                if summary_chunk.is_none() {
+                    // No calls visible: flush the summary so the absorbed
+                    // turns have a chunk to land on; its follower decides its
+                    // bottom padding.
+                    let follower_bg = transcript.get(end).map(|e| {
+                        if entry_is_tinted(&e.kind) {
+                            tool_bg
+                        } else {
+                            Color::Reset
+                        }
+                    });
+                    flush(
+                        &mut chunks,
+                        &mut msg_at,
+                        pending.take(),
+                        follower_bg,
+                        w,
+                        theme,
+                    );
+                    summary_chunk = Some(chunks.len().saturating_sub(1));
+                }
+                for _ in 0..absorbed {
+                    msg_at.push(summary_chunk.unwrap());
+                }
                 group_members_end = Some(end);
                 continue;
             }
@@ -2779,22 +2814,20 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // A hidden thought the reader opened (`thinking_open`) renders its full
         // block — the same rows `/verbose on` shows — so its lazy-height slot
         // must not collide with the collapsed summary's. The last key element
-        // doubles as "this reasoning block renders in full": `show_reasoning`
-        // covers every block at once, `reasoning_open` one at a time.
+        // doubles as "this reasoning block renders in full": `verbose` covers
+        // every block at once, `reasoning_open` one at a time.
         let reasoning_open = matches!(
             &entry.kind,
-            EntryKind::Reasoning { .. }
-                if !app.show_reasoning && app.thinking_open.contains(&entry.content_hash)
+            EntryKind::Reasoning { .. } if !app.verbose && app.thinking_open.contains(&i)
         );
         // A hidden thought is always clickable — collapsed, clicking it opens
         // the block; open, clicking it folds it back.
-        let thinking_hidden =
-            matches!(&entry.kind, EntryKind::Reasoning { .. } if !app.show_reasoning);
+        let thinking_hidden = matches!(&entry.kind, EntryKind::Reasoning { .. } if !app.verbose);
         let ck: BodyKey = (
             base_hash,
             width,
             app.verbose,
-            app.show_reasoning || reasoning_open,
+            app.verbose || reasoning_open,
             // Standalone blocks (edit/replace, which never group) always render
             // in full; only a grouped call's chunk toggles preview vs full.
             true,
@@ -2855,7 +2888,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // Animated because the mark and the clock tick every frame, but
             // its height is stable at any width, so `lazy_height` still places
             // the viewport without building the block it can't see.
-            EntryKind::Reasoning { text, took_ms, .. } if !app.show_reasoning => {
+            EntryKind::Reasoning { text, took_ms, .. } if !app.verbose => {
                 let body = BodySource::Animated(Box::new(move || {
                     if reasoning_open {
                         // The full thought: the same dimmed markdown a
@@ -2872,7 +2905,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 }));
                 (BlockKind::Reasoning, body)
             }
-            // No `⠋ Thinking` / `Thought: 1.2s` label: the dimmer text already
+            // No `⣾ Thinking` / `Thought: 1.2s` label: the dimmer text already
             // says it's the model thinking, and the loader above the input shows
             // that a turn is running. (`took_ms` is still recorded — it's the
             // only trace of how long the model thought.)
@@ -2969,6 +3002,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             body_key: ck,
             tool_idx: (matches!(entry.kind, EntryKind::Tool { .. }) || thinking_hidden)
                 .then_some(i),
+            row_hits: Vec::new(),
             msgs: msg_here,
         });
     }
@@ -3298,250 +3332,148 @@ fn human_duration(ms: u64) -> String {
     }
 }
 
-/// The per-frame state a tool-group chunk renders with: the spinner frame (and
-/// its index, which keys the running members' body cache so their marks
-/// animate), whether the group is expanded, and whether its bottom pad drops.
-#[derive(Clone, Copy)]
-struct GroupFrame {
-    frame: &'static str,
-    frame_idx: u64,
-    expanded: bool,
-    /// Drop the section's bottom pad when the entry after the group is
-    /// untinted — that entry's own top pad is then the one blank row between
-    /// them, instead of two.
-    drop_bottom: bool,
-}
-
-/// The block for a tool group: the summary section on the page background —
-/// the packed `{mark} called N tools · read 2 files` line(s) — and the calls
-/// below it. Expanded, every call renders as a padded box on the tool
-/// background, flush with the transcript's content column — each settled call
-/// as a preview (its tail, or its head for a mutation) until opened in full —
-/// while a collapsed group with a call still running streams that call's live
-/// preview below the summary and folds it back the moment it settles. The mark
-/// reflects the whole group — the spinner frame while any call runs, ✓/✗ by
-/// the group's outcome once it settles. Built fresh every frame (its content
-/// depends on the whole group, so the per-entry body cache cannot serve it).
-///
-/// Clicks are per row: the summary toggles the group, a call's rows toggle
-/// that one call between preview and full body, and the padding gaps between
-/// the boxes fold the group back to its summary. Hover hints on each row name
-/// what the click does.
-fn tool_group_chunk(
-    app: &App,
+/// The summary block of a tool group: the packed `{mark} ran 2 commands · read
+/// 1 file` line(s) on the page background, like a thought or the model's
+/// output. Clicking it toggles the group — expanded, the calls render below it
+/// as ordinary tool blocks; collapsed, they fold away. Built through the same
+/// block path as every other entry; its body is Animated because the mark and
+/// the counts change every frame, but its height is stable at any width.
+fn tool_group_summary_block<'a>(
+    app: &'a App,
     members: &[Entry],
     head_idx: usize,
     w: usize,
-    frame: GroupFrame,
-) -> Chunk<'static> {
+    frame: &'static str,
+) -> PendingBlock<'a> {
     let theme = &app.theme;
-    let bg = BlockKind::Tool.bg(theme);
-    // The summary section renders on the page background like thinking and
-    // output — only the child tool boxes carry a background (the tool's own),
-    // so the summary reads as part of the conversation, not a surface of its
-    // own.
-    let page = Color::Reset;
     let inner = usize::from(inner_width(w));
     let (sections, running, all_ok) = tool_group_summary(members);
-    let packed = pack_loader_segments(&sections, inner);
     let (mark, color) = if running {
-        (frame.frame, theme.warn)
+        (frame, theme.warn)
     } else if all_ok {
         ("✓", theme.success)
     } else {
         ("✗", theme.error)
     };
-    let dim = Style::default().fg(theme.dim).bg(page);
-
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut row_hits: Vec<(usize, RowHit)> = Vec::new();
-    // The summary line is the container's first row — no pad above it, and one
-    // blank row below it, so an expanded group's first tool call never sits
-    // flush against the summary.
-    for (i, text) in packed.into_iter().enumerate() {
-        let mut spans = Vec::new();
-        if i == 0 {
-            spans.push(Span::styled(
-                format!("{} ", mark),
-                Style::default().fg(color).bg(page),
-            ));
-        }
-        spans.push(Span::styled(text, dim));
-        for row in wrap_spans(spans, inner) {
-            rows.push(pad_row(row, w, page));
-        }
-    }
-    if frame.expanded {
-        // The children: one padded tool box per call, each on the normal tool
-        // background and flush with the transcript's own content column — the
-        // same padding as every other block. A blank row on the page precedes
-        // each box (the separation between the surfaces — the box's tint starts
-        // below it), and the box itself carries a top and bottom pad inside the
-        // tint. The summary above the first is separated by that first box's
-        // page blank.
-        //
-        // A settled call renders as a *preview* — its tail (the newest output,
-        // like a running call's live tail) or, for a mutation, its head — and
-        // expands to the full body only when opened (`tool_open`); `verbose`
-        // shows every call in full. Clicking a call's rows toggles that one
-        // call; clicking the padding gaps between the boxes folds the whole
-        // group back to its summary.
-        for (j, member) in members.iter().enumerate() {
-            let EntryKind::Tool {
-                id,
-                name,
-                args,
-                result,
-                ok,
-                done,
-                ..
-            } = &member.kind
-            else {
-                continue; // an absorbed empty-assistant turn renders nothing
-            };
-            let full = app.verbose || app.tool_open.contains(id);
-            // The body is cached per entry like a standalone tool's, so an
-            // unchanged call costs a refcount bump per frame, not a re-render
-            // (syntax highlighting included). Running calls key on the spinner
-            // frame, animating their mark; `full` keeps the preview and the
-            // full body in separate cache slots.
-            let body = cached_body(
-                head_idx + j,
-                (
-                    member.content_hash ^ if *done { 0 } else { frame.frame_idx + 1 },
-                    w as u16,
-                    app.verbose,
-                    app.show_reasoning,
-                    full,
-                ),
-                || {
-                    tool_lines(
-                        theme,
-                        name,
-                        args,
-                        result,
-                        ToolState {
-                            ok: *ok,
-                            done: *done,
-                            preview: !full,
-                            frame: frame.frame,
-                        },
-                    )
-                },
-            );
-            if body.is_empty() {
-                continue;
-            }
-            // The call's own rows, filled to the width on the tool background —
-            // content at the same column as every other transcript entry — with
-            // one page blank before the tint starts, then one blank row above
-            // and below the text for the box's padding.
-            rows.push(pad_row(Vec::new(), w, page));
-            let sep = rows.len() - 1;
-            row_hits.push((sep, RowHit::ToggleToolGroup(head_idx)));
-            rows.push(pad_row(Vec::new(), w, bg));
-            let gap = rows.len() - 1;
-            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            for row in body.as_ref().iter() {
-                rows.push(pad_row(row.spans.clone(), w, bg));
-                let r = rows.len() - 1;
-                row_hits.push((r, RowHit::ToggleToolCall(head_idx + j)));
-            }
-            rows.push(pad_row(Vec::new(), w, bg));
-            let gap = rows.len() - 1;
-            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-        }
-    } else if let Some((live, id, name, args, result, ok)) =
-        members.iter().enumerate().rev().find_map(|(j, m)| {
-            let EntryKind::Tool {
-                id,
-                name,
-                args,
-                result,
-                ok,
-                done,
-                ..
-            } = &m.kind
-            else {
-                return None;
-            };
-            (!*done).then_some((j, id, name, args, result, *ok))
-        })
-    {
-        // A running call streams its live preview below the summary — the same
-        // padded box an expanded child gets — so the newest output stays
-        // visible while the call runs, and it folds behind the summary the
-        // moment it settles. When several calls run at once, only the newest
-        // shows; the rest stay folded until they are the last one running.
-        // Clicking the preview toggles that one call to its full body; the
-        // padding around it toggles the group.
-        let full = app.verbose || app.tool_open.contains(id);
-        let body = cached_body(
-            head_idx + live,
-            (
-                members[live].content_hash ^ (frame.frame_idx + 1),
-                w as u16,
-                app.verbose,
-                app.show_reasoning,
-                full,
-            ),
-            || {
-                tool_lines(
-                    theme,
-                    name,
-                    args,
-                    result,
-                    ToolState {
-                        ok,
-                        done: false,
-                        preview: !full,
-                        frame: frame.frame,
-                    },
-                )
-            },
-        );
-        if !body.is_empty() {
-            rows.push(pad_row(Vec::new(), w, page));
-            let sep = rows.len() - 1;
-            row_hits.push((sep, RowHit::ToggleToolGroup(head_idx)));
-            rows.push(pad_row(Vec::new(), w, bg));
-            let gap = rows.len() - 1;
-            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-            for row in body.as_ref().iter() {
-                rows.push(pad_row(row.spans.clone(), w, bg));
-                let r = rows.len() - 1;
-                row_hits.push((r, RowHit::ToggleToolCall(head_idx + live)));
-            }
-            rows.push(pad_row(Vec::new(), w, bg));
-            let gap = rows.len() - 1;
-            row_hits.push((gap, RowHit::ToggleToolGroup(head_idx)));
-        }
-    }
-    // The section's own bottom padding, unless the follower brings its own.
-    if !frame.drop_bottom {
-        rows.push(pad_row(Vec::new(), w, page));
-    }
-    Chunk {
-        rows: ChunkRows::Ready(Rc::new(rows)),
+    let dim = Style::default().fg(theme.dim);
+    // The hash is the members' aggregate, so a call joining or settling
+    // re-measures the (stable) height; the rows themselves are rebuilt every
+    // frame the block is visible.
+    let members_hash = members.iter().map(|e| e.content_hash).fold(0, |a, h| a ^ h);
+    let body_key = (members_hash, w as u16, app.verbose, app.verbose, true);
+    let body = BodySource::Animated(Box::new(move || {
+        pack_loader_segments(&sections, inner)
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut spans = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled(
+                        format!("{} ", mark),
+                        Style::default().fg(color),
+                    ));
+                }
+                spans.push(Span::styled(text, dim));
+                Line::from(spans)
+            })
+            .collect()
+    }));
+    PendingBlock {
+        idx: head_idx,
+        kind: BlockKind::Assistant,
+        body,
+        lent: Vec::new(),
+        body_key,
         tool_idx: Some(head_idx),
-        row_hits,
-        // The summary is the chunk's first row — no chrome pad above it — so
-        // the hit rows are the chunk rows themselves.
-        hits_from_first_row: true,
+        row_hits: Vec::new(),
+        msgs: 0,
     }
 }
 
-/// Pad a line of spans to the full render width on `bg`, filling any span that
-/// didn't set its own background — the row-by-row form of [`render_block`] for
-/// rows a chunk assembles by hand (the tool-group summary's container).
-fn pad_row(spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
-    let mut spans = spans;
-    for span in &mut spans {
-        if span.style.bg.is_none() {
-            span.style = span.style.bg(bg);
-        }
+/// Whether a settled call's full output fits the preview cap. Such a call
+/// renders in full with nothing to expand or collapse — the preview and the
+/// full body are the same thing.
+fn tool_fits_preview(name: &str, args: &str, result: &str) -> bool {
+    // A mutation's body is its written content (from the args), not the result.
+    if let hrdr_app::ToolBody::Code { content, .. } = hrdr_app::tool_display(name, args).body {
+        return content.lines().count() <= TOOL_RESULT_PREVIEW_LINES;
     }
-    pad_line(spans, width, bg, None)
+    result.lines().count() <= TOOL_RESULT_PREVIEW_LINES
+}
+
+/// One tool call's block — the same path every tool block uses (cached body →
+/// [`tool_lines`] → the shared block chrome). A settled call whose output fits
+/// the preview renders in full with nothing to toggle; a longer one renders as
+/// a preview (the tail, or the head for a mutation) and its body rows toggle it
+/// to the full output and back.
+fn tool_call_block<'a>(
+    app: &'a App,
+    member: &'a Entry,
+    idx: usize,
+    w: usize,
+    frame: &'static str,
+    frame_idx: u64,
+) -> PendingBlock<'a> {
+    let theme = &app.theme;
+    let EntryKind::Tool {
+        id,
+        name,
+        args,
+        result,
+        ok,
+        done,
+        ..
+    } = &member.kind
+    else {
+        unreachable!("only tool members render as tool blocks");
+    };
+    let small = *done && tool_fits_preview(name, args, result);
+    let full = app.verbose || app.tool_open.contains(id) || small;
+    let body_key = (
+        member.content_hash ^ if *done { 0 } else { frame_idx + 1 },
+        w as u16,
+        app.verbose,
+        app.verbose,
+        full,
+    );
+    let body = cached_body(idx, body_key, || {
+        tool_lines(
+            theme,
+            name,
+            args,
+            result,
+            ToolState {
+                ok: *ok,
+                done: *done,
+                preview: !full,
+                frame,
+            },
+        )
+    });
+    // The body rows toggle the call between preview and full — whether it is
+    // currently a preview or already full — except when there is nothing to
+    // toggle: a small call (preview == full) or `verbose` (everything full).
+    // A running call's live tail is the same either way. The chrome pads
+    // around the body have no hits.
+    let togglable = *done && !small && !app.verbose;
+    let row_hits = if togglable {
+        body.iter()
+            .enumerate()
+            .map(|(r, _)| (r, RowHit::ToggleToolCall(idx)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    PendingBlock {
+        idx,
+        kind: BlockKind::Tool,
+        body: BodySource::Cached(body),
+        lent: Vec::new(),
+        body_key,
+        tool_idx: None,
+        row_hits,
+        msgs: 0,
+    }
 }
 
 /// Whether a tool's output is a *change* (a diff or written content), whose
@@ -3583,12 +3515,12 @@ struct ToolState {
 /// the tail of the file for `read`, plain output otherwise.
 ///
 /// A tool call has TWO display levels: folded behind its group's `called N
-/// tools` summary (the chunk [`tool_group_chunk`] renders) — while a running
-/// call's live preview shows in full below that summary — or rendered, either
-/// as a preview (a running call's live tail, or the head/tail of a finished
-/// call) or fully expanded: every detail and the whole result. `edit`/`replace`
-/// never group and always render in full. A finished call shows all of its
-/// result; a running one shows the live tail so the newest output stays
+/// tools` summary — the block [`tool_group_summary_block`] renders, with a
+/// running call's live preview below it — or rendered, either as a preview (a
+/// running call's live tail, or the head/tail of a finished call) or fully
+/// expanded: every detail and the whole result. `edit`/`replace` never group
+/// and always render in full. A finished call shows all of its result; a
+/// running one shows the live tail so the newest output stays
 /// visible.
 ///
 /// `preview` caps the result at [`TOOL_RESULT_PREVIEW_LINES`]: the tail for a
@@ -4444,6 +4376,7 @@ mod block_tests {
             lent: Vec::new(),
             body_key: (0, 10, false, false, true),
             tool_idx: None,
+            row_hits: Vec::new(),
             msgs: 0,
         }
     }
