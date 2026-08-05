@@ -379,7 +379,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Tool calls group behind a summary line — two expansion levels.** A run of
+- **Tool calls group behind a summary line — one expansion level.** A run of
   consecutive calls (everything but `edit`/`replace`, which always render in
   full and break the run) folds into one block: the counts are `·`-separated and
   wrap by section exactly like the live loader, and the mark reflects the group
@@ -387,9 +387,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   group's state — `called 4 tools · ran 2 commands · read 2 files` once settled,
   `calling 4 tools · running 2 commands · reading 2 files` while a call is still
   going; `grep`/`find` show as `searching for N patterns` and `ls`/`tree` as
-  `listing N directories`. Clicking the summary fans the calls out as
-  one-liners; clicking a one-liner expands that call in full; clicking the
-  summary again folds the group back. `/verbose on` shows every group expanded,
+  `listing N directories`. Clicking the summary renders every call in full — a
+  running call streams mid-flight once the group is expanded — and clicking it
+  again folds the group back. A lone tool renders in full always; there is no
+  single-line mode in between. `/verbose on` fans every group out,
   `/verbose off` folds them all.
 
 - **The edit and replace tools color their patch like the code it describes.**

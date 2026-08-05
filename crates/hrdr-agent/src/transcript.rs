@@ -25,7 +25,7 @@ pub struct Entry {
     #[serde(with = "unix_time")]
     pub time: DateTime<Local>,
     /// Precomputed hash of the content fields that affect rendering (excludes
-    /// timestamps, `took_ms`, and the Tool `expanded` flag / `expand_all`).
+    /// timestamps and `took_ms`).
     /// Computed on construction and refreshed on mutation. Never serialized.
     #[serde(skip, default)]
     pub content_hash: u64,
@@ -38,7 +38,8 @@ impl PartialEq for Entry {
 }
 
 /// What an [`Entry`] holds. Everything here round-trips through the session
-/// file except a tool block's `expanded` flag, which is view state.
+/// file; expansion state (which tool groups are folded out) is frontend view
+/// state, keyed by the tool-call ids, and never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EntryKind {
@@ -65,11 +66,6 @@ pub enum EntryKind {
         result: String,
         ok: bool,
         done: bool,
-        /// Show the full result instead of a truncated preview (per-entry
-        /// expansion, or `/verbose` for everything).
-        /// View state: never persisted, so a restored block starts collapsed.
-        #[serde(skip)]
-        expanded: bool,
     },
     System(String),
     /// Session-lifecycle chrome: the welcome banner, "resumed session …",
@@ -109,9 +105,10 @@ impl Entry {
         Self::now(EntryKind::Header)
     }
 
-    /// Hash of the content fields that affect rendering. Excludes timestamps,
-    /// `took_ms`, and the Tool `expanded` flag / `expand_all` — the latter two
-    /// are combined at lookup time in the frontend.
+    /// Hash of the content fields that affect rendering. Excludes timestamps
+    /// and `took_ms` — and a Tool call's own render no longer depends on any
+    /// expand state (it is either hidden behind its group's summary or shown
+    /// in full), so the plain content hash serves it unchanged.
     fn kind_hash(kind: &EntryKind) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match kind {
@@ -136,7 +133,6 @@ impl Entry {
                 result.hash(&mut h);
                 ok.hash(&mut h);
                 done.hash(&mut h);
-                // expanded and expand_all are handled at cache-key lookup time
             }
         }
         h.finish()
@@ -207,7 +203,6 @@ impl Entry {
             result: String::new(),
             ok: false,
             done: false,
-            expanded: false,
         })
     }
 }
@@ -658,7 +653,6 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                     result: String::new(),
                     ok: true,
                     done: false,
-                    expanded: false,
                 },
                 chrono::Local::now(),
             ));

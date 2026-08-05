@@ -120,17 +120,6 @@ pub(crate) struct HitRect {
     pub h: u16,
 }
 
-/// What a click on a tool block does: toggle that tool's own expansion, or
-/// toggle the whole group it heads (the `called N tools` summary line).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ToolHit {
-    /// Transcript index of the tool entry the click landed on.
-    pub idx: usize,
-    /// The block was the group's summary header — the click expands/collapses
-    /// the group rather than the entry.
-    pub group: bool,
-}
-
 impl From<ratatui::layout::Rect> for HitRect {
     fn from(r: ratatui::layout::Rect) -> Self {
         Self {
@@ -607,11 +596,12 @@ pub(crate) struct App {
     /// session), the sibling of [`end_button`](Self::end_button). `None`
     /// when following.
     pub(crate) home_button: Option<HitRect>,
-    /// Clickable screen rects for each visible tool block → the entry it
-    /// toggles, set during draw. A left click toggles that tool's `expanded`
-    /// (like a per-entry `/verbose`); a click on a tool GROUP's summary header
-    /// (`ToolHit.group`) toggles the group instead.
-    pub(crate) tool_hits: Vec<(HitRect, ToolHit)>,
+    /// Clickable screen rects for each visible tool block → the transcript
+    /// entry it toggles, set during draw. A tool call has one expansion level —
+    /// the group's summary or fully expanded — so any click on a grouped tool
+    /// (the summary header or one of its rendered calls) folds or fans out the
+    /// whole group.
+    pub(crate) tool_hits: Vec<(HitRect, usize)>,
     /// Tool ids of group heads whose tool group is EXPANDED (showing each call
     /// as its one-liner). A multi-tool group collapses behind a single
     /// `called N tools · read 2 files` summary line until toggled — view state,
@@ -1801,34 +1791,25 @@ impl App {
             .find(|(r, _)| r.contains(col, row))
             .map(|(_, h)| *h);
         let Some(hit) = hit else { return };
-        if hit.group {
-            // The summary header: expand/collapse the group, keyed by the
-            // group head's tool-call id.
-            let id = self
-                .panes
-                .active_transcript()
-                .get(hit.idx)
-                .and_then(|e| crate::ui::tool_call_id(&e.kind))
-                .map(str::to_owned);
-            if let Some(id) = id
-                && !self.tool_groups.remove(&id)
-            {
-                self.tool_groups.insert(id);
-            }
-            // The group's height is about to change; keep its top where the
-            // reader is looking (see `pending_scroll_entry`).
-            self.pending_scroll_entry = Some(hit.idx);
-        } else if let Some(EntryKind::Tool { expanded, .. }) = self
-            .panes
-            .active_transcript_mut()
-            .get_mut(hit.idx)
-            .map(|e| &mut e.kind)
+        // One expansion level: any click on a grouped tool — the summary
+        // header or one of its rendered calls — folds or fans out the whole
+        // group, keyed by the group head's tool-call id.
+        let transcript = self.panes.active_transcript();
+        let Some(head) = crate::ui::tool_group_head(transcript, hit) else {
+            return;
+        };
+        let id = transcript
+            .get(head)
+            .and_then(|e| crate::ui::tool_call_id(&e.kind))
+            .map(str::to_owned);
+        if let Some(id) = id
+            && !self.tool_groups.remove(&id)
         {
-            *expanded = !*expanded;
-            // The block's height just changed; keep its top where the reader is
-            // looking instead of letting it slide.
-            self.pending_scroll_entry = Some(hit.idx);
+            self.tool_groups.insert(id);
         }
+        // The group's height is about to change; keep its top where the reader
+        // is looking (see `pending_scroll_entry`).
+        self.pending_scroll_entry = Some(head);
     }
 
     /// The screen rect of the pane a mouse selection is anchored in — the band

@@ -772,15 +772,9 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
     ])
     .await;
     h.submit("read that file").await;
-    // The nudge and refusal text live in the tool result, which is collapsed by
-    // default — expand the blocks so the assertion can see it. The three
-    // identical reads also group behind a summary header; expand the groups too.
+    // The three identical reads group behind a summary header; expand the
+    // groups so the assertion can see their results.
     h.app.expand_tools = true;
-    for e in h.app.transcript_mut() {
-        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
-            *expanded = true;
-        }
-    }
     let screen = h.render();
     assert!(
         screen.contains("failed 2 times in a row"),
@@ -812,13 +806,6 @@ async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
     ])
     .await;
     h.submit("use a bad tool").await;
-    // The error text lives in the tool result, collapsed by default — expand so
-    // the assertion can see it.
-    for e in h.app.transcript_mut() {
-        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
-            *expanded = true;
-        }
-    }
     let screen = h.render();
     // The error is shown to the user (and was fed back to the model)…
     assert!(
@@ -1053,16 +1040,15 @@ async fn thinking_toggle_persists_to_config() {
 }
 
 /// `/verbose` is a strict on/off toggle — the rename of `/expand`. A bare
-/// `/verbose` flips the mode, `on`/`off` set it. On expands every tool block
-/// (a collapsed entry renders in full); off collapses them all and hands the
-/// display back to per-block clicking.
+/// `/verbose` flips the mode, `on`/`off` set it. On fans every tool GROUP out
+/// in full; off folds them all back behind their summaries.
 #[tokio::test]
 async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
     let mut h = Harness::new(vec![]).await;
     let t = |secs: i64| hrdr_app::time_from_unix(secs, chrono::Local::now());
-    // A finished tool block whose per-entry flag is collapsed. The result text
-    // appears in no collapsed form — the one-liner shows only the command — so
-    // its presence is proof the block rendered in full.
+    // Two finished calls: a group of two, folded behind its summary by default.
+    // The result text appears in no collapsed form, so its presence is proof
+    // the calls rendered in full.
     h.app.transcript_mut().push(Entry::at(
         EntryKind::Tool {
             id: "c1".into(),
@@ -1071,14 +1057,24 @@ async fn verbose_toggles_all_tool_blocks_between_on_and_off() {
             result: "VERBOSE-MODE-RESULT".into(),
             ok: true,
             done: true,
-            expanded: false,
         },
         t(1_700_000_000),
     ));
-    assert!(!h.app.expand_tools, "default is manual per-block mode");
+    h.app.transcript_mut().push(Entry::at(
+        EntryKind::Tool {
+            id: "c2".into(),
+            name: "read".into(),
+            args: r#"{"path":"x"}"#.into(),
+            result: "SECOND-RESULT".into(),
+            ok: true,
+            done: true,
+        },
+        t(1_700_000_001),
+    ));
+    assert!(!h.app.expand_tools, "default is folded behind the summary");
     assert!(
         !h.render().contains("VERBOSE-MODE-RESULT"),
-        "collapsed by default"
+        "folded by default"
     );
 
     // Bare `/verbose` toggles on: the collapsed block renders in full.
@@ -1274,13 +1270,6 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     ])
     .await;
     h.submit("run it").await;
-    // Tool results are collapsed by default now — expand so the block renders
-    // with its command and output for the layout assertions below.
-    for e in h.app.transcript_mut() {
-        if let EntryKind::Tool { expanded, .. } = &mut e.kind {
-            *expanded = true;
-        }
-    }
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -1399,7 +1388,6 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
                 result: "hi".into(),
                 ok: true,
                 done: true,
-                expanded: false,
             },
             t(1_700_000_003),
         ),
@@ -3133,12 +3121,12 @@ async fn goto_finds_a_text_less_assistant_turn() {
     );
 }
 
-/// Clicking a tool block toggles its expansion. The click rects are derived from
-/// where each tool block lands on screen, which the deferred block flush must
-/// keep accurate.
+/// The click rect for a tool block is derived from where it lands on screen,
+/// which the deferred block flush must keep accurate — a lone tool (its own
+/// group of one) renders fully and its hit rect covers its header.
 #[tokio::test]
-async fn clicking_a_tool_block_toggles_its_expansion() {
-    let long_output: String = (0..30).map(|i| format!("line {i}\n")).collect();
+async fn a_lone_tool_block_hit_rect_tracks_its_header() {
+    let long_output: String = (0..5).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
@@ -3153,7 +3141,6 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
         result: long_output,
         ok: true,
         done: true,
-        expanded: false,
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
@@ -3177,19 +3164,6 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
         rect.contains(2, header_y),
         "the tool hit rect misses the tool header at row {header_y}"
     );
-
-    // Clicking it expands the block; clicking again collapses it.
-    let expanded = |app: &App| {
-        app.transcript()
-            .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded))
-    };
-    assert!(!expanded(&h.app), "starts collapsed");
-    click_at(&mut h.app, 2, header_y);
-    assert!(expanded(&h.app), "the click expanded it");
-    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    click_at(&mut h.app, 2, header_y);
-    assert!(!expanded(&h.app), "the second click collapsed it");
 }
 
 /// Copy/paste feedback goes to a toast, not the transcript: it is chrome about
@@ -3518,7 +3492,6 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
         result: "SELECTABLE".into(),
         ok: true,
         done: true,
-        expanded: false,
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
@@ -3547,11 +3520,8 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
         .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, rect.y + 1));
     assert!(h.app.pending_copy, "releasing a drag queues the copy");
     assert!(
-        !h.app
-            .transcript()
-            .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded)),
-        "a drag is not a click: the block it started on stays collapsed"
+        h.app.tool_groups.is_empty(),
+        "a drag is not a click: it leaves the group state untouched"
     );
 
     // The frame after the release harvests the cells and reports the result.
@@ -3870,8 +3840,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
             args: args.into(),
             result: format!("res-{id}"),
             ok: true,
-            done: true,
-            expanded: true, // the results are the row anchors below
+            done: true, // the results are the row anchors below
         })
     };
     let mut h = Harness::new(vec![]).await;
@@ -3973,7 +3942,6 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
         result: "res".into(),
         ok: true,
         done: true,
-        expanded: false,
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
@@ -4021,14 +3989,14 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     );
 }
 
-/// Collapsing a long tool block pulls its top to the top of the viewport rather
-/// than letting it slide.
+/// Collapsing an expanded tool group pulls its summary to the top of the
+/// viewport rather than letting it slide.
 ///
 /// Regression: `scroll_offset` is measured from the *bottom*, so shrinking the
 /// transcript kept the view the same distance from the end — the block the user
 /// was reading jumped up by however many rows it lost.
 #[tokio::test]
-async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
+async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
@@ -4042,7 +4010,14 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
         result: long,
         ok: true,
         done: true,
-        expanded: true, // long and open
+    }));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c2".into(),
+        name: "read".into(),
+        args: r#"{"path":"x"}"#.into(),
+        result: String::new(),
+        ok: true,
+        done: true,
     }));
     h.app.push_entry(Entry::assistant("after"));
     // Enough filler that the transcript still overflows the viewport AFTER the
@@ -4050,11 +4025,13 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     for i in 0..20 {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
+    // The group is expanded: the calls fan out and the transcript is tall.
+    h.app.tool_groups.insert("c1".to_string());
 
     let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
-    // Scroll up until the tool header is on screen, mid-viewport.
+    // Scroll up until the group summary is on screen, mid-viewport.
     h.app.scroll_offset = h.app.max_scroll;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let header_row = |term: &Terminal<TestBackend>| -> Option<u16> {
@@ -4066,30 +4043,30 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
                         .map(|c| c.symbol().to_string())
                 })
                 .collect::<String>()
-                .contains("✓ bash")
+                .contains("called 2 tools")
         })
     };
-    let before = header_row(&term).expect("tool header on screen");
+    let before = header_row(&term).expect("group summary on screen");
     assert!(h.app.scroll_offset > 0, "the reader is scrolled up");
 
-    // Click it: the block collapses, and its top comes to the viewport's top.
+    // Click the summary: the group folds, and its top comes to the viewport's top.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     assert!(rect.contains(2, before));
     click_at(&mut h.app, 2, before);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
-    let after = header_row(&term).expect("tool header still on screen");
+    let after = header_row(&term).expect("the summary is still on screen");
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
         after <= 1,
-        "the collapsed block should sit at the top of the viewport, got row {after}:\n{screen}"
+        "the folded group should sit at the top of the viewport, got row {after}:\n{screen}"
     );
 }
 
-/// A run of tool calls groups behind one `{mark} called N tools · read 2
-/// files` summary line — the first of the two expansion levels. Clicking the
-/// summary fans the calls out as one-liners; clicking a one-liner expands
-/// that call in full; clicking the summary again folds the group back.
+/// A run of tool calls groups behind one `{mark} called N tools · ran 2
+/// commands · read 1 file` summary line — the only collapsed mode. Clicking
+/// the summary renders every call in full; clicking it again folds the group
+/// back behind the summary. There is no intermediate one-liner state.
 #[tokio::test]
 async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
     let mut h = Harness::new(vec![]).await;
@@ -4103,7 +4080,6 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
         result: "RESULT-A".into(),
         ok: true,
         done: true,
-        expanded: false,
     }));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "b".into(),
@@ -4112,7 +4088,6 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
         result: "RESULT-B".into(),
         ok: true,
         done: true,
-        expanded: false,
     }));
 
     // Level 0: one summary line — the calls themselves are hidden.
@@ -4126,53 +4101,16 @@ async fn tool_groups_collapse_behind_a_summary_and_expand_on_click() {
         "no call bodies while collapsed:\n{screen}"
     );
 
-    // Click the summary → level 1: each call as a one-liner.
-    let (rect, hit) = h
-        .app
-        .tool_hits
-        .iter()
-        .find(|(_, t)| t.group)
-        .copied()
-        .expect("the group summary is clickable");
-    assert_eq!(hit.idx, 0, "the summary belongs to the group head");
+    // Click the summary → fully expanded: every call renders in full.
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     click_at(&mut h.app, rect.x + 2, rect.y + 1);
     let screen = h.render();
     assert!(
-        screen.contains("shell ls -la") && screen.contains("read x.rs"),
-        "the calls fan out as one-liners:\n{screen}"
-    );
-    assert!(
-        !screen.contains("RESULT-A"),
-        "still one-liners, not full bodies:\n{screen}"
+        screen.contains("RESULT-A") && screen.contains("RESULT-B"),
+        "both calls render in full once the group is expanded:\n{screen}"
     );
 
-    // Click the shell one-liner → level 2: that call in full.
-    let (rect, _) = h
-        .app
-        .tool_hits
-        .iter()
-        .find(|(_, t)| !t.group && t.idx == 0)
-        .copied()
-        .expect("the head's one-liner is clickable");
-    click_at(&mut h.app, rect.x + 2, rect.y + 1);
-    let screen = h.render();
-    assert!(
-        screen.contains("RESULT-A"),
-        "the clicked call expands in full:\n{screen}"
-    );
-    assert!(
-        !screen.contains("RESULT-B"),
-        "the other call stays a one-liner:\n{screen}"
-    );
-
-    // Click the summary again → back to level 0.
-    let (rect, _) = h
-        .app
-        .tool_hits
-        .iter()
-        .find(|(_, t)| t.group)
-        .copied()
-        .expect("the summary is still clickable");
+    // Click the summary again → folded back behind it.
     click_at(&mut h.app, rect.x + 2, rect.y + 1);
     let screen = h.render();
     assert!(
@@ -4202,7 +4140,6 @@ async fn collapsing_while_following_stays_at_the_bottom() {
         result: long,
         ok: true,
         done: true,
-        expanded: true,
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
@@ -4232,8 +4169,7 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         args: "{}".into(),
         result: "res".into(),
         ok: true,
-        done: true,
-        expanded: true, // the result row is the layout anchor below
+        done: true, // the result row is the layout anchor below
     }));
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
@@ -5561,7 +5497,6 @@ async fn the_prompt_and_input_wear_a_left_bar() {
         result: "hi".into(),
         ok: true,
         done: true,
-        expanded: false,
     }));
     h.type_str("typing");
 
