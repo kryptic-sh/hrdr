@@ -1584,7 +1584,6 @@ mod tests {
             result: "ok".into(),
             ok: true,
             done: true,
-            expanded: false,
         })];
         Session::new(s.clone())
             .save_to_path(&path)
@@ -2686,8 +2685,7 @@ mod roundtrip_audit {
                         args: "{}".into(),
                         result: "out".into(),
                         ok: true,
-                        done: true,
-                        expanded: true, // NOT persisted: view state
+                        done: true, // NOT persisted: view state
                     },
                     t,
                 ),
@@ -2744,7 +2742,6 @@ mod roundtrip_audit {
                     result: String::new(),
                     ok: true,
                     done: true,
-                    expanded: true,
                 },
                 t,
             )],
