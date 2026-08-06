@@ -2265,6 +2265,26 @@ impl App {
             .main_mut()
             .transcript_mut()
             .drain(head..keep_start);
+        // `thinking_open` is keyed by transcript index; the drain shifted every
+        // surviving entry's index down by `remove`. Renumber the open set so an
+        // opened thought stays open under its new index, and drop the entries
+        // that were themselves evicted (they are off the transcript for good).
+        // Without this an open thought folds back to its summary silently, or
+        // — worse — a later Reasoning entry landing on the stale index renders
+        // expanded without ever being clicked.
+        self.thinking_open = self
+            .thinking_open
+            .iter()
+            .filter_map(|&i| {
+                if (head..keep_start).contains(&i) {
+                    None
+                } else if i >= keep_start {
+                    Some(i - remove)
+                } else {
+                    Some(i)
+                }
+            })
+            .collect();
         // Prune the render cache: any key with an entry_idx that has shifted
         // is stale.  Easiest way: clear the whole thread-local transcript cache
         // once (cheap — it rebuilds lazily on the next frame).
@@ -2274,6 +2294,8 @@ impl App {
     /// Clear the transcript.
     fn clear_transcript(&mut self) {
         self.panes.main_mut().transcript_mut().clear();
+        // A wholesale clear invalidates every index-based view state.
+        self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
     }
 

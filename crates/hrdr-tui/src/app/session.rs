@@ -595,6 +595,9 @@ impl super::App {
         if let Ok(mut t) = self.todos.lock() {
             *t = todos;
         }
+        // A resumed session is a different transcript — every index-based view
+        // state (opened thoughts) from the session we left is meaningless here.
+        self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
     }
 }

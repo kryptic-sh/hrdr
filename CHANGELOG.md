@@ -211,6 +211,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An opened thought stays open across scrollback pruning.** `thinking_open`
+  was keyed by the transcript index while `prune_scrollback` shifted every index
+  on eviction — so once a session grew past the 500-entry cap, an opened thought
+  folded back to its one-line summary silently, and a later Reasoning entry
+  landing on the stale index rendered expanded without being clicked. The open
+  set is now renumbered with the drain, and cleared wholesale when the
+  transcript is rebuilt (`/clear`, resume).
+
 - **The inference/compaction loader sits exactly one blank row off the block
   above.** Its separator used to be unconditional, so under an untinted block
   (an assistant reply, reasoning, the header) the block's own blank bottom pad

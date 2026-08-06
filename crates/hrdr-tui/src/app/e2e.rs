@@ -5362,6 +5362,43 @@ async fn visible_entries_bound_a_tool_group() {
     );
 }
 
+/// An opened thought survives scrollback pruning, renumbered to its new index —
+/// not folded, and not leaving a stale index that a later Reasoning entry would
+/// inherit uninvited. (The 2026-08-06 correctness finding: `thinking_open` was
+/// keyed by transcript index while `prune_scrollback` shifted every index.)
+#[tokio::test]
+async fn opened_thought_survives_scrollback_pruning_renumbered() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // A thought opened mid-transcript, at index 400 (the finding's repro).
+    for i in 0..400 {
+        h.app.push_entry(Entry::assistant(format!("filler {i}")));
+    }
+    h.app.push_entry(Entry::reasoning("the opened thought"));
+    h.app.thinking_open.insert(400);
+    // Grow past the 500-entry scrollback cap: each push past it evicts the
+    // oldest entry, so 8 evictions land and every surviving index shifts down.
+    for i in 0..107 {
+        h.app.push_entry(Entry::assistant(format!("tail {i}")));
+    }
+    assert!(
+        matches!(h.app.transcript()[392].kind, EntryKind::Reasoning { .. }),
+        "the thought survived the pruning at its new index"
+    );
+    assert!(
+        h.app.thinking_open.contains(&392),
+        "the opened thought stays open, renumbered: {:?}",
+        h.app.thinking_open
+    );
+    assert_eq!(
+        h.app.thinking_open.len(),
+        1,
+        "no stale index left behind to open a different entry"
+    );
+}
+
 /// Tool-only turns leave an empty assistant marker in the transcript; the
 /// marker renders nothing, so the tool runs on either side of it merge into
 /// one group — 3 + 2 + 6 calls become a single `ran 7 commands · read 4
