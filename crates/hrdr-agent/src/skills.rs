@@ -287,8 +287,8 @@ fn parse_frontmatter(fm: &str) -> Frontmatter {
 
 /// Stringify a YAML scalar (string/number/bool), trimmed. `None` for `Null`
 /// or a non-scalar (sequence/mapping/tagged) — those aren't valid values for
-/// `name`/`description`/a single `args` element.
-fn scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
+/// `name`/`description`/a single `args` element, nor for a `tools:` list item.
+pub(crate) fn scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
     match v {
         serde_yaml_ng::Value::String(s) => Some(s.trim().to_string()),
         serde_yaml_ng::Value::Number(n) => Some(n.to_string()),

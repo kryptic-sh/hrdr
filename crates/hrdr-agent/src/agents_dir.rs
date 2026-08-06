@@ -438,22 +438,11 @@ fn fm_value_from_yaml(v: serde_yaml_ng::Value) -> Option<FmValue> {
         serde_yaml_ng::Value::Bool(b) => Some(FmValue::Scalar(b.to_string())),
         serde_yaml_ng::Value::Null => Some(FmValue::Scalar(String::new())),
         serde_yaml_ng::Value::Sequence(seq) => Some(FmValue::List(
-            seq.iter().filter_map(scalar_element_to_string).collect(),
+            seq.iter()
+                .filter_map(crate::skills::scalar_to_string)
+                .collect(),
         )),
         serde_yaml_ng::Value::Mapping(_) => None,
-        _ => None,
-    }
-}
-
-/// Stringify one element of a YAML sequence for [`FmValue::List`]: only
-/// string/number/bool scalars are meaningful list items (a `tools:` list is
-/// always these); anything else — including a bare `null` item — is skipped
-/// rather than stringified into a meaningless entry.
-fn scalar_element_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
-    match v {
-        serde_yaml_ng::Value::String(s) => Some(s.trim().to_string()),
-        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
-        serde_yaml_ng::Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
 }
