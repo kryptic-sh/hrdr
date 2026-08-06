@@ -313,6 +313,7 @@ async fn spawn_background(
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
+            kind: hrdr_tools::BackgroundKind::Task,
             tool_id,
             label: label.clone(),
             log: header,
@@ -1775,8 +1776,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
         // whatever it managed before the abort is in the tree, and the caller is
         // told so below rather than left to assume a clean rollback. A watch
         // wrote nothing; its success message says so instead of promising edits
-        // to check. Discriminated by the label prefix `WatchTool` mints
-        // ("watch: …") — the only field that separates the two kinds.
+        // to check. The kind field separates the two — never a label sniff.
         let kind = {
             let mut v = ctx
                 .background_tasks
@@ -1786,7 +1786,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
                 Some(t) => {
                     t.cancelled = true;
                     t.done = true;
-                    if t.label.starts_with("watch: ") {
+                    if t.kind == hrdr_tools::BackgroundKind::Watch {
                         "watch"
                     } else {
                         "background task"

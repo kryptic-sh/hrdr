@@ -297,7 +297,9 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
 /// be *worse*, reinterpreting `30000` as 30,000 **seconds** (over eight hours)
 /// on a command the model wanted killed after thirty. So the field is poison:
 /// name it, say what replaced it, and do the division for the caller.
-fn reject_timeout_ms(args: &serde_json::Value) -> Result<()> {
+///
+/// Shared by `shell` and `watch`, which both take a `timeout_secs`.
+pub(crate) fn reject_timeout_ms(args: &serde_json::Value) -> Result<()> {
     let Some(value) = args.get("timeout_ms") else {
         return Ok(());
     };

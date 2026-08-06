@@ -2937,14 +2937,16 @@ impl App {
         })
     }
 
-    /// A detached sub-agent finished while nothing was running: wake the model so
-    /// it reacts to the result instead of sitting on it until the user's next
-    /// message.
+    /// A detached sub-agent or watch finished while nothing was running: wake
+    /// the model so it reacts to the result instead of sitting on it until the
+    /// user's next message.
     ///
     /// `Agent::run` folds finished background tasks into the conversation before
     /// each request, so an empty turn is enough to deliver them — it pushes no
     /// user message of its own. Only fires when idle: a running turn already
-    /// drains them at its next request, and a compaction is about to.
+    /// drains them at its next request, and a compaction is about to. A
+    /// CANCELLED entry (`task_cancel`) never wakes anyone — the turn it would
+    /// spawn has nothing to deliver.
     pub(crate) fn maybe_deliver_background(&mut self) {
         if self.running() || self.compacting() {
             return;
@@ -2952,7 +2954,7 @@ impl App {
         let ready = self
             .background_tasks
             .lock()
-            .map(|v| v.iter().any(|t| t.done && !t.delivered))
+            .map(|v| v.iter().any(|t| t.done && !t.delivered && !t.cancelled))
             .unwrap_or(false);
         if ready {
             self.launch_turn();

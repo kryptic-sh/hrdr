@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::tools::shell::{Shell, run_streamed_command};
-use crate::{BackgroundTask, Tool, ToolContext};
+use crate::tools::shell::{Shell, reject_timeout_ms, run_streamed_command};
+use crate::{BackgroundKind, BackgroundTask, Tool, ToolContext};
 
 /// How often the check re-runs, by default.
 pub const DEFAULT_WATCH_INTERVAL_SECS: u64 = 30;
@@ -32,7 +32,12 @@ pub const DEFAULT_WATCH_INTERVAL_SECS: u64 = 30;
 /// is watching (a CI API, a health endpoint) and burn a subprocess per poll.
 pub const MIN_WATCH_INTERVAL_SECS: u64 = 15;
 /// How long a watch runs before it gives up, by default.
-pub const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 600;
+///
+/// 30 minutes, not the 10 a first draft chose: the motivating use case is
+/// watching a release tag's CI run, and the runs that prompted this tool take
+/// 12–19 minutes — a 10-minute default would time the flagship flow out
+/// mid-run and force a re-watch with an explicit ceiling.
+pub const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 1800;
 /// The ceiling on `timeout_secs`: any longer and the watch holds its registry
 /// entry — and the poller's clone of the call's stream channel — past any
 /// sensible turn.
@@ -146,6 +151,7 @@ impl Tool for WatchTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        reject_timeout_ms(&args)?;
         let a: WatchArgs = crate::tool_args("watch", args)?;
         let check = a.check.trim().to_string();
         if check.is_empty() {
@@ -175,7 +181,13 @@ impl Tool for WatchTool {
         // collide: `drain_background`/`task_cancel`/the TUI wake all match on
         // `id` alone.
         let id = BackgroundTask::next_id();
-        let label = format!("watch: {}", crate::truncate(&check, 60));
+        // The label doubles as the delivery Notice's header, so newlines from a
+        // multi-line check (or `truncate`'s "output truncated" marker) must not
+        // land raw in it.
+        let label = format!(
+            "watch: {}",
+            crate::truncate(&check, 60).replace(['\n', '\r'], " ")
+        );
         // Push BEFORE spawning, the same order `spawn_background` uses, so the
         // id is addressable (`task_cancel N`, the panel) as soon as the call
         // returns — the poller races nothing.
@@ -186,6 +198,7 @@ impl Tool for WatchTool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             v.push(BackgroundTask {
                 id,
+                kind: BackgroundKind::Watch,
                 tool_id: ctx.call_id.clone(),
                 label: label.clone(),
                 log: String::new(),
@@ -309,12 +322,11 @@ async fn poll_watch(
                 }
             }
             Err(e) => {
-                // A check killed at its own deadline is a failed ROUND, never a
-                // failed watch: only the whole-watch timeout ends it.
-                let note = format!(
-                    "(check failed this round — killed at its {}s deadline: {e:#})",
-                    CHECK_TIMEOUT.as_secs()
-                );
+                // A failed ROUND, never a failed watch: a check killed at its
+                // own deadline (the error text says so) or one that failed to
+                // spawn keeps the watch polling — only the whole-watch timeout
+                // ends it.
+                let note = format!("(check failed this round: {e:#})");
                 last_output = Some(note.clone());
                 append_log(ctx, id, &note);
             }
@@ -334,6 +346,17 @@ fn append_log(ctx: &ToolContext, id: u64, chunk: &str) {
     let Some(entry) = v.iter_mut().find(|t| t.id == id) else {
         return;
     };
+    // A single chunk can itself outgrow the whole cap (a raised `max_output`
+    // makes `run_streamed_command`'s per-check output larger): keep the newest
+    // cap bytes of the chunk and drop the old log — the cap is a hard bound.
+    if chunk.len() > WATCH_LOG_MAX_BYTES {
+        let mut start = chunk.len() - WATCH_LOG_MAX_BYTES;
+        while !chunk.is_char_boundary(start) {
+            start += 1;
+        }
+        entry.log = chunk[start..].to_string();
+        return;
+    }
     if entry.log.len().saturating_add(chunk.len()) > WATCH_LOG_MAX_BYTES {
         // Drop from the front, on a char boundary, keeping the newest output.
         let keep = WATCH_LOG_MAX_BYTES.saturating_sub(chunk.len());
@@ -645,6 +668,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("3600s ceiling"), "{err}");
+
+        // The old millisecond spelling is poison, exactly as in `shell`: it
+        // would silently run the default timeout while the model believes it
+        // asked for 30 seconds.
+        let err = t
+            .execute(
+                serde_json::json!({"check": "true", "timeout_ms": 30_000}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`timeout_ms` is gone"), "{err}");
+        assert!(err.contains("pass `timeout_secs`"), "{err}");
+    }
+
+    /// The ring buffer is a HARD bound: a single chunk larger than the whole
+    /// cap (a raised `max_output` makes `run_streamed_command`'s per-check
+    /// output bigger) must not blow the log past `WATCH_LOG_MAX_BYTES`.
+    #[test]
+    fn append_log_is_a_hard_bound_even_for_an_oversized_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        {
+            let mut v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.push(BackgroundTask {
+                id: 7,
+                kind: BackgroundKind::Watch,
+                label: "watch: x".to_string(),
+                ..Default::default()
+            });
+        }
+        // Prefix bytes, then a multi-byte char straddling the cut point, then a
+        // long tail — exercises the char-boundary walk as well as the cap.
+        let big = format!(
+            "head{}\u{2603}{}",
+            "a".repeat(WATCH_LOG_MAX_BYTES),
+            "b".repeat(WATCH_LOG_MAX_BYTES)
+        );
+        append_log(&ctx, 7, &big);
+        let v = ctx
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = v.iter().find(|t| t.id == 7).unwrap();
+        assert!(
+            entry.log.len() <= WATCH_LOG_MAX_BYTES,
+            "log {} > cap {}",
+            entry.log.len(),
+            WATCH_LOG_MAX_BYTES
+        );
+        assert!(
+            entry.log.ends_with("bbbb"),
+            "the newest bytes survive: {}",
+            &entry.log[entry.log.len().saturating_sub(20)..]
+        );
+        assert!(!entry.log.contains("head"), "the old log was dropped");
     }
 
     /// The optional arguments record their defaults, so a transcript can say

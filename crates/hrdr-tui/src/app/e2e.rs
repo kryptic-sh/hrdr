@@ -6218,7 +6218,7 @@ async fn reserve_session_id_defers_the_first_write_off_thread() {
 #[tokio::test]
 async fn a_finished_background_task_wakes_an_idle_model() {
     let mut h = Harness::new(vec![]).await;
-    let task = |done: bool, delivered: bool| hrdr_tools::BackgroundTask {
+    let task = |done: bool, delivered: bool, cancelled: bool| hrdr_tools::BackgroundTask {
         id: 1,
         tool_id: Some("call-1".into()),
         label: "explore".into(),
@@ -6226,29 +6226,39 @@ async fn a_finished_background_task_wakes_an_idle_model() {
         done,
         result: done.then(|| "found it".to_string()),
         delivered,
+        cancelled,
         ..Default::default()
     };
 
     // Still running: nothing to deliver.
-    *h.app.background_tasks.lock().unwrap() = vec![task(false, false)];
+    *h.app.background_tasks.lock().unwrap() = vec![task(false, false, false)];
     h.app.maybe_deliver_background();
     assert!(!h.app.running(), "an unfinished task doesn't wake anything");
 
     // Finished, but a turn is already in flight — it will drain at its next
     // request, so don't spawn a second turn on top of it.
-    *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, false, false)];
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.maybe_deliver_background();
     h.app.registry.end_turn(hrdr_agent::MAIN_KEY);
 
     // Already delivered: nothing to do (and no wake-up loop).
-    *h.app.background_tasks.lock().unwrap() = vec![task(true, true)];
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, true, false)];
     h.app.maybe_deliver_background();
     assert!(!h.app.running(), "a delivered result doesn't wake anything");
 
+    // Cancelled (`task_cancel` writes done + cancelled): the turn it would
+    // spawn has nothing to deliver — it must not wake the model either.
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, false, true)];
+    h.app.maybe_deliver_background();
+    assert!(
+        !h.app.running(),
+        "a cancelled watch/task doesn't wake anything"
+    );
+
     // Finished, undelivered, idle: the model is woken with an empty turn — no
     // user message of its own is added to the transcript.
-    *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, false, false)];
     let before = h.app.transcript().len();
     h.app.maybe_deliver_background();
     assert!(h.app.running(), "the model was woken");

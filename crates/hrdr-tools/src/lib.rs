@@ -110,6 +110,17 @@ fn default_status() -> String {
     "pending".to_string()
 }
 
+/// Which producer a [`BackgroundTask`] entry belongs to. One variant per kind
+/// of background work in the shared registry (`task` sub-agents, `watch`
+/// pollers); `task_cancel` reads it to say what cancelling means for that kind
+/// — a sub-agent may have edited the working directory, a watch wrote nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundKind {
+    #[default]
+    Task,
+    Watch,
+}
+
 /// A detached background sub-agent (every `task` runs detached): it runs
 /// concurrently with the main agent, streaming into `log`; when `done`, its
 /// `result` is delivered into the conversation and the entry is pruned. Shared
@@ -118,6 +129,11 @@ fn default_status() -> String {
 pub struct BackgroundTask {
     /// Stable id for the run — shown to the model and used for delivery matching.
     pub id: u64,
+    /// Which producer this entry belongs to ([`BackgroundKind::Task`] or
+    /// [`BackgroundKind::Watch`]); `task_cancel` reads it to describe what
+    /// cancelling means for that kind. Defaults to `Task` so legacy
+    /// constructions (tests) keep meaning "a sub-agent".
+    pub kind: BackgroundKind,
     /// Id of the `task` tool call that spawned it, matching its transcript
     /// entry. `None` when the spawn had no call context (tests, `/task`).
     pub tool_id: Option<String>,
