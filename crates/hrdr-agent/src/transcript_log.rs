@@ -201,6 +201,11 @@ const COALESCE_AGE: Duration = Duration::from_millis(500);
 pub struct TranscriptLog {
     file: File,
     path: std::path::PathBuf,
+    /// The file's byte length as this handle has written it — the rollback
+    /// point for a torn append. Tracked instead of `fstat`ed per record: only
+    /// this handle appends, so the length is the open length plus every
+    /// successful line, and a partial write rolls back to the last boundary.
+    len: u64,
     /// The file ends **mid-record**: a previous append got a partial write that
     /// could not be rolled back, or the file we opened already ended without a
     /// newline (a torn tail left by an earlier process). The next record is
@@ -292,6 +297,7 @@ impl TranscriptLog {
             file,
             path,
             // Exclusively created: the file is empty, so it starts on a boundary.
+            len: 0,
             torn: false,
             pending: None,
             opened_at: None,
@@ -318,9 +324,11 @@ impl TranscriptLog {
         let mut opts = hrdr_llm::owner_only_options();
         opts.create(true).append(true);
         let file = opts.open(path)?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            len,
             // A file that does not end in a newline was cut mid-record (a crash
             // or a full disk during an earlier append). Resuming onto it must not
             // glue this session's first record onto that fragment.
@@ -421,14 +429,17 @@ impl TranscriptLog {
         line.push_str(&json);
         line.push('\n');
         // The record boundary to roll back to if this append tears.
-        let before = self.file.metadata().map(|m| m.len()).ok();
+        let before = self.len;
         match append_all(&mut self.file, line.as_bytes()) {
-            Ok(()) => self.torn = false,
+            Ok(()) => {
+                self.torn = false;
+                self.len += line.len() as u64;
+            }
             // Nothing reached the disk: the file is untouched, so it is exactly as
             // torn (or not) as it was before.
             Err(0) => {}
             Err(_partial) => {
-                let rolled = before.is_some_and(|len| self.file.set_len(len).is_ok());
+                let rolled = self.file.set_len(before).is_ok();
                 if !rolled {
                     self.torn = true;
                 }
