@@ -1456,25 +1456,29 @@ fn pack_loader_segments(segments: &[String], width: usize) -> Vec<String> {
 /// as a transcript block would: a **tinted** surface above gets a separator
 /// between its pad and the panel's own — the merge `flush` breaks between two
 /// tinted blocks with one — while an **untinted** surface already supplies the
-/// blank row in its bottom pad. The loader is a pad-less status row, so it
-/// needs the separator after it too. Either way the panel's bg section is
-/// preceded by exactly one blank line, like every other box.
+/// blank row in its bottom pad. The loader's own top is exactly one blank row
+/// off the surface above either way (the separator when that surface is tinted
+/// or absent, the block's own pad when it is untinted); it has no bottom pad,
+/// so the panels below it still get the separator. Either way the panel's bg
+/// section is preceded by exactly one blank line, like every other box.
 fn live_panel_chunks(app: &App, width: u16, above: Option<Color>) -> Vec<Chunk<'static>> {
     let w = width as usize;
     let mut out = Vec::new();
     // Whether the first panel needs a separator above it: the loader (which
-    // has no bottom pad of its own) always does; otherwise only a tinted
-    // surface above does.
+    // has no bottom pad of its own) always needs one below it; otherwise only
+    // a tinted surface above does.
     let mut spacer = if let Some(lines) = loader_line(app, width) {
         // No block chrome: the loader is a single status row on the terminal's
         // own background, as it was when it sat above the input. It heads the
         // panels — it belongs with the reply it is still writing, above the
-        // lists of what is queued up around it. It also has no bottom pad, so
-        // the panels below it still need the separator.
-        out.extend([
-            separator(),
-            Chunk::plain(ChunkRows::Ready(Rc::new(lines)), None),
-        ]);
+        // lists of what is queued up around it. Its top is exactly one blank
+        // row off the surface above: an untinted block's bottom pad already is
+        // that row, so only a tinted (or absent) surface above needs the
+        // separator. It has no bottom pad, so the panels below it still do.
+        if !above.is_some_and(|bg| bg == Color::Reset) {
+            out.push(separator());
+        }
+        out.push(Chunk::plain(ChunkRows::Ready(Rc::new(lines)), None));
         true
     } else {
         above.is_some_and(|bg| bg != Color::Reset)

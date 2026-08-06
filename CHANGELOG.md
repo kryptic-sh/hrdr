@@ -211,6 +211,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The inference/compaction loader sits exactly one blank row off the block
+  above.** Its separator used to be unconditional, so under an untinted block
+  (an assistant reply, reasoning, the header) the block's own blank bottom pad
+  stacked a second blank above the loader; under a tinted block it got the
+  separator and one blank. The separator now only fires when the surface above
+  is tinted — an untinted block's pad already is the blank row.
+
 - **A tinted block above the todo/task panel no longer merges with it.** The two
   `┃` pads stacked with no blank between; the panel now gets the same separator
   `flush` gives two tinted transcript blocks, so its background is preceded by

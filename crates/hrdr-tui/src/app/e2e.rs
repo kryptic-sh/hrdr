@@ -6650,6 +6650,61 @@ async fn the_compacting_indicator_shows_even_in_normal_mode() {
     );
 }
 
+/// The loader sits exactly one blank row off the surface above it, whether
+/// that surface is tinted (a user prompt) or untinted (an assistant reply).
+/// Its separator is conditional on the block above — an untinted block's own
+/// bottom pad already is the blank row, so the loader never stacks a second
+/// one under it.
+#[tokio::test]
+async fn the_loader_is_one_blank_row_off_the_block_above() {
+    // Draw and count the blank rows between the last transcript block's content
+    // and the loader's first non-empty line (columns skip the scrollbar).
+    let blanks_above = |h: &mut Harness| -> (u16, u16) {
+        let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        let buf = term.backend().buffer();
+        let row_at = |y: u16| -> String {
+            (0..59)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect()
+        };
+        let y = (0..30u16)
+            .find(|&y| row_at(y).contains("inferring"))
+            .expect("the loader renders");
+        let blanks = (0..y)
+            .rev()
+            .take_while(|&by| row_at(by).trim().is_empty())
+            .count() as u16;
+        (y, blanks)
+    };
+
+    // Tinted above: the user prompt's solid pad, then the loader's separator.
+    let mut h = Harness::new(vec![]).await;
+    h.app.push_entry(Entry::user("the prompt"));
+    h.app.verbose = true;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    let (y_tinted, blanks_tinted) = blanks_above(&mut h);
+
+    // Untinted above: the assistant reply's own blank bottom pad.
+    let mut h = Harness::new(vec![]).await;
+    h.app.push_entry(Entry::assistant("the reply"));
+    h.app.verbose = true;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    let (y_untinted, blanks_untinted) = blanks_above(&mut h);
+
+    assert_eq!(
+        blanks_tinted, 1,
+        "one blank under a tinted block (loader at row {y_tinted})"
+    );
+    assert_eq!(
+        blanks_untinted, 1,
+        "one blank under an untinted block (loader at row {y_untinted})"
+    );
+}
+
 /// The loader tracks the *model*, not the turn: it hides while the model's tool
 /// calls run, because the model is idle then — and its clock stops with it, so a
 /// slow tool doesn't inflate the turn's reported inference time.
