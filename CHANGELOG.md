@@ -219,6 +219,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   set is now renumbered with the drain, and cleared wholesale when the
   transcript is rebuilt (`/clear`, resume).
 
+- **Expanding a call inside a tool group no longer jumps the view while scrolled
+  up.** The call path pinned the group summary to the clicked call's screen row
+  — which sits below the summary — so each expand/collapse slid the whole view
+  down by the gap. The pin now uses the summary's own top row.
+
 - **The inference/compaction loader sits exactly one blank row off the block
   above.** Its separator used to be unconditional, so under an untinted block
   (an assistant reply, reasoning, the header) the block's own blank bottom pad

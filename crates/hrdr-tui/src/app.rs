@@ -1894,8 +1894,20 @@ impl App {
         else {
             return;
         };
+        // `pending_scroll_row` is the screen row the pinned chunk's TOP lands
+        // on (`draw_chunks`' `entry_pin`), so it must be the group summary's
+        // top row — not the clicked call's row, which sits below it. Pinning to
+        // the click row slides the whole view down by that gap on every toggle
+        // while scrolled up. The summary's rect is the `tool_hits` entry keyed
+        // by the head index (this frame's layout — the same one that produced
+        // the click).
+        let summary_top = self
+            .tool_hits
+            .iter()
+            .find(|(_, i)| *i == head)
+            .map(|(r, _)| r.y);
         self.pending_scroll_entry = Some(head);
-        self.pending_scroll_row = Some(row);
+        self.pending_scroll_row = Some(summary_top.unwrap_or(row));
         if !self.tool_open.remove(&id) {
             self.tool_open.insert(id);
         }

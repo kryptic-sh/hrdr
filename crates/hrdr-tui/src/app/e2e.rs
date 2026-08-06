@@ -5399,6 +5399,69 @@ async fn opened_thought_survives_scrollback_pruning_renumbered() {
     );
 }
 
+/// A click on one call inside an expanded group pins the GROUP SUMMARY's own
+/// top row, not the clicked call's row — the call path used to set
+/// `pending_scroll_row` to the click row (which sits below the summary), so
+/// every call-toggle while scrolled up shifted the whole view down by the gap.
+#[tokio::test]
+async fn toggle_tool_call_pins_the_group_summary_row_not_the_click_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    let tool = |id: &str, result: String| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: "shell".into(),
+            args: "{}".into(),
+            result,
+            ok: true,
+            done: true,
+        })
+    };
+    h.app.push_entry(Entry::reasoning("thinking about it"));
+    // 9 lines of output: past the 8-line preview cap, so each settled call's
+    // body is a togglable preview with its own row hits. A tall terminal keeps
+    // the whole group on screen (following), so the summary is a clickable rect.
+    let long = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9".to_string();
+    h.app.push_entry(tool("a", long.clone()));
+    h.app.push_entry(tool("b", long.clone()));
+    // Expand the group so every call renders as its own block under the summary.
+    h.app.tool_groups.insert("a".to_string());
+    let mut term = Terminal::new(TestBackend::new(60, 50)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let head = crate::ui::tool_group_head(h.app.transcript(), 1).unwrap();
+    let summary_top = h
+        .app
+        .tool_hits
+        .iter()
+        .find(|(_, i)| *i == head)
+        .map(|(r, _)| r.y)
+        .expect("the group summary has a clickable rect");
+    let call_row = h
+        .app
+        .row_hits
+        .iter()
+        .find_map(|(r, hit)| match hit {
+            crate::ui::RowHit::ToggleToolCall(idx) if *idx == 2 => Some(r.y),
+            _ => None,
+        })
+        .expect("the call body has a toggle row");
+    assert!(
+        call_row > summary_top,
+        "the clicked call sits below the summary — the pin must not use its row"
+    );
+
+    h.app.click_transcript(1, call_row);
+    assert_eq!(h.app.pending_scroll_entry, Some(head));
+    assert_eq!(
+        h.app.pending_scroll_row,
+        Some(summary_top),
+        "the pin row is the summary's top, not the click row below it"
+    );
+}
+
 /// Tool-only turns leave an empty assistant marker in the transcript; the
 /// marker renders nothing, so the tool runs on either side of it merge into
 /// one group — 3 + 2 + 6 calls become a single `ran 7 commands · read 4
