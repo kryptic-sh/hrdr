@@ -14,6 +14,8 @@
 use anyhow::{Result, bail};
 use hrdr_llm::{CompactionReason, ToolDef};
 
+use std::sync::Arc;
+
 use crate::{
     Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
     is_context_overflow,
@@ -684,7 +686,7 @@ impl Agent {
         // BEFORE the tail is chosen, not after: the repair inserts messages, so
         // an index taken first would slide backwards underneath it and could
         // land the tail on an orphaned tool result.
-        crate::turn_loop::repair_dangling_tool_calls(&mut self.messages);
+        crate::turn_loop::repair_dangling_tool_calls(Arc::make_mut(&mut self.messages));
         // Keep the most recent messages verbatim — compaction usually fires
         // mid-task, and the summary alone loses exactly the detail the model
         // is working with. Only the head (everything older) is summarized.
@@ -891,7 +893,7 @@ impl Agent {
             ..ChatMessage::user(continuation)
         });
         messages.extend(tail);
-        self.messages = messages;
+        self.messages = Arc::new(messages);
         // Most file contents the model had read live only in the summary now;
         // require fresh reads before further edits.
         self.reset_read_files();

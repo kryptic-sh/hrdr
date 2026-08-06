@@ -814,7 +814,7 @@ pub enum AgentEvent {
     /// duration, so the frontend can't read the history itself). With this
     /// saved, a crash mid-turn loses at most the round in flight; the resume
     /// path's `repair_dangling_tool_calls` covers the rest.
-    History(Vec<ChatMessage>),
+    History(Arc<Vec<ChatMessage>>),
     /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
     /// surfaced to the user as a system line.
     Notice(String),
@@ -1044,7 +1044,7 @@ pub struct Agent {
     last_prompt_tokens: Option<u32>,
     tools: ToolRegistry,
     ctx: ToolContext,
-    messages: Vec<ChatMessage>,
+    messages: Arc<Vec<ChatMessage>>,
     max_steps: usize,
     /// How hard this agent retries a failing model call
     /// ([`AgentConfig::retry`]). One [`RetryBudget`] is minted from it per
@@ -1942,7 +1942,7 @@ impl Agent {
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
-            messages: vec![ChatMessage::system(system)],
+            messages: Arc::new(vec![ChatMessage::system(system)]),
             max_steps: config.max_steps,
             retry_policy: config.retry,
             auto_compact: config.auto_compact,
@@ -2093,7 +2093,7 @@ impl Agent {
     /// session.
     pub fn clear(&mut self) {
         self.abort_background_tasks();
-        self.messages.clear();
+        Arc::make_mut(&mut self.messages).clear();
         self.reset_read_files();
         self.reset_session_cost();
         self.refresh_system();
@@ -2151,9 +2151,9 @@ impl Agent {
         // a stale offset would close the breakpoint in the wrong place.
         self.client.set_system_cache_split(system_cache_split);
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
-            self.messages[0] = ChatMessage::system(system);
+            Arc::make_mut(&mut self.messages)[0] = ChatMessage::system(system);
         } else {
-            self.messages.insert(0, ChatMessage::system(system));
+            Arc::make_mut(&mut self.messages).insert(0, ChatMessage::system(system));
         }
     }
 
@@ -2232,15 +2232,15 @@ impl Agent {
         // a stale offset would close the breakpoint in the wrong place.
         self.client.set_system_cache_split(system_cache_split);
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
-            self.messages[0] = ChatMessage::system(system);
+            Arc::make_mut(&mut self.messages)[0] = ChatMessage::system(system);
         } else {
-            self.messages.insert(0, ChatMessage::system(system));
+            Arc::make_mut(&mut self.messages).insert(0, ChatMessage::system(system));
         }
     }
 
     /// A clone of the full message history (for saving a session).
     pub fn messages_owned(&self) -> Vec<ChatMessage> {
-        self.messages.clone()
+        (*self.messages).clone()
     }
 
     /// A clone of the current TODO list.
@@ -2266,7 +2266,7 @@ impl Agent {
     /// signed Anthropic thinking blocks a pending `tool_use` needs — is installed
     /// verbatim.
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
-        self.messages = messages;
+        self.messages = Arc::new(messages);
         self.reset_read_files();
         // `refresh_system` re-gathers `AGENTS.md` and so recomputes
         // `project_docs_changed`. That flag means "a *new* conversation (`/new`)
@@ -2494,7 +2494,7 @@ impl Agent {
     /// TUI's `!command` shell escape records the command + its output this
     /// way, so the next model call sees what the user ran.
     pub fn push_user_note(&mut self, text: impl Into<String>) {
-        self.messages.push(ChatMessage::user(text));
+        Arc::make_mut(&mut self.messages).push(ChatMessage::user(text));
     }
 
     /// Status of the post-edit LSP layer for `/doctor`:
@@ -5748,7 +5748,7 @@ mod tests {
         agent.memory_enabled = true;
         agent.ctx.memory_project = Some(proj.clone());
         agent.ctx.memory_global = Some(glob.clone());
-        agent.messages = vec![ChatMessage::system("stale prompt".to_string())];
+        agent.messages = Arc::new(vec![ChatMessage::system("stale prompt".to_string())]);
 
         // A note saved mid-session, the way the `memory` tool writes one.
         std::fs::write(
@@ -9008,6 +9008,53 @@ mod tests {
             );
         }
 
+        /// The `History` snapshot the emitter sends after a committed tool round
+        /// must share the agent's message `Arc` — a refcount bump, not a deep
+        /// copy of the whole history on every round. Checked from inside the
+        /// sink, at the moment of emission: the payload is then one of at least
+        /// two handles on the agent's allocation (`self.messages` + the event),
+        /// so a reverted deep copy — a fresh single-owner `Arc` — fails this
+        /// with count 1.
+        #[tokio::test]
+        async fn history_event_shares_the_agents_message_arc() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let file_path = test_file.to_string_lossy().to_string();
+            let args_json = serde_json::to_string(&json!({"path": file_path})).unwrap();
+
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_abc", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Done"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut shared_at_emission = None;
+            agent
+                .run_input("read the file", |ev| {
+                    if let AgentEvent::History(m) = &ev {
+                        shared_at_emission = Some(Arc::strong_count(m) >= 2);
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                shared_at_emission,
+                Some(true),
+                "the History payload must share the agent's message Arc, not deep-copy it"
+            );
+        }
+
         /// A tool that panics takes the whole turn down with it — and used to
         /// take its own transcript entry with it too: the `ToolStart` had landed,
         /// the `ToolEnd` never did, so every frontend went on painting a call
@@ -9497,9 +9544,8 @@ mod tests {
             cfg.max_steps = 1;
             let mut agent = Agent::new(cfg).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let before = agent.messages.len();
@@ -10596,9 +10642,8 @@ mod tests {
             // Enough history that compaction actually shrinks something —
             // otherwise `compact` no-ops and the overflow path bails early.
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let mut notices: Vec<String> = Vec::new();
@@ -10643,10 +10688,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::user(format!("turn {i} {}", "x".repeat(400))));
-                agent.messages.push(ChatMessage::assistant(format!(
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
                     "reply {i} {}",
                     "x".repeat(400)
                 )));
@@ -10711,9 +10755,8 @@ mod tests {
                 ..Default::default()
             });
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -10786,9 +10829,8 @@ mod tests {
                 ..Default::default()
             });
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -11021,9 +11063,8 @@ mod tests {
             cfg.temperature = Some(0.7);
             let mut agent = Agent::new(cfg).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let mut events = Vec::new();
@@ -11082,9 +11123,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -11151,9 +11191,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let mut events = Vec::new();
@@ -11236,9 +11275,8 @@ mod tests {
                 "precondition: no bearer on client"
             );
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -11290,9 +11328,8 @@ mod tests {
             // summarize (bypassing a real multi-turn run — `messages` is a
             // private field visible to this test module).
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let before = agent.message_count();
@@ -11335,9 +11372,8 @@ mod tests {
             agent.ctx.memory_project = Some(proj.clone());
             agent.ctx.memory_global = Some(glob.clone());
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             assert!(
@@ -11413,9 +11449,8 @@ mod tests {
                 ..Default::default()
             });
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             agent.run_input("do the thing", |_| {}).await.unwrap();
@@ -11524,7 +11559,7 @@ mod tests {
             // One turn keeps the tail short enough that the repaired message
             // sits before it.
             agent.compaction_tail_turns = 1;
-            agent.messages.push(ChatMessage::user("first turn"));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user("first turn"));
             // Esc mid-tool-call: the results never arrived.
             let mut calls = ChatMessage::assistant("working on it");
             calls.tool_calls = Some(vec![hrdr_llm::ToolCall {
@@ -11535,9 +11570,9 @@ mod tests {
                     arguments: "{}".into(),
                 },
             }]);
-            agent.messages.push(calls);
-            agent.messages.push(ChatMessage::user("second turn"));
-            agent.messages.push(ChatMessage::assistant("done"));
+            Arc::make_mut(&mut agent.messages).push(calls);
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user("second turn"));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant("done"));
 
             agent
                 .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
@@ -11603,9 +11638,8 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
                 for i in 0..8 {
-                    agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                    agent
-                        .messages
+                    Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                    Arc::make_mut(&mut agent.messages)
                         .push(ChatMessage::assistant(format!("reply {i}")));
                 }
                 agent
@@ -11696,9 +11730,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -11783,9 +11816,9 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             let turns = |agent: &mut Agent, tag: &str| {
                 for i in 0..8 {
-                    agent.messages.push(ChatMessage::user(format!("{tag} {i}")));
-                    agent
-                        .messages
+                    Arc::make_mut(&mut agent.messages)
+                        .push(ChatMessage::user(format!("{tag} {i}")));
+                    Arc::make_mut(&mut agent.messages)
                         .push(ChatMessage::assistant(format!("reply {i}")));
                 }
             };
@@ -11877,9 +11910,8 @@ mod tests {
 
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
 
@@ -11941,9 +11973,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             let history = |agent: &Agent| -> Vec<Option<String>> {
@@ -11993,14 +12024,12 @@ mod tests {
             // agent.messages starts as [system]. Build the sub-agent shape: one
             // user turn, then many tool round-trips with bulky results — never a
             // second `role:"user"` message.
-            agent.messages.push(ChatMessage::user("do the big task"));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user("do the big task"));
             let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
             for i in 0..6 {
                 let id = format!("call{i}");
-                agent.messages.push(super::assistant_with_calls(&[&id]));
-                agent
-                    .messages
-                    .push(ChatMessage::tool_result(&id, big.clone()));
+                Arc::make_mut(&mut agent.messages).push(super::assistant_with_calls(&[&id]));
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::tool_result(&id, big.clone()));
             }
             let before = agent.message_count();
 
@@ -12059,14 +12088,12 @@ mod tests {
                 ..test_cfg(server.base_url(), dir.path())
             })
             .unwrap();
-            agent.messages.push(ChatMessage::user("do the big task"));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user("do the big task"));
             let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
             for i in 0..6 {
                 let id = format!("call{i}");
-                agent.messages.push(super::assistant_with_calls(&[&id]));
-                agent
-                    .messages
-                    .push(ChatMessage::tool_result(&id, big.clone()));
+                Arc::make_mut(&mut agent.messages).push(super::assistant_with_calls(&[&id]));
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::tool_result(&id, big.clone()));
             }
 
             // The tail the split picks, computed against the same history the
@@ -12135,9 +12162,8 @@ mod tests {
                 })
                 .unwrap();
                 for i in 0..8 {
-                    agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                    agent
-                        .messages
+                    Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                    Arc::make_mut(&mut agent.messages)
                         .push(ChatMessage::assistant(format!("reply {i}")));
                 }
                 agent
@@ -12190,9 +12216,9 @@ mod tests {
             // The server reports overflow anyway (413), simulating a real
             // context window smaller than this — still — modest history, or any
             // other case where nothing is left to shrink.
-            agent.messages.push(ChatMessage::user("go"));
-            agent.messages.push(super::assistant_with_calls(&["a"]));
-            agent.messages.push(ChatMessage::tool_result("a", "ok"));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user("go"));
+            Arc::make_mut(&mut agent.messages).push(super::assistant_with_calls(&["a"]));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::tool_result("a", "ok"));
 
             // Opener-less: nothing enqueued — the turn runs on the history already
             // present (an interrupted tool round), which is what overflows.
@@ -12228,9 +12254,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             // Simulate an earlier self-compaction failure that was recorded.
@@ -12278,9 +12303,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             for i in 0..8 {
-                agent.messages.push(ChatMessage::user(format!("turn {i}")));
-                agent
-                    .messages
+                Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+                Arc::make_mut(&mut agent.messages)
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             // A window with a trigger well below it, so every reading below is
@@ -13422,7 +13446,10 @@ mod tests {
         );
         // Bulky bookkeeping is dropped.
         assert_eq!(Record::from_event(&AgentEvent::TurnDone), None);
-        assert_eq!(Record::from_event(&AgentEvent::History(Vec::new())), None);
+        assert_eq!(
+            Record::from_event(&AgentEvent::History(Arc::new(Vec::new()))),
+            None
+        );
     }
 
     /// The config's `[providers.*]` map is rekeyed by the CANONICAL name at load, so

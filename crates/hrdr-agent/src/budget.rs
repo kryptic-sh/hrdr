@@ -181,6 +181,8 @@ impl Agent {
 mod tests {
     use hrdr_llm::{Accumulator, ToolDef, Usage};
 
+    use std::sync::Arc;
+
     use crate::{Agent, AgentConfig, ChatMessage};
 
     /// One tool with a schema roughly the size of a real hrdr tool's.
@@ -201,7 +203,7 @@ mod tests {
 
     fn agent_with_history() -> Agent {
         let mut agent = Agent::new(AgentConfig::default()).unwrap();
-        agent.messages.push(ChatMessage::user("hello"));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::user("hello"));
         agent
     }
 

@@ -375,7 +375,7 @@ async fn spawn_background(
                         // to the jsonl.
                         if let AgentEvent::History(messages) = &ev {
                             snapshot.save(
-                                messages.clone(),
+                                (**messages).clone(),
                                 usage_live.usage(live_key).unwrap_or_default(),
                             );
                         }

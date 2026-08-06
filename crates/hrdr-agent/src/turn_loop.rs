@@ -501,7 +501,7 @@ impl Agent {
         // A previous turn interrupted mid tool-call can leave the history ending
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.
-        repair_dangling_tool_calls(&mut self.messages);
+        repair_dangling_tool_calls(Arc::make_mut(&mut self.messages));
         // Drain the turn opener from the queue — the same queue a mid-turn steer
         // lands on. A normal turn has one waiting (the caller enqueued it); an
         // opener-less turn — nothing queued — exists only to hand the agent
@@ -641,7 +641,7 @@ impl Agent {
                 self.tool_syntax_warned = true;
                 on_event(AgentEvent::Notice(UNPARSED_TOOL_CALL_NOTICE.to_string()));
             }
-            self.messages.push(assistant);
+            Arc::make_mut(&mut self.messages).push(assistant);
 
             if tool_calls.is_empty() {
                 // A degraded high-context model sometimes ends its turn on a
@@ -740,7 +740,7 @@ impl Agent {
             // ends the turn where it stands; that case is left to the user-facing
             // Notice above, since there is no next round to correct.
             if truncated
-                && let Some(last) = self.messages.last_mut()
+                && let Some(last) = Arc::make_mut(&mut self.messages).last_mut()
                 && let Some(content) = &mut last.content
             {
                 content.push_str(
@@ -794,7 +794,7 @@ impl Agent {
             // Mid-turn durability: every result of this round is committed, so
             // hand the frontend a history snapshot to persist. A crash from
             // here on loses at most the next round.
-            on_event(AgentEvent::History(self.messages.clone()));
+            on_event(AgentEvent::History(Arc::clone(&self.messages)));
 
             // 80% of the budget: one soft warning, early enough that the model
             // can still commit what's done and sequence what's left. Rides the
@@ -803,7 +803,7 @@ impl Agent {
             let used = step;
             if !checkpoint_warned
                 && checkpoint_warning_round(self.max_steps) == Some(used)
-                && let Some(last) = self.messages.last_mut()
+                && let Some(last) = Arc::make_mut(&mut self.messages).last_mut()
                 && let Some(content) = &mut last.content
             {
                 checkpoint_warned = true;
@@ -819,7 +819,7 @@ impl Agent {
             // getting cut off mid-plan.
             let remaining = self.max_steps - step;
             if remaining == WRAP_UP_WARNING_ROUNDS
-                && let Some(last) = self.messages.last_mut()
+                && let Some(last) = Arc::make_mut(&mut self.messages).last_mut()
                 && let Some(content) = &mut last.content
             {
                 content.push_str(&format!(
@@ -835,7 +835,7 @@ impl Agent {
             "tool-round limit reached ({}) — asking the model to wrap up",
             self.max_steps
         )));
-        self.messages.push(ChatMessage::user(
+        Arc::make_mut(&mut self.messages).push(ChatMessage::user(
             "[The tool-call budget for this turn is exhausted. Do not request more tool \
              calls. Summarize what you accomplished and what remains to be done.]"
                 .to_string(),
@@ -878,7 +878,7 @@ impl Agent {
         });
         let mut wrap_up_reply = acc.into_message();
         ensure_assistant_has_content(&mut wrap_up_reply);
-        self.messages.push(wrap_up_reply);
+        Arc::make_mut(&mut self.messages).push(wrap_up_reply);
         self.fire_turn_end_hooks(&mut on_event).await;
         self.release_finished_subagents();
         self.age_todos();
@@ -1023,8 +1023,7 @@ impl Agent {
         // it verifies its own edit landed as intended and repairs what it did
         // wrong.
         let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
-        self.messages
-            .push(ChatMessage::tool_result(call.id.clone(), recorded));
+        Arc::make_mut(&mut self.messages).push(ChatMessage::tool_result(call.id.clone(), recorded));
     }
 
     /// Run a batch of tool calls, forwarding each call's streamed output as

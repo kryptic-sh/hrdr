@@ -3010,7 +3010,7 @@ impl App {
         // the queue carries both, so nothing here has to pair them up.
         // Mid-turn durability: the agent committed a round and sent its history.
         if let AgentEvent::History(messages) = &ev {
-            self.persist_mid_turn(messages.clone());
+            self.persist_mid_turn((**messages).clone());
         }
         // The event is already recorded on the agent's own entry — its transcript,
         // its counters and its turn clock — by the turn that produced it

@@ -2230,7 +2230,9 @@ async fn history_snapshot_persists_the_session_mid_turn() {
         hrdr_agent::Message::user("do the thing"),
         hrdr_agent::Message::assistant("on it"),
     ];
-    h.inject(hrdr_agent::AgentEvent::History(snapshot.clone()));
+    h.inject(hrdr_agent::AgentEvent::History(std::sync::Arc::new(
+        snapshot.clone(),
+    )));
 
     let id = h
         .app

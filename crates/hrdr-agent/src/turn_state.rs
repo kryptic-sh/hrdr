@@ -4,6 +4,7 @@
 use crate::{
     Agent, AgentEvent, ChatMessage, MessageOrigin, Steer, SteeringQueue, timestamped_user_message,
 };
+use std::sync::Arc;
 
 impl Agent {
     /// Add a user-role message to history — the single place a user-role turn
@@ -17,7 +18,7 @@ impl Agent {
     /// message entering history" can be applied to one arrival path but not
     /// another.
     pub(crate) fn push_user_message(&mut self, text: impl Into<String>, origin: MessageOrigin) {
-        self.messages.push(ChatMessage {
+        Arc::make_mut(&mut self.messages).push(ChatMessage {
             origin,
             ..timestamped_user_message(text)
         });
