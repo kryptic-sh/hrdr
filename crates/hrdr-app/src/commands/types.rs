@@ -41,6 +41,10 @@ pub enum LineKind {
     System,
     /// A unified diff (frontends with diff-aware rendering color it).
     Diff,
+    /// A slash command's data output (`/status`, `/cost`, `/help`, …) — a
+    /// frontend shows it in an Esc-dismissible popup rather than the
+    /// transcript.
+    Popup,
 }
 
 /// What `/verbose` should do to tool output (parsed by the shared dispatcher;

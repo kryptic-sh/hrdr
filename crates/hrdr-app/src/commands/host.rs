@@ -17,6 +17,10 @@ pub type IdentityPoster = Box<dyn Fn(hrdr_agent::ModelRef, Option<String>, Optio
 pub trait CommandHost {
     /// Emit a system line immediately (on the UI thread).
     fn info(&mut self, line: String);
+    /// Show `text` in an Esc-dismissible popup (a slash command's data output:
+    /// `/help`, `/status`, `/cost`, …) instead of a transcript line. A
+    /// frontend with no popup drops it.
+    fn popup(&mut self, _text: String) {}
     /// Spawn `fut`; when it resolves, show its non-empty string as a system line.
     fn spawn_line(&self, fut: LineFuture) {
         let poster = self.line_poster();
@@ -24,6 +28,17 @@ pub trait CommandHost {
             let line = fut.await;
             if !line.is_empty() {
                 poster(LineKind::System, line);
+            }
+        });
+    }
+    /// Spawn `fut`; when it resolves, show its non-empty string in a popup
+    /// ([`Self::popup`]).
+    fn spawn_popup(&self, fut: LineFuture) {
+        let poster = self.line_poster();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if !line.is_empty() {
+                poster(LineKind::Popup, line);
             }
         });
     }

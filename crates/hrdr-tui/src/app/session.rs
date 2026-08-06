@@ -24,14 +24,14 @@ impl super::App {
         }
     }
 
-    /// Surface a session-save failure once per distinct error: push a notice
-    /// entry and remember the error so a retry failing the same way stays
-    /// silent (the notice is already on screen).
+    /// Surface a session-save failure once per distinct error: warn via the
+    /// toast stack and remember the error so a retry failing the same way
+    /// stays silent (the warning is already on screen).
     fn note_save_error(&mut self, error: String) {
         if self.session_save_error.as_deref() != Some(&error) {
-            self.push_entry(Entry::notice(format!(
+            self.toasts.warn(format!(
                 "session autosave failed — conversation is not safely stored: {error}"
-            )));
+            ));
             self.session_save_error = Some(error);
         }
     }
@@ -148,9 +148,9 @@ impl super::App {
         let name = state.name.clone();
         let messages = state.messages.len();
         self.adopt_state(state, Some(id));
-        self.push_entry(Entry::notice(format!(
+        self.system(format!(
             "resumed most recent session '{name}' ({messages} messages) — /new to start fresh"
-        )));
+        ));
     }
 
     /// Mid-turn durability: the agent just committed a tool round and sent a
@@ -189,7 +189,7 @@ impl super::App {
                 self.active_lock = Some(lock);
             }
             if o.first_save {
-                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
+                self.system(hrdr_app::session_saved_notice(&o.id));
             }
             self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
@@ -310,7 +310,7 @@ impl super::App {
             // so it lands once the first save of the session succeeds.
             if std::mem::take(&mut self.session_notice_pending) {
                 let id = self.state().id.clone().unwrap_or_default();
-                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&id)));
+                self.system(hrdr_app::session_saved_notice(&id));
             }
             self.enqueue_save();
             return;
@@ -326,7 +326,7 @@ impl super::App {
             // `reserve_session_id` created it at turn start and deferred the
             // notice to here (it sees `first_save` as false by then).
             if o.first_save || std::mem::take(&mut self.session_notice_pending) {
-                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
+                self.system(hrdr_app::session_saved_notice(&o.id));
             }
             self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();

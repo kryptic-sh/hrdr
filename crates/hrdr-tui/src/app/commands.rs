@@ -127,6 +127,29 @@ impl super::App {
         self.skill_selector = None;
         self.verbose = false;
     }
+    /// Route one key to the open notice popup (a slash command's data output):
+    /// Esc or Ctrl+C dismisses it, Up/Down scroll when the text overflows.
+    /// Caller checks `self.popup.is_some()` first.
+    pub(super) fn popup_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Char('c') if ctrl => self.popup = None,
+            KeyCode::Up => {
+                if let Some(p) = &mut self.popup {
+                    p.scroll = p.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = &mut self.popup {
+                    p.scroll = p.scroll.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Apply a `/verbose` mode (shared dispatch parses the arg), returning the
     /// status line. `verbose` is the sticky all-on flag; per-entry
     /// expansion lives on the Tool entries. On also shows the model's thinking
@@ -210,7 +233,15 @@ pub(super) struct TuiHost<'a> {
 
 impl hrdr_app::CommandHost for TuiHost<'_> {
     fn info(&mut self, line: String) {
-        self.app.system(line);
+        // A command's status line (a setting change, a toggle, a usage hint)
+        // is transient session chrome: it goes to the toast stack, not the
+        // transcript — the transcript belongs to the conversation.
+        self.app.toasts.info(line);
+    }
+    fn popup(&mut self, text: String) {
+        // A slash command's data output (`/status`, `/cost`, `/help`, …)
+        // renders in an Esc-dismissible popup instead of the transcript.
+        self.app.popup = Some(crate::app::NoticePopup::new(text));
     }
     fn line_poster(&self) -> Box<dyn Fn(hrdr_app::LineKind, String) + Send> {
         let tx = self.app.tx.clone();
@@ -218,6 +249,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             let msg = match kind {
                 hrdr_app::LineKind::Diff => TurnMsg::Diff(line),
                 hrdr_app::LineKind::System => TurnMsg::System(line),
+                hrdr_app::LineKind::Popup => TurnMsg::Popup(line),
             };
             // Sync poster callback — can't await; these are one-shot command
             // results into an otherwise-idle channel, so `try_send` is enough.

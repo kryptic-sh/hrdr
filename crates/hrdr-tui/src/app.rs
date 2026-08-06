@@ -62,6 +62,22 @@ pub(crate) struct UserShell {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// A slash command's data output (`/status`, `/cost`, `/help`, …), shown in
+/// an Esc-dismissible popup rather than the transcript. Scrolls with Up/Down
+/// when the text is taller than the popup.
+pub(crate) struct NoticePopup {
+    /// The command's output, as-is (the popup renders it as plain text).
+    pub(crate) text: String,
+    /// Scroll offset from the top, in rows.
+    pub(crate) scroll: u16,
+}
+
+impl NoticePopup {
+    pub(crate) fn new(text: String) -> Self {
+        Self { text, scroll: 0 }
+    }
+}
+
 /// The `/login` modal's two phases: pick a provider from a fuzzy list, then —
 /// for a remote key-based provider — enter the API key in a masked field.
 /// OAuth and keyless providers finish straight from the first phase.
@@ -212,6 +228,9 @@ pub(crate) enum TurnMsg {
     SubAgent(u64, AgentEvent),
     /// Out-of-band system line (e.g. async `/models` result).
     System(String),
+    /// A slash command's data output (`/status`, `/cost`, `/help`, …) from a
+    /// spawned line task — shown in an Esc-dismissible popup.
+    Popup(String),
     /// Out-of-band diff block (e.g. async `/diff` result).
     Diff(String),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
@@ -597,12 +616,9 @@ pub(crate) struct App {
     /// NOT a steer — a steer reaches the model mid-turn; a compaction must wait
     /// for the turn to finish so the summary sees the whole conversation.
     pending_compaction: Option<(hrdr_app::PaneId, Option<String>)>,
-    /// Chrome lines (slash-command output, async notices) that arrived while
-    /// the model's thinking block was still streaming. Held until the block
-    /// closes, so the thought is never split by a notice; [`Self::push_entry`]
-    /// defers and [`Self::flush_deferred_chrome`] appends them after the
-    /// finished block, in order, before whatever closed it.
-    deferred_chrome: Vec<Entry>,
+    /// A slash command's data output (`/status`, `/cost`, `/help`, …) shown
+    /// in an Esc-dismissible popup. `None` when nothing is open.
+    pub(crate) popup: Option<NoticePopup>,
     /// Screen rect of the "↓ Press END ↓" button (jump to newest output), set
     /// during draw while scrolled up so mouse clicks can hit-test against it.
     /// `None` when following.
@@ -866,7 +882,7 @@ impl App {
             todo_ttl,
             steering: hrdr_agent::steering_queue(),
             pending_compaction: None,
-            deferred_chrome: Vec::new(),
+            popup: None,
             end_button: None,
             tool_hits: Vec::new(),
             tool_groups: std::collections::HashSet::new(),
@@ -1101,6 +1117,13 @@ impl App {
         }
         if self.login_modal.is_some() {
             self.login_modal_key(key);
+            return Action::None;
+        }
+
+        // The notice popup (a slash command's data output) captures keys while
+        // it is open: Esc (or Ctrl+C) dismisses, Up/Down scroll.
+        if self.popup.is_some() {
+            self.popup_key(key);
             return Action::None;
         }
 
@@ -1932,15 +1955,17 @@ impl App {
     /// value stays in the editor buffer untouched (`/login` reads it via
     /// `self.editor.content()` as usual); only the on-screen rendering
     /// changes, so the key isn't fully visible on screen as it's typed.
-    /// Show a transient status line: a command's output, a usage hint, a busy
+    /// Show a transient status toast: a command's output, a usage hint, a busy
     /// guard, a reload notice. These are chrome — regenerated on demand and
-    /// never persisted (see [`hrdr_app::EntryKind::Notice`]).
+    /// never persisted, and they no longer live in the transcript at all: the
+    /// toast stack is the transcript's `::Notice` replacement (see
+    /// [`hrdr_app::EntryKind::Notice`]).
     ///
     /// Content that belongs to the conversation's history — a turn's error, a
     /// cancel, a compaction result, an agent warning — pushes `Entry::system`
     /// directly instead.
     pub(crate) fn system(&mut self, msg: impl Into<String>) {
-        self.push_entry(Entry::notice(msg.into()));
+        self.toasts.info(msg.into());
     }
 
     /// Run `f` with the locked agent, returning its result — or `None` if a turn
@@ -2185,47 +2210,11 @@ impl App {
         view.draft = draft;
     }
 
-    /// Append a chrome entry (a slash-command output line, an async notice, a
-    /// stats row) to the main pane's transcript — unless the model's thinking
-    /// block is still streaming and the entry is a notice, in which case it is
-    /// held and appended after the thought closes ([`Self::flush_deferred_chrome`]).
-    /// Inserting a notice between an open thought and the next reasoning delta
-    /// would split the block into two running halves; deferring keeps it one
-    /// complete block with the notice below it. Everything else — a tool block,
-    /// output, a user message — is a real transcript entry that belongs exactly
-    /// where it is pushed.
+    /// Append a chrome entry (a stats row, a cancel/compaction message) to the
+    /// main pane's transcript. Notices no longer pass through here — they go to
+    /// the toast stack ([`Self::system`]) or an Esc-dismissible popup.
     fn push_entry(&mut self, e: Entry) {
-        let thinking_open = self
-            .panes
-            .main()
-            .transcript()
-            .last()
-            .is_some_and(|l| matches!(&l.kind, EntryKind::Reasoning { took_ms: None, .. }));
-        if thinking_open && matches!(e.kind, EntryKind::Notice(_)) {
-            self.deferred_chrome.push(e);
-            return;
-        }
         self.panes.main_mut().transcript_mut().push(e);
-        self.prune_scrollback();
-    }
-
-    /// Append any chrome deferred while the thinking block was streaming
-    /// ([`Self::push_entry`]), now that a non-Reasoning event has landed. The
-    /// thought is closed the same way the reducer closes it — its duration
-    /// label stops streaming — then the held lines go after it, in order,
-    /// before whatever closed the stream is applied.
-    fn flush_deferred_chrome(&mut self) {
-        if self.deferred_chrome.is_empty() {
-            return;
-        }
-        let entries = std::mem::take(&mut self.deferred_chrome);
-        {
-            let pane = self.panes.main_mut();
-            hrdr_agent::finish_reasoning(pane.transcript_mut());
-            for e in entries {
-                pane.transcript_mut().push(e);
-            }
-        }
         self.prune_scrollback();
     }
 
@@ -2713,13 +2702,6 @@ impl App {
     pub(crate) fn on_turn_msg(&mut self, msg: TurnMsg) {
         match msg {
             TurnMsg::Event(ev) => {
-                // A non-Reasoning event closes the thinking block. Flush any
-                // chrome deferred while it streamed before the event is
-                // applied, so the lines land after the finished thought and
-                // before whatever closed it.
-                if !matches!(ev, AgentEvent::Reasoning(_)) {
-                    self.flush_deferred_chrome();
-                }
                 // Ignore buffered events after cancellation — and only then.
                 // Neither signal answers this alone: the turn clears the agent's
                 // `running` flag itself as it ends (`RunGuard`), so trailing messages
@@ -2742,11 +2724,16 @@ impl App {
                 }
             }
             TurnMsg::System(text) => {
-                self.push_entry(Entry::notice(text));
+                // An async/passive line (e.g. a late `/models` result) is
+                // transient session chrome: a toast, never a transcript entry.
+                self.toasts.info(text);
                 // Do NOT reset scroll_offset here: this is an async/passive line
                 // (e.g. a late `/models` result). Resetting would yank the user's
                 // view when they are scrolled up reading back-scroll. When the
                 // user is already following (offset == 0), it stays 0 unchanged.
+            }
+            TurnMsg::Popup(text) => {
+                self.popup = Some(NoticePopup::new(text));
             }
             TurnMsg::Diff(text) => {
                 self.push_entry(Entry::diff(text));
@@ -2806,9 +2793,6 @@ impl App {
                 // (then it waits for that turn too — a compaction must see the
                 // whole conversation, and the steer that just started is part of it).
                 self.drain_pending_compaction();
-                // Safety net: any chrome deferred while the thought streamed that
-                // no non-Reasoning event flushed (a stale or cancelled turn).
-                self.flush_deferred_chrome();
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;

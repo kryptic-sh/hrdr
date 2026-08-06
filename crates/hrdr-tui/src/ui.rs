@@ -143,6 +143,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_skill_selector(f, &app.theme, sel);
     } else if let Some(modal) = &app.login_modal {
         draw_login_modal(f, &app.theme, modal);
+    } else if let Some(popup) = &app.popup {
+        // A slash command's data output (`/status`, `/cost`, `/help`, …).
+        draw_notice_popup(f, &app.theme, popup);
     } else if let Some(comp) = app.active_completions() {
         // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
@@ -271,6 +274,37 @@ fn popup_bar(theme: &Theme, height: u16) -> Vec<Line<'static>> {
             ))
         })
         .collect()
+}
+
+/// A slash command's data output (`/status`, `/cost`, `/help`, …) in a
+/// centered, Esc-dismissible popup — the same modal chrome as the pickers,
+/// rendering the command's text as-is with a dim hint. Scrolls with Up/Down
+/// when the text is taller than the popup.
+fn draw_notice_popup(f: &mut Frame, theme: &Theme, popup: &crate::app::NoticePopup) {
+    let Some(inner) = modal_frame(f, theme, 92, 30, 3) else {
+        return;
+    };
+    let bg = theme.user_bg;
+    let mut lines: Vec<Line> = popup
+        .text
+        .lines()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(theme.assistant).bg(bg),
+            ))
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Esc to dismiss · Up/Down to scroll",
+        Style::default().fg(theme.dim).bg(bg),
+    )));
+    let mut para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    if popup.scroll > 0 {
+        para = para.scroll((popup.scroll, 0));
+    }
+    f.render_widget(para, inner);
 }
 
 /// Render the shared two-column picker body into `inner`: an optionally-prefixed

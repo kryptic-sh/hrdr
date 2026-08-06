@@ -199,7 +199,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shows `compacting context — summarizing the conversation…` while the pass
   runs, so the notice was the same information twice in two places.
 
+- **Slash-command status lines toast; a data dump opens an Esc-dismissible
+  popup.** `::Notice` entries no longer live in the transcript at all — the
+  transcript belongs to the conversation. A command's status line (a setting
+  change, `/verbose`, a login notice, an async `/models` result) shows as a
+  toast, like the clipboard feedback; a data dump (`/help`, `/status`, `/cost`,
+  `/tools`, `/prompt`, `/guardrails`, `/doctor`) renders in a centered popup
+  that Esc (or Ctrl+C) dismisses and Up/Down scroll. Nothing a command prints
+  pollutes the session record — and nothing it prints can split a streaming
+  thinking block.
+
 ### Fixed
+
+- **A tinted block above the todo/task panel no longer merges with it.** The two
+  `┃` pads stacked with no blank between; the panel now gets the same separator
+  `flush` gives two tinted transcript blocks, so its background is preceded by
+  exactly one blank line whether the block above is tinted or on the page.
+
+- **A notice arriving mid-thought no longer splits the thinking block into two
+  running halves.** The agent's record holds a `Notice` emitted while the model
+  streams reasoning and writes it after the thought, just before whatever closes
+  the stream, so the event log and the durable jsonl fold to one complete block
+  with the notice below it — and slash-command status lines now toast instead of
+  touching the transcript at all.
 
 - **Clicking a streaming thought's summary keeps it open as it streams.** The
   open state was keyed by the thought's content hash, which changes with every

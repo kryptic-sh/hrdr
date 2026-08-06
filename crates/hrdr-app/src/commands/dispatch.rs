@@ -23,7 +23,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 s.push_str("\n\n");
                 s.push_str(&tips);
             }
-            host.info(s);
+            host.popup(s);
         }
         // `/new`, `/clear`, `/reset` — optionally naming the fresh session, so it
         // saves under that name instead of one derived from its first message.
@@ -44,7 +44,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "tools" => {
             let agent = host.agent();
-            host.spawn_line(Box::pin(async move {
+            host.spawn_popup(Box::pin(async move {
                 let tools = agent.lock().await.tools();
                 let mut msg = format!("{} tools:", tools.len());
                 for (name, desc) in tools {
@@ -55,7 +55,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "prompt" | "system" => {
             let agent = host.agent();
-            host.spawn_line(Box::pin(async move {
+            host.spawn_popup(Box::pin(async move {
                 match agent.lock().await.system_prompt() {
                     Some(p) => format!("system prompt ({} chars):\n{p}", p.chars().count()),
                     None => "no system prompt is set".to_string(),
@@ -64,7 +64,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "guardrails" | "rails" => {
             let agent = host.agent();
-            host.spawn_line(Box::pin(async move {
+            host.spawn_popup(Box::pin(async move {
                 let specs = agent.lock().await.guardrail_specs();
                 let mut msg = format!(
                     "{} guardrails (blocked shell commands; add more via [[guardrails]] in config):",
@@ -115,7 +115,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                     )
                 })
                 .unwrap_or_default();
-            host.spawn_line(Box::pin(async move {
+            host.spawn_popup(Box::pin(async move {
                 let (temp, messages, cache) = {
                     let a = agent.lock().await;
                     (a.temperature(), a.message_count(), a.prompt_cache_active())
@@ -472,7 +472,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 let s = crate::fmt_cost_maybe_partial(cost, host.session_cost_partial());
                 line.push_str(&format!(" · est. {s}"));
             }
-            host.info(line);
+            host.popup(line);
         }
         "doctor" => {
             let agent = host.agent();
@@ -492,7 +492,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                  cwd: {}\nconfig: {config_path}\nprobing endpoint…",
                 crate::display_dir(&cwd),
             ));
-            host.spawn_line(Box::pin(async move {
+            host.spawn_popup(Box::pin(async move {
                 // `in_git_repo` walks ancestors calling `.exists()` and
                 // `git_branch` reads `.git/HEAD` up the tree — both belong
                 // here, off the UI thread, along with the auth-file check.
@@ -647,6 +647,8 @@ mod tests {
         cwd: std::path::PathBuf,
         agent: Arc<Mutex<Agent>>,
         info_log: Vec<String>,
+        /// `/help`, `/status`, `/cost`, … — the data commands that popup.
+        popup_log: Vec<String>,
         /// Lines posted by spawned tasks (`line_poster`), captured so async
         /// command output (export results, /doctor reports) is assertable.
         async_log: Arc<std::sync::Mutex<Vec<String>>>,
@@ -676,6 +678,7 @@ mod tests {
                 cwd,
                 agent: Arc::new(Mutex::new(agent)),
                 info_log: Vec::new(),
+                popup_log: Vec::new(),
                 async_log: Arc::new(std::sync::Mutex::new(Vec::new())),
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
@@ -690,6 +693,9 @@ mod tests {
     impl CommandHost for TestHost {
         fn info(&mut self, line: String) {
             self.info_log.push(line);
+        }
+        fn popup(&mut self, text: String) {
+            self.popup_log.push(text);
         }
         fn session_cache(&self) -> Option<(f64, usize, usize)> {
             self.cache
@@ -868,7 +874,7 @@ mod tests {
         let mut host = TestHost::new(dir.path().to_path_buf());
 
         assert!(dispatch(&mut host, "/cost"));
-        let silent = host.info_log.last().cloned().unwrap_or_default();
+        let silent = host.popup_log.last().cloned().unwrap_or_default();
         assert!(silent.contains("session tokens:"), "{silent}");
         assert!(
             !silent.contains("prompt cache"),
@@ -877,7 +883,7 @@ mod tests {
 
         host.cache = Some((0.78, 120_000, 30_000));
         assert!(dispatch(&mut host, "/cost"));
-        let measured = host.info_log.last().cloned().unwrap_or_default();
+        let measured = host.popup_log.last().cloned().unwrap_or_default();
         assert!(
             measured.contains("prompt cache: 78% read (120.0k), 30.0k written"),
             "{measured}"

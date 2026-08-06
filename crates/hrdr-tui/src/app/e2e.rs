@@ -848,13 +848,16 @@ async fn slash_help_renders_locally_without_a_turn() {
     let mut h = Harness::new(vec![]).await;
     // `/help` is handled locally — no model turn, so nothing is consumed.
     h.submit("/help").await;
-    let screen = h.render();
-    // The help text is long and the transcript follows to the bottom, so assert
-    // on lines that stay visible there rather than the "Commands" header up top.
+    let popup = h.app.popup.as_ref().expect("the help popup is open");
     assert!(
-        screen.contains("/exit") && screen.contains("reload AGENTS.md"),
-        "help output missing:\n{screen}"
+        popup.text.contains("/exit") && popup.text.contains("reload AGENTS.md"),
+        "help output missing from the popup"
     );
+    // The popup renders its top — the command list — and Esc closes it.
+    let screen = h.render();
+    assert!(screen.contains("/new"), "the help popup renders:\n{screen}");
+    h.press(KeyCode::Esc);
+    assert!(h.app.popup.is_none(), "Esc closes the help popup");
     assert!(!h.app.running());
 }
 
@@ -1020,16 +1023,12 @@ async fn reasoning_hidden_shows_a_summary_until_verbose() {
     );
 }
 
-/// A chrome line (a slash command's output) that lands while the model's
-/// thinking block is still streaming is deferred, not inserted: the block is
-/// never split into two running halves around the notice, and the line appears
-/// after it once the thought completes — before the reply that closed it.
-///
-/// Regression: the line was pushed straight into the transcript, bypassing the
-/// reducer's `finish_reasoning`, so the first half stayed "⣆ Thinking" forever
-/// and the next reasoning delta opened a second block.
+/// A slash command's status line (`/verbose off`) is a toast, not a
+/// transcript entry: it never touches the streaming thinking block, so the
+/// thought stays one block and closes normally when the reply arrives — no
+/// split into two running halves around a notice.
 #[tokio::test]
-async fn a_notice_mid_thinking_is_deferred_until_the_thought_completes() {
+async fn a_slash_commands_status_toasts_instead_of_entering_the_transcript() {
     let mut h = Harness::new(vec![]).await;
     use hrdr_agent::AgentEvent;
 
@@ -1044,18 +1043,29 @@ async fn a_notice_mid_thinking_is_deferred_until_the_thought_completes() {
         "the thought is open and streaming"
     );
 
-    // `/verbose off` mid-thought: its "verbose mode off" line must not split
-    // the streaming block.
+    // `/verbose off` mid-thought: its "verbose mode off" line goes to the
+    // toast stack — the transcript is untouched.
     h.type_str("/verbose off");
     h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app.toasts.last_body(),
+        Some("verbose mode off"),
+        "the status line toasts"
+    );
+    assert!(
+        !h.app
+            .transcript()
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Notice(s) if s == "verbose mode off")),
+        "the status line did not enter the transcript:\n{:?}",
+        h.app.transcript()
+    );
 
-    // The reply closes the thought; the deferred line lands after it — before
-    // the reply.
+    // The reply closes the thought normally — one block, never split.
     h.inject(AgentEvent::Text("visible reply".into()));
     h.app
         .registry
         .update(hrdr_agent::MAIN_KEY, |e| e.running = false);
-
     let t = h.app.transcript();
     let thoughts: Vec<&Entry> = t
         .iter()
@@ -1077,20 +1087,69 @@ async fn a_notice_mid_thinking_is_deferred_until_the_thought_completes() {
         "the thought closed instead of staying running: {:?}",
         thoughts[0].kind
     );
-    let thought_idx = t
-        .iter()
-        .position(|e| matches!(e.kind, EntryKind::Reasoning { .. }))
-        .expect("the thought renders");
+}
+
+/// A slash command's data output (`/cost`) renders in an Esc-dismissible
+/// popup instead of the transcript, and Esc closes it.
+#[tokio::test]
+async fn a_data_commands_output_shows_in_an_esc_dismissible_popup() {
+    let mut h = Harness::new(vec![]).await;
+
+    // `/cost` posts its line synchronously (no spawned task).
+    h.type_str("/cost");
+    h.press(KeyCode::Enter);
+    let popup = h.app.popup.as_ref().expect("the cost popup is open");
     assert!(
-        matches!(&t[thought_idx + 1].kind, EntryKind::Notice(s) if s == "verbose mode off"),
-        "the notice is pinned below the thought: {:?}",
-        t[thought_idx + 1].kind
+        popup.text.contains("session tokens:"),
+        "the cost data is in the popup: {:?}",
+        popup.text
     );
     assert!(
-        matches!(&t[thought_idx + 2].kind, EntryKind::Assistant(s) if s == "visible reply"),
-        "the reply follows the notice: {:?}",
-        t[thought_idx + 2].kind
+        !h.app
+            .transcript()
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Notice(s) if s.contains("session tokens:"))),
+        "the cost output did not enter the transcript:\n{:?}",
+        h.app.transcript()
     );
+
+    // It renders.
+    let screen = h.render();
+    assert!(
+        screen.contains("session tokens:"),
+        "the popup renders:\n{screen}"
+    );
+
+    // Esc dismisses it.
+    h.press(KeyCode::Esc);
+    assert!(h.app.popup.is_none(), "Esc closes the popup");
+}
+
+/// A spawned data command (`/status`) posts its output through the async line
+/// channel and lands in the same Esc-dismissible popup.
+#[tokio::test]
+async fn an_async_data_commands_output_lands_in_the_popup() {
+    let mut h = Harness::new(vec![]).await;
+
+    h.type_str("/status");
+    h.press(KeyCode::Enter);
+    // The `/status` body is built in a spawned task; drain until it lands.
+    loop {
+        let msg = h.rx.recv().await.expect("the status line arrives");
+        h.app.on_turn_msg(msg);
+        if h.app.popup.is_some() {
+            break;
+        }
+    }
+    let popup = h.app.popup.as_ref().expect("the status popup is open");
+    assert!(
+        popup.text.contains("session:") && popup.text.contains("model:"),
+        "the status data is in the popup: {:?}",
+        popup.text
+    );
+
+    h.press(KeyCode::Esc);
+    assert!(h.app.popup.is_none(), "Esc closes the popup");
 }
 
 /// `/verbose` is a strict on/off toggle — the rename of `/expand`. A bare
@@ -2611,6 +2670,9 @@ async fn the_header_persists_and_shows_live_details() {
         .apply_session("s".to_string(), hrdr_app::Session::new(state));
     // The chrome follows the agent, never leads it: let the repoint land.
     h.settle_switch().await;
+    // `apply_session` reports the endpoint move as a toast, which renders over
+    // the header's details column — drop it so the details are visible.
+    h.app.toasts = hjkl_holler::HollerBus::new();
 
     let mut term = Terminal::new(TestBackend::new(64, 32)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -2763,18 +2825,11 @@ async fn a_session_on_an_unusable_provider_stays_put_and_says_so() {
     h.app.auto_resume_state(saved, "old".to_string());
 
     assert!(
-        h.app.transcript().iter().any(|e| matches!(
-            &e.kind,
-            EntryKind::Notice(t) | EntryKind::System(t)
-                if t.contains("this session ran on provider 'nowhere'")
-                && t.contains("staying on the current endpoint")
-        )),
-        "the failure is reported:\n{:?}",
-        h.app
-            .transcript()
-            .iter()
-            .map(|e| &e.kind)
-            .collect::<Vec<_>>()
+        h.app.toasts.history().any(
+            |t| t.body.contains("this session ran on provider 'nowhere'")
+                && t.body.contains("staying on the current endpoint")
+        ),
+        "the failure is reported via the toast stack"
     );
     let provider = h.app.agent.lock().await.provider_name().to_string();
     assert_eq!(provider, "local", "the agent did not move");
@@ -3712,6 +3767,9 @@ async fn the_stats_line_rides_on_the_turns_block() {
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // The first-save toast ("session saved as …") would cover the top rows this
+    // test asserts on; it is transient chrome, so drop it before drawing.
+    h.app.toasts = hjkl_holler::HollerBus::new();
 
     let mut term = Terminal::new(TestBackend::new(46, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3767,6 +3825,8 @@ async fn user_prompts_render_like_the_models_output() {
     // literal `**`); it now shows in the status bar, but this test is about the
     // transcript, so clear it to keep the `*`-free assertion focused there.
     h.app.state_mut().name.clear();
+    // The first-save toast would cover the top rows; drop it before drawing.
+    h.app.toasts = hjkl_holler::HollerBus::new();
 
     let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3822,6 +3882,8 @@ async fn fenced_code_has_no_extra_indent_or_language_row() {
     h.app
         .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // The first-save toast would cover the top rows; drop it before drawing.
+    h.app.toasts = hjkl_holler::HollerBus::new();
 
     let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -6978,16 +7040,14 @@ async fn the_footer_is_gone_and_the_keys_live_in_help() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("/help");
     h.press(KeyCode::Enter);
+    // `/help` is a data command: its output lives in the Esc-dismissible popup.
     let help = h
         .app
-        .transcript()
-        .iter()
-        .rev()
-        .find_map(|e| match &e.kind {
-            EntryKind::Notice(t) | EntryKind::System(t) if t.contains("Keys:") => Some(t.clone()),
-            _ => None,
-        })
-        .expect("/help output");
+        .popup
+        .as_ref()
+        .map(|p| p.text.clone())
+        .expect("/help popup");
+    assert!(help.contains("Keys:"), "the engine's keys:\n{help}");
     assert!(help.contains("Enter=send"), "the engine's keys:\n{help}");
     assert!(help.contains("Ctrl+G=$EDITOR"), "{help}");
     assert!(help.contains("@path attaches a file"), "{help}");
@@ -7516,9 +7576,9 @@ async fn browser_login_failure_reports_and_closes() {
     );
     assert!(
         h.app
-            .transcript()
-            .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Notice(t) if t.contains("login failed"))),
+            .toasts
+            .last_body()
+            .is_some_and(|t| t.contains("login failed")),
         "the failure is reported to the user"
     );
 }
@@ -7765,11 +7825,10 @@ async fn a_second_bang_command_while_one_runs_leaves_no_phantom_block() {
         .count();
     assert_eq!(open, 1, "the rejected command must not open a second block");
     assert!(
-        h.app.transcript().iter().any(|e| matches!(
-            &e.kind,
-            EntryKind::Notice(t) | EntryKind::System(t)
-                if t.contains("already running")
-        )),
+        h.app
+            .toasts
+            .last_body()
+            .is_some_and(|t| t.contains("already running")),
         "the refusal message is shown"
     );
     // Drain until the first block closes; there must still be exactly one
@@ -8310,16 +8369,12 @@ async fn a_command_line_command_runs_the_same_path_as_typing_it() {
     // is sent to the model.
     let mut h = Harness::new(vec![]).await;
     h.app.submit_input("/help".to_string());
-    let printed: String = h
+    let printed = h
         .app
-        .transcript()
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EntryKind::System(t) | EntryKind::Notice(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .popup
+        .as_ref()
+        .map(|p| p.text.clone())
+        .expect("the /help popup");
     assert!(
         printed.contains("/model"),
         "`hrdr /help` should print the command list, as typing it does: {printed}"
@@ -8718,6 +8773,8 @@ async fn up_after_recalling_a_slash_command_keeps_walking_history() {
     h.submit("the older message").await;
     // A bare slash command: recalled into the box, its own text matches.
     h.submit("/help").await;
+    // `/help` is a data command now — its popup captures keys until Esc.
+    h.press(KeyCode::Esc);
 
     // The first Up recalls the newest entry — the command.
     h.press(KeyCode::Up);
