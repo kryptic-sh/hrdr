@@ -2805,7 +2805,9 @@ mod tests {
 
     use std::sync::Arc;
 
+    use crate::delegation::{TaskCancelTool, bg_handles};
     use crate::model_ref::{r, spec};
+    use hrdr_tools::Tool;
 
     /// A new conversation starts from the `AGENTS.md` that is on disk *now*, and
     /// says so when that differs from what was in the prompt.
@@ -6225,15 +6227,13 @@ mod tests {
         // A general sub-agent has the full set, shell included…
         let general = tools("general");
         for t in [
-            "shell", "edit", "write", "replace", "read", "todo", "verify",
+            "shell", "edit", "write", "replace", "read", "todo", "verify", "watch",
         ] {
             assert!(general.contains(&t.to_string()), "general should have {t}");
         }
         // …and not the tools that were cut: `shell` is how you copy, move, delete
         // and search now, and the search four belong to jail.
-        for gone in [
-            "move", "delete", "copy", "watch", "grep", "find", "ls", "tree",
-        ] {
+        for gone in ["move", "delete", "copy", "grep", "find", "ls", "tree"] {
             assert!(
                 !general.contains(&gone.to_string()),
                 "`{gone}` was removed: {general:?}"
@@ -6248,7 +6248,7 @@ mod tests {
         // `coder` is write-capable like `general` — same full set, shell included.
         let coder = tools("coder");
         for t in [
-            "shell", "edit", "write", "replace", "read", "todo", "verify",
+            "shell", "edit", "write", "replace", "read", "todo", "verify", "watch",
         ] {
             assert!(coder.contains(&t.to_string()), "coder should have {t}");
         }
@@ -6502,6 +6502,159 @@ mod tests {
         let v = reg.lock().unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id, 2);
+    }
+
+    /// A finished watch is delivered exactly like a finished sub-agent: the
+    /// entry flips done, `drain_background` folds its result in as a message,
+    /// prunes the entry, and a second drain delivers nothing.
+    #[tokio::test]
+    async fn a_finished_watch_delivers_once_and_is_pruned() {
+        let Some(shell) = hrdr_tools::Shell::detect() else {
+            return;
+        };
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        agent.ctx.enforce_timeout_floor = false;
+        let ack = hrdr_tools::WatchTool::new(shell)
+            .execute(serde_json::json!({"check": "true"}), &agent.ctx)
+            .await
+            .unwrap();
+        let id: u64 = ack
+            .split('#')
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .expect("an id in the ack");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let done = agent
+                .background_tasks()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id && t.done);
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch #{id} never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let before = agent.message_count();
+        agent.drain_background(&mut |_| {});
+        assert_eq!(agent.message_count(), before + 1, "one delivery");
+        assert!(
+            agent
+                .messages()
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default()
+                .contains("exited 0"),
+            "the watch result was delivered"
+        );
+        // Pruned, so a second drain delivers nothing — exactly-once.
+        assert!(
+            !agent
+                .background_tasks()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
+            "the delivered entry was pruned"
+        );
+        let before = agent.message_count();
+        agent.drain_background(&mut |_| {});
+        assert_eq!(
+            agent.message_count(),
+            before,
+            "the second drain adds nothing"
+        );
+    }
+
+    /// `task_cancel` stops a watch: the poller stops before the round that
+    /// would pass, nothing is delivered, and the success message names a watch
+    /// instead of promising edits to check with `git diff`.
+    #[tokio::test]
+    async fn task_cancel_stops_a_watch_and_says_so() {
+        let Some(shell) = hrdr_tools::Shell::detect() else {
+            return;
+        };
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        agent.ctx.enforce_timeout_floor = false;
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("count");
+        // Passes on round 3 — the round we cancel just before.
+        let check = format!(
+            "c=$(cat {} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\" > {}; test \"$c\" -ge 3",
+            counter.display(),
+            counter.display(),
+        );
+        let ack = hrdr_tools::WatchTool::new(shell)
+            .execute(
+                serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": 60}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let id: u64 = ack
+            .split('#')
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .expect("an id in the ack");
+        // Wait until round 2 has run (counter == 2), then cancel before the
+        // round 3 that would pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let c = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if c >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watch never ran two rounds"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let tool = TaskCancelTool {
+            bg_handles: bg_handles(),
+            live: agent.registry(),
+        };
+        let out = tool
+            .execute(serde_json::json!({"id": id}), &agent.ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("Cancelled watch"), "{out}");
+        assert!(!out.contains("git diff"), "{out}");
+        // The poller stopped: the counter never reaches 3, even with plenty of
+        // time for the round that would have passed.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let c = std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        assert_eq!(c, 2, "the poller ran the would-pass round after cancel");
+        // Nothing is delivered: drain drops the cancelled entry without a message.
+        let before = agent.message_count();
+        agent.drain_background(&mut |_| {});
+        assert_eq!(
+            agent.message_count(),
+            before,
+            "a cancelled watch is never delivered"
+        );
+        assert!(
+            !agent
+                .background_tasks()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
+            "the cancelled entry was pruned"
+        );
     }
 
     /// The workspace map handed to a spawned sub-agent names the real

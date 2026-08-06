@@ -12,6 +12,7 @@ pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
 pub(crate) mod verify;
+pub(crate) mod watch;
 pub(crate) mod write;
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
@@ -132,6 +133,7 @@ pub use shell::{CommandRun, Shell, ShellTool, available_shell_tools, run_user_co
 pub use todo::TodoTool;
 pub use tree::TreeTool;
 pub use verify::{DEFAULT_VERIFY_TIMEOUT_SECS, VerifyTool};
+pub use watch::{DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, WatchTool};
 pub use write::WriteTool;
 
 #[cfg(test)]

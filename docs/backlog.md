@@ -4,6 +4,24 @@
 (the four-harness comparison) and `security-audit.md`, which are deleted — read
 `git log` for what they said before this.
 
+**Watch tool 2026-08-06** (the plan document `docs/watch-tool-plan.md` was
+archived into this file same day it shipped): the new `watch` tool re-runs a
+shell check in the background until it exits 0, returns an id immediately, and
+wakes the model with the result when the condition flips — the missing primitive
+for "watch the tag's CI run" in the release procedure, which used to force a
+blocking `gh run watch` or a sleep-poll loop. Binding decisions carried forward:
+a general check-command watcher, not a CI-specific one (the check runs under the
+same guardrails and sandbox as `shell`); the result wakes the agent's turn like
+a finished background sub-agent (the TUI's `maybe_deliver_background` and
+`drain_background` are generic over `BackgroundTask`, so no delivery change);
+model-invocable, with the end-turn contract in the tool description; and the
+watcher reports "the run finished", never "the release is published" — the
+confirmation (enumerate the jobs, check artifacts) stays a model step on wake.
+Task and watch ids share one counter (`BackgroundTask::next_id`). The prompt's
+"there is no polling tool" rule became "call `watch`, then end your turn", the
+Releasing step calls `watch` on the tag run, and the two tests pinning `watch`'s
+absence were rewritten. The one outstanding item is under Test coverage gaps.
+
 **Threading pass 2026-08-04** (slices 1/2/3/5 shipped in
 `1145ccd`/`b21bec8`/`5130f26`/`6549c7b`; the plan document
 `docs/threading-plan.md` was archived into this file same day): blocking tool fs
@@ -2335,6 +2353,13 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 ---
 
 ## Test coverage gaps
+
+- **`watch` against a real GitHub run: manual smoke never ran.** The watch-tool
+  plan's last item (watch an actual tag-run CI run through `gh`) needs a live
+  GitHub run, so it was not runnable in the automated suite; every automated
+  slice shipped (the poller lifecycle, guardrails, cancel, delivery, schema
+  bounds, prompt rewiring). Run it before trusting the release flow's watch step
+  on a real run.
 
 - **DeepSeek built-in provider: manual smoke slice never ran.** The provider
   plan's slice 7 (single-turn + agentic tool-call turn against the real API)

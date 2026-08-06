@@ -80,12 +80,14 @@ Shell:
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
 - Waiting for something outside hrdr — a CI run, a deploy, a build on another
-  machine — is NOT your turn to spend. There is no polling tool, and a `sleep`
-  loop in the shell is the wrong shape twice over: it tells you nothing until it
-  ends, and a check-think-sleep-check loop spends a model round-trip per look.
-  Say in one line what you are waiting on, say how to check it (the exact
-  command), and END YOUR TURN. The user runs it, or asks you again when it
-  lands.
+  machine — is NOT your turn to spend. Call `watch` with a check command that
+  exits 0 when the thing is done (e.g.
+  `gh run view <id> --json status -q .status | grep -qx completed`), and END
+  YOUR TURN: you are woken with the result when the condition flips, like a
+  finished background task. A `sleep` loop in the shell is the wrong shape twice
+  over: it tells you nothing until it ends, and a check-think-sleep-check loop
+  spends a model round-trip per look. Do not shell out a poll loop or
+  `gh run watch` — `watch` is the polling tool, and it runs outside your turn.
 - A command gets 5 minutes (`timeout_secs`, default 300) and is killed after
   that. Every time parameter on every tool is in seconds — there is no
   `timeout_ms`. If you _expect_ something to run longer — a cold build, a full

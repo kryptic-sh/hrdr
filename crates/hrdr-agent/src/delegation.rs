@@ -12,8 +12,14 @@
 
 use super::*;
 
-/// Monotonic id source for detached background sub-agents (`task` background mode).
-static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Monotonic id source for background registry entries (`task` background mode
+/// and `watch`), delegated to [`hrdr_tools::BackgroundTask::next_id`] so the two
+/// kinds share one counter — task ids and watch ids are matched by
+/// `drain_background`/`task_cancel`/the TUI wake on the same field, so they must
+/// never collide.
+fn bg_seq() -> u64 {
+    hrdr_tools::BackgroundTask::next_id()
+}
 
 /// Shared list of background-task `JoinHandle`s, keyed by task id.
 pub(crate) type BgHandles = Arc<Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>>;
@@ -182,8 +188,7 @@ async fn spawn_background(
     transcript_dir: ChildDirCell,
     live: AgentRegistry,
 ) -> Result<String> {
-    use std::sync::atomic::Ordering;
-    let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let id = bg_seq();
     let header = format!("↳ task#{id} ({}): {label}", cfg.model.model());
     // Identity for the live registry, taken before `tool_id` is moved into the
     // background-task row below.
@@ -566,7 +571,7 @@ pub(crate) type ChildDirCell = Option<std::sync::Arc<std::sync::Mutex<Option<std
 
 /// Monotonic counter for sub-agent transcript file ids, shared by the blocking
 /// and background spawn paths so ids are ordered and unique within a session
-/// dir. Separate from `BG_SEQ`, which numbers background-task registry entries.
+/// dir. Separate from `bg_seq`, which numbers background-task registry entries.
 static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A transcript file id: `NNN-<slug>`, where `slug` is the sanitized label.
@@ -1713,17 +1718,19 @@ impl hrdr_tools::Tool for TaskCancelTool {
         "task_cancel"
     }
     fn description(&self) -> &'static str {
-        "Cancel a running background sub-agent by its `id` (the one `task` returned). This stops the \
-         run; it does NOT undo what the sub-agent already wrote. A write-capable sub-agent edits \
-         your working directory directly, so whatever it managed before the abort is still there \
-         — check `git diff` and keep or revert it deliberately. Use when the user asks to stop a \
-         task or it is no longer needed."
+        "Cancel a running background sub-agent or watch by its `id` (the one `task` or `watch` \
+         returned). For a sub-agent, this stops the run; it does NOT undo what the sub-agent \
+         already wrote — a write-capable sub-agent edits your working directory directly, so \
+         whatever it managed before the abort is still there, check `git diff` and keep or \
+         revert it deliberately. A watch only polls; cancelling it discards its result and \
+         nothing was written to your tree. Use when the user asks to stop a task/watch or it \
+         is no longer needed."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The task id, as returned by `task`." }
+                "id": { "type": "integer", "description": "The id, as returned by `task` or `watch`." }
             },
             "required": ["id"]
         })
@@ -1766,8 +1773,11 @@ impl hrdr_tools::Tool for TaskCancelTool {
         // Mark the registry entry cancelled. A write sub-agent edits the working
         // dir directly, so cancelling it does NOT undo what it already wrote —
         // whatever it managed before the abort is in the tree, and the caller is
-        // told so below rather than left to assume a clean rollback.
-        {
+        // told so below rather than left to assume a clean rollback. A watch
+        // wrote nothing; its success message says so instead of promising edits
+        // to check. Discriminated by the label prefix `WatchTool` mints
+        // ("watch: …") — the only field that separates the two kinds.
+        let kind = {
             let mut v = ctx
                 .background_tasks
                 .lock()
@@ -1776,14 +1786,20 @@ impl hrdr_tools::Tool for TaskCancelTool {
                 Some(t) => {
                     t.cancelled = true;
                     t.done = true;
+                    if t.label.starts_with("watch: ") {
+                        "watch"
+                    } else {
+                        "background task"
+                    }
                 }
                 None if !aborted => anyhow::bail!(
-                    "no background task #{id}. Ids come from `task`'s own return value. {}",
+                    "no background task #{id}. Ids come from `task`'s or `watch`'s return \
+                     value. {}",
                     running_tasks_hint(&self.live)
                 ),
-                None => {}
+                None => "background task",
             }
-        }
+        };
         // Clear its live panel entry.
         self.live.with(|v| {
             for e in v.iter_mut().filter(|e| e.bg_id == Some(id)) {
@@ -1792,11 +1808,18 @@ impl hrdr_tools::Tool for TaskCancelTool {
                 e.delivered = true;
             }
         });
-        Ok(format!(
-            "Cancelled background task #{id}. It worked in YOUR working directory, so anything \
-             it had already written is still there — this aborted the run, it did not undo the \
-             edits. Check with `git diff` and keep or revert them yourself."
-        ))
+        if kind == "watch" {
+            Ok(format!(
+                "Cancelled watch #{id}. It only polled a check — nothing was written to your \
+                 working directory, and its result will not be delivered."
+            ))
+        } else {
+            Ok(format!(
+                "Cancelled background task #{id}. It worked in YOUR working directory, so anything \
+                 it had already written is still there — this aborted the run, it did not undo the \
+                 edits. Check with `git diff` and keep or revert them yourself."
+            ))
+        }
     }
 }
 

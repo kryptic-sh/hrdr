@@ -51,9 +51,10 @@ pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
-    CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS, EditTool, FindTool,
-    GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool,
-    WriteTool, available_shell_tools, redact_secret_diffs, run_user_command,
+    CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS,
+    DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool, FindTool, GrepTool, LsTool,
+    ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool, WatchTool, WriteTool,
+    available_shell_tools, redact_secret_diffs, run_user_command,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -145,6 +146,15 @@ pub enum BackgroundStatus {
 }
 
 impl BackgroundTask {
+    /// The next background-registry id, shared by every producer so ids never
+    /// collide across kinds: `task` sub-agents and `watch` pollers both register
+    /// here, and `drain_background`/`task_cancel`/the TUI wake all match on
+    /// `id` alone. `fetch_add(1) + 1` so ids start at 1.
+    pub fn next_id() -> u64 {
+        static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        BG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
     /// The task's reportable status.
     pub fn status(&self) -> BackgroundStatus {
         if self.cancelled {
@@ -1622,6 +1632,11 @@ impl ToolRegistry {
         // entire body is running commands.
         if let Some(shell) = r.shell() {
             r.register(Arc::new(VerifyTool::new(shell)));
+            // `watch` is all subprocesses, like `verify` — same gating: no
+            // shell on PATH, no watch. It is deliberately NOT in the read-only
+            // set (a check command may mutate the tree), so read-only
+            // sub-agents (explore/review/plan) get shell but not watch.
+            r.register(Arc::new(WatchTool::new(shell)));
         }
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(FindTool));

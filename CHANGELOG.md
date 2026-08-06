@@ -146,6 +146,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cache_measured_tokens`, and `cache_hit_rate()`), so they exist per agent with
   no UI attached and a sub-agent's are its own.
 
+- **New tool `watch`: non-blocking background watch with result delivery.** Call
+  it with a shell check command and it re-runs that command in the background
+  until it exits 0, returning an id immediately — then it wakes the model with
+  the result when the condition flips, exactly like a finished background
+  sub-agent. This is the missing primitive for the release procedure's "watch
+  the tag's CI run": instead of a blocking `gh run watch` or a sleep-poll loop,
+  the model calls `watch` with
+  `gh run view <id> --json status -q .status | grep -qx completed` and ends its
+  turn. The check runs under the same guardrails and sandbox as `shell`, and a
+  watch is cancelled with `task_cancel <id>`. The "there is no polling tool"
+  prompt rule and the two tests that pinned `watch`'s absence are gone with it;
+  the Releasing step now calls `watch` on the tag run.
+
 ### Changed
 
 - **The folded thinking summary no longer shows its age.**

@@ -1936,17 +1936,18 @@ mod tests {
         );
     }
 
-    /// Waiting on something outside hrdr means ENDING THE TURN, and the prompt says
-    /// so — because there is no polling tool any more, and the two things a model
-    /// does without being told are both bad: it sleeps in the shell (which tells it
-    /// nothing until the sleep ends, and gets killed at the shell timeout), or it
-    /// runs a check-think-sleep-check loop, paying a full model round-trip for every
-    /// look at a CI run that takes half an hour.
+    /// Waiting on something outside hrdr means calling `watch` and ENDING THE
+    /// TURN — the spawn-return-deliver contract that wakes the model when the
+    /// condition flips. The two things a model does instead are both bad: it
+    /// sleeps in the shell (which tells it nothing until the sleep ends, and
+    /// gets killed at the shell timeout), or it runs a check-think-sleep-check
+    /// loop, paying a full model round-trip for every look at a CI run that
+    /// takes half an hour.
     ///
-    /// `watch` used to be the answer and is gone: 4 calls across 9,350, and every
-    /// one of them was a thing `shell` plus ending the turn does without a tool.
-    /// Removing it without naming the replacement habit would leave the sleep loop
-    /// as the model's only idea.
+    /// The deleted `watch` (4 calls across 9,350, every one a thing `shell`
+    /// plus ending the turn did without a tool) was a repeat-a-command loop;
+    /// the new one is a notify-on-condition watcher, and it ships with its
+    /// consumer wired — the Releasing step calls it on the tag's CI run.
     #[test]
     fn the_prompt_says_to_end_the_turn_rather_than_wait() {
         let tools = ToolRegistry::with_defaults();
@@ -1959,11 +1960,15 @@ mod tests {
         // The habits it replaces are named, or the model invents them again.
         assert!(says(&p, "check-think-sleep-check loop"), "{p}");
         assert!(
-            says(&p, "say how to check it (the exact command)"),
-            "ending the turn is only useful if it hands the check over: {p}"
+            says(&p, "Call `watch`"),
+            "the polling tool is named, or the model re-invents the sleep loop: {p}"
         );
-        // And the tool it replaces is not offered.
-        assert!(!tools.defs().iter().any(|d| d.function.name == "watch"));
+        // And the tool it replaces is offered — a shell-bearing agent can call
+        // it for an external end state.
+        assert!(
+            tools.defs().iter().any(|d| d.function.name == "watch"),
+            "watch must be registered for a shell-bearing agent"
+        );
     }
 
     /// The prompt forbids the cheapest way to make a red test green: changing the
