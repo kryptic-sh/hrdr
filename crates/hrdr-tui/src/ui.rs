@@ -2399,7 +2399,7 @@ fn pad_line(
 /// entry's body is the same whether it is grouped or expanded (the group's
 /// `expand_all` flag decides whether the call is hidden behind the summary, not
 /// how its own block renders), so the plain content hash suffices.
-fn entry_content_hash(entry: &Entry, _expand_all: bool) -> u64 {
+fn entry_content_hash(entry: &Entry) -> u64 {
     match &entry.kind {
         // The header animates and reads live session state; it is never cached.
         EntryKind::Header => 0,
@@ -2895,7 +2895,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // longer model name wrapping) has to be measured again.
         let base_hash = match entry.kind {
             EntryKind::Header => header_hash(app),
-            _ => entry_content_hash(entry, app.verbose),
+            _ => entry_content_hash(entry),
         };
         let base_hash = match &entry.kind {
             // `+1` keeps a running body's key off the done body's (`^ 0`) even
@@ -4063,7 +4063,7 @@ mod cache_tests {
         BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, Rc, cached_block, cached_body,
         chrome_hash, entry_content_hash,
     };
-    use crate::app::{Entry, EntryKind};
+    use crate::app::Entry;
     use ratatui::text::{Line, Span};
 
     // ── entry_content_hash ─────────────────────────────────────────────────────
@@ -4079,37 +4079,17 @@ mod cache_tests {
         let a = Entry::user("hello");
         let b = Entry::user("world");
         assert_ne!(
-            entry_content_hash(&a, false),
-            entry_content_hash(&b, false),
+            entry_content_hash(&a),
+            entry_content_hash(&b),
             "User entries with different text must produce different hashes"
         );
 
         let c = Entry::assistant("response one");
         let d = Entry::assistant("response two");
         assert_ne!(
-            entry_content_hash(&c, false),
-            entry_content_hash(&d, false),
+            entry_content_hash(&c),
+            entry_content_hash(&d),
             "Assistant entries with different text must produce different hashes"
-        );
-    }
-
-    /// A Tool entry's own render does not depend on the group's expand state —
-    /// a call is either hidden behind the summary or rendered in full — so the
-    /// plain content hash serves it unchanged.
-    #[test]
-    fn entry_content_hash_ignores_the_group_expand_flag() {
-        let tool = Entry::now(EntryKind::Tool {
-            id: "t1".to_string(),
-            name: "bash".to_string(),
-            args: "{}".to_string(),
-            result: "long output".to_string(),
-            ok: true,
-            done: true,
-        });
-        assert_eq!(
-            entry_content_hash(&tool, false),
-            entry_content_hash(&tool, true),
-            "expand_all changes whether the call is hidden, not how it renders"
         );
     }
 
