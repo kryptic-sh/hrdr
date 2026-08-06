@@ -2724,7 +2724,7 @@ mod tests {
         assert!(err.is_none(), "clean stream: {:#}", err.unwrap());
         let mut acc = crate::Accumulator::new();
         for chunk in &chunks {
-            acc.push(chunk);
+            acc.push(chunk).unwrap();
         }
         acc
     }
@@ -2837,7 +2837,7 @@ mod tests {
         // agent asks.
         let mut acc = crate::Accumulator::new();
         for chunk in &chunks {
-            acc.push(chunk);
+            acc.push(chunk).unwrap();
         }
         assert_eq!(
             acc.finish_reason.as_deref(),

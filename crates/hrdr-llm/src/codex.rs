@@ -969,7 +969,7 @@ mod tests {
         let mut acc = Accumulator::new();
         for ev in &events {
             if let Some(chunk) = map_event(&mut state, ev).unwrap() {
-                acc.push(&chunk);
+                acc.push(&chunk).unwrap();
             }
         }
         assert!(state.terminal_seen);
@@ -1013,7 +1013,7 @@ mod tests {
         let mut acc = Accumulator::new();
         for ev in &events {
             if let Some(chunk) = map_event(&mut state, ev).unwrap() {
-                acc.push(&chunk);
+                acc.push(&chunk).unwrap();
             }
         }
         let calls = acc.into_message().tool_calls.expect("tool call");
@@ -1070,7 +1070,7 @@ mod tests {
         let chunk = map_event(&mut state, &ev).unwrap().unwrap();
         assert!(state.terminal_seen);
         let mut acc = Accumulator::new();
-        acc.push(&chunk);
+        acc.push(&chunk).unwrap();
         assert!(
             acc.truncated(),
             "unrecognized incomplete reason must signal truncation, got {:?}",
@@ -1084,7 +1084,7 @@ mod tests {
         let mut state2 = StreamState::default();
         let chunk2 = map_event(&mut state2, &ev_no_details).unwrap().unwrap();
         let mut acc2 = Accumulator::new();
-        acc2.push(&chunk2);
+        acc2.push(&chunk2).unwrap();
         assert!(
             acc2.truncated(),
             "missing incomplete_details must still signal truncation"
@@ -1397,7 +1397,7 @@ mod tests {
         let mut acc = Accumulator::new();
         for ev in &events {
             if let Some(chunk) = map_event(&mut state, ev).unwrap() {
-                acc.push(&chunk);
+                acc.push(&chunk).unwrap();
             }
         }
         // The end-of-stream flush `chat_stream` yields.
@@ -1406,7 +1406,8 @@ mod tests {
             usage: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: std::mem::take(&mut state.reasoning_items),
-        });
+        })
+        .unwrap();
 
         let msg = acc.into_message();
         assert_eq!(msg.content.as_deref(), Some("checking"));

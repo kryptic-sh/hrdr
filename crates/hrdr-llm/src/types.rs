@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::client::{ChatError, ChatErrorKind};
+
 /// Message author role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -703,6 +705,14 @@ pub struct Accumulator {
     /// `length`, …). `length` means the reply was cut off at the output cap.
     pub finish_reason: Option<String>,
     calls: Vec<ToolCall>,
+    /// Bytes appended so far across `content`, `reasoning` and the tool-call
+    /// fragments. The per-event cap alone does not bound a reply: an endpoint
+    /// can stream arbitrarily many small events for the whole request timeout,
+    /// so the accumulated total needs its own ceiling (see [`Self::budget`]).
+    bytes: usize,
+    /// Ceiling on [`Self::bytes`]; the stream errors past it. Defaults to
+    /// [`MAX_ACCUMULATED_BYTES`]; a smaller value is test-only.
+    budget: usize,
     /// Anthropic thinking blocks (with signature) for re-emission in the native
     /// Messages API request. Never serialized — same invariant as reasoning_content.
     anthropic_thinking_blocks: Vec<serde_json::Value>,
@@ -723,17 +733,38 @@ pub struct Accumulator {
 /// crate has no RNG handy, and doesn't need one just for this.
 static NEXT_ACCUMULATOR_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Ceiling on the bytes one [`Accumulator`] may hold before the stream errors.
+/// Independent of the per-event cap ([`crate::sse::SseDecoder`]'s), because a
+/// hostile endpoint can emit many small complete events for the whole request
+/// timeout — without this, memory grows network-bound × 300 s and the inflated
+/// message then rides in history for the next request.
+const MAX_ACCUMULATED_BYTES: usize = 64 * 1024 * 1024;
+
 impl Accumulator {
     pub fn new() -> Self {
         Self {
+            budget: MAX_ACCUMULATED_BYTES,
+            nonce: NEXT_ACCUMULATOR_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ..Self::default()
+        }
+    }
+
+    /// An accumulator with a smaller ceiling than the default — tests only, so
+    /// the overflow path is reachable without allocating 64 MiB.
+    #[cfg(test)]
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Self {
+            budget,
             nonce: NEXT_ACCUMULATOR_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ..Self::default()
         }
     }
 
     /// Merge one chunk. Returns the freshly-appended text delta (for live
-    /// rendering), if any.
-    pub fn push(&mut self, chunk: &ChatChunk) -> Option<String> {
+    /// rendering), if any. Errors once the accumulated reply exceeds the byte
+    /// budget — a flooding endpoint must not grow memory for the whole request
+    /// timeout (mirrors the SSE-overflow handling).
+    pub fn push(&mut self, chunk: &ChatChunk) -> Result<Option<String>, ChatError> {
         // The usage chunk arrives with empty `choices`, so capture it before
         // the early return below.
         if let Some(new) = &chunk.usage {
@@ -776,11 +807,14 @@ impl Accumulator {
             self.responses_reasoning_items
                 .extend(chunk.responses_reasoning_items.iter().cloned());
         }
-        let choice = chunk.choices.first()?;
+        let Some(choice) = chunk.choices.first() else {
+            return Ok(None);
+        };
         if let Some(fr) = &choice.finish_reason {
             self.finish_reason = Some(fr.clone());
         }
         if let Some(r) = &choice.delta.reasoning_content {
+            self.bytes += r.len();
             self.reasoning.push_str(r);
         }
         for tc in choice.delta.tool_calls.iter().flatten() {
@@ -810,18 +844,33 @@ impl Accumulator {
             }
             if let Some(f) = &tc.function {
                 if let Some(name) = &f.name {
+                    self.bytes += name.len();
                     slot.function.name.push_str(name);
                 }
                 if let Some(args) = &f.arguments {
+                    self.bytes += args.len();
                     slot.function.arguments.push_str(args);
                 }
             }
         }
         let delta = choice.delta.content.clone();
         if let Some(text) = &delta {
+            self.bytes += text.len();
             self.content.push_str(text);
         }
-        delta
+        if self.bytes > self.budget {
+            return Err(ChatError {
+                status: None,
+                retry_after: None,
+                kind: ChatErrorKind::Other,
+                message: format!(
+                    "stream overflow: accumulated response exceeding {} MiB limit; \
+                     broken or hostile server",
+                    MAX_ACCUMULATED_BYTES / (1024 * 1024)
+                ),
+            });
+        }
+        Ok(delta)
     }
 
     /// A rough token count for the tool calls streamed so far — the same
@@ -964,7 +1013,8 @@ mod tests {
             usage: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
-        });
+        })
+        .unwrap();
         assert_eq!(acc.finish_reason.as_deref(), Some("length"));
         assert!(acc.truncated());
         // A normal `stop` does not.
@@ -977,7 +1027,8 @@ mod tests {
             usage: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
-        });
+        })
+        .unwrap();
         assert!(!acc2.truncated());
     }
 
@@ -1300,12 +1351,58 @@ mod tests {
     #[test]
     fn accumulator_reassembles_text_across_chunks() {
         let mut acc = Accumulator::new();
-        assert_eq!(acc.push(&chunk(Some("hel"), None)), Some("hel".to_string()));
-        assert_eq!(acc.push(&chunk(Some("lo"), None)), Some("lo".to_string()));
-        assert_eq!(acc.push(&chunk(None, None)), None);
+        assert_eq!(
+            acc.push(&chunk(Some("hel"), None)).unwrap(),
+            Some("hel".to_string())
+        );
+        assert_eq!(
+            acc.push(&chunk(Some("lo"), None)).unwrap(),
+            Some("lo".to_string())
+        );
+        assert_eq!(acc.push(&chunk(None, None)).unwrap(), None);
         let msg = acc.into_message();
         assert_eq!(msg.content, Some("hello".to_string()));
         assert!(msg.tool_calls.is_none());
+    }
+
+    #[test]
+    fn accumulator_errors_past_the_byte_budget() {
+        // Content past the ceiling errors the stream (terminal, like the
+        // SSE-overflow path) instead of growing memory for the request timeout.
+        let mut acc = Accumulator::with_budget(8);
+        assert_eq!(
+            acc.push(&chunk(Some("hello"), None)).unwrap(),
+            Some("hello".to_string())
+        );
+        let err = acc.push(&chunk(Some("world"), None)).unwrap_err();
+        assert_eq!(err.kind, ChatErrorKind::Other);
+        assert!(err.message.contains("accumulated response exceeding"));
+        // Reasoning and tool-call fragments count against the same budget.
+        let mut acc = Accumulator::with_budget(4);
+        assert!(acc.push(&reasoning_chunk("think")).is_err());
+        let mut acc = Accumulator::with_budget(3);
+        assert!(
+            acc.push(&chunk(
+                None,
+                Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    function: Some(FunctionDelta {
+                        name: Some("read".to_string()),
+                        arguments: None,
+                    }),
+                }]),
+            ))
+            .is_err()
+        );
+        // Under the budget, a large-ish reply still lands whole.
+        let mut acc = Accumulator::with_budget(16);
+        let text = "a".repeat(16);
+        assert_eq!(
+            acc.push(&chunk(Some(text.as_str()), None)).unwrap(),
+            Some(text.clone())
+        );
+        assert_eq!(acc.content, text);
     }
 
     #[test]
@@ -1323,7 +1420,8 @@ mod tests {
                     arguments: Some("{\"pa".to_string()),
                 }),
             }]),
-        ));
+        ))
+        .unwrap();
 
         // Second chunk: rest of name + rest of arguments.
         acc.push(&chunk(
@@ -1336,7 +1434,8 @@ mod tests {
                     arguments: Some("th\": \"x\"}".to_string()),
                 }),
             }]),
-        ));
+        ))
+        .unwrap();
 
         let msg = acc.into_message();
         assert!(msg.content.is_none());
@@ -1371,7 +1470,8 @@ mod tests {
                     }),
                 },
             ]),
-        ));
+        ))
+        .unwrap();
         acc.push(&chunk(
             None,
             Some(vec![ToolCallDelta {
@@ -1382,7 +1482,8 @@ mod tests {
                     arguments: Some("\"v\"}".to_string()),
                 }),
             }]),
-        ));
+        ))
+        .unwrap();
 
         let msg = acc.into_message();
         let calls = msg.tool_calls.expect("should have tool calls");
@@ -1425,7 +1526,8 @@ mod tests {
                     }),
                 },
             ]),
-        ));
+        ))
+        .unwrap();
         let calls = acc.into_message().tool_calls.expect("has tool calls");
         // Synthesized, non-empty, and distinct so results can be correlated.
         assert!(!calls[0].id.is_empty());
@@ -1452,7 +1554,8 @@ mod tests {
                         arguments: Some("{}".to_string()),
                     }),
                 }]),
-            ));
+            ))
+            .unwrap();
             acc.into_message().tool_calls.unwrap()[0].id.clone()
         };
         let id_turn1 = make_call_0();
@@ -1497,7 +1600,7 @@ mod tests {
         // A usage-only chunk (empty choices) must store the usage but return None
         // from push (no text delta).
         let mut acc = Accumulator::new();
-        let result = acc.push(&usage_chunk(100, 20));
+        let result = acc.push(&usage_chunk(100, 20)).unwrap();
         assert!(result.is_none(), "usage-only chunk should return None");
         let u = acc.usage.as_ref().expect("usage should be stored");
         assert_eq!(u.prompt_tokens, 100);
@@ -1524,7 +1627,8 @@ mod tests {
             }),
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
-        });
+        })
+        .unwrap();
         // Second chunk: completion only (message_delta shape).
         acc.push(&ChatChunk {
             choices: vec![],
@@ -1535,7 +1639,8 @@ mod tests {
             }),
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
-        });
+        })
+        .unwrap();
         let u = acc.usage.as_ref().unwrap();
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 50);
@@ -1576,7 +1681,7 @@ mod tests {
         for order in [[&start, &delta], [&delta, &start]] {
             let mut acc = Accumulator::new();
             for c in order {
-                acc.push(c);
+                acc.push(c).unwrap();
             }
             let u = acc.usage.as_ref().unwrap();
             assert_eq!(u.prompt_tokens, 1_000);
@@ -1591,8 +1696,8 @@ mod tests {
         // Multi-chunk reasoning_content deltas must concatenate, and no text
         // content should leak into the `content` field.
         let mut acc = Accumulator::new();
-        acc.push(&reasoning_chunk("think "));
-        acc.push(&reasoning_chunk("harder"));
+        acc.push(&reasoning_chunk("think ")).unwrap();
+        acc.push(&reasoning_chunk("harder")).unwrap();
         let msg = acc.into_message();
         assert_eq!(msg.reasoning_content.as_deref(), Some("think harder"));
         assert!(
@@ -1615,7 +1720,8 @@ mod tests {
                     arguments: Some("{\"pattern\":\"foo\"}".to_string()),
                 }),
             }]),
-        ));
+        ))
+        .unwrap();
         let msg = acc.into_message();
         assert_eq!(msg.content.as_deref(), Some("searching..."));
         let calls = msg.tool_calls.expect("should have tool calls");

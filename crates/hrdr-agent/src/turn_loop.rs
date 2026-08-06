@@ -215,14 +215,17 @@ pub(crate) async fn drain_stream<F: FnMut(AgentEvent)>(
         // `#N assistant` header per token group.
         //
         // `acc.push` is still called for every chunk — it accumulates content
-        // and tool-call fragments; only the *event* is suppressed.
+        // and tool-call fragments; only the *event* is suppressed. Its error
+        // (the accumulated reply past the byte budget) ends the stream exactly
+        // like the SSE-overflow error would.
         if let Some(choice) = chunk.choices.first()
             && let Some(r) = &choice.delta.reasoning_content
             && !r.is_empty()
         {
             on_event(AgentEvent::Reasoning(r.clone()));
         }
-        if let Some(text) = acc.push(&chunk)
+        let delta = acc.push(&chunk)?;
+        if let Some(text) = delta
             && !text.is_empty()
         {
             on_event(AgentEvent::Text(text));

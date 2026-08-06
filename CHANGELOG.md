@@ -642,6 +642,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `windows-sys` 0.61 (`HANDLE` became a pointer, and none of it compiles off
   Windows). `docs/backlog.md` records what each attempt showed.
 
+### Security
+
+- **A streaming reply is capped at 64 MiB of accumulated output.** The per-event
+  SSE cap did not bound a whole reply: an endpoint could stream arbitrarily many
+  small complete events for the full request timeout, growing memory
+  network-bound × 300 s, and the inflated message then rode in history for the
+  next request. `Accumulator` now tracks the bytes appended across content,
+  reasoning and tool-call fragments and errors the stream past the ceiling,
+  mirroring the SSE-overflow handling.
+
 ## [0.11.1] - 2026-08-03
 
 ### Added
