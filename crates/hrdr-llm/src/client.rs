@@ -11,7 +11,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
 use crate::capped_read::{MAX_DIAGNOSTIC_BYTES, MAX_LOG_FILE_BYTES, MAX_STRUCTURED_JSON_BYTES};
-use crate::sse::SseDecoder;
+use crate::sse::{SseDecoder, SseOverflow};
 use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, Role, ToolDef};
 
 /// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
@@ -613,28 +613,12 @@ fn detect_backend(base_url: &str) -> Backend {
     }
 }
 
-/// The NAME of the wire protocol hrdr will speak at `base_url` — the public face
-/// of [`detect_backend`], which keys on the HOST.
-///
-/// Exposed because that host-keying is invisible and consequential: two providers
-/// that differ only in their `base_url` (a `[providers.*]` gateway on localhost
-/// versus `api.anthropic.com`) speak DIFFERENT APIs — chat-completions versus the
-/// Anthropic Messages API. A caller that compares this across two URLs can say so
-/// out loud rather than letting the request shape change under the user.
-pub fn wire_protocol(base_url: &str) -> &'static str {
-    match detect_backend(base_url) {
-        Backend::OpenAi => "OpenAI",
-        Backend::Anthropic => "Anthropic",
-        Backend::Codex => "Codex",
-    }
-}
-
 /// Whether hrdr will speak the **native Anthropic Messages API** at `base_url`.
 ///
 /// The predicate form of [`detect_backend`] for callers outside this crate, which
 /// cannot see the private [`Backend`]. It exists so a caller that needs the
 /// *decision* (does this endpoint consume `cache_control`?) asks for the decision
-/// instead of string-comparing [`wire_protocol`]'s display name — that name is for
+/// instead of string-comparing `wire_protocol`'s display name — that name is for
 /// showing a human, and a rename there must not silently flip a behaviour.
 pub fn is_anthropic_backend(base_url: &str) -> bool {
     detect_backend(base_url) == Backend::Anthropic
@@ -1274,9 +1258,7 @@ impl Client {
                                 status: None,
                                 retry_after: None,
                                 kind: ChatErrorKind::Other,
-                                message: "SSE stream overflow: received data exceeding \
-                                          32 MiB limit; broken or hostile server"
-                                    .to_string(),
+                                message: SseOverflow.to_string(),
                             })?;
                         }
                         (decoder.drain(), false)
@@ -1290,9 +1272,7 @@ impl Client {
                                 status: None,
                                 retry_after: None,
                                 kind: ChatErrorKind::Other,
-                                message: "SSE stream overflow: received data exceeding \
-                                          32 MiB limit; broken or hostile server"
-                                    .to_string(),
+                                message: SseOverflow.to_string(),
                             })?,
                         };
                         (events, true)
@@ -2904,30 +2884,6 @@ mod tests {
     #[test]
     fn context_field_empty_object_is_none() {
         assert_eq!(context_field(&json!({})), None);
-    }
-
-    /// The wire protocol is a function of the HOST — which is exactly why the
-    /// `base_url` a provider is defined with decides the API hrdr speaks to it,
-    /// without anything being said about the API anywhere.
-    #[test]
-    fn the_wire_protocol_is_decided_by_the_host_alone() {
-        assert_eq!(wire_protocol("https://api.anthropic.com/v1"), "Anthropic");
-        assert_eq!(
-            wire_protocol("https://chatgpt.com/backend-api/codex"),
-            "Codex"
-        );
-        assert_eq!(wire_protocol("https://api.openai.com/v1"), "OpenAI");
-        // The flip that Deliverable 3(a) exists to announce: same provider, same
-        // model, different host — and a different request shape on the wire.
-        assert_ne!(
-            wire_protocol("https://api.anthropic.com/v1"),
-            wire_protocol("http://localhost:1234/v1"),
-        );
-        assert_eq!(wire_protocol("http://localhost:1234/v1"), "OpenAI");
-        // DeepSeek's OpenAI-compatible API is spoken over the generic
-        // chat-completions wire — never the native Anthropic Messages API.
-        assert_eq!(wire_protocol("https://api.deepseek.com"), "OpenAI");
-        assert!(!is_anthropic_backend("https://api.deepseek.com"));
     }
 
     // ── Log hardening ───────────────────────────────────────────────────

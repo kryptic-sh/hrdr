@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::sse::SseDecoder;
+use crate::sse::{SseDecoder, SseOverflow};
 
 use crate::types::{
     CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, Role, TokenDetails, ToolDef, Usage,
@@ -661,9 +661,7 @@ pub(crate) async fn chat_stream(
                             status: None,
                             retry_after: None,
                             kind: crate::client::ChatErrorKind::Other,
-                            message: "SSE stream overflow: received data exceeding \
-                                      32 MiB limit; broken or hostile server"
-                                .to_string(),
+                            message: SseOverflow.to_string(),
                         })?;
                     }
                     (decoder.drain(), false)
@@ -677,9 +675,7 @@ pub(crate) async fn chat_stream(
                             status: None,
                             retry_after: None,
                             kind: crate::client::ChatErrorKind::Other,
-                            message: "SSE stream overflow: received data exceeding \
-                                      32 MiB limit; broken or hostile server"
-                                .to_string(),
+                            message: SseOverflow.to_string(),
                         })?,
                     };
                     (events, true)

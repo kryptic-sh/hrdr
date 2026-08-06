@@ -288,11 +288,6 @@ impl PaneSet {
         }
     }
 
-    /// The active pane, if a *delegated* agent is what's on screen.
-    pub fn active_sub(&self) -> Option<&Pane> {
-        (!self.active.is_main()).then(|| self.active_pane())
-    }
-
     /// Reconcile against the live registry and pin the active pane.
     ///
     /// Pinning here — every sync, from the frontend that is actually displaying

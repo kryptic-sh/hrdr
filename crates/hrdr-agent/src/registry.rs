@@ -144,14 +144,6 @@ impl PromptDelivery {
     pub fn started_turn(&self) -> bool {
         matches!(self, Self::StartedTurn(_))
     }
-
-    /// Take the turn's handle, if a turn was started.
-    pub fn into_handle(self) -> Option<JoinHandle<()>> {
-        match self {
-            Self::StartedTurn(h) => Some(h),
-            Self::Steered => None,
-        }
-    }
 }
 
 /// How a turn ended, for whoever asked for it.

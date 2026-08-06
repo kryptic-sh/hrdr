@@ -223,11 +223,6 @@ impl ModelRef {
     pub fn model(&self) -> &str {
         &self.model
     }
-
-    /// Take the pair apart — for the call sites that still speak in two values.
-    pub fn into_parts(self) -> (ProviderName, String) {
-        (self.provider, self.model)
-    }
 }
 
 impl FromStr for ModelRef {

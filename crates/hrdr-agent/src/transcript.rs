@@ -495,69 +495,6 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
 /// one `read` of a big file drowns the run around it.
 pub const TRANSCRIPT_TOOL_BODY_MAX: usize = 600;
 
-/// The transcript as plain text for **reading a run back** — what
-/// [`transcript_to_text`] gives, plus the model's thinking and each tool call's
-/// arguments and result, every body trimmed to `body_max` characters.
-///
-/// This exists because the alternative is what a session actually did: `read` the
-/// sub-agent's `.jsonl` and get one JSON record per streamed token. That is the
-/// same content at ~20× the tokens, wrapped in syntax the model then has to parse
-/// by eye. `transcript_to_text` is no substitute for it either — it prints
-/// `[tool: edit]` and drops the arguments and the result, which is precisely what
-/// someone reading a run back is looking for.
-pub fn transcript_to_plain_text(entries: &[Entry], body_max: usize) -> String {
-    let mut out = String::new();
-    for e in entries {
-        match &e.kind {
-            EntryKind::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
-            EntryKind::Assistant(s) => out.push_str(&format!("## Assistant\n{s}\n\n")),
-            EntryKind::Reasoning { text, .. } if !text.trim().is_empty() => {
-                out.push_str(&format!("## Thinking\n{}\n\n", clip(text, body_max)));
-            }
-            EntryKind::Tool {
-                name,
-                args,
-                result,
-                ok,
-                done,
-                ..
-            } => {
-                let status = match (done, ok) {
-                    (false, _) => " (still running)",
-                    (true, false) => " — FAILED",
-                    (true, true) => "",
-                };
-                out.push_str(&format!("## Tool: {name}{status}\n"));
-                let args = args.trim();
-                if !args.is_empty() && args != "{}" {
-                    out.push_str(&format!("args: {}\n", clip(args, body_max)));
-                }
-                let result = result.trim();
-                if !result.is_empty() {
-                    out.push_str(&format!("{}\n", clip(result, body_max)));
-                }
-                out.push('\n');
-            }
-            EntryKind::System(s) | EntryKind::Notice(s) => out.push_str(&format!("[{s}]\n\n")),
-            EntryKind::Diff(s) => out.push_str(&format!("{s}\n\n")),
-            // Chrome, or an empty thinking block: nothing to read back.
-            EntryKind::Reasoning { .. } | EntryKind::Stats(_) | EntryKind::Header => {}
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// `s` trimmed to `max` characters on a char boundary, with what was cut counted
-/// so the reader knows the body was longer rather than guessing.
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max).collect();
-    let cut = s.chars().count() - max;
-    format!("{kept}\n… [{cut} more characters]")
-}
-
 /// Fold an agent event into a transcript. The shared reducer behind every pane —
 /// the main agent's stream and a sub-agent's stream are assembled by the same
 /// rules, so a sub-agent's view reads exactly like the main one.
