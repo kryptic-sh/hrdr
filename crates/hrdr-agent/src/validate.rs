@@ -141,7 +141,7 @@ pub fn validate_identity_in(
         .flatten()
         .and_then(|id| crate::chatgpt_models::cached_entitlements(&id));
     let catalog = hrdr_llm::catalog::load_cached();
-    validate_identity_with(providers, m, entitled.as_deref(), catalog.as_ref())
+    validate_identity_with(providers, m, entitled.as_deref(), catalog.as_deref())
 }
 
 /// The pure core of [`validate_identity`]: both catalogs are passed in, so every

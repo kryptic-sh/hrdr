@@ -19,7 +19,9 @@
 //! * `HRDR_MODELS_PATH` — read this file and never fetch (an air-gapped mirror).
 //! * `HRDR_DISABLE_MODELS_FETCH` — never fetch; use the cache if one exists.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -40,12 +42,58 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// the `/model` selector — it builds a UI list on a keypress and can't await a
 /// fetch. `None` when no cache exists yet (the async [`context_window`] path
 /// populates it on startup). Never fetches.
-pub fn load_cached() -> Option<Value> {
-    let read = |p: &std::path::Path| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok();
+///
+/// The parsed catalog is memoized per path, keyed by the file's mtime (see
+/// [`cached_read`]): the Anthropic branch consults this on every round —
+/// `max_tokens` is `None` by default, so every request pays a full 3.5 MB
+/// read + JSON parse unless the parse is held resident.
+pub fn load_cached() -> Option<Arc<Value>> {
     if let Some(pinned) = std::env::var_os("HRDR_MODELS_PATH") {
-        return read(std::path::Path::new(&pinned));
+        return cached_read(std::path::Path::new(&pinned));
     }
-    read(&cache_path()?)
+    cached_read(&cache_path()?)
+}
+
+/// One memoized parse: the file's mtime at load time and the parsed catalog
+/// (`None` when the file was missing or failed to parse — a miss is cached
+/// too, so a deleted catalog isn't re-read on every call).
+type CatalogEntry = (Option<SystemTime>, Option<Arc<Value>>);
+
+/// The parsed catalog memoized per path, keyed by the file's mtime — see
+/// [`cached_read`]. The parsed 3.5 MB `Value` is held resident so a live
+/// turn's per-round window/max-output lookups don't re-read and re-parse it.
+static CATALOG_LOAD_CACHE: LazyLock<Mutex<HashMap<PathBuf, CatalogEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Read and parse the catalog at `path`, memoized by path + mtime: an
+/// unchanged file is served from [`CATALOG_LOAD_CACHE`] without touching disk.
+///
+/// Coarse-clock caveat, stated honestly (the same one as hrdr-agent's
+/// `auth_store` cache): on a filesystem whose mtime granularity is coarser
+/// than the write spacing, a write landing in the same tick as the last read
+/// is missed and the cache serves the pre-write catalog. For this path that
+/// degrades gracefully — a context window that is a moment out of date beats
+/// none — which is why this cache does not need the fine-mtime probe
+/// `hrdr-tools/src/memory.rs` uses for its durability-critical cache.
+///
+/// A miss is cached too, keyed by the same mtime: a file that doesn't exist
+/// stays `None` until it appears (appearing moves the mtime from `None` to
+/// `Some`, a miss), and a file that fails to parse stays `None` until its
+/// mtime moves.
+fn cached_read(path: &std::path::Path) -> Option<Arc<Value>> {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut cache = CATALOG_LOAD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((cached_mtime, value)) = cache.get(path)
+        && mtime == *cached_mtime
+    {
+        return value.clone();
+    }
+    let value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(Arc::new);
+    cache.insert(path.to_path_buf(), (mtime, value.clone()));
+    value
 }
 
 /// For catalog provider `key`, its friendly display name and every model it
@@ -140,7 +188,7 @@ pub async fn warm() {
 /// it is about to open. `None` when the catalog isn't cached or doesn't know the
 /// model; the caller simply doesn't get to compact proactively.
 pub fn context_window_cached(provider: Option<&str>, model: &str) -> Option<u32> {
-    lookup(&load_cached()?, provider, model)
+    lookup(load_cached()?.as_ref(), provider, model)
 }
 
 /// Find `model`'s window in an already-loaded catalog. Pure, so the resolution
@@ -178,7 +226,7 @@ pub fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u3
 /// `None` when the catalog isn't cached or doesn't know the model; the caller
 /// then falls back to its own conservative default.
 pub fn max_output_cached(provider: Option<&str>, model: &str) -> Option<u32> {
-    lookup_max_output(&load_cached()?, provider, model)
+    lookup_max_output(load_cached()?.as_ref(), provider, model)
 }
 
 /// Find `model`'s output cap in an already-loaded catalog. Pure, so the
@@ -875,5 +923,61 @@ mod tests {
             .filter(|e| e.file_name() != p.file_name().unwrap())
             .collect();
         assert!(leftovers.is_empty(), "temp file cleaned up: {leftovers:?}");
+    }
+
+    /// The memoization contract: an unchanged file is served without re-reading
+    /// — a same-mtime rewrite is invisible — and moving the mtime re-reads.
+    ///
+    /// The same-mtime assertion is the regression test for the memo: before it
+    /// existed, `cached_read` re-read the file on every call and returned the
+    /// new content, so this assertion fails on the old code.
+    #[test]
+    fn cached_read_serves_the_memoized_parse_until_the_mtime_moves() {
+        let _guard = catalog_cache_test_guard();
+        reset_catalog_cache_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("models.json");
+        let write = |json: &str| std::fs::write(&p, json).unwrap();
+        let pin_mtime = |t: SystemTime| {
+            std::fs::File::open(&p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+
+        write(r#"{"a": {"models": {"m": {"limit": {"context": 1000}}}}}"#);
+        let t0 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(lookup(&cached_read(&p).unwrap(), None, "m"), Some(1000));
+
+        // Rewrite with different content, then pin the mtime back to the
+        // cached one: the memo serves the first parse (the file is not
+        // re-read).
+        write(r#"{"b": {"models": {"m": {"limit": {"context": 2000}}}}}"#);
+        pin_mtime(t0);
+        assert_eq!(lookup(&cached_read(&p).unwrap(), None, "m"), Some(1000));
+
+        // Move the mtime forward: the file is re-read and the new content
+        // wins.
+        pin_mtime(t0 + Duration::from_secs(1));
+        assert_eq!(lookup(&cached_read(&p).unwrap(), None, "m"), Some(2000));
+    }
+
+    /// Clear the process-local [`CATALOG_LOAD_CACHE`] — test isolation: a
+    /// recycled tempdir path landing in the same coarse mtime tick as a
+    /// previous test's write could serve that test's parse.
+    pub(crate) fn reset_catalog_cache_for_test() {
+        CATALOG_LOAD_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// Serialize the tests that touch [`CATALOG_LOAD_CACHE`] against each
+    /// other: the harness runs `#[test]`s on parallel threads, and a reset
+    /// mid-assertion is nondeterministic. Hold the guard for the whole test
+    /// body.
+    pub(crate) fn catalog_cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

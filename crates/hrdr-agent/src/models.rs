@@ -527,7 +527,7 @@ pub fn model_choices(config: &AgentConfig, active: Option<&str>) -> Vec<ModelCho
     let catalog = hrdr_llm::catalog::load_cached();
     let live = live_models(&providers);
     let usage = load_model_usage();
-    choices_from(&providers, catalog.as_ref(), &live, &usage)
+    choices_from(&providers, catalog.as_deref(), &live, &usage)
 }
 
 /// What each provider was last seen serving, read from
