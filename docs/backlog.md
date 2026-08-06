@@ -1508,7 +1508,8 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: all entries open. Findings 1-3 are the new wins; finding 4 is the
+**Status: finding 1 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse held
+resident); findings 2-10 open. Findings 2-3 are the next wins; finding 4 is the
 recorded item confirmed with two new sites.**
 
 ## Dependency upgrades held back, 2026-08-03
@@ -3249,6 +3250,17 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 perf review finding 1** (`2f38e1b`). `load_cached` memoizes the
+parsed models.dev catalog per path, keyed by the file's mtime (the pattern
+already shipped in hrdr-agent's `auth_store`), and returns `Arc<Value>` so a hit
+is a refcount bump rather than a deep clone. The Anthropic branch's per-round
+`max_output_cached` → `load_cached` lookup (every request, because `max_tokens`
+defaults to `None`) went from a 3.5 MB read + JSON parse per round to O(1); a
+changed file invalidates by mtime, and misses are cached too. The two hrdr-agent
+callers pass `catalog.as_deref()`. Regression test:
+`cached_read_serves_the_memoized_parse_until_the_mtime_moves`, shown red on the
+unmemoized read first.
 
 **2026-08-06 backlog slices — the four dated 2026-08-06 findings** (`4638e76`,
 `a328c03`, `de51c8b`, `695f07c`, `205844e`). Security audit findings 1-2: the
