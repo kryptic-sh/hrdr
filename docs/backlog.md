@@ -1508,12 +1508,13 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: findings 1-4 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
+**Status: findings 1-5 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
 held resident), `631b432` (per-path-token verdict memo in shell ingest),
 `eafc82c` (windowed `read`: one byte scan, window-only capture + UTF-8
 validation), `9d5f5ed` (`Arc<Vec<ChatMessage>>` History payload — emitter, log
-and `since()` are refcount bumps; the TUI mirror keeps the one deep copy);
-findings 5-10 open.**
+and `since()` are refcount bumps; the TUI mirror keeps the one deep copy),
+`695840d` (`(path, lowercase)` `@file` index — the lowercase form is computed
+once per tree walk, not per keystroke); findings 6-10 open.**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -3253,6 +3254,14 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 perf review finding 5** (`695840d`). The `@file` completion index
+is now `(path, lowercase_path)` pairs: `spawn_file_index` (hrdr-app util.rs)
+computes the lowercase form once per tree walk on the blocking task, and
+`rank_file_matches` ranks against the precomputed half — one lowercase per
+keystroke instead of one per indexed path. The TUI's `file_index` field and
+`TurnMsg::FileIndex` carry the pairs. Mixed-case ranking pinned by
+`rank_file_matches_uses_the_precomputed_lowercase_form`.
 
 **2026-08-06 perf review finding 4** (`9d5f5ed`). `AgentEvent::History` now
 carries `Arc<Vec<ChatMessage>>` and `Agent.messages` is an `Arc` (copy-on-write
