@@ -794,18 +794,6 @@ fn recall_score(mem: &Memory, tokens: &[String]) -> i32 {
     tokens.iter().map(|t| relevance_score(mem, t)).sum()
 }
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
-fn truncate_on_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 /// Rank the project + global memories by relevance to `query` and return the
 /// full text of the top matches, bounded to `max_bytes`, formatted for injection
 /// — or `None` when memory is disabled/empty or nothing matches.
@@ -859,7 +847,7 @@ pub fn recall(
             // Truncate the last entry to whatever budget remains and stop; drop
             // it if nothing meaningful fits. Never exceed `max_bytes`.
             let budget = max_bytes - out.len();
-            let piece = truncate_on_boundary(&entry, budget);
+            let piece = &entry[..crate::floor_char_boundary(&entry, budget)];
             if !piece.trim().is_empty() {
                 out.push_str(piece);
                 wrote = true;
