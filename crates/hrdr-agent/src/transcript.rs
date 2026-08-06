@@ -681,11 +681,7 @@ fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry>
 /// the reducer stamps this because the reducer is what closes the block: every
 /// agent's thinking time is then measured the same way, wherever its events
 /// were folded.
-///
-/// Public for the TUI's deferred-chrome flush, which closes an open thought
-/// the same way the reducer would before appending the lines that waited for
-/// it.
-pub fn finish_reasoning(transcript: &mut [Entry]) {
+fn finish_reasoning(transcript: &mut [Entry]) {
     let Some(entry) = transcript.last_mut() else {
         return;
     };
