@@ -555,7 +555,8 @@ pub(crate) async fn run_streamed_command(
 
     macro_rules! ingest_line {
         ($line:expr) => {{
-            let line: &str = $line;
+            let owned: String = $line;
+            let line: &str = &owned;
             // Drop a line that names a credential file before it reaches anything —
             // the UI, the in-memory head/tail, or the spool. `rg -n "token" .` and
             // `grep -R secret` are how a broad search spills `.env` into the model's
@@ -582,22 +583,17 @@ pub(crate) async fn run_streamed_command(
                 head.push('\n');
                 secrets_dropped += 1;
             } else {
-                // Stream to the UI (unchanged from current behaviour).
-                ctx.emit(format!("{line}\n"));
-
                 total_lines += 1;
-                total_bytes += line.len() + 1; // +1 for the newline
+                total_bytes += line.len(); // the owned line already carries its newline
 
-                // Accumulate in-memory head + tail.
                 // The routing decision, captured up front: the line that trips
                 // the byte cap is exactly the one that does not fit in `head`,
                 // and the seed write below needs to know whether to append it.
                 let went_to_tail = head.len() >= head_budget;
                 if head.len() < head_budget {
                     head.push_str(line);
-                    head.push('\n');
                 } else {
-                    let entry = format!("{line}\n");
+                    let entry = line.to_string();
                     tail_bytes += entry.len();
                     tail.push_back(entry);
                     // Evict oldest tail entries to stay within the tail budget.
@@ -639,7 +635,6 @@ pub(crate) async fn run_streamed_command(
                             let _ = f.write_all(head.as_bytes());
                             if went_to_tail {
                                 let _ = f.write_all(line.as_bytes());
-                                let _ = f.write_all(b"\n");
                             }
                             overflow_path = Some(p);
                             overflow_file = Some(f);
@@ -651,8 +646,10 @@ pub(crate) async fn run_streamed_command(
                     // up to the line that tripped `over_cap` above).
                     use std::io::Write as _;
                     let _ = f.write_all(line.as_bytes());
-                    let _ = f.write_all(b"\n");
                 }
+                // Stream to the UI last, moving the owned line — the trailing
+                // newline is already part of the buffer, so nothing is copied.
+                ctx.emit(owned);
             }
         }};
     }
@@ -684,8 +681,9 @@ pub(crate) async fn run_streamed_command(
                             }
                             // Counted after cleaning: the caps, the spool note and
                             // the grep-tail check are all about what the model sees.
-                            stdout_bytes += line.len() + 1;
-                            ingest_line!(&line);
+                            line.push('\n');
+                            stdout_bytes += line.len();
+                            ingest_line!(line);
                             out_buf.clear();
                             out_over = false;
                         }
@@ -702,7 +700,8 @@ pub(crate) async fn run_streamed_command(
                             if !keep_ansi && crate::ansi::needs_clean(&line) {
                                 line = crate::ansi::clean(&line).into_owned();
                             }
-                            ingest_line!(&line);
+                            line.push('\n');
+                            ingest_line!(line);
                             err_buf.clear();
                             err_over = false;
                         }
@@ -724,12 +723,13 @@ pub(crate) async fn run_streamed_command(
             // reaps `bash` — `node` would keep holding its port forever.
             group.kill();
             let _ = child.kill().await;
-            let msg = format!(
+            let mut msg = format!(
                 "[command timed out after {}s; process killed — raise timeout_secs or \
                  run a narrower command]",
                 timeout.as_secs()
             );
-            ingest_line!(&msg);
+            msg.push('\n');
+            ingest_line!(msg);
             None
         }
     };
@@ -753,11 +753,12 @@ pub(crate) async fn run_streamed_command(
         // "exit status: 3" and Windows as "exit code: 3", so interpolating it gave
         // the model "[exit status: exit code: 3]" on Windows — noise in a line it
         // reads on every failure. A signal has no code, so it says so instead.
-        let msg = match s.code() {
+        let mut msg = match s.code() {
             Some(code) => format!("[exit status: {code}]"),
             None => format!("[killed by signal: {s}]"),
         };
-        ingest_line!(&msg);
+        msg.push('\n');
+        ingest_line!(msg);
     }
 
     // Flush the overflow file (drop closes it).
