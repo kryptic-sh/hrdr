@@ -236,6 +236,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The status bar's sandbox badge now shows the mode the session actually runs
+  under.** The main pane was seeded with `SandboxMode::None` and `PaneSet::sync`
+  refreshed every per-agent field of an existing pane except `sandbox` — so the
+  badge read "Yolo" on every launch, whatever the session really enforced (a
+  plain `hrdr` run is `Write`; only `--yolo` / `--sandbox none` is unconfined).
+  The badge now follows the registry entry, which captures the agent's policy
+  once at registration — one source of truth for the main and every delegated
+  pane. Sub-agent badges were already correct.
+
 - **An opened thought stays open across scrollback pruning.** `thinking_open`
   was keyed by the transcript index while `prune_scrollback` shifted every index
   on eviction — so once a session grew past the 500-entry cap, an opened thought

@@ -375,6 +375,7 @@ impl PaneSet {
             pane.effort = s.effort.clone();
             pane.auto_compact = s.auto_compact;
             pane.compaction_reserved = s.compaction_reserved;
+            pane.sandbox = s.sandbox;
             pane.todos = std::sync::Arc::clone(&s.todos);
             // The registry still carries the agent's identity as two values; it is
             // paired back up here, at the edge, exactly as the session file's is.
@@ -799,6 +800,65 @@ mod tests {
             panes.active(),
             PaneId::MAIN,
             "a dead sub-agent must not strand the view"
+        );
+    }
+
+    /// The status bar's sandbox badge is the session agent's REAL confinement,
+    /// tracked from the registry like every other per-agent field — the main
+    /// pane's `Default` value must not survive the first sync.
+    ///
+    /// Regression: the main pane was seeded with `SandboxMode::None` and `sync`
+    /// refreshed every field of an existing pane except `sandbox`, so the badge
+    /// read "Yolo" forever, whatever the session actually enforced (a plain
+    /// `hrdr` run is `Write`; only `--yolo`/`--sandbox none` is unconfined).
+    #[test]
+    fn the_main_panes_sandbox_badge_tracks_the_registry() {
+        let live = AgentRegistry::new();
+        let agent = crate::Agent::new(crate::AgentConfig {
+            ..Default::default()
+        })
+        .unwrap();
+        live.register(crate::AgentEntry {
+            key: crate::MAIN_KEY,
+            bg_id: None,
+            tool_id: None,
+            label: "main".to_string(),
+            model: "m".to_string(),
+            provider: None,
+            base_url: String::new(),
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            sandbox: hrdr_tools::SandboxMode::Write,
+            todos: Default::default(),
+            usage: crate::AgentUsage::default(),
+            events: crate::event_log(),
+            reasoning_open: false,
+            pending_notices: Vec::new(),
+            turn: crate::TurnStats::default(),
+            agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
+            steering: crate::steering_queue(),
+            running: false,
+            compacting: false,
+            done: false,
+            delivered: false,
+            pinned: true,
+            transcript: None,
+        });
+
+        let mut panes = PaneSet::new();
+        // The seed is the bug: it claims unconfined before any registry exists.
+        assert_eq!(panes.main().sandbox, hrdr_tools::SandboxMode::None);
+        panes.sync(&live);
+        assert_eq!(
+            panes.main().sandbox,
+            hrdr_tools::SandboxMode::Write,
+            "the badge must report the mode the session actually enforces"
+        );
+        assert_eq!(
+            panes.active_pane().sandbox,
+            hrdr_tools::SandboxMode::Write,
+            "what the status bar reads"
         );
     }
 
