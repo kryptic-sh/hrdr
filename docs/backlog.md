@@ -1508,10 +1508,11 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: findings 1-2 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
-held resident), `631b432` (per-path-token verdict memo in shell ingest);
-findings 3-10 open. Finding 3 is the next win; finding 4 is the recorded item
-confirmed with two new sites.**
+**Status: findings 1-3 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
+held resident), `631b432` (per-path-token verdict memo in shell ingest),
+`eafc82c` (windowed `read`: one byte scan, window-only capture + UTF-8
+validation); findings 4-10 open. Finding 4 is the recorded item confirmed with
+two new sites.**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -3251,6 +3252,21 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 perf review finding 3** (`eafc82c`). `ReadTool` no longer reads and
+parses the whole file per call. The file is scanned once in chunks
+(`WindowScanner` in `crates/hrdr-tools/src/tools/read.rs`), capturing exactly
+the `[start, start+limit)` window and counting newlines for the total the
+coverage record needs; only the window is UTF-8-validated (a binary tail outside
+the window no longer fails a paged read of the text before it — it errors when a
+page reaches it; `full` reads still validate the whole file). Rendered output,
+totals and coverage semantics unchanged, pinned by
+`window_scan_matches_str_lines_semantics` (equivalence to `str::lines()` over
+three chunkings — 1-byte chunks, 3-byte, whole — which caught a mid-chunk
+double-capture bug in the first draft) and the existing paging/coverage suite;
+the window-only-UTF-8 contract is pinned by
+`windowed_read_no_longer_requires_the_whole_file_to_be_text`, red on the old
+code first.
 
 **2026-08-06 perf review finding 2** (`631b432`). The per-line shell secret
 filter (`grep_line_is_secret`, which canonicalized `cwd.join(token)` on every
