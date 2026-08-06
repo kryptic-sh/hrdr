@@ -2148,7 +2148,7 @@ pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::Docum
             // Keep a copy so a hand-mangled file is still recoverable, then
             // refuse: overwriting it with a default document would drop every
             // setting it holds.
-            let backup = backup_path(path);
+            let backup = hrdr_llm::sibling_with_suffix(path, ".bak");
             let saved = std::fs::copy(path, &backup).is_ok();
             let note = if saved {
                 format!(" (a copy was saved to {})", backup.display())
@@ -2165,15 +2165,6 @@ pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::Docum
 }
 
 /// The `.bak` sibling a malformed config is copied to before we refuse to write.
-fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".bak");
-    path.with_file_name(name)
-}
-
 /// Write `doc` over `path` atomically: build it in a unique sibling temp file,
 /// then rename that onto the target.
 ///

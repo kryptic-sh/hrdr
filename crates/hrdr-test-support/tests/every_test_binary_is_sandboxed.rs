@@ -11,7 +11,7 @@
 
 extern crate hrdr_test_support;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The link line, in both spellings. A crate root gates it on `cfg(test)`; a `tests/*.rs`
 /// binary is only ever built for tests, so it does not.
@@ -85,10 +85,7 @@ fn every_integration_test_binary_links_the_sandbox_ctor() {
 /// condition as not being tested at all, so it costs no coverage — but it does mean adding
 /// a crate to the workspace is what enrolls it here.
 fn workspace_crates() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<crate> sits two levels under the workspace root");
+    let root = hrdr_test_support::workspace_root();
     let manifest =
         std::fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest is readable");
     let mut out: Vec<PathBuf> = workspace_members(&manifest)

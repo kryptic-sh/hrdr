@@ -34,7 +34,7 @@ fn no_test_in_the_workspace_writes_real_user_state() {
         return;
     }
 
-    let root = workspace_root();
+    let root = hrdr_test_support::workspace_root();
     let sentinel = std::env::temp_dir().join(format!("hrdr-leak-sentinel-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&sentinel);
     std::fs::create_dir_all(&sentinel).expect("a sentinel dir is creatable");
@@ -88,15 +88,6 @@ fn no_test_in_the_workspace_writes_real_user_state() {
         status.success(),
         "the workspace suite failed under the guard"
     );
-}
-
-/// The workspace root: this crate is `<root>/crates/hrdr-test-support`.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<crate> sits two levels under the workspace root")
-        .to_path_buf()
 }
 
 /// `$CARGO_HOME` / `$RUSTUP_HOME` as they really are — from the environment, else from

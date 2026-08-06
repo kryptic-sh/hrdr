@@ -123,14 +123,6 @@ fn open_wire_log(path: &Path) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// The rotated (`.1`) path for `path`: the same path with `.1` appended
-/// (`requests.log` → `requests.log.1`).
-fn rotated_wire_log_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".1");
-    PathBuf::from(name)
-}
-
 /// Rotate the active wire log: rename it to `<name>.1` (atomically replacing
 /// any previous `.1`, which preserves the 0600 perms of the moved inode) and
 /// swap `file` for a freshly created, 0600-hardened active file at `path`.
@@ -139,7 +131,7 @@ fn rotated_wire_log_path(path: &Path) -> PathBuf {
 /// rename-back undoes a partial move) and an error is returned so the caller
 /// can fall back to stop-at-cap.
 fn rotate_wire_log(path: &Path, file: &mut std::fs::File) -> std::io::Result<()> {
-    let rotated = rotated_wire_log_path(path);
+    let rotated = crate::fs::sibling_with_suffix(path, ".1");
     // `rename` replaces an existing `.1`, so no `.2`… ever accumulates, and it
     // preserves the moved file's permissions (same inode).
     std::fs::rename(path, &rotated)?;
@@ -219,7 +211,7 @@ pub(crate) fn log_wire(kind: &str, fields: impl FnOnce() -> serde_json::Value) {
                     set_client_warning(format!(
                         "request log reached {mib} MiB; rotated to {} \
                          (keeping the newest {mib} MiB, at most {} MiB on disk)",
-                        rotated_wire_log_path(&wire.path).display(),
+                        crate::fs::sibling_with_suffix(&wire.path, ".1").display(),
                         mib * 2
                     ));
                 }
@@ -3021,7 +3013,7 @@ mod tests {
         // deterministic test of that code path (no timing needed).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("requests.log");
-        let rotated = rotated_wire_log_path(&path);
+        let rotated = crate::fs::sibling_with_suffix(&path, ".1");
 
         // 1. Create a regular active file.
         std::fs::write(&path, b"original data").unwrap();
@@ -3153,7 +3145,7 @@ mod tests {
         append_with_cap(&path, &mut file, "OLD\n", cap); // 4 bytes, under cap
         append_with_cap(&path, &mut file, "NEW\n", cap); // would hit cap → rotate
 
-        let rotated = rotated_wire_log_path(&path);
+        let rotated = crate::fs::sibling_with_suffix(&path, ".1");
         assert!(rotated.exists(), ".1 file must exist after rotation");
         assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "OLD\n");
         // The active file continues with the new content.
@@ -3171,7 +3163,7 @@ mod tests {
         append_with_cap(&path, &mut file, "BBB\n", cap); // rotate: .1 = AAA
         append_with_cap(&path, &mut file, "CCC\n", cap); // rotate: .1 = BBB
 
-        let rotated = rotated_wire_log_path(&path);
+        let rotated = crate::fs::sibling_with_suffix(&path, ".1");
         assert_eq!(
             std::fs::read_to_string(&rotated).unwrap(),
             "BBB\n",
@@ -3199,7 +3191,7 @@ mod tests {
         append_with_cap(&path, &mut file, "OLD\n", cap);
         append_with_cap(&path, &mut file, "NEW\n", cap); // rotate
 
-        let rotated = rotated_wire_log_path(&path);
+        let rotated = crate::fs::sibling_with_suffix(&path, ".1");
         for p in [&path, &rotated] {
             let mode = std::fs::metadata(p).unwrap().permissions().mode();
             assert_eq!(
@@ -3561,7 +3553,7 @@ mod tests {
     #[test]
     fn rotated_path_appends_dot_one() {
         assert_eq!(
-            rotated_wire_log_path(Path::new("/var/log/requests.log")),
+            crate::fs::sibling_with_suffix(Path::new("/var/log/requests.log"), ".1"),
             PathBuf::from("/var/log/requests.log.1")
         );
     }

@@ -71,11 +71,6 @@ fn is_oauth_login(name: &str) -> bool {
     name == "openrouter" || hrdr_agent::is_chatgpt_provider_name(name)
 }
 
-/// Milliseconds since the Unix epoch, for OAuth token expiry.
-fn now_ms() -> u64 {
-    hrdr_agent::unix_millis()
-}
-
 /// One login ROUTE the flow offers (one modal picker row). A provider can expose
 /// more than one — `openai` and `openrouter` each get a key row and a browser
 /// row — so the row carries its own [`route`](Self::route): the picker dispatches
@@ -677,7 +672,8 @@ async fn chatgpt_exchange_and_save(
     let creds = hrdr_agent::OAuthCreds {
         access: tokens.access_token,
         refresh: tokens.refresh_token,
-        expires_ms: now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000)),
+        expires_ms: hrdr_agent::unix_millis()
+            .saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000)),
         account_id,
     };
     hrdr_agent::save_oauth_for(

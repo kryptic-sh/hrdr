@@ -101,11 +101,6 @@ fn account_digest(account_id: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Current time in epoch milliseconds.
-fn now_ms() -> u64 {
-    crate::unix_millis()
-}
-
 /// The per-account catalog cache path, `<XDG cache>/hrdr/chatgpt_models.json`.
 fn cache_path() -> Option<PathBuf> {
     Some(
@@ -441,7 +436,7 @@ pub async fn chatgpt_model_catalog(access: &OAuthAccess, force: bool) -> ChatGpt
     // Fresh cache short-circuit (skips the network entirely).
     if !force
         && let (Some(c), Some(d)) = (&cache, &digest)
-        && cache_is_fresh(c, d, now_ms())
+        && cache_is_fresh(c, d, crate::unix_millis())
     {
         return ChatGptCatalogResult {
             models: c.models.clone(),
@@ -459,7 +454,8 @@ pub async fn chatgpt_model_catalog(access: &OAuthAccess, force: bool) -> ChatGpt
         _ => None,
     };
     let outcome = fetch_catalog(access, etag).await;
-    let (result, persist) = resolve_catalog(outcome, cache, digest.as_deref(), now_ms());
+    let (result, persist) =
+        resolve_catalog(outcome, cache, digest.as_deref(), crate::unix_millis());
 
     // Persist only when we have an account digest (account-less → no cache).
     if let (Some(entry), Some(p)) = (persist, &path) {

@@ -773,6 +773,13 @@ pub fn fuzzy_match(query: &str, parts: &[&str]) -> bool {
     if q.is_empty() {
         return true;
     }
+    fuzzy_match_q(&q, parts)
+}
+
+/// Case-insensitive subsequence test over the space-joined parts, against an
+/// already-normalized query — the per-row core of [`fuzzy_match`], split out so
+/// a caller filtering many rows normalizes the query once.
+fn fuzzy_match_q(q: &[char], parts: &[&str]) -> bool {
     let hay = parts.join(" ").to_lowercase();
     let mut it = hay.chars();
     q.iter().all(|&c| it.any(|h| h == c))
@@ -799,8 +806,8 @@ pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> 
         .enumerate()
         .filter_map(|(i, c)| {
             let id = format!("{}://{}", c.provider, c.model);
-            fuzzy_match(
-                query,
+            fuzzy_match_q(
+                &q,
                 &[
                     c.model_label.as_str(),
                     c.provider_label.as_str(),

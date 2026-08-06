@@ -27,7 +27,9 @@ pub use client::{
     Backend, ChatError, ChatErrorKind, ChatStream, Client, UNNAMED_MODEL, is_anthropic_backend,
     is_local_host, serve_response, take_client_warning, url_host,
 };
-pub use fs::{owner_only_options, owner_only_options_no_follow, unique_sibling_path};
+pub use fs::{
+    owner_only_options, owner_only_options_no_follow, sibling_with_suffix, unique_sibling_path,
+};
 pub use retry::{
     MAX_BACKOFF, RetryAttempt, RetryBudget, RetryPolicy, UnsupportedParam, is_context_overflow,
     is_transient, retry_after_hint, unsupported_param,

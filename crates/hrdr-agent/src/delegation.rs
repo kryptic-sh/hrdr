@@ -572,22 +572,7 @@ static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// A transcript file id: `NNN-<slug>`, where `slug` is the sanitized label.
 /// `seq` is the pre-fetched counter value.
 pub(crate) fn child_transcript_id(seq: u64, label: &str) -> String {
-    let lowered: String = label
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let slug = lowered
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
+    let slug = crate::paths::flatten_slug(label);
     let slug: String = if slug.is_empty() {
         "task".to_string()
     } else {

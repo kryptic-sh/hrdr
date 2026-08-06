@@ -120,10 +120,7 @@ fn const_decl(line: &str) -> Option<(&str, &str)> {
 
 /// Every `.rs` file under each workspace crate's `src/` and `tests/`.
 fn rust_sources() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/<crate> sits two levels under the workspace root");
+    let root = hrdr_test_support::workspace_root();
     let mut out = Vec::new();
     for dir in ["crates", "apps"] {
         collect(&root.join(dir), &mut out);

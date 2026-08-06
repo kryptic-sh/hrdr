@@ -210,7 +210,7 @@ pub(crate) fn is_usage_limit_text(text: &str) -> bool {
 /// class, or the phrase scan for errors that never went through the typed
 /// classifier. The third classifier alongside [`is_transient`] and
 /// [`is_context_overflow`]; codex's `UsageLimitReached`.
-pub fn is_usage_limit(e: &anyhow::Error) -> bool {
+pub(crate) fn is_usage_limit(e: &anyhow::Error) -> bool {
     if let Some(ce) = e.downcast_ref::<crate::ChatError>() {
         return ce.kind == crate::ChatErrorKind::UsageLimit;
     }

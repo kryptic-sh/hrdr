@@ -36,6 +36,23 @@ pub fn unique_sibling_path(target: &Path, tag: &str) -> PathBuf {
     target.with_file_name(format!(".{name}.{tag}-{}-{seq}", std::process::id()))
 }
 
+/// `path` with `suffix` appended to its final component, in the same directory:
+/// `requests.log` → `requests.log.1`, `auth.json` → `auth.json.lock`. The one
+/// scheme for "a sibling that is the same name plus a marker", shared by the
+/// wire-log rotation (`.1`), the config backup (`.bak`) and the store lock
+/// (`.lock`), which used to each re-derive it.
+pub fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// [`std::fs::OpenOptions`] that create a file only its owner can read, ready
 /// for the caller to add its own create/append/truncate semantics and `open`.
 /// The single owner of that policy: the credential store, the wire log, the
@@ -114,6 +131,20 @@ fn refuse_symlinks(_opts: &mut std::fs::OpenOptions) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sibling keeps the parent and appends the suffix to the final
+    /// component; a bare path (no parent) still gets the suffix.
+    #[test]
+    fn sibling_with_suffix_appends_to_the_final_component() {
+        assert_eq!(
+            sibling_with_suffix(Path::new("/var/log/requests.log"), ".1"),
+            PathBuf::from("/var/log/requests.log.1")
+        );
+        assert_eq!(
+            sibling_with_suffix(Path::new("auth.json"), ".lock"),
+            PathBuf::from("auth.json.lock")
+        );
+    }
 
     /// Two calls for the same target must never collide, must stay hidden
     /// (dot-prefixed), must sit beside the target, and must carry the tag —

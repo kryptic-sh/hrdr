@@ -103,6 +103,18 @@ fn remove_sandbox() {
     }
 }
 
+/// The workspace root: this crate is `<root>/crates/hrdr-test-support`, so the
+/// root is the manifest dir's grandparent. Test binaries that walk the whole
+/// workspace (crate inventory, duration-constant scan, the leak guard) all
+/// derive it the same way.
+pub fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/<crate> sits two levels under the workspace root")
+        .to_path_buf()
+}
+
 /// The throwaway root the ctor installed for this process.
 ///
 /// Panics if the ctor did not run — which means this crate was not linked, and the test

@@ -8,22 +8,28 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
+/// The shared flattening core behind every slug: trim, keep only alphanumerics
+/// (everything else becomes `-`), collapse runs of separators, and lowercase.
+/// `cwd_slug` and the sub-agent transcript ids both need the same
+/// "a label becomes a safe file-name component" step, and both must agree on it.
+pub(crate) fn flatten_slug(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
+}
+
 /// Slug for a working directory — the per-cwd subdirectory name. The full path
 /// is flattened (e.g. `/home/me/Projects/foo` → `home-me-projects-foo`). A hash
 /// of the original path is appended to avoid collisions between distinct paths
 /// that map to the same slug (e.g. `foo-bar` vs `foo_bar`).
 pub fn cwd_slug(cwd: &str) -> String {
-    let raw: String = cwd
-        .trim()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    let s = raw
-        .split('-')
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-        .to_lowercase();
+    let s = flatten_slug(cwd);
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     let suffix = format!("-{:016x}", hasher.finish());

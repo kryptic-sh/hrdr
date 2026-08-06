@@ -116,7 +116,7 @@ impl StoreLock {
     /// before locking). Returns an error — never hangs — when the lock stays
     /// contended past the retry budget or the directory is unwritable.
     pub fn acquire(store_path: &Path) -> Result<Self> {
-        let lock_path = lock_path_for(store_path);
+        let lock_path = hrdr_llm::sibling_with_suffix(store_path, ".lock");
         for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -175,21 +175,6 @@ impl StoreLock {
             "timed out acquiring credential-store lock {} (held by another process?)",
             lock_path.display()
         ))
-    }
-}
-
-/// The sibling lock path for a store file: `<store>.lock`. Placed alongside the
-/// store (same directory) so it shares the store's permissions/ownership and is
-/// obvious to anyone inspecting the config dir.
-fn lock_path_for(store_path: &Path) -> PathBuf {
-    let mut name = store_path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".lock");
-    match store_path.parent() {
-        Some(parent) => parent.join(name),
-        None => PathBuf::from(name),
     }
 }
 
@@ -266,9 +251,15 @@ mod tests {
     #[test]
     fn lock_path_is_sibling_with_lock_suffix() {
         let p = Path::new("/some/dir/auth.toml");
-        assert_eq!(lock_path_for(p), PathBuf::from("/some/dir/auth.toml.lock"));
+        assert_eq!(
+            hrdr_llm::sibling_with_suffix(p, ".lock"),
+            PathBuf::from("/some/dir/auth.toml.lock")
+        );
         let p = Path::new("/x/oauth.json");
-        assert_eq!(lock_path_for(p), PathBuf::from("/x/oauth.json.lock"));
+        assert_eq!(
+            hrdr_llm::sibling_with_suffix(p, ".lock"),
+            PathBuf::from("/x/oauth.json.lock")
+        );
     }
 
     #[test]
