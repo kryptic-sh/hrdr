@@ -1027,8 +1027,8 @@ files. GAPs — not opened: `crates/hrdr-editor`, `crates/hrdr-test-support`, an
 the unchanged regions of `ui.rs`/`app.rs`/`e2e.rs` outside the hunks (all
 unchanged since `fcabdaa`, covered by that sweep).
 
-**Status: both findings are open — low-severity TUI view-state defects in the
-grouping feature; the fix-notes are in the findings.**
+**Status: both findings fixed — `695f07c` (finding 1), `de51c8b` (finding 2);
+the regression tests from the Repro blocks are in place (see Record).**
 
 ## Security audit 2026-08-06
 
@@ -1144,9 +1144,6 @@ allocation (all reads byte-capped, `replace_all` projected before allocating).
   tool and its writes would bypass the "write NOWHERE" boundary. If the promise
   must hold absolutely, route memory mutations through `resolve_write` or drop
   the tool from read-only sessions.
-- `StoreLock::drop` deleting by path without checking ownership is one careless
-  refactor from a real bug even on Linux — the PID-ownership check is cheap
-  insurance (see finding 2).
 - The OpenRouter callback server reflects the attacker's own (escaped) state
   string (`oauth.rs:259`); the comment at `:255-257` should be preserved — a
   future "echo the expected value" change would leak the CSRF token.
@@ -1197,11 +1194,12 @@ routing via grep), `hrdr-tools/src/mcp/{mod,tool,types, util}.rs`, the bulk of
 `hrdr-app/src/{login,status,transcript,completion, format,themes,palette,pane,highlight,effort,commands/*}`.
 Test modules not audited.
 
-**Summary: 2 findings, both low; 0 medium/high. The codebase is unusually
-well-hardened — every untrusted-input read is byte-capped, credentials are
-0600/0700 with atomic locked writes, retries are bounded, path traversal is
-blocked at every file-name boundary, OAuth state/PKCE/token handling is correct,
-and error paths avoid echoing secrets. Fix first: (1) a total-byte budget on
+**Summary: 2 findings, both low, both fixed — `4638e76` (finding 1), `a328c03`
+(finding 2). 0 medium/high. The codebase is unusually well-hardened — every
+untrusted-input read is byte-capped, credentials are 0600/0700 with atomic
+locked writes, retries are bounded, path traversal is blocked at every file-name
+boundary, OAuth state/PKCE/token handling is correct, and error paths avoid
+echoing secrets. What the two fixes shipped: (1) a total-byte budget on
 `Accumulator::push` so a flooding endpoint cannot grow memory for 300 s; (2)
 ownership-checked lock release in `StoreLock` (Windows reap race + cheap
 insurance against future refactors).**
@@ -1363,8 +1361,9 @@ grep-verified as used), `tests/tui_pty.rs` (beyond 200), hrdr-tools
 `sandbox.rs`/`lsp.rs`/`memory.rs`/`verification.rs`/ `web.rs`/`mcp/client.rs`
 (symbol + targeted reads only).
 
-**Status: all entries open; each names its concrete action. Items 1-3 are the
-highest-value (dead code + a six-fold literal).**
+**Status: items 1-2 fixed — `205844e` (the five dead `pub` items and the
+six-fold SSE literal); items 3-12 open, each naming its concrete action. Items
+1-3 were the highest-value (dead code + a six-fold literal).**
 
 ## Performance review 2026-08-06
 
@@ -1784,8 +1783,9 @@ live here:
   refuses). **The fix is `gh run rerun 30767495527 --failed`, not a new tag**;
   the job stages the PKGBUILD and exits 0 when the diff is empty, so re-running
   it is safe. The tag run stays red until it lands, which is
-  `tag-release status` working as intended. **Delete this entry once the RPC
-  reports `0.11.0-1`.**
+  `tag-release status` working as intended. Probed again 2026-08-06: the RPC
+  still reports `0.10.0-1`. **Delete this entry once the RPC reports
+  `0.11.0-1`.**
 
 ## Deferred 2026-08-05
 
@@ -3249,6 +3249,22 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 backlog slices — the four dated 2026-08-06 findings** (`4638e76`,
+`a328c03`, `de51c8b`, `695f07c`, `205844e`). Security audit findings 1-2: the
+`Accumulator` caps the accumulated reply at 64 MiB (content, reasoning and
+tool-call fragments) and errors the stream past it; `StoreLock::drop` removes
+the lock file only when it still carries the guard's own PID (a reaped and
+re-claimed lock is never deleted out from under its new owner). Correctness
+findings 1-2: a click on a call inside an expanded tool group pins the group
+summary's own top row, not the click row (no more view jump while scrolled up);
+`thinking_open` is renumbered across `prune_scrollback` and cleared when the
+transcript is wholesale rebuilt (`/clear`, resume). Tidy review items 1-2: five
+grep-verified-dead `pub` items deleted (`PromptDelivery::into_handle`,
+`ModelRef::into_parts`, `Panes::active_sub`, `transcript_to_plain_text` and its
+orphaned `clip`, `wire_protocol` + test + re-export), and the six hand-written
+SSE-overflow messages collapsed onto `SseOverflow::to_string()`. Each fix ships
+a regression test that was shown red on the old behavior first.
 
 **2026-08-06 notice redesign — `::Notice` leaves the transcript** (`a371434`,
 `2bff248`, `c18a63c`, `72f29e2`). A slash command's status line (a setting
