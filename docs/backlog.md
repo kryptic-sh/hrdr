@@ -1508,11 +1508,12 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: findings 1-3 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
+**Status: findings 1-4 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
 held resident), `631b432` (per-path-token verdict memo in shell ingest),
 `eafc82c` (windowed `read`: one byte scan, window-only capture + UTF-8
-validation); findings 4-10 open. Finding 4 is the recorded item confirmed with
-two new sites.**
+validation), `9d5f5ed` (`Arc<Vec<ChatMessage>>` History payload — emitter, log
+and `since()` are refcount bumps; the TUI mirror keeps the one deep copy);
+findings 5-10 open.**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -3252,6 +3253,18 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 perf review finding 4** (`9d5f5ed`). `AgentEvent::History` now
+carries `Arc<Vec<ChatMessage>>` and `Agent.messages` is an `Arc` (copy-on-write
+via `Arc::make_mut` at every mutation: turn loop, compaction, `clear`,
+`push_user_message`, `push_user_note`, the system-message rewrites,
+`set_messages`). The turn-loop emitter, the registry's event log and `since()`'s
+clones are refcount bumps; the TUI's `persist_mid_turn` and the delegation
+snapshot keep the one deep copy; the OpenAI request body's `to_vec()` is the
+wire copy, out of scope. Regression test
+`history_event_shares_the_agents_message_arc` drives a real mock-server round
+and asserts the emitted payload shares the agent's allocation
+(`Arc::strong_count >= 2` at the sink) — red on a deep-copying emitter.
 
 **2026-08-06 perf review finding 3** (`eafc82c`). `ReadTool` no longer reads and
 parses the whole file per call. The file is scanned once in chunks
