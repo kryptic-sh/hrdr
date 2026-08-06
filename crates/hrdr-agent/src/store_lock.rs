@@ -20,7 +20,9 @@
 //!   `PID TIMESTAMP` (space-separated), matching the session reservation format,
 //!   so a concurrent process can judge staleness.
 //! * [`StoreLock`] is an RAII guard: dropping it removes the lock file, on every
-//!   exit path (normal return, `?`, panic). A crash between create and drop
+//!   exit path (normal return, `?`, panic) — but only if the file still carries
+//!   this guard's PID, so a lock another process reaped and re-claimed is never
+//!   deleted out from under its new owner. A crash between create and drop
 //!   leaves the file behind, which the staleness check below reaps.
 //! * **Staleness**: a lock whose owning PID is gone, or whose timestamp is older
 //!   than [`STALE_LOCK_AGE_SECS`], is reaped and re-claimed. A lock whose content
@@ -67,15 +69,41 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 ///
 /// Held for the duration of one read-modify-write. Dropping it releases the lock
 /// (removes the lock file) on every exit path, so a failed or panicking write
-/// never leaves a permanent lock behind. See the module docs for the full design.
+/// never leaves a permanent lock behind — but only a lock this guard still
+/// owns: if a concurrent process reaped ours as stale and re-claimed the path,
+/// `Drop` leaves the new owner's lock alone. See the module docs for the full
+/// design.
 #[derive(Debug)]
 pub struct StoreLock {
     lock_path: PathBuf,
+    /// PID written into the lock file at acquire — the only identity that may
+    /// release this lock.
+    pid: u32,
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
+        // Remove the lock file only if it still holds OUR pid. Deleting by path
+        // alone is the race: a holder that was reaped as stale (Windows has no
+        // liveness probe, so `process_alive` reports every pid dead past the
+        // staleness age) has its lock reclaimed by a second process, and the
+        // original holder's Drop then deletes the *new* holder's lock mid-write
+        // — the lost-update this module exists to prevent. A lock we cannot
+        // parse to our own pid, or that no longer exists, needs no removal.
+        let owned = match std::fs::read_to_string(&self.lock_path) {
+            Ok(content) => {
+                content
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    == Some(self.pid)
+            }
+            // No lock to read — already removed or never reclaimed — nothing to do.
+            Err(_) => false,
+        };
+        if owned {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -103,7 +131,10 @@ impl StoreLock {
                     let _ = f.write_all(content.as_bytes());
                     let _ = f.flush();
                     drop(f);
-                    return Ok(StoreLock { lock_path });
+                    return Ok(StoreLock {
+                        lock_path,
+                        pid: std::process::id(),
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Someone holds it. Reap it if stale and retry immediately;
@@ -250,6 +281,23 @@ mod tests {
             assert!(lock.exists(), "lock file exists while held");
         }
         assert!(!lock.exists(), "lock file removed on drop");
+    }
+
+    #[test]
+    fn drop_leaves_a_reclaimed_lock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("auth.toml");
+        let lock = dir.path().join("auth.toml.lock");
+        let guard = StoreLock::acquire(&store).unwrap();
+        // A concurrent process reaped our lock as stale (Windows has no
+        // liveness probe, so every pid reads as dead past the staleness age)
+        // and re-claimed the path with its own pid.
+        std::fs::write(&lock, format!("{} {}", 999_999, hrdr_tools::unix_now())).unwrap();
+        drop(guard);
+        assert!(
+            lock.exists(),
+            "the old owner's drop must not delete the new owner's lock"
+        );
     }
 
     #[test]

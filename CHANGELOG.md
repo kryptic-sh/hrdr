@@ -652,6 +652,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reasoning and tool-call fragments and errors the stream past the ceiling,
   mirroring the SSE-overflow handling.
 
+- **The credential-store lock is only released by its owner.** `StoreLock`'s
+  `Drop` removed the lock file by path alone, so a lock that a second process
+  reaped as stale and re-claimed could be deleted out from under the new holder
+  mid-write — two read-modify-writes of `auth.json` in flight, the lost update
+  the lock exists to prevent. On Windows the hazard is reachable (no liveness
+  probe, so any lock older than 60 s reads as dead). `Drop` now verifies the
+  lock file still carries the guard's own PID before removing it, on every
+  platform.
+
 ## [0.11.1] - 2026-08-03
 
 ### Added
