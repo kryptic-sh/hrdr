@@ -409,8 +409,26 @@ pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatch
 /// touch tens of thousands of directory entries, which would stall a frame if
 /// run inline. Runs on a blocking task; `on_done` receives the file list there
 /// (send it back through your UI channel).
-pub fn spawn_file_index(cwd: PathBuf, on_done: impl FnOnce(Vec<String>) + Send + 'static) {
-    tokio::task::spawn_blocking(move || on_done(walk_files(&cwd)));
+///
+/// Each entry is `(path, lowercase_path)`: the lowercase form is computed once
+/// here, so a keystroke's ranking pass ([`crate::rank_file_matches`]) never
+/// re-lowercases the index. Memory trade: one extra String per indexed path,
+/// built once per tree walk.
+pub fn spawn_file_index(
+    cwd: PathBuf,
+    on_done: impl FnOnce(Vec<(String, String)>) + Send + 'static,
+) {
+    tokio::task::spawn_blocking(move || {
+        on_done(
+            walk_files(&cwd)
+                .into_iter()
+                .map(|p| {
+                    let lower = p.to_ascii_lowercase();
+                    (p, lower)
+                })
+                .collect(),
+        );
+    });
 }
 
 /// Current git branch (or short detached-HEAD sha) by walking up from `cwd` to

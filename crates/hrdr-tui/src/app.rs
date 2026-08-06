@@ -269,8 +269,9 @@ pub(crate) enum TurnMsg {
         source: hrdr_agent::CatalogSource,
         warning: Option<String>,
     },
-    /// `@file` completion index built off-thread for `cwd`.
-    FileIndex(std::path::PathBuf, Vec<String>),
+    /// `@file` completion index built off-thread for `cwd` — each entry is
+    /// `(path, lowercase_path)`, the lowercase half precomputed by the builder.
+    FileIndex(std::path::PathBuf, Vec<(String, String)>),
     /// The watched cwd changed on disk (entries created/renamed/removed —
     /// external edits, a `git pull`, the agent's own writes). The `@file`
     /// index is stale; the frontend invalidates it.
@@ -491,8 +492,10 @@ pub(crate) struct App {
     suppress_completions: bool,
     /// Submitted-input history + Up/Down browsing (from the shared core).
     pub(crate) history: hrdr_app::HistoryBrowser,
-    /// Cached relative file paths under the cwd, for `@file` completion.
-    file_index: Vec<String>,
+    /// Cached relative file paths under the cwd, for `@file` completion. Each
+    /// entry is `(path, lowercase_path)` — the lowercase half is built once by
+    /// `hrdr_app::spawn_file_index`, so ranking never re-lowercases the index.
+    file_index: Vec<(String, String)>,
     /// The cwd `file_index` was built for; rebuilt when the cwd changes or a
     /// filesystem change lands in the watched tree.
     file_index_cwd: Option<std::path::PathBuf>,

@@ -102,16 +102,20 @@ pub fn active_file_token(input: &str) -> Option<(usize, String)> {
 /// Empty query keeps input order (shortest paths first); otherwise basename
 /// prefix-matches rank above anywhere-substring matches, ties broken by shorter
 /// path then lexicographically. Case-insensitive.
-pub fn rank_file_matches(files: &[String], query: &str) -> Vec<String> {
+///
+/// Each entry is `(path, lowercase_path)` — the lowercase form is precomputed
+/// once when [`crate::spawn_file_index`] builds the index, off the UI thread,
+/// so a keystroke's ranking pass does one lowercase per *query*, not one per
+/// indexed path.
+pub fn rank_file_matches(files: &[(String, String)], query: &str) -> Vec<String> {
     let q = query.to_ascii_lowercase();
     let mut scored: Vec<(u8, usize, &String)> = files
         .iter()
-        .filter_map(|p| {
+        .filter_map(|(p, lp)| {
             if q.is_empty() {
                 return Some((1u8, p.len(), p));
             }
-            let lp = p.to_ascii_lowercase();
-            let base = lp.rsplit('/').next().unwrap_or(&lp);
+            let base = lp.rsplit('/').next().unwrap_or(lp);
             if base.starts_with(&q) {
                 Some((0, p.len(), p))
             } else if lp.contains(&q) {
@@ -380,10 +384,16 @@ mod tests {
     #[test]
     fn rank_file_matches_prefers_basename_prefix() {
         let files = vec![
-            "src/main.rs".to_string(),
-            "src/app/main_loop.rs".to_string(),
-            "docs/mainframe.md".to_string(),
-            "other.rs".to_string(),
+            ("src/main.rs".to_string(), "src/main.rs".to_string()),
+            (
+                "src/app/main_loop.rs".to_string(),
+                "src/app/main_loop.rs".to_string(),
+            ),
+            (
+                "docs/mainframe.md".to_string(),
+                "docs/mainframe.md".to_string(),
+            ),
+            ("other.rs".to_string(), "other.rs".to_string()),
         ];
         let out = rank_file_matches(&files, "main");
         // Basename prefix matches come first (main.rs, main_loop.rs, mainframe.md),
@@ -392,5 +402,34 @@ mod tests {
         assert!(!out.iter().any(|p| p == "other.rs"));
         // Empty query keeps everything (shortest first) capped at 8.
         assert_eq!(rank_file_matches(&files, "").len(), 4);
+    }
+
+    /// Ranking trusts the precomputed lowercase half of each entry — the
+    /// case-insensitive contract is established when the index is built
+    /// (`spawn_file_index`), not per keystroke. A mixed-case path must still
+    /// match a lowercase query.
+    #[test]
+    fn rank_file_matches_uses_the_precomputed_lowercase_form() {
+        let files = vec![
+            (
+                "SRC/App/Notes.md".to_string(),
+                "src/app/notes.md".to_string(),
+            ),
+            ("docs/README".to_string(), "docs/readme".to_string()),
+        ];
+        // Basename prefix match against the lowercased path.
+        assert_eq!(
+            rank_file_matches(&files, "notes")
+                .first()
+                .map(String::as_str),
+            Some("SRC/App/Notes.md")
+        );
+        // Anywhere-substring match, case-insensitively.
+        assert_eq!(
+            rank_file_matches(&files, "README")
+                .first()
+                .map(String::as_str),
+            Some("docs/README")
+        );
     }
 }

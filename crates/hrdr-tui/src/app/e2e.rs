@@ -9009,7 +9009,7 @@ async fn at_mention_completion_picks_up_files_created_after_the_index() {
         // A keystroke or draw would call this; do it here so the rebuild starts
         // once the dirty ping has been applied.
         let _ = h.app.active_completions();
-        if h.app.file_index.iter().any(|p| p == "beta.rs") {
+        if h.app.file_index.iter().any(|(p, _)| p == "beta.rs") {
             break;
         }
         if std::time::Instant::now() >= deadline {
