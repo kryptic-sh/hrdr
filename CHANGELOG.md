@@ -161,6 +161,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The status bar always names the reasoning effort in force.** With no
+  override set — the `/effort` picker's "Default" — it shows the provider's
+  documented default (`high` on `deepseek` and `claude`, `medium` on `openai`)
+  instead of dropping the effort section; an explicit level still wins when set.
+  The startup header shows the same value. Providers without a documented
+  default (`openrouter`, `zen`, `go`, `local`) keep the old behaviour.
+
 - **The folded thinking summary no longer shows its age.**
   `✓ Thought for 1m 32s · 2m ago` reads `✓ Thought for 1m 32s` — the age was the
   last timestamp still rendered inside a transcript entry, and a static

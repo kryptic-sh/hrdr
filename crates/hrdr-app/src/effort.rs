@@ -110,6 +110,31 @@ pub fn filter_effort_choices(choices: &[EffortChoice], query: &str) -> Vec<usize
         .collect()
 }
 
+/// The reasoning effort a provider applies when no override is set — what the
+/// status bar shows in place of the `/effort` picker's "Default" row. The
+/// override (the agent's `effort`) wins when set; this fills the gap so the bar
+/// names the level actually in force instead of going blank.
+///
+/// These are the providers' *documented API defaults*, not hrdr's choices:
+/// - `deepseek` → `high` (DeepSeek docs: "The default effort is high")
+/// - `openai` → `medium` (OpenAI docs: `reasoning_effort` defaults to medium)
+/// - `claude` → `high` (Claude docs: the default effort is high on the models
+///   that support it)
+///
+/// A provider-level default can still be wrong for a specific model (Claude
+/// Opus 4.7, for one, defaults to `xhigh`). Providers with no documented single
+/// default — `openrouter` passes the upstream model's own through, and
+/// `zen`/`go`/`local` have no effort knob — return `None`, and the status bar
+/// keeps its old behaviour for them: no effort section at default.
+pub fn default_effort(provider: &str) -> Option<&'static str> {
+    match provider {
+        "deepseek" => Some("high"),
+        "openai" => Some("medium"),
+        "claude" => Some("high"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +180,18 @@ mod tests {
         // Detail text matches too ("fastest" → Minimal).
         assert_eq!(c[hits("fastest")[0]].label, "Minimal");
         assert!(hits("zzz").is_empty());
+    }
+
+    #[test]
+    fn default_effort_names_the_documented_provider_defaults_only() {
+        // The three built-ins with a documented API default.
+        assert_eq!(default_effort("deepseek"), Some("high"));
+        assert_eq!(default_effort("openai"), Some("medium"));
+        assert_eq!(default_effort("claude"), Some("high"));
+        // Providers with no single documented default stay unknown, so the
+        // status bar keeps its old behaviour for them.
+        for unknown in ["openrouter", "zen", "go", "local", "custom", ""] {
+            assert_eq!(default_effort(unknown), None, "{unknown}");
+        }
     }
 }

@@ -1732,7 +1732,13 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
         model: pane.model(),
         session: Some(session.as_str()),
         sandbox: Some(hrdr_app::sandbox_label(pane.sandbox)),
-        effort: pane.effort.as_deref(),
+        // The effort in force: the agent's override, else the provider's
+        // documented default — "Default" from the `/effort` picker must not
+        // leave the bar without an effort section.
+        effort: pane
+            .effort
+            .as_deref()
+            .or_else(|| hrdr_app::default_effort(pane.provider())),
         ttft,
         nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,
     };
@@ -2173,8 +2179,14 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
     let pane = app.panes.active_pane();
     field("model", pane.model().to_string(), val);
     field("provider", pane.provider().to_string(), val);
-    if let Some(e) = &pane.effort {
-        field("effort", e.clone(), val);
+    // The effort in force, exactly as the status bar shows it: the override,
+    // else the provider's documented default.
+    let effort = pane
+        .effort
+        .as_deref()
+        .or_else(|| hrdr_app::default_effort(pane.provider()));
+    if let Some(e) = effort {
+        field("effort", e.to_string(), val);
     }
     field("cwd", app.dir.clone(), val);
 

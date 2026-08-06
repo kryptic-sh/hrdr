@@ -8823,6 +8823,59 @@ async fn effort_picker_lists_levels_default_first_and_applies() {
     assert_eq!(effort_of(&h), None, "Default clears the override");
 }
 
+/// The status bar names the effort in force. With no override — "Default" from
+/// the `/effort` picker — it shows the provider's documented default instead of
+/// dropping the effort section: a deepseek agent reads `high` even though
+/// nothing was configured. A provider without a known default (`local`) keeps
+/// the old behaviour, and an explicit override still wins over the default.
+#[tokio::test]
+async fn status_bar_shows_the_providers_default_effort_when_unset() {
+    let _env = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+
+    // `local` has no documented default, so the bar shows no effort section.
+    let screen = h.render();
+    let row = line_index_of(&screen, "local://test-model").expect("model on the bar");
+    assert!(
+        !screen.lines().nth(row as usize).unwrap().contains("high"),
+        "no effort section for a provider without a known default:\n{screen}"
+    );
+
+    // Move the agent onto deepseek (its documented default is "high") and let
+    // the identity land — the chrome follows the agent, one message later.
+    h.app
+        .apply_model_choice_for_test("deepseek", "test-model", Some(1000));
+    h.settle_switch().await;
+    h.app.sync_panes();
+    let screen = h.render();
+    let row = line_index_of(&screen, "deepseek://test-model").expect("model on the bar");
+    assert!(
+        screen.lines().nth(row as usize).unwrap().contains("high"),
+        "the provider's default effort shows on the bar:\n{screen}"
+    );
+
+    // An explicit override still wins over the default.
+    h.submit("/effort").await;
+    h.type_str("medium");
+    h.press(KeyCode::Enter);
+    for _ in 0..20 {
+        if h.app.panes.active_pane().effort.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        h.app.sync_panes();
+    }
+    assert_eq!(h.app.panes.active_pane().effort.as_deref(), Some("medium"));
+    h.app.sync_panes();
+    let screen = h.render();
+    let row = line_index_of(&screen, "deepseek://test-model").expect("model on the bar");
+    let bar = screen.lines().nth(row as usize).unwrap();
+    assert!(
+        bar.contains("medium") && !bar.contains("high"),
+        "the override wins over the default:\n{screen}"
+    );
+}
+
 /// Argument completion: after a command name + space, the popup offers the
 /// argument's candidate values, anchored at the argument column, and Tab
 /// completes just the argument.
