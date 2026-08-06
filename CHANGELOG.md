@@ -161,6 +161,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A collapsed tool group no longer previews its running call.** While a call
+  streams, the summary used to show that call's live tail beneath it — now a
+  collapsed group renders only the summary, and the running output appears only
+  once the group is expanded or `/verbose` is on.
+
 - **The status bar always names the reasoning effort in force.** With no
   override set — the `/effort` picker's "Default" — it shows the provider's
   documented default (`high` on `deepseek` and `claude`, `medium` on `openai`)

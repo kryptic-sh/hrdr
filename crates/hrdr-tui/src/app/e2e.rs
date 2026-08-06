@@ -4244,11 +4244,12 @@ async fn expanding_a_tool_group_keeps_the_viewport_on_the_same_line() {
     );
 }
 
-/// A running call streams its live preview below the summary — the newest
-/// output stays visible while the call runs — and folds behind the summary
-/// once it completes. When several calls run at once, only the newest shows.
+/// A running call renders only its group's summary — the live preview is
+/// `/verbose` territory — and its output folds behind the summary once it
+/// completes. When several calls run at once, none of their bodies show;
+/// expanding the group reveals every call.
 #[tokio::test]
-async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
+async fn a_running_call_renders_only_its_summary_until_expanded() {
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
@@ -4268,8 +4269,8 @@ async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
         })
     };
 
-    // The first call lands and runs: it is its own summary AND a live preview,
-    // so the streaming output is visible while it works.
+    // The first call lands and runs: it is its own summary, and its streaming
+    // output stays hidden until the group is expanded or `/verbose` is on.
     h.app.push_entry(tool("a", "shell", false));
     let screen = h.render();
     assert!(
@@ -4277,12 +4278,12 @@ async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
         "a running lone call gets a summary:\n{screen}"
     );
     assert!(
-        screen.contains("partial-a"),
-        "the running call's live output is visible:\n{screen}"
+        !screen.contains("partial-a"),
+        "a running call shows no live preview:\n{screen}"
     );
 
     // A second call arrives while the first still runs: both join the summary,
-    // but only the newest shows its preview — the earlier one folds.
+    // and neither call's body shows.
     h.app.push_entry(tool("b", "read", false));
     let screen = h.render();
     assert!(
@@ -4290,15 +4291,11 @@ async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
         "the new call updates the summary, it does not open a new entry:\n{screen}"
     );
     assert!(
-        screen.contains("partial-b"),
-        "the newest running call shows its live preview:\n{screen}"
-    );
-    assert!(
-        !screen.contains("partial-a"),
-        "an earlier running call folds while a newer one previews:\n{screen}"
+        !screen.contains("partial-a") && !screen.contains("partial-b"),
+        "no running call previews outside `/verbose`:\n{screen}"
     );
 
-    // The calls finish; the previews fold behind the settled summary.
+    // The calls finish; everything folds behind the settled summary.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, result, .. } = &mut e.kind {
             *done = true;
@@ -4325,11 +4322,10 @@ async fn a_running_call_streams_a_live_preview_and_folds_when_done() {
 }
 
 /// A summary update rewrites only the rows it owns: when a new call joins an
-/// open group — or the group settles — the summary row and the live preview's
-/// own row are the only ones that change; every other row of the buffer is
-/// untouched, so the render cannot jump or flicker while the summary counts
-/// up. (The group chunk is rebuilt fresh each frame; the guarantee is that
-/// the rebuild is layout-stable.)
+/// open group — or the group settles — the summary row is the only one that
+/// changes; every other row of the buffer is untouched, so the render cannot
+/// jump or flicker while the summary counts up. (The group chunk is rebuilt
+/// fresh each frame; the guarantee is that the rebuild is layout-stable.)
 #[tokio::test]
 async fn a_tool_summary_update_rewrites_only_its_own_row() {
     let mut h = Harness::new(vec![]).await;
@@ -4357,11 +4353,8 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let before = term.backend().buffer().clone();
 
-    // A second call joins the group: the summary counts it in place, and the
-    // live preview switches to the newest running call — nothing else moves.
-    // The preview box's header sits three rows below the summary (its page
-    // blank and top pad between them), so the changed rows are fixed relative
-    // to it.
+    // A second call joins the group: the summary counts it in place — nothing
+    // else moves, because a collapsed group renders no call bodies.
     h.app.push_entry(tool("b", "read", false));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let joined = term.backend().buffer().clone();
@@ -4369,8 +4362,8 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
         .expect("the summary is on screen");
     assert_eq!(
         changed_rows(&before, &joined),
-        vec![summary_row, summary_row + 3],
-        "a merged running call must touch only the summary and the preview row"
+        vec![summary_row],
+        "a merged running call must touch only the summary row"
     );
 
     // A completed call joining folds instead: the summary counts it, and
@@ -4386,10 +4379,10 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
         "a folded merge must touch only the summary row"
     );
 
-    // Settling: the summary goes past tense and the preview folds — the group
-    // shrinks back to its one line, so the view re-anchors to the new bottom.
-    // The row-exact guarantee only covers height-preserving updates; assert the
-    // summary settled and no running preview remains.
+    // Settling: the summary goes past tense — it was already the group's only
+    // row, so the view does not move. The row-exact guarantee only covers
+    // height-preserving updates; assert the summary settled and no spinner
+    // remains.
     h.app.transcript_mut().iter_mut().for_each(|e| {
         if let EntryKind::Tool { done, .. } = &mut e.kind {
             *done = true;
@@ -4403,14 +4396,14 @@ async fn a_tool_summary_update_rewrites_only_its_own_row() {
     );
     assert!(
         !settled.contains("⠹"),
-        "settling folds the live preview:\n{settled}"
+        "settling stops the summary's spinner:\n{settled}"
     );
 }
 
-/// An expanded group's settled calls render as *previews*, capped at the same
-/// size as a running call's live preview: the tail of the result (the newest
-/// output) for a normal call, the head for a mutation — the change is at the
-/// front. A short result fits the preview whole.
+/// An expanded group's settled calls render as *previews*, capped at
+/// [`TOOL_RESULT_PREVIEW_LINES`]: the tail of the result (the newest output)
+/// for a normal call, the head for a mutation — the change is at the front. A
+/// short result fits the preview whole.
 #[tokio::test]
 async fn an_expanded_group_previews_calls_until_clicked() {
     let mut h = Harness::new(vec![]).await;

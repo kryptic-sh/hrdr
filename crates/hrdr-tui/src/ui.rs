@@ -2805,9 +2805,10 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // thought or the model's output, and clicking it toggles the calls'
         // visibility: expanded, every call renders below it as an ordinary
         // tool block — the same path every tool call uses — and a collapsed
-        // group with a call still running shows that call's live preview the
-        // same way. Only an `edit`/`replace` or a visible entry (a user
-        // prompt, rendered text or reasoning, stats, a notice) breaks a run —
+        // group shows only the summary, even while a call runs (the live
+        // preview is `/verbose` territory). Only an `edit`/`replace` or a
+        // visible entry (a user prompt, rendered text or reasoning, stats, a
+        // notice) breaks a run —
         // so tool calls that stream in after an invisible turn marker merge
         // into the group that is already open.
         if is_groupable_tool(&entry.kind) {
@@ -2839,21 +2840,19 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 // it as their own blocks.
                 let members = &transcript[i..end];
                 pending = Some(tool_group_summary_block(app, members, i, w, frame));
-                // Which calls are visible: every call when expanded, otherwise
-                // only the newest running one, streaming its live preview.
-                let mut visible: Vec<usize> = Vec::new();
-                if expanded {
-                    visible = members
+                // Which calls are visible: every call when expanded; otherwise
+                // none — a collapsed group renders only its summary, even while
+                // a call runs (no live preview outside `/verbose`).
+                let visible: Vec<usize> = if expanded {
+                    members
                         .iter()
                         .enumerate()
                         .filter(|(_, m)| is_groupable_tool(&m.kind))
                         .map(|(j, _)| i + j)
-                        .collect();
-                } else if let Some(live) = members.iter().enumerate().rev().find_map(|(j, m)| {
-                    matches!(&m.kind, EntryKind::Tool { done: false, .. }).then_some(j)
-                }) {
-                    visible.push(i + live);
-                }
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // The summary chunk's index is where the group's absorbed turns
                 // jump to; it is the first chunk the visible calls' flushes
                 // emit, so capture it there, or force it out when none render.
@@ -3633,13 +3632,13 @@ struct ToolState {
 /// the tail of the file for `read`, plain output otherwise.
 ///
 /// A tool call has TWO display levels: folded behind its group's `called N
-/// tools` summary — the block [`tool_group_summary_block`] renders, with a
-/// running call's live preview below it — or rendered, either as a preview (a
-/// running call's live tail, or the head/tail of a finished call) or fully
-/// expanded: every detail and the whole result. `edit`/`replace` never group
-/// and always render in full. A finished call shows all of its result; a
-/// running one shows the live tail so the newest output stays
-/// visible.
+/// tools` summary — the block [`tool_group_summary_block`] renders, which is
+/// all a collapsed group shows (a running call's live output only appears once
+/// the group is expanded or `/verbose` is on) — or rendered, either as a
+/// preview (a running call's live tail, or the head/tail of a finished call) or
+/// fully expanded: every detail and the whole result. `edit`/`replace` never
+/// group and always render in full. A finished call shows all of its result; a
+/// running one shows the live tail so the newest output stays visible.
 ///
 /// `preview` caps the result at [`TOOL_RESULT_PREVIEW_LINES`]: the tail for a
 /// finished call (the newest output, like a running call's live tail), or the
