@@ -13,7 +13,7 @@
 #[cfg(test)]
 extern crate hrdr_test_support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1228,14 +1228,35 @@ pub(crate) fn guard_secret_read(path: &std::path::Path) -> Result<()> {
 /// filter that only recognised `path:NN:…` would let that straight through even
 /// though the *match* line for the same file was dropped. [`line_path_token`]
 /// recognises either delimiter.
-pub(crate) fn grep_line_is_secret(line: &str, cwd: &std::path::Path) -> bool {
-    let Some(tok) = line_path_token(line) else {
-        return false; // `--` group separators and unrecognized lines ride along
-    };
-    if tok.is_empty() {
-        return false;
+///
+/// Verdicts are memoized per path token for the run's lifetime: `rg -n`/`grep -n`
+/// output names the same handful of paths on many lines, and each
+/// `canonicalize_nearest` costs 2-6 syscalls, so an unmemoized filter pays N
+/// identical canonicalizations for N match lines on the same file. The memo is
+/// per-`SecretLineMemo`, created once per `shell` run beside the `DiffRedactor`;
+/// a path token's verdict is a snapshot taken at first encounter (a file deleted
+/// mid-run still counts as the secret it was when first seen).
+#[derive(Default)]
+pub(crate) struct SecretLineMemo {
+    verdicts: HashMap<PathBuf, bool>,
+}
+
+impl SecretLineMemo {
+    pub(crate) fn is_secret_line(&mut self, line: &str, cwd: &std::path::Path) -> bool {
+        let Some(tok) = line_path_token(line) else {
+            return false; // `--` group separators and unrecognized lines ride along
+        };
+        if tok.is_empty() {
+            return false;
+        }
+        let joined = cwd.join(tok);
+        if let Some(&verdict) = self.verdicts.get(&joined) {
+            return verdict;
+        }
+        let verdict = secret_file_reason(&canonicalize_nearest(&joined)).is_some();
+        self.verdicts.insert(joined, verdict);
+        verdict
     }
-    secret_file_reason(&canonicalize_nearest(&cwd.join(tok))).is_some()
 }
 
 /// Extract the leading path token from a ripgrep/POSIX-`grep` `-C`-style
@@ -2863,21 +2884,49 @@ mod tests {
     // ---- grep secret-line filter ----
 
     #[test]
-    fn grep_line_is_secret_catches_match_and_context_lines() {
+    fn secret_line_memo_catches_match_and_context_lines() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "KEY=xyz\n").unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut memo = SecretLineMemo::default();
 
         // The `:`-delimited match-line form.
-        assert!(grep_line_is_secret(".env:1:KEY=xyz", dir.path()));
+        assert!(memo.is_secret_line(".env:1:KEY=xyz", dir.path()));
         // The `-`-delimited `-C` context-line form — the leak this guards.
-        assert!(grep_line_is_secret(".env-1-KEY=xyz", dir.path()));
+        assert!(memo.is_secret_line(".env-1-KEY=xyz", dir.path()));
         // A non-secret file's lines pass through either way.
-        assert!(!grep_line_is_secret("main.rs:1:fn main() {}", dir.path()));
-        assert!(!grep_line_is_secret("main.rs-1-fn main() {}", dir.path()));
+        assert!(!memo.is_secret_line("main.rs:1:fn main() {}", dir.path()));
+        assert!(!memo.is_secret_line("main.rs-1-fn main() {}", dir.path()));
         // The `-C` group separator between disjoint windows isn't mistaken for
         // a path.
-        assert!(!grep_line_is_secret("--", dir.path()));
+        assert!(!memo.is_secret_line("--", dir.path()));
+    }
+
+    /// The memo's contract: a path's verdict is a per-run snapshot taken at
+    /// first encounter. A symlink retargeted mid-run still reads as the secret
+    /// it pointed at when first seen — the point of the memo is to canonicalize
+    /// each distinct path once, not to re-check the filesystem per line. On the
+    /// unmemoized code this fails: the second line re-canonicalizes through the
+    /// new target and the line passes.
+    #[test]
+    fn a_secret_line_memo_is_a_per_run_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "KEY=xyz\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let link = dir.path().join("resolved");
+        std::os::unix::fs::symlink(".env", &link).unwrap();
+        let mut memo = SecretLineMemo::default();
+        // First line resolves `resolved` through to `.env`: a secret.
+        assert!(memo.is_secret_line("resolved:1:KEY=xyz", dir.path()));
+
+        // Retarget the symlink at a non-secret file: the memo keeps the first
+        // verdict for the run.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("main.rs", &link).unwrap();
+        assert!(
+            memo.is_secret_line("resolved:2:KEY=xyz", dir.path()),
+            "the verdict is memoized for the run, not re-checked per line"
+        );
     }
 
     // ---- concurrency defaults ----

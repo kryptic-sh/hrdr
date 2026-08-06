@@ -549,6 +549,9 @@ pub(crate) async fn run_streamed_command(
     // a header, and then prints its contents as `+SECRET=…` lines that name no file
     // at all. See `DiffRedactor`.
     let mut redactor = crate::tools::secret_diff::DiffRedactor::default();
+    // The per-line verdicts of `SecretLineMemo` are memoized per path token, so a
+    // match-heavy run canonicalizes each distinct path once instead of per line.
+    let mut secret_lines = crate::SecretLineMemo::default();
 
     macro_rules! ingest_line {
         ($line:expr) => {{
@@ -560,14 +563,14 @@ pub(crate) async fn run_streamed_command(
             //
             // A courtesy against the accidental case, not a boundary: `shell` permits
             // `cat ~/.ssh/id_rsa` and guardrails do not stop it. See
-            // `grep_line_is_secret`, which used to filter the `grep` tool's own
+            // `SecretLineMemo`, which used to filter the `grep` tool's own
             // output — one path, while this front door stood open.
             // A diff header both opens a section and ends the previous one, so it is
             // always emitted — the model should see THAT a credential file changed,
             // just not what is in it.
             use crate::tools::secret_diff::LineAction;
             let action = redactor.observe(line, &ctx.cwd);
-            if crate::grep_line_is_secret(line, &ctx.cwd) || action == LineAction::Drop {
+            if secret_lines.is_secret_line(line, &ctx.cwd) || action == LineAction::Drop {
                 // A block expression, not a `continue`: this macro expands inside an
                 // async body where the enclosing loop is not always the one a
                 // `continue` would target.
