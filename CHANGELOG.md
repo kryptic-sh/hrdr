@@ -458,6 +458,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forward to each pass as its target scope, each pass writes its own report to
   the backlog, and the sweep merges the findings — cross-cutting ones first.
 
+- **A notice after a tool group keeps the blank line above its tint.** The group
+  summary's bottom pad was dropped whenever the next entry was judged "untinted"
+  — and that judgment knew only user prompts and tool calls, so a notice (or any
+  slash-command output) that followed a collapsed tool group rendered with its
+  tint starting directly under the summary's last row, no blank above. The
+  follower decision now asks the same `BlockKind` background the renderer
+  paints, so every tinted block gets exactly one plain blank line before its
+  tint.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to

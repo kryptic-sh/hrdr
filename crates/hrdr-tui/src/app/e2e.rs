@@ -9364,3 +9364,87 @@ async fn a_tinted_block_above_the_todo_panel_gets_the_separator() {
         row(content_y + 3)
     );
 }
+
+/// A notice that follows a collapsed tool group keeps the plain blank above
+/// its tint — the summary's bottom pad is dropped only for an UNtinted
+/// follower, and a notice wears the tinted command background. Regression:
+/// `entry_is_tinted` named only `User`/`Tool`, so the notice's tint began
+/// directly under the summary's last row with no blank line above it.
+#[tokio::test]
+async fn a_notice_after_a_tool_group_keeps_a_plain_blank_above_its_tint() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    // A done shell call (groupable → collapses behind a summary), then a notice.
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "call-1".into(),
+        name: "shell".into(),
+        args: "echo hi".into(),
+        result: "hi".into(),
+        ok: true,
+        done: true,
+    }));
+    h.app
+        .push_entry(Entry::system("network issues".to_string()));
+
+    let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    // Columns 0..89 — the last column is the scrollbar track, not block content.
+    let row = |y: u16| -> String {
+        (0..89)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let bg_at = |x: u16, y: u16| buf.cell(Position::new(x, y)).unwrap().bg;
+
+    let notice_y = (0..30)
+        .find(|&y| row(y).contains("network issues"))
+        .expect("the notice renders");
+    let command_bg = h.app.theme.command_bg;
+
+    // The notice block itself: tinted top pad (blank) above the content, tinted
+    // bottom pad below — the "1 blank, content, 1 blank" inside the tint.
+    assert_eq!(
+        bg_at(2, notice_y - 1),
+        command_bg,
+        "tinted top pad:\n{screen}"
+    );
+    assert_eq!(
+        without_bar(&row(notice_y - 1)),
+        "",
+        "top pad is blank:\n{screen}"
+    );
+    assert_eq!(
+        bg_at(2, notice_y + 1),
+        command_bg,
+        "tinted bottom pad:\n{screen}"
+    );
+    assert_eq!(
+        without_bar(&row(notice_y + 1)),
+        "",
+        "bottom pad is blank:\n{screen}"
+    );
+    // The plain blank BEFORE the tint: the summary's kept bottom pad. With the
+    // bug the tint started directly under the summary text — no blank above.
+    assert_eq!(
+        bg_at(2, notice_y - 2),
+        Color::Reset,
+        "plain blank above the tint:\n{screen}"
+    );
+    assert_eq!(
+        without_bar(&row(notice_y - 2)),
+        "",
+        "and it is blank:\n{screen}"
+    );
+    // …and the row above that is the summary's own content.
+    assert!(
+        row(notice_y - 3).contains("ran 1 command"),
+        "the summary sits above the blank:\n{screen}"
+    );
+}

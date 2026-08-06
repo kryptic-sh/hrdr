@@ -2863,14 +2863,13 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 if summary_chunk.is_none() {
                     // No calls visible: flush the summary so the absorbed
                     // turns have a chunk to land on; its follower decides its
-                    // bottom padding.
-                    let follower_bg = transcript.get(end).map(|e| {
-                        if entry_is_tinted(&e.kind) {
-                            tool_bg
-                        } else {
-                            Color::Reset
-                        }
-                    });
+                    // bottom padding — asked the same way the renderer asks
+                    // everywhere (the follower's block background), so a
+                    // tinted follower (a notice, another user prompt) keeps
+                    // the plain blank above it.
+                    let follower_bg = transcript
+                        .get(end)
+                        .map(|e| entry_block_kind(&e.kind).bg(theme));
                     flush(
                         &mut chunks,
                         &mut msg_at,
@@ -3215,12 +3214,22 @@ fn is_always_full_tool(name: &str) -> bool {
     matches!(name, "edit" | "replace")
 }
 
-/// Whether an entry's block wears a tinted background (as opposed to the
-/// plain terminal background) — the summary section's bottom pad is dropped
-/// when an untinted entry follows it, so that entry's own top pad is the one
-/// blank row between them instead of two.
-fn entry_is_tinted(kind: &EntryKind) -> bool {
-    matches!(kind, EntryKind::User(_) | EntryKind::Tool { .. })
+/// The [`BlockKind`] an entry's transcript block wears — the one mapping from
+/// entry kinds to block kinds. The renderer's big match builds each kind's body
+/// separately, but the kind is what decides the block's background, so "is this
+/// entry tinted?" is asked through this + [`BlockKind::bg`] rather than a second
+/// list that can drift (it did: it named only `User` and `Tool`, so a notice
+/// following a tool group lost the plain blank above its tint).
+fn entry_block_kind(kind: &EntryKind) -> BlockKind {
+    match kind {
+        EntryKind::Header => BlockKind::Header,
+        EntryKind::User(_) => BlockKind::User,
+        EntryKind::Assistant(_) => BlockKind::Assistant,
+        EntryKind::Reasoning { .. } => BlockKind::Reasoning,
+        EntryKind::Tool { .. } => BlockKind::Tool,
+        EntryKind::System(_) | EntryKind::Notice(_) | EntryKind::Diff(_) => BlockKind::Command,
+        EntryKind::Stats(_) => BlockKind::Stats,
+    }
 }
 
 /// A tool call that participates in grouping — everything but the always-full
