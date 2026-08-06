@@ -23,7 +23,7 @@
 //! for models.dev — the whole test suite runs under it.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::model_ref::ModelRef;
 use crate::{
@@ -79,15 +79,6 @@ pub fn cached_models(provider: &str) -> Option<Vec<String>> {
     let path = cache_path(provider)?;
     let ids: Vec<String> = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     (!ids.is_empty()).then_some(ids)
-}
-
-/// Whether `path` exists and was written within [`PROVIDER_MODELS_TTL`].
-fn is_fresh(path: &std::path::Path) -> bool {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|m| SystemTime::now().duration_since(m).ok())
-        .is_some_and(|age| age < PROVIDER_MODELS_TTL)
 }
 
 /// Every provider this machine is set up to talk to: each built-in whose auth
@@ -150,7 +141,7 @@ async fn refresh_one(config: &AgentConfig, provider: &str) {
     let Some(path) = cache_path(provider) else {
         return;
     };
-    if is_fresh(&path) {
+    if hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL) {
         return;
     }
     let Some(ids) = list_models(config, provider).await else {
@@ -265,9 +256,12 @@ mod tests {
     #[test]
     fn freshness_follows_the_file_mtime() {
         let path = cache_path("freshness").expect("a cache path");
-        assert!(!is_fresh(&path), "a missing cache is never fresh");
+        assert!(
+            !hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL),
+            "a missing cache is never fresh"
+        );
         write_cache(&path, &["m".to_string()]);
-        assert!(is_fresh(&path));
+        assert!(hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL));
     }
 
     /// The refresh covers every provider the machine could switch to, not the

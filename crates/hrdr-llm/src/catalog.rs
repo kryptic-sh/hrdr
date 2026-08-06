@@ -422,8 +422,8 @@ fn cache_path() -> Option<PathBuf> {
     Some(hjkl_xdg::cache_dir("hrdr").ok()?.join("models.json"))
 }
 
-/// Whether `path` exists and was written within [`CACHE_TTL`].
-fn is_fresh(path: &std::path::Path, ttl: Duration) -> bool {
+/// Whether `path` exists and was written within `ttl`.
+pub fn is_fresh(path: &std::path::Path, ttl: Duration) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
