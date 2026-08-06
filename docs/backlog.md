@@ -1300,11 +1300,12 @@ callers.
     `#![allow(dead_code)]` for exactly this). Action: move all three into
     `common/mod.rs`.
 
-11. **`spawn_line`/`spawn_diff` near-duplicates.**
-    `crates/hrdr-app/src/commands/host.rs:21-29` vs `:90-104` — identical
-    poster/tokio::spawn/await/post bodies differing only in the
-    `starts_with("diff ")` classification. Action: a private
-    `post_async(poster, fut, classify)` both default methods call.
+11. **`spawn_line`/`spawn_diff`/`spawn_popup` near-duplicates.**
+    `crates/hrdr-app/src/commands/host.rs` — `spawn_line` and `spawn_diff`
+    (identical poster/tokio::spawn/await/post bodies differing only in the
+    `starts_with("diff ")` classification), plus `spawn_popup`, a third copy
+    added by the notice redesign (`2bff248`). Action: a private
+    `post_async(poster, fut, classify)` all three default methods call.
 
 12. **Minor items.** `now_ms` forwarding wrappers
     (`crates/hrdr-app/src/login.rs:75-77` → `hrdr_agent::unix_millis()`;
@@ -1502,7 +1503,7 @@ transcript/skills/subagents, hrdr-tools read/edit/write/replace/grep/tree/shell
 ingest/secret_diff/sandbox/memory/tool dispatch/truncation, apps/hrdr headless
 path. Not fully traced (per-tool-call / startup): hrdr-tools lsp/web/guardrails/
 verification/proc/mcp internals, tools/{todo,verify,mutation-tail}, hrdr-app
-commands/*, config, login, effort, palette, themes, hrdr-tui app/commands.rs,
+commands/\*, config, login, effort, palette, themes, hrdr-tui app/commands.rs,
 e2e.rs (tests), trust_prompt.rs. Unsettled without profiling: the per-frame
 transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
@@ -1803,19 +1804,17 @@ live here:
   reproduces: `draw_chunks`' `scroll`/`inner_scroll` off-by-one at the bottom,
   or the live-panel chunk heights vs the transcript area.
 
-- **Hide `Notice` transcript entries unless verbose.** Requested 2026-08-05: the
-  `EntryKind::Notice` chrome — the welcome banner, "session saved as …", config
-  reloads — should render only in `/verbose on` mode. Deferred on the first
-  attempt because slash-command output (`/help`, "unrecognized command", the
-  effort picker) shares the same `EntryKind::Notice` variant via `App::system`
-  (`hrdr-tui/src/app.rs:1903`) and the `TurnMsg::System` handler
-  (`hrdr-tui/src/app.rs:2639`, fed by `CommandHost::info`), so hiding the
-  variant hides user-requested output too. Revisit by splitting a `Command`
-  variant for the `system()` channel (always shown) from `Notice`
-  (verbose-only), then adding an
-  `EntryKind::Notice(_) if !expand_tools => continue` guard in
-  `transcript_chunks`. The guard alone was tried and reverted; it failed eight
-  e2e tests that assert slash output renders.
+- **Hide `Notice` transcript entries unless verbose — the noise half is closed
+  by the notice redesign (`2bff248`).** The variant-mixing blocker is gone:
+  `App::system` and the `TurnMsg::System` handler now toast, and a slash
+  command's data output opens an Esc-dismissible popup — so the
+  `EntryKind::Notice` chrome this item named ("session saved as …", config
+  reloads, slash-command output) no longer enters the transcript at all. What
+  remains is the session-opening banner (the `App::new` welcome + `/reload`'s
+  header repush, `hrdr-tui/src/app.rs`'s `App::new` and `app/commands.rs`'s
+  `reload_cmd`), which still renders always. Decide whether THAT should be
+  verbose-gated; the proposed `Command`-variant split and the
+  `EntryKind::Notice(_) if !expand_tools` guard are moot.
 
 ## Top of the list
 
@@ -3250,6 +3249,20 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 notice redesign — `::Notice` leaves the transcript** (`a371434`,
+`2bff248`, `c18a63c`, `72f29e2`). A slash command's status line (a setting
+change, `/verbose`, a login notice, an async `/models` result) now toasts on the
+clipboard-feedback stack, and a data command's output (`/help`, `/status`,
+`/cost`, `/tools`, `/prompt`, `/guardrails`, `/doctor`) opens an Esc-dismissible
+popup — nothing a command prints enters the transcript, so nothing it prints can
+split a streaming thinking block. The agent's own `Notice` events (errors,
+budget warnings) are still recorded as `Entry::system`, held in `record()` until
+the thought closes so the event log and jsonl fold to one complete block. The
+TUI's mid-thought chrome deferral was removed as dead; the loader and live
+panels now sit exactly one blank row off the surface above. Binding: the
+transcript belongs to the conversation; frontend chrome is toast or popup, never
+an entry. (`/diff` keeps its colored transcript block as a deliberate feature.)
 
 **2026-08-05 Enter-path lag** (`6793464`). The Enter path blocked the UI thread
 on the disk twice: the first Enter of a session ran the full session save
