@@ -462,11 +462,14 @@ model = "<deployment>"
 
 `context_window` is optional: if you omit it, hrdr detects one — at startup
 **and** again after a `/model` switch, so the compaction threshold always tracks
-the current model's real max. Detection tries, in order:
+the current model's real max. Detection is network-free at launch: the cached
+models.dev catalog answers when it knows the model, and the endpoint is only
+consulted when the catalog has nothing for it — in the background for the TUI
+(first paint never waits on the network) and, for `hrdr run`, only for an
+uncatalogued model on a local server, which answers in milliseconds. Detection
+tries, in order:
 
-1. **What the endpoint advertises** — vLLM's `max_model_len`, LM Studio's
-   `max_context_length`, llama.cpp's `/props` `n_ctx`, and similar.
-2. **The [models.dev](https://models.dev) catalog**, keyed `provider/model`.
+1. **The [models.dev](https://models.dev) catalog**, keyed `provider/model`.
    Most OpenAI-compatible APIs — OpenAI itself, opencode zen — publish nothing
    on the wire, so without this the status bar has no "of Y" and auto-compaction
    has no threshold. hrdr downloads `https://models.dev/api.json` (a public,
@@ -481,6 +484,11 @@ the current model's real max. Detection tries, in order:
    Three env vars control it: `HRDR_DISABLE_MODELS_FETCH` (never fetch; use the
    cache if present), `HRDR_MODELS_PATH` (read this file instead, never fetch),
    `HRDR_MODELS_URL` (fetch from your own mirror).
+
+2. **What the endpoint advertises** — vLLM's `max_model_len`, LM Studio's
+   `max_context_length`, llama.cpp's `/props` `n_ctx`, and similar — consulted
+   only when the catalog has no entry for the model (after a `/model` switch it
+   is probed in the background regardless).
 
 Set `context_window` explicitly to override detection entirely. It drives the
 status bar's "X of Y" and the auto-compaction threshold.

@@ -727,34 +727,28 @@ async fn main() -> Result<()> {
     }
 
     // Resolve the context window (drives the status bar's "X of Y" + the
-    // auto-compaction threshold). Precedence: explicit config/provider wins;
-    // else ask the server (many OpenAI-compatible servers advertise it — vLLM's
-    // `max_model_len`, llama.cpp's `/props` n_ctx, …). Left unknown for an
-    // endpoint that advertises nothing.
+    // auto-compaction threshold). Precedence: an explicit config/provider value
+    // wins; else the models.dev catalog answers network-free (`Agent::new` picks
+    // it up and publishes it before the first frame); else the endpoint's own
+    // advertisement (vLLM's `max_model_len`, llama.cpp's `/props` n_ctx, …) is
+    // learned in the background — the TUI probes it via `spawn_context_probe`,
+    // and `hrdr run` awaits it inside `run_headless` before the turn.
     //
-    // A 3-second timeout prevents a firewall-DROPped endpoint from hanging
-    // startup forever before the TUI appears. Timeout ≡ no context window known.
+    // Nothing here waits on the network: a slow or firewall-DROPped endpoint must
+    // not hold first paint open, and the probe that used to sit here cost every
+    // launch a `GET /v1/models` (plus `/props`) round trip — up to the whole 3s
+    // budget — for a window the catalog often already knows.
     if config.context_window.is_none() {
+        // The Codex endpoint 401s on `/v1/models`, so a server probe can't read
+        // it. Resolve per-model from the account catalog cache instead — now
+        // that the final model is known — falling back to the preset floor.
+        // Network-free.
         if config.base_url == hrdr_agent::CHATGPT_CODEX_BASE_URL {
-            // The Codex endpoint 401s on `/v1/models`, so the server probe can't
-            // read it. Resolve per-model from the account catalog cache instead —
-            // now that the final model is known — falling back to the preset floor.
             config.context_window = hrdr_agent::context_window_for(
                 Some(config.model.provider().as_str()),
                 &config.base_url,
                 config.model.model(),
             );
-        } else {
-            let probe = hrdr_llm::Client::new(
-                config.base_url.clone(),
-                config.api_key.clone(),
-                config.model.model().to_string(),
-            );
-            config.context_window =
-                tokio::time::timeout(Duration::from_secs(3), probe.context_window())
-                    .await
-                    .ok()
-                    .flatten();
         }
     }
 
@@ -905,6 +899,37 @@ fn ask_to_trust(cwd: &std::path::Path, theme: Option<&str>) -> hrdr_agent::trust
 /// on stderr. `--json`: newline-delimited JSON events on stdout (scripting).
 /// `--quiet`: text only. Exit code 0 on a completed turn, 1 on error.
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
+    // The endpoint's advertised context window (drives the auto-compaction
+    // threshold) is probed here, before the turn — but ONLY when the catalog
+    // couldn't answer, and `context_window_for` is a network-free cache read.
+    // A catalogued model (the usual `hrdr run`) thus never touches the network
+    // at startup, exactly like the TUI; the one case that probes is an
+    // uncatalogued model on a local server (llama.cpp/vLLM), whose endpoint is
+    // on the same machine and answers in milliseconds.
+    let mut config = config;
+    if config.context_window.is_none()
+        && config.base_url != hrdr_agent::CHATGPT_CODEX_BASE_URL
+        && hrdr_agent::context_window_for(
+            Some(config.model.provider().as_str()),
+            &config.base_url,
+            config.model.model(),
+        )
+        .is_none()
+    {
+        let probe = hrdr_llm::Client::new(
+            config.base_url.clone(),
+            config.api_key.clone(),
+            config.model.model().to_string(),
+        );
+        // Same 3s budget as the startup probe that used to sit in `main` — a
+        // firewall-DROPped endpoint must not hold the run open, and a timeout is
+        // simply "we cannot know".
+        config.context_window =
+            tokio::time::timeout(Duration::from_secs(3), probe.context_window())
+                .await
+                .ok()
+                .flatten();
+    }
     let mut agent = Agent::new(config)?;
     // Prepare the outgoing prompt: expand `@file` mentions and route any
     // `@agent` mention to the matching sub-agent (parity with the TUI), and

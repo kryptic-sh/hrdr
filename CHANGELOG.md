@@ -161,6 +161,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The TUI no longer waits on the endpoint before first paint.** Startup used
+  to `GET /v1/models` (and `/props`) with a 3-second budget, awaited ahead of
+  the first frame, to learn the context window — a slow or firewall-DROPped
+  endpoint held the whole session open. That probe is gone from the launch path:
+  the models.dev catalog answers network-free at `Agent::new` when it knows the
+  model, and the endpoint's own advertisement (vLLM's `max_model_len`,
+  llama.cpp's `/props`) is probed in the background (`spawn_context_probe`),
+  arriving whenever it lands. `hrdr run` behaves the same way: it only consults
+  the endpoint when the catalog has no entry for the model — an uncatalogued
+  local server, which answers in milliseconds — so a catalogued model (the usual
+  case) never touches the network at startup.
+
 - **A collapsed tool group no longer previews its running call.** While a call
   streams, the summary used to show that call's live tail beneath it — now a
   collapsed group renders only the summary, and the running output appears only

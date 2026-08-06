@@ -1249,6 +1249,19 @@ history was replaced.
 
 ### Noticed while working, not fixed
 
+`hrdr --model X run "prompt"` never runs headlessly: with a global flag ahead of
+it, clap's top-level `trailing_var_arg` input swallows `run "prompt"`, so
+`cli.command` is `None` and the words become a TUI startup command. In a
+terminal the TUI opens and tries to run `run prompt` as a command line; in a
+non-tty untrusted dir the trust gate's cancel path returns `Ok(())` — a silent
+exit 0. Verified identical on the pre-change release binary, so it predates the
+startup-probe work. The subcommand only works without a preceding global flag
+(`hrdr run "prompt"`); config-model runs are unaffected. The site is the clap
+shape in `apps/hrdr/src/main.rs` (`args_conflicts_with_subcommands` +
+`trailing_var_arg` on the top-level `input`), and the fix needs a regression
+test in `cli_tests` like `subcommands_are_not_swallowed_by_the_trailing_command`
+but with a leading flag.
+
 `session_name_from` (`hrdr-agent/src/session.rs`) takes the first `Role::User`
 message, which after a compaction is the summary — so a session first NAMED
 after a compaction gets "This conversation was compacted…" as its name. Now
