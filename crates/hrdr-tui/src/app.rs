@@ -597,6 +597,12 @@ pub(crate) struct App {
     /// NOT a steer — a steer reaches the model mid-turn; a compaction must wait
     /// for the turn to finish so the summary sees the whole conversation.
     pending_compaction: Option<(hrdr_app::PaneId, Option<String>)>,
+    /// Chrome lines (slash-command output, async notices) that arrived while
+    /// the model's thinking block was still streaming. Held until the block
+    /// closes, so the thought is never split by a notice; [`Self::push_entry`]
+    /// defers and [`Self::flush_deferred_chrome`] appends them after the
+    /// finished block, in order, before whatever closed it.
+    deferred_chrome: Vec<Entry>,
     /// Screen rect of the "↓ Press END ↓" button (jump to newest output), set
     /// during draw while scrolled up so mouse clicks can hit-test against it.
     /// `None` when following.
@@ -860,6 +866,7 @@ impl App {
             todo_ttl,
             steering: hrdr_agent::steering_queue(),
             pending_compaction: None,
+            deferred_chrome: Vec::new(),
             end_button: None,
             tool_hits: Vec::new(),
             tool_groups: std::collections::HashSet::new(),
@@ -2178,8 +2185,47 @@ impl App {
         view.draft = draft;
     }
 
+    /// Append a chrome entry (a slash-command output line, an async notice, a
+    /// stats row) to the main pane's transcript — unless the model's thinking
+    /// block is still streaming and the entry is a notice, in which case it is
+    /// held and appended after the thought closes ([`Self::flush_deferred_chrome`]).
+    /// Inserting a notice between an open thought and the next reasoning delta
+    /// would split the block into two running halves; deferring keeps it one
+    /// complete block with the notice below it. Everything else — a tool block,
+    /// output, a user message — is a real transcript entry that belongs exactly
+    /// where it is pushed.
     fn push_entry(&mut self, e: Entry) {
+        let thinking_open = self
+            .panes
+            .main()
+            .transcript()
+            .last()
+            .is_some_and(|l| matches!(&l.kind, EntryKind::Reasoning { took_ms: None, .. }));
+        if thinking_open && matches!(e.kind, EntryKind::Notice(_)) {
+            self.deferred_chrome.push(e);
+            return;
+        }
         self.panes.main_mut().transcript_mut().push(e);
+        self.prune_scrollback();
+    }
+
+    /// Append any chrome deferred while the thinking block was streaming
+    /// ([`Self::push_entry`]), now that a non-Reasoning event has landed. The
+    /// thought is closed the same way the reducer closes it — its duration
+    /// label stops streaming — then the held lines go after it, in order,
+    /// before whatever closed the stream is applied.
+    fn flush_deferred_chrome(&mut self) {
+        if self.deferred_chrome.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.deferred_chrome);
+        {
+            let pane = self.panes.main_mut();
+            hrdr_agent::finish_reasoning(pane.transcript_mut());
+            for e in entries {
+                pane.transcript_mut().push(e);
+            }
+        }
         self.prune_scrollback();
     }
 
@@ -2667,6 +2713,13 @@ impl App {
     pub(crate) fn on_turn_msg(&mut self, msg: TurnMsg) {
         match msg {
             TurnMsg::Event(ev) => {
+                // A non-Reasoning event closes the thinking block. Flush any
+                // chrome deferred while it streamed before the event is
+                // applied, so the lines land after the finished thought and
+                // before whatever closed it.
+                if !matches!(ev, AgentEvent::Reasoning(_)) {
+                    self.flush_deferred_chrome();
+                }
                 // Ignore buffered events after cancellation — and only then.
                 // Neither signal answers this alone: the turn clears the agent's
                 // `running` flag itself as it ends (`RunGuard`), so trailing messages
@@ -2753,6 +2806,9 @@ impl App {
                 // (then it waits for that turn too — a compaction must see the
                 // whole conversation, and the steer that just started is part of it).
                 self.drain_pending_compaction();
+                // Safety net: any chrome deferred while the thought streamed that
+                // no non-Reasoning event flushed (a stale or cancelled turn).
+                self.flush_deferred_chrome();
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;
@@ -3049,6 +3105,8 @@ mod tests {
             todos: Default::default(),
             usage: Default::default(),
             events: hrdr_agent::event_log(),
+            reasoning_open: false,
+            pending_notices: Vec::new(),
             turn: hrdr_agent::TurnStats::default(),
             agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
             steering: hrdr_agent::steering_queue(),

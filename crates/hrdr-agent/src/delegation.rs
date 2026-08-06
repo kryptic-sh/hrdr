@@ -259,6 +259,8 @@ async fn spawn_background(
         todos: Default::default(),
         usage: usage_for_live,
         events: registry::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: TurnStats::default(),
         agent: Arc::clone(&sub),
         steering: Arc::clone(&steering),

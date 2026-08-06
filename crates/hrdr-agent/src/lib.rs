@@ -6771,6 +6771,8 @@ mod tests {
                     todos: Default::default(),
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
+                    reasoning_open: false,
+                    pending_notices: Vec::new(),
                     turn: TurnStats::default(),
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),
@@ -6887,6 +6889,8 @@ mod tests {
                     todos: Default::default(),
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
+                    reasoning_open: false,
+                    pending_notices: Vec::new(),
                     turn: TurnStats::default(),
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),

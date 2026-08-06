@@ -244,6 +244,17 @@ pub struct AgentEntry {
     /// prose. Recording the events themselves fixes both, and means a frontend
     /// that attaches late still sees the whole run.
     pub events: EventLog,
+    /// Whether the model's thinking stream is open — the last recorded event
+    /// was a `Reasoning` delta. A notice arriving while it is open is deferred
+    /// (see [`AgentEntry::pending_notices`]) so the thinking block is never
+    /// split into two running halves.
+    pub reasoning_open: bool,
+    /// Notices that arrived while the thinking stream was open, in order.
+    /// Written to the event log and the durable transcript together, just
+    /// before whatever event closes the stream, so the record reads
+    /// `[reasoning][notice][closing]` and the fold shows one complete thought
+    /// with the notice below it.
+    pub pending_notices: Vec<crate::AgentEvent>,
     /// The clock on its current turn: how long the model has worked, its
     /// throughput, whether it is inferring or waiting on a tool. Every agent has
     /// turns, so every agent has one — a frontend showing this agent shows *its*
@@ -382,6 +393,8 @@ impl AgentRegistry {
                 todos: Default::default(),
                 usage,
                 events: event_log(),
+                reasoning_open: false,
+                pending_notices: Vec::new(),
                 turn: crate::TurnStats::default(),
                 // Nobody delegated to it and nothing waits on its answer — the
                 // reason `done`/`delivered` below are meaningless for it.
@@ -422,14 +435,42 @@ impl AgentRegistry {
     pub fn record(&self, key: u64, ev: &crate::AgentEvent) {
         // Record usage/turn/events under the registry lock; the transcript
         // writer is cloned out so the file I/O below runs outside it.
-        let transcript = self.with(|v| {
+        let out = self.with(|v| {
             v.iter_mut().find(|e| e.key == key).and_then(|e| {
                 e.usage.record_event(ev);
                 e.turn.record(ev);
-                if let Ok(mut log) = e.events.lock() {
-                    log.push(ev.clone());
+                let mut to_write: Vec<crate::AgentEvent> = Vec::new();
+                match ev {
+                    // A reasoning delta opens — or continues — the model's
+                    // thinking stream.
+                    crate::AgentEvent::Reasoning(_) => {
+                        e.reasoning_open = true;
+                        to_write.push(ev.clone());
+                    }
+                    // A notice landing mid-thought must not split the thinking
+                    // block: hold it and write it when the stream ends, just
+                    // before whatever closes it, so the record reads
+                    // `[reasoning][notice][closing]` and the fold shows one
+                    // complete thought with the notice below it.
+                    crate::AgentEvent::Notice(_) if e.reasoning_open => {
+                        e.pending_notices.push(ev.clone());
+                    }
+                    _ => {
+                        // The stream is over: flush any held notices ahead of
+                        // the event that closed it.
+                        if e.reasoning_open || !e.pending_notices.is_empty() {
+                            e.reasoning_open = false;
+                            to_write.append(&mut e.pending_notices);
+                        }
+                        to_write.push(ev.clone());
+                    }
                 }
-                e.transcript.clone()
+                if let Ok(mut log) = e.events.lock() {
+                    for w in &to_write {
+                        log.push(w.clone());
+                    }
+                }
+                e.transcript.clone().map(|t| (t, to_write))
             })
         });
         // Append to the agent's durable transcript, if it has one. This is
@@ -445,11 +486,13 @@ impl AgentRegistry {
         // no-record case flushes rather than doing nothing — durability at
         // every round boundary, without a list of event kinds to keep in
         // sync here.
-        if let Some(ts) = transcript {
+        if let Some((ts, to_write)) = out {
             let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match crate::transcript_log::Record::from_event(ev) {
-                Some(rec) => w.write(&rec),
-                None => w.flush(),
+            for ev in &to_write {
+                match crate::transcript_log::Record::from_event(ev) {
+                    Some(rec) => w.write(&rec),
+                    None => w.flush(),
+                }
             }
         }
     }
@@ -1053,6 +1096,8 @@ mod tests {
             todos: Default::default(),
             usage: crate::AgentUsage::default(),
             events: event_log(),
+            reasoning_open: false,
+            pending_notices: Vec::new(),
             turn: crate::TurnStats::default(),
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
@@ -1520,6 +1565,80 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.kind, crate::EntryKind::Assistant(s) if s == "steered reply")),
             "the recorded event landed in the jsonl: {entries:?}"
+        );
+    }
+
+    /// A notice that lands while the model is mid-thought is deferred: it is
+    /// written after the last reasoning delta, just before whatever closes the
+    /// stream, so the record reads `[reasoning][notice][closing]` and the fold
+    /// shows one complete thought block with the notice below it — never two
+    /// running halves split around the notice. The durable jsonl is ordered
+    /// the same way, so a read-back shows the notice after the thought too.
+    #[test]
+    fn a_notice_mid_thought_is_deferred_until_the_stream_ends() {
+        use crate::transcript_log;
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        // Give the entry a real writer, as a spawned sub-agent's does.
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(Mutex::new(
+            transcript_log::TranscriptLog::create(dir.path(), "000-x").unwrap(),
+        ));
+        let path = writer.lock().unwrap().path().to_path_buf();
+        live.update(1, |e| e.transcript = Some(writer.clone()));
+
+        live.record(1, &crate::AgentEvent::Reasoning("first half ".into()));
+        live.record(1, &crate::AgentEvent::Notice("mid-thought warning".into()));
+        live.record(1, &crate::AgentEvent::Reasoning("second half".into()));
+        live.record(1, &crate::AgentEvent::Text("the reply".into()));
+        // A boundary event lands the reply the writer has been coalescing.
+        live.record(1, &crate::AgentEvent::TurnDone);
+
+        let (events, _) = live.events_since(1, 0).expect("recorded");
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                crate::AgentEvent::Reasoning(_) => "R",
+                crate::AgentEvent::Notice(_) => "N",
+                crate::AgentEvent::Text(_) => "T",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            &kinds[..4],
+            ["R", "R", "N", "T"],
+            "the notice follows the whole thought, ahead of the closing event"
+        );
+
+        // Folding the reordered record produces one complete thought, then the
+        // notice, then the reply — the block is never split.
+        let mut t: Vec<crate::Entry> = Vec::new();
+        for ev in &events {
+            crate::apply_event(&mut t, ev);
+        }
+        assert_eq!(t.len(), 3, "one thought, one notice, one reply: {t:?}");
+        assert!(
+            matches!(&t[0].kind,
+                crate::EntryKind::Reasoning { text, took_ms: Some(_) }
+                    if text == "first half second half"),
+            "the thought is one closed block: {:?}",
+            t[0].kind
+        );
+        assert!(
+            matches!(&t[1].kind, crate::EntryKind::System(s) if s == "mid-thought warning"),
+            "the notice sits below the thought: {:?}",
+            t[1].kind
+        );
+        assert!(matches!(&t[2].kind, crate::EntryKind::Assistant(s) if s == "the reply"));
+
+        // The durable transcript reads back the same way: one thought, then
+        // the notice, then the reply — the notice's record is not between two
+        // reasoning records.
+        let from_jsonl = transcript_log::read_transcript(&path);
+        assert_eq!(from_jsonl.len(), 3, "jsonl folds the same: {from_jsonl:?}");
+        assert!(
+            matches!(&from_jsonl[1].kind, crate::EntryKind::System(s) if s == "mid-thought warning"),
+            "the notice's record lands after the thought in the jsonl: {from_jsonl:?}"
         );
     }
 

@@ -1020,6 +1020,79 @@ async fn reasoning_hidden_shows_a_summary_until_verbose() {
     );
 }
 
+/// A chrome line (a slash command's output) that lands while the model's
+/// thinking block is still streaming is deferred, not inserted: the block is
+/// never split into two running halves around the notice, and the line appears
+/// after it once the thought completes — before the reply that closed it.
+///
+/// Regression: the line was pushed straight into the transcript, bypassing the
+/// reducer's `finish_reasoning`, so the first half stayed "⣆ Thinking" forever
+/// and the next reasoning delta opened a second block.
+#[tokio::test]
+async fn a_notice_mid_thinking_is_deferred_until_the_thought_completes() {
+    let mut h = Harness::new(vec![]).await;
+    use hrdr_agent::AgentEvent;
+
+    // A turn is in flight, streaming a thought.
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.inject(AgentEvent::Reasoning("secret thought".into()));
+    assert!(
+        h.app
+            .transcript()
+            .last()
+            .is_some_and(|e| matches!(&e.kind, EntryKind::Reasoning { took_ms: None, .. })),
+        "the thought is open and streaming"
+    );
+
+    // `/verbose off` mid-thought: its "verbose mode off" line must not split
+    // the streaming block.
+    h.type_str("/verbose off");
+    h.press(KeyCode::Enter);
+
+    // The reply closes the thought; the deferred line lands after it — before
+    // the reply.
+    h.inject(AgentEvent::Text("visible reply".into()));
+    h.app
+        .registry
+        .update(hrdr_agent::MAIN_KEY, |e| e.running = false);
+
+    let t = h.app.transcript();
+    let thoughts: Vec<&Entry> = t
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Reasoning { .. }))
+        .collect();
+    assert_eq!(
+        thoughts.len(),
+        1,
+        "the thought is one block, never split:\n{t:?}"
+    );
+    assert!(
+        matches!(
+            &thoughts[0].kind,
+            EntryKind::Reasoning {
+                took_ms: Some(_),
+                ..
+            }
+        ),
+        "the thought closed instead of staying running: {:?}",
+        thoughts[0].kind
+    );
+    let thought_idx = t
+        .iter()
+        .position(|e| matches!(e.kind, EntryKind::Reasoning { .. }))
+        .expect("the thought renders");
+    assert!(
+        matches!(&t[thought_idx + 1].kind, EntryKind::Notice(s) if s == "verbose mode off"),
+        "the notice is pinned below the thought: {:?}",
+        t[thought_idx + 1].kind
+    );
+    assert!(
+        matches!(&t[thought_idx + 2].kind, EntryKind::Assistant(s) if s == "visible reply"),
+        "the reply follows the notice: {:?}",
+        t[thought_idx + 2].kind
+    );
+}
+
 /// `/verbose` is a strict on/off toggle — the rename of `/expand`. A bare
 /// `/verbose` flips the mode, `on`/`off` set it. On fans every tool GROUP out
 /// in full; off folds them all back behind their summaries.
@@ -5512,6 +5585,8 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -5582,6 +5657,8 @@ async fn the_input_box_routes_to_the_focused_agent() {
         todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: steering.clone(),
@@ -5680,6 +5757,8 @@ async fn the_agent_list_switches_the_focused_agent() {
         todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -5823,6 +5902,8 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
             ..Default::default()
         },
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -6603,6 +6684,8 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         todos: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -8775,6 +8858,8 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         todos: sub_todos.clone(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
         steering: hrdr_agent::steering_queue(),
@@ -8851,6 +8936,8 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
         todos: sub_todos.clone(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
         turn: hrdr_agent::TurnStats::default(),
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
         steering: hrdr_agent::steering_queue(),
@@ -8994,5 +9081,62 @@ async fn a_compact_queued_while_busy_runs_after_the_turn_ends() {
     assert!(
         screen.contains("nothing to compact yet"),
         "the compaction ran and reported:\n{screen}"
+    );
+}
+
+/// A tinted surface above the todo panel (a user prompt) gets the same
+/// separator `flush` puts between two tinted transcript blocks: the block's
+/// `┃` pad and the panel's must not stack with no blank between. The untinted
+/// case already supplies its blank (the block's own bottom pad) — the panel's
+/// bg section is preceded by exactly one blank line either way.
+#[tokio::test]
+async fn a_tinted_block_above_the_todo_panel_gets_the_separator() {
+    const WIDTH: u16 = 60;
+    let mut h = Harness::new(vec![]).await;
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "SHIP IT NOW".to_string(),
+        id: 7,
+        status: "in_progress".to_string(),
+        evidence: None,
+    }];
+    h.app.push_entry(Entry::user("a user prompt"));
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    // Full rows, minus the scrollbar column (the transcript's scrollbar paints
+    // there and is not part of any block).
+    let row = |y: u16| -> String {
+        (0..WIDTH - 1)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let content_y = (0..24)
+        .find(|&y| row(y).contains("a user prompt"))
+        .expect("the block content renders");
+    let todo_y = (0..24)
+        .find(|&y| row(y).contains("SHIP IT NOW"))
+        .expect("the todo renders");
+    // content → the block's ┃ bottom pad → the separator (an entirely blank
+    // row) → the panel's ┃ top pad → todo content. Without the separator the
+    // two pads would stack with no blank between (the reported "missing line").
+    assert_eq!(todo_y, content_y + 4, "rows {content_y}..{todo_y}");
+    assert!(
+        row(content_y + 1).starts_with(crate::ui::BORDER_BAR),
+        "row above the separator is the block's ┃ pad: {:?}",
+        row(content_y + 1)
+    );
+    assert!(
+        row(content_y + 2).trim().is_empty(),
+        "the separator is a fully blank row: {:?}",
+        row(content_y + 2)
+    );
+    assert!(
+        row(content_y + 3).starts_with(crate::ui::BORDER_BAR),
+        "row below the separator is the panel's ┃ pad: {:?}",
+        row(content_y + 3)
     );
 }

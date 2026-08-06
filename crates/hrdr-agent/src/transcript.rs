@@ -676,10 +676,16 @@ fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry>
     })
 }
 
-/// Stamp a duration on a reasoning block that is still streaming. The frontend
-/// owns the wall-clock, so this only marks it closed (`took_ms: Some(0)` would
-/// lie); a frontend that tracks timing overwrites it.
-fn finish_reasoning(transcript: &mut [Entry]) {
+/// Stamp a duration on the reasoning block at the tail of the transcript — the
+/// one that is still streaming. The block's own timestamp is the opened time;
+/// the reducer stamps this because the reducer is what closes the block: every
+/// agent's thinking time is then measured the same way, wherever its events
+/// were folded.
+///
+/// Public for the TUI's deferred-chrome flush, which closes an open thought
+/// the same way the reducer would before appending the lines that waited for
+/// it.
+pub fn finish_reasoning(transcript: &mut [Entry]) {
     let Some(entry) = transcript.last_mut() else {
         return;
     };

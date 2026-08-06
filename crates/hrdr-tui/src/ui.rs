@@ -924,10 +924,10 @@ fn draw_chunks(
     pending_goto: Option<usize>,
     pending_entry: Option<usize>,
 ) -> TranscriptFrame {
-    let (mut chunks, msg_at) = transcript_chunks(app, text_area.width);
+    let (mut chunks, msg_at, panel_above) = transcript_chunks(app, text_area.width);
     // The live panels close the transcript, below the last block: they scroll
     // with it instead of holding rows of every frame for themselves.
-    chunks.extend(live_panel_chunks(app, text_area.width));
+    chunks.extend(live_panel_chunks(app, text_area.width, panel_above));
     // The screen row each block starts at. A block's rows come out of
     // `render_block` already wrapped and padded to the render width, so a row is a
     // row: no measuring, no re-wrapping, just a running total.
@@ -1416,21 +1416,39 @@ fn pack_loader_segments(segments: &[String], width: usize) -> Vec<String> {
 /// them. As trailing chunks they cost only what they show, and they scroll away
 /// with the rest of the scrollback — so the reader's viewport is the whole
 /// window minus the input.
-fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
+///
+/// `above` is the background of the chunk that precedes them (the transcript's
+/// last block, or `None` when it rendered none). The panels sit off it exactly
+/// as a transcript block would: a **tinted** surface above gets a separator
+/// between its pad and the panel's own — the merge `flush` breaks between two
+/// tinted blocks with one — while an **untinted** surface already supplies the
+/// blank row in its bottom pad. The loader is a pad-less status row, so it
+/// needs the separator after it too. Either way the panel's bg section is
+/// preceded by exactly one blank line, like every other box.
+fn live_panel_chunks(app: &App, width: u16, above: Option<Color>) -> Vec<Chunk<'static>> {
     let w = width as usize;
     let mut out = Vec::new();
-
-    if let Some(lines) = loader_line(app, width) {
+    // Whether the first panel needs a separator above it: the loader (which
+    // has no bottom pad of its own) always does; otherwise only a tinted
+    // surface above does.
+    let mut spacer = if let Some(lines) = loader_line(app, width) {
         // No block chrome: the loader is a single status row on the terminal's
         // own background, as it was when it sat above the input. It heads the
         // panels — it belongs with the reply it is still writing, above the
-        // lists of what is queued up around it.
+        // lists of what is queued up around it. It also has no bottom pad, so
+        // the panels below it still need the separator.
         out.extend([
             separator(),
             Chunk::plain(ChunkRows::Ready(Rc::new(lines)), None),
         ]);
-    }
+        true
+    } else {
+        above.is_some_and(|bg| bg != Color::Reset)
+    };
     if let Some((body, toggle)) = todo_lines(app) {
+        if spacer {
+            out.push(separator());
+        }
         let hits = toggle.map(|i| (i, RowHit::ToggleDoneTodos));
         out.extend(panel(
             body,
@@ -1439,8 +1457,13 @@ fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
             app.theme.success,
             hits.into_iter().collect(),
         ));
+        // The sub-agent panel below is tinted too: it needs its own separator.
+        spacer = true;
     }
     if let Some((body, ids)) = subagent_lines(app, w) {
+        if spacer {
+            out.push(separator());
+        }
         let hits = ids
             .into_iter()
             .enumerate()
@@ -1453,9 +1476,11 @@ fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
 
 /// One live panel: the panel itself — `bg` behind it, a `rule`-colored left
 /// edge — and `hits` saying what a click on each of its body rows does. The
-/// block wears the same chrome as every transcript entry (`render_block`
-/// supplies its own pad row above and below), so a panel's spacing matches the
-/// blocks around it exactly; there is no extra separator row of its own.
+/// block wears the same chrome as every transcript entry ([`render_block`]
+/// supplies its own pad row above and below); [`live_panel_chunks`] adds the
+/// separator a tinted surface above needs, so a panel's spacing matches the
+/// blocks around it in every case. The panel never emits a separator of its
+/// own.
 fn panel(
     body: Vec<Line<'static>>,
     width: usize,
@@ -2681,14 +2706,16 @@ fn separator<'a>() -> Chunk<'a> {
 }
 
 /// Returns the transcript as a list of rendered blocks, plus the chunk each
-/// 1-based user/assistant message starts at (for `/goto`).
+/// 1-based user/assistant message starts at (for `/goto`), and the background
+/// of the last chunk — what the live panels will sit off (see
+/// [`live_panel_chunks`]).
 ///
 /// Nothing here is laid out against the viewport: a chunk's rows are already
 /// wrapped and padded, so the caller places the viewport by counting them. Blocks
 /// whose entry has not changed come straight out of [`BLOCK_CACHE`] as an `Rc`,
 /// which is what keeps a frame's cost proportional to what *changed* rather than
 /// to the length of the session.
-fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>) {
+fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -3039,6 +3066,14 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     // Each agent's own queue: what is waiting to reach *this* agent.
     let queued = app.panes.active_pane().pending.clone();
     let queued_bg = (!queued.is_empty()).then(|| BlockKind::Queued.bg(theme));
+    // The surface the live panels sit off: the trailing separator a queued
+    // block leaves (Reset), else the last rendered block's background — or
+    // nothing when the transcript rendered no blocks.
+    let panel_above = if !queued.is_empty() {
+        Some(Color::Reset)
+    } else {
+        pending.as_ref().map(|b| b.kind.bg(theme))
+    };
     flush(
         &mut chunks,
         &mut msg_at,
@@ -3077,7 +3112,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         }
     }
 
-    (chunks, msg_at)
+    (chunks, msg_at, panel_above)
 }
 
 /// How wide a tab renders. Ratatui measures a `\t` as one cell and draws it as

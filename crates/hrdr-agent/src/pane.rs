@@ -831,6 +831,8 @@ mod tests {
                 todos: Default::default(),
                 usage: crate::AgentUsage::default(),
                 events: crate::event_log(),
+                reasoning_open: false,
+                pending_notices: Vec::new(),
                 turn: crate::TurnStats::default(),
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: crate::steering_queue(),
