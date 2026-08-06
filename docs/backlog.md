@@ -1508,9 +1508,10 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: finding 1 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse held
-resident); findings 2-10 open. Findings 2-3 are the next wins; finding 4 is the
-recorded item confirmed with two new sites.**
+**Status: findings 1-2 fixed — `2f38e1b` (per-path, mtime-keyed memoized parse
+held resident), `631b432` (per-path-token verdict memo in shell ingest);
+findings 3-10 open. Finding 3 is the next win; finding 4 is the recorded item
+confirmed with two new sites.**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -3250,6 +3251,15 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 perf review finding 2** (`631b432`). The per-line shell secret
+filter (`grep_line_is_secret`, which canonicalized `cwd.join(token)` on every
+line of a command's stdout/stderr) is now `SecretLineMemo` in hrdr-tools: a
+per-run map of joined-path → verdict created once per `shell` run beside the
+`DiffRedactor`, so each distinct path token is canonicalized once and repeated
+`rg -n`/`grep -n` match lines collapse to a map lookup. The verdict is a per-run
+snapshot (pinned by `a_secret_line_memo_is_a_per_run_snapshot`, shown red on the
+unmemoized filter first).
 
 **2026-08-06 perf review finding 1** (`2f38e1b`). `load_cached` memoizes the
 parsed models.dev catalog per path, keyed by the file's mtime (the pattern
