@@ -48,6 +48,84 @@ struct ReadArgs {
     full: bool,
 }
 
+/// One-pass window extractor over a file's bytes: captures exactly the lines
+/// [`start`, `start + limit)` (1-based; `limit == None` = through EOF) and
+/// counts the file's total `\n`s, without ever building the whole text or
+/// validating the whole file's UTF-8. Feed it chunks; [`WindowScanner::finish`]
+/// returns the window bytes and the newline count.
+///
+/// The window is always cut at a line boundary (just past a `\n`, or at EOF),
+/// so rendering the window with `str::lines()` matches rendering the same
+/// lines of the whole file — the `\r`-stripping and empty-line rules carry
+/// over unchanged.
+struct WindowScanner {
+    /// 1-based first line to capture.
+    start: usize,
+    /// How many lines to capture; `None` = through EOF.
+    limit: Option<usize>,
+    /// The captured bytes, exactly the requested window.
+    window: Vec<u8>,
+    /// Inside the window (`start == 1` begins capturing at byte 0).
+    capturing: bool,
+    /// The `limit`-th window newline has been seen — stop appending, but keep
+    /// counting newlines for the total.
+    window_done: bool,
+    /// `\n` seen so far in the whole file.
+    newlines: usize,
+    /// `\n` seen while capturing — bounds the window.
+    window_newlines: usize,
+}
+
+impl WindowScanner {
+    fn new(start: usize, limit: Option<usize>) -> Self {
+        Self {
+            start,
+            limit,
+            window: Vec::new(),
+            capturing: start == 1,
+            // `limit: Some(0)` captures nothing.
+            window_done: limit == Some(0),
+            newlines: 0,
+            window_newlines: 0,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        loop {
+            let Some(j) = rest.iter().position(|&b| b == b'\n') else {
+                // No newline left in this chunk: the bytes belong to the
+                // current line, captured only inside the window.
+                if self.capturing && !self.window_done {
+                    self.window.extend_from_slice(rest);
+                }
+                break;
+            };
+            // This is the `self.newlines`-th newline of the file (1-based).
+            self.newlines += 1;
+            if !self.capturing && self.newlines == self.start - 1 {
+                // The (start-1)-th newline ends line `start - 1`: the window
+                // opens just past it, with line `start`. Nothing of line
+                // `start - 1` is captured — including its newline.
+                self.capturing = true;
+            } else if self.capturing && !self.window_done {
+                // A complete window line: content up to and including its
+                // newline.
+                self.window.extend_from_slice(&rest[..=j]);
+                self.window_newlines += 1;
+                if self.limit.is_some_and(|l| self.window_newlines >= l) {
+                    self.window_done = true;
+                }
+            }
+            rest = &rest[j + 1..];
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, usize) {
+        (self.window, self.newlines)
+    }
+}
+
 #[async_trait]
 impl Tool for ReadTool {
     /// The file itself — in an audit, provenance per byte is the whole point.
@@ -100,13 +178,28 @@ impl Tool for ReadTool {
         })?;
         let path = ctx.resolve_read(&a.path)?;
 
-        // Whole-file open + guards + read on the blocking pool: this is `std::fs`
+        // The window to read: `start` (1-based) and how many lines to capture.
+        // A `full` read captures through EOF and renders without clipping or
+        // budget — the escape hatch for a `write` rewrite.
+        let start = if a.full {
+            1
+        } else {
+            a.offset.unwrap_or(1).max(1)
+        };
+        let window_limit = if a.full {
+            None
+        } else {
+            Some(a.limit.unwrap_or(DEFAULT_READ_LIMIT))
+        };
+
+        // Open + guards + windowed scan on the blocking pool: this is `std::fs`
         // on a handle that can be a multi-MB read, so it must not occupy a tokio
         // worker. The closure takes an owned copy of the resolved path (no borrow
-        // of `ctx` or `path` across the `spawn_blocking` boundary) and returns the
-        // content; the guards and the size cap run inside it, with the same errors.
+        // of `ctx` or `path` across the `spawn_blocking` boundary) and returns
+        // the window's text and the file's total line count; the guards and the
+        // size cap run inside it, with the same errors.
         let resolved = path.clone();
-        let text = tokio::task::spawn_blocking(move || -> Result<String> {
+        let (text, total_lines) = tokio::task::spawn_blocking(move || -> Result<(String, usize)> {
             // Open the file first so the handle is fixed before any path resolution —
             // this closes the TOCTOU window between secret-file validation and reading.
             let mut file = std::fs::File::open(&resolved)
@@ -136,25 +229,49 @@ impl Tool for ReadTool {
                 );
             }
 
-            // Read from the already-opened handle.
-            let mut text = String::new();
-            match file.read_to_string(&mut text) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            // One byte pass over the file: capture only the window and count
+            // newlines for the total. No whole-file String, no whole-file UTF-8
+            // validation, no second `lines()` pass — paging a large file used
+            // to pay all three per page. The window itself must still be text
+            // (a `full` read's window *is* the whole file, so it keeps the old
+            // whole-file validation); a binary tail outside the window no
+            // longer fails a paged read of the text before it, and errors when
+            // a page actually reaches it.
+            let mut scanner = WindowScanner::new(start, window_limit);
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut last_byte = 0u8;
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .with_context(|| format!("reading {}", resolved.display()))?;
+                if n == 0 {
+                    break;
+                }
+                last_byte = buf[n - 1];
+                scanner.feed(&buf[..n]);
+            }
+            let (window, newlines) = scanner.finish();
+            let total_lines = if file_len == 0 {
+                0
+            } else {
+                // `str::lines()` semantics: a trailing newline does not open a
+                // final empty line.
+                newlines + 1 - usize::from(last_byte == b'\n')
+            };
+            let text = match String::from_utf8(window) {
+                Ok(t) => t,
+                Err(_) => {
                     bail!(
-                        "{} is not a text file (invalid UTF-8) — this tool only reads text; \
+                        "{} is not a text file (invalid UTF-8{}) — this tool only reads text; \
                          inspect binaries via bash (`file`, `hexdump -C`, `strings`) if needed",
-                        resolved.display()
+                        resolved.display(),
+                        if a.full { "" } else { " in the requested lines" }
                     );
                 }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("reading {}", resolved.display()));
-                }
-            }
-            Ok(text)
+            };
+            Ok((text, total_lines))
         })
         .await??;
-        let total_lines = text.lines().count();
         // `full` reads the whole file with no per-line clip and no output budget
         // (ignoring offset/limit), so a file with a line over `MAX_LINE` or one
         // simply larger than the budget can still be read whole and marked fully
@@ -168,16 +285,6 @@ impl Tool for ReadTool {
         // `shell`/`grep`/`git` overflow just spilled to disk), so reads get far
         // more room — see `READ_BUDGET_FACTOR`.
         let read_budget = ctx.max_output.saturating_mul(super::READ_BUDGET_FACTOR);
-        let start = if a.full {
-            1
-        } else {
-            a.offset.unwrap_or(1).max(1)
-        };
-        let limit = if a.full {
-            total_lines
-        } else {
-            a.limit.unwrap_or(DEFAULT_READ_LIMIT)
-        };
         let mut out = String::new();
         let mut any_line_truncated = false;
         // The last line number actually emitted (0 = none) and whether the read
@@ -185,8 +292,10 @@ impl Tool for ReadTool {
         // and the "more to read" hint.
         let mut last_line = start.saturating_sub(1);
         let mut budget_stopped = false;
-        for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
-            let n = i + 1;
+        // `text` holds exactly the requested window, so its lines are numbered
+        // from `start` directly — no skip, no take, and no whole-file scan.
+        for (j, line) in text.lines().enumerate() {
+            let n = start + j;
             let cut = if a.full {
                 line.len()
             } else {
@@ -427,6 +536,103 @@ mod tests {
         // Reading from the gap through the end extends the contiguous run to EOF.
         ReadTool.execute(page(401, 600), &ctx).await.unwrap(); // 401–1000
         assert_eq!(ctx.read_state(&path), crate::ReadState::Fresh);
+    }
+
+    /// The scanner's total and window must match `str::lines()` exactly —
+    /// trailing newlines, empty lines and `\r\n` included — for any window and
+    /// any chunking. This is the correctness net for the byte-level scan; the
+    /// total feeds the coverage record and the "of Z" hint, the window feeds
+    /// the renderer.
+    #[test]
+    fn window_scan_matches_str_lines_semantics() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"a\n",
+            b"a\nb",
+            b"a\nb\n",
+            b"\n",
+            b"a\n\nb",
+            b"a\n\nb\n",
+            b"a\r\nb",
+            b"a\r\nb\r\n",
+            b"\r\n",
+            b"a\nb\nc\nd\ne",
+            b"line one\nline two\nline three\n",
+        ];
+        for bytes in cases {
+            let text = std::str::from_utf8(bytes).unwrap();
+            let want_total = text.lines().count();
+            for start in 1..=(want_total + 2) {
+                for limit in [Some(0), Some(1), Some(2), Some(5), None] {
+                    // Feed several chunk sizes: 1-byte chunks stress the
+                    // cross-chunk state machine, while a single whole chunk
+                    // stresses a window opening mid-chunk (the path that
+                    // historically double-captured the remainder).
+                    for chunk in [1usize, 3, bytes.len().max(1)] {
+                        let mut sc = WindowScanner::new(start, limit);
+                        for slice in bytes.chunks(chunk) {
+                            sc.feed(slice);
+                        }
+                        let (window, newlines) = sc.finish();
+                        let total = if bytes.is_empty() {
+                            0
+                        } else {
+                            newlines + 1 - usize::from(bytes.last() == Some(&b'\n'))
+                        };
+                        assert_eq!(
+                            total, want_total,
+                            "total for {bytes:?} start={start} limit={limit:?} chunk={chunk}"
+                        );
+                        let want: Vec<&str> = text
+                            .lines()
+                            .skip(start - 1)
+                            .take(limit.unwrap_or(usize::MAX))
+                            .collect();
+                        let got_text = String::from_utf8(window).unwrap();
+                        let got: Vec<&str> = got_text.lines().collect();
+                        assert_eq!(
+                            got, want,
+                            "window for {bytes:?} start={start} limit={limit:?} chunk={chunk}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The windowed-read contract this change pins: a paged read validates
+    /// only the window it returns. A file whose first lines are text but whose
+    /// tail is binary now pages fine — the old whole-file `read_to_string`
+    /// failed it on InvalidData — and errors only when a page reaches the
+    /// binary.
+    #[tokio::test]
+    async fn windowed_read_no_longer_requires_the_whole_file_to_be_text() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("mixed.txt");
+        let mut body = b"line one\nline two\n".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0x80]); // invalid UTF-8
+        std::fs::write(&path, &body).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+
+        let out = ReadTool
+            .execute(
+                serde_json::json!({"path": "mixed.txt", "offset": 1, "limit": 1}),
+                &ctx,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a paged read of the text prefix must not fail: {e:#}"));
+        assert!(out.contains("line one"), "{out}");
+
+        // A page that actually reaches the binary still errors, as before.
+        let err = ReadTool
+            .execute(
+                serde_json::json!({"path": "mixed.txt", "offset": 3, "limit": 5}),
+                &ctx,
+            )
+            .await
+            .expect_err("a page over the invalid UTF-8 must fail");
+        assert!(err.to_string().contains("not a text file"), "{err}");
     }
 
     /// A call with no path at all gets an instructive error naming the exact
