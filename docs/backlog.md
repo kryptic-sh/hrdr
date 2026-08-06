@@ -146,9 +146,13 @@ the tool-blocking fs off tokio workers. What remains open:
    frames. Cache rendered rows and widths.
 9. **Picker refilter allocates per candidate per keystroke**
    (`selector.rs:43-46`, `models.rs:786-791` `format!`+`to_lowercase`).
-   Precompute a lowercase haystack per choice.
+   Precompute a lowercase haystack per choice. **[partially addressed —
+   `1b84108` hoisted the query normalization into a shared `fuzzy_match_q` core;
+   the per-choice haystack build remains, deferred to a picker-layer pass — it
+   collides with tidy 2026-08-06 #7 on the same pickers]**
 10. **fstat per transcript record** (`transcript_log.rs:434`), used only to roll
-    back a partial write. Track the appended length instead.
+    back a partial write. Track the appended length instead. **[fixed —
+    `c351731`]**
 
 ## Performance review — second pass 2026-08-04
 
@@ -1239,13 +1243,13 @@ callers.
    `SseOverflow.to_string()` at the six `ChatError` constructions.
 
 3. **Byte-identical YAML-scalar stringifier in two modules of one crate.**
-   `scalar_to_string` (`crates/hrdr-agent/src/skills.rs:291-298`) and
-   `scalar_element_to_string` (`crates/hrdr-agent/src/agents_dir.rs:452-459`)
-   are identical bodies. Action: one `pub(crate)` helper both call. (The
-   surrounding frontmatter parsers stay separate — deliberately fail-closed vs
-   fail-open.)
+   **[fixed — `f6c64b3`]** `scalar_to_string`
+   (`crates/hrdr-agent/src/skills.rs:291-298`) and `scalar_element_to_string`
+   (`crates/hrdr-agent/src/agents_dir.rs:452-459`) are identical bodies. Action:
+   one `pub(crate)` helper both call. (The surrounding frontmatter parsers stay
+   separate — deliberately fail-closed vs fail-open.)
 
-4. **`entry_content_hash` has a dead parameter.**
+4. **`entry_content_hash` has a dead parameter.** **[fixed — `25d690e`]**
    `crates/hrdr-tui/src/ui.rs:2312` — `_expand_all` is never read; the only
    production call passes `app.verbose` (`:2806`) and the test at `:4004` pins
    that the flag must NOT change the hash. Action: drop the parameter, update
@@ -1260,7 +1264,7 @@ callers.
    win, no content change) — keep fsync on the credential path. Minimal
    alternative: document `write_config_doc` as `write_atomic` minus fsync.
 
-6. **`is_fresh` duplicated across the crate boundary.**
+6. **`is_fresh` duplicated across the crate boundary.** **[fixed — `2a112f1`]**
    `crates/hrdr-llm/src/catalog.rs:378-386` and
    `crates/hrdr-agent/src/provider_catalog.rs:85-91` — same 7-line body, both
    TTLs 24 h. Action: make the hrdr-llm one `pub` and call it from
@@ -1283,8 +1287,8 @@ callers.
    discards it. Action: a shared `HookRunResult`/note builder for the four
    common arms.
 
-9. **`truncate_on_boundary` reimplements `floor_char_boundary`.**
-   `crates/hrdr-tools/src/memory.rs:798-807` ≡
+9. **`truncate_on_boundary` reimplements `floor_char_boundary`.** **[fixed —
+   `944014c`]** `crates/hrdr-tools/src/memory.rs:798-807` ≡
    `&s[..crate::floor_char_boundary(s, max)]` (`lib.rs:2318-2327` — same fast
    path, same walk). Action: delete the helper, inline at the one use site
    (`memory.rs:862`).
@@ -1305,7 +1309,7 @@ callers.
     added by the notice redesign (`2bff248`). Action: a private
     `post_async(poster, fut, classify)` all three default methods call.
 
-12. **Minor items.** `now_ms` forwarding wrappers
+12. **Minor items.** **[fixed — `1b84108`]** `now_ms` forwarding wrappers
     (`crates/hrdr-app/src/login.rs:75-77` → `hrdr_agent::unix_millis()`;
     `crates/hrdr-agent/src/chatgpt_models.rs:105-107`) — call the underlying fn
     directly. `is_usage_limit` (`crates/hrdr-llm/src/retry.rs:213`) — `pub` in a
@@ -1362,8 +1366,10 @@ grep-verified as used), `tests/tui_pty.rs` (beyond 200), hrdr-tools
 (symbol + targeted reads only).
 
 **Status: items 1-2 fixed — `205844e` (the five dead `pub` items and the
-six-fold SSE literal); items 3-12 open, each naming its concrete action. Items
-1-3 were the highest-value (dead code + a six-fold literal).**
+six-fold SSE literal); items 3, 4, 6, 9, 12 fixed — `f6c64b3`, `25d690e`,
+`2a112f1`, `944014c`, `1b84108`; items 5, 7, 8, 10, 11 open, each naming its
+concrete action. Items 1-3 were the highest-value (dead code + a six-fold
+literal).**
 
 ## Performance review 2026-08-06
 
@@ -1463,7 +1469,7 @@ are not re-reported.
    spinner tick and keypress. Visible for a multi-KB paste. Fix: compute once in
    `draw` and pass it, or cache keyed by `(len, width)`.
 
-9. **Minor — per-line `format!` in shell ingest.**
+9. **Minor — per-line `format!` in shell ingest.** **[fixed — `1e24635`]**
    `crates/hrdr-tools/src/tools/shell.rs:583` — `ctx.emit(format!("{line}\n"))`
    on the same per-line path as finding 2; the line is already owned
    (`into_owned` at `:678/:698`). Fix: append the `\n` to the owned line or have
@@ -1514,7 +1520,9 @@ held resident), `631b432` (per-path-token verdict memo in shell ingest),
 validation), `9d5f5ed` (`Arc<Vec<ChatMessage>>` History payload — emitter, log
 and `since()` are refcount bumps; the TUI mirror keeps the one deep copy),
 `695840d` (`(path, lowercase)` `@file` index — the lowercase form is computed
-once per tree walk, not per keystroke); findings 6-10 open.**
+once per tree walk, not per keystroke); finding 9 fixed — `1e24635` (the
+per-line `format!` in shell ingest moves the owned line into the stream sink);
+findings 6-8 and 10 open.**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -3254,6 +3262,32 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-06 backlog slices — eight perf/tidy items** (`944014c`, `2a112f1`,
+`f6c64b3`, `25d690e`, `1b84108`, `1e24635`, `c351731`, plus the docs commit
+recording them). Worked one slice at a time (direct — each was small enough that
+a delegation round-trip cost more than the work), each gated before commit. Tidy
+2026-08-06: `truncate_on_boundary` folded into `floor_char_boundary`; `is_fresh`
+shared from `hrdr-llm::catalog` (the provider_catalog copy deleted); the YAML
+scalar stringifier shared via `skills::scalar_to_string`; `entry_content_hash`'s
+dead `expand_all` param dropped (its pinning test deleted — the property became
+structural); and the #12 minors: `now_ms` forwarding wrappers inlined,
+`is_usage_limit` narrowed to `pub(crate)`, `filter_model_choices` hoists its
+query normalization behind a shared `fuzzy_match_q` core, one
+`sibling_with_suffix` in `hrdr-llm::fs` replaces the wire-log rotation / config
+backup / store-lock name builders, one `flatten_slug` core for `cwd_slug` and
+`child_transcript_id`, and one `workspace_root()` in hrdr-test-support for the
+three workspace-walking test binaries. Perf 2026-08-06 #9: the shell ingest line
+is streamed by moving the owned newline-terminated buffer into the sink instead
+of `format!`ing a copy per line. Perf 2026-08-04 #10: `TranscriptLog` tracks its
+appended length and drops the per-record `metadata()`; the rollback boundary is
+the open length plus every successful line. Perf 2026-08-04 #9 (picker refilter)
+was **partially addressed, not closed** — the query-normalization half shipped
+in `1b84108`, the per-choice haystack precompute was deferred (cross-cutter over
+the picker layer, collides with tidy 2026-08-06 #7); see its tag in the section.
+The AUR publish for v0.11.0 is still blocked on the AUR's own outage (probed
+2026-08-06: the git backend still answers "down due to maintenance", RPC still
+`0.10.0-1`) — the "Owed right now" entry stays.
 
 **2026-08-06 perf review finding 5** (`695840d`). The `@file` completion index
 is now `(path, lowercase_path)` pairs: `spawn_file_index` (hrdr-app util.rs)
