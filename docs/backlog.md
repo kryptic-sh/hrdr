@@ -147,6 +147,13 @@ still returns the original case on fall-through, so `/CWD` still misses), the
 compaction `session_name_from` item, and the AUR RPC still reporting `0.10.0-1`
 for v0.11.0.
 
+**Pruned again 2026-08-07, third pass same day, by the backlog work session**:
+the compaction `session_name_from` item (`9692197`), perf 2026-08-04 #9
+(`a10ba3a`) and the peer-comparison fuzzy-`old_string` item (`fb407e3`) are
+closed — see [Record: closed efforts](#record-closed-efforts). Also shipped on
+the owner's ask, the cwd-basename default session name (`a5e8ea5`). Re-verified
+and still open: everything else stands as recorded.
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -2570,6 +2577,32 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-07 backlog slices — naming, picker and edit items** (`9692197`,
+`a5e8ea5`, `a10ba3a`, `fb407e3`, plus this docs commit). Worked one slice at a
+time (direct — each was small enough that a delegation round-trip cost more than
+the work), each gated before commit. The compaction `session_name_from` item:
+sessions are named from the first REAL user turn (`compaction::is_user_turn`),
+so a session whose first save comes after a compaction no longer reads "This
+conversation was compacted…"; the regression test was shown red on the old
+predicate first. On the owner's ask, the default session name is the cwd's
+basename (`default_session_name`) instead of "untitled" — `session_name_from`
+now returns `Option` and the first-save and fork callers supply the default;
+"untitled" survives only for a root/empty cwd. Perf 2026-08-04 #9: the pickers
+precompute a lowercase haystack per choice once per open (`Selector` gains a
+haystacks array built by per-type `*_haystack` builders; `replace_model_choices`
+rebuilds it on catalog reload) and the keystroke filter walks the stored strings
+— each filter is now a filter over haystacks, sharing one `fuzzy_match_hay`
+core; the empty-query fast path and match semantics are byte-identical. The
+peer-comparison fuzzy-edit subset: `edit` retries a failed exact match with
+per-line normalization (trailing whitespace trimmed; smart quotes, dashes,
+figure/NBSP spaces mapped 1:1) and applies a unique match, reporting it in the
+result; blank-line `old_string` and non-unique fuzzy matches still refuse. Six
+tests shown red without the matcher; a byte/char offset bug in the byte recovery
+(norm non-ASCII before the match) was caught by a multi-byte test shown red on
+the buggy indexing. All three items are deleted from their sections per this
+file's convention; the deliberate non-takes (space-run collapsing, pi's
+line-alignment machinery) are recorded where the item used to sit.
 
 **2026-08-07 backlog slices — the perf items worked this session** (`38b45d9`,
 `be1bb73`, `48c7b09`, `4c938e2`, `a315eca`, `4250c25`, `4b51f68`, `fb46b51`).
