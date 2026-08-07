@@ -939,7 +939,13 @@ mod tests {
         let p = dir.path().join("models.json");
         let write = |json: &str| std::fs::write(&p, json).unwrap();
         let pin_mtime = |t: SystemTime| {
-            std::fs::File::open(&p)
+            // `.write(true)`: on Windows `SetFileTime` needs write access to
+            // the handle, and a plain `File::open` handle is read-only — the
+            // call then fails with "Access is denied". Unix's `futimens` is
+            // happy with any fd, so the same open works everywhere.
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
                 .unwrap()
                 .set_times(std::fs::FileTimes::new().set_modified(t))
                 .unwrap();

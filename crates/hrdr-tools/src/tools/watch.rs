@@ -434,12 +434,15 @@ mod tests {
     /// in `dir` — the shape the "condition flips" tests need.
     fn flip_check(dir: &std::path::Path, pass_after: u64) -> String {
         let counter = dir.join("count");
+        // Shell-safe form of the path: forward slashes (a `C:\…` spelling is
+        // read cwd-relative by Git Bash, so the check counts in a file the
+        // test cannot see) and shell-quoted (spaces/globs would break it
+        // either way).
+        let normalized = counter.to_string_lossy().replace('\\', "/");
+        let counter = shell_words::quote(&normalized);
         format!(
-            "c=$(cat {} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\"; echo \"$c\" > {}; \
-             test \"$c\" -ge {}",
-            counter.display(),
-            counter.display(),
-            pass_after
+            "c=$(cat {counter} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\"; echo \"$c\" > {counter}; \
+             test \"$c\" -ge {pass_after}"
         )
     }
 

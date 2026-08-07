@@ -6584,11 +6584,14 @@ mod tests {
         agent.ctx.enforce_timeout_floor = false;
         let dir = tempfile::tempdir().unwrap();
         let counter = dir.path().join("count");
-        // Passes on round 3 — the round we cancel just before.
+        // Passes on round 3 — the round we cancel just before. The counter
+        // path must be shell-safe: forward slashes (a `C:\…` spelling is read
+        // cwd-relative by Git Bash, so the check would count in a file the
+        // assertions cannot see) and quoted (spaces/globs would break it).
+        let normalized = counter.to_string_lossy().replace('\\', "/");
+        let counter_arg = shell_words::quote(&normalized);
         let check = format!(
-            "c=$(cat {} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\" > {}; test \"$c\" -ge 3",
-            counter.display(),
-            counter.display(),
+            "c=$(cat {counter_arg} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\" > {counter_arg}; test \"$c\" -ge 3"
         );
         let ack = hrdr_tools::WatchTool::new(shell)
             .execute(
@@ -6616,7 +6619,15 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the watch never ran two rounds"
+                "the watch never ran two rounds; entry log: {}",
+                agent
+                    .background_tasks()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.log.clone())
+                    .unwrap_or_else(|| "(entry gone)".to_string())
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

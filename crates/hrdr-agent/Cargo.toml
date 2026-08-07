@@ -34,4 +34,5 @@ filetime.workspace = true
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
+shell-words = "1.1.1"
 tempfile.workspace = true
