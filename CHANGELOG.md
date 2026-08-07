@@ -248,6 +248,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`hrdr --model X run "prompt"` runs headlessly again.** A leading global flag
+  made clap's `args_conflicts_with_subcommands` stop recognizing subcommand
+  names once any flag had been parsed, so `run "prompt"` was swallowed by the
+  trailing TUI-input arg: in a terminal the TUI opened with `run prompt` as a
+  startup command, and in a non-tty untrusted directory the trust gate's cancel
+  path exited 0 with nothing run at all. Subcommand names now always win over
+  the trailing input (`subcommand_precedence_over_arg`), which stays mutually
+  exclusive anyway because the trailing arg consumes every word after its first
+  one.
+
 - **The status bar's sandbox badge now shows the mode the session actually runs
   under.** The main pane was seeded with `SandboxMode::None` and `PaneSet::sync`
   refreshed every per-agent field of an existing pane except `sandbox` — so the

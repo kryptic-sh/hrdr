@@ -96,9 +96,14 @@ fn chrome_fragment(colour: crossterm::style::Color, text: &str) {
     about = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models.",
     before_help = LOGO_ART,
     // `hrdr run …` / `hrdr models` are subcommands; anything else trailing is a
-    // command for the TUI to run at startup. They are mutually exclusive, so
-    // `hrdr /model` can't be mistaken for a malformed subcommand invocation.
-    args_conflicts_with_subcommands = true,
+    // command for the TUI to run at startup. Subcommand names always win — even
+    // after a global flag (`hrdr --model X run "hi"` is a headless run), which
+    // is why `args_conflicts_with_subcommands` is NOT set: clap then stops
+    // recognizing subcommand names once any flag has been parsed. The mutual
+    // exclusion survives anyway: once the trailing `input` starts consuming,
+    // clap's `trailing_var_arg` swallows every later word, so a TUI command and
+    // a subcommand can never both be present.
+    subcommand_precedence_over_arg = true,
 )]
 struct Cli {
     /// The model to run, as `provider://model` (`chatgpt://gpt-5.5`,
@@ -1234,6 +1239,41 @@ mod cli_tests {
         assert_eq!(cli.model.as_deref(), Some("zen://kimi-k2"));
         assert!(cli.vim);
         assert_eq!(cli.input.join(" "), "/model");
+    }
+
+    /// A leading global flag must not push a subcommand into the TUI input:
+    /// `hrdr --model X run "hi"` is a headless run, not the TUI command `run hi`.
+    /// (clap's `args_conflicts_with_subcommands` used to stop recognizing
+    /// subcommand names once any flag had been parsed.)
+    #[test]
+    fn a_subcommand_is_not_swallowed_by_a_leading_flag() {
+        // `run` / `models` are subcommands; a leading global flag must not push
+        // them into the TUI input.
+        let cli = Cli::parse_from(["hrdr", "--model", "zen://kimi-k2", "run", "hi"]);
+        assert_eq!(
+            cli.model.as_deref(),
+            Some("zen://kimi-k2"),
+            "--model still binds"
+        );
+        match cli.command {
+            Some(Command::Run { prompt, .. }) => assert_eq!(prompt.join(" "), "hi"),
+            _ => panic!("`--model X run hi` must be the run subcommand"),
+        }
+        assert!(cli.input.is_empty());
+
+        let cli = Cli::parse_from(["hrdr", "--vim", "run", "fix", "the", "bug"]);
+        match cli.command {
+            Some(Command::Run { prompt, .. }) => assert_eq!(prompt.join(" "), "fix the bug"),
+            _ => panic!("`--vim run …` must be the run subcommand"),
+        }
+        assert!(cli.input.is_empty());
+
+        let cli = Cli::parse_from(["hrdr", "--model", "zen://kimi-k2", "models"]);
+        assert!(
+            matches!(cli.command, Some(Command::Models)),
+            "`--model X models`"
+        );
+        assert!(cli.input.is_empty());
     }
 
     /// `--provider` is GONE: the provider is named in the model, or not at all.
