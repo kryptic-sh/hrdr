@@ -441,8 +441,8 @@ fn read_args_summary(v: &serde_json::Value) -> String {
 
 impl Entry {
     /// The displayable text of a user/assistant message, if this entry is one.
-    /// These are the only entries that count as numbered "messages" for `/find`,
-    /// `/goto`, `/copy msg N`, and export.
+    /// These are the only entries that count as numbered "messages" for `/find`
+    /// and export.
     pub fn message_text(&self) -> Option<&str> {
         match &self.kind {
             // A text-less assistant turn (tool calls only) still counts: it has
@@ -473,7 +473,7 @@ pub fn find_hits(entries: &[Entry], query: &str) -> Vec<usize> {
 }
 
 /// The transcript as Markdown-ish text (user/assistant/system/diff/tool lines;
-/// reasoning and stats are omitted). Used by `/copy all` and `/export`.
+/// reasoning and stats are omitted). Used by `/export`.
 pub fn transcript_to_text(entries: &[Entry]) -> String {
     let mut out = String::new();
     for e in entries {
