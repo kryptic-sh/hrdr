@@ -4,6 +4,74 @@
 //! registry — the popup/rendering is the frontend's job.
 
 use crate::{SLASH_COMMANDS, resolve_alias};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Memoized `/resume` session listing for [`arg_completions`], which runs on
+/// every keystroke while the argument is being typed — a full `list_sessions`
+/// walk (read_dir + a stat per file + sort) per keystroke otherwise.
+///
+/// Keyed by the command prefix typed so far (stable while the argument itself
+/// changes) and revalidated against the sessions tree's change signature, so a
+/// session saved mid-typing still appears. The signature is the base dir's
+/// mtime plus each per-cwd subdir's name + mtime: every session write, delete
+/// and compression is an atomic rename inside a subdir, which bumps that
+/// subdir's mtime (same granularity caveat as the per-file `meta_cache` in
+/// `hrdr-agent::session`).
+struct ResumeSessionCache {
+    prefix: String,
+    signature: Vec<(String, SystemTime)>,
+    sessions: Vec<crate::SessionMeta>,
+}
+
+fn resume_session_signature() -> Vec<(String, SystemTime)> {
+    let base = crate::sessions_dir();
+    let base_mtime = std::fs::metadata(&base)
+        .and_then(|m| m.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let mut sig = vec![(base.display().to_string(), base_mtime)];
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                sig.push((name.to_string(), mtime));
+            }
+        }
+    }
+    sig.sort();
+    sig
+}
+
+/// The memo itself — module-level so tests can assert the memoization ran (a
+/// cache that never hits would pass every behavior test while still re-walking
+/// per keystroke).
+static RESUME_SESSION_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResumeSessionCache>>> =
+    std::sync::OnceLock::new();
+
+/// The `/resume` session rows for `prefix`, served from the memo when the
+/// prefix and the sessions tree are unchanged.
+fn resume_sessions(prefix: &str) -> Vec<crate::SessionMeta> {
+    let signature = resume_session_signature();
+    let mut guard = RESUME_SESSION_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(cached) = guard.as_ref()
+        && cached.prefix == prefix
+        && cached.signature == signature
+    {
+        return cached.sessions.clone();
+    }
+    let sessions = crate::list_sessions();
+    *guard = Some(ResumeSessionCache {
+        prefix: prefix.to_string(),
+        signature,
+        sessions: sessions.clone(),
+    });
+    sessions
+}
 
 /// Whether a registry entry is an alias row (its name resolves to a different
 /// canonical command). Aliases never render in the completion list — they only
@@ -198,7 +266,7 @@ pub fn arg_completions(
                 rows.push(("reset".to_string(), "back to the default".to_string()));
                 rows
             }
-            "resume" => crate::list_sessions()
+            "resume" => resume_sessions(&input[..arg_start])
                 .into_iter()
                 .map(|m| (m.id, m.name))
                 .collect(),
@@ -260,6 +328,7 @@ pub fn rank_agent_matches(names: &[String], query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn slash_completions_prefix_ranks_first() {
@@ -431,5 +500,76 @@ mod tests {
                 .map(String::as_str),
             Some("docs/README")
         );
+    }
+
+    // ── /resume completion memo ────────────────────────────────────────────
+
+    /// Global lock so env-var-dependent tests don't race on HOME / XDG vars
+    /// (`std::env::set_var` is not thread-safe in Rust tests). Duplicated from
+    /// `sessions.rs` — a `#[cfg(test)]` module in one crate is invisible to
+    /// another.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+        f(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    /// The `/resume` argument completion runs on every keystroke; the listing
+    /// is memoized per prefix and refreshed when the sessions tree changes. A
+    /// cache that never hit (always re-walking) or never invalidated (serving
+    /// a stale list) both fail here.
+    #[test]
+    fn resume_completion_memoizes_and_refreshes_on_session_change() {
+        let skills = Vec::new();
+        let vals = |i: &str| {
+            arg_completions(i, &skills)
+                .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("proj").to_string_lossy().to_string();
+            crate::Session::new(state("First", &cwd))
+                .save("first")
+                .unwrap();
+            assert_eq!(vals("/resume fir"), vec!["first"]);
+
+            // The first walk memoized the listing…
+            let memo_hit = RESUME_SESSION_CACHE
+                .get()
+                .and_then(|m| m.lock().ok())
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            assert!(memo_hit, "the /resume listing was memoized");
+
+            // …a session saved mid-typing (same prefix) is picked up by the
+            // change signature, not hidden behind the memo.
+            crate::Session::new(state("Second", &cwd))
+                .save("second")
+                .unwrap();
+            assert_eq!(vals("/resume sec"), vec!["second"]);
+
+            // A second call on the unchanged tree serves the memo.
+            assert_eq!(vals("/resume sec"), vec!["second"]);
+            assert_eq!(vals("/resume ").len(), 2);
+        });
+    }
+
+    fn state(name: &str, cwd: &str) -> crate::SessionState {
+        crate::SessionState {
+            name: name.to_string(),
+            model: "local://model".parse().unwrap(),
+            base_url: "http://x/v1".to_string(),
+            cwd: cwd.to_string(),
+            messages: vec![hrdr_agent::Message::user("hi")],
+            ..Default::default()
+        }
     }
 }
