@@ -97,67 +97,107 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
         // lifecycle hooks below deliberately pipe stdin to feed their payload.
         // Pipe stdout/stderr: `wait_with_output()` only captures piped streams,
         // and inherited ones would print onto the TUI's alternate screen and
-        // leave `out`'s failure `detail` empty. (`Command::output()`, which this
+        // leave the failure `detail` empty. (`Command::output()`, which this
         // spawn replaced, set these implicitly.)
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
         let timeout = Duration::from_secs(hook.timeout_secs);
-        // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
-        // `tokio::time::timeout(timeout, cmd.output()).await` produced, so the
-        // match below is unchanged; spawning is just pulled out in front so we
-        // can hold the group needed to kill the whole tree on timeout.
-        // Best-effort: a hook whose group couldn't be set up still runs.
-        let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
-            Ok((child, mut group)) => {
-                let ran = tokio::time::timeout(timeout, child.wait_with_output()).await;
-                if ran.is_err() {
-                    // The timer won: kill in full, so a formatter that shelled
-                    // out to something goes with it.
-                    group.kill();
-                }
-                // A hook that ran to completion with success owns its
-                // descendants: it may have left a backgrounded child (stdio
-                // redirected away from our pipes) on purpose, and the guard's
-                // drop-kill must not SIGKILL it. Failure and timeout keep the
-                // armed guard — its drop-kill is the backstop there.
-                if let Ok(Ok(out)) = &ran
-                    && out.status.success()
-                {
-                    group.disarm();
-                }
-                ran
-            }
-            Err(e) => Ok(Err(e)),
-        };
-        match ran {
-            Ok(Ok(out)) if out.status.success() => {}
-            Ok(Ok(out)) => {
-                let mut detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if detail.is_empty() {
-                    detail = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                }
-                let detail = crate::truncate_inline(&detail, 300);
-                notes.push(format!(
-                    "[hook `{}` failed ({}){}]",
-                    hook.run,
-                    out.status,
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                ));
-            }
-            Ok(Err(e)) => notes.push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
-            Err(_) => notes.push(format!(
-                "[hook `{}` timed out after {}s; killed]",
-                hook.run, hook.timeout_secs
-            )),
-        }
+        notes.extend(hook_notes(
+            &hook.run,
+            hook.timeout_secs,
+            run_hook(&mut cmd, timeout, None).await,
+        ));
     }
     notes
+}
+
+/// The three ways a hook run can end, reduced to what the two hook families
+/// share: completed (any status — the caller decides what a success means:
+/// the file path discards output, the lifecycle path takes stdout as context
+/// and treats exit 2 as a block), failed to spawn, or killed by the timer.
+enum HookRun {
+    /// Ran to completion, `Output` in hand.
+    Done(std::process::Output),
+    /// Failed to spawn.
+    CouldntRun(std::io::Error),
+    /// Killed by the timer.
+    TimedOut,
+}
+
+/// Spawn `cmd` as a process group, feed `stdin` if given, race it against
+/// `timeout`, and classify the run. When the timer wins the whole tree is
+/// killed (a hook that shelled out to something goes with it); a run that
+/// completed successfully disarms the group guard so a deliberately
+/// backgrounded descendant survives — failure and timeout keep the armed
+/// guard, whose drop-kill is the backstop there. Group setup is best-effort:
+/// a hook whose group couldn't be set up still runs.
+async fn run_hook(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+    stdin: Option<&[u8]>,
+) -> HookRun {
+    match crate::proc::spawn_group_best_effort(cmd) {
+        Ok((mut child, mut group)) => {
+            let ran = tokio::time::timeout(timeout, async {
+                if let Some(data) = stdin
+                    && let Some(mut stdin) = child.stdin.take()
+                {
+                    use tokio::io::AsyncWriteExt;
+                    // A hook that never reads stdin is fine — the write
+                    // fails when the pipe closes and we move on to
+                    // waiting.
+                    let _ = stdin.write_all(data).await;
+                }
+                child.wait_with_output().await
+            })
+            .await;
+            if ran.is_err() {
+                group.kill();
+            }
+            if let Ok(Ok(o)) = &ran
+                && o.status.success()
+            {
+                group.disarm();
+            }
+            match ran {
+                Ok(Ok(out)) => HookRun::Done(out),
+                Ok(Err(e)) => HookRun::CouldntRun(e),
+                Err(_) => HookRun::TimedOut,
+            }
+        }
+        Err(e) => HookRun::CouldntRun(e),
+    }
+}
+
+/// The notes one failed hook produces — the same three strings in both hook
+/// families: a nonzero exit (stderr, or stdout when stderr is empty, inline-
+/// truncated), a spawn failure, or a timeout. Empty when the run succeeded.
+fn hook_notes(run: &str, timeout_secs: u64, ran: HookRun) -> Vec<String> {
+    match ran {
+        HookRun::Done(o) if o.status.success() => Vec::new(),
+        HookRun::Done(o) => {
+            let mut detail = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if detail.is_empty() {
+                detail = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+            let detail = crate::truncate_inline(&detail, 300);
+            vec![format!(
+                "[hook `{run}` failed ({}){}]",
+                o.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )]
+        }
+        HookRun::CouldntRun(e) => vec![format!("[hook `{run}` couldn't run: {e}]")],
+        HookRun::TimedOut => vec![format!(
+            "[hook `{run}` timed out after {timeout_secs}s; killed]"
+        )],
+    }
 }
 
 // ── Lifecycle hooks ─────────────────────────────────────────────────────────
@@ -277,49 +317,14 @@ pub async fn run_event_hooks(
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         let timeout = Duration::from_secs(hook.timeout_secs);
-        // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
-        // as before; spawning is pulled out in front of the timed race (which
-        // also feeds the payload to stdin) so we can hold the group needed to
-        // kill the whole tree on timeout. Best-effort, as in `run_file_hooks`.
-        let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
-            Ok((mut child, mut group)) => {
-                let ran = tokio::time::timeout(timeout, async {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use tokio::io::AsyncWriteExt;
-                        // A hook that never reads stdin is fine — the write
-                        // fails when the pipe closes and we move on to
-                        // waiting.
-                        let _ = stdin.write_all(payload.as_bytes()).await;
-                    }
-                    child.wait_with_output().await
-                })
-                .await;
-                if ran.is_err() {
-                    // The timer won: kill in full, so a hung hook that forked
-                    // something (a background watcher, say) goes with it.
-                    group.kill();
-                }
-                // Same disarm-on-success as `run_file_hooks`: a hook that ran
-                // to completion with success owns its descendants, and the
-                // guard's drop-kill must not take down a backgrounded child it
-                // left on purpose. Failure and timeout keep the armed guard.
-                if let Ok(Ok(o)) = &ran
-                    && o.status.success()
-                {
-                    group.disarm();
-                }
-                ran
-            }
-            Err(e) => Ok(Err(e)),
-        };
-        match ran {
-            Ok(Ok(o)) if o.status.success() => {
+        match run_hook(&mut cmd, timeout, Some(payload.as_bytes())).await {
+            HookRun::Done(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if !stdout.is_empty() {
                     out.context.push(crate::truncate_inline(&stdout, 10_000));
                 }
             }
-            Ok(Ok(o)) if o.status.code() == Some(2) => {
+            HookRun::Done(o) if o.status.code() == Some(2) => {
                 let mut reason = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 if reason.is_empty() {
                     reason = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -330,30 +335,9 @@ pub async fn run_event_hooks(
                 out.block = Some(crate::truncate_inline(&reason, 2_000));
                 break;
             }
-            Ok(Ok(o)) => {
-                let mut detail = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                if detail.is_empty() {
-                    detail = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                }
-                let detail = crate::truncate_inline(&detail, 300);
-                out.notes.push(format!(
-                    "[hook `{}` failed ({}){}]",
-                    hook.run,
-                    o.status,
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                ));
-            }
-            Ok(Err(e)) => out
+            ran => out
                 .notes
-                .push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
-            Err(_) => out.notes.push(format!(
-                "[hook `{}` timed out after {}s; killed]",
-                hook.run, hook.timeout_secs
-            )),
+                .extend(hook_notes(&hook.run, hook.timeout_secs, ran)),
         }
     }
     out
