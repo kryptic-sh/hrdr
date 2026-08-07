@@ -8543,6 +8543,10 @@ mod tests {
             HttpError(u16),
             /// An HTTP error with a provider error body.
             HttpErrorBody(u16, String),
+            /// An HTTP error with extra response headers — the only way a mock
+            /// can send a `Retry-After`, which the client reads off the real
+            /// response headers (see `retry_after_from_headers`).
+            HttpErrorWithHeaders(u16, Vec<(String, String)>),
         }
 
         impl MockResp {
@@ -8579,6 +8583,19 @@ mod tests {
                         body.len()
                     )
                     .into_bytes(),
+                    MockResp::HttpErrorWithHeaders(status, headers) => {
+                        let head = headers
+                            .iter()
+                            .map(|(k, v)| format!("{k}: {v}\r\n"))
+                            .collect::<String>();
+                        format!(
+                            "HTTP/1.1 {status} Error\r\n\
+                             {head}Content-Length: 0\r\n\
+                             Connection: close\r\n\
+                             \r\n"
+                        )
+                        .into_bytes()
+                    }
                 }
             }
         }
@@ -10757,6 +10774,51 @@ mod tests {
                     i + 2
                 );
             }
+        }
+
+        /// A server-sent `Retry-After` outranks the policy's own schedule — the
+        /// client parses it off the response headers, and `retry` sleeps the
+        /// server's delay over `jittered_backoff`. The mock's backoff is zeroed
+        /// (`test_cfg` → `instant_retries`), so the retry notice reporting the
+        /// server's 1s proves the header won, not the policy.
+        #[tokio::test]
+        async fn the_retry_loop_honours_a_server_retry_after() {
+            let server = MockServer::start(vec![
+                MockResp::HttpErrorWithHeaders(
+                    429,
+                    vec![("Retry-After".to_string(), "1".to_string())],
+                ),
+                MockResp::Sse(vec![
+                    text_chunk("c1", "Hello from mock"),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut notices: Vec<String> = Vec::new();
+            agent
+                .run_input("hi", |ev| {
+                    if let AgentEvent::Notice(n) = ev {
+                        notices.push(n);
+                    }
+                })
+                .await
+                .expect("the retry lands and the turn completes");
+
+            let attempts: Vec<&String> = notices
+                .iter()
+                .filter(|n| n.contains("retrying in"))
+                .collect();
+            assert_eq!(attempts.len(), 1, "one failure, one retry: {notices:#?}");
+            assert!(
+                attempts[0].contains("retrying in 1s"),
+                "the server's Retry-After is honoured, not the zeroed policy \
+                 backoff: {}",
+                attempts[0]
+            );
         }
 
         /// A context overflow is not a transient failure and must not be

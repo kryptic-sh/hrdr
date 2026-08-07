@@ -1824,11 +1824,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   needs a live `DEEPSEEK_API_KEY` and was not runnable in the automated suite;
   every other slice shipped. Run it before trusting a real DeepSeek session.
 
-- **No end-to-end test consumes a real `Retry-After`.** hrdr-agent's `MockResp`
-  has the variants `Sse`, `HttpError` and `HttpErrorBody`, and none can set a
-  response header, so the agent's retry loop honouring a server-named delay is
-  unexercised. `retry_after_from_headers` is covered directly instead. Closing
-  it means another `MockResp` variant carrying headers.
 - **The warm models.dev catalog path is uncovered, deliberately.**
   `catalog::load_cached` reads process-global state (`HRDR_MODELS_PATH` / the
   XDG cache dir), so warming it in a test leaks into every other test in the
