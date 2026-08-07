@@ -107,8 +107,8 @@ findings clearly marked as such).
      (backlog.md is the single work-item file; a review's open findings belong
      in it, its closed ones in the Record section — do not create a sibling
      file).
-   - **Inside a git repo without `docs/backlog.md`** → append it to
-     `backlog.md` at the repo root (creating the file if needed).
+   - **Inside a git repo without `docs/backlog.md`** → append it to `backlog.md`
+     at the repo root (creating the file if needed).
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 

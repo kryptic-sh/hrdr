@@ -56,8 +56,8 @@ named in arguments if given: $ARGUMENTS
      `docs/backlog.md` under a dated `## <area> review YYYY-MM-DD` heading
      (backlog.md is the single work-item file; open findings belong in it, and
      do not create a sibling file).
-   - **Inside a git repo without `docs/backlog.md`** → append it to
-     `backlog.md` at the repo root (creating the file if needed).
+   - **Inside a git repo without `docs/backlog.md`** → append it to `backlog.md`
+     at the repo root (creating the file if needed).
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 
