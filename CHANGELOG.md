@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-07
+
 ### Breaking
 
 - **`/goto`, `/copy` and `/timestamps` are removed, along with the message
@@ -6647,7 +6649,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/kryptic-sh/hrdr/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/hrdr/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/hrdr/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/kryptic-sh/hrdr/compare/v0.9.4...v0.10.0
