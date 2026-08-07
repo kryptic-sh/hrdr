@@ -328,7 +328,6 @@ pub fn rank_agent_matches(names: &[String], query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[test]
     fn slash_completions_prefix_ranks_first() {
@@ -504,24 +503,6 @@ mod tests {
 
     // ── /resume completion memo ────────────────────────────────────────────
 
-    /// Global lock so env-var-dependent tests don't race on HOME / XDG vars
-    /// (`std::env::set_var` is not thread-safe in Rust tests). Duplicated from
-    /// `sessions.rs` — a `#[cfg(test)]` module in one crate is invisible to
-    /// another.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
-        f(&tmp);
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-    }
-
     /// The `/resume` argument completion runs on every keystroke; the listing
     /// is memoized per prefix and refreshed when the sessions tree changes. A
     /// cache that never hit (always re-walking) or never invalidated (serving
@@ -534,7 +515,7 @@ mod tests {
                 .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
                 .unwrap_or_default()
         };
-        with_test_env(|tmp| {
+        hrdr_test_support::with_test_env(|tmp| {
             let cwd = tmp.path().join("proj").to_string_lossy().to_string();
             crate::Session::new(state("First", &cwd))
                 .save("first")

@@ -59,7 +59,15 @@ fn no_test_in_the_workspace_writes_real_user_state() {
         .env("CARGO_HOME", tool_home("CARGO_HOME", ".cargo"))
         .env("RUSTUP_HOME", tool_home("RUSTUP_HOME", ".rustup"));
 
+    // /tmp: the sentinel above only sees writes under `$HOME` and the XDG roots.
+    // The suite used to leak `tempfile` dirs into `temp_dir()` too — a dropped
+    // `TempDir` whose directory a background writer re-created, then the e2e
+    // harness's kept private roots and the wire-log test's latched file, which
+    // now go through `defer_tempdir`'s exit dtor. Count tempfile dirs before and
+    // after the child suite; a NEW one is a leak this sentinel cannot see.
+    let tmp_before = tmp_dirs();
     let status = cmd.status().expect("cargo test is runnable");
+    let tmp_after = tmp_dirs();
 
     let written = files_under(&sentinel);
     let _ = std::fs::remove_dir_all(&sentinel);
@@ -83,7 +91,28 @@ fn no_test_in_the_workspace_writes_real_user_state() {
             .join("\n")
     );
 
-    // Checked after the leak assertion on purpose: a failing suite must not hide a leak.
+    let new_tmp: Vec<&PathBuf> = tmp_after
+        .iter()
+        .filter(|p| !tmp_before.contains(p))
+        .collect();
+    assert!(
+        new_tmp.is_empty(),
+        "A TEST LEAKED TEMPFILE DIRS INTO /tmp.\n\
+         The suite ran and these `tempfile` directories appeared under {} and were never \
+         removed — the exit dtor of `hrdr_test_support::defer_tempdir` should have \
+         reclaimed them:\n{}\n\n\
+         Fix: a directory that must outlive the test that created it (a private XDG \
+         root sibling tests resolve into, a latched log file) goes through \
+         `defer_tempdir`; anything else outliving its test is a leak.",
+        std::env::temp_dir().display(),
+        new_tmp
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Checked after the leak assertions on purpose: a failing suite must not hide a leak.
     assert!(
         status.success(),
         "the workspace suite failed under the guard"
@@ -119,6 +148,34 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
             out.push(p);
         }
     }
+    out.sort();
+    out
+}
+
+/// Every `tempfile::tempdir()` directory under the process temp dir that still
+/// holds content — the `.tmpXXXXXX` naming tempfile uses, with at least one
+/// entry. Empty `.tmp*` dirs are rustc build artifacts (one per compilation,
+/// left behind in TMPDIR, verified empty after the build) and are not leaks;
+/// every hrdr leak this guard exists for held real state (`hrdr/sessions/…`,
+/// `wire.log`). `hrdr-test-sandbox-*` and the sentinel are deliberately not
+/// matched: they have their own lifecycle and their own checks.
+fn tmp_dirs() -> Vec<PathBuf> {
+    let root = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".tmp"))
+                && p.read_dir()
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false)
+        })
+        .collect();
     out.sort();
     out
 }

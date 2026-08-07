@@ -567,11 +567,14 @@ impl Drop for DataHomeGuard {
         // was a bug in autosave.
         //
         // Restoring the vars above closes the window for paths resolved *after*
-        // this point; leaking the directory closes it for the ones already
-        // resolved. The cost is one temp dir per isolating test in a test binary,
-        // which the OS reclaims from `/tmp`.
+        // this point; deferring the directory's removal closes it for the ones
+        // already resolved. The directory must outlive the process's last
+        // sibling test — which is exactly how long `defer_tempdir` keeps it:
+        // it is removed at process exit rather than accumulating in /tmp run
+        // after run (the old "the OS reclaims it" assumption was wrong; tmpfs
+        // only clears on reboot).
         if let Some(tmp) = self.tmp.take() {
-            let _ = tmp.keep();
+            hrdr_test_support::defer_tempdir(tmp);
         }
     }
 }

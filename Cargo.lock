@@ -1430,6 +1430,7 @@ version = "0.12.0"
 dependencies = [
  "ctor",
  "dtor",
+ "tempfile",
 ]
 
 [[package]]

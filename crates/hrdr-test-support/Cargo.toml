@@ -14,3 +14,5 @@ publish = false
 ctor = "1"
 # Removes the sandbox at test-binary exit (ctor 1.x split the dtor into its own crate).
 dtor = "1"
+# `defer_tempdir` keeps a test's private temp dir alive until process exit.
+tempfile.workspace = true

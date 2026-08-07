@@ -103,6 +103,62 @@ fn remove_sandbox() {
     }
 }
 
+/// Keep a test's private temp dir alive until the test binary exits.
+///
+/// The one place a `TempDir` legitimately outlives the test that created it: a
+/// private XDG root that parallel sibling tests resolve paths into (the e2e
+/// harness's `DataHomeGuard`), and the wire-log test's latched log file, both
+/// need the directory to survive until the last sibling thread is done. Handing
+/// the `TempDir` here defers its drop to the exit dtor below instead of leaving
+/// the directory on disk forever — the correctness window is the process, which
+/// is exactly how long the registry holds it.
+pub fn defer_tempdir(tmp: tempfile::TempDir) {
+    DEFERRED_TEMP_DIRS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(tmp);
+}
+
+/// Temp dirs that must outlive their creating test (see [`defer_tempdir`]),
+/// held until the exit dtor drops them.
+static DEFERRED_TEMP_DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::TempDir>>> =
+    std::sync::OnceLock::new();
+
+/// Run `f` with a private `XDG_DATA_HOME` — a `tempfile` tempdir — restored
+/// afterwards. ONE lock for the whole process: the var is process-global, so
+/// two test modules each holding their own lock would swap it under each other,
+/// which is exactly how hrdr-app's completion and sessions tests raced and
+/// flaked (a sessions test's root appeared where the completion test's sessions
+/// should have been). `std::env::set_var` is `unsafe` in edition 2024; the lock
+/// is held for the whole call so no other env-swapping helper can race it.
+pub fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+    f(&tmp);
+    unsafe { std::env::remove_var("XDG_DATA_HOME") };
+}
+
+/// Drop the deferred temp dirs at process exit: `TempDir::drop` removes the
+/// directory, so what the tests kept alive until the last sibling finished is
+/// reclaimed instead of accumulating in /tmp run after run.
+#[dtor::dtor(unsafe)]
+fn drop_deferred_temp_dirs() {
+    let Some(reg) = DEFERRED_TEMP_DIRS.get() else {
+        return;
+    };
+    let roots = match reg.lock() {
+        Ok(mut r) => std::mem::take(&mut *r),
+        Err(p) => std::mem::take(&mut *p.into_inner()),
+    };
+    // Dropping the Vec drops each `TempDir` (and its `remove_dir_all`).
+    drop(roots);
+}
+
 /// The workspace root: this crate is `<root>/crates/hrdr-test-support`, so the
 /// root is the manifest dir's grandparent. Test binaries that walk the whole
 /// workspace (crate inventory, duration-constant scan, the leak guard) all

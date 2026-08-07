@@ -36,11 +36,12 @@ static WIRE_LOG: OnceLock<PathBuf> = OnceLock::new();
 
 fn wire_log_path() -> &'static PathBuf {
     WIRE_LOG.get_or_init(|| {
-        // Leak the tempdir so the directory outlives the one-time init: a
-        // `TempDir` dropped here would delete the file the wire log keeps
-        // appending to.
-        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        // Defer the tempdir's removal to process exit so the directory outlives
+        // the one-time init: a `TempDir` dropped here would delete the file the
+        // wire log keeps appending to.
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wire.log");
+        hrdr_test_support::defer_tempdir(dir);
         // SAFETY: this binary runs only its own tests, and the `OnceLock` above
         // guarantees this init runs exactly once, so nothing else sets the
         // variable while it is read and no second `set_var` ever happens.

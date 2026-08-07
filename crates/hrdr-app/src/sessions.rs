@@ -135,27 +135,6 @@ pub fn filter_sessions(sessions: &[crate::SessionMeta], query: &str) -> Vec<usiz
 mod tests {
     use super::*;
     use hrdr_agent::Message;
-    use std::sync::Mutex;
-
-    /// Global lock so env-var-dependent session tests don't race on HOME / XDG
-    /// vars (`std::env::set_var` is not thread-safe in Rust tests). A local copy
-    /// of the helper that lived in `session.rs` before its move to hrdr-agent —
-    /// duplicated here (rather than shared through a re-export) because a
-    /// `#[cfg(test)]` module in one crate is invisible to another crate's tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
-    fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
-        f(&tmp);
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-    }
 
     /// A saveable state: one user message, named, rooted at `cwd`.
     fn state(name: &str, cwd: &str) -> SessionState {
@@ -174,7 +153,7 @@ mod tests {
     /// exercises `session_diagnostics`, which stays in hrdr-app.
     #[test]
     fn session_diagnostics_returns_only_corrupt_files() {
-        with_test_env(|tmp| {
+        hrdr_test_support::with_test_env(|tmp| {
             let cwd = tmp.path().join("p");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
