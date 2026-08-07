@@ -8641,6 +8641,17 @@ async fn session_selector_renders_columns_filters_and_closes() {
     assert!(screen.contains("Fix the auth bug"), "name column: {screen}");
     assert!(screen.contains("ago"), "age column: {screen}");
     assert!(screen.contains("/home/u/api"), "cwd column: {screen}");
+    // The picker memoizes its rendered rows + widths per filter: this frame
+    // populated the memo, and the typing below must move it, not be hidden
+    // behind it (both halves pinned, so a memo that never hit — or never
+    // invalidated — goes red).
+    assert!(
+        h.app
+            .session_rows
+            .as_ref()
+            .is_some_and(|c| c.filter.is_empty()),
+        "the picker memoized its rows for the unfiltered list"
+    );
 
     // Column order on a row: id, name, age, cwd.
     let row = screen
@@ -8663,6 +8674,13 @@ async fn session_selector_renders_columns_filters_and_closes() {
     assert!(
         !screen.contains("fix-auth"),
         "filtered the non-match out: {screen}"
+    );
+    assert!(
+        h.app
+            .session_rows
+            .as_ref()
+            .is_some_and(|c| c.filter == "hrdr"),
+        "the memo follows the filter"
     );
 
     // Esc closes the modal.

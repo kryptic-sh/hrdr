@@ -134,7 +134,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     if let Some(sel) = &app.model_selector {
         draw_model_selector(f, &app.theme, sel, app.model_loading, app.model_source);
     } else if let Some(sel) = &app.session_selector {
-        draw_session_selector(f, &app.theme, sel);
+        draw_session_selector(f, &app.theme, sel, &mut app.session_rows);
     } else if let Some(sel) = &app.theme_selector {
         draw_theme_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.effort_selector {
@@ -648,27 +648,104 @@ fn draw_theme_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ThemeSele
     );
 }
 
+/// Pre-rendered rows + column widths for the `/resume` picker, recomputed only
+/// when the filter or the modal width moves. The picker repaints every frame,
+/// and the `relative_time`/`display_dir` formatting plus the three width passes
+/// are pure functions of the (filter, width) pair — caching them keeps a frame
+/// from redoing all of it for rows that have not changed.
+pub(crate) struct SessionRows {
+    /// The filter these rows and widths were derived from.
+    pub(crate) filter: String,
+    /// The modal inner width they were laid out for (changes on terminal
+    /// resize, which narrows the modal below its 110-column cap).
+    pub(crate) inner_w: usize,
+    /// id · name · age · cwd · error, in filtered display order.
+    pub(crate) rows: Vec<(String, String, String, String, Option<String>)>,
+    pub(crate) id_w: usize,
+    pub(crate) ts_w: usize,
+    pub(crate) cwd_w: usize,
+    pub(crate) name_w: usize,
+}
+
+impl SessionRows {
+    fn build(sel: &crate::app::SessionSelector, inner_w: usize) -> Self {
+        // Pre-render each visible row's cells: id · name · age · cwd · error.
+        let rows: Vec<(String, String, String, String, Option<String>)> = sel
+            .rows()
+            .map(|m| {
+                let ts = chrono::DateTime::from_timestamp(m.updated as i64, 0)
+                    .map(|t| hrdr_app::relative_time(t.with_timezone(&chrono::Local)))
+                    .unwrap_or_else(|| "—".to_string());
+                let cwd = hrdr_app::display_dir(std::path::Path::new(&m.cwd));
+                (m.id.clone(), m.name.clone(), ts, cwd, m.error.clone())
+            })
+            .collect();
+
+        // Column widths from the data: id and age fit their longest value
+        // (capped), the cwd gets up to a third of the width, and the name takes
+        // the rest. Error rows use the error text as the display name.
+        let id_w = rows
+            .iter()
+            .map(|r| r.0.chars().count())
+            .max()
+            .unwrap_or(2)
+            .min(20);
+        let ts_w = rows
+            .iter()
+            .map(|r| r.2.chars().count())
+            .max()
+            .unwrap_or(2)
+            .min(12);
+        let cwd_w = rows
+            .iter()
+            .filter(|r| r.4.is_none())
+            .map(|r| r.3.chars().count())
+            .max()
+            .unwrap_or(2)
+            .min(inner_w / 3);
+        let gaps = 3 * 2; // three two-space column separators
+        let name_w = inner_w.saturating_sub(id_w + ts_w + cwd_w + gaps).max(4);
+        Self {
+            filter: sel.filter.clone(),
+            inner_w,
+            rows,
+            id_w,
+            ts_w,
+            cwd_w,
+            name_w,
+        }
+    }
+}
+
 /// The `/resume` session picker modal: a search line, a hint, and a
 /// four-column list (id · name · age · cwd) of every saved session, newest
 /// first, narrowed by the fuzzy filter. Same chrome as the `/model` selector.
-fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SessionSelector) {
+fn draw_session_selector(
+    f: &mut Frame,
+    theme: &Theme,
+    sel: &crate::app::SessionSelector,
+    cache: &mut Option<SessionRows>,
+) {
     // A wider modal than the two-column pickers, and a custom four-column body,
     // so it keeps its own layout on top of the shared `modal_frame` chrome.
     let Some(inner) = modal_frame(f, theme, 110, 32, 3) else {
         return;
     };
+    let inner_w = inner.width as usize;
 
-    // Pre-render each visible row's cells: id · name · age · cwd · error.
-    let rows: Vec<(String, String, String, String, Option<String>)> = sel
-        .rows()
-        .map(|m| {
-            let ts = chrono::DateTime::from_timestamp(m.updated as i64, 0)
-                .map(|t| hrdr_app::relative_time(t.with_timezone(&chrono::Local)))
-                .unwrap_or_else(|| "—".to_string());
-            let cwd = hrdr_app::display_dir(std::path::Path::new(&m.cwd));
-            (m.id.clone(), m.name.clone(), ts, cwd, m.error.clone())
-        })
-        .collect();
+    // The rows and widths only move with the filter or the width — serve the
+    // memoized set and keep the per-frame work to the highlight window.
+    if cache
+        .as_ref()
+        .is_none_or(|c| c.filter != sel.filter || c.inner_w != inner_w)
+    {
+        *cache = Some(SessionRows::build(sel, inner_w));
+    }
+    let rows = &cache.as_ref().expect("just built").rows;
+    let id_w = cache.as_ref().expect("just built").id_w;
+    let ts_w = cache.as_ref().expect("just built").ts_w;
+    let cwd_w = cache.as_ref().expect("just built").cwd_w;
+    let name_w = cache.as_ref().expect("just built").name_w;
 
     let search = Line::from(vec![
         Span::styled("Search  ", Style::default().fg(theme.dim)),
@@ -685,37 +762,11 @@ fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Session
     ));
 
     let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
-    let inner_w = inner.width as usize;
     let start = if sel.selected >= list_height {
         (sel.selected + 1).saturating_sub(list_height)
     } else {
         0
     };
-
-    // Column widths from the data: id and age fit their longest value (capped),
-    // the cwd gets up to a third of the width, and the name takes the rest.
-    // Error rows use the error text as the display name.
-    let id_w = rows
-        .iter()
-        .map(|r| r.0.chars().count())
-        .max()
-        .unwrap_or(2)
-        .min(20);
-    let ts_w = rows
-        .iter()
-        .map(|r| r.2.chars().count())
-        .max()
-        .unwrap_or(2)
-        .min(12);
-    let cwd_w = rows
-        .iter()
-        .filter(|r| r.4.is_none())
-        .map(|r| r.3.chars().count())
-        .max()
-        .unwrap_or(2)
-        .min(inner_w / 3);
-    let gaps = 3 * 2; // three two-space column separators
-    let name_w = inner_w.saturating_sub(id_w + ts_w + cwd_w + gaps).max(4);
 
     let mut lines = vec![search, hint, Line::from("")];
     if rows.is_empty() {

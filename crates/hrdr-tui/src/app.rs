@@ -531,6 +531,11 @@ pub(crate) struct App {
     pub(crate) model_source: Option<hrdr_agent::CatalogSource>,
     /// The open `/resume` session picker modal; while `Some`, it captures every key.
     pub(crate) session_selector: Option<SessionSelector>,
+    /// Memoized rendered rows for the open `/resume` picker, keyed by its
+    /// filter + modal width — the picker repaints every frame and the rows only
+    /// move when the filter does. Cleared when the picker (re)opens, so a fresh
+    /// `list_sessions` is never hidden behind the previous open's rows.
+    pub(crate) session_rows: Option<crate::ui::SessionRows>,
     /// The open `/theme` picker modal; while `Some`, it captures every key and
     /// live-previews the highlighted theme.
     pub(crate) theme_selector: Option<ThemeSelector>,
@@ -855,6 +860,7 @@ impl App {
             model_loading: false,
             model_source: None,
             session_selector: None,
+            session_rows: None,
             theme_selector: None,
             theme_original: None,
             effort_selector: None,

@@ -517,6 +517,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             return;
         }
         self.app.session_selector = Some(super::session_selector(sessions));
+        // A fresh listing must never be hidden behind the previous open's
+        // cached rows (the memo is keyed by filter + width only).
+        self.app.session_rows = None;
     }
     fn begin_effort_selector(&mut self) {
         let reference = self.app.state().model.clone();
