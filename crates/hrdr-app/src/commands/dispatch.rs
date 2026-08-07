@@ -890,6 +890,97 @@ mod tests {
         );
     }
 
+    // ── dispatch contract ───────────────────────────────────────────────────
+
+    /// Every command in the registry is recognized by `dispatch` — except the
+    /// four handled above it. A name that stops returning `true` here is an arm
+    /// deleted, or a `return false` that slipped into a handler; a name added
+    /// to `SLASH_COMMANDS` without an arm fails this test until it gets one.
+    /// `tokio` because several arms post their output through spawned tasks.
+    #[tokio::test]
+    async fn every_registered_command_is_recognized_by_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        // Handled above `dispatch`, not by it: the TUI intercepts find/next/prev
+        // before falling through, and `/exit` is the caller's (the frontend
+        // quits rather than dispatching it). `dispatch` must NOT claim them.
+        const HANDLED_ABOVE_DISPATCH: &[&str] = &["/exit", "/find", "/next", "/prev"];
+
+        for (name, _) in crate::SLASH_COMMANDS {
+            if HANDLED_ABOVE_DISPATCH.contains(name) {
+                assert!(
+                    !dispatch(&mut host, name),
+                    "{name} is handled above dispatch — a dispatch arm would claim it"
+                );
+            } else {
+                assert!(
+                    dispatch(&mut host, name),
+                    "{name} must be recognized by dispatch"
+                );
+            }
+        }
+
+        // Unknown input is the only other thing that returns false.
+        assert!(!dispatch(&mut host, "/no-such-command"));
+        assert!(!dispatch(&mut host, "not a command"));
+        assert!(!dispatch(&mut host, ""));
+    }
+
+    /// The busy guards fire — the "check that cannot fail" shape nothing else
+    /// observes. `/cwd` (with an argument), `/init` and `/resume` (with an
+    /// argument) are refused while a turn is running; `/compact` queues instead
+    /// of starting, so the summary runs after the turn ends.
+    #[test]
+    fn busy_guards_fire_while_a_turn_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        std::fs::create_dir_all(&here).unwrap();
+        let mut host = TestHost::new(here.clone());
+        host.busy = true;
+
+        // /cwd is refused: the cwd does not move, and it says why.
+        assert!(dispatch(&mut host, &format!("/cwd {}", here.display())));
+        assert_eq!(host.cwd, here, "a busy session must not /cwd");
+        assert!(
+            host.info_log.iter().any(|l| l.contains("busy")),
+            "the refusal names it: {:?}",
+            host.info_log
+        );
+
+        // /init is refused.
+        assert!(dispatch(&mut host, "/init"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("can't /init while a turn is running")),
+            "{:?}",
+            host.info_log
+        );
+
+        // /resume with an argument is refused.
+        assert!(dispatch(&mut host, "/resume some-session"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("interrupt it before /resume")),
+            "{:?}",
+            host.info_log
+        );
+
+        // /compact is queued, not started.
+        assert!(dispatch(&mut host, "/compact"));
+        assert!(
+            host.started_compactions.is_empty(),
+            "a busy session must not start a compaction"
+        );
+        assert_eq!(
+            host.queued_compactions.len(),
+            1,
+            "a busy /compact is queued for after the turn"
+        );
+    }
+
     // ── /temp, /export, /effort, /doctor, /login, /skills ──────────────────
 
     /// The tests that read or write the shared sandboxed `config.toml`
