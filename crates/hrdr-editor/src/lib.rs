@@ -74,7 +74,9 @@ pub trait EditorEngine {
     /// Desired number of text rows for the input box given the inner `width`,
     /// clamped to `1..=max`. Lets the host auto-grow the input with content.
     /// Default counts logical lines (suits no-wrap engines like vim).
-    fn desired_rows(&self, _width: u16, max: u16) -> u16 {
+    /// `&mut` because a wrapping engine memoizes its layout across the sizing
+    /// and rendering passes of a frame.
+    fn desired_rows(&mut self, _width: u16, max: u16) -> u16 {
         let lines = self.content().split('\n').count().max(1);
         lines.clamp(1, max as usize) as u16
     }
@@ -133,8 +135,8 @@ pub(crate) fn char_width(c: char) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Word-wrapping layout — shared by [`wrapped_row_count`] and
-// [`plain::PlainEngine::render`] so both count and visual lines agree.
+// Word-wrapping layout — shared by the sizing and rendering halves of
+// [`plain::PlainEngine`] so both count and visual lines agree.
 // ---------------------------------------------------------------------------
 
 /// A single visual (wrapped) line: the chars rendered on one terminal row.
@@ -291,14 +293,6 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
     positions[n] = (lines.len() - 1, lines[lines.len() - 1].width);
 
     WrappedLayout { lines, positions }
-}
-
-/// Number of display rows `text` occupies when word-wrapped at `width`
-/// display columns (not chars).  Delegates to [`compute_wrapped_layout`],
-/// guaranteeing that [`PlainEngine::desired_rows`] and `PlainEngine::render`
-/// always agree.
-pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
-    compute_wrapped_layout(text, width.max(1) as usize).row_count()
 }
 
 /// The default discipline: hjkl's vim FSM.
@@ -471,6 +465,13 @@ impl TuiRender for VimEngine {
 mod wrap_tests {
     use super::*;
 
+    /// Row count for `text` at `width` — the tests' entry point into the wrap
+    /// algorithm, now that the production callers go through the engine's
+    /// layout memo.
+    fn rows(text: &str, width: u16) -> usize {
+        compute_wrapped_layout(text, width.max(1) as usize).row_count()
+    }
+
     // ------------------------------------------------------------------
     // Basic wrapping (applies to both hard-wrap and word-wrap)
     // ------------------------------------------------------------------
@@ -478,29 +479,29 @@ mod wrap_tests {
     /// Plain ASCII: one row exactly at the boundary, two rows one char past.
     #[test]
     fn ascii_wraps_at_the_column_boundary() {
-        assert_eq!(wrapped_row_count("0123456789", 10), 1);
-        assert_eq!(wrapped_row_count("01234567890", 10), 2);
+        assert_eq!(rows("0123456789", 10), 1);
+        assert_eq!(rows("01234567890", 10), 2);
     }
 
     /// Wide glyphs (CJK, width 2) count as 2 columns each.
     #[test]
     fn wide_glyphs_count_as_two_columns() {
         let line: String = std::iter::repeat_n('国', 6).collect();
-        assert_eq!(wrapped_row_count(&line, 10), 2);
+        assert_eq!(rows(&line, 10), 2);
     }
 
     /// A wide glyph that would straddle the boundary wraps whole.
     #[test]
     fn a_wide_glyph_does_not_split_across_the_boundary() {
         let line = format!("{}{}", "a".repeat(9), '国');
-        assert_eq!(wrapped_row_count(&line, 10), 2);
+        assert_eq!(rows(&line, 10), 2);
     }
 
     /// Zero-width combining marks ride on the previous cell.
     #[test]
     fn zero_width_combining_marks_are_free() {
         let line: String = std::iter::repeat_n("e\u{0301}", 10).collect();
-        assert_eq!(wrapped_row_count(&line, 10), 1);
+        assert_eq!(rows(&line, 10), 1);
     }
 
     // ------------------------------------------------------------------
@@ -512,26 +513,26 @@ mod wrap_tests {
     fn word_wrap_does_not_split_words() {
         // "hello world" at width 7: "hello" (5) + ws (1) = 6 fits,
         // "world" (5) would make 11 > 7.  Word-wrap puts "world" on row 2.
-        assert_eq!(wrapped_row_count("hello world", 7), 2);
+        assert_eq!(rows("hello world", 7), 2);
 
         // At width 11 everything fits on one row.
-        assert_eq!(wrapped_row_count("hello world", 11), 1);
+        assert_eq!(rows("hello world", 11), 1);
     }
 
     /// A word longer than width is still hard-wrapped.
     #[test]
     fn overlong_word_is_hard_wrapped() {
         // "superlongword" at width 6: each chunk of 6 chars wraps.
-        assert_eq!(wrapped_row_count("superlongword", 6), 3); // superl ongwor d
+        assert_eq!(rows("superlongword", 6), 3); // superl ongwor d
     }
 
     /// Word-wrap + explicit newlines interact correctly.
     #[test]
     fn explicit_newlines_force_breaks() {
         // Two short logical lines each fit their own row.
-        assert_eq!(wrapped_row_count("ab\ncd", 10), 2);
+        assert_eq!(rows("ab\ncd", 10), 2);
         // Long first line wraps, second fits.
-        assert_eq!(wrapped_row_count("hello world\nab", 7), 3);
+        assert_eq!(rows("hello world\nab", 7), 3);
     }
 
     /// Unicode width with word-wrap: wide chars in words.
@@ -540,7 +541,7 @@ mod wrap_tests {
         // "hello 世界 world" at width 11:
         // "hello " = 6 fits, "世界" (4 cols) + " world" (6) = overflow.
         // "世" alone is 2 cols; "世界" is 4 cols, fits on empty line.
-        assert_eq!(wrapped_row_count("hello 世界 world", 11), 2);
+        assert_eq!(rows("hello 世界 world", 11), 2);
     }
 
     /// Cursor position mapping at various char indices.
@@ -618,7 +619,7 @@ mod wrap_tests {
     /// Empty text produces 1 row.
     #[test]
     fn empty_text() {
-        assert_eq!(wrapped_row_count("", 10), 1);
+        assert_eq!(rows("", 10), 1);
         let layout = compute_wrapped_layout("", 10);
         assert_eq!(layout.row_count(), 1);
         assert_eq!(layout.cursor_pos(0), (0, 0));
@@ -627,7 +628,7 @@ mod wrap_tests {
     /// Text that is only newlines.
     #[test]
     fn only_newlines() {
-        assert_eq!(wrapped_row_count("\n", 10), 2);
-        assert_eq!(wrapped_row_count("\n\n", 10), 3);
+        assert_eq!(rows("\n", 10), 2);
+        assert_eq!(rows("\n\n", 10), 3);
     }
 }

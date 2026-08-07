@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use crate::{EditorEngine, wrapped_row_count};
+use crate::EditorEngine;
 
 /// A plain UTF-8 text buffer with a char-index cursor.
 #[derive(Default)]
@@ -22,6 +22,12 @@ pub struct PlainEngine {
     chars: Vec<char>,
     /// Cursor position as an index into `chars`, in `0..=chars.len()`.
     cursor: usize,
+    /// Memoized wrap layout for the current content, keyed by width. The frame
+    /// sizes the pane with [`EditorEngine::desired_rows`] and then renders it
+    /// with the same width, so the two wrap computations would otherwise run
+    /// per frame on identical input. Invalidated on every content mutation;
+    /// cursor-only moves leave it valid.
+    layout_cache: Option<(usize, crate::WrappedLayout)>,
 }
 
 impl PlainEngine {
@@ -29,21 +35,39 @@ impl PlainEngine {
         Self::default()
     }
 
+    /// The wrap layout for the current content at `width`, computing it once
+    /// per (content, width) pair instead of once per caller.
+    fn layout(&mut self, width: usize) -> &crate::WrappedLayout {
+        if !matches!(&self.layout_cache, Some((w, _)) if *w == width) {
+            self.layout_cache =
+                Some((width, crate::compute_wrapped_layout(&self.content(), width)));
+        }
+        &self.layout_cache.as_ref().expect("just filled").1
+    }
+
+    /// Any content mutation invalidates the memoized layout.
+    fn invalidate_layout(&mut self) {
+        self.layout_cache = None;
+    }
+
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+        self.invalidate_layout();
     }
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
+            self.invalidate_layout();
         }
     }
 
     fn delete(&mut self) {
         if self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
+            self.invalidate_layout();
         }
     }
 
@@ -126,6 +150,7 @@ impl PlainEngine {
         let start = self.line_start();
         self.chars.drain(start..self.cursor);
         self.cursor = start;
+        self.invalidate_layout();
     }
 
     /// True when the char immediately before the cursor is a backslash — the
@@ -174,6 +199,7 @@ impl EditorEngine for PlainEngine {
     fn set_content(&mut self, text: &str) {
         self.chars = text.chars().collect();
         self.cursor = self.chars.len();
+        self.invalidate_layout();
     }
 
     fn mode_label(&self) -> &'static str {
@@ -198,8 +224,10 @@ impl EditorEngine for PlainEngine {
         "Enter=send · Alt/Shift+Enter or \\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
 
-    fn desired_rows(&self, width: u16, max: u16) -> u16 {
-        wrapped_row_count(&self.content(), width).clamp(1, max as usize) as u16
+    fn desired_rows(&mut self, width: u16, max: u16) -> u16 {
+        self.layout(width.max(1) as usize)
+            .row_count()
+            .clamp(1, max as usize) as u16
     }
 
     fn paste(&mut self, text: &str) {
@@ -214,11 +242,12 @@ impl EditorEngine for PlainEngine {
 impl crate::TuiRender for PlainEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width.max(1) as usize;
-        let layout = crate::compute_wrapped_layout(&self.content(), width);
+        let cursor = self.cursor; // copy out before the layout borrow
+        let layout = self.layout(width);
 
         // Vertically scroll so the cursor row stays visible when the content
         // is taller than the (capped) box.
-        let (crow, ccol) = layout.cursor_pos(self.cursor);
+        let (crow, ccol) = layout.cursor_pos(cursor);
         let height = area.height.max(1) as usize;
         let top = crow.saturating_sub(height - 1);
         let visible: Vec<Line> = layout
@@ -331,6 +360,41 @@ mod tests {
     /// Regression: both `desired_rows` and `render` counted `chars().count()`,
     /// so 6 double-width glyphs (12 columns) were treated as fitting a
     /// 10-column line with room to spare.
+    #[test]
+    fn the_layout_memo_spans_the_frame_and_invalidates_on_edit() {
+        let mut e = PlainEngine::new();
+        type_str(&mut e, "hello world again");
+
+        // The sizing pass computes the layout and memoizes it…
+        assert_eq!(e.desired_rows(7, 10), 3);
+        assert!(
+            e.layout_cache.is_some(),
+            "the sizing pass memoizes its layout"
+        );
+        // …a cursor move changes nothing in the buffer, so the memo stands…
+        e.left();
+        assert!(
+            e.layout_cache.is_some(),
+            "a cursor move must not invalidate the memo"
+        );
+        // …and a different width recomputes (the memo is keyed by width).
+        e.desired_rows(9, 10);
+        assert!(
+            matches!(&e.layout_cache, Some((w, _)) if *w == 9),
+            "a new width recomputes and re-memoizes"
+        );
+
+        // Any content edit invalidates, so the next sizing pass recomputes
+        // against the new buffer.
+        e.insert('!');
+        assert!(
+            e.layout_cache.is_none(),
+            "an edit invalidates the memoized layout"
+        );
+        assert_eq!(e.desired_rows(9, 10), 3);
+        assert!(e.layout_cache.is_some(), "recomputed for the new content");
+    }
+
     #[test]
     fn wide_glyphs_wrap_by_display_width_and_place_the_cursor_on_the_right_cell() {
         use crate::TuiRender;
