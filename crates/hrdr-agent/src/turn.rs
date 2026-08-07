@@ -34,7 +34,7 @@ const CHARS_PER_TOKEN: usize = 4;
 /// bookkeeping between rounds. Dividing tokens by the first is what made a fast
 /// model read as one that slows down over a long turn — every round adds another
 /// prefill to the denominator and none of it to the numerator.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TurnStats {
     /// When the turn began (monotonic — for durations).
     pub started: Option<Instant>,

@@ -14,7 +14,7 @@
 //! it, so every view is assembled by exactly the same rules: assistant text
 //! coalesces, reasoning coalesces, tool calls open and close.
 
-use crate::{AgentEvent, AgentRegistry, Entry, SessionState, apply_event};
+use crate::{AgentEntry, AgentEvent, AgentRegistry, Entry, SessionState, apply_event};
 
 /// Which conversation a pane is: the [`crate::AgentEntry::key`] of the agent it
 /// shows. The session's own agent is [`PaneId::MAIN`] and is a key like any
@@ -103,6 +103,13 @@ pub struct Pane {
     pub sandbox: hrdr_tools::SandboxMode,
     /// This agent's live TODO list — the one its own `todo` tool writes.
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
+    /// The `task` call that spawned this agent, when there was one — what
+    /// [`apply_replayed`] matches a finished `task` block against. Set at
+    /// registration, never changes (see [`crate::AgentEntry::tool_id`]).
+    tool_id: Option<String>,
+    /// What that `task` block should read once it finishes: *what was delegated
+    /// to*. Set at registration, never changes.
+    delegation: Option<String>,
     /// Where the reader is in this conversation, and what they had half-typed to
     /// it.
     ///
@@ -201,6 +208,8 @@ impl Default for PaneSet {
                 compaction_reserved: 0,
                 sandbox: hrdr_tools::SandboxMode::None,
                 todos: Default::default(),
+                tool_id: None,
+                delegation: None,
                 consumed: 0,
                 view: PaneView::default(),
             }],
@@ -265,6 +274,13 @@ impl PaneSet {
         self.panes.iter_mut().find(|p| p.id.key() == key)
     }
 
+    /// The pane for a registry key, read-only — the immutable twin of
+    /// [`Self::pane_for`], which is what `sync`'s diff pass needs inside the
+    /// registry lock.
+    fn pane_ref(&self, key: u64) -> Option<&Pane> {
+        self.panes.iter().find(|p| p.id.key() == key)
+    }
+
     /// A pane by id.
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.pane_for(id.key())
@@ -296,62 +312,53 @@ impl PaneSet {
     /// thing that says "someone is still reading this one".
     pub fn sync(&mut self, live: &AgentRegistry) {
         let active = self.active;
-        let seen: Vec<LiveSnapshot> = live.with(|v| {
+        // Diff against the panes: an entry is snapshotted only when its pane no
+        // longer holds its data. An idle agent — nothing changed since the pane
+        // last saw it — costs one `pane_holds` pass (no allocation) instead of a
+        // full snapshot build (five string clones, a steering-queue clone, and
+        // the re-clones into the pane).
+        let (keys, seen, delegations) = live.with(|v| {
             for e in v.iter_mut() {
                 // The session's agent is always pinned — it is the conversation,
                 // and `owns_session` is the one place that says so.
                 e.pinned = e.owns_session() || PaneId(e.key) == active;
             }
-            v.iter()
-                .map(|e| LiveSnapshot {
-                    key: e.key,
-                    label: e.label.clone(),
-                    model: e.model.clone(),
-                    provider: e.provider.clone(),
-                    base_url: e.base_url.clone(),
-                    effort: e.effort.clone(),
-                    auto_compact: e.auto_compact,
-                    compaction_reserved: e.compaction_reserved,
-                    sandbox: e.sandbox,
-                    todos: std::sync::Arc::clone(&e.todos),
-                    usage: e.usage,
-                    turn: e.turn,
-                    running: e.running,
-                    done: e.done,
-                    compacting: e.compacting,
-                    pending: e
-                        .steering
-                        .lock()
-                        .map(|q| q.iter().map(|s| s.display.clone()).collect())
-                        .unwrap_or_default(),
-                    // A finished `task` block shows *what was delegated to*, not the
-                    // work — the work is in that agent's own transcript.
-                    tool_id: e.tool_id.clone(),
-                    delegation: (!e.owns_session()).then(|| match &e.provider {
-                        Some(p) => format!("{} · {p}/{}", e.label, e.model),
-                        None => format!("{} · {}", e.label, e.model),
-                    }),
-                })
-                .collect()
+            let keys: Vec<u64> = v.iter().map(|e| e.key).collect();
+            let seen: Vec<LiveSnapshot> = v
+                .iter()
+                .filter(|e| !self.pane_ref(e.key).is_some_and(|p| pane_holds(e, p)))
+                .map(LiveSnapshot::from)
+                .collect();
+            // Which `task` call each sub-agent was spawned by, and how its
+            // finished block should read. What `apply_replayed` resolves a
+            // delegation against — paid per frame for every entry, exactly as
+            // the snapshot list used to.
+            let delegations: Vec<(String, String)> = v
+                .iter()
+                .filter_map(|e| Some((e.tool_id.clone()?, delegation_of(e)?)))
+                .collect();
+            (keys, seen, delegations)
         });
 
-        // Every agent is brought up to date the same way — the main one included.
-        // Adopt any newly delegated agent, refresh what the registry owns (its
-        // model/provider/endpoint, which a `/model` switch repoints, and its usage,
-        // which it counts for itself), then replay whatever it has emitted since we
-        // last looked.
-        for s in &seen {
+        // Every changed agent is brought up to date the same way — the main one
+        // included. Adopt any newly delegated agent, refresh what the registry
+        // owns (its model/provider/endpoint, which a `/model` switch repoints, and
+        // its usage, which it counts for itself), then replay whatever it has
+        // emitted since we last looked. Unchanged agents keep their pane's data
+        // wholesale — the snapshot is consumed, not re-cloned.
+        for s in seen {
             let status = match (s.running, s.done) {
                 (true, _) => PaneStatus::Running,
                 (false, true) => PaneStatus::Done,
                 (false, false) => PaneStatus::Idle,
             };
-            let is_main = PaneId(s.key).is_main();
-            let pane = match self.pane_for(s.key) {
+            let key = s.key;
+            let is_main = PaneId(key).is_main();
+            let pane = match self.pane_for(key) {
                 Some(p) => p,
                 None => {
                     self.panes.push(Pane {
-                        id: PaneId(s.key),
+                        id: PaneId(key),
                         status,
                         state: SessionState::default(),
                         turn: crate::TurnStats::default(),
@@ -362,6 +369,8 @@ impl PaneSet {
                         compaction_reserved: 0,
                         sandbox: s.sandbox,
                         todos: Default::default(),
+                        tool_id: None,
+                        delegation: None,
                         consumed: 0,
                         view: PaneView::default(),
                     });
@@ -371,12 +380,12 @@ impl PaneSet {
             pane.status = status;
             pane.turn = s.turn;
             pane.compacting = s.compacting;
-            pane.pending = s.pending.clone();
-            pane.effort = s.effort.clone();
+            pane.pending = s.pending;
+            pane.effort = s.effort;
             pane.auto_compact = s.auto_compact;
             pane.compaction_reserved = s.compaction_reserved;
             pane.sandbox = s.sandbox;
-            pane.todos = std::sync::Arc::clone(&s.todos);
+            pane.todos = s.todos;
             // The registry still carries the agent's identity as two values; it is
             // paired back up here, at the edge, exactly as the session file's is.
             pane.state.model = crate::ModelRef::new(
@@ -384,27 +393,32 @@ impl PaneSet {
                 &s.model,
             )
             .unwrap_or_else(|_| pane.state.model.clone());
-            pane.state.base_url = s.base_url.clone();
+            pane.state.base_url = s.base_url;
             pane.state.usage = s.usage;
             // The main pane's name is the *session's*, which the session file owns —
             // it is not the agent's label.
             if !is_main {
-                pane.state.name = s.label.clone();
+                pane.state.name = s.label;
             }
+            pane.tool_id = s.tool_id;
+            pane.delegation = s.delegation;
+        }
 
-            // Replay the agent's own record into its transcript. This is the only
-            // thing that builds any transcript, main or delegated: one reducer, one
-            // record, one rule — a frontend renders an agent without knowing which
-            // kind it is.
+        // Replay every live agent's record into its transcript. This is the only
+        // thing that builds any transcript, main or delegated: one reducer, one
+        // record, one rule — a frontend renders an agent without knowing which
+        // kind it is. Unchanged entries are replayed too: events are exactly what
+        // the diff does not cover.
+        for &key in &keys {
+            let pane = self.pane_for(key).expect("every live key has a pane");
             let from = pane.consumed;
-            if let Some((events, next)) = live.events_since(s.key, from) {
-                let pane = self.pane_for(s.key).expect("just adopted");
+            if let Some((events, next)) = live.events_since(key, from) {
                 for ev in &events {
-                    apply_replayed(&mut pane.state.transcript, ev, &seen);
+                    apply_replayed(&mut pane.state.transcript, ev, &delegations);
                 }
                 pane.consumed = next;
                 // Folded in — the agent may release them.
-                live.compact(s.key, next);
+                live.compact(key, next);
             }
         }
 
@@ -414,7 +428,7 @@ impl PaneSet {
         // (`panes[0]`, the invariant `main()` rests on) rather than depending on the
         // registry having reported it this tick.
         self.panes
-            .retain(|p| p.id.is_main() || seen.iter().any(|s| s.key == p.id.key()));
+            .retain(|p| p.id.is_main() || keys.contains(&p.id.key()));
 
         // If the active pane was released anyway (it was never live), fall back.
         if !self.panes.iter().any(|p| p.id == self.active) {
@@ -449,6 +463,96 @@ struct LiveSnapshot {
     delegation: Option<String>,
 }
 
+/// Test-only count of snapshot builds, so the diff's observable: a no-op sync
+/// must build none, a one-entry change exactly one.
+#[cfg(test)]
+static SNAPSHOT_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What [`PaneSet::sync`] reads off one registry entry — the full snapshot, for
+/// the entries the diff judged changed.
+impl From<&AgentEntry> for LiveSnapshot {
+    fn from(e: &AgentEntry) -> Self {
+        #[cfg(test)]
+        SNAPSHOT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            key: e.key,
+            label: e.label.clone(),
+            model: e.model.clone(),
+            provider: e.provider.clone(),
+            base_url: e.base_url.clone(),
+            effort: e.effort.clone(),
+            auto_compact: e.auto_compact,
+            compaction_reserved: e.compaction_reserved,
+            sandbox: e.sandbox,
+            todos: std::sync::Arc::clone(&e.todos),
+            usage: e.usage,
+            turn: e.turn,
+            running: e.running,
+            done: e.done,
+            compacting: e.compacting,
+            pending: e
+                .steering
+                .lock()
+                .map(|q| q.iter().map(|s| s.display.clone()).collect())
+                .unwrap_or_default(),
+            tool_id: e.tool_id.clone(),
+            delegation: delegation_of(e),
+        }
+    }
+}
+
+/// What a finished `task` block should read: *what was delegated to*, not the
+/// work — the work is in that agent's own transcript. `None` for the main agent,
+/// whose block is not a delegation.
+fn delegation_of(entry: &AgentEntry) -> Option<String> {
+    (!entry.owns_session()).then(|| match &entry.provider {
+        Some(p) => format!("{} · {p}/{}", entry.label, entry.model),
+        None => format!("{} · {}", entry.label, entry.model),
+    })
+}
+
+/// Whether the pane already shows everything `sync` would copy off `entry` —
+/// the allocation-free diff that lets an unchanged agent skip its snapshot
+/// build. `false` for a pane that is not there yet: a fresh pane starts from
+/// `Default`s no live entry matches.
+fn pane_holds(entry: &AgentEntry, pane: &Pane) -> bool {
+    let status = match (entry.running, entry.done) {
+        (true, _) => PaneStatus::Running,
+        (false, true) => PaneStatus::Done,
+        (false, false) => PaneStatus::Idle,
+    };
+    // The queue is compared element-wise, by display string only, without
+    // cloning. A poisoned lock counts as changed: the snapshot path falls back
+    // to an empty default, which is what the pane would otherwise diverge from.
+    let pending_holds = match entry.steering.lock() {
+        Ok(q) => {
+            q.len() == pane.pending.len()
+                && q.iter().zip(&pane.pending).all(|(s, p)| s.display == *p)
+        }
+        Err(_) => false,
+    };
+    pane.status == status
+        && pane.turn == entry.turn
+        && pane.compacting == entry.compacting
+        && pane.effort.as_deref() == entry.effort.as_deref()
+        && pane.auto_compact == entry.auto_compact
+        && pane.compaction_reserved == entry.compaction_reserved
+        && pane.sandbox == entry.sandbox
+        // Same Arc means an in-place `todo` mutation is visible without a rebuild.
+        && std::sync::Arc::ptr_eq(&pane.todos, &entry.todos)
+        && pane.state.usage == entry.usage
+        && pane.state.model.provider().as_str() == entry.provider.as_deref().unwrap_or("local")
+        && pane.state.model.model() == entry.model
+        && pane.state.base_url == entry.base_url
+        // The main pane's name is the *session's* — `sync` never sets it from the
+        // agent's label (which is just "main") — so the name check applies to
+        // sub-agents only, whose pane name *is* the label.
+        && (entry.owns_session() || pane.state.name == entry.label)
+        && pane.tool_id == entry.tool_id
+        && pane.delegation == delegation_of(entry)
+        && pending_holds
+}
+
 /// Fold a replayed event into a transcript, applying the one thing a transcript
 /// cannot know from the event alone: a `task` call is a *delegation*.
 ///
@@ -458,12 +562,12 @@ struct LiveSnapshot {
 /// make the parent's transcript a second, flattened copy of a conversation that
 /// has a transcript of its own. The model still receives the real result; this is
 /// only what is *shown*.
-fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, agents: &[LiveSnapshot]) {
-    let delegated = |id: &str| {
-        agents
+fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, delegations: &[(String, String)]) {
+    let delegated = |tid: &str| {
+        delegations
             .iter()
-            .find(|s| s.tool_id.as_deref() == Some(id))
-            .and_then(|s| s.delegation.clone())
+            .find(|(id, _)| id == tid)
+            .map(|(_, d)| d.clone())
     };
     match ev {
         AgentEvent::ToolOutput { id, .. } if delegated(id).is_some() => {}
@@ -943,5 +1047,122 @@ mod tests {
         live.prune();
         panes.sync(&live);
         assert!(panes.subs().is_empty());
+    }
+
+    /// The diff: an idle agent — nothing changed since the pane last saw it —
+    /// is not rebuilt on the next sync. Only entries whose data actually moved
+    /// get a fresh snapshot; everything else keeps the pane it already has.
+    #[test]
+    fn sync_rebuilds_only_changed_panes() {
+        let live = live_with(&[1]);
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+
+        // Nothing changed since the pane was built: the next sync builds none.
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an unchanged agent costs no snapshot build"
+        );
+
+        // One field changes: exactly that entry rebuilds, and the pane sees it.
+        live.update(1, |e| e.model = "other".into());
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the changed entry rebuilds"
+        );
+        panes.focus(PaneId(1));
+        assert_eq!(panes.active_pane().model(), "other");
+    }
+
+    /// The main pane is the one synced every frame, and its name is the
+    /// *session's*, never the agent's `"main"` label — so the diff must not
+    /// compare them (it did once, inverted, rebuilding the main pane every
+    /// frame forever).
+    #[test]
+    fn the_main_pane_is_not_rebuilt_by_a_noop_sync() {
+        let live = live_with(&[crate::MAIN_KEY]);
+        // The main pane's name is the session's, and it is set by the app, not
+        // by sync — give it one to prove the label is irrelevant.
+        let mut panes = PaneSet::new();
+        panes.main_mut().state.name = "The Session".to_string();
+        panes.sync(&live);
+
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an unchanged main agent costs no snapshot build"
+        );
+
+        // A changed main agent still rebuilds.
+        live.update(crate::MAIN_KEY, |e| e.running = true);
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(panes.main().status, PaneStatus::Running);
+    }
+
+    /// Steering is part of the diff too: a message pushed onto the agent's queue
+    /// since the last sync is picked up, and an untouched queue is not rebuilt.
+    #[test]
+    fn sync_picks_up_a_pending_steer_through_the_diff() {
+        let live = live_with(&[1]);
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+
+        // The agent is handed one steer; the next sync sees it.
+        live.update(1, |e| {
+            e.steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::new("<expanded @file blob>", "check auth"));
+        });
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            panes.subs()[0].pending,
+            vec!["check auth".to_string()],
+            "the pane shows what was typed, not the expansion"
+        );
+
+        // Nothing new was steered: no rebuild.
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // A second steer is picked up in order, queue and pane aligned.
+        live.update(1, |e| {
+            e.steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::plain("one more"));
+        });
+        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        panes.sync(&live);
+        assert_eq!(
+            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            panes.subs()[0].pending,
+            vec!["check auth".to_string(), "one more".to_string()]
+        );
     }
 }
