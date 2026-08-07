@@ -356,6 +356,53 @@ const COMPACT_ASSUMED_OUTPUT_TOKENS: u32 = 32_768;
 /// [`Agent::first_viable_compact_stage`]'s `prefix_tokens`.
 const COMPACT_INPUT_SLACK: u32 = 8_192;
 
+/// Token estimate for the history a shrink stage would send, without building
+/// it: the sizing pass in [`Agent::first_viable_compact_stage`] used to
+/// construct each stage's full `Vec` just to count it — a whole-history clone
+/// for `Full`, another for `Elided`, and a fresh window per shrink stage. The
+/// estimator is a per-message sum, so slices plus the carried summary estimate
+/// equal the built request exactly.
+fn estimate_stage_history(
+    stage: ShrinkStage,
+    full: &[ChatMessage],
+    elided: &mut Option<Vec<ChatMessage>>,
+) -> u32 {
+    if stage == ShrinkStage::Full {
+        return estimate_tokens_in_messages(full);
+    }
+    let elided = elided.get_or_insert_with(|| elide_tool_results(full));
+    match stage {
+        // `Full` returned above; naming it (rather than a catch-all) is what
+        // makes a new stage a compile error here instead of silently taking
+        // whichever arm was written last.
+        ShrinkStage::Full | ShrinkStage::Elided => estimate_tokens_in_messages(elided),
+        ShrinkStage::Half => estimate_tail_window(elided, 2),
+        ShrinkStage::Quarter => estimate_tail_window(elided, 4),
+        ShrinkStage::Eighth => estimate_tail_window(elided, 8),
+    }
+}
+
+/// The token estimate of [`tail_window`] plus [`carry_prior_summary`] for
+/// `div`, without building either: the window is a slice and the carried
+/// summary is one message, both counted in place.
+fn estimate_tail_window(msgs: &[ChatMessage], div: usize) -> u32 {
+    let keep = (msgs.len() / div.max(1))
+        .min(msgs.len())
+        .max(2.min(msgs.len()));
+    let start = align_past_tool_results(msgs, msgs.len() - keep);
+    let mut est = estimate_tokens_in_messages(&msgs[start..]);
+    // Mirror `carry_prior_summary`: a cut window dropped the previous summary
+    // at its front, and the request would re-attach it.
+    if start > 0
+        && let Some(summary) = msgs
+            .first()
+            .filter(|m| matches!(m.origin, MessageOrigin::Summary(_)))
+    {
+        est = est.saturating_add(estimate_tokens_in_messages(std::slice::from_ref(summary)));
+    }
+    est
+}
+
 /// The history a given shrink stage sends: the whole head, the head with bulky
 /// tool results elided, then the most recent 1/2, 1/4, 1/8 of the elided head.
 ///
@@ -966,9 +1013,7 @@ impl Agent {
         }
         ShrinkStage::LADDER
             .into_iter()
-            .find(|&stage| {
-                estimate_tokens_in_messages(&compact_stage_history(stage, full, elided)) <= budget
-            })
+            .find(|&stage| estimate_stage_history(stage, full, elided) <= budget)
             .unwrap_or(ShrinkStage::Eighth)
     }
 
@@ -1243,6 +1288,45 @@ mod tests {
         // than by comparing against a bound written down somewhere else.
         assert_eq!(ShrinkStage::Eighth.next(), None);
         assert_eq!(ShrinkStage::LADDER.last(), Some(&ShrinkStage::Eighth));
+    }
+
+    /// The sizing estimator (`estimate_stage_history`) must agree with actually
+    /// building each stage's history and counting it — it exists to avoid those
+    /// builds, so a drift between the two would start the ladder at the wrong
+    /// rung. Asserted across every stage on a history with tool results, with
+    /// and without a prior compaction summary (the case that exercises the
+    /// carry logic).
+    #[test]
+    fn the_ladder_estimator_matches_the_built_histories() {
+        let with_summary: Vec<ChatMessage> = {
+            let mut v = vec![ChatMessage {
+                origin: MessageOrigin::Summary(CompactionReason::ContextOverflow),
+                ..ChatMessage::user("EVERYTHING BEFORE THE LAST COMPACTION")
+            }];
+            v.extend((0..16).map(|i| {
+                if i % 2 == 0 {
+                    sized(Role::User, 100)
+                } else {
+                    sized(Role::Tool, 1_000)
+                }
+            }));
+            v
+        };
+
+        for full in [with_summary.clone(), with_summary[1..].to_vec()] {
+            for stage in ShrinkStage::LADDER {
+                let mut built_elided = None;
+                let built = compact_stage_history(stage, &full, &mut built_elided);
+                let mut est_elided = None;
+                let estimate = estimate_stage_history(stage, &full, &mut est_elided);
+                assert_eq!(
+                    estimate,
+                    estimate_tokens_in_messages(&built),
+                    "{}: the estimator agrees with the built history",
+                    stage.label()
+                );
+            }
+        }
     }
 
     /// A shrink stage drops the front of the history — but never the previous
