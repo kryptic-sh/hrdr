@@ -73,9 +73,8 @@ something and deleted where it does not.
 **Pruned again 2026-08-01**, by the full-codebase review pass
 (`4e66a1c`..`2e3be29`, released v0.10.0). It closed all sixteen of its own
 findings, so `docs/code-review.md` is deleted per the convention below; what it
-left open is under [Review coverage still owed](#review-coverage-still-owed) and
-[Known behaviour to revisit](#known-behaviour-to-revisit), and what it taught is
-under
+left open is under [Known behaviour to revisit](#known-behaviour-to-revisit),
+and what it taught is under
 [Cleared in the 2026-08-01 review pass](#cleared-in-the-2026-08-01-review-pass).
 
 **Pruned again 2026-08-02**, by the backend pass (`7e80605`..`9c3d012`). macOS
@@ -128,6 +127,25 @@ and still did not reproduce; two discriminating resume-driven probes now pin the
 geometry and the item stays only as that record. The AUR outage behind the
 v0.11.0 publish persists (probed 2026-08-07). The rest of what needs a decision
 stays where it is.
+
+**Pruned again 2026-08-07, second pass same day**: the perf 2026-08-06 findings
+6-8, closed by the morning's perf slices and already recorded under
+[Record: closed efforts](#record-closed-efforts), are deleted with their
+`[fixed]` tags; only the context item stays. The "Review coverage still owed"
+section is deleted — every file it named (the TUI's `ui.rs` block rendering and
+`app/commands.rs`, and the twelve `hrdr-tools` files) was walked in full by the
+2026-08-04/05/06 passes, whose Coverage records now carry that. The three
+commits since the last record (`333abf6` `:tickets` skill, `49d9657` template
+reflow, `c25532a` Content-Type restore on the no-graft OpenAI request) closed no
+backlog item. Everything else was re-verified against the tree and still stands:
+the per-choice haystack half of perf 2026-08-04 #9 (`selector.rs::refilter`
+still filters on the fly), tidy 2026-08-04 #9 (`apply_cache_breakpoints` still
+re-exported from `hrdr-llm`'s `lib.rs`), correctness 2026-08-04 #1 (memory
+descriptions still emit unquoted), the two dispatch.rs findings (`/cwd` still
+resolves against `host.cwd()` while writing `host.agent()`; `resolve_alias`
+still returns the original case on fall-through, so `/CWD` still misses), the
+compaction `session_name_from` item, and the AUR RPC still reporting `0.10.0-1`
+for v0.11.0.
 
 Conventions:
 
@@ -896,23 +914,12 @@ hrdr-test-support + apps/hrdr). All findings below were re-traced at the cited
 lines. Already-shipped wins from the 2026-08-05 pass were verified in place and
 are not re-reported.
 
-**Findings (ranked by impact):**
-
-6. **`PaneSet::sync` rebuilds a full snapshot of every registry entry once per
-   frame** — **[fixed — `a315eca`: `sync` diffs each entry against its pane and
-   snapshots only what changed, moving the snapshot in instead of re-cloning]**
-7. **Every historical tool call's arguments re-parsed from JSON on every
-   Anthropic request** — **[fixed — `38b45d9`: the parsed form is memoized on
-   the call at finalization]**
-8. **Input pane laid out twice per frame** — **[fixed — `48c7b09`: `PlainEngine`
-   memoizes the wrap layout, invalidated on edits]**
-
-9. **Context — `budget`'s O(H) token estimate per round when the server reports
-   no usage.** `crates/hrdr-agent/src/budget.rs:122-127`
-   (`estimate_tokens_in_messages(&self.messages)` per round in `account_usage`
-   when `acc.usage` is None). Cheap per pass; hoistable into a running total,
-   but needs care across compaction/resume. Not worth it unless the no-usage
-   case (self-hosted servers) is common.
+**Context — `budget`'s O(H) token estimate per round when the server reports no
+usage.** `crates/hrdr-agent/src/budget.rs:122-127`
+(`estimate_tokens_in_messages(&self.messages)` per round in `account_usage` when
+`acc.usage` is None). Cheap per pass; hoistable into a running total, but needs
+care across compaction/resume. Not worth it unless the no-usage case
+(self-hosted servers) is common.
 
 **Recorded items confirmed still present (not re-recorded):** the per-frame
 full-transcript layout walk (`ui.rs:2664` `transcript_chunks` + `:912-918`
@@ -945,9 +952,10 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: findings 6-8 fixed — `a315eca`, `38b45d9`, `48c7b09`; finding 9 is
-context, left open by decision. The rest were fixed — `2f38e1b`, `631b432`,
-`eafc82c`, `9d5f5ed`, `695840d`, `1e24635` (Record: closed efforts).**
+**Status: findings 6-8 fixed — `a315eca`, `38b45d9`, `48c7b09` (Record: closed
+efforts); the context item above is left open by decision. The rest were fixed —
+`2f38e1b`, `631b432`, `eafc82c`, `9d5f5ed`, `695840d`, `1e24635` (Record: closed
+efforts).**
 
 ## Dependency upgrades held back, 2026-08-03
 
@@ -1925,20 +1933,6 @@ was judged only at its `begin_*` entry points. `login.rs`, `skills.rs`,
 compiled.
 
 ---
-
-## Review coverage still owed
-
-The 2026-08-01 pass (see
-[Cleared in the 2026-08-01 review pass](#cleared-in-the-2026-08-01-review-pass))
-closed every finding it raised, but it did not read everything. What it never
-opened, so nobody records it as reviewed:
-
-- **`hrdr-tui/src/ui.rs` block rendering** and **`app/commands.rs`**. Only the
-  mouse/selection path (`e1b3023`) and the scroll/highlight math were read.
-- **Twelve `hrdr-tools` files**: `find`, `ls`, `secret_diff`, `mutation`,
-  `todo`, `tree`, `verify`, `memory`, `verification`, `ansi`, `test_nudge`,
-  `lsp`. The 2026-07-31 pass listed them as a gap and the 2026-08-01 pass
-  covered `gate`, `hooks`, `web`, `replace` and `mcp/client` instead.
 
 ## Known behaviour to revisit
 
