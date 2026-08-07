@@ -118,6 +118,17 @@ sandbox follow-ups are gone. Deleted, not annotated — `git log` and
 open is under the sections above; the hardened-but-fragile notes stay where they
 are.
 
+**Pruned again 2026-08-07, by the backlog work session**: the tidy 2026-08-06
+items 5-9, the `/tmp` tempdir-leak item, the two small hrdr-llm corrections
+(already in the tree), the dispatch `/copy msg` finding (the command is gone)
+and the dispatch coverage ask are closed — see
+[Record: closed efforts](#record-closed-efforts). The todo-panel report was
+re-probed on the resume path, the one variable the original probes never drove,
+and still did not reproduce; two discriminating resume-driven probes now pin the
+geometry and the item stays only as that record. The AUR outage behind the
+v0.11.0 publish persists (probed 2026-08-07). The rest of what needs a decision
+stays where it is.
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -830,49 +841,12 @@ five dead-item claims and the SSE-literal claim were re-verified by
 workspace-wide grep; the rest are the passes' own, verified by them against
 callers.
 
-**Findings (ranked):**
-
-5. **Three hand-rolled temp-sibling + rename atomic writers.** `write_atomic`
-   (`crates/hrdr-agent/src/auth.rs:95-141`, create_new + fsync),
-   `write_config_doc` (`config.rs:2190-2214`, create_new, no fsync — a strict
-   subset), `catalog::write_cache` (`crates/hrdr-llm/src/catalog.rs:458-485`).
-   Action (caveat): move `write_atomic`'s logic into `hrdr-llm::fs` as the one
-   shared helper; delegating adds fsync to config/catalog writes (durability
-   win, no content change) — keep fsync on the credential path. Minimal
-   alternative: document `write_config_doc` as `write_atomic` minus fsync.
-
-6. **Picker-navigation blocks duplicated.**
-   `crates/hrdr-tui/src/app/commands.rs` — `model_selector_key:512`,
-   `session_selector_key:601`, `theme_selector_key:657`,
-   `skill_selector_key:696`, `effort_selector_key:1112` — each carries the same
-   Esc/Ctrl+C-close + up/down/backspace/push_char block (~20 near-identical
-   blocks); `app.rs:1638-1688` repeats the wheel pattern five times. Action: a
-   `Selector<T>` nav helper returning the key so each handler keeps its
-   divergent bits (Enter, theme preview, model Ctrl+D, skill Enter-inserts).
-
-7. **Duplicated hook-spawn/outcome block.** `crates/hrdr-tools/src/hooks.rs` —
-   `run_file_hooks` (`:112-158`) and `run_event_hooks` (`:284-357`) share
-   spawn→timeout→kill-on-timeout→ disarm-on-success plus the verbatim-identical
-   failure/couldn't-run/timed-out note strings. The event path has one extra arm
-   (exit-2 block note, `:322-332`) and pushes stdout to context; the file path
-   discards it. Action: a shared `HookRunResult`/note builder for the four
-   common arms.
-
-8. **Test helpers duplicated across sibling test binaries.** `visible()` is
-   verbatim in `apps/hrdr/tests/tui_pty.rs:80` and `trust_pty.rs:50`;
-   `pty_available()`/`skip_for_want_of_a_pty()` in three files
-   (`tui_pty.rs:48,67`, `trust_pty.rs:28,41`, `headless_tty.rs:35,48`) with a
-   fourth variant in `sandbox_windows.rs:30-41`. The shared-helper home already
-   exists (`tests/common/mod.rs`, which carries `drain_pty`/`pty_text` and the
-   `#![allow(dead_code)]` for exactly this). Action: move all three into
-   `common/mod.rs`.
-
-9. **`spawn_line`/`spawn_diff`/`spawn_popup` near-duplicates.**
-   `crates/hrdr-app/src/commands/host.rs` — `spawn_line` and `spawn_diff`
-   (identical poster/tokio::spawn/await/post bodies differing only in the
-   `starts_with("diff ")` classification), plus `spawn_popup`, a third copy
-   added by the notice redesign (`2bff248`). Action: a private
-   `post_async(poster, fut, classify)` all three default methods call.
+**Closed: all nine findings fixed — `9d28da9` (item 5, one shared atomic writer
+in `hrdr-llm::fs`), `50f4151` (item 6, shared picker-nav helpers), `26ba2ee`
+(item 7, shared hook-run/note builder), `afdf6d0` (item 8, pty test helpers into
+`tests/common/mod.rs`), `0f68987` (item 9, `post_async`) — each exactly as its
+action named it (Record: closed efforts). What the pass left to remember
+follows.**
 
 **Deliberate mirrors checked and left alone** — `render_unfinished_todos` vs
 `render_todos` (outputs genuinely differ; acknowledged in a comment);
@@ -913,9 +887,6 @@ skimmed, not line-walked: hrdr-tui `app/e2e.rs` (8.9 k; all 202 helpers
 grep-verified as used), `tests/tui_pty.rs` (beyond 200), hrdr-tools
 `sandbox.rs`/`lsp.rs`/`memory.rs`/`verification.rs`/ `web.rs`/`mcp/client.rs`
 (symbol + targeted reads only).
-
-**Status: items 5-9 open, each naming its concrete action; the rest are fixed
-(Record: closed efforts).**
 
 ## Performance review 2026-08-06
 
@@ -1259,20 +1230,17 @@ live here:
 
 ## Deferred 2026-08-05
 
-- **Todo panel cut off 1 row at the bottom when following.** Reported
-  2026-08-05: with the transcript fully scrolled down (following, `offset 0`),
-  the todo list's last row sits one line below the visible area — the
-  scrollbar's `↓` lands on the `▸ N finished` toggle row while panel rows
-  continue beneath it, as if the transcript area ends a row early. **Not
-  reproduced** in e2e probes: following at `offset 0` at every terminal height
-  (11–30 rows), with and without a finished sub-agent panel present, the panel's
-  bottom pad renders on the transcript area's last row. The repro gap: the
-  report came from a _resumed_ session (the `resumed … (359 messages)` notice
-  was on screen), so the untried variable is the resume path — resume rebuilds
-  the transcript and the follow state, which the probes did not drive. Revisit
-  with a resume-driven repro before touching the layout; candidates if it
-  reproduces: `draw_chunks`' `scroll`/`inner_scroll` off-by-one at the bottom,
-  or the live-panel chunk heights vs the transcript area.
+- **Todo panel cut off 1 row at the bottom when following — probed on the resume
+  path 2026-08-07, still not reproduced, and the gap is now covered.** The
+  untried variable is driven for real: two e2e probes resume a saved session
+  through `resume_locked_path` (the jsonl rebuild + follow-state re-pin) and
+  render at every height 11–30, with and without a finished sub-agent, asserting
+  the panels' last body rows stay above the transcript area's last row. Both
+  pass; injecting the reported geometry (the transcript area ending a row early)
+  makes them fail in exactly the reported shape, so they are discriminating
+  rather than vacuous. If the report resurfaces, the candidates remain
+  `draw_chunks`' `scroll`/`inner_scroll` off-by-one at the bottom, or the
+  live-panel chunk heights vs the transcript area.
 
 - **Hide `Notice` transcript entries unless verbose — the noise half is closed
   by the notice redesign (`2bff248`).** The variant-mixing blocker is gone:
@@ -1805,42 +1773,18 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
   table-driven stream test awkward. `impl Into<String>` is a one-line change
   when someone needs it.
-- **The suite leaks `tempfile` dirs into `/tmp`, and nothing guards it.**
-  Measured 2026-08-02 on the owner's machine: 3,643 `/tmp/.tmp*` directories
-  holding 771 MB, the oldest dated 2026-07-15 and 795 of them created that day
-  alone by ordinary `cargo test` runs. Each holds real session state —
-  `hrdr/history`, `hrdr/sessions/<cwd-slug>/session.json` — so something wrote
-  through `XDG_DATA_HOME` while it pointed at a `tempfile::tempdir()` that had
-  already been dropped, or was still writing as `remove_dir_all` walked it. Not
-  the `hrdr-test-support` ctor sandbox: that one is named
-  `hrdr-test-sandbox-<pid>`, its `#[ctor::dtor]` fires, and zero of those were
-  on disk after the same runs. The suspects are the helpers that swap
-  `XDG_DATA_HOME` for the duration of a closure — `with_test_env` in
-  `session.rs` and in `hrdr-app/src/sessions.rs`, and the e2e harness's own root
-  in `hrdr-tui/src/app/e2e.rs` — all of which drop the `TempDir` while
-  background savers may still hold the old path. `leak_guard.rs` cannot see
-  this: it asserts on a sentinel `$HOME`, and these land in `temp_dir()`
-  instead. Closing it means both a fix and a guard that counts `/tmp` entries
-  across a suite run, or the leak silently returns.
 
 ---
 
 ## Small corrections owed in hrdr-llm
 
 Raised while closing the provider-divergence audit, out of those slices' scope,
-each re-verified against the tree.
+each re-verified against the tree. The first two were already closed in the tree
+by the time they were revisited (2026-08-07): the `UNNAMED_MODEL` docstring now
+names the two native builders and the pinning test, and the `thinking_delta`
+no-open-block path carries the same "don't default to slot 0" note as
+`input_json_delta`.
 
-- **The `UNNAMED_MODEL` docstring tells half the story.** It states that putting
-  the sentinel on the wire "cannot succeed anywhere it is actually read", then
-  says the _OpenAI-shaped_ builder omits the field. Correctly scoped as far as
-  it goes, but it never says the two native builders emit it verbatim — and this
-  docstring is where a reader would go to check the invariant. Add the caveat,
-  or fold it into the early-error decision below.
-- **A `thinking_delta` for an index with no open block is silently dropped.**
-  `map_event`'s `thinking_slot.get_mut` no-ops, which looks right; the point is
-  that the neighbouring `input_json_delta` path carries an explicit note about
-  why it must not default to slot 0, and the thinking path's equivalent choice
-  is unexplained. A comment, not a fix.
 - **`parse_imf_fixdate` ignores the weekday.** It splits on `", "` and discards
   the prefix, so `Xyz, 06 Nov 2999 …` parses fine. Laxer than RFC 7231 and
   harmless — the weekday is redundant with the date — but worth knowing before
@@ -1957,12 +1901,11 @@ lowercases only for its match arms and returns the original on fall-through, so
 "unknown command". Two spellings of one command behave oppositely. Decide which
 way, then pin it — neither side has a test, so any fix could regress silently.
 
-Smaller, each verified: `/copy msg 1-99999999999999` labels the range it
-_requested_ rather than what it copied (the existing bounded-scan test uses
-exactly that input; still open, cosmetic). The rest of this paragraph's items —
-`/export`'s format/overwrite/token handling, `/effort` applying a level,
-`/login`/`/skills` arguing, `/doctor`'s pre-spawn probes — were fixed in
-`be0f340` (Record: closed efforts).
+Smaller, each verified: `/export`'s format/overwrite/token handling, `/effort`
+applying a level, `/login`/`/skills` arguing, `/doctor`'s pre-spawn probes were
+fixed in `be0f340` (Record: closed efforts). The `/copy msg` range-label item is
+moot — `/copy` no longer exists in `SLASH_COMMANDS`, so the cosmetic label bug
+went with it (the stale doc references were dropped 2026-08-07).
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return
@@ -1973,12 +1916,6 @@ falls through to the model. `parse_msg_range` rejects the degenerate ranges. The
 `metadata().len()`, which is `0` for procfs, so the post-read check is the real
 backstop. No arm reads state, awaits, then writes back stale. `dispatch` is
 synchronous and holds no lock across an await.
-
-**Coverage worth adding first**, in order of how bad a silent regression is: a
-table asserting `dispatch` returns `true` for every name in `SLASH_COMMANDS` and
-`false` only for unknown input (catches an arm being deleted, or a
-`return false` slipping into a handler); the busy guards firing at all — they
-are the "check that cannot fail" shape and nothing observes them today.
 
 **Not covered by this pass:** no runtime exercise. The concurrency claims are
 reasoned from lock scopes, not from a racing repro. TUI modal/picker key routing
@@ -2684,6 +2621,31 @@ compaction ladder sizes each shrink stage from slices without building its
 history (`fb46b51`). The 2026-08-04 #9 (picker haystack) half is still open, and
 the per-round save durability tradeoff (2026-08-04 second pass #1) still needs
 the owner's call — both stay in their sections.
+
+**2026-08-07 backlog slices — the tidy/test/dispatch/resume items** (`9d28da9`,
+`50f4151`, `26ba2ee`, `afdf6d0`, `0f68987`, `f60426d`, `6e28e75`, `c36d1a9`,
+`e3b899a`, plus this docs commit). Worked one slice at a time (delegate → review
+→ commit → push), each gated before commit. Tidy 2026-08-06 items 5-9: the three
+atomic writers consolidated onto one `hrdr_llm::fs::write_atomic`
+(config/catalog writes gain fsync; the catalog temp open becomes `create_new`);
+the five picker key handlers and six mouse-wheel arms share
+`selector_key`/`selector_wheel`; the two hook families share
+`run_hook`/`hook_notes`; the pty test helpers move into `tests/common/mod.rs`;
+and `CommandHost`'s spawn defaults collapse onto `post_async`. The /tmp
+tempdir-leak item: the e2e harness's kept roots (`DataHomeGuard`) and the
+wire-log test's `Box::leak`ed tempdir now go through
+`hrdr_test_support::defer_tempdir` (removed by an exit dtor instead of
+accumulating — measured 28 leaked dirs per suite run → 0), the leak guard counts
+non-empty `.tmp*` dirs across the recursive run (rustc leaves empty ones per
+compilation), and the guard surfaced a pre-existing race it would have flaked
+on: completion.rs and sessions.rs each held their own `ENV_LOCK` while swapping
+the process-global `XDG_DATA_HOME` (the pair failed 6/6 together, passes 8/8 on
+one shared `hrdr_test_support::with_test_env`). The two hrdr-llm small
+corrections were already in the tree. The dispatch review's `/copy msg` item is
+moot (the command is gone; stale doc references dropped) and its coverage ask
+shipped (a `SLASH_COMMANDS`-coverage table + busy-guard firing tests). The
+todo-panel report was probed on the resume path — the untried variable — and did
+not reproduce; two discriminating resume-driven probes now cover the geometry.
 
 **2026-08-06 backlog slices — eight perf/tidy items** (`944014c`, `2a112f1`,
 `f6c64b3`, `25d690e`, `1b84108`, `1e24635`, `c351731`, plus the docs commit
