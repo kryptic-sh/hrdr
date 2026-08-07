@@ -330,18 +330,21 @@ impl SessionState {
         }
     }
 
-    /// A copy of this state as it should be written to disk: the session-chrome
-    /// notices are dropped.
+    /// This state as it should be written to disk: the session-chrome notices
+    /// are dropped.
     ///
     /// Every launch prints its own welcome, and every resume prints its own
     /// "resumed session …" line. Persisting them means the next resume restores
     /// the old ones *and* appends a fresh one, so they accrete one copy per
     /// resume, forever.
-    pub fn persisted(&self) -> SessionState {
-        let mut out = self.clone();
-        out.transcript
+    ///
+    /// Consumes `self` so the save pipeline never clones the whole state just to
+    /// filter the transcript: every caller already owns the snapshot it is about
+    /// to write.
+    pub fn persisted(mut self) -> SessionState {
+        self.transcript
             .retain(|e| !matches!(e.kind, crate::EntryKind::Notice(_)));
-        out
+        self
     }
 
     /// Whether this conversation is worth persisting: it has at least one user
@@ -403,6 +406,32 @@ impl Session {
             state,
         }
     }
+
+    /// The serialized shape of a save: [`Session`] with `created` taken from the
+    /// created-cache instead of `self.created` (which is a fresh-timestamp guess
+    /// from [`Self::new`] until the first save learns the file's real creation
+    /// time). Borrowed, so a save serializes without cloning the whole state —
+    /// the message history and transcript used to be deep-cloned once per write
+    /// just to patch one `u64`.
+    fn body(&self, created: u64) -> SessionBody<'_> {
+        SessionBody {
+            version: self.version,
+            created,
+            updated: self.updated,
+            state: &self.state,
+        }
+    }
+}
+
+/// The on-disk session body, field-for-field identical to [`Session`]'s
+/// serialized shape except that `created` is supplied by the caller.
+#[derive(serde::Serialize)]
+struct SessionBody<'a> {
+    version: u32,
+    created: u64,
+    updated: u64,
+    #[serde(flatten)]
+    state: &'a SessionState,
 }
 
 /// Lightweight directory listing entry.
@@ -775,14 +804,12 @@ impl Session {
                 c
             }
         };
-        let mut snap = self.clone();
-        snap.created = created;
         // Compact, not pretty: a real session reaches multiple MB (full message
         // history + transcript with tool results), and this is rewritten on every
         // tool round — pretty-printing spends ~15-30% more bytes and serialize CPU
         // per save for indentation no one reads (idle files are zstd-compressed by
         // retention anyway).
-        let json = serde_json::to_string(&snap).context("serializing session")?;
+        let json = serde_json::to_string(&self.body(created)).context("serializing session")?;
         crate::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         // If retention had compressed this session, the plaintext we just wrote
@@ -834,10 +861,8 @@ impl Session {
                 c
             }
         };
-        let mut snap = self.clone();
-        snap.created = created;
         // Compact, not pretty — see the note in `save`.
-        let json = serde_json::to_string(&snap).context("serializing session")?;
+        let json = serde_json::to_string(&self.body(created)).context("serializing session")?;
         crate::write_atomic(path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
@@ -1425,7 +1450,10 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
     let Some(outcome) = mint_session(state)? else {
         return Ok(None);
     };
-    Session::new(state.persisted()).save(&outcome.id)?;
+    // `persisted` consumes the state; `save_session` only holds a reference
+    // (this is the once-per-session first-save path, not the per-round one), so
+    // clone here.
+    Session::new(state.clone().persisted()).save(&outcome.id)?;
     // The reservation is dropped here. If `save` failed above, the drop
     // removes the lock file that `unique_session_id` created — no stale
     // lock is left behind. If `save` succeeded, `save()` already removed
