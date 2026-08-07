@@ -172,10 +172,11 @@ pub(crate) use config::{
 };
 pub use models::{
     AvailableModel, LastModels, ModelChoice, ModelSource, available_models, builtin_catalog_key,
-    chatgpt_model_choices, filter_model_choices, fuzzy_match, last_model_on, load_last_model,
-    load_last_models, load_model_usage, merge_chatgpt_choices, model_choices, model_for_provider,
-    model_for_provider_in, model_for_resolved_provider, model_for_resolved_provider_in,
-    record_last_model, record_model_use,
+    chatgpt_model_choices, filter_model_choices, fuzzy_match, fuzzy_match_hay, last_model_on,
+    load_last_model, load_last_models, load_model_usage, merge_chatgpt_choices,
+    model_choice_haystack, model_choices, model_for_provider, model_for_provider_in,
+    model_for_resolved_provider, model_for_resolved_provider_in, record_last_model,
+    record_model_use,
 };
 pub use usage::AgentUsage;
 

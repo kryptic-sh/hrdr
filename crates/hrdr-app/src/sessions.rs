@@ -112,22 +112,26 @@ pub fn session_diagnostics() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Case-insensitive fuzzy filter over session rows for the `/resume` picker:
-/// the query's characters must appear in order somewhere within
-/// `"id name cwd"`. Returns matching indices in input order (callers pass
+/// The lowercase haystack [`filter_sessions`] matches against: the
+/// space-joined `"id name cwd"`, precomputed once per picker open.
+pub fn session_haystack(m: &crate::SessionMeta) -> String {
+    format!("{} {} {}", m.id, m.name, m.cwd).to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed session haystacks (built by
+/// [`session_haystack`]): the query's characters must appear in order somewhere
+/// within the haystack. Returns matching indices in input order (callers pass
 /// [`crate::list_sessions`]'s newest-first list); an empty query matches
 /// everything.
-pub fn filter_sessions(sessions: &[crate::SessionMeta], query: &str) -> Vec<usize> {
+pub fn filter_sessions(haystacks: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..sessions.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    sessions
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, m)| {
-            hrdr_agent::fuzzy_match(query, &[m.id.as_str(), m.name.as_str(), m.cwd.as_str()])
-                .then_some(i)
-        })
+        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 
@@ -195,18 +199,20 @@ mod tests {
             path: std::path::PathBuf::new(),
             error: None,
         };
-        let sessions = vec![
+        let sessions = [
             meta("fix-auth", "Fix the auth bug", "/home/u/proj-a"),
             meta("tui-work", "TUI polish", "/home/u/proj-b"),
         ];
+        let hay = sessions.iter().map(session_haystack).collect::<Vec<_>>();
+        let hits = |q: &str| filter_sessions(&hay, q);
         // Empty query keeps everything in input (newest-first) order.
-        assert_eq!(filter_sessions(&sessions, ""), vec![0, 1]);
+        assert_eq!(hits(""), vec![0, 1]);
         // Matches on id, name (case-insensitive), and cwd.
-        assert_eq!(filter_sessions(&sessions, "auth"), vec![0]);
-        assert_eq!(filter_sessions(&sessions, "POLISH"), vec![1]);
-        assert_eq!(filter_sessions(&sessions, "proj-b"), vec![1]);
+        assert_eq!(hits("auth"), vec![0]);
+        assert_eq!(hits("POLISH"), vec![1]);
+        assert_eq!(hits("proj-b"), vec![1]);
         // Fuzzy subsequence across the combined text.
-        assert_eq!(filter_sessions(&sessions, "fx bug"), vec![0]);
-        assert!(filter_sessions(&sessions, "zzz").is_empty());
+        assert_eq!(hits("fx bug"), vec![0]);
+        assert!(hits("zzz").is_empty());
     }
 }

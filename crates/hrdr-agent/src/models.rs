@@ -780,42 +780,51 @@ pub fn fuzzy_match(query: &str, parts: &[&str]) -> bool {
 /// already-normalized query — the per-row core of [`fuzzy_match`], split out so
 /// a caller filtering many rows normalizes the query once.
 fn fuzzy_match_q(q: &[char], parts: &[&str]) -> bool {
-    let hay = parts.join(" ").to_lowercase();
-    let mut it = hay.chars();
+    fuzzy_match_hay(q, &parts.join(" ").to_lowercase())
+}
+
+/// The per-row core of [`fuzzy_match_q`] against an already-joined,
+/// already-lowercased haystack — what the pickers pay for when a choice's
+/// haystack is precomputed once per picker open instead of per keystroke.
+/// Shared with the app-crate picker filters, which precompute their own
+/// haystacks (see the `*_haystack` builders in `hrdr-app`).
+pub fn fuzzy_match_hay(q: &[char], haystack: &str) -> bool {
+    let mut it = haystack.chars();
     q.iter().all(|&c| it.any(|h| h == c))
 }
 
-/// Case-insensitive fuzzy filter over the choices: the query's characters must
-/// appear in order somewhere within `"model_label provider_label provider://model"`.
-/// Returns the matching indices in their original (sorted) order; an empty query
-/// matches everything.
+/// The lowercase haystack [`filter_model_choices`] matches against: the
+/// space-joined `"model_label provider_label provider://model"`, precomputed
+/// once per picker open so a keystroke's refilter never re-derives it.
 ///
 /// The canonical `provider://model` id is part of the haystack because it is the
 /// form the user is told the identity in everywhere else — the status bar, `hrdr
 /// models`, `--model`. Filtering on the friendly labels alone meant typing the
-/// thing you were looking at (`zen://kimi`) matched nothing. It is passed to
-/// [`fuzzy_match`] as ONE part so the `://` separator survives the join and the
-/// id stays searchable as typed.
-pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
+/// thing you were looking at (`zen://kimi`) matched nothing. It is kept as ONE
+/// part so the `://` separator survives the join and the id stays searchable as
+/// typed.
+pub fn model_choice_haystack(c: &ModelChoice) -> String {
+    format!(
+        "{} {} {}://{}",
+        c.model_label, c.provider_label, c.provider, c.model
+    )
+    .to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed choice haystacks (built by
+/// [`model_choice_haystack`]): the query's characters must appear in order
+/// somewhere within the haystack. Returns the matching indices in their
+/// original (sorted) order; an empty query matches everything. The haystacks
+/// are a parallel array of the choices, so index `i` answers for choice `i`.
+pub fn filter_model_choices(haystacks: &[String], query: &str) -> Vec<usize> {
     let q: Vec<char> = query.trim().to_lowercase().chars().collect();
     if q.is_empty() {
-        return (0..choices.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    choices
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            let id = format!("{}://{}", c.provider, c.model);
-            fuzzy_match_q(
-                &q,
-                &[
-                    c.model_label.as_str(),
-                    c.provider_label.as_str(),
-                    id.as_str(),
-                ],
-            )
-            .then_some(i)
-        })
+        .filter_map(|(i, hay)| fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 
@@ -1248,35 +1257,37 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
+        let hay = out.iter().map(model_choice_haystack).collect::<Vec<_>>();
+        let hits = |q: &str| filter_model_choices(&hay, q);
         // Matches on the model name.
-        let deepseek = filter_model_choices(&out, "deepseek");
+        let deepseek = hits("deepseek");
         assert_eq!(deepseek.len(), 1);
         assert_eq!(out[deepseek[0]].model, "deepseek-v4-pro");
         // Matches on the provider name (case-insensitive) — both Zen models.
-        let zen = filter_model_choices(&out, "zen");
+        let zen = hits("zen");
         assert_eq!(zen.len(), 2);
         // Fuzzy subsequence across the combined text.
-        let fuzzy = filter_model_choices(&out, "fable zen");
+        let fuzzy = hits("fable zen");
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(out[fuzzy[0]].model, "claude-fable-5");
         // Empty query matches everything.
-        assert_eq!(filter_model_choices(&out, "  ").len(), out.len());
+        assert_eq!(hits("  ").len(), out.len());
         // No match.
-        assert!(filter_model_choices(&out, "zzzzz").is_empty());
+        assert!(hits("zzzzz").is_empty());
 
         // The CANONICAL identity is filterable too — the form the status bar,
         // `hrdr models` and `--model` all speak. Typing what you are looking at
         // used to match nothing, because only the friendly labels were searched
         // and neither carries a `://` or the raw model id.
-        let by_id = filter_model_choices(&out, "zen://gpt-5-6");
+        let by_id = hits("zen://gpt-5-6");
         assert_eq!(by_id.len(), 1);
         assert_eq!(out[by_id[0]].model, "gpt-5-6");
         // The filter is a fuzzy SUBSEQUENCE, so a bare `go://` legitimately also
         // matches rows whose text merely contains those characters in order —
         // the point here is only that the identity is searchable at all.
-        assert!(filter_model_choices(&out, "go://deepseek").len() == 1);
+        assert!(hits("go://deepseek").len() == 1);
         // And the raw id, which no friendly label contains.
-        assert_eq!(filter_model_choices(&out, "claude-fable-5").len(), 1);
+        assert_eq!(hits("claude-fable-5").len(), 1);
     }
 
     /// The store keeps a model PER PROVIDER, because that is the only honest answer

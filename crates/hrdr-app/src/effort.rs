@@ -86,27 +86,32 @@ pub fn choices_from(values: &[String]) -> Vec<EffortChoice> {
     out
 }
 
-/// Case-insensitive fuzzy filter over effort choices: the query's characters
-/// must appear in order within `"label value detail"`. Returns matching
-/// indices in input order; an empty query matches everything.
-pub fn filter_effort_choices(choices: &[EffortChoice], query: &str) -> Vec<usize> {
+/// The lowercase haystack [`filter_effort_choices`] matches against: the
+/// space-joined `"label value detail"` (the Default row's `value` is `None` and
+/// matches as "default"), precomputed once per picker open.
+pub fn effort_choice_haystack(c: &EffortChoice) -> String {
+    format!(
+        "{} {} {}",
+        c.label,
+        c.value.as_deref().unwrap_or("default"),
+        c.detail
+    )
+    .to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed effort haystacks (built by
+/// [`effort_choice_haystack`]): the query's characters must appear in order
+/// within the haystack. Returns matching indices in input order; an empty query
+/// matches everything.
+pub fn filter_effort_choices(haystacks: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..choices.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    choices
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            hrdr_agent::fuzzy_match(
-                query,
-                &[
-                    c.label.as_str(),
-                    c.value.as_deref().unwrap_or("default"),
-                    c.detail.as_str(),
-                ],
-            )
-            .then_some(i)
-        })
+        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 
@@ -169,7 +174,8 @@ mod tests {
     #[test]
     fn filter_matches_label_value_and_default() {
         let c = choices_from(&vals(&["minimal", "low", "medium", "high"]));
-        let hits = |q: &str| filter_effort_choices(&c, q);
+        let hay = c.iter().map(effort_choice_haystack).collect::<Vec<_>>();
+        let hits = |q: &str| filter_effort_choices(&hay, q);
         assert_eq!(hits("").len(), c.len());
         // Subsequence match: "hig" hits High only ("hi" would also catch
         // Default via "the … provider").

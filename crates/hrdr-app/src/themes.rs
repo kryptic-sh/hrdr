@@ -83,19 +83,25 @@ pub fn theme_choices() -> Vec<ThemeChoice> {
     out
 }
 
-/// Case-insensitive fuzzy filter over theme choices: the query's characters
-/// must appear in order within `"name source"`. Returns matching indices in
-/// input order; an empty query matches everything.
-pub fn filter_themes(choices: &[ThemeChoice], query: &str) -> Vec<usize> {
+/// The lowercase haystack [`filter_themes`] matches against: the space-joined
+/// `"name source"`, precomputed once per picker open.
+pub fn theme_choice_haystack(c: &ThemeChoice) -> String {
+    format!("{} {}", c.name, c.source).to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed theme haystacks (built by
+/// [`theme_choice_haystack`]): the query's characters must appear in order
+/// within the haystack. Returns matching indices in input order; an empty query
+/// matches everything.
+pub fn filter_themes(haystacks: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..choices.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    choices
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            hrdr_agent::fuzzy_match(query, &[c.name.as_str(), c.source.as_str()]).then_some(i)
-        })
+        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 
@@ -164,12 +170,17 @@ mod tests {
             .into_iter()
             .filter(|c| c.source == "built-in")
             .collect();
-        assert_eq!(filter_themes(&choices, "").len(), choices.len());
-        let nord = filter_themes(&choices, "nord");
+        let hay = choices
+            .iter()
+            .map(theme_choice_haystack)
+            .collect::<Vec<_>>();
+        let hits = |q: &str| filter_themes(&hay, q);
+        assert_eq!(hits("").len(), choices.len());
+        let nord = hits("nord");
         assert_eq!(nord.len(), 1);
         assert_eq!(choices[nord[0]].name, "nord");
         // Source column matches too.
-        assert_eq!(filter_themes(&choices, "built-in").len(), choices.len());
-        assert!(filter_themes(&choices, "zzz").is_empty());
+        assert_eq!(hits("built-in").len(), choices.len());
+        assert!(hits("zzz").is_empty());
     }
 }

@@ -8,27 +8,25 @@
 
 pub use hrdr_agent::{ProjectInstructions, Skill, builtin_skills, discover_skills, expand_skill};
 
-/// Case-insensitive fuzzy filter over skills for the `/skills` picker: the
-/// query's characters must appear in order within `"name description source"`.
-/// Returns matching indices in input order; an empty query matches everything.
-pub fn filter_skills(skills: &[Skill], query: &str) -> Vec<usize> {
+/// The lowercase haystack [`filter_skills`] matches against: the space-joined
+/// `"name description source"`, precomputed once per picker open.
+pub fn skill_haystack(sk: &Skill) -> String {
+    format!("{} {} {}", sk.name, sk.description, sk.source).to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed skill haystacks (built by
+/// [`skill_haystack`]): the query's characters must appear in order within the
+/// haystack. Returns matching indices in input order; an empty query matches
+/// everything.
+pub fn filter_skills(haystacks: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..skills.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    skills
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, sk)| {
-            hrdr_agent::fuzzy_match(
-                query,
-                &[
-                    sk.name.as_str(),
-                    sk.description.as_str(),
-                    sk.source.as_str(),
-                ],
-            )
-            .then_some(i)
-        })
+        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 
@@ -101,11 +99,13 @@ mod tests {
     /// fields the `/skills` rows show.
     #[test]
     fn filter_matches_name_description_and_source() {
-        let skills = vec![skill("ship", "release checklist"), skill("audit", "review")];
-        assert_eq!(filter_skills(&skills, ""), vec![0, 1]);
-        assert_eq!(filter_skills(&skills, "ship"), vec![0]);
-        assert_eq!(filter_skills(&skills, "checklist"), vec![0]);
-        assert_eq!(filter_skills(&skills, "test"), vec![0, 1], "source matches");
-        assert!(filter_skills(&skills, "nomatch").is_empty());
+        let skills = [skill("ship", "release checklist"), skill("audit", "review")];
+        let hay = skills.iter().map(skill_haystack).collect::<Vec<_>>();
+        let hits = |q: &str| filter_skills(&hay, q);
+        assert_eq!(hits(""), vec![0, 1]);
+        assert_eq!(hits("ship"), vec![0]);
+        assert_eq!(hits("checklist"), vec![0]);
+        assert_eq!(hits("test"), vec![0, 1], "source matches");
+        assert!(hits("nomatch").is_empty());
     }
 }

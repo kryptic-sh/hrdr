@@ -4,15 +4,20 @@
 //! fuzzy filter function; only what Enter *does* with the highlighted choice
 //! differs, and that lives in each picker's key handler.
 
-use hrdr_agent::{ModelChoice, filter_model_choices};
+use hrdr_agent::{ModelChoice, filter_model_choices, model_choice_haystack};
 use hrdr_app::{
-    EffortChoice, LoginProviderChoice, SessionMeta, Skill, ThemeChoice, filter_effort_choices,
-    filter_login_providers, filter_sessions, filter_skills, filter_themes,
+    EffortChoice, LoginProviderChoice, SessionMeta, Skill, ThemeChoice, effort_choice_haystack,
+    filter_effort_choices, filter_login_providers, filter_sessions, filter_skills, filter_themes,
+    login_provider_haystack, session_haystack, skill_haystack, theme_choice_haystack,
 };
 
 pub(crate) struct Selector<T> {
     /// All choices, in the order the picker's data source produced them.
     choices: Vec<T>,
+    /// Lowercase search haystack per choice, built once when the picker opens
+    /// (or the choices are replaced) — a keystroke's refilter then walks
+    /// precomputed text instead of re-deriving every choice's haystack.
+    haystacks: Vec<String>,
     /// The fuzzy-find query typed into the picker's search line.
     pub(crate) filter: String,
     /// Indices into `choices` matching `filter`, in input order.
@@ -20,14 +25,20 @@ pub(crate) struct Selector<T> {
     /// Selected row within `filtered`.
     pub(crate) selected: usize,
     /// The picker's fuzzy filter (matching indices for a query).
-    filter_fn: fn(&[T], &str) -> Vec<usize>,
+    filter_fn: fn(&[String], &str) -> Vec<usize>,
 }
 
 impl<T> Selector<T> {
-    pub(crate) fn new(choices: Vec<T>, filter_fn: fn(&[T], &str) -> Vec<usize>) -> Self {
+    pub(crate) fn new(
+        choices: Vec<T>,
+        haystack_fn: fn(&T) -> String,
+        filter_fn: fn(&[String], &str) -> Vec<usize>,
+    ) -> Self {
+        let haystacks = choices.iter().map(haystack_fn).collect();
         let filtered = (0..choices.len()).collect();
         Self {
             choices,
+            haystacks,
             filter: String::new(),
             filtered,
             selected: 0,
@@ -36,7 +47,7 @@ impl<T> Selector<T> {
     }
 
     fn refilter(&mut self) {
-        self.filtered = (self.filter_fn)(&self.choices, &self.filter);
+        self.filtered = (self.filter_fn)(&self.haystacks, &self.filter);
         self.selected = 0;
     }
 
@@ -130,7 +141,7 @@ pub(super) fn selector_key<T>(
 
 pub(crate) type ModelSelector = Selector<ModelChoice>;
 pub(crate) fn model_selector(choices: Vec<ModelChoice>) -> ModelSelector {
-    Selector::new(choices, filter_model_choices)
+    Selector::new(choices, model_choice_haystack, filter_model_choices)
 }
 
 impl Selector<ModelChoice> {
@@ -141,8 +152,9 @@ impl Selector<ModelChoice> {
         let current = self
             .current()
             .map(|c| (c.provider.clone(), c.model.clone()));
+        self.haystacks = choices.iter().map(model_choice_haystack).collect();
         self.choices = choices;
-        self.filtered = (self.filter_fn)(&self.choices, &self.filter);
+        self.filtered = (self.filter_fn)(&self.haystacks, &self.filter);
         self.selected = current
             .and_then(|(p, m)| {
                 self.filtered
@@ -155,27 +167,27 @@ impl Selector<ModelChoice> {
 
 pub(crate) type SessionSelector = Selector<SessionMeta>;
 pub(crate) fn session_selector(sessions: Vec<SessionMeta>) -> SessionSelector {
-    Selector::new(sessions, filter_sessions)
+    Selector::new(sessions, session_haystack, filter_sessions)
 }
 
 pub(crate) type ThemeSelector = Selector<ThemeChoice>;
 pub(crate) fn theme_selector(choices: Vec<ThemeChoice>) -> ThemeSelector {
-    Selector::new(choices, filter_themes)
+    Selector::new(choices, theme_choice_haystack, filter_themes)
 }
 
 pub(crate) type EffortSelector = Selector<EffortChoice>;
 pub(crate) fn effort_selector(choices: Vec<EffortChoice>) -> EffortSelector {
-    Selector::new(choices, filter_effort_choices)
+    Selector::new(choices, effort_choice_haystack, filter_effort_choices)
 }
 
 pub(crate) type SkillSelector = Selector<Skill>;
 pub(crate) fn skill_selector(skills: Vec<Skill>) -> SkillSelector {
-    Selector::new(skills, filter_skills)
+    Selector::new(skills, skill_haystack, filter_skills)
 }
 
 pub(crate) type LoginProviderSelector = Selector<LoginProviderChoice>;
 pub(crate) fn login_provider_selector(choices: Vec<LoginProviderChoice>) -> LoginProviderSelector {
-    Selector::new(choices, filter_login_providers)
+    Selector::new(choices, login_provider_haystack, filter_login_providers)
 }
 
 #[cfg(test)]

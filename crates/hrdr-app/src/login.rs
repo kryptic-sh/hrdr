@@ -160,21 +160,23 @@ pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
     out
 }
 
-/// Case-insensitive fuzzy filter over login choices (name + label + detail).
-pub fn filter_login_providers(choices: &[LoginProviderChoice], query: &str) -> Vec<usize> {
+/// The lowercase haystack [`filter_login_providers`] matches against: the
+/// space-joined `"name label detail"`, precomputed once per picker open.
+pub fn login_provider_haystack(c: &LoginProviderChoice) -> String {
+    format!("{} {} {}", c.name, c.label, c.detail).to_lowercase()
+}
+
+/// Case-insensitive fuzzy filter over precomputed login haystacks (built by
+/// [`login_provider_haystack`]).
+pub fn filter_login_providers(haystacks: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..choices.len()).collect();
+        return (0..haystacks.len()).collect();
     }
-    choices
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            hrdr_agent::fuzzy_match(
-                query,
-                &[c.name.as_str(), c.label.as_str(), c.detail.as_str()],
-            )
-            .then_some(i)
-        })
+        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
         .collect()
 }
 

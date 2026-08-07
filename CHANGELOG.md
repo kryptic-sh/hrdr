@@ -44,6 +44,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Compaction ladder sizing estimates each shrink stage without building its
   history.** The once-per-compaction `Vec` builds (whole history, whole elided
   history, and a window per stage) are now counted from slices.
+- **Picker re-filtering walks precomputed haystacks instead of re-deriving every
+  choice's text per keystroke.** Each picker choice's lowercase search haystack
+  (the `format!` + join + `to_lowercase` per candidate per keystroke) is built
+  once when the picker opens — and once when an async catalog load replaces the
+  rows — so a typed character only runs the subsequence walk against the stored
+  strings.
 
 ### Fixed
 
