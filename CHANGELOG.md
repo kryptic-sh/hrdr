@@ -68,6 +68,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name derives from the conversation, a session now reads `my-project` in the
   `/resume` picker instead of `untitled` — "untitled" survives only for a cwd
   with no basename (the filesystem root). Session forks share the same default.
+- **`edit` recovers a match that differs only in trailing line-end whitespace or
+  typographic characters.** The model's `old_string` copied from `read` output
+  can differ from the file in what read shows poorly or not at all — trailing
+  whitespace, smart quotes, em/en dashes, non-breaking spaces — and `edit` used
+  to fail forever on exactly those. It now retries the match with those
+  normalizations, applies a unique match, and the result says the match was
+  fuzzy and shows the diff of what actually changed. Blank-line `old_string` and
+  non-unique fuzzy matches still refuse rather than guess.
 
 ## [0.12.0] - 2026-08-07
 

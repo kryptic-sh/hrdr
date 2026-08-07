@@ -79,6 +79,173 @@ fn stale_error(ctx: &ToolContext, path: &std::path::Path) -> anyhow::Error {
     )
 }
 
+/// Per-line normalization for the fuzzy retry: trailing whitespace trimmed and
+/// typographic variants mapped 1:1 (smart quotes → ASCII, dashes → hyphen,
+/// figure/NBSP spaces → space). Deliberately no NFKC and no internal space
+/// collapsing: every normalized char maps back to exactly one original char
+/// (before the trimmed tail), so a match in normalized space recovers its
+/// original byte span. Line boundaries are untouched, so lines correspond 1:1.
+fn fuzzy_norm_line(line: &str) -> String {
+    line.trim_end_matches(char::is_whitespace)
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' => ' ',
+            _ => c,
+        })
+        .collect()
+}
+
+/// One file line prepared for the fuzzy matcher: byte offsets plus the
+/// normalized form and, per normalized char, the byte offset of its original
+/// char (normalization is 1:1 over the trimmed prefix, so char `c` of `norm`
+/// is char `c` of the line's trimmed content).
+struct FuzzyLine {
+    /// Byte offset of the line content (after the preceding newline).
+    start: usize,
+    /// Byte offset one past the content (before any newline).
+    content_end: usize,
+    /// Byte offset one past the content *and* its newline (== `content_end`
+    /// for the final line when the text has no trailing newline).
+    end_incl_nl: usize,
+    norm: String,
+    byte_of_char: Vec<usize>,
+}
+
+impl FuzzyLine {
+    fn new(start: usize, content: &str, text_len: usize) -> Self {
+        let content_end = start + content.len();
+        let end_incl_nl = if content_end < text_len {
+            content_end + 1
+        } else {
+            content_end
+        };
+        let trimmed = content.trim_end_matches(char::is_whitespace);
+        let mut byte_of_char = Vec::with_capacity(trimmed.chars().count());
+        let mut b = 0;
+        for ch in trimmed.chars() {
+            byte_of_char.push(b);
+            b += ch.len_utf8();
+        }
+        let norm = fuzzy_norm_line(content);
+        Self {
+            start,
+            content_end,
+            end_incl_nl,
+            norm,
+            byte_of_char,
+        }
+    }
+}
+
+/// Find the byte spans in `text` that `old` occupies when the only differences
+/// from the file are line-end whitespace and typographic characters (see
+/// [`fuzzy_norm_line`]). A single-line `old` may sit anywhere within a file
+/// line; a multi-line `old`'s first line must END its file line (it is
+/// followed by a newline), its last line must BEGIN its, and interior lines
+/// must match whole. A trailing newline in `old` extends the span through the
+/// last matched line's newline. Returns all non-overlapping spans in ascending
+/// order; empty when there is no fuzzy match — including when any line of
+/// `old` normalizes to nothing, since blank lines would match vacuously
+/// everywhere.
+fn fuzzy_match_spans(text: &str, old: &str) -> Vec<(usize, usize)> {
+    let mut old_lines: Vec<&str> = old.split('\n').collect();
+    if old_lines.last() == Some(&"") {
+        old_lines.pop(); // `old` ended with a newline: no trailing content line
+    }
+    if old_lines.is_empty() {
+        return Vec::new();
+    }
+    let old_norm: Vec<String> = old_lines.iter().map(|l| fuzzy_norm_line(l)).collect();
+    if old_norm.iter().any(|l| l.is_empty()) {
+        return Vec::new();
+    }
+    let old_ends_with_nl = old.ends_with('\n');
+    let k = old_norm.len();
+
+    let mut lines: Vec<FuzzyLine> = Vec::new();
+    let mut start = 0;
+    for content in text.split('\n') {
+        lines.push(FuzzyLine::new(start, content, text.len()));
+        start += content.len() + 1;
+    }
+
+    let mut spans = Vec::new();
+    if k == 1 {
+        // Single-line `old`: a substring anywhere within a file line. A match
+        // that reaches the line's trimmed end also consumes the trailing
+        // whitespace the model never copied.
+        let needle = &old_norm[0];
+        for line in &lines {
+            let mut search_from = 0;
+            while let Some(rel) = line.norm[search_from..].find(needle) {
+                // `find` yields byte offsets; the byte-of-char table is indexed
+                // by char, so convert (a norm is not all-ASCII once any other
+                // non-mapped char — é, CJK — appears before the match).
+                let abs_byte = search_from + rel;
+                let s_char = line.norm[..abs_byte].chars().count();
+                let e_char = s_char + needle.chars().count();
+                let span_end = if old_ends_with_nl {
+                    line.end_incl_nl
+                } else if e_char == line.byte_of_char.len() {
+                    line.content_end
+                } else {
+                    line.start + line.byte_of_char[e_char]
+                };
+                spans.push((line.start + line.byte_of_char[s_char], span_end));
+                search_from = abs_byte + needle.len();
+            }
+        }
+    } else {
+        // Multi-line `old`: first line is a suffix of its file line, last a
+        // prefix, interior lines equal.
+        let first = &old_norm[0];
+        let last = &old_norm[k - 1];
+        for i in 0..=lines.len().saturating_sub(k) {
+            let tail = &lines[i..];
+            let first_line = &tail[0];
+            let last_line = &tail[k - 1];
+            if !first_line.norm.ends_with(first) {
+                continue;
+            }
+            if !last_line.norm.starts_with(last) {
+                continue;
+            }
+            if tail[1..k - 1]
+                .iter()
+                .zip(&old_norm[1..k - 1])
+                .any(|(l, o)| l.norm != *o)
+            {
+                continue;
+            }
+            let s_char = first_line.norm.len() - first.len();
+            let span_start = first_line.start + first_line.byte_of_char[s_char];
+            let e_char = last.len();
+            let span_end = if old_ends_with_nl {
+                last_line.end_incl_nl
+            } else if e_char == last_line.norm.len() {
+                last_line.content_end
+            } else {
+                last_line.start + last_line.byte_of_char[e_char]
+            };
+            spans.push((span_start, span_end));
+        }
+        // Candidates are line-ranges, so a later one can overlap an earlier
+        // (a line ending in `first` that also equals an interior line) — drop
+        // the overlap so `replace_all` never double-replaces a byte.
+        let mut dedup: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for span in spans {
+            if dedup.last().is_none_or(|&(_, e)| span.0 >= e) {
+                dedup.push(span);
+            }
+        }
+        spans = dedup;
+    }
+    spans
+}
+
 // ---- edit ----
 
 pub struct EditTool;
@@ -179,6 +346,9 @@ impl Tool for EditTool {
         let mut old_string: Cow<str> = Cow::Borrowed(&a.old_string);
         let mut new_string: Cow<str> = Cow::Borrowed(&a.new_string);
         let mut count = text.matches(old_string.as_ref()).count();
+        // Byte spans of the fuzzy retry (see the count == 0 arm); empty when
+        // the exact or CRLF-translated match won.
+        let mut fuzzy_spans: Vec<(usize, usize)> = Vec::new();
         if count == 0
             && a.old_string.contains('\n')
             && !a.old_string.contains("\r\n")
@@ -206,24 +376,39 @@ impl Tool for EditTool {
             return Err(stale_error(ctx, &path));
         }
         if count == 0 {
-            // The #1 retry cause: right text, wrong whitespace. Detect it and
-            // say so instead of the generic error.
-            let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
-            let normalized_old = norm(&a.old_string);
-            if !normalized_old.is_empty() && norm(&text).contains(&normalized_old) {
+            // The fuzzy retry: `read` shows lines as-is, and the failure modes
+            // for a model copying them are exactly the things read output makes
+            // invisible or easy to drop — trailing line-end whitespace, and
+            // typographic characters (smart quotes, dashes, non-breaking
+            // spaces). Retry the match with those normalizations instead of
+            // failing forever; a unique match is applied and the result says
+            // the match was fuzzy, so the model sees what actually changed.
+            fuzzy_spans = fuzzy_match_spans(&text, &a.old_string);
+            if !fuzzy_spans.is_empty() {
+                count = fuzzy_spans.len();
+                if is_crlf_dominant(&text) {
+                    new_string = Cow::Owned(lf_to_crlf(&a.new_string));
+                }
+            } else {
+                // The #1 retry cause: right text, wrong whitespace. Detect it
+                // and say so instead of the generic error.
+                let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+                let normalized_old = norm(&a.old_string);
+                if !normalized_old.is_empty() && norm(&text).contains(&normalized_old) {
+                    bail!(
+                        "old_string not found in {}, but a near-match differing only in \
+                         whitespace/indentation exists — copy the exact text from read \
+                         output (keep tabs/spaces, strip the line-number prefix)",
+                        path.display()
+                    );
+                }
                 bail!(
-                    "old_string not found in {}, but a near-match differing only in \
-                     whitespace/indentation exists — copy the exact text from read \
-                     output (keep tabs/spaces, strip the line-number prefix)",
+                    "old_string not found in {} — the file may have changed since you read it; \
+                     re-read it and copy the exact current text (whitespace included, no \
+                     line-number prefixes)",
                     path.display()
                 );
             }
-            bail!(
-                "old_string not found in {} — the file may have changed since you read it; \
-                 re-read it and copy the exact current text (whitespace included, no \
-                 line-number prefixes)",
-                path.display()
-            );
         }
         if count > 1 && !a.replace_all {
             bail!(
@@ -245,7 +430,37 @@ impl Tool for EditTool {
         } else {
             String::new()
         };
-        let updated = if a.replace_all {
+        // A fuzzy match is a report, not a silent success: the model must see
+        // that its old_string differed from the file (trailing whitespace or
+        // typographic characters) and what the diff actually changed, or it
+        // keeps copying the variant that only fuzzy-matches.
+        let fuzzy_note = if fuzzy_spans.is_empty() {
+            String::new()
+        } else {
+            "\nnote: old_string matched only after normalizing line-end whitespace and \
+             quote/dash characters — the diff below shows what actually changed"
+                .to_string()
+        };
+        let updated = if !fuzzy_spans.is_empty() {
+            // Bound the allocation before splicing: the output size is exactly
+            // computable from the spans and the replacement length.
+            let projected = text.len()
+                + fuzzy_spans
+                    .iter()
+                    .map(|&(s, e)| new_string.len().saturating_sub(e - s))
+                    .sum::<usize>();
+            if projected > MAX_EDIT_OUTPUT_BYTES {
+                bail!(
+                    "this edit would produce ~{projected} bytes; narrow `old_string` or \
+                     drop `replace_all`"
+                );
+            }
+            let mut out = text.to_string();
+            for &(s, e) in fuzzy_spans.iter().rev() {
+                out.replace_range(s..e, new_string.as_ref());
+            }
+            out
+        } else if a.replace_all {
             // Bound the allocation before making it: only a growing replacement
             // can blow up, and its output size is exactly computable from the
             // match count. Bail rather than let `String::replace` OOM.
@@ -273,7 +488,7 @@ impl Tool for EditTool {
         // The full diff rides back uncapped — it is what the transcript shows
         // the user; the agent abbreviates the model's copy.
         Ok(format!(
-            "Replaced {count} occurrence(s) in {}{warn}{stale_note}\n{diff}",
+            "Replaced {count} occurrence(s) in {}{warn}{fuzzy_note}{stale_note}\n{diff}",
             path.display()
         ))
     }
@@ -537,5 +752,258 @@ mod tests {
         assert!(err.contains("sandbox: refusing to write"), "{err}");
         assert!(err.contains("You may write only under"), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn old() {}\n");
+    }
+
+    /// The model's `old_string` can differ from the file in trailing line-end
+    /// whitespace (invisible in `read` output and easy to drop when copying).
+    /// The fuzzy retry recovers such a match, consumes the trailing whitespace,
+    /// and the result says the match was fuzzy.
+    #[tokio::test]
+    async fn edit_recovers_a_match_with_trailing_line_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.rs");
+        std::fs::write(&path, "fn old() {  \n    let x = 1;\n}\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "fn old() {\n    let x = 1;\n}\n",
+                    "new_string": "fn new() {\n    let x = 1;\n}\n",
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert!(
+            out.contains("normalizing line-end whitespace"),
+            "a fuzzy match must be reported: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn new() {\n    let x = 1;\n}\n",
+            "the trailing whitespace the model never copied is consumed"
+        );
+    }
+
+    /// Smart quotes and dashes (the typography formatters apply) normalize to
+    /// their ASCII forms, so an edit whose only difference is those characters
+    /// succeeds — and replaces exactly the quoted span, leaving the rest of the
+    /// line untouched.
+    #[tokio::test]
+    async fn edit_recovers_typographic_quote_and_dash_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.md");
+        std::fs::write(&path, "let s = \u{201C}hello\u{201D}; // a \u{2014} b\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "\"hello\"",
+                    "new_string": "\"world\"",
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "let s = \"world\"; // a \u{2014} b\n",
+            "only the quoted span is replaced; the dash outside the span stays"
+        );
+
+        // A dash difference is covered too, when the old_string spans it.
+        let path = dir.path().join("g.md");
+        std::fs::write(&path, "// a \u{2014} b\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "// a - b",
+                    "new_string": "// a - c",
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "// a - c\n",
+            "the em dash is consumed with the matched line"
+        );
+    }
+
+    /// A fuzzy match after a multi-byte character must land on the right
+    /// bytes: `find` yields byte offsets while the recovery table is
+    /// char-indexed, so a non-ASCII char before the match used to shift the
+    /// span and corrupt the edit.
+    #[tokio::test]
+    async fn edit_fuzzy_match_after_a_multibyte_char_lands_on_the_right_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "café \u{201C}bon\u{201D}!\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "\"bon\"",
+                    "new_string": "\"très\"",
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "café \"très\"!\n",
+            "the smart-quoted span is replaced exactly, bytes after the é intact"
+        );
+    }
+
+    /// The fuzzy retry on a CRLF file keeps CRLF endings and translates the
+    /// replacement the same way the exact CRLF path does.
+    #[tokio::test]
+    async fn edit_fuzzy_on_crlf_keeps_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf_fuzzy.txt");
+        std::fs::write(&path, "alpha \r\nbeta\r\ngamma\r\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "alpha\nbeta\n",
+                    "new_string": "replaced\n",
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "replaced\r\ngamma\r\n");
+        assert!(
+            on_disk.contains("\r\n"),
+            "CRLF endings are kept: {on_disk:?}"
+        );
+    }
+
+    /// A fuzzy match that is not unique refuses exactly like the exact path:
+    /// same "not unique" message, same untouched file. (`old` ends in a
+    /// newline so it does not match the lines exactly — the trailing spaces
+    /// are what the fuzzy path bridges.)
+    #[tokio::test]
+    async fn edit_fuzzy_requires_a_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "foo \nfoo  \n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let err = EditTool
+            .execute(
+                json!({"path": path.to_str().unwrap(), "old_string": "foo\n", "new_string": "bar\n"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not unique"), "{err}");
+        assert!(err.contains("2 matches"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo \nfoo  \n");
+    }
+
+    /// `replace_all` applies every fuzzy match, exactly like the exact path.
+    #[tokio::test]
+    async fn edit_fuzzy_replace_all_replaces_every_fuzzy_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "foo \nfoo  \n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let out = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "foo\n",
+                    "new_string": "bar\n",
+                    "replace_all": true,
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 2 occurrence"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "bar\nbar\n",
+            "both fuzzy occurrences, trailing whitespace and newline consumed"
+        );
+    }
+
+    /// When even the normalized form does not match, the edit still refuses
+    /// with the informative message and leaves the file byte-for-byte intact.
+    #[tokio::test]
+    async fn edit_with_no_fuzzy_match_still_refuses_and_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let err = EditTool
+            .execute(
+                json!({"path": path.to_str().unwrap(), "old_string": "gamma", "new_string": "x"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+    }
+
+    /// An `old_string` with blank lines normalizes to an empty line, which
+    /// would match every file line vacuously — the fuzzy path refuses rather
+    /// than guess, and the file is untouched.
+    #[tokio::test]
+    async fn edit_fuzzy_refuses_when_old_has_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha\n\nbeta\n").unwrap();
+        let c = ToolContext::new(dir.path());
+        c.mark_read(&path);
+
+        let err = EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "alpha\n\nx",
+                    "new_string": "y",
+                }),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\n\nbeta\n");
     }
 }
