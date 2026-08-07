@@ -1290,8 +1290,11 @@ live here:
   the job stages the PKGBUILD and exits 0 when the diff is empty, so re-running
   it is safe. The tag run stays red until it lands, which is
   `tag-release status` working as intended. Probed again 2026-08-06: the RPC
-  still reports `0.10.0-1`. **Delete this entry once the RPC reports
-  `0.11.0-1`.**
+  still reports `0.10.0-1`. Probed again 2026-08-07:
+  `gh run rerun 30767495527 --failed` ran and the job failed with the same
+  banner — the outage is still up (the https git endpoint answers `ls-remote`
+  while the SSH one the job pushes through refuses). The RPC still reports
+  `0.10.0-1`. **Delete this entry once the RPC reports `0.11.0-1`.**
 
 ## Deferred 2026-08-05
 
@@ -1842,14 +1845,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   written on the test itself, because what the user cares about is that the
   variable works, not which layer honoured it. Closing it means asserting on
   `colour_stderr` directly, which is a private fn in a binary crate.
-- **`the_question_is_painted_in_the_theme_from_config` (trust_pty) fails under a
-  `NO_COLOR` environment.** The binary suppresses colour (crossterm does it
-  itself), so the assertion that the trust prompt carries the theme's RGB escape
-  goes red when the test process inherits `NO_COLOR` — found 2026-08-05, the
-  inverse sibling of the entry above. CI is unaffected (no `NO_COLOR` there); a
-  local run with `NO_COLOR=1` exports must unset it for the suite. Closing it
-  means asserting on something other than the raw escape stream, or the test
-  clearing `NO_COLOR` for the child it spawns.
 - **`serve_once` takes `&'static str`**, so every mock SSE body must be a
   literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
   table-driven stream test awkward. `impl Into<String>` is a one-line change
