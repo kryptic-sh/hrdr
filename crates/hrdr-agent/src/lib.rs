@@ -3047,6 +3047,7 @@ mod tests {
                         function: FunctionCall {
                             name: "t".to_string(),
                             arguments: "{}".to_string(),
+                            parsed_arguments: None,
                         },
                     })
                     .collect(),
@@ -11794,6 +11795,7 @@ mod tests {
                 function: hrdr_llm::FunctionCall {
                     name: "read".into(),
                     arguments: "{}".into(),
+                    parsed_arguments: None,
                 },
             }]);
             Arc::make_mut(&mut agent.messages).push(calls);

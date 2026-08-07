@@ -784,6 +784,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
@@ -1438,6 +1439,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,

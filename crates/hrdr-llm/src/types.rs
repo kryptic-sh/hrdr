@@ -207,6 +207,35 @@ pub struct FunctionCall {
     pub name: String,
     /// Raw JSON string of arguments (OpenAI sends this as a string, not an object).
     pub arguments: String,
+    /// Memoized [`Self::parsed_input`] result, filled when the call is
+    /// finalized ([`Accumulator::into_message`]) so the Anthropic request
+    /// builder never re-parses a historical call's arguments on every round.
+    /// Never serialized — `arguments` stays the wire's canonical form.
+    #[serde(default, skip_serializing)]
+    pub parsed_arguments: Option<serde_json::Value>,
+}
+
+impl FunctionCall {
+    /// The call's arguments as a JSON value for the Anthropic wire: `{}` for a
+    /// no-argument call, the parsed object when `arguments` is valid JSON, or
+    /// the raw string preserved verbatim when it is not (a malformed args
+    /// string must surface as the model's original intent, never be rewritten).
+    ///
+    /// Serves the memoized [`Self::parsed_arguments`] when the call was
+    /// finalized through [`Accumulator::into_message`]; a call that arrives
+    /// with a cold cache (restored, hand-built, or deserialized) parses on
+    /// demand — correct, just not cached.
+    pub fn parsed_input(&self) -> serde_json::Value {
+        if let Some(parsed) = &self.parsed_arguments {
+            return parsed.clone();
+        }
+        if self.arguments.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&self.arguments)
+                .unwrap_or_else(|_| serde_json::json!(self.arguments.clone()))
+        }
+    }
 }
 
 fn function_kind() -> String {
@@ -833,6 +862,7 @@ impl Accumulator {
                     function: FunctionCall {
                         name: String::new(),
                         arguments: String::new(),
+                        parsed_arguments: None,
                     },
                 });
             }
@@ -909,6 +939,11 @@ impl Accumulator {
             if call.id.is_empty() {
                 call.id = format!("call_{}_{i}", self.nonce);
             }
+            // Arguments are final once the stream ends — memoize the parsed
+            // form now so the Anthropic request builder never re-parses this
+            // call's arguments on every subsequent round (see
+            // [`FunctionCall::parsed_input`]).
+            call.function.parsed_arguments = Some(call.function.parsed_input());
         }
         ChatMessage {
             role: Role::Assistant,
@@ -1444,6 +1479,50 @@ mod tests {
         assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].function.arguments, "{\"path\": \"x\"}");
+        // `into_message` finalizes the call, so the parsed form is memoized —
+        // the Anthropic request builder must never re-parse it per round.
+        assert_eq!(
+            calls[0].function.parsed_arguments,
+            Some(json!({ "path": "x" }))
+        );
+    }
+
+    #[test]
+    fn parsed_input_covers_cold_cache_and_edge_shapes() {
+        // A call that never went through `into_message` (restored, hand-built,
+        // or deserialized) has a cold cache and parses on demand — the same
+        // shapes the request builder used to handle inline.
+        let valid = FunctionCall {
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+            parsed_arguments: None,
+        };
+        assert_eq!(valid.parsed_input(), json!({ "path": "a.rs" }));
+        assert!(
+            valid.parsed_arguments.is_none(),
+            "a cold cache parses on demand without mutating the call"
+        );
+        assert_eq!(
+            valid.parsed_input(),
+            json!({ "path": "a.rs" }),
+            "repeated calls agree"
+        );
+
+        // No-argument call: empty args is a no-arg call, not lost intent.
+        let no_args = FunctionCall {
+            name: "read".into(),
+            arguments: "  ".into(),
+            parsed_arguments: None,
+        };
+        assert_eq!(no_args.parsed_input(), json!({}));
+
+        // Malformed JSON is preserved as a JSON string, never rewritten.
+        let malformed = FunctionCall {
+            name: "read".into(),
+            arguments: "not valid json".into(),
+            parsed_arguments: None,
+        };
+        assert_eq!(malformed.parsed_input(), json!("not valid json"));
     }
 
     #[test]

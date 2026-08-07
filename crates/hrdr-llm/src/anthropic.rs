@@ -527,12 +527,11 @@ fn assistant_blocks(m: &ChatMessage) -> Vec<Value> {
         // rewriting to `{}`: that erases the model's original intent from history
         // and hides the problem. It will likely still fail validation on resend,
         // but that failure is honest and visible.
-        let input: Value = if call.function.arguments.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&call.function.arguments)
-                .unwrap_or_else(|_| json!(call.function.arguments))
-        };
+        //
+        // The parse is memoized on the call ([`FunctionCall::parsed_input`]) —
+        // arguments are fixed once the call streams in, so re-parsing them on
+        // every request would only repeat work across rounds.
+        let input = call.function.parsed_input();
         blocks.push(json!({
             "type": "tool_use",
             "id": call.id,
@@ -1117,6 +1116,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
@@ -1167,6 +1167,7 @@ mod tests {
                 function: FunctionCall {
                     name: "list_agents".into(),
                     arguments: String::new(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
@@ -1730,6 +1731,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: "not valid json".into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
@@ -1738,6 +1740,36 @@ mod tests {
         let blocks = assistant_blocks(&assistant);
         assert_eq!(blocks[0]["type"], "tool_use");
         assert_eq!(blocks[0]["input"], json!("not valid json"));
+    }
+
+    #[test]
+    fn assistant_blocks_serve_the_memoized_parsed_arguments() {
+        // A finalized call's cache is authoritative: the builder must not
+        // re-parse `arguments` per request. The `arguments` string below is
+        // deliberately stale/malformed — if the builder parsed it instead of
+        // trusting the memo, this test goes red.
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
+            origin: MessageOrigin::User,
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_cached".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "stale, would not parse".into(),
+                    parsed_arguments: Some(json!({ "path": "cached.rs" })),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let blocks = assistant_blocks(&assistant);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["input"], json!({ "path": "cached.rs" }));
     }
 
     #[test]
@@ -1974,6 +2006,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"x"}"#.into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
@@ -2169,6 +2202,7 @@ mod tests {
                 function: FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                    parsed_arguments: None,
                 },
             }]),
             tool_call_id: None,
