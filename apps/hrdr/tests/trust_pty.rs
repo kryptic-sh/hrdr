@@ -18,63 +18,12 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{drain_pty, pty_text};
+use common::{drain_pty, pty_text, skip_for_want_of_a_pty, visible};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 /// Generous: a cold runner is slow, and a flaky timeout here is worse than a slow
 /// test.
 const BOOT: Duration = Duration::from_secs(60);
-
-fn pty_available() -> bool {
-    native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 90,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .is_ok()
-}
-
-/// Skip for want of a pty — never in CI, where a missing pty is a broken
-/// environment rather than the local Landlock sandbox blocking `/dev/ptmx`.
-fn skip_for_want_of_a_pty() -> bool {
-    if pty_available() || std::env::var_os("CI").is_some() {
-        return false;
-    }
-    eprintln!("skipping: no pty available (a Landlock sandbox blocks /dev/ptmx)");
-    true
-}
-
-/// Strip ANSI escapes so assertions read the text, not the codes that placed it.
-fn visible(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() || c == '~' {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                for c in chars.by_ref() {
-                    if c == '\x07' || c == '\x1b' {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
 
 /// One run: an untrusted project, the keys to answer with, and what came back.
 struct Asked {

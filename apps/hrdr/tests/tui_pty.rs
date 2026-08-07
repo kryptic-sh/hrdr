@@ -28,6 +28,7 @@ extern crate hrdr_test_support;
 
 mod common;
 
+use common::{skip_for_want_of_a_pty, visible};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,70 +43,6 @@ const EXIT: Duration = Duration::from_secs(30);
 /// Grace for output still in flight. A ConPTY hands its buffer over when it is torn
 /// down, so a child that has already exited can still have a screenful coming.
 const DRAIN: Duration = Duration::from_secs(2);
-
-/// Check whether a pty can be allocated. Returns `false` when the Landlock
-/// sandbox inherited from the parent hrdr process blocks `/dev/ptmx`.
-fn pty_available() -> bool {
-    native_pty_system()
-        .openpty(PtySize {
-            rows: 1,
-            cols: 1,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .is_ok()
-}
-
-/// Whether to skip a pty test for want of a pty — **never in CI**.
-///
-/// Locally this is the common case: hrdr running these tests under its own
-/// Landlock sandbox cannot open `/dev/ptmx`, and reporting that as a failure
-/// says nothing about the code. On a runner there is no such sandbox, so a
-/// missing pty is a broken environment and the only useful thing a test can do
-/// is fail. A skip that cannot tell those apart converts an infrastructure
-/// failure into a green tick, which is the one outcome worse than either.
-fn skip_for_want_of_a_pty() -> bool {
-    if pty_available() {
-        return false;
-    }
-    if std::env::var_os("CI").is_some() {
-        return false;
-    }
-    eprintln!("skipping: no pty available (a Landlock sandbox blocks /dev/ptmx)");
-    true
-}
-
-/// Strip ANSI escape sequences, so assertions read the *text* on the screen rather
-/// than the control codes that positioned it.
-fn visible(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // CSI (`ESC [ … final`) and OSC (`ESC ] … BEL|ST`) are the two hrdr emits.
-        match chars.next() {
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() || c == '~' {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                for c in chars.by_ref() {
-                    if c == '\x07' || c == '\x1b' {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
 
 /// The pty's write end, shared by the handshake responder and the keystrokes.
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;

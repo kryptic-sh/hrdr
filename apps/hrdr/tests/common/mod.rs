@@ -25,6 +25,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use portable_pty::{PtySize, native_pty_system};
+
 /// What the server does for one `POST …/chat/completions` request.
 pub enum Chat {
     /// Stream these payloads as SSE `data:` events (each already a JSON string,
@@ -374,4 +376,65 @@ pub fn drain_pty(
 /// should report *its* failure, not have a poisoned mutex bury it.
 pub fn pty_text(seen: &Arc<Mutex<String>>) -> String {
     seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Check whether a pty can be allocated. Returns `false` when the Landlock
+/// sandbox inherited from the parent hrdr process blocks `/dev/ptmx`.
+pub fn pty_available() -> bool {
+    native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok()
+}
+
+/// Whether to skip a pty test for want of a pty — **never in CI**.
+///
+/// Locally this is the common case: hrdr running these tests under its own
+/// Landlock sandbox cannot open `/dev/ptmx`, and reporting that as a failure
+/// says nothing about the code. On a runner there is no such sandbox, so a
+/// missing pty is a broken environment and the only useful thing a test can do
+/// is fail. A skip that cannot tell those apart converts an infrastructure
+/// failure into a green tick, which is the one outcome worse than either.
+pub fn skip_for_want_of_a_pty() -> bool {
+    if pty_available() || std::env::var_os("CI").is_some() {
+        return false;
+    }
+    eprintln!("skipping: no pty available (a Landlock sandbox blocks /dev/ptmx)");
+    true
+}
+
+/// Strip ANSI escape sequences, so assertions read the *text* on the screen
+/// rather than the control codes that positioned it.
+pub fn visible(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // CSI (`ESC [ … final`) and OSC (`ESC ] … BEL|ST`) are the two hrdr emits.
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                for c in chars.by_ref() {
+                    if c == '\x07' || c == '\x1b' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

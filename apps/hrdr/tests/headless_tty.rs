@@ -14,7 +14,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Chat, MockServer, drain_pty, pty_text, text_chunk};
+use common::{Chat, MockServer, drain_pty, pty_text, skip_for_want_of_a_pty, text_chunk};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 /// Generous: a cold runner is slow, and a flaky timeout is worse than a slow test.
@@ -30,27 +30,6 @@ const DONE: Duration = Duration::from_secs(60);
 /// `ESC[38;5;<n>m`, which is the thing actually under test.
 fn set_a_colour(seen: &str) -> bool {
     seen.contains("\x1b[38;5;")
-}
-
-fn pty_available() -> bool {
-    native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 90,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .is_ok()
-}
-
-/// Skip for want of a pty — never in CI, where a missing pty is a broken
-/// environment rather than a local sandbox blocking `/dev/ptmx`.
-fn skip_for_want_of_a_pty() -> bool {
-    if pty_available() || std::env::var_os("CI").is_some() {
-        return false;
-    }
-    eprintln!("skipping: no pty available (a Landlock sandbox blocks /dev/ptmx)");
-    true
 }
 
 /// Run one headless turn with stdout+stderr on a pty, and return everything the
