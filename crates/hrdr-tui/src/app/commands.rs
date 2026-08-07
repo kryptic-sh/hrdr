@@ -1,5 +1,6 @@
 //! Slash-command dispatch and the individual command handlers.
 
+use super::selector::{SelectorKey, selector_key};
 use super::*;
 use crate::theme::Theme;
 use hrdr_app::{CommandHost, resolve_alias};
@@ -549,35 +550,19 @@ impl super::App {
     /// checks `self.model_selector.is_some()` first.
     pub(super) fn model_selector_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.close_model_selector(),
-            KeyCode::Char('c') if ctrl => self.close_model_selector(),
-            KeyCode::Up => {
-                if let Some(s) = &mut self.model_selector {
-                    s.up();
+        match selector_key(&mut self.model_selector, key) {
+            SelectorKey::Close => self.close_model_selector(),
+            SelectorKey::Handled => {}
+            SelectorKey::Other(key) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    // Enter switches for this session; Ctrl+D also persists the pick as
+                    // the config default (provider + model), so it sticks next launch.
+                    KeyCode::Enter => self.apply_selected_model(false),
+                    KeyCode::Char('d') if ctrl => self.apply_selected_model(true),
+                    _ => {}
                 }
             }
-            KeyCode::Down => {
-                if let Some(s) = &mut self.model_selector {
-                    s.down();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = &mut self.model_selector {
-                    s.backspace();
-                }
-            }
-            // Enter switches for this session; Ctrl+D also persists the pick as
-            // the config default (provider + model), so it sticks next launch.
-            KeyCode::Enter => self.apply_selected_model(false),
-            KeyCode::Char('d') if ctrl => self.apply_selected_model(true),
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(s) = &mut self.model_selector {
-                    s.push_char(ch);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -637,33 +622,15 @@ impl super::App {
     /// and any other character edits the fuzzy filter. Caller checks
     /// `self.session_selector.is_some()` first.
     pub(super) fn session_selector_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.session_selector = None,
-            KeyCode::Char('c') if ctrl => self.session_selector = None,
-            KeyCode::Up => {
-                if let Some(s) = &mut self.session_selector {
-                    s.up();
+        use crossterm::event::KeyCode;
+        match selector_key(&mut self.session_selector, key) {
+            SelectorKey::Close => self.session_selector = None,
+            SelectorKey::Handled => {}
+            SelectorKey::Other(key) => {
+                if key.code == KeyCode::Enter {
+                    self.apply_selected_session();
                 }
             }
-            KeyCode::Down => {
-                if let Some(s) = &mut self.session_selector {
-                    s.down();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = &mut self.session_selector {
-                    s.backspace();
-                }
-            }
-            KeyCode::Enter => self.apply_selected_session(),
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(s) = &mut self.session_selector {
-                    s.push_char(ch);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -693,37 +660,15 @@ impl super::App {
     /// character edits the fuzzy filter. Caller checks
     /// `self.theme_selector.is_some()` first.
     pub(super) fn theme_selector_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.close_theme_selector(),
-            KeyCode::Char('c') if ctrl => self.close_theme_selector(),
-            KeyCode::Up => {
-                if let Some(s) = &mut self.theme_selector {
-                    s.up();
+        use crossterm::event::KeyCode;
+        match selector_key(&mut self.theme_selector, key) {
+            SelectorKey::Close => self.close_theme_selector(),
+            SelectorKey::Handled => self.preview_selected_theme(),
+            SelectorKey::Other(key) => {
+                if key.code == KeyCode::Enter {
+                    self.apply_selected_theme();
                 }
-                self.preview_selected_theme();
             }
-            KeyCode::Down => {
-                if let Some(s) = &mut self.theme_selector {
-                    s.down();
-                }
-                self.preview_selected_theme();
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = &mut self.theme_selector {
-                    s.backspace();
-                }
-                self.preview_selected_theme();
-            }
-            KeyCode::Enter => self.apply_selected_theme(),
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(s) = &mut self.theme_selector {
-                    s.push_char(ch);
-                }
-                self.preview_selected_theme();
-            }
-            _ => {}
         }
     }
 
@@ -732,45 +677,25 @@ impl super::App {
     /// any other character edits the fuzzy filter. Caller checks
     /// `self.skill_selector.is_some()` first.
     pub(super) fn skill_selector_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.skill_selector = None,
-            KeyCode::Char('c') if ctrl => self.skill_selector = None,
-            KeyCode::Up => {
-                if let Some(s) = &mut self.skill_selector {
-                    s.up();
+        use crossterm::event::KeyCode;
+        match selector_key(&mut self.skill_selector, key) {
+            SelectorKey::Close => self.skill_selector = None,
+            SelectorKey::Handled => {}
+            SelectorKey::Other(key) => {
+                // Enter inserts the invocation and hands the cursor back — the
+                // user finishes the arguments and submits like any message.
+                if key.code == KeyCode::Enter {
+                    let chosen = self
+                        .skill_selector
+                        .as_ref()
+                        .and_then(|s| s.current())
+                        .map(|sk| sk.name.clone());
+                    self.skill_selector = None;
+                    if let Some(name) = chosen {
+                        self.editor.set_content(&format!(":{name} "));
+                    }
                 }
             }
-            KeyCode::Down => {
-                if let Some(s) = &mut self.skill_selector {
-                    s.down();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = &mut self.skill_selector {
-                    s.backspace();
-                }
-            }
-            // Enter inserts the invocation and hands the cursor back — the
-            // user finishes the arguments and submits like any message.
-            KeyCode::Enter => {
-                let chosen = self
-                    .skill_selector
-                    .as_ref()
-                    .and_then(|s| s.current())
-                    .map(|sk| sk.name.clone());
-                self.skill_selector = None;
-                if let Some(name) = chosen {
-                    self.editor.set_content(&format!(":{name} "));
-                }
-            }
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(s) = &mut self.skill_selector {
-                    s.push_char(ch);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1148,33 +1073,15 @@ impl super::App {
     /// any other character edits the fuzzy filter. Caller checks
     /// `self.effort_selector.is_some()` first.
     pub(super) fn effort_selector_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.effort_selector = None,
-            KeyCode::Char('c') if ctrl => self.effort_selector = None,
-            KeyCode::Up => {
-                if let Some(s) = &mut self.effort_selector {
-                    s.up();
+        use crossterm::event::KeyCode;
+        match selector_key(&mut self.effort_selector, key) {
+            SelectorKey::Close => self.effort_selector = None,
+            SelectorKey::Handled => {}
+            SelectorKey::Other(key) => {
+                if key.code == KeyCode::Enter {
+                    self.apply_selected_effort();
                 }
             }
-            KeyCode::Down => {
-                if let Some(s) = &mut self.effort_selector {
-                    s.down();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = &mut self.effort_selector {
-                    s.backspace();
-                }
-            }
-            KeyCode::Enter => self.apply_selected_effort(),
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(s) = &mut self.effort_selector {
-                    s.push_char(ch);
-                }
-            }
-            _ => {}
         }
     }
 

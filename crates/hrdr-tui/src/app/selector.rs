@@ -71,6 +71,60 @@ impl<T> Selector<T> {
     }
 }
 
+/// The keys every picker shares: Esc/Ctrl+C close, Up/Down/Backspace move the
+/// highlight, and any other non-ctrl char edits the fuzzy filter. Runs the
+/// shared part and reports what kind of key it was so each handler keeps only
+/// its divergent bits (Enter, Ctrl+D, the theme preview, the skill insert).
+pub(super) enum SelectorKey {
+    /// A shared key, fully handled (highlight move or filter edit).
+    Handled,
+    /// Esc or Ctrl+C — the caller closes its own picker (the close differs:
+    /// some restore state, some just drop the selector).
+    Close,
+    /// Anything else — the caller decides (Enter applies, Ctrl+D persists …).
+    Other(crossterm::event::KeyEvent),
+}
+
+/// Dispatch the keys every picker shares, mutating the selector for the shared
+/// ones, and report which way the key went so the caller keeps only its
+/// divergent arms (Enter, Ctrl+D, the theme preview, the skill insert).
+pub(super) fn selector_key<T>(
+    sel: &mut Option<Selector<T>>,
+    key: crossterm::event::KeyEvent,
+) -> SelectorKey {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => SelectorKey::Close,
+        KeyCode::Char('c') if ctrl => SelectorKey::Close,
+        KeyCode::Up => {
+            if let Some(s) = sel {
+                s.up();
+            }
+            SelectorKey::Handled
+        }
+        KeyCode::Down => {
+            if let Some(s) = sel {
+                s.down();
+            }
+            SelectorKey::Handled
+        }
+        KeyCode::Backspace => {
+            if let Some(s) = sel {
+                s.backspace();
+            }
+            SelectorKey::Handled
+        }
+        KeyCode::Char(ch) if !ctrl => {
+            if let Some(s) = sel {
+                s.push_char(ch);
+            }
+            SelectorKey::Handled
+        }
+        _ => SelectorKey::Other(key),
+    }
+}
+
 // ── Per-picker aliases + constructors (each pairs a choice type with its
 //    fuzzy filter) ──────────────────────────────────────────────────────────
 

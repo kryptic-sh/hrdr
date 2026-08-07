@@ -41,7 +41,7 @@ pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{display_dir, git_branch, is_known_command, is_quit_command};
 pub(crate) use selector::{
-    EffortSelector, LoginProviderSelector, ModelSelector, SessionSelector, SkillSelector,
+    EffortSelector, LoginProviderSelector, ModelSelector, Selector, SessionSelector, SkillSelector,
     ThemeSelector, effort_selector, login_provider_selector, model_selector, session_selector,
     skill_selector, theme_selector,
 };
@@ -1677,58 +1677,29 @@ impl App {
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
         self.disarm();
-        // The `/model` selector owns the mouse while open: the wheel scrolls its
-        // list (moving the highlight, which the view follows); other events are
-        // swallowed so they don't reach the transcript beneath the modal.
         if let Some(sel) = &mut self.model_selector {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             return;
         }
-        // The `/resume` and `/theme` pickers get the same treatment (the theme
-        // picker also live-previews the newly-highlighted row).
         if let Some(sel) = &mut self.session_selector {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             return;
         }
         if let Some(sel) = &mut self.theme_selector {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             self.preview_selected_theme();
             return;
         }
         if let Some(sel) = &mut self.effort_selector {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             return;
         }
         if let Some(sel) = &mut self.skill_selector {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             return;
         }
         if let Some(LoginModal::Providers(sel)) = &mut self.login_modal {
-            match m.kind {
-                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
-                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
-                _ => {}
-            }
+            selector_wheel(sel, m.kind);
             return;
         }
         match m.kind {
@@ -3028,6 +2999,16 @@ impl App {
         // (`AgentRegistry::start_turn`), for every agent alike. Nothing is folded
         // here; this wake-up only brings the panes up to date with that record.
         self.sync_panes();
+    }
+}
+
+/// Wheel over an open picker: scroll lines move the highlight (which the view
+/// follows); any other event is swallowed — the modal owns the mouse.
+fn selector_wheel<T>(sel: &mut Selector<T>, kind: MouseEventKind) {
+    match kind {
+        MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+        MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+        _ => {}
     }
 }
 
