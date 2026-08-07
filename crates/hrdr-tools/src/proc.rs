@@ -288,7 +288,7 @@ mod windows_job {
             // using out-parameters/handles exactly as their signatures
             // require; every failure path is checked and propagated.
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle == 0 {
+            if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
             let job = Self { handle };
@@ -310,7 +310,7 @@ mod windows_job {
             let Some(raw) = child.raw_handle() else {
                 return Err(io::Error::other("child has already exited"));
             };
-            let ok = unsafe { AssignProcessToJobObject(job.handle, raw as isize) };
+            let ok = unsafe { AssignProcessToJobObject(job.handle, raw) };
             if ok == 0 {
                 return Err(io::Error::last_os_error());
             }

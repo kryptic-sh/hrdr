@@ -257,6 +257,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The Windows build compiles again.** `windows-sys` 0.52 → 0.61 changed
+  `HANDLE` from an integer to `*mut c_void` (commit `201c98c`), breaking the
+  Job-Object tree-kill in `hrdr-tools` (`proc.rs`) and the low-integrity token
+  opener (`sandbox.rs`): null checks compared a pointer to `0`, and
+  `AssignProcessToJobObject` got an `isize` cast. The null checks now use
+  `is_null`/`null_mut`, the cast is gone (tokio's `raw_handle()` already returns
+  the pointer), and the symlink-retargeting test in `lib.rs` that was built on
+  `std::os::unix::fs::symlink` is `#[cfg(unix)]`-gated — its Windows twin needs
+  a privileged reparse point and resolves differently.
+
+- **The macOS seatbelt sandbox no longer denies every write through a symlinked
+  path.** Writable roots are canonicalized before they reach the SBPL profile
+  (`/var/folders/…` becomes `/private/var/folders/…`), but Seatbelt matches the
+  pathname a process passes to the syscall — so `shell`/`watch` commands writing
+  to `$TMPDIR` on macOS were refused with "Operation not permitted". The Write
+  profile now grants each root's public spelling (`/private/var/…` and `/var/…`)
+  alongside the canonical one.
+
 - **`hrdr --model X run "prompt"` runs headlessly again.** A leading global flag
   made clap's `args_conflicts_with_subcommands` stop recognizing subcommand
   names once any flag had been parsed, so `run "prompt"` was swallowed by the

@@ -1303,7 +1303,7 @@ pub fn lower_current_process_to_low_integrity() -> std::io::Result<()> {
     // expects and outlives the call; `token` is checked before use and closed on
     // every path. Nothing here allocates, so there is nothing to leak.
     unsafe {
-        let mut token: HANDLE = 0;
+        let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT, &mut token) == 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1385,6 +1385,30 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
             .join(" ")
     }
 
+    /// The public spelling of a canonicalized root: `/private/var/…` →
+    /// `/var/…`. [`SandboxPolicy`] keeps only the canonical form (that is what
+    /// makes the file-tool guard escape-proof), but Seatbelt matches the
+    /// pathname a process passes to the syscall — which on macOS is the
+    /// symlinked `/var/folders/…`, not the `/private/var/folders/…` that
+    /// `canonicalize` resolves it to. A profile that grants only the canonical
+    /// form denies every write through the public one. No-op for roots without
+    /// the `/private/` prefix (the common case: a cwd or any path with no
+    /// symlinked ancestor).
+    fn literal_siblings(roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for root in roots {
+            let s = root.to_string_lossy();
+            let Some(literal) = s.strip_prefix("/private") else {
+                continue;
+            };
+            let candidate = PathBuf::from(literal);
+            if !out.contains(&candidate) && !roots.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+        out
+    }
+
     let mut profile = String::from(
         "(version 1)\n\
          (deny default)\n\
@@ -1404,7 +1428,14 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
             // roots at all, so it always takes that branch — broad reads, no
             // writes anywhere.
             if !policy.writable_roots.is_empty() {
-                let writes = subpaths(&policy.writable_roots);
+                // Grant the literal spellings too: the roots are canonicalized
+                // (macOS resolves `/var` to `/private/var`), but Seatbelt
+                // matches the pathname a process passes to the syscall —
+                // `/var/folders/…` — which a `(subpath "/private/var/…")`
+                // filter does not cover. Both name the same directory.
+                let mut roots = policy.writable_roots.clone();
+                roots.extend(literal_siblings(&policy.writable_roots));
+                let writes = subpaths(&roots);
                 profile.push_str(&format!("(allow file-write* {writes})\n"));
             }
         }
@@ -2200,6 +2231,46 @@ mod tests {
                 "(allow file-write* (subpath \"/work/wt\") (subpath \"/tmp/scratch\"))\n",
                 "(allow network*)\n",
             )
+        );
+
+        // A `/private/…` root also grants its public spelling: Seatbelt matches
+        // the pathname a process passes (`/var/folders/…`), not the
+        // canonicalized `/private/var/folders/…` the policy holds — the exact
+        // gap that made the watch tool's macOS test fail. Roots without the
+        // prefix gain nothing (the whole-profile assertion at the top of this
+        // test already pins that), and a root that is already the public
+        // spelling is not duplicated.
+        let mac = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![
+                PathBuf::from("/private/var/folders/ab/T"),
+                PathBuf::from("/Users/me/work"),
+            ],
+            readable_roots: Vec::new(),
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+        let profile = seatbelt_profile(SandboxMode::Write, &mac);
+        assert!(
+            profile.contains(
+                "(allow file-write* (subpath \"/private/var/folders/ab/T\") \
+                 (subpath \"/Users/me/work\") (subpath \"/var/folders/ab/T\"))"
+            ),
+            "{profile}"
+        );
+        let literal = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![PathBuf::from("/var/folders/ab/T")],
+            readable_roots: Vec::new(),
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+        assert_eq!(
+            seatbelt_profile(SandboxMode::Write, &literal)
+                .matches("(subpath \"/var/folders/ab/T\")")
+                .count(),
+            1,
+            "a root already in its public spelling is granted once, not re-derived"
         );
 
         // A quote in a path is escaped, not left to break the profile.

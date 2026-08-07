@@ -2939,6 +2939,10 @@ mod tests {
     /// each distinct path once, not to re-check the filesystem per line. On the
     /// unmemoized code this fails: the second line re-canonicalizes through the
     /// new target and the line passes.
+    ///
+    /// Unix-only: it is built on `std::os::unix::fs::symlink`, whose Windows
+    /// twin needs a privileged reparse point and resolves differently.
+    #[cfg(unix)]
     #[test]
     fn a_secret_line_memo_is_a_per_run_snapshot() {
         let dir = tempfile::tempdir().unwrap();
