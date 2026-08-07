@@ -29,6 +29,7 @@ pub use client::{
 };
 pub use fs::{
     owner_only_options, owner_only_options_no_follow, sibling_with_suffix, unique_sibling_path,
+    write_atomic,
 };
 pub use retry::{
     MAX_BACKOFF, RetryAttempt, RetryBudget, RetryPolicy, UnsupportedParam, is_context_overflow,

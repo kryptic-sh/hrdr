@@ -508,28 +508,10 @@ fn write_cache(path: &std::path::Path, v: &Value) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let tmp = crate::unique_sibling_path(path, "hrdr-tmp");
     let Some(s) = serde_json::to_string(v).ok() else {
         return;
     };
-    // Owner-only: the cached catalog is fetched with the user's credentials and
-    // can name provider/model entitlements that are theirs to know, so it gets
-    // the same treatment as the rest of hrdr's on-disk state
-    // ([`crate::fs::owner_only_options`] states what that is worth per platform).
-    let mut opts = crate::fs::owner_only_options();
-    opts.write(true).create(true).truncate(true);
-    if opts
-        .open(&tmp)
-        .ok()
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(s.as_bytes()).ok()
-        })
-        .is_some()
-    {
-        let _ = std::fs::rename(&tmp, path);
-    }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = crate::write_atomic(path, s.as_bytes());
 }
 
 #[cfg(test)]

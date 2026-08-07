@@ -43,7 +43,6 @@
 //! validation guards the values instead.)
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -2183,25 +2182,8 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
-    // `create_new` guarantees we own the temp; a failure here means someone
-    // else's temp collided, so it must not be cleaned up. Everything after gets
-    // a cleanup-on-error guard so a failed write never leaves a stray temp.
-    let mut f = hrdr_llm::owner_only_options()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(doc.to_string().as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Don't leave the scratch file behind when the rename is the thing that
-        // failed (a read-only directory, a cross-device target).
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()));
-    }
-    Ok(())
+    hrdr_llm::write_atomic(path, doc.to_string().as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Shorthand: a config with no `[providers.*]` entries — every provider name

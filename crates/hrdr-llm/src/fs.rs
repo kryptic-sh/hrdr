@@ -17,6 +17,7 @@
 //! that writes a secret (credentials, wire logs, transcripts, the catalog cache)
 //! needs the identical rule stated once.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -127,6 +128,77 @@ fn refuse_symlinks(opts: &mut std::fs::OpenOptions) {
 /// equivalent, so nothing is set and callers keep their own preflight check.
 #[cfg(not(unix))]
 fn refuse_symlinks(_opts: &mut std::fs::OpenOptions) {}
+
+/// Write `data` to `path` atomically: write to a temp file in the same
+/// directory, fsync, then rename over the target — a concurrent reader never
+/// sees a partial write. The temp file is created owner-only from the start (see
+/// [`owner_only_options`]) so there is no window where it exists with
+/// broader permissions.
+///
+/// Confidentiality guarantee, stated honestly: on Unix the file is owner-only
+/// (`0600`), enforced on every write. On Windows hrdr sets **no** explicit ACL —
+/// [`owner_only_options`] documents that stance in full. In practice
+/// the credential files land under `~/.config/hrdr` (see `hrdr_agent::config_dir`),
+/// which on Windows resolves to the per-user profile (`%USERPROFILE%`, not
+/// `%APPDATA%`) and is user-scoped by default — so the inherited default ACL
+/// that hrdr relies on there is a per-user one.
+///
+/// On unix the parent directory is fsynced after a successful rename so that the
+/// rename is crash-durable (the directory entry change is flushed to media).
+/// A directory sync failure is **not** reported as an error: the rename
+/// itself is atomic and the data is already on disk — a lost sync only
+/// risks losing the rename itself if the machine crashes before the
+/// directory metadata write completes.
+///
+/// The parent directory must already exist. A rename failure removes the temp
+/// so no stray file is left behind.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    // Write to a temp file in the same directory, then rename atomically.
+    // tempfile is a dev-dependency only, so the temp name comes from the
+    // shared sibling-temp scheme instead.
+    let tmp = unique_sibling_path(path, "hrdr-tmp");
+
+    // `create_new` guarantees we own `tmp`; a failure here means someone else's
+    // temp collided, so we must not clean it up. Everything after gets a
+    // cleanup-on-error guard so a failed save never leaves a stray temp behind
+    // (notably: a rename that fails still removes the temp we wrote).
+    let mut f = owner_only_options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| -> std::io::Result<()> {
+        f.write_all(data)?;
+        // Flush + fsync so the data is on disk before the rename. `sync_all` is
+        // portable — it is `FlushFileBuffers` on Windows — so a crash right
+        // after the rename cannot lose a freshly saved credential on any
+        // platform.
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    drop(f);
+    let result = result.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // After a successful rename, sync the parent directory so the directory
+    // entry change (the rename) is crash-durable.  Unix-only, and genuinely so:
+    // this needs a *directory* handle, and Windows cannot `File::open` a
+    // directory at all (it wants `CreateFile` with
+    // FILE_FLAG_BACKUP_SEMANTICS).  Unlike the file `sync_all` above — which is
+    // portable and now runs everywhere — there is no std equivalent to reach
+    // for here.  A sync failure is silently swallowed either way: the write is
+    // atomic and the data is on disk, so a lost directory sync risks only the
+    // rename itself in a crash before the directory metadata flushes.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -254,5 +326,55 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "mode={mode:#o}");
+    }
+
+    #[test]
+    fn write_atomic_produces_content_and_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        write_atomic(&path, b"hello world").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "out.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
+    }
+
+    /// `write_atomic` syncs the parent directory after a successful rename so
+    /// the directory entry change is crash-durable on Unix.  This test cannot
+    /// verify the sync itself (it is a kernel-level durability guarantee), but
+    /// it verifies that the sync does not break the happy path: the file is
+    /// written, the content is correct, no stray temps are left, and the
+    /// directory is still usable.
+    #[test]
+    fn write_atomic_with_dir_sync_completes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+
+        write_atomic(&path, b"sync test data").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"sync test data",
+            "content is preserved"
+        );
+
+        // No temp files or other stray files were left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "out.txt")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no stray files after write_atomic: {leftovers:?}"
+        );
+
+        // A second write_atomic on the same path also succeeds.
+        write_atomic(&path, b"second write").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second write");
     }
 }
