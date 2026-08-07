@@ -52,6 +52,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Content-Type — `.json()` set it implicitly and `.body(bytes)` sets none — so
   OpenAI-compatible endpoints rejected every turn with
   `415 Unsupported Media Type`.
+- **A session first saved after a compaction is named from the real first user
+  turn, not from the compaction summary.** `session_name_from` took the first
+  user-_role_ message regardless of origin, so a session whose first save came
+  after a compaction got "This conversation was compacted…" as its `/resume`
+  name; it now skips synthetic user-role messages (compaction summaries, nudges,
+  detached sub-agent reports) exactly as compaction itself does.
 
 ## [0.12.0] - 2026-08-07
 

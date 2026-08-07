@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::Entry;
-use crate::{DEFAULT_MODEL_REF, Message, MessageRole, ModelRef, ModelSpec, cwd_slug};
+use crate::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use anyhow::{Context, Result};
 use hrdr_tools::TodoItem;
 use serde::{Deserialize, Serialize};
@@ -1471,12 +1471,16 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
 /// not push the other columns off a narrow terminal.
 pub const SESSION_NAME_MAX_CHARS: usize = 60;
 
-/// A short session name derived from the first user message (first line, trimmed,
-/// capped at [`SESSION_NAME_MAX_CHARS`]). Falls back to `"untitled"` when there's
+/// A short session name derived from the first real user turn (first line,
+/// trimmed, capped at [`SESSION_NAME_MAX_CHARS`]). A user-role message that is
+/// compaction's own summary, a nudge or a detached sub-agent report is not the
+/// user speaking and does not name the session — after a compaction the first
+/// user-role message is the summary, and naming a session after it would be
+/// "This conversation was compacted…". Falls back to `"untitled"` when there's
 /// no usable text.
 pub fn session_name_from(msgs: &[Message]) -> String {
     msgs.iter()
-        .find(|m| m.role == MessageRole::User)
+        .find(|m| crate::compaction::is_user_turn(m))
         .and_then(|m| m.content.as_deref())
         // The user turn's content carries an immutable model-facing timestamp
         // prefix; a session name is for humans, so strip it first.
@@ -1498,6 +1502,7 @@ pub fn session_name_from(msgs: &[Message]) -> String {
 mod tests {
     use super::*;
     use crate::EntryKind;
+    use crate::MessageRole;
     use std::sync::Mutex;
 
     /// Global lock so env-var-dependent session tests don't race on HOME / XDG
@@ -1546,6 +1551,43 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         }
+    }
+
+    /// A session first named after a compaction must not take its name from the
+    /// summary — the summary is user-role but is not the user speaking, and
+    /// neither is a nudge or a detached sub-agent report. Named from the first
+    /// real user turn only; falls back to `"untitled"` when there is none.
+    #[test]
+    fn session_name_skips_compaction_summary_and_other_synthetic_user_roles() {
+        let summary = Message {
+            role: MessageRole::User,
+            content: Some("This conversation was compacted…".to_string()),
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
+            origin: crate::MessageOrigin::Summary(crate::CompactionReason::ContextOverflow),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let nudge = Message {
+            origin: crate::MessageOrigin::Nudge,
+            ..summary.clone()
+        };
+        assert_eq!(
+            session_name_from(&[summary.clone(), Message::user("Deploy the fix")]),
+            "Deploy the fix",
+            "the summary does not name the session; the first real user turn does"
+        );
+        assert_eq!(
+            session_name_from(&[nudge, summary.clone(), Message::user("Ship it")]),
+            "Ship it"
+        );
+        assert_eq!(
+            session_name_from(&[summary]),
+            "untitled",
+            "no real user turn → no name"
+        );
     }
 
     /// Async endpoint/catalog warnings are `Notice` entries, which `persisted()`
