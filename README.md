@@ -193,6 +193,8 @@ hrdr ships built-in skills that work with zero setup:
 - `:cli <tool>` — learn a command-line tool's real usage from the tool itself
   (`tldr`, `--help`, `man`, the repo's own scripts), so it never uses flags from
   a different version
+- `:ci` — check the CI/CD pipeline status and fix any failures it finds (a no-op
+  when it's passing)
 - `:fix` — root-cause and fix a pasted error
 - `:perf` — report performance problems: hot paths, allocations, complexity
 - `:plan` — explore read-only and produce an implementation plan

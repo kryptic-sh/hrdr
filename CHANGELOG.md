@@ -61,6 +61,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **New built-in skill `:ci` — check the CI/CD pipeline status and fix what is
+  failing in it.** It detects the project's pipeline (GitHub Actions via `gh`,
+  GitLab via `glab`, else names what it found), picks the run for the remote tip
+  of the current branch, and is a no-op when everything is green. On a failure
+  it separates a broken pipeline (the workflow file) from a failure the pipeline
+  merely caught (the code), fixes the root cause, proves it locally with the
+  project's own gate, then verifies the fix on the remote by watching the new
+  run to completion.
+
 - **`/compact` accepts a message to steer the summary — and queues while the
   agent is busy.** `/compact keep the file paths` appends the message to the
   summary request as additional instructions ("follow them closely"), so the
