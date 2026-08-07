@@ -833,6 +833,11 @@ fn map_event(
                         .and_then(|d| d.get("thinking"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    // An unknown block index (no matching `content_block_start`
+                    // recorded it) must not silently default to thinking slot 0 —
+                    // a stray delta belonging to a different block would corrupt
+                    // slot 0's text. Ignore the delta, like `input_json_delta`
+                    // does for tool slots below.
                     if let Some(entry) = thinking_slot.get_mut(&idx) {
                         entry.0.push_str(t);
                     }

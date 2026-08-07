@@ -367,7 +367,10 @@ fn parse_imf_fixdate(raw: &str) -> Option<std::time::Duration> {
     // date = day SP month SP year, e.g. `06 Nov 1994`
     // time = hour ":" minute ":" second, e.g. `08:49:37`
     let raw = raw.strip_suffix(" GMT")?;
-    // Strip the leading `wkday, ` prefix.
+    // Strip the leading `wkday, ` prefix. The weekday is discarded without
+    // validation — `Xyz, 06 Nov …` parses fine. Laxer than RFC 7231 and
+    // harmless (the weekday is redundant with the date), but deliberate: know
+    // it before "fixing" a test that relies on the laxness.
     let date_time = raw.split_once(", ").map(|(_, rest)| rest).unwrap_or(raw);
     let (date_str, time_str) = date_time.rsplit_once(' ')?;
 
@@ -469,7 +472,13 @@ const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 /// The one server that tolerates it is single-model llama.cpp, which ignores
 /// `model` entirely. So the OpenAI-shaped request builder omits the field
 /// instead — vLLM's own `model` is nullable and falls back to the served model,
-/// which is the same thing the sentinel was trying to say.
+/// which is the same thing the sentinel was trying to say. The two native
+/// builders are the other side of the same decision: neither has a nullable
+/// `model`, so `chat_stream` hands them the sentinel before `wire_model`
+/// resolves it and they put the literal string on the wire — a provider entry
+/// left at `default` pointed at Anthropic or Codex sends `"model": "default"`
+/// and gets that provider's own "unknown model" error (pinned by
+/// `the_unnamed_model_sentinel_reaches_the_wire_on_the_native_backends`).
 ///
 /// Defined here rather than in hrdr-agent (whose `DEFAULT_MODEL` is the same
 /// string) because this crate is what decides whether the field goes on the
