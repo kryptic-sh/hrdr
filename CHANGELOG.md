@@ -267,13 +267,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `std::os::unix::fs::symlink` is `#[cfg(unix)]`-gated — its Windows twin needs
   a privileged reparse point and resolves differently.
 
-- **The macOS seatbelt sandbox no longer denies every write through a symlinked
-  path.** Writable roots are canonicalized before they reach the SBPL profile
-  (`/var/folders/…` becomes `/private/var/folders/…`), but Seatbelt matches the
-  pathname a process passes to the syscall — so `shell`/`watch` commands writing
-  to `$TMPDIR` on macOS were refused with "Operation not permitted". The Write
-  profile now grants each root's public spelling (`/private/var/…` and `/var/…`)
-  alongside the canonical one.
+- **The macOS seatbelt sandbox no longer refuses `2>/dev/null`.** The Write
+  profile granted `file-write*` only under the writable roots, so a sandboxed
+  `shell`/`watch` command redirecting to `/dev/null` failed with "bash:
+  /dev/null: Operation not permitted" — the check that caught it was a watch
+  whose `cat … 2>/dev/null || …` round died before ever reaching its counter
+  write. The standard devices (`/dev/null`, `/dev/zero`, `/dev/random`,
+  `/dev/urandom`) are now open for writing in the Write and Read profiles.
 
 - **`hrdr --model X run "prompt"` runs headlessly again.** A leading global flag
   made clap's `args_conflicts_with_subcommands` stop recognizing subcommand

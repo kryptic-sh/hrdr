@@ -1422,11 +1422,23 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
     match mode {
         SandboxMode::Write | SandboxMode::Read => {
             profile.push_str("(allow file-read*)\n");
+            // The standard devices stay open for writing even though they are
+            // not writable roots: `2>/dev/null` is the one write every shell
+            // command needs, and without it a sandboxed command fails with
+            // "bash: /dev/null: Operation not permitted" — the exact error a
+            // watch check (`cat … 2>/dev/null || …`) hit on macOS CI before
+            // the roots line was ever reached. /dev/null discards, the rest
+            // are generators; every real-world Seatbelt profile allows them.
+            profile.push_str(
+                "(allow file-write* (subpath \"/dev/null\") (subpath \"/dev/zero\") \
+                 (subpath \"/dev/random\") (subpath \"/dev/urandom\"))\n",
+            );
             // An empty root list must stay closed: `(allow file-write*)` with
             // no filter allows every write there is, so the line is omitted
             // and `(deny default)` answers instead. `Read` has no writable
             // roots at all, so it always takes that branch — broad reads, no
-            // writes anywhere.
+            // project writes anywhere (the device line above is the only
+            // exception).
             if !policy.writable_roots.is_empty() {
                 // Grant the literal spellings too: the roots are canonicalized
                 // (macOS resolves `/var` to `/private/var`), but Seatbelt
@@ -2228,18 +2240,18 @@ mod tests {
                 "(allow mach-lookup)\n",
                 "(allow ipc-posix*)\n",
                 "(allow file-read*)\n",
+                "(allow file-write* (subpath \"/dev/null\") (subpath \"/dev/zero\") (subpath \"/dev/random\") (subpath \"/dev/urandom\"))\n",
                 "(allow file-write* (subpath \"/work/wt\") (subpath \"/tmp/scratch\"))\n",
                 "(allow network*)\n",
             )
         );
 
-        // A `/private/…` root also grants its public spelling: Seatbelt matches
-        // the pathname a process passes (`/var/folders/…`), not the
-        // canonicalized `/private/var/folders/…` the policy holds — the exact
-        // gap that made the watch tool's macOS test fail. Roots without the
-        // prefix gain nothing (the whole-profile assertion at the top of this
-        // test already pins that), and a root that is already the public
-        // spelling is not duplicated.
+        // A `/private/…` root also grants its public spelling — defensive, not
+        // the fix for the watch tool's macOS test (that was the `/dev/null`
+        // write above; the check died on `2>/dev/null` before the roots line
+        // was ever reached). Roots without the prefix gain nothing (the
+        // whole-profile assertion above pins that), and a root that is already
+        // the public spelling is not duplicated.
         let mac = SandboxPolicy {
             mode: SandboxMode::Write,
             writable_roots: vec![
@@ -2297,9 +2309,12 @@ mod tests {
             cache_roots: Vec::new(),
             wrap_tool_results: false,
         };
-        assert!(
-            !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
-            "an empty root set must stay closed, not open"
+        assert_eq!(
+            seatbelt_profile(SandboxMode::Write, &empty)
+                .matches("(allow file-write*")
+                .count(),
+            1,
+            "an empty root set must not open project writes — only the device line stays"
         );
     }
 
@@ -2336,6 +2351,7 @@ mod tests {
                 "(allow mach-lookup)\n",
                 "(allow ipc-posix*)\n",
                 "(allow file-read*)\n",
+                "(allow file-write* (subpath \"/dev/null\") (subpath \"/dev/zero\") (subpath \"/dev/random\") (subpath \"/dev/urandom\"))\n",
                 "(allow file-write* (subpath \"/work/wt\"))\n",
                 "(allow network*)\n",
             )
