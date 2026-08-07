@@ -1034,7 +1034,15 @@ impl Client {
     }
 
     fn post_bytes(&self, body: Vec<u8>) -> reqwest::RequestBuilder {
-        self.auth(self.http.post(self.url("chat/completions")).body(body))
+        self.auth(
+            self.http
+                .post(self.url("chat/completions"))
+                // `.json()` set this implicitly; `.body(bytes)` sets no
+                // Content-Type at all, and OpenAI-compatible endpoints 415 a
+                // JSON body without it.
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body),
+        )
     }
 
     /// Apply the backend's auth + any provider-configured extra headers to a
@@ -2628,12 +2636,13 @@ mod tests {
     }
 
     /// Serve one canned SSE body like [`serve_once`], but hand the **request**
-    /// back: the returned handle resolves to the JSON hrdr actually put on the
-    /// wire. `serve_once` reads the request only to drain the socket and then
-    /// discards it, and what the two tests below are about is a request field.
+    /// back: the returned handle resolves to the raw request headers plus the
+    /// JSON hrdr actually put on the wire. `serve_once` reads the request only
+    /// to drain the socket and then discards it, and what the tests below are
+    /// about is a request field (or header).
     async fn serve_once_capturing(
         body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    ) -> (String, tokio::task::JoinHandle<(serde_json::Value, String)>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2676,7 +2685,9 @@ mod tests {
                  {body}"
             );
             let _ = stream.write_all(resp.as_bytes()).await;
-            serde_json::from_slice(&request).expect("the request body is JSON")
+            let headers = String::from_utf8_lossy(&buf[..headers_end]).into_owned();
+            let body = serde_json::from_slice(&request).expect("the request body is JSON");
+            (body, headers)
         });
         (format!("http://127.0.0.1:{port}/v1"), handle)
     }
@@ -2715,7 +2726,7 @@ mod tests {
             .expect("the mock server answers 200");
         while stream.next().await.is_some() {}
 
-        let body = request.await.expect("the server captured the request");
+        let (body, _headers) = request.await.expect("the server captured the request");
         // Spelled as a literal on purpose. Written as `ANTHROPIC_MAX_TOKENS`
         // this assertion would follow the constant anywhere it went, and the
         // constant's VALUE is the thing that hurts: every Anthropic reply capped
@@ -2744,7 +2755,7 @@ mod tests {
             .expect("the mock server answers 200");
         while stream.next().await.is_some() {}
 
-        let body = request.await.expect("the server captured the request");
+        let (body, _headers) = request.await.expect("the server captured the request");
         assert_eq!(body["max_tokens"], 4321, "{body}");
     }
 
@@ -2753,7 +2764,11 @@ mod tests {
     /// bytes (the fast path in `chat_stream`), so the wire body is the request
     /// verbatim, with no intermediate `Value` tree. Asserted against a
     /// re-built request, so a fast path that dropped a field or changed the
-    /// `include_usage` flag goes red.
+    /// `include_usage` flag goes red. Also pins the `Content-Type` the request
+    /// carries: `.body(bytes)` sends no header of its own, and an
+    /// OpenAI-compatible endpoint answers a JSON body without
+    /// `Content-Type: application/json` with a 415 (the regression this test
+    /// guards).
     #[tokio::test]
     async fn the_no_graft_openai_request_is_the_request_serialized_verbatim() {
         let stream_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
@@ -2766,7 +2781,13 @@ mod tests {
         let mut stream = client.chat_stream(&msgs, &[]).await.unwrap();
         while stream.next().await.is_some() {}
 
-        let body = request.await.expect("the server captured the request");
+        let (body, headers) = request.await.expect("the server captured the request");
+        let headers = headers.to_ascii_lowercase();
+        assert!(
+            headers.contains("content-type: application/json"),
+            "the JSON chat request must carry Content-Type: application/json, or \
+             OpenAI-compatible endpoints answer 415: {headers}"
+        );
         let expected =
             serde_json::to_value(client.request(Some("fast-path-test".into()), &msgs, &[], true))
                 .unwrap();
@@ -2798,7 +2819,7 @@ mod tests {
             .unwrap();
         while stream.next().await.is_some() {}
 
-        let body = request.await.expect("the server captured the request");
+        let (body, _headers) = request.await.expect("the server captured the request");
         let messages = body["messages"].as_array().expect("messages on the wire");
         let blocks_carry_cache = messages
             .iter()

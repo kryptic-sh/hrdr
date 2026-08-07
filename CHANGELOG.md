@@ -45,6 +45,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   history.** The once-per-compaction `Vec` builds (whole history, whole elided
   history, and a window per stage) are now counted from slices.
 
+### Fixed
+
+- **OpenAI chat requests carry `Content-Type: application/json` again.** The
+  request-body fast path (`post_bytes`) sent the serialized JSON with no
+  Content-Type — `.json()` set it implicitly and `.body(bytes)` sets none — so
+  OpenAI-compatible endpoints rejected every turn with
+  `415 Unsupported Media Type`.
+
 ## [0.12.0] - 2026-08-07
 
 ### Breaking
