@@ -1033,8 +1033,8 @@ impl Client {
         }
     }
 
-    fn post(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
-        self.auth(self.http.post(self.url("chat/completions")).json(body))
+    fn post_bytes(&self, body: Vec<u8>) -> reqwest::RequestBuilder {
+        self.auth(self.http.post(self.url("chat/completions")).body(body))
     }
 
     /// Apply the backend's auth + any provider-configured extra headers to a
@@ -1078,9 +1078,24 @@ impl Client {
         crate::catalog::max_output_cached(None, &self.model).unwrap_or(ANTHROPIC_MAX_TOKENS)
     }
 
+    /// Whether the OpenAI request body needs a post-serialization graft:
+    /// cache breakpoints (Ephemeral mode), the `prompt_cache_key` routing hint,
+    /// or the DeepSeek `reasoning_content` replay. With none of these the body
+    /// is the request serialized as-is — which is what `chat_stream`'s fast
+    /// path sends, skipping the `serde_json::Value` tree entirely. The single
+    /// source of truth for both [`Self::body_json`] and that fast path.
+    fn grafts_needed(&self) -> bool {
+        self.cache == CacheMode::Ephemeral
+            || (self.prompt_cache_key.is_some() && self.consumes_prompt_cache_key())
+            || is_deepseek(&self.base_url)
+    }
+
     /// Serialize a request and apply cache breakpoints per the active [`CacheMode`].
     fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
         let mut json = serde_json::to_value(body).unwrap_or_default();
+        if !self.grafts_needed() {
+            return json;
+        }
         if self.cache == CacheMode::Ephemeral {
             crate::types::apply_cache_breakpoints(
                 &mut json,
@@ -1209,15 +1224,36 @@ impl Client {
         // sentinel this asks the endpoint once, so vLLM gets the name it
         // validates against instead of a placeholder it 404s.
         let model = self.wire_model().await;
-        let body = self.body_json(&self.request(model, messages, tools, true));
-        log_wire("request", || {
-            serde_json::json!({
-                "url": self.url("chat/completions"),
-                "body": body,
-            })
-        });
+        let request = self.request(model, messages, tools, true);
+        // Fast path: `body_json` builds a `serde_json::Value` tree that reqwest
+        // would serialize again. With no graft to apply (default cache mode, no
+        // prompt-cache key, not DeepSeek) the tree is pure intermediate — the
+        // request serializes straight to bytes, byte-identical to the Value
+        // path's output (both are the same Serialize impl, compact).
+        let body = if self.grafts_needed() {
+            let json = self.body_json(&request);
+            log_wire("request", || {
+                serde_json::json!({
+                    "url": self.url("chat/completions"),
+                    "body": json,
+                })
+            });
+            serde_json::to_vec(&json).context("serializing request")?
+        } else {
+            let bytes = serde_json::to_vec(&request).context("serializing request")?;
+            log_wire("request", || {
+                // The wire log wants a Value; re-parse the bytes only when the
+                // log is actually live (it is off by default).
+                serde_json::json!({
+                    "url": self.url("chat/completions"),
+                    "body": serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or_default(),
+                })
+            });
+            bytes
+        };
         let resp = self
-            .post(&body)
+            .post_bytes(body)
             .send()
             .await
             .context("chat stream request failed")?;
@@ -2710,6 +2746,68 @@ mod tests {
 
         let body = request.await.expect("the server captured the request");
         assert_eq!(body["max_tokens"], 4321, "{body}");
+    }
+
+    /// With no graft to apply — default cache mode, no `prompt_cache_key`, not
+    /// DeepSeek — the OpenAI request serializes straight from `ChatRequest` to
+    /// bytes (the fast path in `chat_stream`), so the wire body is the request
+    /// verbatim, with no intermediate `Value` tree. Asserted against a
+    /// re-built request, so a fast path that dropped a field or changed the
+    /// `include_usage` flag goes red.
+    #[tokio::test]
+    async fn the_no_graft_openai_request_is_the_request_serialized_verbatim() {
+        let stream_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                           data: [DONE]\n\n";
+        let (url, request) = serve_once_capturing(stream_body).await;
+        let msgs = vec![ChatMessage::user("hi")];
+        let client = Client::new(url, None, "fast-path-test");
+        // Default client: CacheMode::Off, no prompt-cache key, not DeepSeek.
+
+        let mut stream = client.chat_stream(&msgs, &[]).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let body = request.await.expect("the server captured the request");
+        let expected =
+            serde_json::to_value(client.request(Some("fast-path-test".into()), &msgs, &[], true))
+                .unwrap();
+        assert_eq!(
+            body, expected,
+            "the wire body is the request serialized as-is"
+        );
+    }
+
+    /// The graft path still routes through `body_json`: with a graft in force,
+    /// the fast path must not run, or the graft would be missing from the wire.
+    /// Ephemeral cache is used here because the other grafts are host-gated
+    /// (`prompt_cache_key` only goes to OpenAI's hosts; DeepSeek is one host) —
+    /// cache breakpoints apply to every host.
+    #[tokio::test]
+    async fn a_graft_reaches_the_wire_through_body_json() {
+        let stream_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                           data: [DONE]\n\n";
+        let (url, request) = serve_once_capturing(stream_body).await;
+        let mut client = Client::new(url, None, "fast-path-test");
+        client.set_cache(CacheMode::Ephemeral);
+
+        let mut stream = client
+            .chat_stream(
+                &[ChatMessage::system("be brief"), ChatMessage::user("hi")],
+                &[],
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let body = request.await.expect("the server captured the request");
+        let messages = body["messages"].as_array().expect("messages on the wire");
+        let blocks_carry_cache = messages
+            .iter()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .any(|b| b.get("cache_control").is_some());
+        assert!(
+            blocks_carry_cache,
+            "the cache breakpoint graft reached the wire: {body}"
+        );
     }
 
     /// Serve one canned JSON body (with `Connection: close`, so the client reads
