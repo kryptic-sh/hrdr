@@ -23,24 +23,12 @@ pub trait CommandHost {
     fn popup(&mut self, _text: String) {}
     /// Spawn `fut`; when it resolves, show its non-empty string as a system line.
     fn spawn_line(&self, fut: LineFuture) {
-        let poster = self.line_poster();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if !line.is_empty() {
-                poster(LineKind::System, line);
-            }
-        });
+        post_async(self.line_poster(), fut, |_| LineKind::System);
     }
     /// Spawn `fut`; when it resolves, show its non-empty string in a popup
     /// ([`Self::popup`]).
     fn spawn_popup(&self, fut: LineFuture) {
-        let poster = self.line_poster();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if !line.is_empty() {
-                poster(LineKind::Popup, line);
-            }
-        });
+        post_async(self.line_poster(), fut, |_| LineKind::Popup);
     }
     /// The agent a command **acts on**: the one the user is looking at.
     ///
@@ -103,18 +91,12 @@ pub trait CommandHost {
     /// unified diff: a real diff routes to the frontend's diff rendering,
     /// status/error lines stay plain (one classification rule for both).
     fn spawn_diff(&self, fut: LineFuture) {
-        let poster = self.line_poster();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if line.is_empty() {
-                return;
-            }
-            let kind = if line.starts_with("diff ") {
+        post_async(self.line_poster(), fut, |line| {
+            if line.starts_with("diff ") {
                 LineKind::Diff
             } else {
                 LineKind::System
-            };
-            poster(kind, line);
+            }
         });
     }
 
@@ -401,4 +383,20 @@ pub trait CommandHost {
     fn help_tips(&self) -> Option<String> {
         None
     }
+}
+
+/// The one async-result→chrome primitive behind the [`CommandHost`] spawn
+/// defaults: await `fut`, and deliver its non-empty string through `poster`
+/// (the host itself isn't `Send`, so the spawned task captures these instead).
+fn post_async(
+    poster: Box<dyn Fn(LineKind, String) + Send>,
+    fut: LineFuture,
+    classify: impl Fn(&str) -> LineKind + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let line = fut.await;
+        if !line.is_empty() {
+            poster(classify(&line), line);
+        }
+    });
 }
