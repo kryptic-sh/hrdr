@@ -139,40 +139,17 @@ Conventions:
 
 From `docs/performance-review.md`, archived into this file. Findings ranked by
 impact; the threading slices (above) closed #1's save half and #1d, and moved
-the tool-blocking fs off tokio workers. What remains open:
+the tool-blocking fs off tokio workers. **Items 1-8 are closed**: the history
+payloads ride on an `Arc` (`9d5f5ed`) and the save pipeline no longer clones the
+state at all (`be1bb73`), the ungrafted OpenAI request serializes straight to
+bytes (`4250c25`), `/resume` completion listing is memoized against a
+sessions-tree signature (`4c938e2`), `rank_file_matches` uses a precomputed
+lowercase path table (`695840d`), the shell secret filter memoizes per token
+(`631b432`), the compaction ladder estimates without building each stage
+(`fb46b51`), and the `/resume` picker caches its rendered rows and widths per
+filter (`4b51f68`). #5 (running token counter) was dropped for risk. What
+remains open:
 
-1. **Per-round full-history clone ×3 in the event pipeline.** The turn loop
-   clones the whole message list per round (`turn_loop.rs:759`), the registry
-   log re-clones it (`registry.rs:415`; the reducer ignores the payload, the
-   headless runner reads only its `len`), and the frontend re-clones it in
-   `persist_mid_turn`. Slice 3 moved the save off the UI thread; the three
-   clones remain — log a lightweight marker, hand the `History` payload by
-   value, and drop `Session::save`'s double state clone
-   (`session.rs:341`/`:778`).
-2. **Request body deep-copied into a `serde_json::Value` per request.**
-   `client.rs:1062-1120` (`to_value` + grafts) then reqwest serializes the tree;
-   under no graft (default cache mode, no prompt-cache key, not DeepSeek) the
-   Value is pure waste — serialize `ChatRequest` straight to bytes.
-3. **`list_sessions()` rescanned per frame and per keystroke** while a `/resume`
-   popup is live (`hrdr-app/completion.rs:201` ← `ui.rs:148`, `app.rs:994`;
-   read_dir + stat + sort every call). Memoize by editor content / sessions-dir
-   mtime.
-4. **`rank_file_matches` over the 20k-file index per frame and per keystroke**
-   (`hrdr-tui/app/completion.rs:160-166`, `WALK_MAX_FILES = 20_000`), with a
-   `to_ascii_lowercase` per path per call. Precompute a lowercase path table.
-5. **Full-history token re-estimate every round** on endpoints reporting no
-   usage (`budget.rs:122-123`). Keep a running `messages_tokens` counter.
-6. **Per-line `canonicalize_nearest` in the shell secret filter.**
-   `grep_line_is_secret` (`lib.rs:1233`) realpath-chains the same path token
-   once per match line; memoize the verdict per token for one command's run.
-   (The grep-walk per-file canonicalize is closed: Slice 1 moved the whole walk
-   to `spawn_blocking`.)
-7. **Compaction tail-window selection re-sums overlapping suffixes**
-   (`compaction.rs:451-460`) plus a per-stage history clone in the ladder
-   sizing. One newest→oldest accumulating pass.
-8. **`/resume` picker rebuilds every row per frame** (`ui.rs:600-663`):
-   `relative_time` + `display_dir` + three width passes, unchanged between
-   frames. Cache rendered rows and widths.
 9. **Picker refilter allocates per candidate per keystroke**
    (`selector.rs:43-46`, `models.rs:786-791` `format!`+`to_lowercase`).
    Precompute a lowercase haystack per choice. **[partially addressed —
@@ -951,29 +928,13 @@ are not re-reported.
 **Findings (ranked by impact):**
 
 6. **`PaneSet::sync` rebuilds a full snapshot of every registry entry once per
-   frame (cross-cutting — flagged by the TUI-side pass, code in hrdr-agent).**
-   `crates/hrdr-agent/src/pane.rs:302-341` clones label/model/provider/
-   base_url/effort per entry and locks + clones each steering queue, per call;
-   invoked per frame from `hrdr-tui/src/app.rs:2022-2029` (`sync_panes`, which
-   also pins panes — "Called each frame") plus per event
-   (`app.rs:2054, 2081, 2359, 2619, 2760, 2902`). Fine at 1-2 agents; per-frame
-   string cloning + N mutex acquisitions with many sub-agents. Fix: diff the
-   registry snapshot rather than rebuilding it.
-
-7. **Minor — every historical tool call's arguments re-parsed from JSON on every
-   Anthropic request.** `crates/hrdr-llm/src/anthropic.rs:530-534`
-   (`serde_json::from_str(&call.function.arguments)` per assistant message with
-   tool_calls, per request build). Same unchanged strings each round; the
-   OpenAI/Codex paths never re-parse. Fix: cache the parsed `Value` on
-   `ChatMessage` after first parse (memory: a second copy of args on the wire
-   struct).
-
-8. **Minor — input pane laid out twice per frame.**
-   `crates/hrdr-tui/src/ui.rs:74-77` (`desired_rows` → `compute_wrapped_layout`)
-   and `crates/hrdr-editor/src/plain.rs:215-230` (`render` →
-   `compute_wrapped_layout` again) on identical content, same frame, every
-   spinner tick and keypress. Visible for a multi-KB paste. Fix: compute once in
-   `draw` and pass it, or cache keyed by `(len, width)`.
+   frame** — **[fixed — `a315eca`: `sync` diffs each entry against its pane and
+   snapshots only what changed, moving the snapshot in instead of re-cloning]**
+7. **Every historical tool call's arguments re-parsed from JSON on every
+   Anthropic request** — **[fixed — `38b45d9`: the parsed form is memoized on
+   the call at finalization]**
+8. **Input pane laid out twice per frame** — **[fixed — `48c7b09`: `PlainEngine`
+   memoizes the wrap layout, invalidated on edits]**
 
 9. **Context — `budget`'s O(H) token estimate per round when the server reports
    no usage.** `crates/hrdr-agent/src/budget.rs:122-127`
@@ -986,8 +947,7 @@ are not re-reported.
 full-transcript layout walk (`ui.rs:2664` `transcript_chunks` + `:912-918`
 `cum` + `:974-1006` hit map — O(entries) per frame, cached bodies make per-entry
 work cheap) and the per-frame cache/save pipeline (autosave turn-end, off-thread
-behind a coalescer). Also noted: `/resume ` argument completion re-lists
-sessions per keystroke (`hrdr-app/src/completion.rs:197` — small N, cacheable).
+behind a coalescer).
 
 **Coverage** — chunk A traced end-to-end: turn loop (full), registry + Events
 (full), client.rs SSE/request path, anthropic.rs + codex.rs build_body/stream
@@ -1014,7 +974,8 @@ transcript walk's actual share of frame time, and the streaming-body re-render
 per frame for in-flight tool calls (bounded by the block's size, but compounds
 with the walk for long streams).
 
-**Status: findings 6-9 open; the rest are fixed — `2f38e1b`, `631b432`,
+**Status: findings 6-8 fixed — `a315eca`, `38b45d9`, `48c7b09`; finding 9 is
+context, left open by decision. The rest were fixed — `2f38e1b`, `631b432`,
 `eafc82c`, `9d5f5ed`, `695840d`, `1e24635` (Record: closed efforts).**
 
 ## Dependency upgrades held back, 2026-08-03
@@ -2699,6 +2660,30 @@ What survives that would otherwise be relearned:
 
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
+
+**2026-08-07 backlog slices — the perf items worked this session** (`38b45d9`,
+`be1bb73`, `48c7b09`, `4c938e2`, `a315eca`, `4250c25`, `4b51f68`, `fb46b51`).
+Worked one slice at a time (all but the `PaneSet::sync` diff directly — each was
+small enough that a delegation round-trip cost more than the work; the sync diff
+went through a delegated implementation, whose review caught an inverted
+main-pane name condition that rebuilt the main pane every frame — pinned by a
+test shown red on it). Perf 2026-08-06: the Anthropic request builder serves a
+memoized parsed form of each finalized tool call's arguments (`38b45d9`); the
+input pane's word-wrap layout is computed once per frame, memoized in
+`PlainEngine` and invalidated on edits (`48c7b09`); `PaneSet::sync` diffs each
+registry entry against its pane's data and snapshots only what changed, moving
+the snapshot into the pane instead of re-cloning (`a315eca`). Perf 2026-08-04:
+the save pipeline's two redundant whole-state clones are gone — `persisted`
+consumes its state and `save`/`save_to_path` serialize a borrowed `SessionBody`
+with the created-cache value patched in (`be1bb73`); the ungrafted OpenAI
+request serializes straight to bytes (`4250c25`); the `/resume` argument
+completion memoizes its session listing per prefix against a sessions-tree
+change signature (`4c938e2`); the `/resume` picker memoizes its rendered rows
+and column widths per (filter, width), cleared on reopen (`4b51f68`); the
+compaction ladder sizes each shrink stage from slices without building its
+history (`fb46b51`). The 2026-08-04 #9 (picker haystack) half is still open, and
+the per-round save durability tradeoff (2026-08-04 second pass #1) still needs
+the owner's call — both stay in their sections.
 
 **2026-08-06 backlog slices — eight perf/tidy items** (`944014c`, `2a112f1`,
 `f6c64b3`, `25d690e`, `1b84108`, `1e24635`, `c351731`, plus the docs commit

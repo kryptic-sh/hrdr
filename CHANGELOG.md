@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Per-round session saves no longer clone the whole state.** The save pipeline
+  rebuilt `Session` two or three times per write — a clone in
+  `SessionState::persisted` (filtering a transcript that no longer serializes)
+  and a clone in `Session::save` just to patch the `created` timestamp. Both are
+  gone: `persisted` consumes its state, and the write serializes a borrowed body
+  with the created-cache value patched in.
+- **The OpenAI request body serializes straight to bytes when no graft
+  applies.** The per-request `serde_json::Value` tree was an intermediate
+  reqwest re-serialized anyway; ungrafted requests now go `ChatRequest` → bytes
+  directly (byte-identical output).
+- **The Anthropic request builder no longer re-parses historical tool-call
+  arguments.** Each call's parsed arguments are memoized when the call is
+  finalized and served on every later request; a cold cache (restored or
+  hand-built calls) falls back to the same on-demand parse.
+- **`PaneSet::sync` diffs registry entries instead of rebuilding every pane.**
+  The per-frame full-snapshot rebuild (five string clones + a steering-queue
+  clone per entry) is now skipped for entries whose pane already holds their
+  data; changed entries move their snapshot into the pane instead of re-cloning.
+- **The input pane's wrap layout is computed once per frame.** `desired_rows`
+  and `render` used to run the same word-wrap on identical content and width;
+  `PlainEngine` now memoizes it, invalidated on every content edit.
+- **`/resume` no longer re-walks or re-renders on every keystroke.** The
+  argument completion's session listing is memoized per prefix against a
+  sessions-tree change signature, and the picker's rendered rows and column
+  widths are cached per filter.
+- **Compaction ladder sizing estimates each shrink stage without building its
+  history.** The once-per-compaction `Vec` builds (whole history, whole elided
+  history, and a window per stage) are now counted from slices.
+
 ## [0.12.0] - 2026-08-07
 
 ### Breaking
