@@ -1370,21 +1370,16 @@ outlier is most likely to be a mistake rather than a stance.
 
 ### Editing and tool ergonomics
 
-- **Fuzzy `old_string` matching that preserves unchanged lines.** hrdr already
-  _detects_ the class and writes a good message (_"a near-match differing only
-  in whitespace/indentation exists"_) but still **fails the call**; it has a
-  CRLF retry (`is_crlf_dominant`) and no trailing-whitespace or quote retry,
-  while `read` clips at `MAX_LINE`, so the model's view can differ from disk in
-  exactly these ways. pi retries in a normalized space (NFKC, per-line
-  `trimEnd`, smart quotes → ASCII, dash/space variants → plain) and — the clever
-  part — `applyReplacementsPreservingUnchangedLines` widens each replacement to
-  the lines it touches, rewrites only those, and copies every other line back
-  byte-for-byte, with a duplicate-line alignment guard and a line-count
-  assertion. _Caveat:_ fuzzy matching in an edit tool normalizes Unicode as a
-  side effect of an unrelated change. **Cheapest useful subset:** trailing
-  whitespace + quotes/dashes/spaces, no NFKC, no new dependency — and **report**
-  when a fuzzy match was used (pi tracks `usedFuzzyMatch` and doesn't surface
-  it).
+- **Fuzzy `old_string` matching that preserves unchanged lines — the cheapest
+  useful subset shipped 2026-08-07 (`fb407e3`).** `edit` now retries the match
+  with per-line normalizations (trailing whitespace trimmed; smart quotes,
+  dashes and figure/NBSP spaces mapped 1:1 — no NFKC, no new dependency) and
+  applies a unique match, reporting it in the result so the model sees what
+  changed. Deliberately NOT taken: internal space-run collapsing (indentation
+  and space-count differences still get the near-match message — a collapse
+  would break the 1:1 byte-offset recovery), and pi's duplicate-line alignment
+  machinery (unneeded: the span splice replaces only the matched region). The
+  item was deleted, not annotated — `git log` has the detail.
 - **Per-model argument tolerance.** pi repairs tool arguments per model —
   `prepareEditArguments` re-parses `edits` when it arrives as a JSON string,
   commented _"Some models (Opus 4.6, GLM-5.1) send edits as a JSON string
