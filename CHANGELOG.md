@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **New built-in skill: `:tickets`.** Turns the open tasks in the session
+  context and `docs/backlog.md` into tickets on the project's tracker — GitHub
+  via `gh`, GitLab via `glab`, JIRA via `acli` (the repo's remote decides).
+  Existing tickets are found by search and updated with a comment rather than
+  duplicated; only genuinely new items are created.
+
 ### Performance
 
 - **Per-round session saves no longer clone the whole state.** The save pipeline

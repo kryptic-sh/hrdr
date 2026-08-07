@@ -977,7 +977,8 @@ mod tests {
                 .model_invocable
         };
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tickets",
+            "tidy", "todo",
         ] {
             assert!(flag(name), "{name} stays model-invocable");
         }
