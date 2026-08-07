@@ -176,15 +176,9 @@ sessions-tree signature (`4c938e2`), `rank_file_matches` uses a precomputed
 lowercase path table (`695840d`), the shell secret filter memoizes per token
 (`631b432`), the compaction ladder estimates without building each stage
 (`fb46b51`), and the `/resume` picker caches its rendered rows and widths per
-filter (`4b51f68`). #5 (running token counter) was dropped for risk. What
-remains open:
-
-9. **Picker refilter allocates per candidate per keystroke**
-   (`selector.rs:43-46`, `models.rs:786-791` `format!`+`to_lowercase`).
-   Precompute a lowercase haystack per choice. **[partially addressed —
-   `1b84108` hoisted the query normalization into a shared `fuzzy_match_q` core;
-   the per-choice haystack build remains, deferred to a picker-layer pass — it
-   collides with tidy 2026-08-06 #6 on the same pickers]**
+filter (`4b51f68`). #5 (running token counter) was dropped for risk. Item 9
+(picker refilter allocations) is closed by `a10ba3a`: each choice's lowercase
+haystack is built once per picker open and the keystroke filter only walks it.
 
 ## Performance review — second pass 2026-08-04
 
