@@ -1187,16 +1187,6 @@ trigger is persisted with the summary itself as
 `MessageOrigin::Summary(reason)`, so a resumed session still knows why its
 history was replaced.
 
-### Noticed while working, not fixed
-
-`session_name_from` (`hrdr-agent/src/session.rs`) takes the first `Role::User`
-message, which after a compaction is the summary — so a session first NAMED
-after a compaction gets "This conversation was compacted…" as its name. Now
-trivially fixable with the `MessageOrigin` predicate that compaction uses
-(`compaction::is_user_turn`), but out of scope for the plan and rare in
-practice: names are set on the first save, which normally precedes any
-compaction.
-
 ### Binding decisions from the archived plan
 
 These constrain any future compaction work; the plan file is deleted, so they
