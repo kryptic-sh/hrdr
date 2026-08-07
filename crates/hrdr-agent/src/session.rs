@@ -326,7 +326,8 @@ impl SessionState {
         self.todos = todos;
         self.cwd = cwd;
         if self.name.is_empty() {
-            self.name = crate::session_name_from(&self.messages);
+            self.name = crate::session_name_from(&self.messages)
+                .unwrap_or_else(|| crate::default_session_name(&self.cwd));
         }
     }
 
@@ -1019,12 +1020,8 @@ impl Session {
         // Derive a fork name from the source's, falling back to a sensible base.
         let base = state.name.trim();
         let base = if base.is_empty() {
-            let derived = crate::session_name_from(&state.messages);
-            if derived.trim().is_empty() {
-                "session".to_string()
-            } else {
-                derived
-            }
+            crate::session_name_from(&state.messages)
+                .unwrap_or_else(|| crate::default_session_name(cwd))
         } else {
             base.to_string()
         };
@@ -1472,13 +1469,15 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
 pub const SESSION_NAME_MAX_CHARS: usize = 60;
 
 /// A short session name derived from the first real user turn (first line,
-/// trimmed, capped at [`SESSION_NAME_MAX_CHARS`]). A user-role message that is
-/// compaction's own summary, a nudge or a detached sub-agent report is not the
-/// user speaking and does not name the session — after a compaction the first
-/// user-role message is the summary, and naming a session after it would be
-/// "This conversation was compacted…". Falls back to `"untitled"` when there's
-/// no usable text.
-pub fn session_name_from(msgs: &[Message]) -> String {
+/// trimmed, capped at [`SESSION_NAME_MAX_CHARS`]), or `None` when there is no
+/// usable text. A user-role message that is compaction's own summary, a nudge
+/// or a detached sub-agent report is not the user speaking and does not name
+/// the session — after a compaction the first user-role message is the summary,
+/// and naming a session after it would be "This conversation was compacted…".
+///
+/// The caller supplies the default when this returns `None`
+/// ([`default_session_name`] — the working directory's basename).
+pub fn session_name_from(msgs: &[Message]) -> Option<String> {
     msgs.iter()
         .find(|m| crate::compaction::is_user_turn(m))
         .and_then(|m| m.content.as_deref())
@@ -1495,6 +1494,19 @@ pub fn session_name_from(msgs: &[Message]) -> String {
                 .collect::<String>()
         })
         .filter(|s| !s.is_empty())
+}
+
+/// The default session name when no conversation-derived name exists: the
+/// working directory's basename (`~/Projects/my-app` → `my-app`), so an
+/// unnamed session is identifiable in the `/resume` picker instead of reading
+/// "untitled". Falls back to `"untitled"` only when the cwd has no basename
+/// (the filesystem root, or an empty path).
+pub fn default_session_name(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| "untitled".to_string())
 }
 
@@ -1576,18 +1588,29 @@ mod tests {
         };
         assert_eq!(
             session_name_from(&[summary.clone(), Message::user("Deploy the fix")]),
-            "Deploy the fix",
+            Some("Deploy the fix".to_string()),
             "the summary does not name the session; the first real user turn does"
         );
         assert_eq!(
             session_name_from(&[nudge, summary.clone(), Message::user("Ship it")]),
-            "Ship it"
+            Some("Ship it".to_string())
         );
         assert_eq!(
             session_name_from(&[summary]),
-            "untitled",
-            "no real user turn → no name"
+            None,
+            "no real user turn → no derived name; the caller supplies the default"
         );
+    }
+
+    /// The default session name is the working directory's basename, so an
+    /// unnamed session reads "my-app" in the `/resume` picker instead of
+    /// "untitled" — "untitled" survives only for a cwd with no basename.
+    #[test]
+    fn default_session_name_is_the_cwd_basename() {
+        assert_eq!(default_session_name("/home/me/Projects/my-app"), "my-app");
+        assert_eq!(default_session_name("/home/me/My Project"), "My Project");
+        assert_eq!(default_session_name("/"), "untitled");
+        assert_eq!(default_session_name(""), "untitled");
     }
 
     /// Async endpoint/catalog warnings are `Notice` entries, which `persisted()`
@@ -1895,6 +1918,11 @@ mod tests {
         st.name = "Kept".into();
         st.sync_from(vec![Message::user("other")], vec![], "/tmp/p".into());
         assert_eq!(st.name, "Kept");
+
+        // No conversation-derived name → the default is the cwd's basename.
+        st.name = String::new();
+        st.sync_from(vec![], vec![], "/tmp/my-proj".into());
+        assert_eq!(st.name, "my-proj", "default name is the cwd basename");
     }
 
     // ── unique_session_id ─────────────────────────────────────────────────────

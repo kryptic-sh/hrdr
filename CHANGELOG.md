@@ -58,6 +58,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a compaction got "This conversation was compacted…" as its `/resume`
   name; it now skips synthetic user-role messages (compaction summaries, nudges,
   detached sub-agent reports) exactly as compaction itself does.
+- **An unnamed session defaults to its working directory's basename.** When no
+  name derives from the conversation, a session now reads `my-project` in the
+  `/resume` picker instead of `untitled` — "untitled" survives only for a cwd
+  with no basename (the filesystem root). Session forks share the same default.
 
 ## [0.12.0] - 2026-08-07
 
