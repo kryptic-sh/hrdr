@@ -461,7 +461,14 @@ impl Harness {
 
     /// Render the whole UI to a [`TestBackend`] and flatten it to text.
     fn render(&mut self) -> String {
-        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        self.render_h(30)
+    }
+
+    /// Render the whole UI to a [`TestBackend`] of the given height — the
+    /// layout probe (e.g. the todo-panel cut-off at short terminals) renders
+    /// at every height rather than the fixed 30-row default.
+    fn render_h(&mut self, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(90, height)).unwrap();
         term.draw(|f| ui::draw(f, &mut self.app)).unwrap();
         buffer_to_string(term.backend().buffer())
     }
@@ -4907,6 +4914,18 @@ fn screen_row_of(term: &Terminal<TestBackend>, needle: &str) -> Option<u16> {
             .collect::<String>()
             .contains(needle)
     })
+}
+
+/// The screen row the transcript area's LAST row — where the scrollbar's `↓`
+/// end symbol renders (the rightmost column). The transcript area is the
+/// full-width top chunk, so the `↓` sits in the terminal's last column.
+fn scrollbar_end_row(screen: &str) -> Option<u16> {
+    let rows: Vec<&str> = screen.lines().collect();
+    rows.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| l.ends_with('↓'))
+        .map(|(i, _)| i as u16)
 }
 
 /// Scrolled up, new content streaming in must not move the viewport: the view
@@ -9514,4 +9533,185 @@ async fn a_notice_after_a_tool_group_keeps_a_plain_blank_above_its_tint() {
         row(notice_y - 3).contains("ran 1 command"),
         "the summary sits above the blank:\n{screen}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resume-path layout probes (the "todo panel cut off 1 row" report, revisited)
+// ---------------------------------------------------------------------------
+//
+// The reported bug: with the transcript fully scrolled down (following,
+// `offset 0`) the todo panel's last row sat one line below the visible area —
+// the scrollbar's `↓` landed on the `▸ N finished` toggle row while the
+// panel's bottom pad stayed cut off, as if the transcript area ended a row
+// early. Fresh-session probes at every height (11–30) never reproduced it; the
+// one variable they never drove was the RESUME path — the report came from a
+// resumed session, and resume rebuilds the transcript from the session's
+// sibling jsonl (`Session::load_path` → `read_transcript`) and re-pins the
+// follow state (`apply_session` → `scroll_offset = 0`).
+//
+// Each probe below runs that path for real: session A autosaves a turn that
+// leaves a todo list, session B — a second, fresh app — resumes session A
+// through `resume_locked_path` (the shared `/resume` body), and renders at
+// every terminal height with `offset 0`. The layout is correct when the last
+// panel's LAST BODY ROW sits strictly above the transcript area's last row
+// (the scrollbar's `↓`) — i.e. the panel's bottom pad renders beneath it,
+// inside the visible area.
+
+/// Resume + following + a todo panel: at every terminal height the panel's
+/// last body row (the `▸ N finished` toggle) must not land on the transcript
+/// area's last row.
+#[tokio::test]
+async fn resumed_session_todo_panel_is_not_cut_off_when_following() {
+    let _data_home = isolated_data_home();
+
+    // Session A: one turn that leaves an in-progress todo AND a finished one —
+    // the finished item is what makes the `▸ 1 finished` toggle row render.
+    let mut a = Harness::new(vec![
+        MockReply::ToolCall {
+            name: "todo".to_string(),
+            args: r#"{"todos":[{"content":"write more tests","status":"in_progress"},{"content":"finish review","status":"completed","evidence":"ran the suite"}]}"#
+                .to_string(),
+        },
+        MockReply::Text("Planned.".to_string()),
+    ])
+    .await;
+    a.submit("make a plan").await;
+    a.save_drain().await; // the session must be on disk before it can be resumed
+    let id = a
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("the turn's autosave assigned a session id");
+    let cwd = a.app.current_cwd();
+    let path = hrdr_app::session_file_path(&cwd, &id);
+    // Release session A's open-lock so the second instance can take it.
+    a.app.active_lock = None;
+
+    // Session B: a fresh app resumes A's session through the real resume path.
+    let mut b = Harness::new(vec![]).await;
+    b.app.resume_locked_path(id.clone(), &path);
+    assert_eq!(
+        b.app.state().id.as_deref(),
+        Some(id.as_str()),
+        "the resumed session is active"
+    );
+    assert_eq!(b.app.scroll_offset, 0, "resume follows the newest output");
+    // The resumed transcript is the jsonl REBUILD: the tool call survived, and
+    // the never-persisted chrome (the header banner) did not come back.
+    let kinds: Vec<&EntryKind> = b.app.transcript().iter().map(|e| &e.kind).collect();
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EntryKind::Tool { name, .. } if name == "todo")),
+        "the todo call survived the resume rebuild: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(k, EntryKind::Header)),
+        "chrome (the header) is never persisted: {kinds:?}"
+    );
+    // The resumed session's todos came back with it (the panel reads the
+    // shared list).
+    assert_eq!(
+        b.app.todos.lock().unwrap().len(),
+        2,
+        "the resumed session's todos were adopted"
+    );
+
+    // The probe: following at every height, the toggle row must sit ABOVE the
+    // transcript area's last row — the row the scrollbar's `↓` occupies. On the
+    // reported bug the `↓` landed ON the toggle row, i.e. the panel's bottom
+    // pad was cut off below the visible area.
+    for height in 11..=30u16 {
+        let screen = b.render_h(height);
+        let toggle_y = line_index_of(&screen, "▸ 1 finished")
+            .unwrap_or_else(|| panic!("toggle row missing at height {height}:\n{screen}"));
+        let down_y = scrollbar_end_row(&screen)
+            .unwrap_or_else(|| panic!("scrollbar ↓ missing at height {height}:\n{screen}"));
+        assert!(
+            toggle_y < down_y,
+            "height {height}: the todo panel's toggle row ({toggle_y}) sits on the \
+             transcript area's last row ({down_y}) — the panel's bottom pad is cut off:\n{screen}"
+        );
+    }
+}
+
+/// The same resume probe with a finished sub-agent present, matching the
+/// original probes' coverage: the agent switcher panel renders BELOW the todo
+/// panel, so its last body row (the finished sub-agent's `✓` row) is the one
+/// that must not land on the transcript area's last row.
+#[tokio::test]
+async fn resumed_session_panels_are_not_cut_off_with_a_finished_subagent() {
+    let _data_home = isolated_data_home();
+
+    // Session A: as above — a turn that leaves a todo list, autosaved.
+    let mut a = Harness::new(vec![
+        MockReply::ToolCall {
+            name: "todo".to_string(),
+            args: r#"{"todos":[{"content":"write more tests","status":"in_progress"},{"content":"finish review","status":"completed","evidence":"ran the suite"}]}"#
+                .to_string(),
+        },
+        MockReply::Text("Planned.".to_string()),
+    ])
+    .await;
+    a.submit("make a plan").await;
+    a.save_drain().await;
+    let id = a
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("the turn's autosave assigned a session id");
+    let cwd = a.app.current_cwd();
+    let path = hrdr_app::session_file_path(&cwd, &id);
+    a.app.active_lock = None;
+
+    // Session B resumes A's session, then gains a FINISHED sub-agent — the
+    // switcher panel below the todo panel renders its row.
+    let mut b = Harness::new(vec![]).await;
+    b.app.resume_locked_path(id.clone(), &path);
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
+    b.app.registry.register(hrdr_agent::AgentEntry {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "done-sub".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        sandbox: hrdr_tools::SandboxMode::None,
+        todos: Default::default(),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
+        turn: hrdr_agent::TurnStats::default(),
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
+        steering: hrdr_agent::steering_queue(),
+        running: false,
+        compacting: false,
+        done: true,
+        delivered: false,
+        pinned: false,
+        transcript: None,
+    });
+
+    // The finished sub-agent's `✓` row is the switcher panel's last body row;
+    // it must stay above the transcript area's last row at every height.
+    for height in 11..=30u16 {
+        let screen = b.render_h(height);
+        let sub_y = line_index_of(&screen, "✓ done-sub").unwrap_or_else(|| {
+            panic!("finished sub-agent row missing at height {height}:\n{screen}")
+        });
+        let down_y = scrollbar_end_row(&screen)
+            .unwrap_or_else(|| panic!("scrollbar ↓ missing at height {height}:\n{screen}"));
+        assert!(
+            sub_y < down_y,
+            "height {height}: the finished sub-agent row ({sub_y}) sits on the \
+             transcript area's last row ({down_y}) — the switcher's bottom pad is cut off:\n{screen}"
+        );
+    }
 }
