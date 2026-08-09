@@ -120,6 +120,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A directory you declined at the trust gate no longer supplies commands or
+  skills to the session anyway.** Declining opens the session jailed, and the
+  agent already refused the working tree's `.hrdr/commands`, `.claude/skills`
+  and the rest — but every frontend ran its own discovery with project
+  instructions unconditionally enabled, so the `:` completion popup offered that
+  repository's `:name`s, the `/commands` picker listed them, and typing one
+  expanded the repository's own text into the message the model received. All
+  three now take the session agent's answer
+  (`hrdr_agent::Agent::project_instructions`, new and public), so the trust
+  decision has one owner. hrdr's built-in `:commit`, `:review` and friends are
+  unaffected and still work in a jailed session. API: `hrdr_app`'s
+  `prepare_outgoing`, `prepare_outgoing_tracked`, `prepare_outgoing_via` and
+  `prepare_outgoing_relayed` each take a `ProjectInstructions` argument, and
+  `CommandHost` gains a required `project_instructions()` method.
 - **OpenAI chat requests carry `Content-Type: application/json` again.** The
   request-body fast path (`post_bytes`) sent the serialized JSON with no
   Content-Type — `.json()` set it implicitly and `.body(bytes)` sets none — so

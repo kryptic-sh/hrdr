@@ -2111,6 +2111,21 @@ impl Agent {
         self.project_docs.project.as_deref()
     }
 
+    /// **Whether this session may read project-scoped instruction files at all**
+    /// — the single source of truth for that question, for the agent and for
+    /// every frontend.
+    ///
+    /// Derived once in [`Self::new`] from the effective sandbox mode (a jailed
+    /// session gets [`ProjectInstructions::Skip`]) and fixed for the agent's
+    /// life, so it is safe to read once and keep. A frontend that discovers
+    /// commands or skills for its own `:name` completion, picker or send path
+    /// **must** pass this value to [`discover_commands`] / [`discover_skills`]
+    /// rather than deciding for itself: re-deriving the rule is how the two
+    /// answers drift, and the frontend's is the one the user types into.
+    pub fn project_instructions(&self) -> prompt::ProjectInstructions {
+        self.project_instructions
+    }
+
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }

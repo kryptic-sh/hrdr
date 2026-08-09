@@ -40,6 +40,14 @@ pub trait CommandHost {
 
     /// Working directory the tools operate in.
     fn cwd(&self) -> PathBuf;
+
+    /// Whether this session may read project-scoped instruction files out of
+    /// [`Self::cwd`] — the session agent's own
+    /// [`hrdr_agent::Agent::project_instructions`], and the only answer a
+    /// frontend is allowed to give. Required rather than defaulted: a host that
+    /// forgot to answer would silently offer an untrusted directory's commands
+    /// and skills, which is the whole failure this exists to prevent.
+    fn project_instructions(&self) -> hrdr_agent::ProjectInstructions;
     /// Current endpoint base URL (recorded into saved sessions).
     fn base_url(&self) -> String;
 
@@ -332,9 +340,10 @@ pub trait CommandHost {
         // `:release`, `:review`) even with no command files on disk, so the list
         // is never empty — no "no commands yet" fallback needed here.
         let cwd = self.cwd();
+        let project = self.project_instructions();
         let entries = crate::prompt_entries(
-            &crate::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load),
-            &crate::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load),
+            &crate::discover_commands(&cwd, project),
+            &crate::discover_skills(&cwd, project),
         );
         let mut s = format!(
             "{} commands and skills (invoke with :name [arguments]):",

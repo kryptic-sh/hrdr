@@ -182,8 +182,8 @@ impl super::App {
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
         let cwd = std::path::PathBuf::from(self.current_cwd());
-        self.commands = hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load);
-        self.skills = hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load);
+        self.commands = hrdr_app::discover_commands(&cwd, self.project_instructions);
+        self.skills = hrdr_app::discover_skills(&cwd, self.project_instructions);
     }
     /// `/find <text>` — search the transcript and jump to the next match
     /// (case-insensitive). No arg cycles to the next match of the current query;
@@ -289,6 +289,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
 
     fn cwd(&self) -> std::path::PathBuf {
         hrdr_app::agent_cwd(&self.app.agent)
+    }
+    fn project_instructions(&self) -> hrdr_agent::ProjectInstructions {
+        self.app.project_instructions
     }
     // Chrome — model, provider, endpoint, context window — belongs to whichever
     // agent is on screen, and is read back from it. `/model` on a sub-agent's view
@@ -415,7 +418,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
         self.app.arm_file_watcher(new);
-        self.app.commands = hrdr_app::discover_commands(new, hrdr_agent::ProjectInstructions::Load);
+        self.app.commands = hrdr_app::discover_commands(new, self.app.project_instructions);
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl
@@ -459,9 +462,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // so the list is never empty — no "no commands yet" fallback needed here.
         // Skills join them: one `:name` namespace, one picker.
         let cwd = std::path::PathBuf::from(self.app.current_cwd());
+        let project = self.app.project_instructions;
         let entries = hrdr_app::prompt_entries(
-            &hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load),
-            &hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load),
+            &hrdr_app::discover_commands(&cwd, project),
+            &hrdr_app::discover_skills(&cwd, project),
         );
         self.app.command_selector = Some(super::command_selector(entries));
     }

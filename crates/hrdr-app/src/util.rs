@@ -180,8 +180,16 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
 /// delegation directive (via [`agent_mention_message`]). This is the canonical
 /// "input → sent" transform shared by the TUI and the headless runner; the
 /// display copy keeps the raw input.
-pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
-    prepare_outgoing_tracked(input, names, cwd, &[]).0
+///
+/// `project` is the session's own answer to "may this directory's files steer
+/// it" — see [`prepare_outgoing_tracked`].
+pub fn prepare_outgoing(
+    input: &str,
+    names: &[String],
+    cwd: &Path,
+    project: hrdr_agent::ProjectInstructions,
+) -> String {
+    prepare_outgoing_tracked(input, names, cwd, project, &[]).0
 }
 
 /// [`prepare_outgoing`], plus the paths whose whole content the sent message now
@@ -189,10 +197,18 @@ pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
 /// [`hrdr_agent::Agent::mark_files_read`] so the read-before-edit guard knows the
 /// model has already seen them. `todos` is the agent's TODO list, used to expand
 /// `todo#N` / `task#N` references (see [`expand_todo_refs`]).
+///
+/// `project` decides whether a `:name` may resolve to a **project** command or
+/// skill (`.hrdr/commands`, `.claude/skills`, …). It is the receiving agent's
+/// own [`hrdr_agent::Agent::project_instructions`], never re-derived here: this
+/// is the path that turns a typed `:name` into the text the model receives, so
+/// a session the user declined to trust must not expand the repository's own
+/// files through it. Built-ins resolve either way.
 pub fn prepare_outgoing_tracked(
     input: &str,
     names: &[String],
     cwd: &Path,
+    project: hrdr_agent::ProjectInstructions,
     todos: &[hrdr_tools::TodoItem],
 ) -> (String, Vec<PathBuf>) {
     // A `:command` template or `:skill` body may itself carry `@file` / `@agent`
@@ -201,8 +217,8 @@ pub fn prepare_outgoing_tracked(
     let input = if input.trim_start().starts_with(':') {
         match crate::expand_invocation(
             input,
-            &crate::discover_commands(cwd, hrdr_agent::ProjectInstructions::Load),
-            &crate::discover_skills(cwd, hrdr_agent::ProjectInstructions::Load).skills,
+            &crate::discover_commands(cwd, project),
+            &crate::discover_skills(cwd, project).skills,
         ) {
             Some(prompt) => {
                 expanded = prompt;
@@ -632,6 +648,11 @@ fn walk_files_fallback(root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A trusted session — what every test here that is not *about* trust wants.
+    const LOAD: hrdr_agent::ProjectInstructions = hrdr_agent::ProjectInstructions::Load;
+    /// The answer a directory the user declined gets (see [`hrdr_agent::trust`]).
+    const SKIP: hrdr_agent::ProjectInstructions = hrdr_agent::ProjectInstructions::Skip;
+
     #[test]
     fn expand_mentions_attaches_readable_files_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -769,13 +790,13 @@ mod tests {
         std::fs::write(root.join("note.txt"), "the note").unwrap();
         let names = vec!["explore".to_string()];
 
-        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root, &[]);
+        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root, LOAD, &[]);
         assert!(sent.contains("the note"));
         assert_eq!(inlined, vec![root.join("note.txt")]);
 
         // Routed at a sub-agent: same expansion, same report.
         let (sent, inlined) =
-            prepare_outgoing_tracked("@explore read @note.txt", &names, root, &[]);
+            prepare_outgoing_tracked("@explore read @note.txt", &names, root, LOAD, &[]);
         assert!(sent.contains("`explore`") && sent.contains("the note"));
         assert_eq!(inlined, vec![root.join("note.txt")]);
     }
@@ -840,7 +861,7 @@ mod tests {
         }];
 
         let (sent, _) =
-            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, &todos);
+            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, LOAD, &todos);
         // The todo section comes after the @file section.
         let file_at = sent.find("--- Referenced paths (via @) ---").unwrap();
         let todo_at = sent.find("--- Referenced todos ---").unwrap();
@@ -848,7 +869,7 @@ mod tests {
         assert!(sent.contains("add a test"), "{sent}");
 
         // Routed at a sub-agent: same expansion, wrapped in the directive.
-        let (sent, _) = prepare_outgoing_tracked("@explore do todo#2", &names, root, &todos);
+        let (sent, _) = prepare_outgoing_tracked("@explore do todo#2", &names, root, LOAD, &todos);
         assert!(
             sent.contains("`explore`") && sent.contains("add a test"),
             "{sent}"
@@ -913,15 +934,69 @@ mod tests {
         std::fs::create_dir_all(&commands).unwrap();
         std::fs::write(commands.join("ship.md"), "Run the checklist for $ARGUMENTS").unwrap();
 
-        let out = prepare_outgoing(":ship v2", &[], dir.path());
+        let out = prepare_outgoing(":ship v2", &[], dir.path(), LOAD);
         assert_eq!(out, "Run the checklist for v2");
         // An unknown :name goes to the model verbatim.
-        assert_eq!(prepare_outgoing(":nope", &[], dir.path()), ":nope");
+        assert_eq!(prepare_outgoing(":nope", &[], dir.path(), LOAD), ":nope");
         // A command body's own @file mentions expand too.
         std::fs::write(dir.path().join("notes.txt"), "note body").unwrap();
         std::fs::write(commands.join("review.md"), "Review @notes.txt please").unwrap();
-        let out = prepare_outgoing(":review", &[], dir.path());
+        let out = prepare_outgoing(":review", &[], dir.path(), LOAD);
         assert!(out.contains("note body"), "{out}");
+    }
+
+    /// **An untrusted directory's `:name` is not expanded on the send path.**
+    ///
+    /// The trust gate's promise is that a declined directory contributes nothing
+    /// to what the model is told, and `prepare_outgoing_tracked` is where a typed
+    /// `:name` becomes the text the model receives — so a project command and a
+    /// project skill both have to go verbatim there, while the vetted built-ins
+    /// keep working. The control half runs the identical fixture with `Load` and
+    /// is what makes the `Skip` half mean something: without it, an assertion
+    /// that "the body did not appear" would also pass on a typo in the fixture.
+    #[test]
+    fn a_skipped_project_expands_neither_its_commands_nor_its_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let commands = root.join(".hrdr/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("ship.md"), "PROJECT-COMMAND-BODY").unwrap();
+        let skill = root.join(".hrdr/skills/proj-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: proj-skill\ndescription: d\n---\nPROJECT-SKILL-BODY",
+        )
+        .unwrap();
+
+        // Control: a trusted session expands both.
+        assert!(
+            prepare_outgoing(":ship", &[], root, LOAD).contains("PROJECT-COMMAND-BODY"),
+            "control: a trusted project's command expands"
+        );
+        assert!(
+            prepare_outgoing(":proj-skill", &[], root, LOAD).contains("PROJECT-SKILL-BODY"),
+            "control: a trusted project's skill expands"
+        );
+
+        // Declined: the repository's own files reach the model through neither.
+        assert_eq!(
+            prepare_outgoing(":ship", &[], root, SKIP),
+            ":ship",
+            "an untrusted project's command must go verbatim"
+        );
+        assert_eq!(
+            prepare_outgoing(":proj-skill", &[], root, SKIP),
+            ":proj-skill",
+            "an untrusted project's skill must go verbatim"
+        );
+
+        // The vetted built-ins are unaffected — a jailed session still has them.
+        let built_in = prepare_outgoing(":commit", &[], root, SKIP);
+        assert_ne!(
+            built_in, ":commit",
+            "the built-in still expands: {built_in}"
+        );
     }
 
     #[test]
@@ -934,7 +1009,7 @@ mod tests {
 
         // Known @agent mention: body gets expand_mentions treatment and a routing
         // directive is prepended.
-        let out = prepare_outgoing("@bot check @note.txt please", &names, root);
+        let out = prepare_outgoing("@bot check @note.txt please", &names, root, LOAD);
         assert!(
             out.contains("[Directed to the `bot` agent"),
             "delegation directive missing: {out}"
@@ -945,7 +1020,7 @@ mod tests {
         );
 
         // Plain input with a resolvable @file: no delegation, just expansion.
-        let out = prepare_outgoing("look at @note.txt", &names, root);
+        let out = prepare_outgoing("look at @note.txt", &names, root, LOAD);
         assert!(
             !out.contains("[Directed to"),
             "no agent mention, should not route: {out}"
@@ -956,7 +1031,7 @@ mod tests {
         );
 
         // No matches at all: passes through unchanged.
-        let out = prepare_outgoing("just some text", &names, root);
+        let out = prepare_outgoing("just some text", &names, root, LOAD);
         assert_eq!(out, "just some text");
     }
 

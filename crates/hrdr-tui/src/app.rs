@@ -566,6 +566,16 @@ pub(crate) struct App {
     /// `:name` namespace, refreshed alongside `commands`. The invalid ones ride
     /// along because the `/commands` picker shows them with their reason.
     pub(crate) skills: hrdr_app::DiscoveredSkills,
+    /// Whether this session may read project-scoped commands and skills at all
+    /// — the session agent's own [`hrdr_agent::Agent::project_instructions`],
+    /// which every discovery this frontend runs has to be given (completion
+    /// popup, `/commands` picker, and the `:name` expansion on submit).
+    ///
+    /// Read once at construction and kept: the agent derives it from its
+    /// sandbox mode and never changes it, and the send path cannot take the
+    /// agent's lock — a running turn holds it, which is exactly when a steer is
+    /// typed.
+    pub(crate) project_instructions: hrdr_agent::ProjectInstructions,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -774,6 +784,12 @@ impl App {
         let registry = agent.registry();
         let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
+        // The agent has already answered "may this directory's files steer this
+        // session" (it is jailed, or it is not). Take that answer rather than
+        // asking the trust store a second time: two derivations of one rule are
+        // two answers waiting to disagree, and the frontend's is the one the
+        // user types `:name` into.
+        let project_instructions = agent.project_instructions();
         let (tx, rx) = mpsc::channel(TUI_EVENT_CAP);
         let editor: Box<dyn TuiEditorEngine> = if vim_mode {
             Box::new(VimEngine::new())
@@ -873,14 +889,9 @@ impl App {
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
-            commands: hrdr_app::discover_commands(
-                &cwd_for_commands,
-                hrdr_agent::ProjectInstructions::Load,
-            ),
-            skills: hrdr_app::discover_skills(
-                &cwd_for_commands,
-                hrdr_agent::ProjectInstructions::Load,
-            ),
+            commands: hrdr_app::discover_commands(&cwd_for_commands, project_instructions),
+            skills: hrdr_app::discover_skills(&cwd_for_commands, project_instructions),
+            project_instructions,
             pending_goto: None,
             pending_scroll_entry: None,
             pending_scroll_row: None,
@@ -1448,7 +1459,8 @@ impl App {
                 // model reads them together. If the model ends the turn instead,
                 // nothing drains it and `Done` re-sends it as a turn of its own.
                 // (While compacting, nothing is in `run()` to drain it at all.)
-                let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
+                let sent =
+                    hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
                 self.registry
                     .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
             } else {
@@ -2076,7 +2088,8 @@ impl App {
     fn send_to_subagent(&mut self, key: u64, input: String) {
         // Expanded with the main agent's cwd/names, but delivered to the
         // sub-agent — so no `@file` read-state marking on this handle.
-        let sent = hrdr_app::prepare_outgoing_relayed(&self.agent, &input);
+        let sent =
+            hrdr_app::prepare_outgoing_relayed(&self.agent, &input, self.project_instructions);
         let input = hrdr_agent::Steer::new(sent, input);
         // What was said and everything that comes back is recorded on the agent's
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
@@ -2318,8 +2331,8 @@ impl App {
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
         self.arm_file_watcher(&new);
-        self.commands = hrdr_app::discover_commands(&new, hrdr_agent::ProjectInstructions::Load);
-        self.skills = hrdr_app::discover_skills(&new, hrdr_agent::ProjectInstructions::Load);
+        self.commands = hrdr_app::discover_commands(&new, self.project_instructions);
+        self.skills = hrdr_app::discover_skills(&new, self.project_instructions);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does
@@ -2484,7 +2497,7 @@ impl App {
     fn spawn_turn(&mut self, input: String) {
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
-        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
+        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
         // Reserve the session id from what the user actually sent (seeds the saved
         // mirror so a first save is named), then enqueue the message as the turn's
         // opener onto the agent's own queue — the same queue a mid-turn steer lands

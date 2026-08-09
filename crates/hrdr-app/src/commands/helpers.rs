@@ -235,11 +235,22 @@ pub fn agent_todos(agent: &Arc<Mutex<Agent>>) -> Vec<hrdr_tools::TodoItem> {
 /// **to** `agent`; for one merely prepared with its cwd/names and delivered
 /// elsewhere, use [`prepare_outgoing_relayed`] so a file the agent never sees
 /// doesn't disarm its guard.
-pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
+///
+/// `project` is [`Agent::project_instructions`], which the caller has to supply
+/// rather than have this read: the path that needs it most is the *steer*, and
+/// there a turn is running and holding the very lock every `try_lock` in this
+/// module goes through. The value is fixed for the agent's life, so a frontend
+/// reads it once at construction and keeps it.
+pub fn prepare_outgoing_via(
+    agent: &Arc<Mutex<Agent>>,
+    input: &str,
+    project: hrdr_agent::ProjectInstructions,
+) -> String {
     let (sent, inlined) = crate::prepare_outgoing_tracked(
         input,
         &agent_names(agent),
         &agent_cwd(agent),
+        project,
         &agent_todos(agent),
     );
     // Best-effort, and deliberately not blocking: a turn in flight holds the
@@ -259,8 +270,12 @@ pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
 /// Identical expansion, no read-state change: the inlined content lands in the
 /// recipient's context, not this one's, and marking it here would tell `agent` it
 /// had seen a file it never received.
-pub fn prepare_outgoing_relayed(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
-    crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent))
+pub fn prepare_outgoing_relayed(
+    agent: &Arc<Mutex<Agent>>,
+    input: &str,
+    project: hrdr_agent::ProjectInstructions,
+) -> String {
+    crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent), project)
 }
 
 /// The working-tree `git diff` for `cwd` (stdout on success, stderr message on

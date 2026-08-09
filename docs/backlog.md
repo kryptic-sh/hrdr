@@ -1361,10 +1361,24 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   addable to the jail set a one-line change, and what lets a jailed agent open a
   bundle a user names), but the decision to leave `skill` out of `JAIL_TOOLS` is
   worth revisiting deliberately rather than by default.
-- **`prepare_outgoing_tracked` re-walks both command and skill roots on every
-  submit** (`crates/hrdr-app/src/util.rs`), on top of the cached copies the TUI
-  already holds for the popup. That is the pre-existing command behaviour
-  extended, not a regression, and it has not been measured.
+- **`prepare_outgoing_tracked` re-walks both command and skill roots on a `:`
+  submit** (`crates/hrdr-app/src/util.rs`) — the walk sits inside the
+  `input.trim_start().starts_with(':')` guard, so an ordinary message costs
+  nothing; only a message that opens with `:` pays for it, and it pays on top of
+  the cached copies the TUI already holds for the popup (`App::commands` /
+  `App::skills`). That is the pre-existing command behaviour extended, not a
+  regression, and it has not been measured.
+
+  **Open: whether the send path should use the frontend's cached sets instead of
+  re-walking.** The trade is immediacy against I/O. Today a command file added
+  mid-session expands the moment you type its name — the caches are only
+  refreshed by `/reload`, `/cwd` and `apply_cwd`, so reading them instead would
+  mean a newly written `.hrdr/commands/foo.md` is `:foo` verbatim until one of
+  those runs. Against that, the walk is per-`:`-submit filesystem work that the
+  popup has usually just done. It also touches the seam this path now carries:
+  the caches are already discovered with the session's `ProjectInstructions`, so
+  switching to them would keep the trust gate honoured either way. Not changed;
+  needs a call on which behaviour is wanted.
 
 Coverage gaps, stated plainly:
 
@@ -1550,14 +1564,45 @@ directory's files may then do:
   push site in `build_system_prompt_sections`. Closing it would mean the
   `memory`-tool treatment (main agent only), which that tool could afford
   because it had no second use.
-- **Project skills shadow built-ins by name.** `skill_dirs` includes
-  `cwd/.hrdr/skills`, `cwd/.claude/commands`, `cwd/.opencode/command`, all under
-  the writable cwd; project files are discovered _before_ built-ins and win,
-  with `model_invocable` defaulting true, so `.hrdr/skills/commit.md` silently
-  replaces the vetted `:commit`. Re-runs on every `set_cwd`/`clear` and in every
-  new `Agent::new`. Same shape as `AGENTS.md` but with a **weaker second use** —
-  a project skill is a convenience where `AGENTS.md` is a core feature — which
-  makes it the stronger candidate of the two if either is closed.
+- **Project commands and skills shadow built-ins by name.** `command_dirs` and
+  `skill_dirs` both start with the working tree's own roots (`.hrdr/commands`,
+  `.claude/commands`, `.opencode/command(s)`; `.hrdr/skills`, `.agents/skills`,
+  `.claude/skills`, `.codex/skills`), all under the writable cwd, and a project
+  entry is discovered _before_ the built-ins and wins the name — so a project
+  `.hrdr/commands/commit.md` silently replaces the vetted `:commit`. Re-runs on
+  every `set_cwd`/`clear` and in every new `Agent::new`. Same shape as
+  `AGENTS.md` but with a **weaker second use** — a project command is a
+  convenience where `AGENTS.md` is a core feature — which makes it the stronger
+  candidate of the two if either is closed. This is the **trusted** case only;
+  the untrusted one is the bullet below.
+- **Every frontend discovery must take the agent's own
+  `Agent::project_instructions`, never `ProjectInstructions::Load`.** The trust
+  gate's answer lives on the agent, derived once in `Agent::new` from the
+  effective sandbox mode; a frontend that passes `Load` to `discover_commands` /
+  `discover_skills` is a second answer to the same question, and it is the one
+  the user types into. That is what the `:` completion popup, the `/commands`
+  picker and `prepare_outgoing_tracked` all used to do, so a declined
+  directory's commands and skills were offered and expanded into the sent
+  message anyway. The seam now is: `Agent::project_instructions()`,
+  `App::project_instructions` (read once at construction — the send path cannot
+  take the agent's lock, since a running turn holds it, which is exactly when a
+  steer is typed), and `CommandHost::project_instructions()`, which is
+  deliberately required rather than defaulted so a new host cannot forget to
+  answer.
+
+  Coverage gap:
+  `a_jailed_session_neither_offers_nor_expands_the_projects_own_names`
+  (`hrdr-tui/src/app/e2e.rs`) drives `/reload`, the `/commands` picker and a
+  `:name` submit under a jailed harness, and
+  `a_skipped_project_expands_neither_its_commands_nor_its_skills`
+  (`hrdr-app/src/util.rs`) covers the send-path seam directly. The other two
+  frontend rediscovery sites are **not** exercised by a jailed test and are
+  correct by inspection only: `TuiHost::cwd_changed` (`/cwd`, which reaches it
+  only for a directory the user _has_ trusted) and `App::apply_cwd`, reached
+  from `apply_session` when a resumed session names a different cwd — that path
+  asks the trust store nothing, so it is the one that moves a jailed session's
+  cwd without a trust answer, and the one worth a test if this is revisited.
+
 - **A jailed session cannot `/cwd` into another untrusted directory.** The hole
   is closed — `/cwd` refuses a directory nobody has answered for, so a trusted
   session can no longer walk into a fresh checkout and read its `AGENTS.md` with

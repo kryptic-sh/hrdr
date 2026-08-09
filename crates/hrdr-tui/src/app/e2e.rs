@@ -294,6 +294,14 @@ impl Harness {
         Self::build(vec![], 50, hrdr_tools::SandboxMode::Read, true).await
     }
 
+    /// A session opened the way a **declined** directory opens: jailed. Both
+    /// arguments are needed — `effective_sandbox` floors a write-capable agent at
+    /// `write`, so `Jail` only survives on a read-only agent, which is exactly
+    /// what `main`'s `TrustGate::Jail` arm sets.
+    async fn jailed(replies: Vec<MockReply>) -> Self {
+        Self::build(replies, 50, hrdr_tools::SandboxMode::Jail, true).await
+    }
+
     async fn build(
         replies: Vec<MockReply>,
         max_steps: usize,
@@ -8407,7 +8415,7 @@ async fn a_skill_bundle_completes_and_expands_like_a_command() {
     .unwrap();
     // The App cache was built before the file existed — refresh it the way
     // /reload and a cwd change do.
-    h.app.skills = hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load);
+    h.app.skills = hrdr_app::discover_skills(&cwd, h.app.project_instructions);
 
     h.type_str(":pdf");
     let screen = h.render();
@@ -8508,7 +8516,7 @@ async fn a_namespaced_command_completes_picks_and_expands() {
     .unwrap();
     // The App cache was built before the file existed — refresh it the way
     // /reload and a cwd change do.
-    h.app.commands = hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load);
+    h.app.commands = hrdr_app::discover_commands(&cwd, h.app.project_instructions);
 
     h.type_str(":git");
     let screen = h.render();
@@ -8935,7 +8943,7 @@ Run the release checklist for $ARGUMENTS",
     // existed — refresh the way /reload and a cwd change do).
     h.app.commands = hrdr_app::discover_commands(
         std::path::Path::new(&h.app.current_cwd()),
-        hrdr_agent::ProjectInstructions::Load,
+        h.app.project_instructions,
     );
     h.type_str(":sh");
     let screen = h.render();
@@ -8972,6 +8980,104 @@ Run the release checklist for $ARGUMENTS",
     assert_eq!(
         hrdr_agent::strip_user_timestamp(&user),
         "Run the release checklist for v0.3"
+    );
+}
+
+/// **A jailed session offers, and expands, none of the working tree's own
+/// `:name`s.**
+///
+/// A directory the user declined at the trust gate opens jailed, and the agent
+/// already refuses its commands and skills. This is the same guarantee on the
+/// path a user actually types: the completion popup, the `/commands` picker, and
+/// the `:name` → sent-message expansion all have to take the agent's answer
+/// rather than reach for the project roots themselves.
+///
+/// Both surfaces of the namespace are planted — a `.hrdr/commands` template and
+/// a `.hrdr/skills` bundle — because they are two discoveries and were two
+/// separate `ProjectInstructions::Load` call sites.
+#[tokio::test]
+async fn a_jailed_session_neither_offers_nor_expands_the_projects_own_names() {
+    let mut h = Harness::jailed(vec![MockReply::Text("ok".to_string())]).await;
+    assert_eq!(
+        h.app.project_instructions,
+        hrdr_agent::ProjectInstructions::Skip,
+        "a jailed session reads no project instructions — the premise of this test"
+    );
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    let commands_dir = cwd.join(".hrdr/commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    std::fs::write(
+        commands_dir.join("ship.md"),
+        "---\ndescription: release checklist\n---\nPROJECT-COMMAND-BODY",
+    )
+    .unwrap();
+    let bundle = cwd.join(".hrdr/skills/proj-skill");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: proj-skill\ndescription: the project's own skill\n---\nPROJECT-SKILL-BODY",
+    )
+    .unwrap();
+    // The files were planted after the app was built, so refresh the completion
+    // caches — through `/reload`, the real command, rather than by assigning the
+    // fields, so the rediscovery under test is the one that actually ships.
+    h.submit("/reload").await;
+
+    // The `:` completion popup offers neither.
+    h.type_str(":ship");
+    let screen = h.render();
+    assert!(
+        !screen.contains("release checklist"),
+        "the popup must not offer an untrusted project's command:\n{screen}"
+    );
+    for _ in 0..5 {
+        h.press(KeyCode::Backspace);
+    }
+    h.type_str(":proj");
+    let screen = h.render();
+    assert!(
+        !screen.contains("the project's own skill"),
+        "the popup must not offer an untrusted project's skill:\n{screen}"
+    );
+    for _ in 0..5 {
+        h.press(KeyCode::Backspace);
+    }
+
+    // Nor does the `/commands` picker.
+    h.submit("/commands").await;
+    let rows: Vec<String> = h
+        .app
+        .command_selector
+        .as_ref()
+        .expect("the picker opened")
+        .rows()
+        .map(|e| e.name.clone())
+        .collect();
+    assert!(
+        !rows.iter().any(|n| n == "ship" || n == "proj-skill"),
+        "the picker must not list an untrusted project's entries: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|n| n == "commit"),
+        "…while the vetted built-ins are still listed: {rows:?}"
+    );
+    h.app.command_selector = None;
+
+    // And a typed `:name` reaches the model verbatim rather than as the
+    // repository's text.
+    h.submit(":ship v0.3").await;
+    let user = h
+        .app
+        .state()
+        .messages
+        .iter()
+        .find(|m| m.role == hrdr_agent::MessageRole::User)
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        hrdr_agent::strip_user_timestamp(&user),
+        ":ship v0.3",
+        "an untrusted project's command must not be expanded into the sent message"
     );
 }
 

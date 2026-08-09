@@ -709,6 +709,10 @@ mod tests {
         fn cwd(&self) -> std::path::PathBuf {
             self.cwd.clone()
         }
+        fn project_instructions(&self) -> hrdr_agent::ProjectInstructions {
+            // This host's agent is built without a sandbox, so it is not jailed.
+            hrdr_agent::ProjectInstructions::Load
+        }
         fn base_url(&self) -> String {
             "http://test.invalid".to_string()
         }
