@@ -928,10 +928,50 @@ mod tests {
         assert_eq!(matches.len(), 1, "one slot per key: {matches:?}");
     }
 
+    /// **A symlinked command dir IS walked; a symlink INSIDE one is not.**
+    ///
+    /// `discover_commands` builds its walk with `ignore`'s default
+    /// `follow_links(false)`, but walkdir follows a symlinked *root* regardless
+    /// (`follow_root_links` defaults on) and `WalkBuilder` leaves that default
+    /// alone. So `~/.config/hrdr/commands -> ~/dotfiles/commands` — the dotfiles
+    /// layout — does contribute its files, while a `shared -> …` link dropped
+    /// inside a command dir contributes nothing. Both halves are asserted
+    /// because the two look identical from outside and behave oppositely.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_dir_is_walked_but_a_symlink_inside_one_is_not() {
+        let dotfiles = tempfile::tempdir().unwrap();
+        std::fs::write(dotfiles.path().join("ship.md"), "ship it").unwrap();
+
+        let linked = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked.path().join(".hrdr")).unwrap();
+        std::os::unix::fs::symlink(dotfiles.path(), linked.path().join(".hrdr/commands")).unwrap();
+        let commands = discover_commands(linked.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(
+            commands.iter().any(|c| c.name == "ship"),
+            "a symlinked command dir IS walked"
+        );
+
+        let nested = tempfile::tempdir().unwrap();
+        let dir = nested.path().join(".hrdr/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(dotfiles.path(), dir.join("shared")).unwrap();
+        let commands = discover_commands(nested.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(
+            !commands.iter().any(|c| c.name == "shared/ship"),
+            "a symlink below the dir is NOT followed"
+        );
+        assert!(
+            commands.iter().all(|c| c.source == "built-in"),
+            "…so that dir contributes nothing at all"
+        );
+    }
+
     /// A symlink cycle inside a command dir must not hang discovery — a
     /// liveness guard, so the failure it catches is the run never returning
-    /// rather than an assertion. Today the walk simply does not follow links;
-    /// this is what would fail if a later walk did, without cycle detection.
+    /// rather than an assertion. Today the walk follows no link below the dir
+    /// itself; this is what would fail if a later walk did, without cycle
+    /// detection.
     #[cfg(unix)]
     #[test]
     fn a_symlink_cycle_does_not_hang_discovery() {
@@ -1250,6 +1290,53 @@ mod tests {
             commands
                 .iter()
                 .any(|s| s.name == "commit" && s.source == "built-in")
+        );
+    }
+
+    /// A dir holding more bytes than `MAX_COMMANDS_TOTAL_BYTES` yields a bounded
+    /// set even while the file COUNT stays far under `MAX_COMMANDS`: the two
+    /// ceilings are independent, and this is the one a few big files hit.
+    #[test]
+    fn discover_commands_caps_the_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands_dir = dir.path().join(".hrdr/commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        // Each file at the per-file ceiling, so the aggregate budget buys exactly
+        // this many before it is spent.
+        let per_file = MAX_COMMAND_FILE_BYTES as usize;
+        let affordable = MAX_COMMANDS_TOTAL_BYTES / per_file;
+        for i in 0..(affordable + 6) {
+            std::fs::write(
+                commands_dir.join(format!("command{i:04}.md")),
+                "b".repeat(per_file),
+            )
+            .unwrap();
+        }
+        let commands = discover_commands(dir.path(), crate::prompt::ProjectInstructions::Load);
+        let discovered = commands.iter().filter(|c| c.source != "built-in").count();
+        assert_eq!(discovered, affordable);
+        assert!(
+            affordable < MAX_COMMANDS,
+            "the byte cap is what bit here, not the file-count cap"
+        );
+    }
+
+    /// A command file over `MAX_COMMAND_FILE_BYTES` is skipped before it is
+    /// read. The cap is a ceiling, so a file of exactly that size still loads.
+    #[test]
+    fn discover_commands_refuses_a_file_over_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands_dir = dir.path().join(".hrdr/commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let cap = MAX_COMMAND_FILE_BYTES as usize;
+        std::fs::write(commands_dir.join("huge.md"), "b".repeat(cap + 1)).unwrap();
+        std::fs::write(commands_dir.join("atcap.md"), "b".repeat(cap)).unwrap();
+
+        let commands = discover_commands(dir.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(!commands.iter().any(|c| c.name == "huge"));
+        assert!(
+            commands.iter().any(|c| c.name == "atcap"),
+            "a file at exactly the cap is within it"
         );
     }
 }

@@ -58,7 +58,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     arguments — trailing text is appended, never substituted), and they share
     the `:`-completion popup and the `/commands` picker with commands. **A
     command wins a name collision**; the shadowed skill is marked in the picker
-    and stays loadable by the `skill` tool.
+    and stays loadable by the `skill` tool. A bundle whose name a
+    higher-precedence skill root already holds is marked in the picker too — it
+    is reachable by nothing at all, which is otherwise invisible.
   - The skill roots are readable in **every** sandbox mode, `jail` included, so
     a confined agent can open what its listing names. Bundled `scripts/` get no
     special privilege — running one is a `shell` call under the current mode.

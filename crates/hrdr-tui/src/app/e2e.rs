@@ -8462,6 +8462,99 @@ async fn a_skill_bundle_completes_and_expands_like_a_command() {
     );
 }
 
+/// A bundle that failed validation still gets a row in `/commands`, carrying
+/// the reason — "my skill is not showing up" has to be answerable from the
+/// screen rather than from reading the source.
+#[tokio::test]
+async fn the_commands_picker_shows_an_invalid_skill_with_its_reason() {
+    let mut h = Harness::new(vec![]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    let bundle = cwd.join(".hrdr/skills/broken");
+    std::fs::create_dir_all(&bundle).unwrap();
+    // `name:` disagreeing with the directory: an authoring mistake discovery
+    // refuses to guess at, so the bundle is skipped and the reason kept.
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: mismatch\ndescription: d\n---\nBody.",
+    )
+    .unwrap();
+
+    h.submit("/commands").await;
+    // The invalid rows sort last, behind every built-in command — filter to it.
+    h.type_str("broken");
+    let screen = h.render();
+    assert!(screen.contains(":broken"), "the row is listed:\n{screen}");
+    assert!(
+        screen.contains("invalid skill: `name` is `mismatch`"),
+        "…marked invalid, with the reason on the row (the tail of a long reason \
+         is elided to the row width):\n{screen}"
+    );
+}
+
+/// A namespaced command is reachable end to end: `.hrdr/commands/git/commit.md`
+/// completes as `:git/commit` in the popup, is offered under that name by the
+/// `/commands` picker, and expands on submit — including when the user spells
+/// the separator `.` instead of `/`.
+#[tokio::test]
+async fn a_namespaced_command_completes_picks_and_expands() {
+    let mut h = Harness::new(vec![MockReply::Text("committed".to_string())]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    let dir = cwd.join(".hrdr/commands/git");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("commit.md"),
+        "---\ndescription: commit the tree\n---\nStage and commit.",
+    )
+    .unwrap();
+    // The App cache was built before the file existed — refresh it the way
+    // /reload and a cwd change do.
+    h.app.commands = hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load);
+
+    h.type_str(":git");
+    let screen = h.render();
+    assert!(
+        screen.contains(":git/commit"),
+        "the popup offers the namespaced name:\n{screen}"
+    );
+    assert!(
+        screen.contains("commit the tree"),
+        "…with its description:\n{screen}"
+    );
+    for _ in 0..4 {
+        h.press(KeyCode::Backspace);
+    }
+
+    h.submit("/commands").await;
+    h.type_str("git/commit");
+    let screen = h.render();
+    assert!(
+        screen.contains(":git/commit"),
+        "the picker lists it too:\n{screen}"
+    );
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app.editor.content(),
+        ":git/commit ",
+        "the picker inserts the canonical `/` spelling"
+    );
+    h.app.editor.set_content("");
+
+    // `.` is an accepted spelling of the separator, so this reaches the same file.
+    h.submit(":git.commit now").await;
+    let user = h
+        .app
+        .state()
+        .messages
+        .iter()
+        .find(|m| m.role == hrdr_agent::MessageRole::User)
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(
+        user.contains("Stage and commit.\n\nnow"),
+        "the body expands, with the trailing text appended: {user}"
+    );
+}
+
 /// A transcript whose cumulative wrapped-row count exceeds `u16::MAX` must not
 /// have its scroll math wrap around: `draw_transcript` keeps that accumulator
 /// in `usize` to avoid overflow, but the cast down to ratatui's `u16`-only

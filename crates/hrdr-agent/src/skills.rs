@@ -45,6 +45,10 @@ const MAX_SKILLS_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 /// codex and opencode allow (`skills/<group>/<name>/SKILL.md`).
 const SKILL_MAX_DEPTH: usize = 6;
 
+/// codex's own override for its user directory, honoured so one bundle can serve
+/// both harnesses.
+const CODEX_HOME: &str = "CODEX_HOME";
+
 /// Longest `name`, in characters — codex's `MAX_NAME_LEN`, and what the format's
 /// documented "1–64 characters" rule means.
 const MAX_NAME_LEN: usize = 64;
@@ -95,12 +99,17 @@ pub struct InvalidSkill {
     pub reason: String,
 }
 
-/// What [`discover_skills`] found: the usable bundles, and the ones skipped
-/// with their reasons. Both halves are returned because a skill that silently
-/// does not appear is the format's most common complaint.
+/// What [`discover_skills`] found: the usable bundles, the ones a
+/// higher-precedence root already claimed the name of, and the ones skipped with
+/// their reasons. All three are returned because a skill that silently does not
+/// appear is the format's most common complaint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveredSkills {
     pub skills: Vec<Skill>,
+    /// Bundles that lost a name collision — a lower-precedence root's copy of a
+    /// name `skills` already holds. Never invocable and never listed to the
+    /// model; kept only so the `/commands` picker can say why they never run.
+    pub shadowed: Vec<Skill>,
     pub invalid: Vec<InvalidSkill>,
 }
 
@@ -135,7 +144,7 @@ pub fn skill_dirs(cwd: &Path, project: crate::prompt::ProjectInstructions) -> Ve
         dirs.push(home.join(".agents").join("skills"));
         dirs.push(home.join(".claude").join("skills"));
         // `$CODEX_HOME/skills`, codex's own user location.
-        let codex_home = std::env::var_os("CODEX_HOME")
+        let codex_home = std::env::var_os(CODEX_HOME)
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| home.join(".codex"));
@@ -153,7 +162,8 @@ fn skill_match_key(name: &str) -> String {
 /// Discover skill bundles across the hrdr/agents/Claude/codex roots, relative to
 /// `cwd` for project scopes. Each root is walked recursively for `SKILL.md`
 /// files; the skill's identity comes from the directory immediately containing
-/// it. One skill per name, first root in precedence order wins.
+/// it. One skill per name, first root in precedence order wins; the losers go to
+/// [`DiscoveredSkills::shadowed`] rather than being dropped.
 pub fn discover_skills(
     cwd: &Path,
     project: crate::prompt::ProjectInstructions,
@@ -223,7 +233,12 @@ pub fn discover_skills(
         found.sort_by(|a, b| a.name.cmp(&b.name));
         for skill in found {
             let key = skill_match_key(&skill.name);
-            if !out.skills.iter().any(|s| skill_match_key(&s.name) == key) {
+            if out.skills.iter().any(|s| skill_match_key(&s.name) == key) {
+                // The name is already taken by a higher-precedence root. Kept
+                // rather than dropped: this bundle can never run, and the
+                // `/commands` picker is where that stops being a mystery.
+                out.shadowed.push(skill);
+            } else {
                 out.skills.push(skill);
             }
         }
@@ -494,6 +509,11 @@ fn known_names(skills: &[Skill]) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the one test that mutates `$CODEX_HOME`. The variable is
+    /// process-global, so two of these at once would read each other's value —
+    /// and the failure would be a *passing* test, not a crash.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Write `<root>/<name>/SKILL.md` with `text`, returning the bundle dir.
     fn bundle(root: &Path, name: &str, text: &str) -> PathBuf {
         let dir = root.join(name);
@@ -504,6 +524,14 @@ mod tests {
 
     fn skill_md(name: &str, description: &str, body: &str) -> String {
         format!("---\nname: {name}\ndescription: {description}\n---\n{body}")
+    }
+
+    /// A valid `SKILL.md` for `name`, padded with body text to exactly `bytes`.
+    fn skill_md_of_size(name: &str, bytes: usize) -> String {
+        let head = skill_md(name, "d", "");
+        let mut text = head.clone();
+        text.push_str(&"b".repeat(bytes - head.len()));
+        text
     }
 
     fn parse(dir_name: &str, text: &str) -> Result<Skill, String> {
@@ -832,6 +860,222 @@ mod tests {
         }
         let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         assert_eq!(found.skills.len(), MAX_SKILLS);
+    }
+
+    /// A root holding more bytes than `MAX_SKILLS_TOTAL_BYTES` yields a bounded
+    /// set even while the file COUNT stays far under `MAX_SKILLS`: the two
+    /// ceilings are independent, and this is the one a few big bundles hit.
+    #[test]
+    fn discovery_caps_the_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".hrdr/skills");
+        // Each file at the per-file ceiling, so the aggregate budget buys exactly
+        // this many before it is spent.
+        let per_file = MAX_SKILL_FILE_BYTES as usize;
+        let affordable = MAX_SKILLS_TOTAL_BYTES / per_file;
+        for i in 0..(affordable + 6) {
+            let name = format!("skill{i:04}");
+            bundle(&root, &name, &skill_md_of_size(&name, per_file));
+        }
+        let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
+        assert_eq!(found.skills.len(), affordable);
+        assert!(
+            affordable < MAX_SKILLS,
+            "the byte cap is what bit here, not the file-count cap"
+        );
+    }
+
+    /// A `SKILL.md` over `MAX_SKILL_FILE_BYTES` is skipped before it is read —
+    /// and skipped silently, not reported as invalid: nothing about it was
+    /// parsed, so there is no authoring mistake to name. The cap is a ceiling,
+    /// so a file of exactly that size still loads.
+    #[test]
+    fn discovery_refuses_a_skill_file_over_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".hrdr/skills");
+        let cap = MAX_SKILL_FILE_BYTES as usize;
+        bundle(&root, "huge", &skill_md_of_size("huge", cap + 1));
+        bundle(&root, "atcap", &skill_md_of_size("atcap", cap));
+
+        let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(
+            !found.skills.iter().any(|s| s.name == "huge"),
+            "{:?}",
+            found.skills
+        );
+        assert!(found.invalid.is_empty(), "{:?}", found.invalid);
+        assert!(
+            found.skills.iter().any(|s| s.name == "atcap"),
+            "a file at exactly the cap is within it: {:?}",
+            found.skills
+        );
+    }
+
+    /// A bundle whose name a higher-precedence root already holds is kept, not
+    /// dropped — it can never run, and the `/commands` picker needs the row to
+    /// say so.
+    #[test]
+    fn a_shadowed_duplicate_is_kept_for_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        bundle(
+            &dir.path().join(".hrdr/skills"),
+            "ship",
+            &skill_md("ship", "hrdr's ship", "hrdr wins"),
+        );
+        bundle(
+            &dir.path().join(".claude/skills"),
+            "ship",
+            &skill_md("ship", "claude's ship", "claude loses"),
+        );
+
+        let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
+        assert_eq!(found.skills.len(), 1);
+        assert_eq!(found.skills[0].body, "hrdr wins");
+        assert_eq!(found.shadowed.len(), 1, "{:?}", found.shadowed);
+        assert_eq!(found.shadowed[0].name, "ship");
+        assert_eq!(found.shadowed[0].body, "claude loses");
+    }
+
+    /// `$CODEX_HOME` moves codex's user root, and an empty value is no value.
+    /// [`skill_dirs`] is tested rather than discovery because a real bundle
+    /// planted under the shared sandbox `$HOME` would leak into every other
+    /// test's discovery.
+    ///
+    /// `set_var` is process-global, so this holds [`ENV_LOCK`] and restores what
+    /// it found.
+    #[test]
+    fn codex_home_overrides_the_default_codex_root() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(CODEX_HOME);
+        let home = crate::agents_dir::home_dir().expect("the test sandbox sets $HOME");
+        let default_root = home.join(".codex").join("skills");
+        let cwd = Path::new("/nonexistent-cwd");
+        let dirs = || skill_dirs(cwd, crate::prompt::ProjectInstructions::Skip);
+
+        // SAFETY: ENV_LOCK makes this the only thread touching CODEX_HOME, and
+        // nothing else in the process reads it. Same for the three below.
+        unsafe { std::env::remove_var(CODEX_HOME) };
+        assert!(dirs().contains(&default_root), "{:?}", dirs());
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(CODEX_HOME, elsewhere.path()) };
+        assert!(
+            dirs().contains(&elsewhere.path().join("skills")),
+            "{:?}",
+            dirs()
+        );
+        assert!(
+            !dirs().contains(&default_root),
+            "the override replaces the default, it does not add to it: {:?}",
+            dirs()
+        );
+
+        unsafe { std::env::set_var(CODEX_HOME, "") };
+        assert!(
+            dirs().contains(&default_root),
+            "an empty value is not a location: {:?}",
+            dirs()
+        );
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var(CODEX_HOME, v) },
+            None => unsafe { std::env::remove_var(CODEX_HOME) },
+        }
+    }
+
+    /// A `SKILL.md` big enough to blow the tool's output cap comes back
+    /// truncated with the standard overflow pointer, and the rest is readable
+    /// from the file it names — a procedure the model asked for by name is never
+    /// silently cut short.
+    #[tokio::test]
+    async fn skill_tool_truncates_a_huge_body_and_spills_it_to_a_file() {
+        use hrdr_tools::Tool;
+        const LAST_STEP: &str = "the-final-step-marker";
+        // Twice the cap: an 8-byte line repeated a quarter-of-the-cap times.
+        let body = format!(
+            "{}{LAST_STEP}\n",
+            "padding\n".repeat(SKILL_OUTPUT_MAX_BYTES / 4)
+        );
+        let tool = SkillTool {
+            skills: Arc::new(Mutex::new(vec![Skill {
+                name: "long".to_string(),
+                description: "a very long procedure".to_string(),
+                body: body.clone(),
+                source: "test".to_string(),
+                base_dir: PathBuf::from("/tmp/skills/long"),
+                license: None,
+                compatibility: None,
+                metadata: BTreeMap::new(),
+            }])),
+        };
+        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+
+        let out = tool
+            .execute(serde_json::json!({"name": "long"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.len() < body.len(),
+            "the body is far over the cap, so the output must be shorter than it: {} vs {}",
+            out.len(),
+            body.len()
+        );
+        assert!(
+            !out.contains(LAST_STEP),
+            "the tail is what was cut — otherwise nothing was truncated"
+        );
+        let saved = out
+            .split("saved to ")
+            .nth(1)
+            .and_then(|rest| rest.split(" — ").next())
+            .unwrap_or_else(|| panic!("no overflow pointer in the output:\n{out}"));
+        let spilled = std::fs::read_to_string(saved).unwrap();
+        assert!(
+            spilled.contains(LAST_STEP),
+            "the spill file holds the part that was cut"
+        );
+        assert!(
+            spilled.contains("Base directory for this skill: /tmp/skills/long"),
+            "…and the footer, so the spilled copy is the whole prompt"
+        );
+    }
+
+    /// **A symlinked skill ROOT is walked; a symlink INSIDE one is not.**
+    ///
+    /// `discover_skills` builds its walk with `ignore`'s default
+    /// `follow_links(false)`, but walkdir follows a symlinked *root* regardless
+    /// (`follow_root_links` defaults on), and `WalkBuilder` leaves that default
+    /// alone. So `~/.agents/skills -> ~/dotfiles/skills` — the dotfiles layout —
+    /// does contribute its bundles, while a `shared -> …` link dropped inside a
+    /// root contributes nothing. Both halves are asserted because the two look
+    /// identical from outside and behave oppositely.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_walked_but_a_symlink_inside_one_is_not() {
+        let dotfiles = tempfile::tempdir().unwrap();
+        bundle(dotfiles.path(), "ship", &skill_md("ship", "d", "Body."));
+
+        let linked_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked_root.path().join(".hrdr")).unwrap();
+        std::os::unix::fs::symlink(dotfiles.path(), linked_root.path().join(".hrdr/skills"))
+            .unwrap();
+        let found = discover_skills(linked_root.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(
+            found.skills.iter().any(|s| s.name == "ship"),
+            "a symlinked root IS walked: {:?}",
+            found.skills
+        );
+
+        let nested = tempfile::tempdir().unwrap();
+        let root = nested.path().join(".hrdr/skills");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(dotfiles.path(), root.join("shared")).unwrap();
+        let found = discover_skills(nested.path(), crate::prompt::ProjectInstructions::Load);
+        assert!(
+            found.skills.is_empty(),
+            "a symlink below the root is NOT followed: {:?}",
+            found.skills
+        );
     }
 
     /// A symlink cycle inside a skill root must not hang discovery — a liveness

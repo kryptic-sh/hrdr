@@ -27,10 +27,13 @@ pub enum PromptEntryKind {
     Command,
     /// A skill bundle, invocable as `:name`.
     Skill,
-    /// A skill whose name a command already owns: `:name` runs the command. The
-    /// bundle is still loadable by the model through the `skill` tool, which is
-    /// why it is shown rather than dropped.
-    ShadowedSkill,
+    /// A skill something else already owns the name of, carrying what shadows
+    /// it: a **command** (`:name` runs the command, but the bundle is still
+    /// loadable by the model through the `skill` tool) or a **higher-precedence
+    /// skill root** (nothing can reach this copy at all). Shown rather than
+    /// dropped either way — "why is my skill not running" has to be answerable
+    /// from this screen.
+    ShadowedSkill(String),
     /// A `SKILL.md` that failed validation, with the reason — shown because a
     /// skill that silently does not appear is the format's usual complaint.
     InvalidSkill(String),
@@ -61,7 +64,7 @@ impl PromptEntry {
         match &self.kind {
             PromptEntryKind::Command => describe(""),
             PromptEntryKind::Skill => describe("skill"),
-            PromptEntryKind::ShadowedSkill => describe("skill, shadowed by a command"),
+            PromptEntryKind::ShadowedSkill(by) => describe(&format!("skill, shadowed by {by}")),
             PromptEntryKind::InvalidSkill(reason) => format!("invalid skill: {reason}"),
         }
     }
@@ -69,7 +72,9 @@ impl PromptEntry {
 
 /// The `:name` namespace as one list: every command, then every skill — the
 /// shadowed and the invalid ones included and marked, since "my skill is not
-/// showing up" is otherwise unanswerable from the UI.
+/// showing up" is otherwise unanswerable from the UI. Both kinds of shadowing
+/// are marked: a command owning the name, and a higher-precedence skill root
+/// holding a bundle of the same name.
 pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<PromptEntry> {
     let mut out: Vec<PromptEntry> = commands
         .iter()
@@ -80,7 +85,7 @@ pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<Pr
             kind: PromptEntryKind::Command,
         })
         .collect();
-    let shadowed = |name: &str| {
+    let shadowed_by_command = |name: &str| {
         let key = command_match_key(name);
         commands.iter().any(|c| command_match_key(&c.name) == key)
     };
@@ -88,11 +93,20 @@ pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<Pr
         name: s.name.clone(),
         description: s.description.clone(),
         source: s.source.clone(),
-        kind: if shadowed(&s.name) {
-            PromptEntryKind::ShadowedSkill
+        kind: if shadowed_by_command(&s.name) {
+            PromptEntryKind::ShadowedSkill("a command".to_string())
         } else {
             PromptEntryKind::Skill
         },
+    }));
+    // A bundle a higher-precedence root already claimed the name of. It never
+    // runs and the model never sees it, so the command that may also own the
+    // name changes nothing about it: name the skill root that won.
+    out.extend(skills.shadowed.iter().map(|s| PromptEntry {
+        name: s.name.clone(),
+        description: s.description.clone(),
+        source: s.source.clone(),
+        kind: PromptEntryKind::ShadowedSkill("a higher-precedence skill".to_string()),
     }));
     out.extend(skills.invalid.iter().map(|i| PromptEntry {
         name: i.name.clone(),
@@ -283,7 +297,7 @@ mod tests {
             ],
             &DiscoveredSkills {
                 skills: vec![skill("pdf-fill", "fill in a PDF form")],
-                invalid: Vec::new(),
+                ..Default::default()
             },
         );
         let hay = entries
@@ -301,9 +315,12 @@ mod tests {
 
     /// The picker's one flat view of the namespace: commands, then skills, with
     /// the shadowed and the invalid ones visible and labelled — "why is my skill
-    /// not showing up" has to be answerable from this screen.
+    /// not showing up" has to be answerable from this screen. Both shadowings
+    /// are marked, and they are different situations: a command owning the name
+    /// leaves the bundle loadable through the `skill` tool, while a
+    /// higher-precedence skill root leaves nothing able to reach it at all.
     #[test]
-    fn entries_mark_shadowed_and_invalid_skills() {
+    fn entries_mark_both_shadowings_and_invalid_skills() {
         let entries = prompt_entries(
             &[command("ship", "release checklist")],
             &DiscoveredSkills {
@@ -311,6 +328,7 @@ mod tests {
                     skill("ship", "the shadowed one"),
                     skill("pdf-fill", "fill a PDF"),
                 ],
+                shadowed: vec![skill("pdf-fill", "the user-scope copy")],
                 invalid: vec![InvalidSkill {
                     name: "broken".to_string(),
                     path: "~/.claude/skills/broken/SKILL.md".to_string(),
@@ -325,12 +343,19 @@ mod tests {
         assert_eq!(by("pdf-fill").detail(), "skill · fill a PDF");
         // Both `ship` rows are present: the command's, and the skill it shadows —
         // which the model can still load through the `skill` tool.
-        let shadowed = entries
+        let details: Vec<String> = entries
             .iter()
-            .find(|e| e.kind == PromptEntryKind::ShadowedSkill)
-            .expect("the shadowed skill is shown, not dropped");
-        assert_eq!(shadowed.name, "ship");
-        assert!(shadowed.detail().contains("shadowed by a command"));
+            .filter(|e| matches!(e.kind, PromptEntryKind::ShadowedSkill(_)))
+            .map(|e| format!("{}: {}", e.name, e.detail()))
+            .collect();
+        assert_eq!(
+            details,
+            vec![
+                "ship: skill, shadowed by a command · the shadowed one",
+                "pdf-fill: skill, shadowed by a higher-precedence skill · the user-scope copy",
+            ],
+            "both shadowings are shown, and say which one it is"
+        );
         assert_eq!(
             by("broken").detail(),
             "invalid skill: missing `description`",

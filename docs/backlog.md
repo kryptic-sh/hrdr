@@ -1297,16 +1297,20 @@ write, and built-ins become user-editable (codex accepts both).
 The rename itself shipped whole (module, tool, `/commands`, dirs, recursive
 namespaced names). What it left open:
 
-- **A symlinked command directory is not walked.** `discover_commands` builds
-  its `ignore::WalkBuilder` with the default `follow_links(false)`, which is
-  what makes a symlink cycle a non-issue. The cost is that
-  `~/.config/hrdr/commands/shared -> ~/dotfiles/commands` — a normal dotfiles
-  layout — contributes nothing. Verified by reading the builder defaults, not by
-  a test. Turning links on would be safe as far as hangs go (`ignore` detects
-  cycles and yields an error rather than looping), so if anyone asks for it the
-  change is one call; it was left off as the conservative default, not because
-  it cannot work. `a_symlink_cycle_does_not_hang_discovery` covers the liveness
-  half only.
+- **A symlink _inside_ a command directory is not walked** — the directory
+  itself being a symlink is fine. `discover_commands` builds its
+  `ignore::WalkBuilder` with the default `follow_links(false)`, which is what
+  makes a symlink cycle a non-issue, but walkdir follows a symlinked _root_
+  regardless (`follow_root_links` defaults on, and `WalkBuilder` leaves it
+  alone), so `~/.config/hrdr/commands -> ~/dotfiles/commands` — the normal
+  dotfiles layout — does contribute its files. What contributes nothing is a
+  link dropped below the root, e.g. `~/.config/hrdr/commands/shared -> …`.
+  Pinned by `a_symlinked_dir_is_walked_but_a_symlink_inside_one_is_not`
+  (`commands.rs`), which asserts both halves; the same shape holds for
+  `discover_skills`. Turning nested links on would be safe as far as hangs go
+  (`ignore` detects cycles and yields an error rather than looping), so if
+  anyone asks for it the change is one call; it is off as the conservative
+  default, not because it cannot work.
 - **Nothing warns a user whose commands are still in `.hrdr/skills/` or
   `~/.config/hrdr/skills/`.** Those two paths now belong to the `SKILL.md`
   bundles (see the skills entry below), so a stray `review.md` left there is not
@@ -1321,10 +1325,6 @@ namespaced names). What it left open:
   `prompt::commands_section`. The one live entry affected is **Project skills
   shadow built-ins by name** under Peer-comparison findings: still true, now
   about `.hrdr/commands`.
-- **Not verified:** no e2e coverage of a _namespaced_ command through the TUI —
-  the picker, the completion popup and the `command` tool are each covered by
-  unit tests, and `commands_picker_inserts_the_invocation` still uses a
-  top-level `ship.md`.
 
 ## Deferred 2026-08-09 — Agent Skills (`SKILL.md` bundles)
 
@@ -1339,18 +1339,24 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   picker row, not the `skill` tool's output (which would spend tokens on a
   licence string the model cannot use). Decide a surface before adding one; the
   parse and its test are already there.
-- **A symlinked skill root is not walked**, same as `discover_commands` and for
-  the same reason (`ignore::WalkBuilder`'s default `follow_links(false)` is what
-  makes a cycle a non-issue). `~/.agents/skills -> ~/dotfiles/skills` therefore
-  contributes nothing. Turning it on is one call if anyone asks.
+- **A symlink _inside_ a skill root is not walked**, same as `discover_commands`
+  and for the same reason (`ignore::WalkBuilder`'s default `follow_links(false)`
+  is what makes a cycle a non-issue). A symlinked _root_ is walked, so
+  `~/.agents/skills -> ~/dotfiles/skills` does contribute its bundles — see the
+  commands entry above for why, and
+  `a_symlinked_root_is_walked_but_a_symlink_inside_one_is_not` (`skills.rs`) for
+  the assertion of both halves. Turning nested links on is one call if anyone
+  asks.
 - **No per-skill permission model.** opencode gates skills per agent with
   `permission.skill` patterns (`internal-*: deny`); hrdr's only lever is a
   profile's `tools:` allow-list dropping `skill` wholesale, which takes the
   listing with it. Not built because nothing has asked for per-name gating yet.
-- **A duplicate name across roots is resolved silently** — first root in
-  precedence order wins, no notice. opencode logs a warning. The `/commands`
-  picker only marks a skill shadowed by a _command_, not one shadowed by a
-  higher-precedence skill.
+- **Considered and declined: warning on a duplicate name across roots.**
+  opencode logs one; hrdr does not, because discovery runs inside the TUI and
+  stderr there corrupts the display (the same reason `discover_commands` is
+  silent at its cap). The visibility went to the `/commands` picker instead —
+  `DiscoveredSkills::shadowed` keeps the losing bundle and the row says which
+  kind of shadowing it is. Revisit only if a non-TUI frontend appears.
 - **hrdr ships no built-in skills**, only built-in commands. Deliberate: a
   built-in belongs in `src/templates/commands/` where it is one file and no
   directory bundle.
@@ -1370,21 +1376,15 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
 
 Coverage gaps, stated plainly:
 
-- **Not tested: the `$CODEX_HOME` override and the user-scope roots.** Every
-  discovery test uses project scopes under a `tempfile::tempdir`, because
-  `$HOME` is one sandboxed directory shared by all tests in a process and a real
-  bundle planted there would leak into other tests' discovery. The jail-read
-  test (`a_jailed_agent_may_read_the_user_skill_roots`) creates only an empty
-  `~/.claude/skills` directory for that reason.
-- **Not tested: `MAX_SKILL_FILE_BYTES` and `MAX_SKILLS_TOTAL_BYTES`.** Only the
-  file-count cap (`MAX_SKILLS`) has a test.
-- **Not covered end-to-end: the picker's "invalid skill" row.** Its construction
-  and text are unit-tested in `hrdr-app`
-  (`entries_mark_shadowed_and_invalid_skills`), but no TUI e2e renders one.
-- **Not reviewed: how a very long `SKILL.md` behaves in practice.** Discovery
-  refuses a file over `MAX_SKILL_FILE_BYTES` and the tool truncates at
-  `SKILL_OUTPUT_MAX_BYTES` with the usual spill-to-file, both untested for
-  skills specifically.
+- **Not tested: discovery from the user-scope roots.** Every discovery test uses
+  project scopes under a `tempfile::tempdir`, because `$HOME` is one sandboxed
+  directory shared by all tests in a process and a real bundle planted there
+  would leak into other tests' discovery. The jail-read test
+  (`a_jailed_agent_may_read_the_user_skill_roots`) creates only an empty
+  `~/.claude/skills` directory for that reason, and
+  `codex_home_overrides_the_default_codex_root` tests `skill_dirs` (the pure
+  path function) rather than a planted bundle. What is therefore unexercised is
+  the walk of a user root, not the roots' composition.
 
 ## Top of the list
 
