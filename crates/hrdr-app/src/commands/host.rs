@@ -325,23 +325,24 @@ pub trait CommandHost {
     }
 
     /// Open the interactive `/commands` picker — the discovered `:name` prompt
-    /// templates; picking one inserts `:name ` into the input. The default
-    /// lists them as text.
+    /// templates and skill bundles; picking one inserts `:name ` into the input.
+    /// The default lists them as text.
     fn begin_command_selector(&mut self) {
         // `discover_commands` always returns hrdr's built-ins (`:commit`,
         // `:release`, `:review`) even with no command files on disk, so the list
         // is never empty — no "no commands yet" fallback needed here.
-        let commands = crate::discover_commands(&self.cwd(), hrdr_agent::ProjectInstructions::Load);
-        let mut s = format!(
-            "{} commands (invoke with :name [arguments]):",
-            commands.len()
+        let cwd = self.cwd();
+        let entries = crate::prompt_entries(
+            &crate::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load),
+            &crate::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load),
         );
-        for cmd in commands {
-            s.push_str(&format!("\n  :{}", cmd.name));
-            if !cmd.description.is_empty() {
-                s.push_str(&format!(" — {}", cmd.description));
-            }
-            s.push_str(&format!("  [{}]", cmd.source));
+        let mut s = format!(
+            "{} commands and skills (invoke with :name [arguments]):",
+            entries.len()
+        );
+        for entry in entries {
+            s.push_str(&format!("\n  :{} — {}", entry.name, entry.detail()));
+            s.push_str(&format!("  [{}]", entry.source));
         }
         self.info(s);
     }

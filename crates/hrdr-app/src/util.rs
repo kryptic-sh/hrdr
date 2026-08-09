@@ -195,19 +195,20 @@ pub fn prepare_outgoing_tracked(
     cwd: &Path,
     todos: &[hrdr_tools::TodoItem],
 ) -> (String, Vec<PathBuf>) {
-    // A `:command` template may itself carry `@file` / `@agent` mentions — they
-    // get the same expansion below.
+    // A `:command` template or `:skill` body may itself carry `@file` / `@agent`
+    // mentions — they get the same expansion below.
     let expanded;
     let input = if input.trim_start().starts_with(':') {
-        match crate::expand_command(
+        match crate::expand_invocation(
             input,
             &crate::discover_commands(cwd, hrdr_agent::ProjectInstructions::Load),
+            &crate::discover_skills(cwd, hrdr_agent::ProjectInstructions::Load).skills,
         ) {
             Some(prompt) => {
                 expanded = prompt;
                 expanded.as_str()
             }
-            None => input, // not a known command: send verbatim
+            None => input, // not a known command or skill: send verbatim
         }
     } else {
         input

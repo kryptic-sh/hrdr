@@ -1269,10 +1269,11 @@ namespaced names). What it left open:
   it cannot work. `a_symlink_cycle_does_not_hang_discovery` covers the liveness
   half only.
 - **Nothing warns a user whose commands are still in `.hrdr/skills/` or
-  `~/.config/hrdr/skills/`.** Those two paths are deliberately no longer read
-  (they are reserved for the `SKILL.md` bundles the next slice adds), and per
-  the pre-1.0 no-migration rule there is no shim and no bespoke error — the
-  files simply go quiet. The CHANGELOG's Breaking entry is the only notice.
+  `~/.config/hrdr/skills/`.** Those two paths now belong to the `SKILL.md`
+  bundles (see the skills entry below), so a stray `review.md` left there is not
+  a bundle, is not a command, and goes quiet. Per the pre-1.0 no-migration rule
+  there is no shim and no bespoke error; the CHANGELOG's Breaking entry is the
+  only notice.
 - **Older backlog entries still name the pre-rename symbols** — `skill_dirs`,
   `discover_skills`, `skills.rs`, `.hrdr/skills`, `prompt::skills_section` — in
   the review/audit sections above. They were left as written rather than
@@ -1285,6 +1286,66 @@ namespaced names). What it left open:
   the picker, the completion popup and the `command` tool are each covered by
   unit tests, and `commands_picker_inserts_the_invocation` still uses a
   top-level `ship.md`.
+
+## Deferred 2026-08-09 — Agent Skills (`SKILL.md` bundles)
+
+The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
+`skill` tool), `prompt::skills_section`, the always-readable sandbox grant
+(`SandboxPolicy::allow_read`), and the shared `:name` namespace in the frontends
+(`hrdr_app::PromptEntry`). What it left open:
+
+- **`license`, `compatibility` and `metadata` are parsed and preserved, and
+  rendered nowhere.** They are on `Skill` because the format defines them and a
+  bundle round-trip must not drop them, but no surface shows them — not the
+  picker row, not the `skill` tool's output (which would spend tokens on a
+  licence string the model cannot use). Decide a surface before adding one; the
+  parse and its test are already there.
+- **A symlinked skill root is not walked**, same as `discover_commands` and for
+  the same reason (`ignore::WalkBuilder`'s default `follow_links(false)` is what
+  makes a cycle a non-issue). `~/.agents/skills -> ~/dotfiles/skills` therefore
+  contributes nothing. Turning it on is one call if anyone asks.
+- **No per-skill permission model.** opencode gates skills per agent with
+  `permission.skill` patterns (`internal-*: deny`); hrdr's only lever is a
+  profile's `tools:` allow-list dropping `skill` wholesale, which takes the
+  listing with it. Not built because nothing has asked for per-name gating yet.
+- **A duplicate name across roots is resolved silently** — first root in
+  precedence order wins, no notice. opencode logs a warning. The `/commands`
+  picker only marks a skill shadowed by a _command_, not one shadowed by a
+  higher-precedence skill.
+- **hrdr ships no built-in skills**, only built-in commands. Deliberate: a
+  built-in belongs in `src/templates/commands/` where it is one file and no
+  directory bundle.
+- **A jailed agent holds no `skill` tool today, so the always-readable grant
+  only helps it `read` a `SKILL.md` by path.** `ToolRegistry::cap_to_jail_set`
+  caps jail to `JAIL_TOOLS` (`read`/`grep`/`find`/`ls`/`tree`), which excludes
+  `command` and now `skill` alike, and the prompt listing is gated on the tool —
+  so the "listing it cannot open" the grant was asked for cannot arise while
+  that cap stands. The grant is still the right shape (it is what makes the tool
+  addable to the jail set a one-line change, and what lets a jailed agent open a
+  bundle a user names), but the decision to leave `skill` out of `JAIL_TOOLS` is
+  worth revisiting deliberately rather than by default.
+- **`prepare_outgoing_tracked` re-walks both command and skill roots on every
+  submit** (`crates/hrdr-app/src/util.rs`), on top of the cached copies the TUI
+  already holds for the popup. That is the pre-existing command behaviour
+  extended, not a regression, and it has not been measured.
+
+Coverage gaps, stated plainly:
+
+- **Not tested: the `$CODEX_HOME` override and the user-scope roots.** Every
+  discovery test uses project scopes under a `tempfile::tempdir`, because
+  `$HOME` is one sandboxed directory shared by all tests in a process and a real
+  bundle planted there would leak into other tests' discovery. The jail-read
+  test (`a_jailed_agent_may_read_the_user_skill_roots`) creates only an empty
+  `~/.claude/skills` directory for that reason.
+- **Not tested: `MAX_SKILL_FILE_BYTES` and `MAX_SKILLS_TOTAL_BYTES`.** Only the
+  file-count cap (`MAX_SKILLS`) has a test.
+- **Not covered end-to-end: the picker's "invalid skill" row.** Its construction
+  and text are unit-tested in `hrdr-app`
+  (`entries_mark_shadowed_and_invalid_skills`), but no TUI e2e renders one.
+- **Not reviewed: how a very long `SKILL.md` behaves in practice.** Discovery
+  refuses a file over `MAX_SKILL_FILE_BYTES` and the tool truncates at
+  `SKILL_OUTPUT_MAX_BYTES` with the usual spill-to-file, both untested for
+  skills specifically.
 
 ## Top of the list
 

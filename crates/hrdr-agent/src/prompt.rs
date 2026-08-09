@@ -277,6 +277,9 @@ pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
 // same commands. See `commands_section`.
 pub const SECTION_MEMORY: &str = "memory";
 pub const SECTION_COMMANDS: &str = "commands";
+// The skill listing, the same shape as the command one and next to it: names +
+// one-line descriptions of what the `skill` tool can load. See `skills_section`.
+pub const SECTION_SKILLS: &str = "skills";
 pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
 // The project's verification gate — what "done" means here, in commands. Its own
@@ -461,17 +464,48 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLim
     format!("\n\nEnvironment:\n{}", lines.join("\n"))
 }
 
-/// Max bytes the command listing may spend. Names are never dropped (a name the
-/// model cannot see is a command it cannot load); descriptions are what gives, tail
-/// first, once the budget is gone. Generous next to a real setup — the
-/// built-ins list in well under 1 KiB — so this only bites on a directory full of
-/// commands, where names-only is exactly the right degradation.
-const COMMANDS_SECTION_MAX_BYTES: usize = 4 * 1024;
+/// Max bytes a `name — description` listing (commands, skills) may spend. Names
+/// are never dropped (a name the model cannot see is a procedure it cannot
+/// load); descriptions are what gives, tail first, once the budget is gone.
+/// Generous next to a real setup — the built-in commands list in well under
+/// 1 KiB — so this only bites on a directory full of them, where names-only is
+/// exactly the right degradation.
+const LISTING_SECTION_MAX_BYTES: usize = 4 * 1024;
 
-/// Longest description rendered per command; longer ones are cut at a word
-/// boundary. A command file may carry a paragraph in `description:`, and the
-/// listing is a menu, not the content.
-const COMMAND_DESCRIPTION_MAX_CHARS: usize = 120;
+/// Longest description rendered per listed entry; longer ones are cut at a word
+/// boundary. A command or skill file may carry a paragraph in `description:`,
+/// and the listing is a menu, not the content.
+const LISTING_DESCRIPTION_MAX_CHARS: usize = 120;
+
+/// Render one `name — description` listing under `header`, within
+/// [`LISTING_SECTION_MAX_BYTES`]. Shared by [`commands_section`] and
+/// [`skills_section`] so the two menus degrade identically: every name survives,
+/// descriptions are trimmed to [`LISTING_DESCRIPTION_MAX_CHARS`] and then
+/// dropped tail-first once the budget is spent.
+fn name_description_listing<'a>(
+    header: &str,
+    entries: impl Iterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut out = String::from(header);
+    let mut budget = LISTING_SECTION_MAX_BYTES.saturating_sub(header.len());
+    for (name, description) in entries {
+        let desc = truncate_words(description.trim(), LISTING_DESCRIPTION_MAX_CHARS);
+        let full = if desc.is_empty() {
+            format!("\n- {name}")
+        } else {
+            format!("\n- {name} — {desc}")
+        };
+        // Names always; the description is what the budget buys.
+        let line = if full.len() <= budget {
+            full
+        } else {
+            format!("\n- {name}")
+        };
+        budget = budget.saturating_sub(line.len());
+        out.push_str(&line);
+    }
+    out
+}
 
 /// The command listing — what the `command` tool can load, as `name — description`
 /// lines. Bodies are never inlined: that is the whole point of the tool (pay for
@@ -515,25 +549,40 @@ pub fn commands_section(tools: &ToolRegistry, commands: &[crate::Command]) -> St
                   project, or hrdr. Load one with the `command` tool (by name) when the task matches \
                   its description, and follow it; that is how the user wants that job done. The \
                   bodies are not here — the tool returns them.\n";
-    let mut out = String::from(header);
-    let mut budget = COMMANDS_SECTION_MAX_BYTES.saturating_sub(header.len());
-    for command in commands {
-        let desc = truncate_words(command.description.trim(), COMMAND_DESCRIPTION_MAX_CHARS);
-        let full = if desc.is_empty() {
-            format!("\n- {}", command.name)
-        } else {
-            format!("\n- {} — {}", command.name, desc)
-        };
-        // Names always; the description is what the budget buys.
-        let line = if full.len() <= budget {
-            full
-        } else {
-            format!("\n- {}", command.name)
-        };
-        budget = budget.saturating_sub(line.len());
-        out.push_str(&line);
+    name_description_listing(
+        header,
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.description.as_str())),
+    )
+}
+
+/// The skill listing — what the `skill` tool can load, as `name — description`
+/// lines, in the same shape and with the same budget as [`commands_section`].
+///
+/// Empty — and so dropped by [`SystemPrompt::push`] — when there are no skills or
+/// when this agent has no `skill` tool.
+///
+/// Carries **no paths**, for the same reason the command listing does not: a
+/// bundle's absolute directory is per-machine noise in a section every agent
+/// shares, and it would push uncacheable bytes into the shared prefix. The
+/// `skill` tool's own result names the base directory, where it costs nothing
+/// shared and is exactly where relative paths need resolving.
+pub fn skills_section(tools: &ToolRegistry, skills: &[crate::Skill]) -> String {
+    if skills.is_empty() || !tools.defs().iter().any(|d| d.function.name == "skill") {
+        return String::new();
     }
-    out
+    let header = "\n\nSkills — procedure bundles (an Agent Skill: a `SKILL.md` plus the scripts, \
+                  references and assets beside it) installed by the user or this project. Load one \
+                  with the `skill` tool (by name) when the task matches its description, and follow \
+                  it. The bodies are not here — the tool returns them, along with the base \
+                  directory the bundle's own relative paths resolve against.\n";
+    name_description_listing(
+        header,
+        skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str())),
+    )
 }
 
 /// `text` cut to at most `max` chars, at a word boundary, with an ellipsis when
@@ -1467,9 +1516,10 @@ mod tests {
         // — which `with_defaults` only registers when one is on PATH, and a machine
         // without one must not silently pass a `shell` mention. Named with the
         // capability they carry, since this side of the registry cannot ask them.
-        let also_known: [(&str, bool); 5] = [
+        let also_known: [(&str, bool); 6] = [
             ("models", true),
             ("command", true),
+            ("skill", true),
             // `shell` counts as available to a read-only agent: it IS in that tool
             // set (the sandbox is what makes the agent read-only, not the absence of
             // a command line), so a prompt line naming it is safe for everyone.
@@ -3674,13 +3724,13 @@ mod tests {
     /// only costs it a guess.
     #[test]
     fn commands_section_keeps_every_name_when_the_budget_runs_out() {
-        let long = "d".repeat(COMMAND_DESCRIPTION_MAX_CHARS);
+        let long = "d".repeat(LISTING_DESCRIPTION_MAX_CHARS);
         let commands: Vec<crate::Command> = (0..200)
             .map(|i| test_command(&format!("command{i:03}"), &long))
             .collect();
         let s = commands_section(&tools_with_command(), &commands);
         assert!(
-            s.len() < COMMANDS_SECTION_MAX_BYTES * 2,
+            s.len() < LISTING_SECTION_MAX_BYTES * 2,
             "the listing stays bounded: {} bytes",
             s.len()
         );
@@ -3755,6 +3805,82 @@ mod tests {
         assert!(!line.contains('\n'));
         assert!(says(line, "line one line two"), "flattened: {line}");
         assert!(line.ends_with('…'), "trimmed with an ellipsis: {line}");
-        assert!(line.chars().count() <= COMMAND_DESCRIPTION_MAX_CHARS + 20);
+        assert!(line.chars().count() <= LISTING_DESCRIPTION_MAX_CHARS + 20);
+    }
+
+    /// A registry that has the `skill` tool — what gates the skill listing.
+    fn tools_with_skill() -> ToolRegistry {
+        let mut tools = ToolRegistry::with_defaults();
+        tools.register(std::sync::Arc::new(crate::skills::SkillTool {
+            skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }));
+        tools
+    }
+
+    fn test_skill(name: &str, description: &str) -> crate::Skill {
+        crate::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: "THE BODY".to_string(),
+            source: "~/secret/place".to_string(),
+            base_dir: std::path::PathBuf::from("/secret/place/skills").join(name),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// The skill listing is a menu too: names and descriptions, no bodies and no
+    /// paths — the base directory travels with the tool's result, where it is
+    /// actually needed and does not split the shared cache prefix.
+    #[test]
+    fn skills_section_lists_names_and_descriptions_only() {
+        let skills = [test_skill("pdf-fill", "fill in a PDF form")];
+        let s = skills_section(&tools_with_skill(), &skills);
+        assert!(s.starts_with("\n\nSkills"), "own separator + header: {s:?}");
+        assert!(says(&s, "`skill` tool"), "names the tool that loads one");
+        assert!(s.contains("\n- pdf-fill — fill in a PDF form"));
+        assert!(!says(&s, "THE BODY"), "bodies are never inlined: {s}");
+        assert!(!says(&s, "secret/place"), "no paths: {s}");
+    }
+
+    /// No skills, or no `skill` tool, means no section — the second case being the
+    /// one that matters: a profile whose `tools:` allow-list drops `skill` must
+    /// not be handed a menu it cannot order from.
+    #[test]
+    fn skills_section_is_empty_without_skills_or_without_the_tool() {
+        assert!(skills_section(&tools_with_skill(), &[]).is_empty());
+        let skills = [test_skill("pdf-fill", "fill in a PDF form")];
+        assert!(
+            skills_section(&ToolRegistry::with_defaults(), &skills).is_empty(),
+            "the default registry has no `skill` tool, so nothing may be listed"
+        );
+    }
+
+    /// Same degradation as the command listing, because both go through
+    /// `name_description_listing`: every name survives a blown budget, the
+    /// descriptions are what gives.
+    #[test]
+    fn skills_section_keeps_every_name_when_the_budget_runs_out() {
+        let long = "d".repeat(LISTING_DESCRIPTION_MAX_CHARS);
+        let skills: Vec<crate::Skill> = (0..200)
+            .map(|i| test_skill(&format!("skill{i:03}"), &long))
+            .collect();
+        let s = skills_section(&tools_with_skill(), &skills);
+        assert!(
+            s.len() < LISTING_SECTION_MAX_BYTES * 2,
+            "the listing stays bounded: {} bytes",
+            s.len()
+        );
+        for i in 0..200 {
+            assert!(
+                s.contains(&format!("\n- skill{i:03}")),
+                "every name survives; skill{i:03} did not"
+            );
+        }
+        assert!(
+            !s.contains(&format!("skill199 — {long}")),
+            "the tail loses its description, not its name"
+        );
     }
 }

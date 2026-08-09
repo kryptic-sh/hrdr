@@ -229,6 +229,71 @@ same name overrides them.
 Review the working-tree diff. Focus on: $ARGUMENTS
 ```
 
+### Skills
+
+A skill is an **Agent Skill bundle**: a directory holding a `SKILL.md` plus
+whatever it references — `references/`, `scripts/`, `assets/`, anything. hrdr
+reads the same bundles Claude Code, Codex and opencode do, so one directory
+serves every harness; nothing here is an hrdr dialect.
+
+Bundles are discovered from `.hrdr/skills/`, `.agents/skills/`,
+`.claude/skills/` and `.codex/skills/` in the project, then
+`~/.config/hrdr/skills/`, `~/.agents/skills/`, `~/.claude/skills/` and
+`$CODEX_HOME/skills/` (default `~/.codex/skills/`) — first match by name wins.
+Each root is walked recursively, so a grouping directory is fine
+(`skills/docs/pdf-fill/SKILL.md`); the skill's name always comes from the
+directory immediately containing `SKILL.md`.
+
+`SKILL.md` must open with YAML frontmatter:
+
+- `name` (**required**) — 1–64 characters, lowercase alphanumerics with single
+  hyphen separators (`^[a-z0-9]+(-[a-z0-9]+)*$`), and it must equal the
+  containing directory's name
+- `description` (**required**) — 1–1024 characters; this is what the model reads
+  to decide whether the skill applies, so make it specific
+- `license`, `compatibility`, `metadata` (optional) — recognized and preserved
+- anything else is ignored, so a bundle carrying another harness's fields still
+  loads
+
+A bundle that breaks a rule is **skipped, not repaired** — `/commands` shows it
+with the reason, because a skill that silently does not appear is the format's
+usual complaint.
+
+**Skills take no arguments.** There is no `$ARGUMENTS` substitution and no
+`args:` frontmatter; text typed after `:name` is appended to the body as extra
+context. Both invocation paths — yours and the model's — append the bundle's
+base directory, so a body that says `scripts/fill.py` resolves against the
+bundle rather than the working directory. A bundled script has no privilege of
+its own: running one is an ordinary `shell` call under whatever the sandbox
+already permits.
+
+**The model can invoke a skill too**, exactly like a command: every agent's
+system prompt lists the available skills by name and one-line description, and a
+read-only `skill` tool returns the named bundle's instructions. The skill roots
+stay readable in **every** sandbox mode, `jail` included — a listing whose
+entries the agent is then refused permission to open would be worse than none.
+
+Commands and skills share one `:name` namespace and one `/commands` picker, and
+**a command wins a collision**: `:name` runs the command, and the shadowed skill
+is marked as such in the picker (the model can still load it with the `skill`
+tool).
+
+```text
+# .claude/skills/git-release/SKILL.md
+---
+name: git-release
+description: Draft release notes and propose a version bump
+license: MIT
+---
+
+## What I do
+
+- Draft release notes from merged PRs
+- Propose a version bump
+
+Run `scripts/notes.sh` for the changelog draft.
+```
+
 ### Keybindings
 
 | Key                       | Action                                                                                                   |

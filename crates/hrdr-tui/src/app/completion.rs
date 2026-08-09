@@ -2,7 +2,7 @@
 //! sharing one popup.
 
 use hrdr_app::{
-    active_file_token, arg_completions, command_arg_offset, command_completions, command_match_key,
+    active_file_token, arg_completions, command_arg_offset, command_match_key, prompt_completions,
     rank_agent_matches, rank_file_matches, resolve_alias, slash_completions,
 };
 
@@ -27,12 +27,12 @@ impl super::App {
                     .collect(),
             });
         }
-        let commands = command_completions(&content, &self.commands);
-        if !commands.is_empty() {
+        let invocations = prompt_completions(&content, &self.commands, &self.skills.skills);
+        if !invocations.is_empty() {
             return Some(Completions {
                 kind: CompletionKind::Command,
                 anchor_col: 0,
-                items: commands,
+                items: invocations,
             });
         }
         // Argument completion: "/cmd partial" / ":command partial" — enum

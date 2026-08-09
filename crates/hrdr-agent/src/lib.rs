@@ -44,6 +44,8 @@ mod commands;
 pub use commands::{
     Command, builtin_commands, command_match_key, discover_commands, expand_body, expand_command,
 };
+mod skills;
+pub use skills::{DiscoveredSkills, InvalidSkill, Skill, discover_skills, expand_invocation};
 mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod resolve;
@@ -1131,6 +1133,9 @@ pub struct Agent {
     /// on `clear`/`set_cwd` so a project switch changes both the prompt listing and
     /// what the tool serves — one cell, so they cannot disagree.
     commands: commands::SharedCommands,
+    /// The skill bundles this agent can load, shared with the `skill` tool — the
+    /// same one-cell arrangement as `commands`, re-discovered on `clear`/`set_cwd`.
+    skills: skills::SharedSkills,
     /// `JoinHandle`s for all running background sub-agent tasks (`task` with
     /// `background: true`), keyed by task id. Stored so [`Self::clear`] can
     /// abort them and so callers can query the live count.
@@ -1347,6 +1352,7 @@ fn build_system_prompt_sections(
     docs: &prompt::AgentDocs,
     memory: &MemoryIndex,
     commands: &[Command],
+    skills: &[Skill],
     persona: Option<&str>,
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
@@ -1356,7 +1362,7 @@ fn build_system_prompt_sections(
     use prompt::{
         SECTION_BASE, SECTION_COMMANDS, SECTION_ENVIRONMENT, SECTION_GATE,
         SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY, SECTION_MEMORY, SECTION_PERSONA,
-        SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
+        SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX, SECTION_SKILLS,
     };
     let mut p = prompt::SystemPrompt::default();
     // 1. identical for every agent hrdr runs
@@ -1402,6 +1408,10 @@ fn build_system_prompt_sections(
     // on that tool being registered (see `prompt::commands_section`), and above the
     // persona because every profile working this project sees the same commands.
     p.push(SECTION_COMMANDS, prompt::commands_section(tools, commands));
+    // …and the skill bundles, immediately after and on the same terms: gated on the
+    // `skill` tool, names and one-liners only, shared by every profile in this
+    // project.
+    p.push(SECTION_SKILLS, prompt::skills_section(tools, skills));
     // 8-10. per-agent, then the volatile tail. The sandbox roots name this agent's
     // cwd, so they sit below the environment block — the cache split is taken
     // before `SECTION_ENVIRONMENT`, so appending here costs the prefix nothing.
@@ -1429,6 +1439,7 @@ fn build_system_prompt(
     docs: &prompt::AgentDocs,
     memory: &MemoryIndex,
     commands: &[Command],
+    skills: &[Skill],
     persona: Option<&str>,
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
@@ -1436,7 +1447,7 @@ fn build_system_prompt(
     gate: &hrdr_tools::Gate,
 ) -> Result<(String, Option<usize>)> {
     let p = build_system_prompt_sections(
-        tools, cwd, docs, memory, commands, persona, delegated, sandbox, limits, gate,
+        tools, cwd, docs, memory, commands, skills, persona, delegated, sandbox, limits, gate,
     )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
@@ -1671,6 +1682,16 @@ impl Agent {
         tools.register(Arc::new(commands::CommandTool {
             commands: Arc::clone(&commands),
         }));
+        // Skills: the same arrangement for the `SKILL.md` bundles — one shared cell
+        // behind both the prompt listing and the `skill` tool, and read-only, so a
+        // read-only explorer keeps it. The invalid bundles discovery reports are for
+        // the frontends' picker; the agent carries only what it can actually load.
+        let skills: skills::SharedSkills = Arc::new(Mutex::new(
+            skills::discover_skills(&config.cwd, project_instructions).skills,
+        ));
+        tools.register(Arc::new(skills::SkillTool {
+            skills: Arc::clone(&skills),
+        }));
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
         // wins; else, for a read-only agent, the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
@@ -1728,6 +1749,13 @@ impl Agent {
         // silently remove the marking from the one mode whose whole premise is that
         // the content is hostile.
         sandbox.wrap_tool_results |= config.wrap_tool_results;
+        // The skill roots stay readable in EVERY mode, jail included. Jail is the
+        // only mode that confines reads, and there a listing the agent cannot open
+        // is worse than no listing at all: it names procedures, then refuses them.
+        // Exactly the roots `discover_skills` walks (one definition, so the grant
+        // cannot drift from the discovery), and read access only — a bundled
+        // `scripts/` gets no execution privilege from this.
+        sandbox.allow_read(skills::skill_dirs(&config.cwd, project_instructions));
         // No git lock and no network confinement, for anybody. An agent working in
         // the user's project — main or delegated — is assumed to have authority
         // over that project: it commits, it pushes, it fetches dependencies. The
@@ -1829,6 +1857,7 @@ impl Agent {
             &project_docs,
             &memory,
             &commands.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            &skills.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             config.agent_prompt.as_deref(),
             config.delegated,
             &ctx.sandbox,
@@ -1972,6 +2001,7 @@ impl Agent {
             memory_dir: config.memory_dir,
             agent_names,
             commands,
+            skills,
             bg_handles,
             cost_total,
             cost_partial,
@@ -2142,6 +2172,7 @@ impl Agent {
             &self.project_docs,
             &memory,
             &self.commands_snapshot(),
+            &self.skills_snapshot(),
             self.agent_prompt.as_deref(),
             self.delegated,
             &self.ctx.sandbox,
@@ -2163,6 +2194,14 @@ impl Agent {
     /// A copy of the shared command set, for a prompt rebuild.
     fn commands_snapshot(&self) -> Vec<Command> {
         self.commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A copy of the shared skill set, for a prompt rebuild.
+    fn skills_snapshot(&self) -> Vec<Skill> {
+        self.skills
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -2208,6 +2247,13 @@ impl Agent {
             .commands
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = commands.clone();
+        // Skills likewise, through their own cell — a project switch that changes
+        // the listing must change what the `skill` tool serves in the same step.
+        let skills = discover_skills(&self.ctx.cwd, self.project_instructions).skills;
+        *self
+            .skills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills.clone();
         // A different project has a different gate, and the ledger must move with
         // the prompt — measuring a new project against the old project's CI is
         // exactly the kind of confident wrong answer the gate exists to remove.
@@ -2223,6 +2269,7 @@ impl Agent {
             &self.project_docs,
             &memory,
             &commands,
+            &skills,
             self.agent_prompt.as_deref(),
             self.delegated,
             &self.ctx.sandbox,
@@ -3411,6 +3458,51 @@ mod tests {
                 .any(|n| n.contains("needs a read-only agent")),
             "nothing was declined for a read-only agent"
         );
+    }
+
+    /// **A jailed agent can still read its skill bundles.** Jail is the one mode
+    /// that confines reads, and the user's skill roots sit outside the working
+    /// tree — so without the grant in `Agent::new` a jailed agent would be shown a
+    /// `Skills` listing whose every entry it is refused permission to open.
+    ///
+    /// The root here is the user scope (`~/.claude/skills`): a project root is
+    /// under the cwd and would pass whether or not the grant exists, which is the
+    /// version of this test that proves nothing.
+    #[tokio::test]
+    async fn a_jailed_agent_may_read_the_user_skill_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::agents_dir::home_dir().expect("the test harness sandboxes $HOME");
+        let root = home.join(".claude").join("skills");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let jailed = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::Jail,
+            read_only: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(jailed.ctx.sandbox.mode, hrdr_tools::SandboxMode::Jail);
+
+        let bundle = root.join("probe").join("SKILL.md");
+        jailed
+            .ctx
+            .sandbox
+            .check_read(&hrdr_tools::canonicalize_nearest(&bundle), &bundle)
+            .expect("the skill root is readable in jail");
+        // The grant is exactly the skill roots, not the home directory around them:
+        // a sibling under `~/.claude` is still refused.
+        let sibling = home.join(".claude").join("settings.json");
+        assert!(
+            jailed
+                .ctx
+                .sandbox
+                .check_read(&hrdr_tools::canonicalize_nearest(&sibling), &sibling)
+                .is_err(),
+            "only the skill roots are granted"
+        );
+        // Read only: jail still writes nowhere, the skill root included.
+        assert!(jailed.ctx.sandbox.writable_roots.is_empty());
     }
 
     /// **A declared mode is absolute — it beats `--yolo`.**
@@ -5566,15 +5658,29 @@ mod tests {
         use super::prompt::{
             SECTION_BASE, SECTION_COMMANDS, SECTION_ENVIRONMENT, SECTION_GATE,
             SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY, SECTION_PERSONA,
-            SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
+            SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX, SECTION_SKILLS,
         };
         let mut tools = hrdr_tools::ToolRegistry::with_defaults();
-        // The `command` tool is registered by `Agent::new`, not by the defaults, and
-        // the listing section is gated on it — so the order assertion below only
-        // sees `SECTION_COMMANDS` with it present.
+        // The `command` and `skill` tools are registered by `Agent::new`, not by the
+        // defaults, and each listing section is gated on its tool — so the order
+        // assertion below only sees `SECTION_COMMANDS` / `SECTION_SKILLS` with them
+        // present.
         tools.register(std::sync::Arc::new(super::commands::CommandTool {
             commands: std::sync::Arc::new(std::sync::Mutex::new(super::builtin_commands())),
         }));
+        tools.register(std::sync::Arc::new(super::skills::SkillTool {
+            skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }));
+        let skills = vec![super::Skill {
+            name: "pdf-fill".to_string(),
+            description: "fill in a PDF form".to_string(),
+            body: "Body.".to_string(),
+            source: "test".to_string(),
+            base_dir: std::path::PathBuf::from("/tmp/skills/pdf-fill"),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+        }];
         // A non-empty gate, so its section is present and its POSITION is what
         // this test pins. An empty one would let the section move anywhere.
         let gate = hrdr_tools::Gate {
@@ -5599,6 +5705,7 @@ mod tests {
                     project: Some("project memory".to_string()),
                 },
                 &super::builtin_commands(),
+                &skills,
                 Some("the persona"),
                 false,
                 sandbox,
@@ -5645,6 +5752,8 @@ mod tests {
             // names + one-liners of what `command` can load: project-scoped, so
             // above the persona and out of the volatile tail
             SECTION_COMMANDS,
+            // the same, for what `skill` can load
+            SECTION_SKILLS,
             SECTION_PERSONA,
             SECTION_ENVIRONMENT,
             // what "done" means here, in commands — a requirement, so it gets
@@ -5677,6 +5786,7 @@ mod tests {
             std::path::Path::new("/tmp/proj"),
             &super::prompt::AgentDocs::default(),
             &super::MemoryIndex::default(),
+            &[],
             &[],
             None,
             false,
@@ -5711,6 +5821,7 @@ mod tests {
             std::path::Path::new("/tmp/proj"),
             &super::prompt::AgentDocs::default(),
             &super::MemoryIndex::default(),
+            &[],
             &[],
             None,
             false,
@@ -6225,7 +6336,12 @@ mod tests {
             "command", "fetch", "models", "read", "search",
             // A shell, sandbox-confined to reads — `git log`/`diff`/`blame`, a
             // linter, a test all run here.
-            "shell", "todo",
+            "shell",
+            // `skill` is here on the same terms as `command`: it returns a
+            // bundle's instructions and writes nothing. A bundled `scripts/` has
+            // no privilege of its own — running one is a `shell` call, bounded by
+            // this same set and the sandbox.
+            "skill", "todo",
         ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);

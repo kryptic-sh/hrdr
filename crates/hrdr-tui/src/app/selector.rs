@@ -6,10 +6,10 @@
 
 use hrdr_agent::{ModelChoice, filter_model_choices, model_choice_haystack};
 use hrdr_app::{
-    Command, EffortChoice, LoginProviderChoice, SessionMeta, ThemeChoice, command_haystack,
-    effort_choice_haystack, filter_commands, filter_effort_choices, filter_login_providers,
-    filter_sessions, filter_themes, login_provider_haystack, session_haystack,
-    theme_choice_haystack,
+    EffortChoice, LoginProviderChoice, PromptEntry, SessionMeta, ThemeChoice,
+    effort_choice_haystack, filter_effort_choices, filter_login_providers, filter_prompt_entries,
+    filter_sessions, filter_themes, login_provider_haystack, prompt_entry_haystack,
+    session_haystack, theme_choice_haystack,
 };
 
 pub(crate) struct Selector<T> {
@@ -181,9 +181,11 @@ pub(crate) fn effort_selector(choices: Vec<EffortChoice>) -> EffortSelector {
     Selector::new(choices, effort_choice_haystack, filter_effort_choices)
 }
 
-pub(crate) type CommandSelector = Selector<Command>;
-pub(crate) fn command_selector(commands: Vec<Command>) -> CommandSelector {
-    Selector::new(commands, command_haystack, filter_commands)
+/// The `/commands` picker: both halves of the `:name` namespace, commands and
+/// skills, as one filterable list (see [`hrdr_app::PromptEntry`]).
+pub(crate) type CommandSelector = Selector<PromptEntry>;
+pub(crate) fn command_selector(entries: Vec<PromptEntry>) -> CommandSelector {
+    Selector::new(entries, prompt_entry_haystack, filter_prompt_entries)
 }
 
 pub(crate) type LoginProviderSelector = Selector<LoginProviderChoice>;

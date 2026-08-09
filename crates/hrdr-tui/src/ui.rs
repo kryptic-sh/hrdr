@@ -441,27 +441,25 @@ fn draw_model_selector(
 }
 
 /// The `/commands` picker modal: a search line, a hint, and a two-column list
-/// (`:name` · description [source]); Enter inserts the invocation into the
-/// input. Same chrome as the other pickers.
+/// (`:name` · what it is and its description); Enter inserts the invocation into
+/// the input. Same chrome as the other pickers. Rows are both halves of the
+/// `:name` namespace — commands and skills, the shadowed and invalid skills
+/// included and labelled by
+/// [`PromptEntry::detail`](hrdr_app::PromptEntry::detail).
 fn draw_command_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::CommandSelector) {
     let Some(inner) = modal_frame(f, theme, 92, 24, 3) else {
         return;
     };
     let rows: Vec<PickRow> = sel
         .rows()
-        .map(|sk| PickRow {
-            left: format!(":{}", sk.name),
-            right: if sk.description.is_empty() {
-                sk.source.clone()
-            } else {
-                sk.description.clone()
-            },
+        .map(|entry| PickRow {
+            left: format!(":{}", entry.name),
+            right: entry.detail(),
         })
         .collect();
     let hint = format!(
-        "{} command{} · ↑↓ select · Enter insert · Esc cancel",
+        "{} commands & skills · ↑↓ select · Enter insert · Esc cancel",
         rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
     );
     draw_pick_body(
         f,
@@ -470,7 +468,7 @@ fn draw_command_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::Command
         None,
         &sel.filter,
         hint,
-        "no commands match",
+        "no commands or skills match",
         sel.selected,
         &rows,
         (2, 3),
@@ -3368,6 +3366,7 @@ fn tool_action(name: &str) -> Option<(&'static str, &'static str, &'static str, 
         // "loaded", not "used": `shell`'s own noun is also `command`, and the
         // verb is all that keeps "ran 2 commands" and this apart in one summary.
         "command" => Some(("loaded", "loading", "command", false)),
+        "skill" => Some(("loaded", "loading", "skill", false)),
         "grep" | "find" => Some(("searched", "searching", "pattern", true)),
         "ls" | "tree" => Some(("listed", "listing", "directory", false)),
         _ => None,

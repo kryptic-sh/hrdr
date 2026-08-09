@@ -379,15 +379,25 @@ pub(crate) fn scalar_to_string(v: &serde_yaml_ng::Value) -> Option<String> {
 ///   (or, when the body has no placeholder, appends it) — free-form input like
 ///   a pasted error or a commit scope isn't split on the first space.
 pub fn expand_command(input: &str, commands: &[Command]) -> Option<String> {
-    let rest = input.trim_start().strip_prefix(':')?;
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let name = parts.next().filter(|n| !n.is_empty())?;
-    let after_name = parts.next().unwrap_or("").trim();
+    let (name, after_name) = split_invocation(input)?;
     let key = command_match_key(name);
     let command = commands
         .iter()
         .find(|c| command_match_key(&c.name) == key)?;
     Some(expand_body(command, after_name))
+}
+
+/// Split a `:name rest…` invocation into its name and the trimmed text after it.
+/// `None` when `input` is not a `:` invocation (or names nothing at all), which
+/// is how a plain message reaches the model untouched.
+///
+/// Shared with [`crate::skills`]: commands and skills answer the same `:name`
+/// namespace, so they must agree on where the name ends.
+pub(crate) fn split_invocation(input: &str) -> Option<(&str, &str)> {
+    let rest = input.trim_start().strip_prefix(':')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().filter(|n| !n.is_empty())?;
+    Some((name, parts.next().unwrap_or("").trim()))
 }
 
 /// Fill `command`'s body from `arguments` — the shared half of [`expand_command`]

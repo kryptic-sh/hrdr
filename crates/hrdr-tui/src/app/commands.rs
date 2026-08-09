@@ -180,10 +180,9 @@ impl super::App {
     /// conversation (`/new`).
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
-        self.commands = hrdr_app::discover_commands(
-            &std::path::PathBuf::from(self.current_cwd()),
-            hrdr_agent::ProjectInstructions::Load,
-        );
+        let cwd = std::path::PathBuf::from(self.current_cwd());
+        self.commands = hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load);
+        self.skills = hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load);
     }
     /// `/find <text>` — search the transcript and jump to the next match
     /// (case-insensitive). No arg cycles to the next match of the current query;
@@ -457,11 +456,13 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // `discover_commands` always returns hrdr's built-ins (`:commit`,
         // `:release`, `:review`) even in a cwd with no command files of its own,
         // so the list is never empty — no "no commands yet" fallback needed here.
-        let commands = hrdr_app::discover_commands(
-            &std::path::PathBuf::from(self.app.current_cwd()),
-            hrdr_agent::ProjectInstructions::Load,
+        // Skills join them: one `:name` namespace, one picker.
+        let cwd = std::path::PathBuf::from(self.app.current_cwd());
+        let entries = hrdr_app::prompt_entries(
+            &hrdr_app::discover_commands(&cwd, hrdr_agent::ProjectInstructions::Load),
+            &hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load),
         );
-        self.app.command_selector = Some(super::command_selector(commands));
+        self.app.command_selector = Some(super::command_selector(entries));
     }
     fn begin_model_selector(&mut self) {
         let choices = hrdr_agent::model_choices(

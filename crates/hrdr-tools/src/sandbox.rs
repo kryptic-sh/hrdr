@@ -227,6 +227,29 @@ impl SandboxPolicy {
         }
     }
 
+    /// Grant read access to `roots` on top of what [`for_agent`](Self::for_agent)
+    /// derived, canonicalized and deduped the same way (a root already covered by
+    /// an existing one is dropped). Roots that are not directories are skipped —
+    /// a location nobody has created is not worth a line in the prompt's
+    /// "you may read only under" list.
+    ///
+    /// This exists for directories that must stay readable **in jail**, the one
+    /// mode that confines reads: hrdr grants the Agent Skill roots here, because a
+    /// jailed agent listing procedures it is then refused permission to open is
+    /// worse off than one that was told nothing. It widens reads only — writes and
+    /// execution are untouched.
+    ///
+    /// A no-op under [`SandboxMode::None`], which reads everything already and
+    /// whose policy stays byte-identical to [`unconfined`](Self::unconfined).
+    pub fn allow_read(&mut self, roots: Vec<PathBuf>) {
+        if self.mode == SandboxMode::None {
+            return;
+        }
+        let mut merged = std::mem::take(&mut self.readable_roots);
+        merged.extend(roots.into_iter().filter(|p| p.is_dir()));
+        self.readable_roots = canonical_roots(merged);
+    }
+
     /// The writable roots worth naming to a human or a model: everything except
     /// the package-manager caches (see [`cache_roots`](Self::cache_roots)).
     ///
@@ -1956,6 +1979,45 @@ mod tests {
         check_read(&write_mode, Path::new("/etc/passwd")).unwrap();
         check_read(&SandboxPolicy::unconfined(), Path::new("/etc/passwd")).unwrap();
         check_write(&SandboxPolicy::unconfined(), Path::new("/etc/passwd")).unwrap();
+    }
+
+    /// `allow_read` widens jail's read boundary and nothing else — the case it
+    /// exists for is hrdr's Agent Skill roots, which sit outside the working tree
+    /// and must stay readable in the one mode that confines reads.
+    #[test]
+    fn allow_read_widens_jail_reads_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let skills = elsewhere.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let missing = elsewhere.path().join("never-created");
+
+        let mut policy = SandboxPolicy::for_agent(SandboxMode::Jail, dir.path(), &[]);
+        // Refused before the grant — otherwise this test would pass on a policy
+        // that never read the roots at all.
+        check_read(&policy, &skills.join("ship/SKILL.md")).unwrap_err();
+
+        policy.allow_read(vec![skills.clone(), missing.clone()]);
+        check_read(&policy, &skills.join("ship/SKILL.md")).unwrap();
+        // A root nobody created is not carried, so it never reaches the prompt's
+        // "you may read only under" list.
+        assert!(
+            !policy
+                .readable_roots
+                .iter()
+                .any(|r| r == &canonicalize_nearest(&missing)),
+            "{:?}",
+            policy.readable_roots
+        );
+        // Reads only: the grant opens no write anywhere, jail's roots included.
+        check_write(&policy, &skills.join("x")).unwrap_err();
+        check_write(&policy, &dir.path().join("x")).unwrap_err();
+
+        // Unconfined stays byte-identical to `unconfined()` — mode None answers
+        // every question with "allowed" and must carry no roots to render.
+        let mut none = SandboxPolicy::for_agent(SandboxMode::None, dir.path(), &[]);
+        none.allow_read(vec![skills]);
+        assert!(none.readable_roots.is_empty());
     }
 
     #[test]

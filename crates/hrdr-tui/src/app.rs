@@ -562,6 +562,10 @@ pub(crate) struct App {
     /// completion popup (refreshed on cwd change and `/reload`; the send path
     /// re-discovers on its own, so a stale list only affects completion).
     pub(crate) commands: Vec<hrdr_app::Command>,
+    /// Discovered `SKILL.md` bundles for the current cwd — the other half of the
+    /// `:name` namespace, refreshed alongside `commands`. The invalid ones ride
+    /// along because the `/commands` picker shows them with their reason.
+    pub(crate) skills: hrdr_app::DiscoveredSkills,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -870,6 +874,10 @@ impl App {
             browser_login_task: None,
             user_shell: None,
             commands: hrdr_app::discover_commands(
+                &cwd_for_commands,
+                hrdr_agent::ProjectInstructions::Load,
+            ),
+            skills: hrdr_app::discover_skills(
                 &cwd_for_commands,
                 hrdr_agent::ProjectInstructions::Load,
             ),
@@ -2311,6 +2319,7 @@ impl App {
         self.file_index_cwd = None; // force a rebuild for the new directory
         self.arm_file_watcher(&new);
         self.commands = hrdr_app::discover_commands(&new, hrdr_agent::ProjectInstructions::Load);
+        self.skills = hrdr_app::discover_skills(&new, hrdr_agent::ProjectInstructions::Load);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does

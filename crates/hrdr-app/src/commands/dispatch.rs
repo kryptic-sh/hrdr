@@ -1366,7 +1366,7 @@ mod tests {
         assert!(
             host.info_log
                 .iter()
-                .any(|l| l.contains("commands (invoke with :name")),
+                .any(|l| l.contains("commands and skills (invoke with :name")),
             "{:?}",
             host.info_log
         );

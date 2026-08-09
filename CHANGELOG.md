@@ -28,9 +28,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `hrdr_app`'s `filter_skills`/`skill_haystack`/`skill_completions` are
     renamed to their `command` equivalents; `hrdr-agent/src/skills.rs` is now
     `commands.rs` and its built-in templates live in `src/templates/commands/`.
+  - The `/commands` picker and the `:`-completion popup now list commands
+    **and** skills, so `hrdr_app`'s `command_completions`, `command_haystack`
+    and `filter_commands` are replaced by `prompt_completions`,
+    `prompt_entry_haystack` and `filter_prompt_entries`, which work over the
+    combined `PromptEntry` rows.
 
 ### Added
 
+- **Agent Skills — `<name>/SKILL.md` bundles, the format Claude Code, Codex and
+  opencode already read.** A skill is a directory holding a `SKILL.md` plus the
+  files it references (`references/`, `scripts/`, `assets/`), and hrdr now
+  discovers them from `.hrdr/skills/`, `.agents/skills/`, `.claude/skills/` and
+  `.codex/skills/` in the project, then `~/.config/hrdr/skills/`,
+  `~/.agents/skills/`, `~/.claude/skills/` and `$CODEX_HOME/skills/` (default
+  `~/.codex/skills/`), walked recursively so grouping directories work. First
+  match by name wins.
+  - Frontmatter `name` and `description` are **required** and validated the way
+    codex and opencode validate them (`name` is 1–64 chars matching
+    `^[a-z0-9]+(-[a-z0-9]+)*$` and must equal its directory; `description` is
+    1–1024 chars); `license`, `compatibility` and `metadata` are recognized and
+    preserved, and unknown fields are ignored. An invalid bundle is skipped, and
+    the `/commands` picker shows it with the reason.
+  - A new read-only **`skill` tool** returns a bundle's instructions plus its
+    base directory, so relative paths in the body resolve against the bundle;
+    the system prompt gains a `Skills` listing (names and one-liners) gated on
+    that tool. Read-only sub-agents (`explore`, `review`, `plan`) get it.
+  - Skills are user-invocable too: `:name` sends the body (skills take **no**
+    arguments — trailing text is appended, never substituted), and they share
+    the `:`-completion popup and the `/commands` picker with commands. **A
+    command wins a name collision**; the shadowed skill is marked in the picker
+    and stays loadable by the `skill` tool.
+  - The skill roots are readable in **every** sandbox mode, `jail` included, so
+    a confined agent can open what its listing names. Bundled `scripts/` get no
+    special privilege — running one is a `shell` call under the current mode.
+  - Public API:
+    `hrdr_agent::{Skill, DiscoveredSkills, InvalidSkill, discover_skills, expand_invocation}`,
+    `hrdr_tools::SandboxPolicy::allow_read`, and `hrdr_app`'s `PromptEntry` /
+    `prompt_entries` / `prompt_completions`.
 - **Commands are discovered recursively and namespaced by path.**
   `.hrdr/commands/git/commit.md` is `:git/commit`, matching opencode's naming.
   The canonical name uses `/`, and `:` and `.` are accepted as spellings of the

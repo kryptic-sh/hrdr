@@ -8389,6 +8389,72 @@ async fn commands_picker_inserts_the_invocation() {
     );
 }
 
+/// A skill bundle is invocable exactly like a command: it completes in the `:`
+/// popup, it is in the `/commands` picker labelled as a skill, and submitting
+/// `:name` sends the bundle's body — with the base-directory footer, without
+/// which every relative path the body names resolves against the wrong
+/// directory.
+#[tokio::test]
+async fn a_skill_bundle_completes_and_expands_like_a_command() {
+    let mut h = Harness::new(vec![MockReply::Text("filled".to_string())]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    let bundle = cwd.join(".hrdr/skills/pdf-fill");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: pdf-fill\ndescription: fill in a PDF form\n---\nRun scripts/fill.py.",
+    )
+    .unwrap();
+    // The App cache was built before the file existed — refresh it the way
+    // /reload and a cwd change do.
+    h.app.skills = hrdr_app::discover_skills(&cwd, hrdr_agent::ProjectInstructions::Load);
+
+    h.type_str(":pdf");
+    let screen = h.render();
+    assert!(
+        screen.contains(":pdf-fill"),
+        "popup lists the skill:\n{screen}"
+    );
+    assert!(
+        screen.contains("fill in a PDF form"),
+        "popup shows the description:\n{screen}"
+    );
+    for _ in 0..4 {
+        h.press(KeyCode::Backspace);
+    }
+
+    h.submit("/commands").await;
+    let screen = h.render();
+    assert!(
+        screen.contains(":pdf-fill"),
+        "the picker lists it too:\n{screen}"
+    );
+    assert!(
+        screen.contains("skill · fill in a PDF form"),
+        "…marked as a skill, not a command:\n{screen}"
+    );
+    h.press(KeyCode::Esc);
+
+    h.submit(":pdf-fill and use the sample data").await;
+    let user = h
+        .app
+        .state()
+        .messages
+        .iter()
+        .find(|m| m.role == hrdr_agent::MessageRole::User)
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    assert!(user.contains("Run scripts/fill.py."), "{user}");
+    assert!(user.contains("and use the sample data"), "appended: {user}");
+    assert!(
+        user.contains(&format!(
+            "Base directory for this skill: {}",
+            bundle.display()
+        )),
+        "{user}"
+    );
+}
+
 /// A transcript whose cumulative wrapped-row count exceeds `u16::MAX` must not
 /// have its scroll math wrap around: `draw_transcript` keeps that accumulator
 /// in `usize` to avoid overflow, but the cast down to ratatui's `u16`-only
