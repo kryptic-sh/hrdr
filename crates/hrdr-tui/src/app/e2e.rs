@@ -8446,12 +8446,19 @@ async fn a_skill_bundle_completes_and_expands_like_a_command() {
         .unwrap_or_default();
     assert!(user.contains("Run scripts/fill.py."), "{user}");
     assert!(user.contains("and use the sample data"), "appended: {user}");
-    assert!(
-        user.contains(&format!(
-            "Base directory for this skill: {}",
-            bundle.display()
-        )),
-        "{user}"
+    // Compare the footer as a path, not as text: Windows hands a temp dir back
+    // in its 8.3 short form (`C:\Users\RUNNER~1\…`) through one lookup and its
+    // long form through another, so the two spellings of this one directory
+    // differ as strings while naming the same place. Canonicalizing both sides
+    // keeps the assertion's teeth — a footer pointing anywhere else still fails.
+    let footer = user
+        .lines()
+        .find_map(|l| l.strip_prefix("Base directory for this skill: "))
+        .unwrap_or_else(|| panic!("no base-directory footer:\n{user}"));
+    assert_eq!(
+        std::fs::canonicalize(footer).unwrap(),
+        std::fs::canonicalize(&bundle).unwrap(),
+        "the footer names the bundle directory:\n{user}"
     );
 }
 
