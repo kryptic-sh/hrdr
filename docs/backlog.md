@@ -1253,6 +1253,45 @@ live here:
   verbose-gated; the proposed `Command`-variant split and the
   `EntryKind::Notice(_) if !expand_tools` guard are moot.
 
+## Which built-ins should become skills — needs a decision, 2026-08-09
+
+With both mechanisms now shipped, four built-in commands are better as Agent
+Skill bundles, and the rest are not. Assessed against: skills take no arguments,
+skills fire from a description match rather than user intent, and a bundle only
+earns its directory when it has `references/` or `scripts/` to hold.
+
+- **Move to skills: `cli`, `deps`, `ci`, `tickets`.** Each is portable procedure
+  with no session state, and each branches by ecosystem — `deps` over
+  cargo/npm/pnpm/yarn/bun/uv/poetry/go/composer, `ci` over the CI providers,
+  `tickets` over `gh`/`glab`/`acli`. Today the model reads every branch to use
+  one; as bundles they become a thin `SKILL.md` router plus one `references/`
+  file per ecosystem, and `tickets`' search-then-comment dedup wants to be a
+  script rather than prose. `cli` needs a rewrite first to drop its
+  `args: [tool]` (take the tool from the task context or trailing text); the
+  other three declare no args already. Bonus: installed into `~/.agents/skills/`
+  they serve Codex and opencode too.
+- **Stay commands, three distinct reasons.** Arguments that genuinely change the
+  procedure: `review`/`audit` (`low`/`high`), `release`
+  (`patch`/`minor`/`major`), `fix`, `plan`, `commit`. Outward-facing
+  irreversible tail, so the model must never fire it: `release` (tag + push).
+  Scoped to session state rather than to a matching description: `todo`,
+  `commit`, `test`, `work`, `sweep`.
+- **`perf` and `tidy` are the close call.** Both declare no args and would work
+  as skills, but `sweep` orchestrates review + audit + tidy + perf as one set,
+  and splitting those four across two mechanisms costs more than it buys. Move
+  all four together or none — revisit if `review`/`audit` ever lose their args.
+
+**The open question is how a built-in ships as a bundle.** `build.rs` embeds
+`templates/commands/*.md` as single files (`COMMAND_FILES`); a bundle is a
+directory. Codex's answer is worth copying: it embeds its system skills and
+extracts them to `$CODEX_HOME/skills/.system/` at startup, guarded by a
+fingerprint and a marker file so it rewrites only when the binary's copy changed
+(`~/Projects/harness/codex/codex-rs/skills/src/lib.rs`, functions
+`system_cache_root_dir` / `embedded_system_skills_fingerprint`). Extracting to
+`~/.config/hrdr/skills/.builtin/` would let built-in bundles load through
+ordinary discovery with no special case. Trade-off to settle: a first-run disk
+write, and built-ins become user-editable (codex accepts both).
+
 ## Deferred 2026-08-09 — the skills → commands rename
 
 The rename itself shipped whole (module, tool, `/commands`, dirs, recursive
