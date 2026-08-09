@@ -174,7 +174,7 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
 }
 
 /// Prepare an outgoing user message for sending to the model: expand a
-/// `:skill` invocation into its prompt template (via [`crate::expand_skill`]),
+/// `:command` invocation into its prompt template (via [`crate::expand_command`]),
 /// then `@file` mentions into their contents (via [`expand_mentions`]) and,
 /// when an `@agent` mention matches a known sub-agent name, wrap the body in a
 /// delegation directive (via [`agent_mention_message`]). This is the canonical
@@ -195,19 +195,19 @@ pub fn prepare_outgoing_tracked(
     cwd: &Path,
     todos: &[hrdr_tools::TodoItem],
 ) -> (String, Vec<PathBuf>) {
-    // A `:skill` template may itself carry `@file` / `@agent` mentions — they
+    // A `:command` template may itself carry `@file` / `@agent` mentions — they
     // get the same expansion below.
     let expanded;
     let input = if input.trim_start().starts_with(':') {
-        match crate::expand_skill(
+        match crate::expand_command(
             input,
-            &crate::discover_skills(cwd, hrdr_agent::ProjectInstructions::Load),
+            &crate::discover_commands(cwd, hrdr_agent::ProjectInstructions::Load),
         ) {
             Some(prompt) => {
                 expanded = prompt;
                 expanded.as_str()
             }
-            None => input, // not a known skill: send verbatim
+            None => input, // not a known command: send verbatim
         }
     } else {
         input
@@ -279,8 +279,8 @@ pub use hrdr_tools::resolve_under;
 
 /// Display form of a directory, with the home directory collapsed to `~`.
 ///
-/// Lives in `hrdr-agent` because skill discovery labels each skill's source
-/// with it, and the agent owns skill discovery; re-exported so the frontends
+/// Lives in `hrdr-agent` because command discovery labels each command's source
+/// with it, and the agent owns command discovery; re-exported so the frontends
 /// (chrome, pickers) render paths identically.
 pub use hrdr_agent::display_dir;
 
@@ -906,19 +906,19 @@ mod tests {
     }
 
     #[test]
-    fn prepare_outgoing_expands_a_skill_invocation() {
+    fn prepare_outgoing_expands_a_command_invocation() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = dir.path().join(".hrdr/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(skills.join("ship.md"), "Run the checklist for $ARGUMENTS").unwrap();
+        let commands = dir.path().join(".hrdr/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("ship.md"), "Run the checklist for $ARGUMENTS").unwrap();
 
         let out = prepare_outgoing(":ship v2", &[], dir.path());
         assert_eq!(out, "Run the checklist for v2");
         // An unknown :name goes to the model verbatim.
         assert_eq!(prepare_outgoing(":nope", &[], dir.path()), ":nope");
-        // A skill body's own @file mentions expand too.
+        // A command body's own @file mentions expand too.
         std::fs::write(dir.path().join("notes.txt"), "note body").unwrap();
-        std::fs::write(skills.join("review.md"), "Review @notes.txt please").unwrap();
+        std::fs::write(commands.join("review.md"), "Review @notes.txt please").unwrap();
         let out = prepare_outgoing(":review", &[], dir.path());
         assert!(out.contains("note body"), "{out}");
     }

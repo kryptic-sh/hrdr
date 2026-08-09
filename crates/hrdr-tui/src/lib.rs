@@ -126,7 +126,7 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
 /// `command` is a line of input to run as soon as the session is up, exactly as if
 /// it had been typed into the input box and submitted: `hrdr /new` starts fresh,
 /// `hrdr /model` opens the picker, `hrdr '!git status'` runs the shell escape,
-/// `hrdr ':review src/lib.rs'` invokes a skill, and anything else is a first
+/// `hrdr ':review src/lib.rs'` invokes a command, and anything else is a first
 /// message to the model.
 pub async fn run(
     config: AgentConfig,

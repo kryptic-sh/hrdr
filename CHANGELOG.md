@@ -6,9 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- **"Skills" are now "commands", end to end.** The industry settled on _skill_
+  meaning a `<name>/SKILL.md` directory bundle; hrdr's `:name` markdown prompt
+  templates are commands, and are named that everywhere now.
+  - The model-facing **`skill` tool is renamed `command`**, and the system
+    prompt's `Skills` section is now `Commands`. A sub-agent profile whose
+    `tools:` allow-list names `skill` no longer gets the tool (or the listing) —
+    rename it to `command`.
+  - **`/skills` is renamed `/commands`**, and `/commands` is therefore no longer
+    an alias of `/help` (`/?` still is).
+  - Discovery directories moved: project `.hrdr/skills/` → **`.hrdr/commands/`**
+    and user `~/.config/hrdr/skills/` → **`~/.config/hrdr/commands/`**. There is
+    no fallback — a command left in `.hrdr/skills/` is not read at all, because
+    those two paths are reserved for the `SKILL.md` bundles a later release
+    adds. `.claude/commands/` and `.opencode/command/` are unchanged, and
+    `.opencode/commands/` is now read as well (opencode accepts both spellings).
+  - Public API:
+    `hrdr_agent::{Skill, discover_skills, expand_skill, builtin_skills}` and
+    `hrdr_app`'s `filter_skills`/`skill_haystack`/`skill_completions` are
+    renamed to their `command` equivalents; `hrdr-agent/src/skills.rs` is now
+    `commands.rs` and its built-in templates live in `src/templates/commands/`.
+
 ### Added
 
-- **New built-in skill: `:tickets`.** Turns the open tasks in the session
+- **Commands are discovered recursively and namespaced by path.**
+  `.hrdr/commands/git/commit.md` is `:git/commit`, matching opencode's naming.
+  The canonical name uses `/`, and `:` and `.` are accepted as spellings of the
+  separator, so `:git/commit`, `:git:commit` and `:git.commit` all resolve to
+  the same file — as does the `command` tool's `name` argument. Typing `:git`
+  narrows the completion popup to that namespace. A frontmatter `name:` still
+  replaces the derived name outright and is never namespace-prefixed.
+- **New built-in command: `:tickets`.** Turns the open tasks in the session
   context and `docs/backlog.md` into tickets on the project's tracker — GitHub
   via `gh`, GitLab via `glab`, JIRA via `acli` (the repo's remote decides).
   Existing tickets are found by search and updated with a comment rather than

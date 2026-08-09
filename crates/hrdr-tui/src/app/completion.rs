@@ -2,8 +2,8 @@
 //! sharing one popup.
 
 use hrdr_app::{
-    active_file_token, arg_completions, command_arg_offset, rank_agent_matches, rank_file_matches,
-    resolve_alias, skill_completions, slash_completions,
+    active_file_token, arg_completions, command_arg_offset, command_completions, command_match_key,
+    rank_agent_matches, rank_file_matches, resolve_alias, slash_completions,
 };
 
 impl super::App {
@@ -27,17 +27,17 @@ impl super::App {
                     .collect(),
             });
         }
-        let skills = skill_completions(&content, &self.skills);
-        if !skills.is_empty() {
+        let commands = command_completions(&content, &self.commands);
+        if !commands.is_empty() {
             return Some(Completions {
-                kind: CompletionKind::Skill,
+                kind: CompletionKind::Command,
                 anchor_col: 0,
-                items: skills,
+                items: commands,
             });
         }
-        // Argument completion: "/cmd partial" / ":skill partial" — enum
-        // values, theme names, session ids, or a skill's declared `args:`.
-        if let Some((start, items)) = arg_completions(&content, &self.skills) {
+        // Argument completion: "/cmd partial" / ":command partial" — enum
+        // values, theme names, session ids, or a command's declared `args:`.
+        if let Some((start, items)) = arg_completions(&content, &self.commands) {
             return Some(Completions {
                 kind: CompletionKind::Arg { token_start: start },
                 anchor_col: content[..start].chars().count(),
@@ -91,7 +91,7 @@ impl super::App {
     ) {
         let chosen = &comp.items[idx].0;
         match comp.kind {
-            CompletionKind::Slash | CompletionKind::Skill => {
+            CompletionKind::Slash | CompletionKind::Command => {
                 if trailing_space {
                     self.editor.set_content(&format!("{chosen} "));
                 } else {
@@ -128,18 +128,19 @@ impl super::App {
         let chosen = comp.items[idx].0.as_str();
         let content = self.editor.content();
         match comp.kind {
-            // A command/skill is "already typed in full" when it dispatches as-is
-            // — NOT merely when it equals the highlighted suggestion. `/clear` is a
-            // real command even though the popup surfaces its canonical `/new`, so
-            // comparing against the suggestion would wrongly treat it as partial.
+            // A `/…` or `:…` command is "already typed in full" when it dispatches
+            // as-is — NOT merely when it equals the highlighted suggestion. `/clear`
+            // is a real command even though the popup surfaces its canonical `/new`,
+            // so comparing against the suggestion would wrongly treat it as partial.
             CompletionKind::Slash => hrdr_app::is_known_command(content.trim()),
-            CompletionKind::Skill => {
+            CompletionKind::Command => {
                 let name = content.trim().trim_start_matches(':');
+                let key = command_match_key(name);
                 !name.is_empty()
                     && self
-                        .skills
+                        .commands
                         .iter()
-                        .any(|s| s.name.eq_ignore_ascii_case(name))
+                        .any(|c| command_match_key(&c.name) == key)
             }
             CompletionKind::Arg { token_start } => {
                 content.get(token_start..).map(str::trim) == Some(chosen)
@@ -258,10 +259,10 @@ pub(crate) struct Completions {
 pub(crate) enum CompletionKind {
     /// Replace the whole input with the chosen command.
     Slash,
-    /// Replace the whole input with the chosen `:skill` invocation.
-    Skill,
+    /// Replace the whole input with the chosen `:command` invocation.
+    Command,
     /// Replace the argument (everything from this byte offset on) with the
-    /// chosen value — enum settings, theme names, session ids, skill `args:`,
+    /// chosen value — enum settings, theme names, session ids, command `args:`,
     /// and `/edit`/`/add` file paths.
     Arg { token_start: usize },
     /// Replace the `@…` token starting at this byte offset with `@<label> `

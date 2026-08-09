@@ -126,7 +126,7 @@ fn run_menus(
             ),
             Line::raw(""),
             Line::styled(
-                "Its AGENTS.md and skill files are instructions that reach the model,",
+                "Its AGENTS.md and command files are instructions that reach the model,",
                 Style::default().fg(theme.dim),
             ),
             Line::styled(

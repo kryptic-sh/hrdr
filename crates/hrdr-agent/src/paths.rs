@@ -1,7 +1,7 @@
 //! Path helpers shared across hrdr's on-disk state (sessions, per-project
 //! memory): all of them partition by working directory using the same slug, so
 //! they must agree on how it's computed. Plus the one display helper —
-//! [`display_dir`] — that both the agent (skill sources) and the frontends
+//! [`display_dir`] — that both the agent (command sources) and the frontends
 //! (chrome, pickers) render paths with, so they never disagree about where a
 //! `~` goes.
 

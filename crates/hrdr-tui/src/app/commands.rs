@@ -125,7 +125,7 @@ impl super::App {
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.login_modal = None;
-        self.skill_selector = None;
+        self.command_selector = None;
         self.verbose = false;
     }
     /// Route one key to the open notice popup (a slash command's data output):
@@ -170,7 +170,7 @@ impl super::App {
             }
         }
     }
-    /// `/reload` — re-read config (and rediscover skills), applying the runtime bits
+    /// `/reload` — re-read config (and rediscover commands), applying the runtime bits
     /// that can change live; keeps the current settings if the config is invalid.
     ///
     /// It does **not** re-seed `AGENTS.md` into a running conversation. Project docs
@@ -180,7 +180,7 @@ impl super::App {
     /// conversation (`/new`).
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
-        self.skills = hrdr_app::discover_skills(
+        self.commands = hrdr_app::discover_commands(
             &std::path::PathBuf::from(self.current_cwd()),
             hrdr_agent::ProjectInstructions::Load,
         );
@@ -415,7 +415,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
         self.app.arm_file_watcher(new);
-        self.app.skills = hrdr_app::discover_skills(new, hrdr_agent::ProjectInstructions::Load);
+        self.app.commands = hrdr_app::discover_commands(new, hrdr_agent::ProjectInstructions::Load);
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl
@@ -453,15 +453,15 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             super::login_provider_selector(hrdr_app::login_provider_choices()),
         ));
     }
-    fn begin_skill_selector(&mut self) {
-        // `discover_skills` always returns hrdr's built-ins (`:commit`,
-        // `:release`, `:review`) even in a cwd with no skill files of its own,
-        // so the list is never empty — no "no skills yet" fallback needed here.
-        let skills = hrdr_app::discover_skills(
+    fn begin_command_selector(&mut self) {
+        // `discover_commands` always returns hrdr's built-ins (`:commit`,
+        // `:release`, `:review`) even in a cwd with no command files of its own,
+        // so the list is never empty — no "no commands yet" fallback needed here.
+        let commands = hrdr_app::discover_commands(
             &std::path::PathBuf::from(self.app.current_cwd()),
             hrdr_agent::ProjectInstructions::Load,
         );
-        self.app.skill_selector = Some(super::skill_selector(skills));
+        self.app.command_selector = Some(super::command_selector(commands));
     }
     fn begin_model_selector(&mut self) {
         let choices = hrdr_agent::model_choices(
@@ -672,25 +672,25 @@ impl super::App {
         }
     }
 
-    /// Route one key to the open `/skills` picker: Esc/Ctrl+C closes it,
+    /// Route one key to the open `/commands` picker: Esc/Ctrl+C closes it,
     /// Up/Down move the highlight, Enter inserts `:name ` into the input, and
     /// any other character edits the fuzzy filter. Caller checks
-    /// `self.skill_selector.is_some()` first.
-    pub(super) fn skill_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+    /// `self.command_selector.is_some()` first.
+    pub(super) fn command_selector_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
-        match selector_key(&mut self.skill_selector, key) {
-            SelectorKey::Close => self.skill_selector = None,
+        match selector_key(&mut self.command_selector, key) {
+            SelectorKey::Close => self.command_selector = None,
             SelectorKey::Handled => {}
             SelectorKey::Other(key) => {
                 // Enter inserts the invocation and hands the cursor back — the
                 // user finishes the arguments and submits like any message.
                 if key.code == KeyCode::Enter {
                     let chosen = self
-                        .skill_selector
+                        .command_selector
                         .as_ref()
                         .and_then(|s| s.current())
                         .map(|sk| sk.name.clone());
-                    self.skill_selector = None;
+                    self.command_selector = None;
                     if let Some(name) = chosen {
                         self.editor.set_content(&format!(":{name} "));
                     }

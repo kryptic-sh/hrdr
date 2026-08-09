@@ -139,8 +139,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_theme_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.effort_selector {
         draw_effort_selector(f, &app.theme, sel);
-    } else if let Some(sel) = &app.skill_selector {
-        draw_skill_selector(f, &app.theme, sel);
+    } else if let Some(sel) = &app.command_selector {
+        draw_command_selector(f, &app.theme, sel);
     } else if let Some(modal) = &app.login_modal {
         draw_login_modal(f, &app.theme, modal);
     } else if let Some(popup) = &app.popup {
@@ -440,10 +440,10 @@ fn draw_model_selector(
     );
 }
 
-/// The `/skills` picker modal: a search line, a hint, and a two-column list
+/// The `/commands` picker modal: a search line, a hint, and a two-column list
 /// (`:name` · description [source]); Enter inserts the invocation into the
 /// input. Same chrome as the other pickers.
-fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSelector) {
+fn draw_command_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::CommandSelector) {
     let Some(inner) = modal_frame(f, theme, 92, 24, 3) else {
         return;
     };
@@ -459,7 +459,7 @@ fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSele
         })
         .collect();
     let hint = format!(
-        "{} skill{} · ↑↓ select · Enter insert · Esc cancel",
+        "{} command{} · ↑↓ select · Enter insert · Esc cancel",
         rows.len(),
         if rows.len() == 1 { "" } else { "s" },
     );
@@ -470,7 +470,7 @@ fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSele
         None,
         &sel.filter,
         hint,
-        "no skills match",
+        "no commands match",
         sel.selected,
         &rows,
         (2, 3),
@@ -3365,7 +3365,9 @@ fn tool_action(name: &str) -> Option<(&'static str, &'static str, &'static str, 
         "shell" => Some(("ran", "running", "command", false)),
         "read" => Some(("read", "reading", "file", false)),
         "write" => Some(("wrote", "writing", "file", false)),
-        "skill" => Some(("used", "using", "skill", false)),
+        // "loaded", not "used": `shell`'s own noun is also `command`, and the
+        // verb is all that keeps "ran 2 commands" and this apart in one summary.
+        "command" => Some(("loaded", "loading", "command", false)),
         "grep" | "find" => Some(("searched", "searching", "pattern", true)),
         "ls" | "tree" => Some(("listed", "listing", "directory", false)),
         _ => None,
@@ -3385,7 +3387,7 @@ fn plural(noun: &str, n: usize) -> String {
 }
 
 /// The summary for a tool group: one verb section per distinct tool name in
-/// the order the calls appear (`ran 2 commands`, `used 1 skill`, `searching
+/// the order the calls appear (`ran 2 commands`, `loaded 1 command`, `searching
 /// for 2 patterns`, `listing 3 directories`) — no `called N tools` total, the
 /// sections themselves are the summary. The sections are ` · `-joined and
 /// wrapped by [`pack_loader_segments`] exactly like the live loader, so a
@@ -4998,9 +5000,9 @@ mod block_tests {
             "progressive while a call is still going"
         );
 
-        // A lone skill call reads `used 1 skill`, not a bare tool name.
-        let (sections, ..) = tool_group_summary(&[entry("s", "skill", true, true)]);
-        assert_eq!(sections, vec!["used 1 skill"]);
+        // A lone command call reads `loaded 1 command`, not a bare tool name.
+        let (sections, ..) = tool_group_summary(&[entry("s", "command", true, true)]);
+        assert_eq!(sections, vec!["loaded 1 command"]);
 
         // The verify tool reads as the named action, without a count.
         let (sections, ..) = tool_group_summary(&[entry("v", "verify", true, true)]);

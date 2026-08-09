@@ -9,7 +9,7 @@ Cut a release.
 The procedure is the **Releasing** section of your instructions — version
 choice, manifest and lockfile, changelog, commit, tag, push, and watching the
 tag's run to confirm it published. That section is always in front of a write
-agent, and this skill deliberately does not restate it: the two copies of it
+agent, and this command deliberately does not restate it: the two copies of it
 that used to exist drifted, and what went missing from the always-on one was the
 last step — so a release cut by phrase rather than by `:release` stopped at
 "pushed".

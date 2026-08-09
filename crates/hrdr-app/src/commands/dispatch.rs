@@ -422,13 +422,13 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             );
         }
         "reload" => host.reload_config(),
-        "skills" => {
+        "commands" => {
             if !arg.is_empty() {
-                host.info("/skills takes no argument — skills run via `:name`".to_string());
+                host.info("/commands takes no argument — commands run via `:name`".to_string());
             }
             // Interactive picker where supported; the default host lists the
-            // skills as text (see CommandHost::begin_skill_selector).
-            host.begin_skill_selector();
+            // commands as text (see CommandHost::begin_command_selector).
+            host.begin_command_selector();
         }
         "login" => {
             if !arg.is_empty() {
@@ -981,7 +981,7 @@ mod tests {
         );
     }
 
-    // ── /temp, /export, /effort, /doctor, /login, /skills ──────────────────
+    // ── /temp, /export, /effort, /doctor, /login, /commands ──────────────────
 
     /// The tests that read or write the shared sandboxed `config.toml`
     /// (dispatch's `persist_setting`/`unpersist_setting` target the
@@ -1349,24 +1349,24 @@ mod tests {
         );
     }
 
-    /// `/skills <arg>` says the argument is unused but still opens the picker.
+    /// `/commands <arg>` says the argument is unused but still opens the picker.
     #[tokio::test]
-    async fn skills_with_an_argument_still_opens_the_picker() {
+    async fn commands_with_an_argument_still_opens_the_picker() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = TestHost::new(dir.path().to_path_buf());
-        assert!(dispatch(&mut host, "/skills foo"));
+        assert!(dispatch(&mut host, "/commands foo"));
         assert!(
             host.info_log
                 .iter()
-                .any(|l| l.contains("/skills takes no argument")),
+                .any(|l| l.contains("/commands takes no argument")),
             "{:?}",
             host.info_log
         );
-        // The picker still opened (the default host lists the skills as text).
+        // The picker still opened (the default host lists the commands as text).
         assert!(
             host.info_log
                 .iter()
-                .any(|l| l.contains("skills (invoke with :name")),
+                .any(|l| l.contains("commands (invoke with :name")),
             "{:?}",
             host.info_log
         );

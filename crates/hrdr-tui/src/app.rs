@@ -41,9 +41,9 @@ pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{display_dir, git_branch, is_known_command, is_quit_command};
 pub(crate) use selector::{
-    EffortSelector, LoginProviderSelector, ModelSelector, Selector, SessionSelector, SkillSelector,
-    ThemeSelector, effort_selector, login_provider_selector, model_selector, session_selector,
-    skill_selector, theme_selector,
+    CommandSelector, EffortSelector, LoginProviderSelector, ModelSelector, Selector,
+    SessionSelector, ThemeSelector, command_selector, effort_selector, login_provider_selector,
+    model_selector, session_selector, theme_selector,
 };
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
@@ -544,8 +544,8 @@ pub(crate) struct App {
     pub(crate) theme_original: Option<Theme>,
     /// The open `/effort` picker modal; while `Some`, it captures every key.
     pub(crate) effort_selector: Option<EffortSelector>,
-    /// The open `/skills` picker modal; while `Some`, it captures every key.
-    pub(crate) skill_selector: Option<SkillSelector>,
+    /// The open `/commands` picker modal; while `Some`, it captures every key.
+    pub(crate) command_selector: Option<CommandSelector>,
     /// The open `/login` modal (provider list, then masked key entry); while
     /// `Some`, it captures every key (and pasted text, for the key field).
     pub(crate) login_modal: Option<LoginModal>,
@@ -558,10 +558,10 @@ pub(crate) struct App {
     pub(crate) browser_login_task: Option<tokio::task::JoinHandle<()>>,
     /// The running user `!command`, if any — Esc cancels it.
     pub(crate) user_shell: Option<UserShell>,
-    /// Discovered `:skill` prompt templates for the current cwd, for the
+    /// Discovered `:command` prompt templates for the current cwd, for the
     /// completion popup (refreshed on cwd change and `/reload`; the send path
     /// re-discovers on its own, so a stale list only affects completion).
-    pub(crate) skills: Vec<hrdr_app::Skill>,
+    pub(crate) commands: Vec<hrdr_app::Command>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -741,7 +741,7 @@ impl App {
         let theme = Theme::load(ui.theme.as_deref());
         let dir = display_dir(&config.cwd);
         let branch = git_branch(&config.cwd);
-        let cwd_for_skills = config.cwd.clone();
+        let cwd_for_commands = config.cwd.clone();
         let context_window = config.context_window;
         let auto_resume = ui.auto_resume;
         let bell = ui.bell;
@@ -864,13 +864,13 @@ impl App {
             theme_selector: None,
             theme_original: None,
             effort_selector: None,
-            skill_selector: None,
+            command_selector: None,
             login_modal: None,
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
-            skills: hrdr_app::discover_skills(
-                &cwd_for_skills,
+            commands: hrdr_app::discover_commands(
+                &cwd_for_commands,
                 hrdr_agent::ProjectInstructions::Load,
             ),
             pending_goto: None,
@@ -936,7 +936,7 @@ impl App {
         // Watch the working tree so a change to it (a new file, a `git pull`)
         // invalidates the `@file` completion index instead of leaving the cached
         // snapshot stale forever. Re-armed on every cwd change.
-        app.arm_file_watcher(&cwd_for_skills);
+        app.arm_file_watcher(&cwd_for_commands);
         if auto_resume {
             app.auto_resume_latest();
         }
@@ -1120,8 +1120,8 @@ impl App {
             self.effort_selector_key(key);
             return Action::None;
         }
-        if self.skill_selector.is_some() {
-            self.skill_selector_key(key);
+        if self.command_selector.is_some() {
+            self.command_selector_key(key);
             return Action::None;
         }
         if self.login_modal.is_some() {
@@ -1356,8 +1356,9 @@ impl App {
     /// Act on one line of input — the single path everything the user can *say* to
     /// hrdr goes down, whichever way they said it.
     ///
-    /// A `/command`, a `:skill`, a `!shell` escape, a quit word, or a message for
-    /// the model: the rules for telling them apart, and the routing that follows,
+    /// A `/name` slash command, a `:name` prompt command, a `!shell` escape, a quit
+    /// word, or a message for the model: the rules for telling them apart, and the
+    /// routing that follows,
     /// live here and nowhere else. `Enter` in the input box is one caller; a
     /// command handed to hrdr on the command line (`hrdr /new`) is another, and it
     /// gets exactly the behaviour typing it would.
@@ -1376,7 +1377,7 @@ impl App {
             // (bash/PowerShell), stream the output into a transcript tool
             // block, and record command + output into the model's history.
             // `:!command` is the same escape under the ex-style prefix —
-            // vim muscle memory means the shell, never a skill named `!`.
+            // vim muscle memory means the shell, never a command named `!`.
             let trimmed = input.trim();
             if let Some(cmd) = trimmed
                 .strip_prefix('!')
@@ -1694,7 +1695,7 @@ impl App {
             selector_wheel(sel, m.kind);
             return;
         }
-        if let Some(sel) = &mut self.skill_selector {
+        if let Some(sel) = &mut self.command_selector {
             selector_wheel(sel, m.kind);
             return;
         }
@@ -2309,7 +2310,7 @@ impl App {
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
         self.arm_file_watcher(&new);
-        self.skills = hrdr_app::discover_skills(&new, hrdr_agent::ProjectInstructions::Load);
+        self.commands = hrdr_app::discover_commands(&new, hrdr_agent::ProjectInstructions::Load);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does

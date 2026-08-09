@@ -7921,7 +7921,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
 }
 
 /// `:!command` is the `!` shell escape under the ex-style prefix — vim
-/// muscle memory types `:!git status` and means the shell, not a skill
+/// muscle memory types `:!git status` and means the shell, not a command
 /// named `!`. It takes the exact `!` path: no model turn spawns, the
 /// output streams into a tool block, and ToolEnd commits the note.
 #[cfg(unix)]
@@ -8355,12 +8355,12 @@ async fn esc_esc_cancels_a_turn_mid_tool_call_and_aborts_the_tool_task() {
     assert!(settled, "the cancelled tool block settled as failed");
 }
 
-/// `/skills` opens a picker of the discovered skills; Enter inserts the
+/// `/commands` opens a picker of the discovered commands; Enter inserts the
 /// `:name ` invocation into the input and hands the cursor back.
 #[tokio::test]
-async fn skills_picker_inserts_the_invocation() {
+async fn commands_picker_inserts_the_invocation() {
     let mut h = Harness::new(vec![]).await;
-    let dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/skills");
+    let dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/commands");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("ship.md"),
@@ -8368,17 +8368,20 @@ async fn skills_picker_inserts_the_invocation() {
     )
     .unwrap();
 
-    h.submit("/skills").await;
-    assert!(h.app.skill_selector.is_some(), "/skills opens the picker");
+    h.submit("/commands").await;
+    assert!(
+        h.app.command_selector.is_some(),
+        "/commands opens the picker"
+    );
     let screen = h.render();
-    assert!(screen.contains(":ship"), "skill listed:\n{screen}");
+    assert!(screen.contains(":ship"), "command listed:\n{screen}");
     assert!(
         screen.contains("release checklist"),
         "description column:\n{screen}"
     );
 
     h.press(KeyCode::Enter);
-    assert!(h.app.skill_selector.is_none(), "Enter closes the picker");
+    assert!(h.app.command_selector.is_none(), "Enter closes the picker");
     assert_eq!(
         h.app.editor.content(),
         ":ship ",
@@ -8539,7 +8542,7 @@ async fn a_theme_switch_invalidates_transcript_cache() {
 
 /// A command handed to hrdr on the command line does exactly what typing it does.
 ///
-/// `hrdr /new`, `hrdr /model`, `hrdr '!git status'`, `hrdr ':skill …'` — all of it
+/// `hrdr /new`, `hrdr /model`, `hrdr '!git status'`, `hrdr ':command …'` — all of it
 /// goes through `submit_input`, the same function `Enter` calls, so the two can't
 /// drift: a command the input box learns, the command line gets for free. What is
 /// checked here is that each *kind* of input is still told apart when it arrives
@@ -8746,31 +8749,34 @@ async fn theme_selector_previews_and_esc_restores() {
     assert_eq!(h.app.theme.user, original_user, "original theme restored");
 }
 
-/// A `:skill` invocation sends the expanded template to the model while the
+/// A `:command` invocation sends the expanded template to the model while the
 /// transcript shows the raw `:name args` the user typed; the `:` prefix also
 /// drives the shared completion popup.
 #[tokio::test]
-async fn skill_invocation_expands_for_the_model_and_completes() {
+async fn command_invocation_expands_for_the_model_and_completes() {
     let mut h = Harness::new(vec![MockReply::Text("shipped".to_string())]).await;
-    let skills_dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/skills");
-    std::fs::create_dir_all(&skills_dir).unwrap();
+    let commands_dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
     std::fs::write(
-        skills_dir.join("ship.md"),
+        commands_dir.join("ship.md"),
         "---
 description: release checklist
 ---
 Run the release checklist for $ARGUMENTS",
     )
     .unwrap();
-    // The popup lists the skill (the App cache was built before the file
+    // The popup lists the command (the App cache was built before the file
     // existed — refresh the way /reload and a cwd change do).
-    h.app.skills = hrdr_app::discover_skills(
+    h.app.commands = hrdr_app::discover_commands(
         std::path::Path::new(&h.app.current_cwd()),
         hrdr_agent::ProjectInstructions::Load,
     );
     h.type_str(":sh");
     let screen = h.render();
-    assert!(screen.contains(":ship"), "popup lists the skill:\n{screen}");
+    assert!(
+        screen.contains(":ship"),
+        "popup lists the command:\n{screen}"
+    );
     assert!(
         screen.contains("release checklist"),
         "popup shows the description:\n{screen}"

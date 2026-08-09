@@ -1,6 +1,6 @@
 //! Trust on first use, per working directory.
 //!
-//! A project's `AGENTS.md` and its `.hrdr/skills` are instructions that reach the
+//! A project's `AGENTS.md` and its `.hrdr/commands` are instructions that reach the
 //! model, and they arrive from a checkout the user may have done nothing but
 //! clone. The question "should this directory's files steer my agent?" has one
 //! honest answer and it is not a heuristic over the file contents: it is the

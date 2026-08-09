@@ -25,7 +25,6 @@ mod login;
 mod palette;
 mod pane;
 mod sessions;
-mod skills;
 mod status;
 mod subagents;
 mod themes;
@@ -53,7 +52,6 @@ pub use hrdr_agent::{
 };
 pub use hrdr_agent::{Pane, PaneId, PaneSet, PaneStatus, PaneView};
 pub use sessions::*;
-pub use skills::*;
 pub use status::*;
 pub use subagents::*;
 pub use themes::*;
@@ -72,7 +70,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (picker, name/path, reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
-    ("/skills", "list custom :skills (prompt templates)"),
+    ("/commands", "list custom :commands (prompt templates)"),
     ("/prompt", "show the rendered system prompt"),
     ("/guardrails", "list active shell guardrails"),
     (
@@ -127,7 +125,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Appearance", &["/theme", "/statusbar", "/todo-ttl"]),
     (
         "Other",
-        &["/skills", "/reload", "/help", "/doctor", "/exit"],
+        &["/commands", "/reload", "/help", "/doctor", "/exit"],
     ),
 ];
 
@@ -156,8 +154,9 @@ pub fn resolve_alias(cmd: &str) -> &str {
         "continue" | "sessions" => "resume",
         // descriptive name for compaction.
         "summarize" | "summary" => "compact",
-        // help variants.
-        "commands" | "?" => "help",
+        // help variants. `/commands` is NOT one: it is the prompt-template
+        // listing (`:name`), so it dispatches to itself.
+        "?" => "help",
         // usage / health variants.
         "usage" => "cost",
         "health" => "doctor",

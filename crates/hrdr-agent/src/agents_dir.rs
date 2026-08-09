@@ -3,7 +3,7 @@
 //! well as hrdr's own (`.hrdr/agents/`).
 //!
 //! Each file is Markdown with a YAML frontmatter block, parsed via
-//! `serde_yaml_ng` (matching `hrdr-app`'s skill parser); the body is the
+//! `serde_yaml_ng` (matching `hrdr-app`'s command parser); the body is the
 //! agent's system prompt. We map the flat frontmatter fields we understand
 //! (name/description/model/tools/knobs) into [`FmValue`]s; a nested mapping
 //! (e.g. opencode's per-tool boolean `tools:` map) has no representation
@@ -325,7 +325,7 @@ impl FmValue {
 ///
 /// Shared by `hrdr-agent`'s agent-file frontmatter (which further parses the
 /// returned frontmatter text as YAML via [`split_frontmatter`]) and
-/// `hrdr-app`'s skill files (which parse it as YAML too, via its own
+/// `hrdr-app`'s command files (which parse it as YAML too, via its own
 /// `serde_yaml_ng` call) — the fence-splitting itself, including two
 /// independently-fixed CRLF bugs, used to be duplicated between the two.
 pub fn split_fence(text: &str) -> Option<(&str, &str)> {
@@ -439,7 +439,7 @@ fn fm_value_from_yaml(v: serde_yaml_ng::Value) -> Option<FmValue> {
         serde_yaml_ng::Value::Null => Some(FmValue::Scalar(String::new())),
         serde_yaml_ng::Value::Sequence(seq) => Some(FmValue::List(
             seq.iter()
-                .filter_map(crate::skills::scalar_to_string)
+                .filter_map(crate::commands::scalar_to_string)
                 .collect(),
         )),
         serde_yaml_ng::Value::Mapping(_) => None,
@@ -708,7 +708,7 @@ mod tests {
         );
     }
 
-    /// `split_fence` is the shared helper `hrdr-app`'s skill parser also
+    /// `split_fence` is the shared helper `hrdr-app`'s command parser also
     /// calls: exercise its CRLF opening fence, trailing-whitespace closing
     /// fence, body extraction, and no-fence `None` directly.
     #[test]

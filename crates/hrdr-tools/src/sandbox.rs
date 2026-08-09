@@ -2141,7 +2141,7 @@ mod tests {
             ".git/config",
             ".git/info/exclude",
             "vendor/dep/.git/hooks/post-checkout",
-            ".hrdr/skills/helpful.md",
+            ".hrdr/commands/helpful.md",
             ".claude/agents/reviewer.md",
             "src/main.rs",
             ".gitignore",

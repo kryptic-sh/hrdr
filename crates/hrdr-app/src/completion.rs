@@ -211,7 +211,7 @@ pub fn command_arg_offset(rest: &str) -> Option<usize> {
     Some(1 + ws + (after.len() - after.trim_start().len()))
 }
 
-/// Argument completion for a slash (`/cmd partial…`) or skill
+/// Argument completion for a slash (`/cmd partial…`) or command
 /// (`:name partial…`) input: candidates for the argument being typed, matched
 /// against everything after the command name (so multi-word values like
 /// session names still complete). Returns the byte offset where the argument
@@ -220,7 +220,7 @@ pub fn command_arg_offset(rest: &str) -> Option<usize> {
 /// command takes no completable argument, or nothing matches.
 pub fn arg_completions(
     input: &str,
-    skills: &[crate::Skill],
+    commands: &[crate::Command],
 ) -> Option<(usize, Vec<(String, String)>)> {
     let (sigil, rest) = match input.chars().next()? {
         c @ ('/' | ':') => (c, &input[1..]),
@@ -238,10 +238,11 @@ pub fn arg_completions(
             .collect()
     };
     let candidates: Vec<(String, String)> = if sigil == ':' {
-        // A skill's frontmatter-declared argument values.
-        skills
+        // A command's frontmatter-declared argument values.
+        let key = crate::command_match_key(cmd);
+        commands
             .iter()
-            .find(|sk| sk.name.eq_ignore_ascii_case(cmd))?
+            .find(|c| crate::command_match_key(&c.name) == key)?
             .args
             .iter()
             .map(|a| (a.clone(), String::new()))
@@ -396,8 +397,8 @@ mod tests {
     }
 
     #[test]
-    fn arg_completions_complete_enum_theme_and_skill_arguments() {
-        let skills = vec![crate::Skill {
+    fn arg_completions_complete_enum_theme_and_command_arguments() {
+        let commands = vec![crate::Command {
             name: "deploy".to_string(),
             description: String::new(),
             body: "…".to_string(),
@@ -406,7 +407,7 @@ mod tests {
             model_invocable: true,
         }];
         let vals = |i: &str| {
-            arg_completions(i, &skills)
+            arg_completions(i, &commands)
                 .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
                 .unwrap_or_default()
         };
@@ -417,16 +418,16 @@ mod tests {
         // Theme names come from the registry (built-ins are always there).
         assert!(vals("/theme dra").contains(&"dracula".to_string()));
         assert!(vals("/theme re").contains(&"reset".to_string()));
-        // Skill arguments come from the frontmatter `args:` list.
+        // Command arguments come from the frontmatter `args:` list.
         assert_eq!(vals(":deploy st"), vec!["staging"]);
         assert_eq!(vals(":deploy ").len(), 2);
         // No argument yet, unknown command, or no match → nothing.
-        assert!(arg_completions("/statusbar", &skills).is_none());
-        assert!(arg_completions("/help x", &skills).is_none());
-        assert!(arg_completions("/statusbar zz", &skills).is_none());
-        assert!(arg_completions("hello there", &skills).is_none());
+        assert!(arg_completions("/statusbar", &commands).is_none());
+        assert!(arg_completions("/help x", &commands).is_none());
+        assert!(arg_completions("/statusbar zz", &commands).is_none());
+        assert!(arg_completions("hello there", &commands).is_none());
         // The offset points at the argument, past the whitespace run.
-        let (start, _) = arg_completions("/verbose   off", &skills).unwrap();
+        let (start, _) = arg_completions("/verbose   off", &commands).unwrap();
         assert_eq!(&"/verbose   off"[start..], "off");
     }
 
@@ -509,9 +510,9 @@ mod tests {
     /// a stale list) both fail here.
     #[test]
     fn resume_completion_memoizes_and_refreshes_on_session_change() {
-        let skills = Vec::new();
+        let commands = Vec::new();
         let vals = |i: &str| {
-            arg_completions(i, &skills)
+            arg_completions(i, &commands)
                 .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
                 .unwrap_or_default()
         };

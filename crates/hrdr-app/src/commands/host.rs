@@ -324,21 +324,24 @@ pub trait CommandHost {
         self.info(crate::session_list_text());
     }
 
-    /// Open the interactive `/skills` picker — the discovered `:skill`
+    /// Open the interactive `/commands` picker — the discovered `:name` prompt
     /// templates; picking one inserts `:name ` into the input. The default
     /// lists them as text.
-    fn begin_skill_selector(&mut self) {
-        // `discover_skills` always returns hrdr's built-ins (`:commit`,
-        // `:release`, `:review`) even with no skill files on disk, so the list
-        // is never empty — no "no skills yet" fallback needed here.
-        let skills = crate::discover_skills(&self.cwd(), hrdr_agent::ProjectInstructions::Load);
-        let mut s = format!("{} skills (invoke with :name [arguments]):", skills.len());
-        for sk in skills {
-            s.push_str(&format!("\n  :{}", sk.name));
-            if !sk.description.is_empty() {
-                s.push_str(&format!(" — {}", sk.description));
+    fn begin_command_selector(&mut self) {
+        // `discover_commands` always returns hrdr's built-ins (`:commit`,
+        // `:release`, `:review`) even with no command files on disk, so the list
+        // is never empty — no "no commands yet" fallback needed here.
+        let commands = crate::discover_commands(&self.cwd(), hrdr_agent::ProjectInstructions::Load);
+        let mut s = format!(
+            "{} commands (invoke with :name [arguments]):",
+            commands.len()
+        );
+        for cmd in commands {
+            s.push_str(&format!("\n  :{}", cmd.name));
+            if !cmd.description.is_empty() {
+                s.push_str(&format!(" — {}", cmd.description));
             }
-            s.push_str(&format!("  [{}]", sk.source));
+            s.push_str(&format!("  [{}]", cmd.source));
         }
         self.info(s);
     }

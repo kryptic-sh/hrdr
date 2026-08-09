@@ -12,8 +12,8 @@ Commit the current work.
 3. Stage and word each commit as the Git section of your instructions says —
    explicit paths, Conventional Commits subject, body when the _why_ isn't
    obvious. Not restated here: it is already in front of you, and the copy that
-   drifted from it is how this skill came to specify a different subject length
-   than the rules it was meant to follow.
+   drifted from it is how this command came to specify a different subject
+   length than the rules it was meant to follow.
 4. Never skip hooks (`--no-verify`). If a hook fails, fix what it flagged and
    commit again.
 5. After committing, show the result with `git log -1 --stat` and stop — don't

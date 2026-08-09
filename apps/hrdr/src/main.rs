@@ -259,7 +259,7 @@ struct Cli {
 
     /// A command to run in the TUI as soon as it starts, exactly as if you had
     /// typed it into the input box: a slash command (`hrdr /new`, `hrdr /model`),
-    /// a skill (`hrdr :review src/lib.rs`), a shell escape (`hrdr '!git status'`),
+    /// a command (`hrdr :review src/lib.rs`), a shell escape (`hrdr '!git status'`),
     /// or a plain message to open the session with. Put flags *before* it — every
     /// word after it is part of the command.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
@@ -767,7 +767,7 @@ async fn main() -> Result<()> {
     }
 
     // The working directory decides whether this session may be steered by files
-    // in it. Answered before anything reads `AGENTS.md` or a project skill —
+    // in it. Answered before anything reads `AGENTS.md` or a project command —
     // `Agent::new` does both, and the TUI builds one immediately.
     match trust_gate(&config.cwd, cli.command.is_some(), ui.theme.as_deref()) {
         TrustGate::Proceed => {}

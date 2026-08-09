@@ -1253,6 +1253,39 @@ live here:
   verbose-gated; the proposed `Command`-variant split and the
   `EntryKind::Notice(_) if !expand_tools` guard are moot.
 
+## Deferred 2026-08-09 — the skills → commands rename
+
+The rename itself shipped whole (module, tool, `/commands`, dirs, recursive
+namespaced names). What it left open:
+
+- **A symlinked command directory is not walked.** `discover_commands` builds
+  its `ignore::WalkBuilder` with the default `follow_links(false)`, which is
+  what makes a symlink cycle a non-issue. The cost is that
+  `~/.config/hrdr/commands/shared -> ~/dotfiles/commands` — a normal dotfiles
+  layout — contributes nothing. Verified by reading the builder defaults, not by
+  a test. Turning links on would be safe as far as hangs go (`ignore` detects
+  cycles and yields an error rather than looping), so if anyone asks for it the
+  change is one call; it was left off as the conservative default, not because
+  it cannot work. `a_symlink_cycle_does_not_hang_discovery` covers the liveness
+  half only.
+- **Nothing warns a user whose commands are still in `.hrdr/skills/` or
+  `~/.config/hrdr/skills/`.** Those two paths are deliberately no longer read
+  (they are reserved for the `SKILL.md` bundles the next slice adds), and per
+  the pre-1.0 no-migration rule there is no shim and no bespoke error — the
+  files simply go quiet. The CHANGELOG's Breaking entry is the only notice.
+- **Older backlog entries still name the pre-rename symbols** — `skill_dirs`,
+  `discover_skills`, `skills.rs`, `.hrdr/skills`, `prompt::skills_section` — in
+  the review/audit sections above. They were left as written rather than
+  rewritten in place, since most are dated records of past passes; read them
+  against `commands.rs` / `discover_commands` / `command_dirs` /
+  `prompt::commands_section`. The one live entry affected is **Project skills
+  shadow built-ins by name** under Peer-comparison findings: still true, now
+  about `.hrdr/commands`.
+- **Not verified:** no e2e coverage of a _namespaced_ command through the TUI —
+  the picker, the completion popup and the `command` tool are each covered by
+  unit tests, and `commands_picker_inserts_the_invocation` still uses a
+  top-level `ship.md`.
+
 ## Top of the list
 
 The five that were here are all shipped — see

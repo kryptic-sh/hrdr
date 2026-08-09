@@ -1,14 +1,15 @@
 //! The pickers' shared state machine: a filterable, navigable list. Every
-//! picker modal (`/model`, `/resume`, `/theme`, `/effort`, `/skills`, the
+//! picker modal (`/model`, `/resume`, `/theme`, `/effort`, `/commands`, the
 //! `/login` provider list) is a `Selector<T>` over its own choice type with a
 //! fuzzy filter function; only what Enter *does* with the highlighted choice
 //! differs, and that lives in each picker's key handler.
 
 use hrdr_agent::{ModelChoice, filter_model_choices, model_choice_haystack};
 use hrdr_app::{
-    EffortChoice, LoginProviderChoice, SessionMeta, Skill, ThemeChoice, effort_choice_haystack,
-    filter_effort_choices, filter_login_providers, filter_sessions, filter_skills, filter_themes,
-    login_provider_haystack, session_haystack, skill_haystack, theme_choice_haystack,
+    Command, EffortChoice, LoginProviderChoice, SessionMeta, ThemeChoice, command_haystack,
+    effort_choice_haystack, filter_commands, filter_effort_choices, filter_login_providers,
+    filter_sessions, filter_themes, login_provider_haystack, session_haystack,
+    theme_choice_haystack,
 };
 
 pub(crate) struct Selector<T> {
@@ -85,7 +86,7 @@ impl<T> Selector<T> {
 /// The keys every picker shares: Esc/Ctrl+C close, Up/Down/Backspace move the
 /// highlight, and any other non-ctrl char edits the fuzzy filter. Runs the
 /// shared part and reports what kind of key it was so each handler keeps only
-/// its divergent bits (Enter, Ctrl+D, the theme preview, the skill insert).
+/// its divergent bits (Enter, Ctrl+D, the theme preview, the command insert).
 pub(super) enum SelectorKey {
     /// A shared key, fully handled (highlight move or filter edit).
     Handled,
@@ -98,7 +99,7 @@ pub(super) enum SelectorKey {
 
 /// Dispatch the keys every picker shares, mutating the selector for the shared
 /// ones, and report which way the key went so the caller keeps only its
-/// divergent arms (Enter, Ctrl+D, the theme preview, the skill insert).
+/// divergent arms (Enter, Ctrl+D, the theme preview, the command insert).
 pub(super) fn selector_key<T>(
     sel: &mut Option<Selector<T>>,
     key: crossterm::event::KeyEvent,
@@ -180,9 +181,9 @@ pub(crate) fn effort_selector(choices: Vec<EffortChoice>) -> EffortSelector {
     Selector::new(choices, effort_choice_haystack, filter_effort_choices)
 }
 
-pub(crate) type SkillSelector = Selector<Skill>;
-pub(crate) fn skill_selector(skills: Vec<Skill>) -> SkillSelector {
-    Selector::new(skills, skill_haystack, filter_skills)
+pub(crate) type CommandSelector = Selector<Command>;
+pub(crate) fn command_selector(commands: Vec<Command>) -> CommandSelector {
+    Selector::new(commands, command_haystack, filter_commands)
 }
 
 pub(crate) type LoginProviderSelector = Selector<LoginProviderChoice>;

@@ -59,8 +59,8 @@ sudo rpm -i hrdr-*.rpm
   `messages[]` + `tools[]`.
 - **A deliberately small tool set.** `read`, `write`, `edit`, `replace`
   (project-wide substitution with a diff and a `dry_run`), `todo`, `verify`,
-  `fetch`, `search`, `skill` (load one of the user's / project's reusable
-  procedures — see "Skills"), a shell, and any MCP-server tools. More tools is
+  `fetch`, `search`, `command` (load one of the user's / project's reusable
+  procedures — see "Commands"), a shell, and any MCP-server tools. More tools is
   not more capability, it is more to choose between on every turn: a dedicated
   tool earns its place only when it carries a guarantee the shell cannot —
   atomicity, a harness invariant, or something with no shell equivalent. So
@@ -86,7 +86,7 @@ sudo rpm -i hrdr-*.rpm
   `EditorEngine` impls behind an **FSM-agnostic** seam, so a future hjkl
   VSCode/Helix discipline drops in with zero churn.
 - **Sectioned system prompt.** Assembled from markdown fragments compiled in
-  with `include_str!` plus runtime-built sections (skills, environment,
+  with `include_str!` plus runtime-built sections (commands, environment,
   sandbox), pushed least-volatile-first so the cached prompt prefix stays stable
   across agents.
 
@@ -115,7 +115,7 @@ hrdr --vim
 hrdr /new                     # a fresh session, not the auto-resumed one
 hrdr /model                   # open the model picker on the way in
 hrdr /resume                  # pick a session to come back to
-hrdr ':review src/lib.rs'     # invoke a skill
+hrdr ':review src/lib.rs'     # invoke a command
 hrdr '!git status'            # run a shell escape, output into the transcript
 hrdr "why is the build slow"  # open the session with a message to the model
 
@@ -145,46 +145,54 @@ MiB).
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
-typing `/` opens a slash-command menu, `:` invokes a custom skill, and `!` runs
-a shell command directly (`!git status` — output streams into the transcript as
-a tool block and is recorded into the model's context, so the next turn knows
-what you ran and saw; your `!` commands skip hrdr's shell guardrails). All share
-one popup: at most five rows (scroll for more), anchored above the token being
-completed. After a command name + space the popup completes the **argument** too
-— enum values (`/thinking on`, `/timestamps relative`), theme names, session ids
-for `/resume`, file paths for `/edit`/`/add`, and a skill's declared `args:`
-values.
+typing `/` opens a slash-command menu, `:` invokes a custom command, and `!`
+runs a shell command directly (`!git status` — output streams into the
+transcript as a tool block and is recorded into the model's context, so the next
+turn knows what you ran and saw; your `!` commands skip hrdr's shell
+guardrails). All share one popup: at most five rows (scroll for more), anchored
+above the token being completed. After a command name + space the popup
+completes the **argument** too — enum values (`/thinking on`,
+`/timestamps relative`), theme names, session ids for `/resume`, file paths for
+`/edit`/`/add`, and a command's declared `args:` values.
 
-### Skills
+### Commands
 
-A skill is a reusable prompt template: a Markdown file whose body is sent to the
-model when you type `:name [arguments]`. `$ARGUMENTS` in the body is replaced
-with everything after the name (no placeholder → arguments append on their own
-line), and the template's own `@file` / `@agent` mentions expand as usual. Files
-are discovered from `.hrdr/skills/`, `.claude/commands/`, and
-`.opencode/command/` in the project, then `~/.config/hrdr/skills/`,
-`~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
-wins. Optional YAML frontmatter — `name:`, `description:` (multi-line and block
+A command is a reusable prompt template: a Markdown file whose body is sent to
+the model when you type `:name [arguments]`. `$ARGUMENTS` in the body is
+replaced with everything after the name (no placeholder → arguments append on
+their own line), and the template's own `@file` / `@agent` mentions expand as
+usual. Files are discovered from `.hrdr/commands/`, `.claude/commands/`, and
+`.opencode/command/` (or `commands/`) in the project, then
+`~/.config/hrdr/commands/`, `~/.claude/commands/`, and
+`~/.config/opencode/command/` (or `commands/`) — first match by name wins.
+Optional YAML frontmatter — `name:`, `description:` (multi-line and block
 scalars both work), `args:` (a YAML list or a comma-separated string) —
 candidate argument values the completion popup offers after `:name `; and
-`model_invocable:` (default `true`, see below); the file stem names it
-otherwise. `/skills` opens a picker over what's loaded (Enter inserts `:name `
+`model_invocable:` (default `true`, see below); the file's path names it
+otherwise. `/commands` opens a picker over what's loaded (Enter inserts `:name `
 into the input); the transcript shows the raw `:name args` you typed while the
 model receives the expanded prompt.
 
-**The model can invoke a skill too.** Every agent's system prompt lists the
-available skills by name and one-line description (bodies excluded — the listing
-is a menu), and a `skill` tool loads the one it names, `$ARGUMENTS` and all. So
-"review what I changed" reaches for `:review`'s checklist without you typing it,
-and a sub-agent does the same — `skill` is read-only, so read-only profiles
-(`explore`, `review`, `plan`) keep it. A profile whose `tools:` allow-list drops
-`skill` loses the listing with it.
+**Command directories are walked recursively, and a nested file is namespaced by
+its path.** `.hrdr/commands/git/commit.md` is `:git/commit` — the same naming
+opencode uses. The canonical spelling (the listing, the picker, the completion
+popup) uses `/`, but `:` and `.` are accepted as the separator too, so
+`:git/commit`, `:git:commit` and `:git.commit` all reach the same file. Typing
+`:git` narrows the popup to that namespace. A frontmatter `name:` overrides the
+path-derived name outright and is never prefixed with its directory.
 
-`model_invocable: false` in the frontmatter keeps a skill **yours**: unlisted,
-and the tool refuses it, so `:name` is the only way in. Built-in `:release`
-ships marked — its last step pushes a tag, so starting a release is your call.
+**The model can invoke a command too.** Every agent's system prompt lists the
+available commands by name and one-line description (bodies excluded — the
+listing is a menu), and a `command` tool loads the one it names, `$ARGUMENTS`
+and all. So "review what I changed" reaches for `:review`'s checklist without
+you typing it, and a sub-agent does the same — `command` is read-only, so
+read-only profiles (`explore`, `review`, `plan`) keep it. A profile whose
+`tools:` allow-list drops `command` loses the listing with it.
 
-hrdr ships built-in skills that work with zero setup:
+`model_invocable: false` in the frontmatter keeps a command **yours**: unlisted,
+and the tool refuses it, so `:name` is the only way in.
+
+hrdr ships built-in commands that work with zero setup:
 
 - `:audit [low|high]` — audit the codebase for security bugs and correctness
 - `:commit` — commit the working changes with a Conventional Commit message
@@ -207,14 +215,14 @@ hrdr ships built-in skills that work with zero setup:
 - `:work` — work the actionable backlog items, one slice at a time (delegate →
   review → commit); empty backlog → suggest `:sweep`
 
-The built-in bodies live in `crates/hrdr-agent/src/templates/skills/*.md` and
+The built-in bodies live in `crates/hrdr-agent/src/templates/commands/*.md` and
 are baked into the binary by `build.rs` — adding one is adding a file.
 
-They sit last in the discovery order, so a project or user skill file with the
+They sit last in the discovery order, so a project or user command file with the
 same name overrides them.
 
 ```markdown
-## <!-- .hrdr/skills/review.md -->
+## <!-- .hrdr/commands/review.md -->
 
 ## description: focused diff review
 

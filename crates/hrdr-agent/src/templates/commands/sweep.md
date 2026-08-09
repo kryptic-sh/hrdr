@@ -3,10 +3,10 @@ name: sweep
 description: run the review, audit, tidy and perf passes in one sweep
 ---
 
-Run the four quality passes as one sweep. Load each pass's skill with the
-`skill` tool (`name: "review"`, `"audit"`, `"tidy"`, `"perf"`) and follow its
+Run the four quality passes as one sweep. Load each pass's command with the
+`command` tool (`name: "review"`, `"audit"`, `"tidy"`, `"perf"`) and follow its
 procedure in full — never restate any of them here, so a change to a pass takes
-effect without touching this skill. Each pass routes its own report to the
+effect without touching this command. Each pass routes its own report to the
 backlog; let it. When arguments are given, forward them to each pass as its
 target scope. $ARGUMENTS
 

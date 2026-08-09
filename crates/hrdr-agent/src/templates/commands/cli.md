@@ -7,8 +7,8 @@ args: [tool]
 Learn how to drive a command-line tool by reading what the tool itself publishes
 — the help and docs on THIS machine — instead of recalling or guessing its
 interface. The tool you learn is the version actually installed: never outdated,
-never mismatched, and the skill works for any tool on the machine, curated run
-books included.
+never mismatched, and this procedure works for any tool on the machine, curated
+run books included.
 
 `$ARGUMENTS` is the tool to learn (or the task to learn it for — pick the tool
 from the context).

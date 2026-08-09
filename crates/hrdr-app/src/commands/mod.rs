@@ -11,6 +11,11 @@
 //! as a system line. This keeps the layer uniform across a sync-polled frontend
 //! (the TUI) and an async-locked one, which both hold the agent as
 //! `Arc<tokio::sync::Mutex>`.
+//!
+//! hrdr has two kinds of command and this module holds the frontend half of
+//! both: the `/name` slash commands above, and — in [`prompt_commands`] — the
+//! `:name` prompt templates whose discovery and expansion live in
+//! [`hrdr_agent::commands`].
 
 mod compaction;
 mod conversation;
@@ -18,6 +23,7 @@ mod dispatch;
 mod helpers;
 mod host;
 mod model;
+mod prompt_commands;
 mod types;
 
 pub use compaction::*;
@@ -26,6 +32,7 @@ pub use dispatch::*;
 pub use helpers::*;
 pub use host::*;
 pub use model::*;
+pub use prompt_commands::*;
 pub use types::*;
 
 #[cfg(test)]

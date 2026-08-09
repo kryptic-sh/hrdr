@@ -222,7 +222,7 @@ async fn spawn_background(
     };
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
-    // Construction is synchronous fs/config work (profile resolution, skills
+    // Construction is synchronous fs/config work (profile resolution, commands
     // discovery, gate detection), so it runs on the blocking pool rather than
     // occupying a tokio worker. The parent waits for the ack either way — the
     // registration below still happens before the id is returned.
