@@ -143,6 +143,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   normalizations, applies a unique match, and the result says the match was
   fuzzy and shows the diff of what actually changed. Blank-line `old_string` and
   non-unique fuzzy matches still refuse rather than guess.
+- **Slash commands ignore case in their names.** Only the aliases did: `/RESET`
+  and `/Clear` worked while `/CWD`, `/Status`, `/Model` and `/Help` answered
+  "unknown command", because alias resolution folded case for its own match arms
+  and handed unrecognized names back with their original spelling. Every name
+  now resolves the same way. Arguments are untouched — `/cwd /Some/Path` keeps
+  the path's case, as does a session name or a model id.
+- **A `memory` name that slugs to a Windows device name is refused up front.**
+  `con`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` are unusable file names
+  on Windows with or without an extension, so a memory saved under one wrote
+  fine on Unix and failed on Windows with an error naming nothing. The tool now
+  refuses the name on every platform, saying which name and why.
+- **Two `memory` drift backups in the same second no longer overwrite each
+  other.** The `<stem>.<unix_ts>.bak` name is whole seconds, so a second
+  hand-edit detected within the same second silently replaced the first backup;
+  the name is now claimed with a `-1`, `-2` … suffix until one is free.
 
 ## [0.12.0] - 2026-08-07
 

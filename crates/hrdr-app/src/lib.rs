@@ -139,11 +139,18 @@ pub fn is_known_command(cmd: &str) -> bool {
         .any(|(n, _)| resolve_alias(n.trim_start_matches('/')) == c)
 }
 
-/// Resolve a slash-command alias to its canonical name (case-insensitive), so
-/// users coming from other agents can use familiar names. Unknown names pass
-/// through unchanged.
-pub fn resolve_alias(cmd: &str) -> &str {
-    match cmd.to_ascii_lowercase().as_str() {
+/// Resolve a slash-command name to its canonical, lowercase form (aliases
+/// included), so users coming from other agents can use familiar names and no
+/// command cares how it was capitalized. Unrecognized names come back lowercased
+/// and otherwise unchanged.
+///
+/// Lowercasing every name, not just the aliases, is what keeps `/Status` and
+/// `/RESET` behaving alike: the alias arms matched case-insensitively while the
+/// fall-through returned the original spelling, so `/RESET` reached `dispatch` as
+/// `new` and worked, and `/Status` reached it as `Status` and did not.
+pub fn resolve_alias(cmd: &str) -> String {
+    let lower = cmd.to_ascii_lowercase();
+    let canonical = match lower.as_str() {
         // Claude Code / aider names for starting over; /new is opencode's.
         "clear" | "reset" => "new",
         // aider/shell-style directory change.
@@ -160,8 +167,9 @@ pub fn resolve_alias(cmd: &str) -> &str {
         // usage / health variants.
         "usage" => "cost",
         "health" => "doctor",
-        _ => cmd,
-    }
+        _ => return lower,
+    };
+    canonical.to_string()
 }
 
 /// The grouped, aligned `/help` body: a `Commands` header followed by each
@@ -244,6 +252,23 @@ mod tests {
         assert_eq!(resolve_alias("summarize"), "compact");
         assert_eq!(resolve_alias("?"), "help");
         assert_eq!(resolve_alias("model"), "model"); // unknown passes through
+    }
+
+    /// Every name resolves case-insensitively, not just the aliased ones — the
+    /// half that used to fall through with its original spelling and then match
+    /// no `dispatch` arm.
+    #[test]
+    fn canonical_names_resolve_case_insensitively_too() {
+        assert_eq!(resolve_alias("CWD"), "cwd");
+        assert_eq!(resolve_alias("Status"), "status");
+        assert_eq!(resolve_alias("Model"), "model");
+        assert_eq!(resolve_alias("HELP"), "help");
+        // An unknown name is still unknown, just lowercased.
+        assert_eq!(resolve_alias("Frobnicate"), "frobnicate");
+        // …so the frontends' "did you mean a command?" check agrees.
+        assert!(is_known_command("/Status"));
+        assert!(is_known_command("/CWD"));
+        assert!(!is_known_command("/Frobnicate"));
     }
 
     #[test]

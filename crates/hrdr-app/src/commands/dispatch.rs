@@ -14,9 +14,12 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         return false;
     };
     let mut parts = rest.splitn(2, char::is_whitespace);
+    // The command NAME is canonicalized (aliases resolved, case folded); the
+    // argument is not touched — a path, a session name and a model id all carry
+    // their own case.
     let cmd = crate::resolve_alias(parts.next().unwrap_or(""));
     let arg = parts.next().unwrap_or("").trim().to_string();
-    match cmd {
+    match cmd.as_str() {
         "help" => {
             let mut s = crate::help_body_for(|name| host.supports_command(name));
             if let Some(tips) = host.help_tips() {
@@ -925,6 +928,48 @@ mod tests {
         assert!(!dispatch(&mut host, "/no-such-command"));
         assert!(!dispatch(&mut host, "not a command"));
         assert!(!dispatch(&mut host, ""));
+    }
+
+    /// A command's NAME is case-insensitive; its ARGUMENT is left exactly as
+    /// typed.
+    ///
+    /// The two halves used to disagree: `resolve_alias` folded case only to match
+    /// its alias arms and returned the original spelling on fall-through, so
+    /// `/RESET` arrived here as `new` and worked while `/Status` arrived as
+    /// `Status` and fell out as an unknown command. Folding the argument too
+    /// would be the opposite defect — a path, a session name and a model id all
+    /// mean something different in lower case.
+    #[tokio::test]
+    async fn command_names_ignore_case_and_arguments_keep_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        // Canonical names (the half that did not work) and aliases (the half
+        // that did), in several spellings.
+        for name in ["/STATUS", "/Status", "/CWD", "/Help", "/RESET", "/Cd"] {
+            assert!(dispatch(&mut host, name), "{name} must be recognized");
+        }
+
+        // The argument survives untouched: a session name …
+        assert!(dispatch(&mut host, "/NEW ReleaseNotes"));
+        assert!(
+            host.info_log
+                .last()
+                .is_some_and(|l| l.contains("new session 'ReleaseNotes'")),
+            "the session name must keep its case: {:?}",
+            host.info_log
+        );
+
+        // … and a path, which `/cwd` echoes back when it does not exist.
+        let missing = dir.path().join("MixedCase");
+        assert!(dispatch(&mut host, &format!("/CWD {}", missing.display())));
+        assert!(
+            host.info_log
+                .last()
+                .is_some_and(|l| l.contains("not a directory") && l.contains("MixedCase")),
+            "the path must keep its case: {:?}",
+            host.info_log
+        );
     }
 
     /// The busy guards fire — the "check that cannot fail" shape nothing else

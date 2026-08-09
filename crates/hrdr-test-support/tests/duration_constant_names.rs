@@ -118,14 +118,25 @@ fn const_decl(line: &str) -> Option<(&str, &str)> {
     Some((name, ty))
 }
 
-/// Every `.rs` file under each workspace crate's `src/` and `tests/`.
+/// Every `.rs` file under each workspace member crate.
 fn rust_sources() -> Vec<PathBuf> {
-    let root = hrdr_test_support::workspace_root();
-    let mut out = Vec::new();
-    for dir in ["crates", "apps"] {
-        collect(&root.join(dir), &mut out);
-    }
+    let out = sources_of(&hrdr_test_support::workspace_crates());
     assert!(!out.is_empty(), "the workspace has Rust sources");
+    out
+}
+
+/// Every `.rs` file under each of `crates`.
+///
+/// The crate list comes from `[workspace] members`, not from what `crates/` and `apps/`
+/// happen to hold, so a directory left behind by a removed crate — build output its
+/// deletion could not take with it — is governed by nothing and scanned by nothing. That
+/// is the same rule `every_test_binary_is_sandboxed` follows, through the same
+/// [`hrdr_test_support::workspace_crates`].
+fn sources_of(crates: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for krate in crates {
+        collect(krate, &mut out);
+    }
     out
 }
 
@@ -146,6 +157,45 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// The scan covers the workspace's member crates and nothing else, so a directory
+/// left behind by a removed crate cannot fail (or quietly pass) this rule.
+///
+/// Against a fixture workspace, because this one has nothing out of scope in it —
+/// the leftover `crates/hrdr-ui/` that prompted the rule was deleted long ago, and a
+/// claim about scope that is only ever exercised on a tree where every directory is
+/// in scope is a claim nothing checks.
+#[test]
+fn a_directory_no_member_names_is_not_scanned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\n    \"crates/live\",\n]\n",
+    )
+    .unwrap();
+    // Two crate directories, identical but for the manifest naming one of them.
+    for krate in ["live", "ghost"] {
+        let dir = root.join("crates").join(krate);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            dir.join("src").join(format!("{krate}.rs")),
+            "const A_TIMEOUT: u64 = 5;\n",
+        )
+        .unwrap();
+    }
+
+    let found = sources_of(&hrdr_test_support::workspace_crates_in(root));
+    assert!(
+        found.iter().any(|p| p.ends_with("live.rs")),
+        "a member crate's sources are scanned: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|p| p.ends_with("ghost.rs")),
+        "a directory no member names must not be scanned: {found:?}"
+    );
 }
 
 /// The scan is only worth running if it can fail. These pin the two shapes it

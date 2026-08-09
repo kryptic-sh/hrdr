@@ -234,7 +234,7 @@ impl super::App {
 fn file_arg_token(input: &str) -> Option<(usize, String)> {
     let rest = input.strip_prefix('/')?;
     let ws = rest.find(char::is_whitespace)?;
-    if !matches!(resolve_alias(&rest[..ws]), "edit" | "add") {
+    if !matches!(resolve_alias(&rest[..ws]).as_str(), "edit" | "add") {
         return None;
     }
     let arg_start = command_arg_offset(rest)?;

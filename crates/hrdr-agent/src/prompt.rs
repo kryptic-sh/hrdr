@@ -81,7 +81,8 @@ mod frag {
 /// 2. **Global AGENTS.md** ([`global_agent_docs_section`]) — the user-level file,
 ///    identical in every project.
 /// 3. **Global memory** ([`crate::global_memory_section`]) — likewise.
-/// 4. **Project AGENTS.md** ([`project_agent_docs_section`]) — the cwd walk.
+/// 4. **Project AGENTS.md** ([`project_agent_docs_section`]) — the working
+///    directory's own file.
 /// 5. **Project memory** ([`crate::project_memory_section`]) — changes when the
 ///    agent saves a note.
 /// 6. **Capability group** ([`capability_sections`]) — write/shell/delegate/
@@ -363,8 +364,8 @@ pub fn global_agent_docs_section(docs: Option<&str>) -> String {
     )
 }
 
-/// The project's `AGENTS.md` instructions as a prompt section — the cwd walk,
-/// outer-first, so a nearer file appears later and takes precedence.
+/// The project's `AGENTS.md` instructions as a prompt section — the working
+/// directory's own file, which is the only one [`gather_agent_docs`] reads.
 ///
 /// Separate from [`global_agent_docs_section`] so switching projects still reuses
 /// the global bytes; see [`AgentDocs`].
@@ -863,11 +864,11 @@ fn read_agent_doc(path: &Path) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
-/// the filesystem root, plus global instruction files from standard locations.
-/// Less specific files (system, then user-global, then ancestors) come first so
-/// nearer files override by appearing later. Returns `None` if nothing is found.
-/// Project instructions split by scope, so each can be its own prompt section.
+/// The instruction files [`gather_agent_docs`] found, split by scope so each can
+/// be its own prompt section: the operator's single global file, and the working
+/// directory's own `AGENTS.md` — that directory only, never an ancestor (the
+/// reasoning is on [`gather_agent_docs`]). The global one is the less specific of
+/// the two, so it is emitted first and the project file overrides it.
 ///
 /// The split exists for the prompt cache: the global file is the same in every
 /// project, so keeping it in a section of its own means switching projects still
@@ -879,7 +880,7 @@ pub struct AgentDocs {
     /// The single global instruction file, if any — least specific, so it is
     /// emitted first and a nearer file overrides it.
     pub global: Option<String>,
-    /// The `AGENTS.md` files found walking cwd up to the root, outer-first.
+    /// The working directory's own `AGENTS.md`, if it has one.
     pub project: Option<String>,
     /// Instruction files that were found and deliberately **not** loaded — see
     /// [`SkippedAgentDoc`]. Empty for every ordinary project; non-empty is
@@ -3199,7 +3200,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_agent_docs_loads_project_via_cwd_walk() {
+    fn gather_agent_docs_loads_the_cwds_own_file() {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("project");
@@ -3208,8 +3209,8 @@ mod tests {
         writeln!(f, "Project-level").unwrap();
 
         // No env mutation: `gather_agent_docs` collects *all* docs (project +
-        // any global), and we only assert the project one was picked up by the
-        // cwd walk — true regardless of the machine's global files. Mutating
+        // any global), and we only assert the project one was picked up from the
+        // working directory — true regardless of the machine's global files. Mutating
         // HOME/XDG here used to race concurrent tests (`set_var` is process-wide
         // and unsafe under any parallel getenv), a source of CI-only flakes.
         let docs = gather_agent_docs(&proj, ProjectInstructions::Load)

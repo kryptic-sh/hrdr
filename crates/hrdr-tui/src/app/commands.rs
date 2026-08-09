@@ -14,12 +14,13 @@ impl super::App {
             return false;
         };
         let mut parts = rest.splitn(2, char::is_whitespace);
+        // Canonical, case-folded name; the argument keeps its own case.
         let cmd = resolve_alias(parts.next().unwrap_or(""));
         let arg = parts.next().unwrap_or("").trim();
         // Commands with a richer TUI rendering or that touch terminal-only state
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so every frontend runs one implementation).
-        match cmd {
+        match cmd.as_str() {
             "reload" => self.reload_cmd(),
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),

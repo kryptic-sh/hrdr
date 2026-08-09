@@ -325,8 +325,9 @@ fn require_field<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str> 
 }
 
 /// Slugify a memory `name` to a safe file stem: lowercase, `[a-z0-9-]` only,
-/// collapsed/trimmed dashes. Rejects path separators and empty results so a name
-/// can never escape the memory root.
+/// collapsed/trimmed dashes. Rejects path separators, empty results and Windows
+/// device names so a name can never escape the memory root — or become a file
+/// one of the supported platforms refuses to create.
 fn safe_stem(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -339,7 +340,40 @@ fn safe_stem(name: &str) -> Result<String> {
     if slug.is_empty() {
         bail!("memory name '{name}' has no usable characters for a slug");
     }
+    // Refused on every platform, not only Windows, and refused rather than
+    // rewritten. Rewriting (`con` → `con-memory`, say) would move an existing
+    // `con.md` to a different path with nothing telling the user their memory was
+    // left behind, and a store synced between machines would then hold two names
+    // for one memory. The refusal names the fix instead. What it costs: a `con.md`
+    // written before this check is no longer reachable through the tool — rename
+    // the file on disk — but it still lists in the index, so it cannot go missing
+    // in silence.
+    if is_windows_device_name(&slug) {
+        bail!(
+            "memory name '{name}' slugs to '{slug}', which Windows reserves as a device name \
+             (with any extension) — pick another name"
+        );
+    }
     Ok(slug)
+}
+
+/// Whether `slug` is one of the names Windows reserves for a device: `CON`,
+/// `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`. Reserved case-insensitively
+/// and with any extension, so `con.md` is as unusable as `con`.
+///
+/// Only whole-slug matches can occur: [`slugify`] emits `[a-z0-9-]`, and turns
+/// the dot of a name like `con.md` into a dash (`con-md`), which is not reserved.
+fn is_windows_device_name(slug: &str) -> bool {
+    if matches!(slug, "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let Some(port) = slug
+        .strip_prefix("com")
+        .or_else(|| slug.strip_prefix("lpt"))
+    else {
+        return false;
+    };
+    matches!(port.as_bytes(), [b'1'..=b'9'])
 }
 
 fn slugify(name: &str) -> String {
@@ -461,8 +495,9 @@ fn emit_memory(mem: &Memory) -> String {
 /// `emit_memory(&parse_memory(content, stem)) == content`. A human hand-edit
 /// or a sibling hrdr session's rewrite breaks that round-trip. When `content`
 /// still round-trips (or the file does not exist — nothing to preserve),
-/// return `Ok(None)`. Otherwise copy the file to a `<stem>.<unix_ts>.bak` name
-/// in the same directory and return `Ok(Some(<backup file name>))`.
+/// return `Ok(None)`. Otherwise copy the file to a free `<stem>.<unix_ts>.bak`
+/// name in the same directory (see [`claim_backup_name`]) and return
+/// `Ok(Some(<backup file name>))`.
 ///
 /// The backup name MUST NOT end in `.md`: [`load_memories`] loads every file
 /// whose extension is `md`, so a `.bak.md` name would be loaded as a memory
@@ -479,12 +514,52 @@ fn backup_if_drifted(file: &Path, content: &str, stem: &str) -> Result<Option<St
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup_name = format!("{stem}.{unix_ts}.bak");
-    let backup = file.with_file_name(&backup_name);
-    if let Err(e) = std::fs::copy(file, &backup) {
-        bail!("refusing to overwrite hand-edited memory '{stem}' — could not back it up: {e}");
+    let backup_name = claim_backup_name(file, stem, unix_ts)
+        .and_then(|name| std::fs::copy(file, file.with_file_name(&name)).map(|_| name));
+    match backup_name {
+        Ok(name) => Ok(Some(name)),
+        Err(e) => {
+            bail!("refusing to overwrite hand-edited memory '{stem}' — could not back it up: {e}")
+        }
     }
-    Ok(Some(backup_name))
+}
+
+/// How many drifted copies of one memory a single second can hold before
+/// [`claim_backup_name`] gives up. Reaching it means something is rewriting the
+/// same memory in a loop, which the caller should hear about rather than have
+/// papered over.
+const MAX_BACKUPS_PER_SECOND: u32 = 100;
+
+/// Reserve an unused `<stem>.<unix_ts>.bak` next to `file`, adding a `-1`, `-2`
+/// … suffix until one is free, and return the name.
+///
+/// The timestamp is whole seconds, so two drift detections in the same second
+/// name the same file — and a plain copy would make the second backup eat the
+/// first, which is the one thing a backup must not do. The name is *claimed*
+/// with `create_new` rather than tested with `exists` so that a sibling hrdr
+/// session racing for the same name loses the race instead of silently winning
+/// it; the caller's copy then overwrites the empty file it just created (and
+/// `fs::copy` carries the source's permission bits onto it).
+fn claim_backup_name(file: &Path, stem: &str, unix_ts: u64) -> std::io::Result<String> {
+    for n in 0..MAX_BACKUPS_PER_SECOND {
+        let name = match n {
+            0 => format!("{stem}.{unix_ts}.bak"),
+            n => format!("{stem}.{unix_ts}-{n}.bak"),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(file.with_file_name(&name))
+        {
+            Ok(_) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{stem} already has {MAX_BACKUPS_PER_SECOND} backups from this second"),
+    ))
 }
 
 /// Per-root parsed-memory cache: scope root → file stem → (mtime, memory).
@@ -1179,6 +1254,125 @@ mod tests {
         let index = std::fs::read_to_string(proj.join("MEMORY.md")).unwrap();
         assert!(index.contains("deploy.md"), "{index}");
         assert!(!index.contains(".bak"), "{index}");
+    }
+
+    /// Two drifts in the same second keep both backups. The whole-second
+    /// timestamp is the collision, so the name claim is pinned directly with a
+    /// fixed one — asserting through the clock would only exercise it on runs
+    /// where both edits happened to land in the same second.
+    #[test]
+    fn a_second_backup_in_the_same_second_does_not_replace_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deploy.md");
+        std::fs::write(&file, "first").unwrap();
+
+        let first = claim_backup_name(&file, "deploy", 1_700_000_000).unwrap();
+        std::fs::copy(&file, file.with_file_name(&first)).unwrap();
+        std::fs::write(&file, "second").unwrap();
+        let second = claim_backup_name(&file, "deploy", 1_700_000_000).unwrap();
+        std::fs::copy(&file, file.with_file_name(&second)).unwrap();
+
+        assert_eq!(first, "deploy.1700000000.bak");
+        assert_eq!(second, "deploy.1700000000-1.bak");
+        // Both extensions are `bak`, so neither is loaded as a memory.
+        assert!(second.ends_with(".bak"), "{second}");
+        assert_eq!(
+            std::fs::read_to_string(file.with_file_name(&first)).unwrap(),
+            "first",
+            "the earlier backup must survive the later one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.with_file_name(&second)).unwrap(),
+            "second"
+        );
+    }
+
+    /// The end-to-end shape of the same thing: two drifted edits leave two
+    /// backups, each holding the content it preserved.
+    #[tokio::test]
+    async fn two_drifted_edits_leave_two_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+        let proj = dir.path().join("project");
+
+        tool.execute(
+            json!({"action": "write", "name": "deploy", "description": "original"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let file = proj.join("deploy.md");
+        for marker in ["# first hand edit", "# second hand edit"] {
+            // The emitter always ends the file with a newline, so a marker
+            // appended without one breaks the round-trip the guard checks —
+            // twice over, unlike a marker that leaves the file well-formed.
+            let mut hand_edited = std::fs::read_to_string(&file).unwrap();
+            hand_edited.push_str(marker);
+            std::fs::write(&file, &hand_edited).unwrap();
+            tool.execute(
+                json!({"action": "edit", "name": "deploy", "description": marker}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+
+        let backups = backup_paths(&proj);
+        assert_eq!(backups.len(), 2, "each drift keeps its own backup");
+        let saved: Vec<String> = backups
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect();
+        assert!(
+            saved.iter().any(|s| s.contains("description: original")),
+            "the first drift's content must not have been overwritten: {saved:?}"
+        );
+        assert!(
+            saved.iter().any(|s| s.contains("# second hand edit")),
+            "{saved:?}"
+        );
+    }
+
+    /// Windows reserves a handful of stems as device names, with or without an
+    /// extension. They are refused everywhere: the alternative is a memory that
+    /// writes on Unix and fails on Windows with an error naming neither.
+    #[tokio::test]
+    async fn windows_device_names_are_refused_as_memory_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        for name in ["con", "CON", "con.md", "aux", "NUL", "com1", "lpt9"] {
+            let r = tool
+                .execute(
+                    json!({"action": "write", "name": name, "description": "d"}),
+                    &ctx,
+                )
+                .await;
+            // `con.md` slugs to `con-md`, which is a fine file name — the rest
+            // slug to the reserved stem itself.
+            if name == "con.md" {
+                assert!(r.is_ok(), "'{name}' slugs to con-md, which is usable");
+                continue;
+            }
+            let err = match r {
+                Err(e) => format!("{e}"),
+                Ok(ok) => panic!("'{name}' must be refused, got: {ok}"),
+            };
+            assert!(err.contains("device name"), "'{name}': {err}");
+        }
+
+        // Names that merely start with a reserved word are not reserved.
+        for name in ["console", "com10", "auxiliary"] {
+            tool.execute(
+                json!({"action": "write", "name": name, "description": "d"}),
+                &ctx,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("'{name}' is not a device name: {e}"));
+        }
     }
 
     #[tokio::test]

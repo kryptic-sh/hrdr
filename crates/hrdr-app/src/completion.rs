@@ -248,7 +248,7 @@ pub fn arg_completions(
             .map(|a| (a.clone(), String::new()))
             .collect()
     } else {
-        match resolve_alias(cmd) {
+        match resolve_alias(cmd).as_str() {
             "statusbar" => set(&[
                 ("none", "hide the status bar"),
                 ("truncate", "one line"),

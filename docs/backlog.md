@@ -141,11 +141,10 @@ backlog item. Everything else was re-verified against the tree and still stands:
 the per-choice haystack half of perf 2026-08-04 #9 (`selector.rs::refilter`
 still filters on the fly), tidy 2026-08-04 #9 (`apply_cache_breakpoints` still
 re-exported from `hrdr-llm`'s `lib.rs`), correctness 2026-08-04 #1 (memory
-descriptions still emit unquoted), the two dispatch.rs findings (`/cwd` still
-resolves against `host.cwd()` while writing `host.agent()`; `resolve_alias`
-still returns the original case on fall-through, so `/CWD` still misses), the
-compaction `session_name_from` item, and the AUR RPC still reporting `0.10.0-1`
-for v0.11.0.
+descriptions still emit unquoted), the dispatch.rs `/cwd` finding (`/cwd` still
+resolves against `host.cwd()` while writing `host.agent()`), the compaction
+`session_name_from` item, and the AUR RPC still reporting `0.10.0-1` for
+v0.11.0.
 
 **Pruned again 2026-08-07, third pass same day, by the backlog work session**:
 the compaction `session_name_from` item (`9692197`), perf 2026-08-04 #9
@@ -340,10 +339,8 @@ forever, giving a spurious permanent busy error; `openai_refresh` requires
 a re-login; the wrap-up round shares `overflow_compacted`
 (`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
 turn; `cost_partial` is a process-lifetime latch (`budget.rs:44`) that
-`reset_session_cost` doesn't clear; `memory` `safe_stem` allows Windows-reserved
-device names (`con`, `aux`, `nul`) — a confusing Windows-only write failure;
-`parse_scalar` quote-stripping loses legitimately edge-quoted values (cosmetic
-until finding 1's edit truncates).
+`reset_session_cost` doesn't clear; `parse_scalar` quote-stripping loses
+legitimately edge-quoted values (cosmetic until finding 1's edit truncates).
 
 **Coverage** — walked in full: hrdr-llm sse/retry/capped_read/catalog/types/
 client; hrdr-agent session/transcript_log/transcript/compaction/budget/usage/
@@ -517,19 +514,14 @@ untrusted directory; inert today because `JAIL_TOOLS`
 `verify` and the runner line is skipped when `verify` isn't registered
 (`prompt.rs:582-589`), but it is the one instruction surface the trust gate does
 not protect, and it becomes a live injection vector if jail ever gains
-`verify`/`shell`; `backup_if_drifted` (`hrdr-tools/src/memory.rs`) — `unix_ts`
-is `as_secs`, so two drift-detections in the same second produce the same `.bak`
-and the second copy silently overwrites the first (never clobbers a memory — the
-later copy is the more recent drift); `atomic_write` write-path TOCTOU
-(`tools/mutation.rs:149-154` — admitted in the comment; requires a hostile
-process racing the agent's own edits); MCP tool descriptions ride into the tools
-cache block unwrapped (`mcp/client.rs:366-370`, `Box::leak`) — a compromised
-operator-installed server can steer the model through its descriptions, where
-results are wrapped as untrusted; `/export` writes to any absolute path the user
-names (`conversation.rs:29` — equivalent to the user's own shell redirection,
-but the transcript contains model output); `AgentDocs` doc comment
-(`prompt.rs:817-827`) still describes walking cwd→root, stale since the trust
-gate (doc drift only).
+`verify`/`shell`; `atomic_write` write-path TOCTOU (`tools/mutation.rs:149-154`
+— admitted in the comment; requires a hostile process racing the agent's own
+edits); MCP tool descriptions ride into the tools cache block unwrapped
+(`mcp/client.rs:366-370`, `Box::leak`) — a compromised operator-installed server
+can steer the model through its descriptions, where results are wrapped as
+untrusted; `/export` writes to any absolute path the user names
+(`conversation.rs:29` — equivalent to the user's own shell redirection, but the
+transcript contains model output).
 
 **Coverage** — walked in full (half A): `fs`, `trust`, `agents_dir`, `skills`,
 `hooks`, `pane`, `config` (all 2750 lines), `prompt` (agent-docs, sections,
@@ -1977,14 +1969,6 @@ sections above.
   feature, not a missing test.
 - **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
   `catalog.rs`; hrdr-tui / hrdr-tools / hrdr-app entirely.
-- **`duration_constant_names.rs` walks `crates/` on disk, not
-  `[workspace] members`.** Its `rust_sources` recurses `crates` and `apps`,
-  skipping only `target`, so a directory left behind by a removed crate is
-  scanned. The leftover that prompted this (`crates/hrdr-ui/`, build output the
-  crate's deletion could not take with it) has since been removed from disk, so
-  nothing is mis-scanned today — but the rule's scope is still "whatever is on
-  disk", unlike `every_test_binary_is_sandboxed.rs`, which parses `members` and
-  documents why. Verified by reading both, not by a failing run.
 
 ---
 
@@ -2021,12 +2005,6 @@ then repoints the global chrome as if main had moved. A bare `/cwd` afterwards
 contradicts the status bar. `/status` has the same split — main's cwd beside the
 active agent's message count. Needs a call: derive the base from `host.agent()`,
 or add `active_cwd()` so both halves name one agent.
-
-**Canonical names are case-sensitive, aliases are not.** `resolve_alias`
-lowercases only for its match arms and returns the original on fall-through, so
-`/CD`, `/RESET`, `/Clear` work while `/CWD`, `/Status`, `/Model`, `/Help` answer
-"unknown command". Two spellings of one command behave oppositely. Decide which
-way, then pin it — neither side has a test, so any fix could regress silently.
 
 Smaller, each verified: `/export`'s format/overwrite/token handling, `/effort`
 applying a level, `/login`/`/skills` arguing, `/doctor`'s pre-spawn probes were

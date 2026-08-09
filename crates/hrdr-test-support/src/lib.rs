@@ -171,6 +171,60 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Every crate directory listed in the root manifest's `[workspace] members`.
+///
+/// Members only, deliberately — the workspace is what cargo builds, and a directory left
+/// behind on disk by a removed crate is not part of it. Both workspace-walking rules
+/// (`every_test_binary_is_sandboxed`, `duration_constant_names`) go through here so
+/// neither can quietly disagree with the other about what "the workspace" means. A crate
+/// outside it (`[workspace] exclude`) is never compiled or run by the workspace
+/// `cargo test`, so no rule about test binaries or source conventions has anything to say
+/// about it. The root manifest currently has no `exclude` key at all.
+///
+/// The flip side: a crate that is missing from `members` is not scanned. That is the same
+/// condition as not being tested at all, so it costs no coverage — but it does mean adding
+/// a crate to the workspace is what enrolls it here.
+pub fn workspace_crates() -> Vec<PathBuf> {
+    workspace_crates_in(&workspace_root())
+}
+
+/// [`workspace_crates`] for an arbitrary workspace root — what lets the rules that use it
+/// be tested against a fixture workspace instead of only against this repo.
+pub fn workspace_crates_in(root: &Path) -> Vec<PathBuf> {
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest is readable");
+    let mut out: Vec<PathBuf> = workspace_members(&manifest)
+        .into_iter()
+        .map(|m| root.join(m))
+        .filter(|dir| dir.join("Cargo.toml").is_file())
+        .collect();
+    assert!(!out.is_empty(), "the workspace has member crates");
+    out.sort();
+    out
+}
+
+/// The `members = [...]` paths from the workspace manifest.
+///
+/// A deliberately small parser instead of a toml dependency: the array is a flat list of
+/// quoted relative paths, so every odd field of a split on `"` is one entry. Globs would
+/// slip through unexpanded — the workspace does not use them, and a stray `*` in a path
+/// simply fails the `Cargo.toml` existence filter above rather than scanning the wrong dir.
+fn workspace_members(manifest: &str) -> Vec<String> {
+    let after = manifest
+        .split_once("members = [")
+        .expect("the root manifest declares [workspace] members")
+        .1;
+    let list = after
+        .split_once(']')
+        .expect("the members array is closed")
+        .0;
+    list.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect()
+}
+
 /// The throwaway root the ctor installed for this process.
 ///
 /// Panics if the ctor did not run — which means this crate was not linked, and the test
