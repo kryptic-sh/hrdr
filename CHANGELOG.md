@@ -131,6 +131,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A `memory` description is no longer truncated to its first line.** The tool
+  wrote and read frontmatter as one unquoted `key: value` line each, so a
+  `description` containing a newline was written across two lines and everything
+  that read it back — the `MEMORY.md` index, `search`, recall, and `edit`
+  re-emitting the memory — saw only the first. The lost half was unrecoverable:
+  each edit rewrote the file, tripped the drift guard, and left a
+  `<name>.<ts>.bak` that the tool never loads. A description that began and
+  ended with a quote character lost its quotes the same way. Memory frontmatter
+  is now strict YAML, read and written with `serde_yaml_ng`, so a value holding
+  a `: `, a newline, an edge quote or a leading `-`/`#`/`%` round-trips exactly
+  and the guard stops firing. Frontmatter the parser rejects — an unquoted
+  `description: repo: note`, or a `---` block that never closes — is reported
+  rather than guessed at: `view` and `edit` fail with the file name and the
+  parser's own line and column, `write` still replaces the file and keeps the
+  unparsable original as a `<name>.<ts>.bak`, and a listing (the `MEMORY.md`
+  index, the scope listing, `search`) skips the file while naming it and the
+  count, so one bad file can neither take down the store nor vanish from it
+  silently. A memory file with **no** frontmatter at all still works unchanged:
+  it reads as `type: reference` with the description taken from its first
+  non-empty line.
+- **A `memory` name too long for a file name is refused with the limit**, rather
+  than reaching the filesystem and coming back as
+  `File name too long (os error 36)` — an error naming neither the tool nor the
+  memory.
 - **A git global flag no longer walks straight through the shell guardrails.**
   Every git rule was anchored on an adjacent `git <subcommand>`, and git's
   global options go _between_ the two — so `git -C /repo add -A`,
