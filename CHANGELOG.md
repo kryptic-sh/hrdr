@@ -118,8 +118,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rows — so a typed character only runs the subsequence walk against the stored
   strings.
 
+- **Guardrails for a delete the model cannot see the target of.** A `rm` whose
+  argument is a whole `$VAR`, `${VAR}`, `$(…)` or `` `…` ``, a `find … -delete`,
+  and a pipeline ending in `xargs rm` are now refused with the remedy: run the
+  `ls`/`find` alone, read what it matched, then delete by name. A variable used
+  as the _prefix_ of a longer path is untouched — `rm -rf "$TMPDIR/build"` and
+  `rm -f "$out/x.o"` name a specific thing and are ordinary work — and so is a
+  literal path such as `rm -rf ~/Projects/scratch`, deliberately: refusing every
+  path under home stops far more real work than it saves. `rm` has to be the
+  program being run, so `docker run --rm $IMAGE` — where `--rm` is a flag and
+  nothing is deleted — is unaffected.
+
 ### Fixed
 
+- **A git global flag no longer walks straight through the shell guardrails.**
+  Every git rule was anchored on an adjacent `git <subcommand>`, and git's
+  global options go _between_ the two — so `git -C /repo add -A`,
+  `git --no-pager push --force`, `git -c core.hooksPath=/dev/null commit -am x`
+  and the rest were refused in their bare form and allowed with one flag in
+  front. The gap now matches git's global options for every rule. It matches
+  options specifically, not "anything", so a subcommand name in argument
+  position still passes: `git grep add -A 3` and `git grep restore .` are
+  ordinary searches, not staging and not a restore.
+- **`git restore`/`git checkout` on the whole tree is caught in every
+  spelling.** Only a bare `checkout .`/`restore .` was blocked, so
+  `git restore --staged .`, `--worktree .`, `--source=HEAD .`, `-SW .`,
+  `git checkout -f .`, `git checkout HEAD .`, `git restore ../` and git's
+  repo-root pathspec `git checkout -- :/` all discarded the tree unchallenged.
+  The single-path form (`git restore -- <file>`, the supported way for the model
+  to undo its own edit after reading the diff) is deliberately still allowed.
+- **`git add -p` is refused like `git add -i`.** The prompt named patch mode as
+  interactive; the rule only looked for an `i`, so `-p`/`--patch` on `add`,
+  `commit` and `rebase` reached a shell with no TTY.
+- **Piping a downloaded script into a non-shell interpreter is blocked too.**
+  `wget -qO- <url> | python3` — and `| perl`, `| ruby`, `| node` — ran
+  downloaded code exactly as `| sh` did, and only the shells were covered. The
+  interpreter must be the program the pipe runs, so `curl <url> | grep python`
+  and `curl <url> | jq '.node'` are unaffected.
+- **A `[[guardrails]]` entry whose regex does not compile is now reported.** It
+  was dropped silently, leaving a rule the user could read in `config.toml`,
+  enforcing nothing, with no way to find out. Startup is still lenient — the
+  session comes up — but the rejected pattern is raised as a notice and listed
+  by `/guardrails` as `NOT ACTIVE`.
 - **A directory you declined at the trust gate no longer supplies commands or
   skills to the session anyway.** Declining opens the session jailed, and the
   agent already refused the working tree's `.hrdr/commands`, `.claude/skills`

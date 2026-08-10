@@ -1015,6 +1015,12 @@ pub struct Agent {
     /// already renders; an interactive switch drains it sooner
     /// ([`Agent::take_pending_notices`]) so the answer arrives with the keystroke.
     pending_notices: Vec<String>,
+    /// `[[guardrails]]` config entries whose regex did not compile, as
+    /// `(pattern, error)`. They enforce nothing; kept so [`Agent::guardrail_specs`]
+    /// can list them as inactive rather than leave the user reading a
+    /// `/guardrails` output their rule is simply missing from. The notice at
+    /// construction is the other half.
+    invalid_guardrails: Vec<(String, String)>,
     /// Sanitized live model state shared with introspection and delegation tools.
     delegation_runtime: SharedDelegationRuntime,
     /// Sub-agents this agent has delegated to and is still holding — the
@@ -1819,16 +1825,30 @@ impl Agent {
             }
         }
         let event_hooks = Arc::new(event_hooks);
-        // User guardrails layer on top of the built-in set; an invalid regex
-        // is skipped (lenient, like the rest of config parsing).
+        // User guardrails layer on top of the built-in set. An invalid regex is
+        // skipped rather than fatal (lenient, like the rest of config parsing) —
+        // but never silently: a rule the user believes is enforcing something,
+        // and which is not there, is worse than no rule at all. Each rejected
+        // pattern is kept, queued below as a startup notice and listed by
+        // `/guardrails` (see [`Agent::guardrail_specs`]) as not active.
+        let mut invalid_guardrails: Vec<(String, String)> = Vec::new();
         if !config.guardrails.is_empty() {
             let mut rails = hrdr_tools::default_guardrails();
-            rails.extend(
-                config
-                    .guardrails
-                    .iter()
-                    .filter_map(|g| hrdr_tools::Guardrail::new(&g.pattern, &g.message).ok()),
-            );
+            for g in &config.guardrails {
+                match hrdr_tools::Guardrail::new(&g.pattern, &g.message) {
+                    Ok(rail) => rails.push(rail),
+                    Err(e) => invalid_guardrails.push((
+                        g.pattern.clone(),
+                        // `regex::Error` renders as several lines with a caret
+                        // under the offending byte; flattened it still names the
+                        // pattern and the syntax problem, and fits a notice line.
+                        e.to_string()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )),
+                }
+            }
             ctx.guardrails = Arc::new(rails);
         }
         let project_docs = gather_agent_docs(&config.cwd, project_instructions);
@@ -1911,6 +1931,15 @@ impl Agent {
         // An `AGENTS.md` hrdr found and did not load is a user instruction silently
         // missing from the prompt — the same channel carries it, for the same reason.
         pending_notices.extend(project_docs.skipped.iter().map(|s| s.notice()));
+        // A `[[guardrails]]` entry whose regex does not compile blocks nothing,
+        // and from the outside that is indistinguishable from a rule that is
+        // working — the same channel, for the same reason.
+        pending_notices.extend(invalid_guardrails.iter().map(|(pattern, err)| {
+            format!(
+                "guardrail: `{pattern}` is not a valid regex, so this `[[guardrails]]` rule is \
+                 NOT in effect and the commands you meant it to block are allowed — {err}"
+            )
+        }));
         // `--sandbox jail` asked for the audit posture and this agent cannot have it:
         // jail's tool set has no shell, no writers and no network, so a
         // write-capable agent under it could not work at all, and `effective_sandbox`
@@ -1963,6 +1992,7 @@ impl Agent {
             resolved,
             providers: config.providers,
             pending_notices,
+            invalid_guardrails,
             delegation_runtime,
             registry,
             live_home: None,
@@ -2635,12 +2665,20 @@ impl Agent {
     }
 
     /// Active shell guardrails as `(pattern, message)` pairs — built-ins plus
-    /// any `[[guardrails]]` config extras (for `/guardrails`).
+    /// any `[[guardrails]]` config extras (for `/guardrails`) — followed by any
+    /// config entry whose regex did not compile, marked as not active. A rule
+    /// that silently failed to load looks exactly like one that was never
+    /// written; listing it is what tells the two apart.
     pub fn guardrail_specs(&self) -> Vec<(String, String)> {
         self.ctx
             .guardrails
             .iter()
             .map(|g| (g.pattern.as_str().to_string(), g.message.clone()))
+            .chain(
+                self.invalid_guardrails
+                    .iter()
+                    .map(|(pattern, err)| (pattern.clone(), format!("NOT ACTIVE — {err}"))),
+            )
             .collect()
     }
 
@@ -7749,6 +7787,76 @@ mod tests {
         assert_eq!(cfg.guardrails.len(), 2);
         assert_eq!(cfg.guardrails[0].message, "no recursive force-remove");
         assert_eq!(cfg.guardrails[1].pattern, r"\bnpm\s+publish\b");
+    }
+
+    /// A `[[guardrails]]` entry with a typo in its regex used to be dropped with
+    /// `.ok()` and never mentioned again: the user reads their rule in
+    /// `config.toml`, `/guardrails` does not list it, and the command they meant
+    /// to block runs. Startup stays lenient — the session still comes up — but
+    /// the failure is on the notice channel and in `/guardrails`.
+    #[test]
+    fn an_invalid_user_guardrail_is_reported_rather_than_silently_dropped() {
+        let cfg = AgentConfig {
+            guardrails: vec![
+                crate::GuardrailConfig {
+                    pattern: r"\brm\s+-rf\s+/tmp\b".to_string(),
+                    message: "not the shared tmp".to_string(),
+                },
+                crate::GuardrailConfig {
+                    pattern: r"[unclosed".to_string(),
+                    message: "never loads".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+
+        // The valid rule is live; the broken one blocks nothing.
+        let rails = agent.ctx.guardrails.clone();
+        assert_eq!(
+            hrdr_tools::check_guardrails("rm -rf /tmp", &rails),
+            Some("not the shared tmp")
+        );
+
+        let notices = agent.take_pending_notices();
+        let notice = notices
+            .iter()
+            .find(|n| n.contains("[unclosed"))
+            .unwrap_or_else(|| panic!("the rejected pattern must be named: {notices:?}"));
+        assert!(notice.contains("NOT in effect"), "{notice}");
+        assert!(
+            notice.contains("[[guardrails]]"),
+            "it says where to fix it: {notice}"
+        );
+        // And `/guardrails` lists it, marked as dead, rather than just omitting it.
+        let specs = agent.guardrail_specs();
+        let listed = specs
+            .iter()
+            .find(|(p, _)| p == "[unclosed")
+            .unwrap_or_else(|| panic!("`/guardrails` must list the broken rule: {specs:?}"));
+        assert!(listed.1.contains("NOT ACTIVE"), "{}", listed.1);
+        // A config with only valid rules raises nothing.
+        let mut clean = Agent::new(AgentConfig {
+            guardrails: vec![crate::GuardrailConfig {
+                pattern: r"\bnpm\s+publish\b".to_string(),
+                message: "publishing is manual".to_string(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !clean
+                .take_pending_notices()
+                .iter()
+                .any(|n| n.starts_with("guardrail:")),
+            "a valid rule must not raise a notice"
+        );
+        assert!(
+            clean
+                .guardrail_specs()
+                .iter()
+                .all(|(_, m)| !m.contains("NOT ACTIVE"))
+        );
     }
 
     #[test]

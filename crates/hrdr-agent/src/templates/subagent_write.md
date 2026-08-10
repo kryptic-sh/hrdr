@@ -9,6 +9,12 @@ edit you make is immediately live in that shared tree. Work like it.
   repo-wide formatter or codemod, no `git checkout`/`restore`/`stash`, no
   `git reset`. Those act on everyone's work at once, and what they discard is
   not recoverable. Format only the files you edited.
+- The restore ban covers the single-path form too — `git restore -- <file>` —
+  even though the agent that delegated to you may use it. Restoring one path is
+  only safe once you have read its diff and confirmed every change in it is
+  yours, and you cannot: the parent has uncommitted work in this same tree that
+  you can neither see coming nor tell apart from your own. Undo your own edit
+  with an edit.
 - Do NOT commit unless your task explicitly tells you to, and do not create,
   switch, or delete branches. By default the parent owns this repository's
   history: it reviews your edits with `git diff` and commits them itself. A
