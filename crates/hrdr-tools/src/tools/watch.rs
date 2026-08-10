@@ -582,9 +582,18 @@ mod tests {
             .await
             .unwrap();
         let id = ack_id(&ack);
-        // Let two rounds run, then cancel with the exact two-flag write
-        // `task_cancel` makes.
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        // Wait for two rounds to have actually happened rather than assuming a
+        // fixed sleep bought any: spawning a shell is slow enough on a loaded
+        // runner that a couple of seconds need not contain two of them.
+        let rounds_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while counter_value(dir.path()) < 2 {
+            assert!(
+                std::time::Instant::now() < rounds_deadline,
+                "the poller never ran two rounds"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Cancel with the exact two-flag write `task_cancel` makes.
         {
             let mut v = ctx
                 .background_tasks
@@ -594,8 +603,37 @@ mod tests {
             entry.cancelled = true;
             entry.done = true;
         }
+        // `poll_watch` reads `cancelled` once per iteration, before it spawns
+        // the check, so a round already in flight when the flags land runs to
+        // completion and still increments the counter — deliberately, since
+        // there is no handle to kill it with. Sampling `before` right here would
+        // miss that write and then blame the poller for a round that started
+        // while the watch was still live. That is the Windows CI flake: a Git
+        // Bash spawn is slow enough to stretch the in-flight window across the
+        // sample. (It also opens a torn read — the check writes the counter with
+        // a truncating `>`, so a sample landing mid-write parses as 0.)
+        //
+        // So wait the in-flight round out first, on the observable rather than a
+        // guess: let the counter go quiet for longer than a round plausibly
+        // takes to reach its write, then sample. Bounded by SETTLE_MAX, and
+        // exhausting that bound weakens nothing — we sample and assert either
+        // way, and a poller still polling moves the counter inside the window
+        // below regardless of how it got there.
+        const SETTLE_QUIET: Duration = Duration::from_secs(3);
+        const SETTLE_MAX: Duration = Duration::from_secs(15);
+        let settle_deadline = std::time::Instant::now() + SETTLE_MAX;
+        let mut last = counter_value(dir.path());
+        let mut quiet_since = std::time::Instant::now();
+        while quiet_since.elapsed() < SETTLE_QUIET && std::time::Instant::now() < settle_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = counter_value(dir.path());
+            if now != last {
+                last = now;
+                quiet_since = std::time::Instant::now();
+            }
+        }
         let before = counter_value(dir.path());
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(
             counter_value(dir.path()),
             before,
