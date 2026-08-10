@@ -603,6 +603,43 @@ Coverage gaps, stated plainly:
   path function) rather than a planted bundle. What is therefore unexercised is
   the walk of a user root, not the roots' composition.
 
+## Deferred 2026-08-10 — the guardrail audit
+
+The slice shipped: git global options no longer defeat the git rules, whole-tree
+`checkout`/`restore` is caught in every spelling, `-p` counts as interactive,
+the pipe rule covers non-shell interpreters, delete-by-expansion and
+`find … -delete`/`xargs rm` are refused, an uncompilable `[[guardrails]]` entry
+is reported, and the prompt-to-rail drift test runs both directions
+(`PROMPT_PROHIBITIONS` in `prompt.rs`, every row either a rail-enforced command
+or a mandatory prompt-only reason). What it left open:
+
+- **`git checkout -p` is not caught**, only `rebase`/`add`/`commit` carry the
+  interactive rule. It is patch mode and equally TTY-dependent; the prompt does
+  not name it either, so neither half covers it. One alternation to widen if it
+  ever shows up.
+- **`:(top)`, git's long-form spelling of the `:/` repo-root pathspec, is not in
+  the whole-tree set.** Rare enough that widening the alternation was judged not
+  worth the false-positive surface.
+- **`git rm $FILE` and `npm rm $PKG` trip the delete-by-expansion rule.** The
+  rule requires `rm` in program position (so `docker run --rm $IMAGE` passes),
+  but a leading subcommand word still matches. Refusing them is consistent — it
+  is the same delete built from a variable — and it is a slightly wider blast
+  radius than "the `rm` program". Revisit if it fires on real work.
+- **Considered and declined: extending the whole-tree `rm` list.**
+  `rm -rf ~/Projects/scratch`, `rm -rf ../build` and `rm -rf /home/<user>/x`
+  stay allowed. Deleting a named directory is ordinary cleanup, and refusing
+  every path under home or above the cwd stops far more real work than it saves.
+  The rules catch the shape where the model cannot SEE its target instead. The
+  decision is written on the rule in `default_guardrails()` so it is not
+  re-"fixed" later.
+- **Considered and declined: catching `rm -rf "$DIR"/*`.** A variable as a path
+  prefix is legitimate (`rm -rf "$TMPDIR"/*` is ordinary cleanup), and no rail
+  separates the two. Recorded as a `PromptOnly` row with that reason.
+- **The sub-agent restore ban is kept deliberately**, now with its reason in
+  `subagent_write.md`: a sub-agent shares the parent's tree and cannot tell the
+  parent's uncommitted work from its own, so the look-at-the-diff-first
+  procedure `write_main.md` gives the main agent is one it cannot actually run.
+
 ## Top of the list
 
 What is left here needs a decision, not work.
@@ -630,17 +667,6 @@ What is left here needs a decision, not work.
    Weakest of the set — whether evidence _answers_ its claim is a semantic
    judgement a string check cannot make. One observation behind it; worth
    leaving until there is a second.
-4. **`git restore <path>` / `git checkout <path>` is unguarded, and the
-   don't-discard-others'-work rule is sub-agent-only.** The guardrails block the
-   whole-tree forms (`git checkout .`, `git restore .`) but not the single-path
-   form — the one that discards someone else's uncommitted work file by file.
-   And `templates/subagent_write.md` forbids `git checkout`/`restore`/`stash`
-   outright while the main agent's copy — `write_main.md` since the 2026-08-01
-   split, not `write.md` — only tells it to look first, though the main agent
-   has more authority and the same need. Both surfaced by a real incident: a
-   concurrent hrdr session was editing a file, an unexpected `M` appeared in
-   `git status`, and it was restored away on the assumption that the only other
-   writer was a sub-agent. Recovered because the other session had committed it.
 
 ---
 
