@@ -620,6 +620,51 @@ Coverage gaps, stated plainly:
   path function) rather than a planted bundle. What is therefore unexercised is
   the walk of a user root, not the roots' composition.
 
+## Deferred 2026-08-11 — media attachments
+
+Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three
+dialects, `@file` and `Ctrl+]` construct them, blobs persist beside the session,
+and `estimate_tokens_in_messages` prices them. What the six slices left open:
+
+- **A sub-agent cannot receive an attachment.** `spawn_background` takes
+  `prompt: String` and `task_steer` builds `Steer::plain` from a string, so
+  neither carries one. `RunSnapshot::save_to_path` was wired for blobs anyway,
+  so the two save paths cannot diverge the day a `task` prompt can carry one.
+  Deliberate, not an oversight — decide whether delegating a screenshot to a
+  sub-agent is wanted before building it.
+- **The blob store has no lock.** Two hrdr processes and the retention sweeper
+  share `sessions/<cwd-slug>/blobs/` with no coordination. The mark phase is the
+  real protection (a purged session's digests are collected only if no surviving
+  session names them); a 1-hour mtime grace covers the write-between-mark-and-
+  sweep window. If blob loss is ever observed, the honest fix is a lock, not a
+  longer grace.
+- **Token estimates are charged at Anthropic's high-resolution tier for every
+  dialect** (`CHARGED_MAX_EDGE_PX` in `media.rs`). OpenAI uses 32×32 patches
+  with its own budgets, so one formula is an approximation either way; the
+  expensive tier was chosen because under-counting is what lets a request
+  overflow its window. Revisit only with a real over-compaction complaint, and
+  note the per-attachment cost is cached at construction, so making it
+  model-aware means caching dimensions instead and pricing at estimate time.
+- **A PDF's page count is a byte scan for `/Type /Page`.** A compressed page
+  tree (most real PDFs) falls back to file size at 50 KB/page. Both err high.
+- **`Ctrl+S` stashes the draft text but leaves a pending attachment on the
+  composer**, so popping the stash reunites them. Correct enough to leave, but
+  it is an unstated coupling between two pieces of composer state.
+- **A prompt relayed to a released sub-agent loses its attachments with its
+  text.** `send_to_subagent` takes the attachments before `registry.send_prompt`
+  can return `None`. Same fate the text already had — pre-existing, not new.
+- **Considered and declined: auto-attaching a pasted file path.** Dragging a
+  file onto a terminal and typing about a path are the same keystrokes, so
+  `Event::Paste` leaves text as text. The two deliberate spellings are `@path`
+  and `Ctrl+]`, which reads the clipboard's file flavour.
+- **Considered and declined: a temp file for pasted bytes.** They live on the
+  composer behind the `Arc` the attachment already holds; dropping the vector is
+  the cleanup, where a file would need a lifetime policy for every way a message
+  can end and would litter after the first missed one.
+- **Not covered:** no test drives a real provider with a real image. Every
+  dialect assertion is on the JSON hrdr builds, so the shapes are pinned against
+  the docs, not against a live endpoint that accepted them.
+
 ## Deferred 2026-08-10 — the guardrail audit
 
 The slice shipped: git global options no longer defeat the git rules, whole-tree
