@@ -246,7 +246,7 @@ pub fn prepare_outgoing_via(
     input: &str,
     project: hrdr_agent::ProjectInstructions,
 ) -> String {
-    let (sent, inlined) = crate::prepare_outgoing_tracked(
+    let out = crate::prepare_outgoing_tracked(
         input,
         &agent_names(agent),
         &agent_cwd(agent),
@@ -257,12 +257,18 @@ pub fn prepare_outgoing_via(
     // lock, and the same `try_lock` gate already decides whether `@agent`
     // routing resolves at all (see `agent_names`). Missing the mark costs one
     // redundant read; waiting here would stall the frontend.
-    if !inlined.is_empty()
+    if !out.inlined().is_empty()
         && let Ok(a) = agent.try_lock()
     {
-        a.mark_files_read(&inlined);
+        a.mark_files_read(out.inlined());
     }
-    sent
+    // Text only: the frontends on this path hand the result to `Steer::new`, which
+    // takes a string, so there is nowhere for an `@image.png` attachment to ride
+    // yet. `into_text` drops the attachments *and* their labels together, so an
+    // image mention reads to the model exactly as it did before attachments
+    // existed — as nothing — rather than as a label for a picture it never got.
+    // A frontend that can carry them calls `Outgoing::into_steer` instead.
+    out.into_text()
 }
 
 /// [`prepare_outgoing_via`] for a message expanded with `agent`'s cwd and

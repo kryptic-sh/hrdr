@@ -36,21 +36,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Groundwork for image and PDF attachments — the wire half only.** A new
-  `hrdr_llm::media` module adds `Attachment` (raw bytes + a `MediaType` the
-  bytes were checked to match by magic number + the file name) and a
-  `ChatMessage.attachments` field, and every provider dialect now renders it:
+- **Image and PDF attachments: `@file` sends the file, not a transcription of
+  its bytes.** A new `hrdr_llm::media` module adds `Attachment` (raw bytes + a
+  `MediaType` the bytes were checked to match by magic number + the file name)
+  and a `ChatMessage.attachments` field, and every provider dialect renders it:
   Anthropic `image`/`document` blocks, Responses `input_image`/`input_file`
   items, and chat-completions content parts, with the attachments placed ahead
   of the text in all three. Requests are refused before they are sent when the
   model's models.dev `modalities.input` list does not cover the attachment (a
   model the catalog does not list is allowed through, so self-hosted endpoints
   still work), when one attachment is over the size ceiling below, when the
-  request totals over 32 MB, or when it carries more than 100 images. **Nothing
-  constructs an attachment yet** — there is no way to attach a file from the UI,
-  and attachments are not written to the session file, so they do not survive a
-  resume. A message with no attachments serializes exactly as before on all
-  three dialects.
+  request totals over 32 MB, or when it carries more than 100 images. A message
+  with no attachments serializes exactly as before on all three dialects.
+  - **An `@shot.png` or `@report.pdf` mention now becomes one of these** instead
+    of being dropped: the text path reads a file as UTF-8, so an image failed
+    and the mention silently reached the model as bare text, while a PDF whose
+    bytes happened to be valid UTF-8 was inlined as object soup.
+    `hrdr_tools::read_attach_media` decides by **leading bytes, never the
+    extension** — a `.png` holding text is still read as text, a screenshot
+    saved with no extension still attaches — and anything the sniffer does not
+    recognise keeps the text path it had.
+  - The message text carries one short line per attached file under
+    `--- Attached files (via @) ---` (`Image 1: shot.png`), since every dialect
+    renders the attachments _before_ the text and the model otherwise has no way
+    to say which screenshot it is describing.
+  - The 100 KB `@file` cap does not apply to them: it is a context-window guard
+    for inlined **text**, and an image's bytes never enter the text. A 200 KB
+    screenshot attaches; what bounds it is `max_attachment_bytes`, enforced at
+    the request gate. An attached file is also **not** reported as read — seeing
+    a rendered image is not seeing a file's content, so it does not disarm the
+    read-before-edit guard. `@dir/` still attaches a listing, so a directory of
+    screenshots names its files rather than sending fifty images.
+  - `hrdr_app::prepare_outgoing_tracked` and `expand_mentions_tracked` now
+    return an `Outgoing` (text + attachments + inlined paths) rather than a
+    `(String, Vec<PathBuf>)` tuple, and `hrdr_agent::Steer` carries the
+    attachments to the user message it belongs to.
+  - **The TUI cannot attach one yet**: its send path takes text only
+    (`Outgoing::into_text`, which drops the labels along with the attachments,
+    so an image mention reads as it always did — as nothing). `hrdr -p` is the
+    path that sends them today. Attachments are still not written to the session
+    file, so they do not survive a resume.
 - **`max_attachment_bytes` — the per-attachment size ceiling is configurable**
   (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
   limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64

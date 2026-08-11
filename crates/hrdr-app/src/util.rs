@@ -14,7 +14,9 @@ fn trim_token(s: &str) -> &str {
 
 /// Expand `@path` mentions in `input` (resolved under `cwd`) for sending to the
 /// model: a **file** contributes its contents, truncated at
-/// [`MAX_ATTACH_BYTES`] on a char boundary; a **directory** contributes a
+/// [`MAX_ATTACH_BYTES`] on a char boundary; a file whose **bytes** are an image
+/// or a PDF contributes an [`Outgoing::attachments`] entry instead, since those
+/// bytes are not text and never were; a **directory** contributes a
 /// one-level listing of what it holds, since a directory is a pointer at files
 /// to read rather than content itself.
 /// Each distinct path is attached once under a trailing "Referenced paths"
@@ -99,22 +101,111 @@ pub fn agent_mention_message(agent: &str, body: &str) -> String {
 pub const MAX_ATTACH_BYTES: usize = 100 * 1024;
 
 pub fn expand_mentions(input: &str, cwd: &Path) -> String {
-    expand_mentions_tracked(input, cwd).0
+    expand_mentions_tracked(input, cwd).into_text()
 }
 
-/// [`expand_mentions`], plus the paths whose **whole** content was inlined.
+/// A prepared outgoing message: the text the model reads, the image/PDF
+/// [`hrdr_tools::Attachment`]s that ride **beside** that text, and the paths whose
+/// whole content the text inlined.
 ///
-/// The second element is what lets the read-before-edit guard learn what the
-/// model has already seen: an `@doc.md` mention puts the entire file in the
-/// model's context, so forcing a re-read of it before an edit is pure waste
-/// (transcripts show a 38 KiB doc re-read for exactly this reason). Only
-/// complete inlines are listed — a truncated attachment is a partial view, and a
-/// partial view must never license a blind overwrite.
-pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
+/// The fields are private on purpose, because the two halves are only correct
+/// together. [`Self::into_steer`] hands over the attachments *and* the label line
+/// each one needs ("Image 1: shot.png") so the model can tell which file it is
+/// looking at; [`Self::into_text`] is for a caller that cannot carry them, and
+/// drops the labels along with the bytes. Text that names an image the request
+/// never carried would tell the model it had been shown something it had not.
+#[derive(Debug, Clone, Default)]
+pub struct Outgoing {
+    /// The expanded text, *without* the attachment labels — see [`Self::labels`].
+    text: String,
+    attachments: Vec<hrdr_tools::Attachment>,
+    inlined: Vec<PathBuf>,
+}
+
+impl Outgoing {
+    /// The expanded text on its own, as a caller that carries no attachments
+    /// sees it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The image/PDF attachments this message carries, in mention order.
+    pub fn attachments(&self) -> &[hrdr_tools::Attachment] {
+        &self.attachments
+    }
+
+    /// The paths whose **whole** content the text inlined.
+    ///
+    /// This is what lets the read-before-edit guard learn what the model has
+    /// already seen: an `@doc.md` mention puts the entire file in the model's
+    /// context, so forcing a re-read of it before an edit is pure waste
+    /// (transcripts show a 38 KiB doc re-read for exactly this reason). Only
+    /// complete inlines are listed — a truncated attachment is a partial view, a
+    /// directory listing is not content at all, and an attached image is not
+    /// something anything can be edited from, so none of the three may license a
+    /// blind overwrite.
+    pub fn inlined(&self) -> &[PathBuf] {
+        &self.inlined
+    }
+
+    /// The label block naming each attachment, appended to the text whenever the
+    /// attachments travel with it.
+    ///
+    /// Every dialect renders attachments *before* the message text, so this
+    /// trailing block is what maps the images the model has just seen back onto
+    /// file names — without it, "what does this show?" has no referent and the
+    /// model cannot say which of two screenshots it is describing. Numbered per
+    /// kind ("Image 1", "Document 1"), matching the order the blocks render in
+    /// and Anthropic's own recommendation to prefix each image with `Image N:`.
+    /// One short line per file: an attachment's whole cost in text tokens.
+    fn labels(&self) -> String {
+        if self.attachments.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("\n\n--- Attached files (via @) ---\n");
+        let (mut images, mut docs) = (0, 0);
+        for a in &self.attachments {
+            let label = if a.media_type().is_image() {
+                images += 1;
+                format!("Image {images}")
+            } else {
+                docs += 1;
+                format!("Document {docs}")
+            };
+            out.push_str(&format!("{label}: {}\n", a.filename()));
+        }
+        out
+    }
+
+    /// The text alone, for a caller with no way to carry attachments.
+    ///
+    /// The attachments are dropped **and so are their labels**, leaving the text
+    /// exactly as it would have been had the mention resolved to nothing — which
+    /// is what an `@shot.png` did before attachments existed.
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// The message as one queued [`hrdr_agent::Steer`] — labelled text and the
+    /// attachments it names, together. `display` is what the user typed.
+    pub fn into_steer(self, display: impl Into<String>) -> hrdr_agent::Steer {
+        let labels = self.labels();
+        hrdr_agent::Steer::new(format!("{}{labels}", self.text), display)
+            .with_attachments(self.attachments)
+    }
+}
+
+/// [`expand_mentions`], plus what the text cannot carry: the attachments and the
+/// fully-inlined paths (see [`Outgoing`]).
+pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
     // (label, body, whole-file-inlined). Only a file's complete content counts as
     // inlined — a truncated file is a partial view, and a directory listing is not
     // content at all, so neither may license a blind overwrite.
     let mut attached: Vec<(String, String, bool)> = Vec::new();
+    let mut attachments: Vec<hrdr_tools::Attachment> = Vec::new();
+    // Every mention that resolved to something, so a path mentioned twice is
+    // carried once whichever half of the message it landed in.
+    let mut seen: Vec<String> = Vec::new();
     for raw in input.split_whitespace() {
         let Some(rel) = raw.strip_prefix('@') else {
             continue;
@@ -123,22 +214,36 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
         // inserts); strip it for resolution but keep the label honest below.
         let rel = trim_token(rel);
         let rel = rel.strip_suffix('/').unwrap_or(rel);
-        if rel.is_empty()
-            || attached
-                .iter()
-                .any(|(p, _, _)| p.trim_end_matches('/') == rel)
-        {
+        if rel.is_empty() || seen.iter().any(|s| s == rel) {
             continue;
         }
         // A directory is pointed at, not inlined: attach what it contains so the
         // model can pick what to read, instead of the mention silently doing
         // nothing (which is what happened before — `read_attach_file` rejects a
-        // directory, and the failure was swallowed).
+        // directory, and the failure was swallowed). What the listing names stays
+        // a name: a directory of screenshots is a pointer at fifty files, not an
+        // instruction to send fifty images.
         if resolve_under(cwd, rel).is_dir() {
             if let Ok(listing) = hrdr_tools::read_attach_dir(rel, cwd) {
+                seen.push(rel.to_string());
                 attached.push((format!("{rel}/"), listing, false));
             }
             continue;
+        }
+        // The bytes decide, not the extension: an image or PDF rides beside the
+        // text as an attachment, and everything else — including a `.png` that
+        // holds text — goes down the text path below.
+        match hrdr_tools::read_attach_media(rel, cwd) {
+            Ok(Some(a)) => {
+                seen.push(rel.to_string());
+                attachments.push(a);
+                continue;
+            }
+            // Not a type hrdr can attach: read it as text.
+            Ok(None) => {}
+            // Unreadable, or refused (a secret file, a vanished path): skipped,
+            // exactly as an unreadable text mention is.
+            Err(_) => continue,
         }
         let Ok(text) = hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES)) else {
             continue;
@@ -149,10 +254,15 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
         } else {
             (text, true)
         };
+        seen.push(rel.to_string());
         attached.push((rel.to_string(), text, full));
     }
     if attached.is_empty() {
-        return (input.to_string(), Vec::new());
+        return Outgoing {
+            text: input.to_string(),
+            attachments,
+            inlined: Vec::new(),
+        };
     }
     let mut inlined = Vec::new();
     let mut out = String::from(input);
@@ -170,7 +280,11 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
         };
         out.push_str(&format!("\n=== {rel}{what} ===\n{text}\n"));
     }
-    (out, inlined)
+    Outgoing {
+        text: out,
+        attachments,
+        inlined,
+    }
 }
 
 /// Prepare an outgoing user message for sending to the model: expand a
@@ -189,11 +303,12 @@ pub fn prepare_outgoing(
     cwd: &Path,
     project: hrdr_agent::ProjectInstructions,
 ) -> String {
-    prepare_outgoing_tracked(input, names, cwd, project, &[]).0
+    prepare_outgoing_tracked(input, names, cwd, project, &[]).into_text()
 }
 
-/// [`prepare_outgoing`], plus the paths whose whole content the sent message now
-/// carries (see [`expand_mentions_tracked`]) — for the caller to hand to
+/// [`prepare_outgoing`], as the [`Outgoing`] it really is: the text, the
+/// attachments an `@image.png` / `@doc.pdf` mention produced, and the paths whose
+/// whole content the sent message now carries — the last for the caller to hand to
 /// [`hrdr_agent::Agent::mark_files_read`] so the read-before-edit guard knows the
 /// model has already seen them. `todos` is the agent's TODO list, used to expand
 /// `todo#N` / `task#N` references (see [`expand_todo_refs`]).
@@ -210,7 +325,7 @@ pub fn prepare_outgoing_tracked(
     cwd: &Path,
     project: hrdr_agent::ProjectInstructions,
     todos: &[hrdr_tools::TodoItem],
-) -> (String, Vec<PathBuf>) {
+) -> Outgoing {
     // A `:command` template or `:skill` body may itself carry `@file` / `@agent`
     // mentions — they get the same expansion below.
     let expanded;
@@ -231,15 +346,14 @@ pub fn prepare_outgoing_tracked(
     };
     match extract_agent_mention(input, names) {
         Some((agent, body)) => {
-            let (body, inlined) = expand_mentions_tracked(&body, cwd);
-            (
-                agent_mention_message(&agent, &expand_todo_refs(&body, todos)),
-                inlined,
-            )
+            let mut out = expand_mentions_tracked(&body, cwd);
+            out.text = agent_mention_message(&agent, &expand_todo_refs(&out.text, todos));
+            out
         }
         None => {
-            let (body, inlined) = expand_mentions_tracked(input, cwd);
-            (expand_todo_refs(&body, todos), inlined)
+            let mut out = expand_mentions_tracked(input, cwd);
+            out.text = expand_todo_refs(&out.text, todos);
+            out
         }
     }
 }
@@ -708,9 +822,9 @@ mod tests {
 
         // A directory is a pointer, not content, so it never disarms the
         // read-before-edit guard for the files inside it.
-        let (_, inlined) = expand_mentions_tracked("@src", root);
+        let inlined = expand_mentions_tracked("@src", root);
         assert!(
-            inlined.is_empty(),
+            inlined.inlined().is_empty(),
             "a listing licenses no blind overwrite: {inlined:?}"
         );
 
@@ -759,16 +873,23 @@ mod tests {
         std::fs::write(root.join("sub/b.txt"), "hello from b").unwrap();
 
         // Nothing inlined → nothing to mark.
-        assert!(expand_mentions_tracked("just text", root).1.is_empty());
-        assert!(expand_mentions_tracked("@nope.txt", root).1.is_empty());
+        assert!(
+            expand_mentions_tracked("just text", root)
+                .inlined()
+                .is_empty()
+        );
+        assert!(
+            expand_mentions_tracked("@nope.txt", root)
+                .inlined()
+                .is_empty()
+        );
 
         // Two distinct mentions, one repeated: each reported once, resolved.
-        let (out, inlined) =
-            expand_mentions_tracked("see @a.txt and @sub/b.txt, plus @a.txt again", root);
-        assert!(out.contains("hello from b"));
+        let out = expand_mentions_tracked("see @a.txt and @sub/b.txt, plus @a.txt again", root);
+        assert!(out.text().contains("hello from b"));
         assert_eq!(
-            inlined,
-            vec![root.join("a.txt"), root.join("sub/b.txt")],
+            out.inlined(),
+            [root.join("a.txt"), root.join("sub/b.txt")],
             "resolved, deduplicated, in mention order"
         );
 
@@ -776,9 +897,12 @@ mod tests {
         // there is nothing to mark — a partial view must not license an edit.
         let big = root.join("big.log");
         std::fs::write(&big, "x".repeat(MAX_ATTACH_BYTES + 1)).unwrap();
-        let (out, inlined) = expand_mentions_tracked("look at @big.log", root);
-        assert_eq!(out, "look at @big.log");
-        assert!(inlined.is_empty(), "an unattached file is not a read file");
+        let out = expand_mentions_tracked("look at @big.log", root);
+        assert_eq!(out.text(), "look at @big.log");
+        assert!(
+            out.inlined().is_empty(),
+            "an unattached file is not a read file"
+        );
     }
 
     /// `prepare_outgoing_tracked` carries the inlined-path list out through both
@@ -790,15 +914,14 @@ mod tests {
         std::fs::write(root.join("note.txt"), "the note").unwrap();
         let names = vec!["explore".to_string()];
 
-        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root, LOAD, &[]);
-        assert!(sent.contains("the note"));
-        assert_eq!(inlined, vec![root.join("note.txt")]);
+        let out = prepare_outgoing_tracked("read @note.txt", &names, root, LOAD, &[]);
+        assert!(out.text().contains("the note"));
+        assert_eq!(out.inlined(), [root.join("note.txt")]);
 
         // Routed at a sub-agent: same expansion, same report.
-        let (sent, inlined) =
-            prepare_outgoing_tracked("@explore read @note.txt", &names, root, LOAD, &[]);
-        assert!(sent.contains("`explore`") && sent.contains("the note"));
-        assert_eq!(inlined, vec![root.join("note.txt")]);
+        let out = prepare_outgoing_tracked("@explore read @note.txt", &names, root, LOAD, &[]);
+        assert!(out.text().contains("`explore`") && out.text().contains("the note"));
+        assert_eq!(out.inlined(), [root.join("note.txt")]);
     }
 
     #[test]
@@ -860,8 +983,9 @@ mod tests {
             evidence: None,
         }];
 
-        let (sent, _) =
-            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, LOAD, &todos);
+        let sent =
+            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, LOAD, &todos)
+                .into_text();
         // The todo section comes after the @file section.
         let file_at = sent.find("--- Referenced paths (via @) ---").unwrap();
         let todo_at = sent.find("--- Referenced todos ---").unwrap();
@@ -869,7 +993,8 @@ mod tests {
         assert!(sent.contains("add a test"), "{sent}");
 
         // Routed at a sub-agent: same expansion, wrapped in the directive.
-        let (sent, _) = prepare_outgoing_tracked("@explore do todo#2", &names, root, LOAD, &todos);
+        let sent =
+            prepare_outgoing_tracked("@explore do todo#2", &names, root, LOAD, &todos).into_text();
         assert!(
             sent.contains("`explore`") && sent.contains("add a test"),
             "{sent}"
@@ -1149,6 +1274,276 @@ mod tests {
         let out = expand_mentions("show @sub/notes.txt", &root);
         assert!(out.starts_with("show @sub/notes.txt"));
         assert!(out.contains("nested content"));
+    }
+
+    // ---- image / PDF mentions ----
+
+    /// A genuine PNG header plus `pad` filler bytes — enough for the sniffer,
+    /// and (deliberately) not valid UTF-8, which is why the text path used to
+    /// drop it on the floor.
+    fn png_bytes(pad: usize) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.resize(v.len() + pad, 0);
+        v
+    }
+
+    /// A PDF whose body is plain ASCII — the case that used to be *worse* than a
+    /// dropped mention: it read as text and the model saw `%PDF-1.7` and raw
+    /// object soup.
+    const PDF_BYTES: &[u8] = b"%PDF-1.7\nplain-ascii-object-soup\n%%EOF\n";
+
+    /// An `@image` / `@doc` mention rides beside the text as an attachment: the
+    /// bytes never enter the message, and the text carries only a short label
+    /// naming what the model has been shown.
+    ///
+    /// Before this, `@shot.png` was **silently skipped** — `read_attach_file`
+    /// fails on non-UTF-8 bytes and the error was swallowed — while a
+    /// plain-ASCII PDF was inlined as text.
+    #[test]
+    fn an_image_and_a_pdf_mention_become_attachments_beside_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(256)).unwrap();
+        std::fs::write(root.join("report.pdf"), PDF_BYTES).unwrap();
+
+        let out = expand_mentions_tracked("what is @shot.png and @report.pdf", root);
+        let kinds: Vec<_> = out
+            .attachments()
+            .iter()
+            .map(|a| (a.filename(), a.media_type()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("shot.png", hrdr_tools::MediaType::Png),
+                ("report.pdf", hrdr_tools::MediaType::Pdf),
+            ],
+            "both attach, in mention order"
+        );
+
+        // Nothing of either file's bytes reached the text.
+        assert_eq!(out.text(), "what is @shot.png and @report.pdf");
+        assert!(!out.text().contains("%PDF"), "{:?}", out.text());
+        assert!(
+            !out.text().contains("=== shot.png ==="),
+            "an attachment is not a referenced-paths block: {:?}",
+            out.text()
+        );
+
+        // Delivered as a message, the text gains one label line per file so the
+        // model can say which image it is describing.
+        let steer = out.into_steer("what is @shot.png and @report.pdf");
+        assert_eq!(
+            steer.sent,
+            "what is @shot.png and @report.pdf\n\n--- Attached files (via @) ---\n\
+             Image 1: shot.png\nDocument 1: report.pdf\n"
+        );
+        assert_eq!(steer.attachments.len(), 2);
+    }
+
+    /// The regression that matters most: a text mention, and a message with no
+    /// mention at all, produce byte-identical output to the pre-attachment path.
+    #[test]
+    fn a_text_mention_is_untouched_by_the_attachment_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("notes.md"), "# notes\nbody\n").unwrap();
+
+        let out = expand_mentions_tracked("look at @notes.md", root);
+        assert_eq!(
+            out.text(),
+            "look at @notes.md\n\n--- Referenced paths (via @) ---\n\n=== notes.md ===\n\
+             # notes\nbody\n\n"
+        );
+        assert!(out.attachments().is_empty());
+        assert_eq!(out.inlined(), [root.join("notes.md")]);
+        // And with attachments empty, delivery adds no label block.
+        assert_eq!(
+            expand_mentions_tracked("look at @notes.md", root)
+                .into_steer("look at @notes.md")
+                .sent,
+            out.text()
+        );
+
+        let plain = expand_mentions_tracked("just some text", root);
+        assert_eq!(plain.text(), "just some text");
+        assert!(plain.attachments().is_empty() && plain.inlined().is_empty());
+    }
+
+    /// The **bytes** decide. A `.png` extension over text is read as text — the
+    /// file lands in the referenced-paths block, not in an image block a provider
+    /// would reject — and a screenshot saved with no extension still attaches.
+    #[test]
+    fn the_extension_never_decides_what_is_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("liar.png"), "not an image at all\n").unwrap();
+        std::fs::write(root.join("screenshot"), png_bytes(32)).unwrap();
+
+        let out = expand_mentions_tracked("see @liar.png", root);
+        assert!(
+            out.attachments().is_empty(),
+            "bytes that are not an image are not attached as one"
+        );
+        assert!(
+            out.text().contains("=== liar.png ===") && out.text().contains("not an image at all"),
+            "it takes the text path instead: {:?}",
+            out.text()
+        );
+        assert_eq!(out.inlined(), [root.join("liar.png")]);
+
+        let out = expand_mentions_tracked("see @screenshot", root);
+        assert_eq!(out.attachments().len(), 1, "the bytes are a PNG");
+    }
+
+    /// Bytes matching no supported type keep the behaviour they had: the text
+    /// path, whatever it makes of them. Readable-as-UTF-8 bytes are inlined; the
+    /// rest are skipped, exactly as before attachments existed.
+    #[test]
+    fn unsupported_bytes_stay_on_the_text_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A RIFF container that is not WebP: a near-miss for the sniffer, and not
+        // valid UTF-8 either.
+        std::fs::write(
+            root.join("clip.wav"),
+            b"RIFF\x24\x08\x00\x00WAVEfmt \xff\xfe",
+        )
+        .unwrap();
+        std::fs::write(root.join("data.csv"), "a,b\n1,2\n").unwrap();
+
+        let out = expand_mentions_tracked("hear @clip.wav", root);
+        assert!(out.attachments().is_empty());
+        assert_eq!(
+            out.text(),
+            "hear @clip.wav",
+            "unreadable as text → skipped, as before"
+        );
+
+        let out = expand_mentions_tracked("read @data.csv", root);
+        assert!(out.attachments().is_empty());
+        assert!(out.text().contains("a,b"), "{:?}", out.text());
+    }
+
+    /// A mention that resolves to nothing is left alone, image or not — the
+    /// pre-existing miss behaviour, unchanged.
+    #[test]
+    fn a_missing_image_mention_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let out = expand_mentions_tracked("what is @missing.png", root);
+        assert_eq!(out.text(), "what is @missing.png");
+        assert!(out.attachments().is_empty() && out.inlined().is_empty());
+    }
+
+    /// An attached file is **not** reported as read.
+    ///
+    /// That list disarms the read-before-edit guard, and it may only name files
+    /// whose full text the model is looking at. Seeing a rendered image is not
+    /// seeing a file's bytes, and a blind `edit` from that view would overwrite
+    /// content nobody saw.
+    #[test]
+    fn an_attachment_never_counts_as_a_file_the_model_has_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(64)).unwrap();
+        std::fs::write(root.join("report.pdf"), PDF_BYTES).unwrap();
+        std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
+
+        let out = expand_mentions_tracked("@shot.png @report.pdf @notes.md", root);
+        assert_eq!(out.attachments().len(), 2);
+        assert_eq!(
+            out.inlined(),
+            [root.join("notes.md")],
+            "only the text file's content is in the message"
+        );
+    }
+
+    /// A directory of screenshots is a listing, not fifty images: `@dir` points
+    /// at files, and what it names stays a name.
+    #[test]
+    fn a_directory_of_images_attaches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let shots = root.join("shots");
+        std::fs::create_dir_all(&shots).unwrap();
+        for n in 0..3 {
+            std::fs::write(shots.join(format!("s{n}.png")), png_bytes(16)).unwrap();
+        }
+
+        let out = expand_mentions_tracked("look at @shots/", root);
+        assert!(
+            out.attachments().is_empty(),
+            "a listed directory sends no images"
+        );
+        assert!(
+            out.text()
+                .contains("=== shots/ (directory listing, one level) ===")
+                && out.text().contains("s0.png"),
+            "the files are named, not sent: {:?}",
+            out.text()
+        );
+    }
+
+    /// The 100 KB text cap is a *context-window* guard for inlined text and has
+    /// no say over an image, whose bytes never enter the text. A 200 KB
+    /// screenshot — over that cap, and the size a real one actually is — attaches
+    /// whole; the size ceiling that applies to it (`max_attachment_bytes`) is
+    /// enforced at the request gate.
+    #[test]
+    fn the_text_attach_cap_does_not_reject_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let raw = MAX_ATTACH_BYTES * 2;
+        std::fs::write(root.join("big.png"), png_bytes(raw)).unwrap();
+
+        let out = expand_mentions_tracked("what is @big.png", root);
+        assert_eq!(out.attachments().len(), 1, "an image is not text");
+        assert_eq!(
+            out.attachments()[0].encoded_len(),
+            (raw + 8).div_ceil(3) * 4,
+            "the whole file attached, not a prefix"
+        );
+    }
+
+    /// A caller that cannot carry attachments takes the text alone — and gets
+    /// **no label** for the images it is not sending, so the model is never told
+    /// about a picture it did not receive.
+    #[test]
+    fn into_text_drops_the_labels_with_the_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
+
+        let text = expand_mentions_tracked("what is @shot.png", root).into_text();
+        assert_eq!(text, "what is @shot.png");
+        assert!(!text.contains("Attached files"), "{text}");
+    }
+
+    /// Attachments survive both shapes of `prepare_outgoing_tracked` — a plain
+    /// message and one routed at an `@agent` — alongside the text expansion.
+    #[test]
+    fn prepare_outgoing_tracked_carries_attachments_through_agent_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
+        std::fs::write(root.join("note.txt"), "the note").unwrap();
+        let names = vec!["explore".to_string()];
+
+        let out = prepare_outgoing_tracked("read @note.txt and @shot.png", &names, root, LOAD, &[]);
+        assert!(out.text().contains("the note"));
+        assert_eq!(out.attachments().len(), 1);
+
+        let out = prepare_outgoing_tracked("@explore what is @shot.png", &names, root, LOAD, &[]);
+        assert!(out.text().contains("`explore`"), "{:?}", out.text());
+        assert_eq!(out.attachments().len(), 1);
+        // The label block trails the delegation directive it belongs to.
+        let sent = out.into_steer("@explore what is @shot.png").sent;
+        assert!(
+            sent.ends_with("--- Attached files (via @) ---\nImage 1: shot.png\n"),
+            "{sent}"
+        );
     }
 }
 

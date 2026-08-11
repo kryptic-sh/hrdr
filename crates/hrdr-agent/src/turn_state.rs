@@ -18,8 +18,21 @@ impl Agent {
     /// message entering history" can be applied to one arrival path but not
     /// another.
     pub(crate) fn push_user_message(&mut self, text: impl Into<String>, origin: MessageOrigin) {
+        self.push_user_message_with(text, origin, Vec::new());
+    }
+
+    /// [`Self::push_user_message`], with images/PDFs riding beside the text — the
+    /// only way an attachment enters history, so it travels the same chokepoint
+    /// (timestamp, origin) as the text it belongs to.
+    pub(crate) fn push_user_message_with(
+        &mut self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        attachments: Vec<hrdr_llm::media::Attachment>,
+    ) {
         Arc::make_mut(&mut self.messages).push(ChatMessage {
             origin,
+            attachments,
             ..timestamped_user_message(text)
         });
     }

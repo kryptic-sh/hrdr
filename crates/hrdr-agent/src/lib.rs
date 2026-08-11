@@ -864,6 +864,10 @@ pub struct Steer {
     pub sent: String,
     /// What the user typed, for display.
     pub display: String,
+    /// Images/PDFs that ride **beside** `sent` rather than inside it: an `@shot.png`
+    /// mention becomes bytes on the user message, not text. Empty for every
+    /// text-only message, which is all of them until a frontend attaches one.
+    pub attachments: Vec<hrdr_llm::media::Attachment>,
 }
 
 impl Steer {
@@ -873,6 +877,7 @@ impl Steer {
         Self {
             display: text.clone(),
             sent: text,
+            attachments: Vec::new(),
         }
     }
 
@@ -880,7 +885,14 @@ impl Steer {
         Self {
             sent: sent.into(),
             display: display.into(),
+            attachments: Vec::new(),
         }
+    }
+
+    /// The same message, carrying `attachments` to the model.
+    pub fn with_attachments(mut self, attachments: Vec<hrdr_llm::media::Attachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 }
 
@@ -9207,6 +9219,46 @@ mod tests {
             // disk afterwards still voids the read, exactly as a real one would.
             std::fs::write(&file, "# doc\nedited by someone else\n").unwrap();
             assert_eq!(agent.ctx.read_state(&file), hrdr_tools::ReadState::Stale);
+        }
+
+        /// A queued message's attachments reach the user turn they belong to.
+        ///
+        /// The whole point of an `@shot.png` mention is bytes on the wire, and
+        /// [`Steer`] is the only road a user message travels — so the delivery
+        /// step has to carry them onto the [`ChatMessage`], not just the text.
+        #[tokio::test]
+        async fn a_steers_attachments_land_on_the_user_message() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent =
+                Agent::new(test_cfg("http://127.0.0.1:1".to_string(), dir.path())).unwrap();
+            let png = hrdr_llm::media::Attachment::new(
+                b"\x89PNG\r\n\x1a\n\0\0\0\0".to_vec(),
+                hrdr_llm::media::MediaType::Png,
+                "shot.png",
+            )
+            .unwrap();
+
+            agent
+                .deliver_user_message(
+                    crate::Steer::new("what is this", "what is @shot.png")
+                        .with_attachments(vec![png.clone()]),
+                    /*opening*/ false,
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+
+            let last = agent.messages.last().expect("a user message");
+            assert_eq!(last.role, hrdr_llm::Role::User);
+            assert_eq!(last.attachments, vec![png]);
+
+            // A text-only message still carries none — the field is not a place
+            // stray state can accumulate.
+            agent
+                .deliver_user_message(crate::Steer::plain("and now?"), false, &mut |_| {})
+                .await
+                .unwrap();
+            assert!(agent.messages.last().unwrap().attachments.is_empty());
         }
 
         // ── (a) plain text turn ───────────────────────────────────────────────

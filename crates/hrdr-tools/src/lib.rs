@@ -41,6 +41,9 @@ pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_SECS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,
 };
+/// The attachment model, re-exported so a frontend that only depends on this
+/// crate can hold what [`read_attach_media`] returns.
+pub use hrdr_llm::media::{Attachment, MediaType};
 pub use lsp::{
     DEFAULT_LSP_WAIT_SECS, LspFileEdits, LspLocation, LspRegistry, LspServerConfig,
     LspServerReport, LspServerStatus, LspTextEdit, apply_lsp_edits, default_lsp_servers,
@@ -939,19 +942,18 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
     result
 }
 
-/// Open and read a file that is safe to attach to a model request.
+/// Open a file that is safe to attach to a model request, returning the handle
+/// and the path it resolved to.
 ///
-/// The file handle is opened before validation and read through that same handle,
-/// preventing the validated path from being replaced between validation and read.
-pub fn read_attach_file(
+/// The handle is opened *before* validation and everything downstream reads
+/// through that same handle, so the validated path cannot be swapped for another
+/// file between the check and the read.
+fn open_attach_file(
     path_str: &str,
     cwd: &std::path::Path,
-    max_bytes: Option<usize>,
-) -> anyhow::Result<String> {
-    use std::io::Read;
-
+) -> anyhow::Result<(std::fs::File, PathBuf)> {
     let resolved = resolve_under(cwd, path_str);
-    let mut file = std::fs::File::open(&resolved)
+    let file = std::fs::File::open(&resolved)
         .map_err(|e| anyhow::anyhow!("can't open {}: {e}", resolved.display()))?;
     // Validate on every platform (rejects unsafe attaches); the returned path is
     // only consumed by the Unix handle-identity check below, so it is
@@ -972,6 +974,76 @@ pub fn read_attach_file(
             );
         }
     }
+    Ok((file, resolved))
+}
+
+/// How many leading bytes are enough to identify every type
+/// [`hrdr_llm::media::MediaType::sniff`] knows: the longest signature it checks
+/// is WebP's, which needs the RIFF header plus the form type at bytes 8..12.
+const SNIFF_BYTES: usize = 12;
+
+/// Read a file as an image/PDF [`Attachment`] when its **bytes** say it is one.
+///
+/// `Ok(None)` means "not something hrdr can attach" — the leading bytes match no
+/// [`MediaType`] — and the caller should fall back to the text path
+/// ([`read_attach_file`]). The extension is never consulted: a `.png` holding a
+/// text file reads as text, and a screenshot saved without an extension still
+/// attaches.
+///
+/// **No size cap here.** How large an attachment may be belongs to the request it
+/// is headed for — the endpoint's limit and the user's `max_attachment_bytes`
+/// over it — and that is enforced once, at the gate every request passes through
+/// ([`hrdr_llm::media::check_attachments`]). The text cap
+/// (`hrdr_app::MAX_ATTACH_BYTES`) is a context-window guard for inlined *text*
+/// and has nothing to say about an image, whose bytes never enter the text at
+/// all.
+pub fn read_attach_media(
+    path_str: &str,
+    cwd: &std::path::Path,
+) -> anyhow::Result<Option<Attachment>> {
+    use std::io::Read;
+
+    let (mut file, resolved) = open_attach_file(path_str, cwd)?;
+    let mut head = [0u8; SNIFF_BYTES];
+    let mut filled = 0;
+    // One `read` may return fewer bytes than asked for even mid-file; loop until
+    // the header is complete or the file ends (a file shorter than any signature
+    // simply sniffs to `None`).
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(anyhow::anyhow!("can't read {}: {e}", resolved.display())),
+        }
+    }
+    let Some(media_type) = MediaType::sniff(&head[..filled]) else {
+        return Ok(None);
+    };
+
+    let mut bytes = head[..filled].to_vec();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("can't read {}: {e}", resolved.display()))?;
+    let filename = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_str.to_string());
+    Attachment::new(bytes, media_type, filename)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("can't attach {}: {e}", resolved.display()))
+}
+
+/// Open and read a file that is safe to attach to a model request.
+///
+/// The file handle is opened before validation and read through that same handle,
+/// preventing the validated path from being replaced between validation and read.
+pub fn read_attach_file(
+    path_str: &str,
+    cwd: &std::path::Path,
+    max_bytes: Option<usize>,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let (mut file, resolved) = open_attach_file(path_str, cwd)?;
 
     if let Some(max) = max_bytes {
         let len = file
@@ -3684,6 +3756,111 @@ b:2:y"
             err.to_string().contains("not a regular file"),
             "expected not-a-file error, got: {err}"
         );
+    }
+
+    // ---- read_attach_media ----
+
+    /// A PNG header followed by filler, and a PDF header followed by text — the
+    /// smallest byte strings each sniffs as.
+    fn png_bytes(pad: usize) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.resize(v.len() + pad, 0);
+        v
+    }
+
+    /// An image and a PDF each come back as an attachment of the type their
+    /// **bytes** say, named for the file they came from.
+    #[test]
+    fn read_attach_media_returns_an_attachment_for_image_and_pdf_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("shot.png"), png_bytes(64)).unwrap();
+        std::fs::write(cwd.join("report.pdf"), b"%PDF-1.7\nbody\n%%EOF\n").unwrap();
+
+        let img = read_attach_media("shot.png", cwd).unwrap().expect("a png");
+        assert_eq!(img.media_type(), MediaType::Png);
+        assert_eq!(img.filename(), "shot.png");
+        let doc = read_attach_media("report.pdf", cwd)
+            .unwrap()
+            .expect("a pdf");
+        assert_eq!(doc.media_type(), MediaType::Pdf);
+        assert_eq!(doc.filename(), "report.pdf");
+    }
+
+    /// The extension is a claim and the bytes are the fact — in both directions.
+    /// A text file named `.png` is not an image, and a screenshot saved without
+    /// an extension still is one.
+    #[test]
+    fn read_attach_media_reads_the_bytes_not_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("liar.png"), "just text, no signature").unwrap();
+        std::fs::write(cwd.join("screenshot"), png_bytes(16)).unwrap();
+
+        assert!(
+            read_attach_media("liar.png", cwd).unwrap().is_none(),
+            "a .png holding text is not an image"
+        );
+        assert_eq!(
+            read_attach_media("screenshot", cwd)
+                .unwrap()
+                .expect("bytes are a png")
+                .media_type(),
+            MediaType::Png
+        );
+    }
+
+    /// Anything the sniffer does not know is `None` (the caller reads it as
+    /// text), including a file too short to carry a signature at all.
+    #[test]
+    fn read_attach_media_returns_none_for_unsupported_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("notes.md"), "# hello\n").unwrap();
+        std::fs::write(cwd.join("tiny.bin"), b"\x89PN").unwrap();
+        // A RIFF container that is not WebP — a .wav — is a real near-miss.
+        std::fs::write(cwd.join("clip.wav"), b"RIFF\x24\x08\x00\x00WAVEfmt ").unwrap();
+        std::fs::write(cwd.join("empty.png"), b"").unwrap();
+
+        for name in ["notes.md", "tiny.bin", "clip.wav", "empty.png"] {
+            assert!(
+                read_attach_media(name, cwd).unwrap().is_none(),
+                "{name} is not something hrdr can attach"
+            );
+        }
+    }
+
+    /// The same refusals the text path makes: a missing file and a secret file
+    /// are errors, not attachments — the media reader goes through the same
+    /// open-then-validate handle as [`read_attach_file`].
+    #[test]
+    fn read_attach_media_refuses_what_the_text_path_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        assert!(read_attach_media("nope.png", cwd).is_err());
+
+        // A secret file whose bytes *are* a PNG is still off-limits.
+        std::fs::write(cwd.join(".env"), png_bytes(8)).unwrap();
+        let err = read_attach_media(".env", cwd).unwrap_err();
+        assert!(
+            err.to_string().contains("secret"),
+            "expected the secret-file refusal, got: {err}"
+        );
+    }
+
+    /// No size cap of its own: a file far past the *text* attach cap comes back
+    /// whole, because an image's ceiling belongs to the request gate
+    /// (`check_attachments`), not to the reader.
+    #[test]
+    fn read_attach_media_applies_no_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let big = 300 * 1024;
+        std::fs::write(cwd.join("big.png"), png_bytes(big)).unwrap();
+
+        let a = read_attach_media("big.png", cwd).unwrap().expect("a png");
+        // 4 encoded bytes per 3 raw: the whole file arrived, not a prefix.
+        assert_eq!(a.encoded_len(), (big + 8).div_ceil(3) * 4);
     }
 
     /// Every optional argument of every registered tool declares the value it

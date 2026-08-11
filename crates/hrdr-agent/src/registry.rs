@@ -643,6 +643,10 @@ impl AgentRegistry {
                     last.display.push_str(&msg.display);
                     last.sent.push('\n');
                     last.sent.push_str(&msg.sent);
+                    // The merged text still refers to them, so the attachments
+                    // merge too — dropping them here would leave the labels in
+                    // `sent` pointing at images the model never received.
+                    last.attachments.extend(msg.attachments);
                 } else {
                     q.push_back(msg);
                 }
@@ -1726,6 +1730,46 @@ mod tests {
             live.pending(1),
             vec!["next".to_string()],
             "the message is left for the next run to drain, not popped here"
+        );
+    }
+
+    /// Merging two queued messages merges their attachments too.
+    ///
+    /// The merged `sent` text still names every attached file ("Image 1:
+    /// shot.png"), so dropping the second message's bytes would leave the model
+    /// reading a label for a picture it never got.
+    #[test]
+    fn merging_queued_messages_keeps_every_attachment() {
+        let png = |name: &str| {
+            hrdr_llm::media::Attachment::new(
+                b"\x89PNG\r\n\x1a\n\0\0\0\0".to_vec(),
+                hrdr_llm::media::MediaType::Png,
+                name,
+            )
+            .unwrap()
+        };
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        live.begin_turn(1);
+        live.enqueue(
+            1,
+            crate::Steer::plain("first").with_attachments(vec![png("a.png")]),
+        );
+        live.enqueue(
+            1,
+            crate::Steer::plain("second").with_attachments(vec![png("b.png")]),
+        );
+
+        let merged = live.take_pending(1).expect("one merged message");
+        assert_eq!(merged.sent, "first\nsecond");
+        assert_eq!(
+            merged
+                .attachments
+                .iter()
+                .map(|a| a.filename())
+                .collect::<Vec<_>>(),
+            vec!["a.png", "b.png"],
+            "both files ride on the merged message, in order"
         );
     }
 

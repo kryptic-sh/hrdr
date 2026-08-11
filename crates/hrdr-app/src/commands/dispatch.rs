@@ -664,6 +664,8 @@ mod tests {
         queued_compactions: Vec<Option<String>>,
         /// Session prompt-cache figures, as `session_cache` reports them.
         cache: Option<(f64, usize, usize)>,
+        /// What `/paste` reads back, when a test sets it.
+        clipboard: Option<String>,
     }
 
     impl TestHost {
@@ -689,6 +691,7 @@ mod tests {
                 started_compactions: Vec::new(),
                 queued_compactions: Vec::new(),
                 cache: None,
+                clipboard: None,
             }
         }
     }
@@ -748,6 +751,9 @@ mod tests {
         fn insert_input(&mut self, text: String) {
             self.input.push_str(&text);
         }
+        fn read_clipboard(&self) -> Option<String> {
+            self.clipboard.clone()
+        }
         fn set_tool_expansion(&mut self, _mode: ExpandMode) -> String {
             String::new()
         }
@@ -759,7 +765,6 @@ mod tests {
         }
     }
 
-    /// `/add` applies the same attach-size cap as `@file` mentions
     /// `/model` always opens the picker — an argument no longer switches
     /// directly (the picker's fuzzy filter covers that), so the displayed
     /// model must not change from dispatch alone.
@@ -843,8 +848,45 @@ mod tests {
         );
     }
 
-    /// `/add` attaches files outside the working directory (full-access default):
-    /// a `..` escape and an absolute path both go through. Only secret/credential
+    /// `/paste` of an image path leaves the `@mention` that attaches it, however
+    /// big the file is.
+    ///
+    /// There is no cap on this path at all — and deliberately so. The 100 KB
+    /// [`crate::MAX_ATTACH_BYTES`] is a context-window guard for *inlined text*;
+    /// an image's bytes never enter the text, and the ceiling that does apply to
+    /// it (`max_attachment_bytes`) is enforced once, at the request gate, where
+    /// the configured value is in scope. Refusing here would mean inventing a
+    /// second number — and a 200 KB screenshot, which is simply what a screenshot
+    /// weighs, silently refused by the wrong one.
+    #[tokio::test]
+    async fn paste_attaches_an_image_path_whatever_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(crate::MAX_ATTACH_BYTES * 2, 0);
+        std::fs::write(root.join("big.png"), &png).unwrap();
+
+        let mut host = TestHost::new(root.clone());
+        host.clipboard = Some("big.png".to_string());
+        assert!(dispatch(&mut host, "/paste"));
+        assert_eq!(host.input, "@big.png ", "the mention lands in the input");
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("attached @big.png")),
+            "{:?}",
+            host.info_log
+        );
+
+        // And that mention is what produces the attachment on the way out.
+        let out = crate::expand_mentions_tracked(&host.input, &root);
+        assert_eq!(out.attachments().len(), 1, "over the text cap, still sent");
+        assert_eq!(
+            out.attachments()[0].media_type(),
+            hrdr_tools::MediaType::Png
+        );
+    }
+
     /// `cmd.exe` treats `&` as a command separator even when the argument
     /// itself isn't shell-quoted, so an OAuth URL's query string
     /// (`...&state=...`) would get truncated by `cmd /C start "" <url>` on

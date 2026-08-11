@@ -967,7 +967,7 @@ impl Agent {
         // speaking, so both are plain `User` turns: the origin marker records WHO
         // sent a message, not when it arrived.
         on_event(AgentEvent::Steered(msg.display));
-        self.push_user_message(sent, MessageOrigin::User);
+        self.push_user_message_with(sent, MessageOrigin::User, msg.attachments);
         Ok(())
     }
 

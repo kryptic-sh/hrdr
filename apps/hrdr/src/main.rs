@@ -940,7 +940,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     // `@agent` mention to the matching sub-agent (parity with the TUI), and
     // expand `todo#N` / `task#N` references against this agent's own list.
     let todos = agent.todos_owned();
-    let (prompt, inlined) = hrdr_app::prepare_outgoing_tracked(
+    let outgoing = hrdr_app::prepare_outgoing_tracked(
         &prompt,
         agent.agent_names(),
         &agent.cwd(),
@@ -949,7 +949,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     );
     // A fully inlined `@file` is content the model has already seen — tell the
     // read-before-edit guard so it doesn't demand a redundant re-read.
-    agent.mark_files_read(&inlined);
+    agent.mark_files_read(outgoing.inlined());
     // Connect any configured MCP servers before the turn (their tools join the
     // set); surface the per-server status on stderr unless quiet.
     for notice in agent.connect_mcp().await {
@@ -973,10 +973,14 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     // Headless runs have no interactive steering: enqueue the prompt as the
     // turn's opener (the same queue an interactive steer would use) and run.
     let steering = hrdr_agent::steering_queue();
+    // Sent and displayed forms are the same here (nothing echoes a headless
+    // prompt back), so the expanded text is both — plus any `@image.png` /
+    // `@doc.pdf` attachments, which ride on the message rather than in it.
+    let display = outgoing.text().to_string();
     steering
         .lock()
         .unwrap()
-        .push_back(hrdr_agent::Steer::plain(prompt));
+        .push_back(outgoing.into_steer(display));
     let result = agent
         .run(steering, |ev| {
             if json {
