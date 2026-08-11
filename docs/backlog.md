@@ -626,17 +626,29 @@ Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three
 dialects, `@file` and `Ctrl+]` construct them, blobs persist beside the session,
 and `estimate_tokens_in_messages` prices them. What the six slices left open:
 
-- **The model cannot delegate an attachment; the user can send one.** Two
-  different paths, and only one is closed: `spawn_background` takes
-  `prompt: String` and `task_steer` builds `Steer::plain` from a string, so the
-  model's own delegation carries no attachment. A user typing into a focused
-  sub-agent pane does — `send_to_subagent` moves them onto the `Steer` and
-  `send_prompt` hands it through whole on both the idle and running branches,
-  and `save_to_path` persists them beside the snapshot. Pinned by
-  `an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent`, added after a
-  comment in `session.rs` claimed the broader "nothing puts attachments on a
-  sub-agent's messages" and no test contradicted it. Whether the model should be
-  able to hand a screenshot to a sub-agent is still open.
+- **A finished-but-retained sub-agent can be steered by the user and not by the
+  main agent** — one rule, deliberately asymmetric, worth re-reading before
+  anyone "fixes" it. `send_prompt` takes a `WhenIdle`: the frontend passes
+  `StartTurn` because the pane the user typed into is watching, and is the only
+  reason the finished sub-agent was retained at all; `task_steer` passes
+  `Decline` because the main agent hears from a background sub-agent through a
+  `BackgroundTask` row that `turn_state` drops once the answer is delivered
+  (`v.retain(|t| !(t.delivered || t.cancelled))`), so a turn started there would
+  spend a model call answering nobody while reporting success. Full parity needs
+  either the follow-up turn's report piped back as the tool result (blocking the
+  parent on a call the model expects to be instant) or a re-armed background row
+  — which is `task_revive`, removed on purpose ("re-briefing beats resuming",
+  `delegation.rs`). Revisit only if the retained context is worth paying for one
+  of those.
+- **What each path may attach is still spelled differently, on purpose.** The
+  user writes `@shot.png` and gets `@dir/`, todo refs and `:command` expansion
+  with it; the model passes an explicit `attachments: [path]` array. Reusing `@`
+  for the model was rejected: the expander lives a crate above `hrdr-agent`,
+  swallows every failure (right for a human who can see their own typo, wrong
+  for a model that would otherwise delegate a task with no picture), also
+  inlines text files, and `@` is ordinary punctuation in prose a model writes.
+  Both feed one builder, so the difference is input rather than a second
+  implementation — pinned by `the_two_paths_build_the_same_message`.
 - **The blob store has no lock.** Two hrdr processes and the retention sweeper
   share `sessions/<cwd-slug>/blobs/` with no coordination. The mark phase is the
   real protection (a purged session's digests are collected only if no surviving
