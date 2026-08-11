@@ -10154,6 +10154,82 @@ async fn a_message_with_no_attachments_is_unchanged() {
     );
 }
 
+/// A message typed into a **sub-agent's** pane carries its attachments too.
+///
+/// Worth its own test because the two ways a sub-agent can be given work are not
+/// the same path: the model's own `task`/`task_steer` take a plain `String` and
+/// cannot carry an attachment at all, while this one — the user typing into a
+/// focused pane — goes through `send_to_subagent` and can. A comment claiming
+/// nothing ever puts an attachment on a sub-agent's message was true of the
+/// first path only, and nothing here contradicted it.
+#[tokio::test]
+async fn an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent() {
+    let mut h = Harness::new(vec![MockReply::Text("main reply".to_string())]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    std::fs::write(cwd.join("shot.png"), png_bytes(64)).unwrap();
+
+    // Registered as already running, so the message is queued as a steer rather
+    // than opening a turn — the assertion is about what the send path carries,
+    // not about driving a second agent to completion.
+    let sub_key = 7_u64;
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
+    h.app.registry.register(hrdr_agent::AgentEntry {
+        key: sub_key,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        sandbox: hrdr_tools::SandboxMode::None,
+        todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
+        turn: hrdr_agent::TurnStats::default(),
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        compacting: false,
+        done: false,
+        delivered: false,
+        pinned: false,
+        transcript: None,
+    });
+    h.app.sync_panes();
+    h.app.focus_pane(hrdr_app::PaneId(sub_key));
+
+    h.type_str("look at @shot.png");
+    h.press(KeyCode::Enter);
+
+    let queued = h
+        .app
+        .registry
+        .take_pending(sub_key)
+        .expect("the message reached the sub-agent's queue");
+    assert_eq!(
+        queued.attachments.len(),
+        1,
+        "the image went to the sub-agent, not to main"
+    );
+    assert_eq!(queued.attachments[0].filename(), "shot.png");
+    assert!(
+        queued.sent.contains("Image 1: shot.png"),
+        "labelled for the sub-agent's model too: {:?}",
+        queued.sent
+    );
+    // And it went *there*: main's queue never saw it.
+    assert!(
+        h.app.registry.take_pending(hrdr_agent::MAIN_KEY).is_none(),
+        "the main agent was not sent the sub-agent's message"
+    );
+    h.pump().await;
+}
+
 /// Ctrl+] with an image on the clipboard attaches it to the message being
 /// written, and the composer says so.
 #[tokio::test]

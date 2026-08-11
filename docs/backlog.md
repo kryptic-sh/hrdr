@@ -626,12 +626,17 @@ Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three
 dialects, `@file` and `Ctrl+]` construct them, blobs persist beside the session,
 and `estimate_tokens_in_messages` prices them. What the six slices left open:
 
-- **A sub-agent cannot receive an attachment.** `spawn_background` takes
-  `prompt: String` and `task_steer` builds `Steer::plain` from a string, so
-  neither carries one. `RunSnapshot::save_to_path` was wired for blobs anyway,
-  so the two save paths cannot diverge the day a `task` prompt can carry one.
-  Deliberate, not an oversight — decide whether delegating a screenshot to a
-  sub-agent is wanted before building it.
+- **The model cannot delegate an attachment; the user can send one.** Two
+  different paths, and only one is closed: `spawn_background` takes
+  `prompt: String` and `task_steer` builds `Steer::plain` from a string, so the
+  model's own delegation carries no attachment. A user typing into a focused
+  sub-agent pane does — `send_to_subagent` moves them onto the `Steer` and
+  `send_prompt` hands it through whole on both the idle and running branches,
+  and `save_to_path` persists them beside the snapshot. Pinned by
+  `an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent`, added after a
+  comment in `session.rs` claimed the broader "nothing puts attachments on a
+  sub-agent's messages" and no test contradicted it. Whether the model should be
+  able to hand a screenshot to a sub-agent is still open.
 - **The blob store has no lock.** Two hrdr processes and the retention sweeper
   share `sessions/<cwd-slug>/blobs/` with no coordination. The mark phase is the
   real protection (a purged session's digests are collected only if no surviving

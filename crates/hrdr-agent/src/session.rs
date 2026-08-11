@@ -934,10 +934,11 @@ impl Session {
             }
         };
         // Attachment blobs first, exactly as `save` does — a sub-agent's snapshot
-        // gets its own `blobs/` beside it. Nothing puts attachments on a
-        // sub-agent's messages today (a `task` prompt and a `task_steer` prompt
-        // are both plain strings), so in practice this writes nothing; wiring it
-        // anyway is what keeps the two save paths from diverging the day one can.
+        // gets its own `blobs/` beside it, and it really is reached: a user typing
+        // into a focused sub-agent pane sends attachments through
+        // `send_to_subagent`, so a sub-agent's history can hold them. What cannot
+        // carry one is the model's own delegation (`task` and `task_steer` both
+        // take a plain string), which is a narrower claim than "nothing does".
         let attachments = crate::attachment_store::attachment_refs(&self.state.messages);
         crate::attachment_store::write_blobs(
             &crate::attachment_store::blob_dir(path),
