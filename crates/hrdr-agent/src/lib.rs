@@ -3191,7 +3191,7 @@ mod tests {
         AgentEntry, AgentRegistry, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind, TurnStats,
     };
     use futures_util::FutureExt;
-    use hrdr_llm::{ChatMessage, FunctionCall, MessageOrigin, Role, ToolCall};
+    use hrdr_llm::{ChatMessage, FunctionCall, MessageOrigin, Role, TokenTarget, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
         agent.messages()[0].content.clone().unwrap_or_default()
@@ -3266,8 +3266,11 @@ mod tests {
         assert_eq!(estimate_tokens(&"x".repeat(40)), 10);
         assert_eq!(estimate_tokens(""), 0);
         // Per-message overhead + content; more content ⇒ strictly more tokens.
-        let small = estimate_tokens_in_messages(&[ChatMessage::user("hi")]);
-        let big = estimate_tokens_in_messages(&[ChatMessage::user("word ".repeat(100))]);
+        let small = estimate_tokens_in_messages(&[ChatMessage::user("hi")], TokenTarget::Anthropic);
+        let big = estimate_tokens_in_messages(
+            &[ChatMessage::user("word ".repeat(100))],
+            TokenTarget::Anthropic,
+        );
         assert!(big > small);
         assert!(small >= 4, "per-message overhead applies");
     }
@@ -8187,16 +8190,28 @@ mod tests {
             ChatMessage::assistant(big.clone()), // 6
         ];
         // Generous budget: keep the last 2 whole turns → tail starts at u2 (3).
-        assert_eq!(compaction_tail_start(&msgs, 2, 1_000_000), 3);
+        assert_eq!(
+            compaction_tail_start(&msgs, 2, 1_000_000, TokenTarget::Anthropic),
+            3
+        );
         // One turn only → starts at u3 (5).
-        assert_eq!(compaction_tail_start(&msgs, 1, 1_000_000), 5);
+        assert_eq!(
+            compaction_tail_start(&msgs, 1, 1_000_000, TokenTarget::Anthropic),
+            5
+        );
         // Budget caps it to the newest turn even when tail_turns allows more
         // (each turn is ~5k tokens; two would bust an 8k budget).
-        assert_eq!(compaction_tail_start(&msgs, 3, 8_000), 5);
+        assert_eq!(
+            compaction_tail_start(&msgs, 3, 8_000, TokenTarget::Anthropic),
+            5
+        );
         // tail_turns = 0 keeps nothing verbatim (whole history summarized).
-        assert_eq!(compaction_tail_start(&msgs, 0, 8_000), msgs.len());
+        assert_eq!(
+            compaction_tail_start(&msgs, 0, 8_000, TokenTarget::Anthropic),
+            msgs.len()
+        );
         // The tail always begins on a user message — never orphans a tool result.
-        let start = compaction_tail_start(&msgs, 2, 1_000_000);
+        let start = compaction_tail_start(&msgs, 2, 1_000_000, TokenTarget::Anthropic);
         assert_eq!(msgs[start].role, Role::User);
     }
 
@@ -8225,9 +8240,15 @@ mod tests {
         // Two turns back from the newest REAL turn is u1 (1), not the nudge at
         // 7 and the background result at 5 — which is what a role-only filter
         // would have picked, leaving one real turn's worth of tail.
-        assert_eq!(compaction_tail_start(&msgs, 2, 1_000_000), 1);
-        assert_eq!(compaction_tail_start(&msgs, 1, 1_000_000), 3);
-        let start = compaction_tail_start(&msgs, 2, 1_000_000);
+        assert_eq!(
+            compaction_tail_start(&msgs, 2, 1_000_000, TokenTarget::Anthropic),
+            1
+        );
+        assert_eq!(
+            compaction_tail_start(&msgs, 1, 1_000_000, TokenTarget::Anthropic),
+            3
+        );
+        let start = compaction_tail_start(&msgs, 2, 1_000_000, TokenTarget::Anthropic);
         assert_eq!(msgs[start].origin, crate::MessageOrigin::User);
 
         // A summary does not open a turn either: the message right after a
@@ -8242,7 +8263,10 @@ mod tests {
             ChatMessage::user("u1"),
             ChatMessage::assistant(big.clone()),
         ];
-        assert_eq!(compaction_tail_start(&after_compaction, 2, 1_000_000), 2);
+        assert_eq!(
+            compaction_tail_start(&after_compaction, 2, 1_000_000, TokenTarget::Anthropic),
+            2
+        );
     }
 
     #[test]
@@ -8264,13 +8288,18 @@ mod tests {
             ChatMessage::assistant("final answer"),     // 7
         ];
         assert_eq!(
-            compaction_tail_start(&msgs, DEFAULT_TAIL_TURNS, DEFAULT_PRESERVE_RECENT_TOKENS),
+            compaction_tail_start(
+                &msgs,
+                DEFAULT_TAIL_TURNS,
+                DEFAULT_PRESERVE_RECENT_TOKENS,
+                TokenTarget::Anthropic
+            ),
             1,
             "only one user turn exists — compaction_tail_start can't split further"
         );
 
         // A tight budget forces a real split inside the turn.
-        let split = mega_turn_tail_start(&msgs, 1, 8_000);
+        let split = mega_turn_tail_start(&msgs, 1, 8_000, TokenTarget::Anthropic);
         assert!(split > 1, "must find something to summarize, got {split}");
         assert!(
             split < msgs.len(),
@@ -8285,10 +8314,16 @@ mod tests {
 
         // A generous budget covering the whole turn is a genuine no-op (nothing
         // to gain by summarizing).
-        assert_eq!(mega_turn_tail_start(&msgs, 1, 1_000_000), 1);
+        assert_eq!(
+            mega_turn_tail_start(&msgs, 1, 1_000_000, TokenTarget::Anthropic),
+            1
+        );
 
         // turn_start at/after the end of the slice: nothing to split.
-        assert_eq!(mega_turn_tail_start(&msgs, msgs.len(), 8_000), msgs.len());
+        assert_eq!(
+            mega_turn_tail_start(&msgs, msgs.len(), 8_000, TokenTarget::Anthropic),
+            msgs.len()
+        );
     }
 
     #[test]
@@ -8305,7 +8340,7 @@ mod tests {
             assistant_with_calls(&["a"]),
             ChatMessage::tool_result("a", "x".repeat(80_000)), // ~20k tokens alone
         ];
-        let split = mega_turn_tail_start(&msgs, 1, 1_000);
+        let split = mega_turn_tail_start(&msgs, 1, 1_000, TokenTarget::Anthropic);
         assert_eq!(
             split,
             msgs.len(),
@@ -8513,7 +8548,7 @@ mod tests {
         // Keep the last 1 turn (tail_turns=1, generous token budget).
         // Turn 2 starts at index 3 (u2), so the tail must begin there —
         // NOT at index 4 (the tool-calling assistant) or 5 (the result).
-        let tail_start = compaction_tail_start(&msgs, 1, 1_000_000);
+        let tail_start = compaction_tail_start(&msgs, 1, 1_000_000, TokenTarget::Anthropic);
         assert_eq!(
             msgs[tail_start].role,
             Role::User,
@@ -8780,7 +8815,7 @@ mod tests {
             tool_call_id: None,
             name: None,
         };
-        let estimate = estimate_tokens_in_messages(&[msg]);
+        let estimate = estimate_tokens_in_messages(&[msg], TokenTarget::Anthropic);
         assert!(
             estimate >= 4,
             "per-message overhead must be at least 4, got {estimate}"
@@ -11364,10 +11399,13 @@ mod tests {
                     "x".repeat(400)
                 )));
             }
-            let before = crate::compaction::estimate_tokens_in_messages(&agent.messages)
-                .saturating_add(crate::compaction::estimate_tokens_in_tools(
-                    &agent.tools.defs(),
-                ));
+            let before = crate::compaction::estimate_tokens_in_messages(
+                &agent.messages,
+                agent.client.token_target(),
+            )
+            .saturating_add(crate::compaction::estimate_tokens_in_tools(
+                &agent.tools.defs(),
+            ));
             // Keep the tail budget out of the way so the pass really shrinks:
             // only the last turn stays verbatim, the other seven summarize.
             agent.compaction_tail_turns = 1;
@@ -11381,7 +11419,10 @@ mod tests {
 
             // The figure is the post-compaction request — system + summary +
             // tail plus the tools block — not the pre-compaction history.
-            let after = crate::compaction::estimate_tokens_in_messages(&agent.messages);
+            let after = crate::compaction::estimate_tokens_in_messages(
+                &agent.messages,
+                agent.client.token_target(),
+            );
             let tools = crate::compaction::estimate_tokens_in_tools(&agent.tools.defs());
             assert_eq!(report.context_after, after.saturating_add(tools));
             assert!(
@@ -12710,6 +12751,7 @@ mod tests {
                     agent.messages(),
                     super::DEFAULT_TAIL_TURNS,
                     super::DEFAULT_PRESERVE_RECENT_TOKENS,
+                    agent.client.token_target(),
                 ),
                 1
             );
@@ -12768,8 +12810,12 @@ mod tests {
 
             // The tail the split picks, computed against the same history the
             // compaction is about to read.
-            let tail_start =
-                super::mega_turn_tail_start(agent.messages(), 1, agent.preserve_recent_tokens);
+            let tail_start = super::mega_turn_tail_start(
+                agent.messages(),
+                1,
+                agent.preserve_recent_tokens,
+                agent.client.token_target(),
+            );
             assert!(
                 tail_start > 1 && tail_start < agent.messages.len(),
                 "precondition: the split found a boundary inside the turn, got {tail_start}"

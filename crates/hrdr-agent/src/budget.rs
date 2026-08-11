@@ -120,7 +120,8 @@ impl Agent {
             // it, so omitting them made the gauge and the compaction trigger
             // read low by a constant several thousand tokens.
             None => (
-                estimate_tokens_in_messages(&self.messages).saturating_add(tool_tokens),
+                estimate_tokens_in_messages(&self.messages, self.client.token_target())
+                    .saturating_add(tool_tokens),
                 estimate_tokens(&acc.content)
                     .saturating_add(estimate_tokens(&acc.reasoning))
                     .saturating_add(acc.tool_call_tokens()),
@@ -274,8 +275,12 @@ mod tests {
              ({text_only} vs {trigger})"
         );
 
-        // The same turn with a screenshot on it: 1000x1000 costs 1,296 visual
-        // tokens, and no text changed.
+        // The same turn with a screenshot on it, and no text changed. The
+        // default endpoint is a local OpenAI-compatible server, so the image is
+        // priced at OpenAI's 32×32 patches: ⌈1000/32⌉² = 1,024. The same bytes
+        // bound for Anthropic cost 1,296 (⌈1000/28⌉²) — asserted below, because
+        // the endpoint reaching the estimator is the whole point of it being a
+        // parameter.
         msg.attachments = vec![
             hrdr_llm::media::Attachment::new(
                 crate::compaction::tests::png_sized(1_000, 1_000),
@@ -295,8 +300,17 @@ mod tests {
         );
         assert_eq!(
             with_image,
-            text_only + 1_296,
+            text_only + 1_024,
             "and it is charged its visual tokens, nothing else having changed"
+        );
+
+        // Repointed at Anthropic, the identical history estimates higher — the
+        // agent's own client is what decides, not a constant compiled in here.
+        agent.client.set_base_url("https://api.anthropic.com/v1");
+        assert_eq!(
+            agent.account_usage(&acc, 0).await.prompt_tokens,
+            text_only + 1_296,
+            "the same screenshot costs Anthropic's 28px patches there"
         );
     }
 

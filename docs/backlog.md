@@ -656,13 +656,28 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   is a lock genuinely aged past its window in real time — every staleness test
   backdates the timestamp, so the clock arithmetic is exercised but a minute of
   real waiting is not.
-- **Token estimates are charged at Anthropic's high-resolution tier for every
-  dialect** (`CHARGED_MAX_EDGE_PX` in `media.rs`). OpenAI uses 32×32 patches
-  with its own budgets, so one formula is an approximation either way; the
-  expensive tier was chosen because under-counting is what lets a request
-  overflow its window. Revisit only with a real over-compaction complaint, and
-  note the per-attachment cost is cached at construction, so making it
-  model-aware means caching dimensions instead and pricing at estimate time.
+- **An image is now priced for the endpoint it is bound for** (`TokenTarget` in
+  `media.rs`, threaded through `estimate_tokens_in_messages`), which closes the
+  "charged at Anthropic's tier for every dialect" entry that stood here. What is
+  still an approximation, deliberately:
+  - **Anthropic is always charged the high-resolution tier**
+    (`HIGH_RES_MAX_EDGE_PX`/`HIGH_RES_MAX_IMAGE_TOKENS`). Which tier a model is
+    on is a property of its generation ("Claude 4.7 and later"), and the only
+    way to decide it from a model id is a hard-coded name list that goes stale;
+    stale here means charging 1568 for an image that costs 4784. Reconsider only
+    if models.dev ever publishes the tier.
+  - **OpenAI is charged an uncapped 32×32 patch count** (`openai_patch_tokens`),
+    which is what `"detail": "auto"` costs on the GPT-5.6 family. The two
+    documented under-estimates it cannot see from a width and a height: the
+    `-mini`/`-nano` multipliers (×1.62–×2.46), and the tile method used by
+    GPT-4o/GPT-4.1/o-series, which scales a _small_ image's short edge up to 768
+    px and so charges more than its patches (a 200×200 image is 49 patches here,
+    ~765 tokens there). Both would need a per-model table hrdr does not have.
+  - **Round-half-to-even is transcribed but not pinned by a vendor number.**
+    `div_round_ties_even` follows Anthropic's published reference
+    implementation, and `halves_round_to_the_even_neighbour` asserts the rule
+    itself — but no image in the published table lands on a tie that changes its
+    patch count, so nothing proves the two interact as the vendor's code does.
 - **A PDF's page count is a byte scan for `/Type /Page`.** A compressed page
   tree (most real PDFs) falls back to file size at 50 KB/page. Both err high.
 - **Idle and delivered are one state for a sub-agent, which is why the pane

@@ -15,9 +15,11 @@
 //! An attachment reaches a message from an `@file` mention, from a `Ctrl+]`
 //! paste (image bytes, or a `text/uri-list` naming a file), or from a resumed
 //! session's blob store — all of them through [`Attachment::new`], which is
-//! also where the bytes are sniffed and where each attachment's token cost is
-//! computed once ([`Attachment::estimated_tokens`], the figure the agent's
-//! context accounting adds to its per-message estimate).
+//! also where the bytes are sniffed and where an image's pixel dimensions are
+//! read out of its header. What those dimensions *cost* depends on where the
+//! message is going, so it is priced per estimate instead
+//! ([`Attachment::estimated_tokens`] against a [`TokenTarget`], the figure the
+//! agent's context accounting adds to its per-message estimate).
 //!
 //! The refusals that keep a request the provider would reject off the wire live
 //! here too ([`check_attachments`]): the model's input modalities, the
@@ -175,16 +177,21 @@ impl std::fmt::Display for MediaType {
     }
 }
 
-/// Anthropic's visual-token patch: an image costs `⌈width / 28⌉ × ⌈height / 28⌉`
-/// tokens, one per 28×28 pixel patch.
-const IMAGE_PATCH_PX: u64 = 28;
+/// Anthropic's visual-token patch: *"Each patch is a 28×28-pixel block of the
+/// image, referred to as a visual token. An image, therefore, costs
+/// `⌈width / 28⌉ × ⌈height / 28⌉` visual tokens."*
+const ANTHROPIC_PATCH_PX: u64 = 28;
+
+/// OpenAI's patch: *"Some models tokenize images by covering them with 32px x
+/// 32px patches"*, counted as `ceil(width/32)×ceil(height/32)`.
+const OPENAI_PATCH_PX: u64 = 32;
 
 /// The standard tier's long-edge cap in pixels: an image longer than this on its
 /// long edge is downscaled (aspect preserved) before it is charged.
 ///
-/// Nothing is charged at this tier (see [`CHARGED_MAX_EDGE_PX`]); it is kept so
-/// the tests can check [`visual_tokens`] against the standard-tier figures
-/// Anthropic publishes, which are half the evidence that the formula is
+/// Nothing is charged at this tier (see [`TokenTarget::Anthropic`]); it is kept
+/// so the tests can check [`anthropic_visual_tokens`] against the standard-tier
+/// figures Anthropic publishes, which are half the evidence that the formula is
 /// transcribed correctly.
 #[cfg(test)]
 const STANDARD_MAX_EDGE_PX: u64 = 1_568;
@@ -201,23 +208,36 @@ const HIGH_RES_MAX_EDGE_PX: u64 = 2_576;
 /// The high-resolution tier's ceiling on one image's visual tokens.
 const HIGH_RES_MAX_IMAGE_TOKENS: u64 = 4_784;
 
-/// The tier every attachment is charged at, and the reason it is the expensive
-/// one: an image is charged the same way for every dialect, so the choice is
-/// which way to be wrong. The high-resolution tier is automatic on Claude 4.7
-/// and later — the models hrdr points at by default — where the standard tier
-/// under-charges a 1080p screenshot by 1,131 tokens, and **under-counting is
-/// the error that lets a request overflow the window** while over-counting only
-/// compacts a little early. On a standard-tier or non-Anthropic model this runs
-/// high (never more than the ratio between the two ceilings), which is the
-/// direction a budget estimate should err.
-const CHARGED_MAX_EDGE_PX: u64 = HIGH_RES_MAX_EDGE_PX;
-const CHARGED_MAX_IMAGE_TOKENS: u64 = HIGH_RES_MAX_IMAGE_TOKENS;
-
 /// What one image is charged when its header cannot be parsed — the most the
-/// charged tier can charge for any single image, so an unreadable header can
-/// only ever over-count. Zero (what an unaccounted attachment used to cost) is
-/// the one answer that lets a request overflow the window.
-const UNKNOWN_IMAGE_TOKENS: u32 = CHARGED_MAX_IMAGE_TOKENS as u32;
+/// Anthropic high-resolution tier can charge for any single image. Zero (what an
+/// unaccounted attachment used to cost) is the one answer that lets a request
+/// overflow the window.
+///
+/// One figure for every target rather than one per target, because there is no
+/// second principled number: [`TokenTarget::OpenAi`] has no ceiling to borrow (a
+/// patch count with no budget applied to it), so a big enough unreadable image
+/// would out-cost this there. It stays the largest charge hrdr can put a bound
+/// on, which is the most an unknown can honestly be priced at.
+const UNKNOWN_IMAGE_TOKENS: u32 = HIGH_RES_MAX_IMAGE_TOKENS as u32;
+
+/// Which endpoint a token estimate is being made for — the one thing outside the
+/// image itself that decides what it costs.
+///
+/// Two arms where [`crate::client::Backend`] has three: the OpenAI Responses API
+/// and chat-completions are the same account billed the same way, and price
+/// identically. Obtained from [`crate::Client::token_target`], so the "which
+/// wire dialect is this endpoint" question keeps being answered in exactly one
+/// place — the backend the client already detected — rather than by a second
+/// reading of the URL that could disagree with the request's own shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenTarget {
+    /// The native Anthropic Messages API.
+    Anthropic,
+    /// Both OpenAI-shaped dialects — and with them every OpenAI-compatible
+    /// server hrdr can be pointed at, none of which document a formula of their
+    /// own.
+    OpenAi,
+}
 
 /// Tokens charged per PDF page. Anthropic converts every page to an image *and*
 /// extracts its text, and documents the result as 1,500–3,000 tokens per page;
@@ -373,27 +393,56 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
-/// What one image of `width × height` costs, on Anthropic's published rule:
-/// `⌈width / 28⌉ × ⌈height / 28⌉` visual tokens, after any downscale needed to
-/// bring it inside `max_edge_px` on its long edge and `max_tokens` in total.
+/// `n / d`, rounded to nearest with halves to even.
 ///
-/// The downscale preserves the aspect ratio and takes the largest size that
-/// fits, which is why the token cap is walked one patch column at a time rather
-/// than solved in closed form: the two ceilings make the cost a step function,
-/// and the largest fitting size is the one just under a step. (1920×1080 is the
-/// worked example — the long-edge scale alone lands on 1792 tokens, over the
-/// 1568 cap, and the largest aspect-preserving size under it is 1456×819, or
-/// 1560 tokens, which is what Anthropic publishes.)
+/// The rounding Anthropic's reference implementation uses to derive the short
+/// edge of a resized image (Python's `round`), and the one its TypeScript port
+/// says the service itself applies: *"The live API resolves exact .5 ties toward
+/// the even neighbor, so Math.round (which rounds halves up) would compute a
+/// different size for some images."*
 ///
-/// `max_edge_px`/`max_tokens` are the tier's two numbers. Only the standard tier
-/// is charged for ([`Attachment::estimated_tokens`]); the high-resolution tier's
+/// Exact integer arithmetic rather than a float division, so a tie is the exact
+/// `2 × remainder == divisor` rather than whatever a double happened to land on.
+/// `n` is a product of two values that each fit a `u32`, so it fits a `u64`.
+fn div_round_ties_even(n: u64, d: u64) -> u64 {
+    let (q, r) = (n / d, n % d);
+    match (2 * r).cmp(&d) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Less => q,
+        // The even neighbour: `q` if it is already even, otherwise `q + 1`.
+        std::cmp::Ordering::Equal => q + q % 2,
+    }
+}
+
+/// Patches down one edge of `px` pixels, at `patch` pixels each.
+fn patches(px: u64, patch: u64) -> u64 {
+    px.div_ceil(patch)
+}
+
+/// A patch count as the `u32` an estimate is carried in.
+fn clamp_tokens(tokens: u64) -> u32 {
+    tokens.min(u64::from(u32::MAX)) as u32
+}
+
+/// What one image of `width × height` costs on Anthropic:
+/// `⌈width / 28⌉ × ⌈height / 28⌉` visual tokens, after the downscale that
+/// brings it inside `max_edge_px` on either edge and `max_tokens` in total.
+///
+/// Transcribed from the reference implementation published beside *"How Claude
+/// resizes and pads images"*: *"Claude finds the largest aspect-preserving size
+/// that satisfies both of the model's image limits"*, located by binary search
+/// along the long edge with the short edge rounded to nearest
+/// ([`div_round_ties_even`]). Neither shortcut gives the same answer, which is
+/// why the search is here rather than a formula: scaling to the edge limit alone
+/// makes a 1920×1080 screenshot *"1456×819, not 1568×882"*, and stepping the
+/// patch count down one column at a time lands a 2000×1500 image on 1530 tokens
+/// where the published table says 1564.
+///
+/// `max_edge_px`/`max_tokens` are the tier's two numbers. Only the
+/// high-resolution pair is charged ([`TokenTarget::Anthropic`]); the standard
 /// pair is passed by the tests, which assert both sets of published reference
 /// points and so are what proves the formula is transcribed correctly.
-///
-/// An aspect ratio extreme enough that even a single patch column exceeds
-/// `max_tokens` returns what that column costs — over the tier cap, which is the
-/// direction an estimate should err.
-fn visual_tokens(width: u32, height: u32, max_edge_px: u64, max_tokens: u64) -> u32 {
+fn anthropic_visual_tokens(width: u32, height: u32, max_edge_px: u64, max_tokens: u64) -> u32 {
     let (long, short) = if width >= height {
         (u64::from(width), u64::from(height))
     } else {
@@ -402,19 +451,92 @@ fn visual_tokens(width: u32, height: u32, max_edge_px: u64, max_tokens: u64) -> 
     if long == 0 || short == 0 {
         return 0;
     }
-    let mut long_px = long.min(max_edge_px);
-    loop {
-        let cols = long_px.div_ceil(IMAGE_PATCH_PX);
-        // The short edge at this scale, in patches: ⌈short × long_px / long / 28⌉
-        // in one integer step, so the ratio is never rounded twice.
-        let rows = (short * long_px).div_ceil(long * IMAGE_PATCH_PX);
-        let tokens = cols * rows;
-        if tokens <= max_tokens || cols <= 1 {
-            return tokens.min(u64::from(u32::MAX)) as u32;
+    // Both limits, on the padded size: an image is padded out to whole patches
+    // before the edge limit is applied to it. Both tiers' caps are multiples of
+    // 28, so the padding only matters for a tier that is not — but it is what
+    // the reference implementation checks, and transcribing it differently is
+    // how a limit drifts.
+    let fits = |long_px: u64, short_px: u64| {
+        let (cols, rows) = (
+            patches(long_px, ANTHROPIC_PATCH_PX),
+            patches(short_px, ANTHROPIC_PATCH_PX),
+        );
+        cols * ANTHROPIC_PATCH_PX <= max_edge_px
+            && rows * ANTHROPIC_PATCH_PX <= max_edge_px
+            && cols * rows <= max_tokens
+    };
+    // The short edge that preserves the aspect ratio at a given long edge.
+    let short_at = |long_px: u64| div_round_ties_even(long_px * short, long).max(1);
+    let cost = |long_px: u64| {
+        clamp_tokens(
+            patches(long_px, ANTHROPIC_PATCH_PX) * patches(short_at(long_px), ANTHROPIC_PATCH_PX),
+        )
+    };
+    if fits(long, short) {
+        return cost(long);
+    }
+    // `lo` always fits (one patch is inside every tier), `hi` never does.
+    let (mut lo, mut hi) = (1u64, long);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid, short_at(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
         }
-        // The largest width one patch column narrower — the next size down that
-        // can cost less.
-        long_px = (cols - 1) * IMAGE_PATCH_PX;
+    }
+    cost(lo)
+}
+
+/// What one image of `width × height` costs on an OpenAI-shaped endpoint:
+/// `ceil(width/32) × ceil(height/32)` patches, with **no budget applied**.
+///
+/// OpenAI documents two formulas and hrdr applies this one deliberately. The
+/// other is the tile method — *"GPT-4o, GPT-4.1, GPT-4o-mini, CUA, and o-series
+/// (except o4-mini)"* — which rescales an image so *"the image's shortest side
+/// is 768px long"* and charges a base plus a per-512px-tile amount. Those are
+/// the previous generation; the patch method is what the current one uses, and
+/// it is the one whose inputs hrdr has (a width and a height, no model table).
+///
+/// Uncapped because of what hrdr sends. Most patch-based families cap the count
+/// at a *"patch budget"* (1,536, 2,500 or 10,000, by family and `detail`), but
+/// every image goes out with `"detail": "auto"`
+/// ([`Attachment::openai_part`]/[`Attachment::responses_item`]), and for the
+/// newest family the doc says *"For GPT-5.6 models with `detail` set to
+/// `original` or `auto`, the service uses the original patch count without
+/// resizing the image to a patch budget or pixel-dimension limit. This means
+/// large images can use more input tokens than they did with earlier models."*
+/// So the uncapped count is the true cost on the newest models and an
+/// over-estimate on every budgeted one, which is the direction to be wrong in.
+///
+/// The two known under-estimates, neither of which hrdr can see from a width and
+/// a height: the `-mini`/`-nano` models multiply the patch count (×1.62 to
+/// ×2.46), and the tile method charges a small image *more* than its patches
+/// because it scales the short edge **up** to 768 px.
+fn openai_patch_tokens(width: u32, height: u32) -> u32 {
+    clamp_tokens(
+        patches(u64::from(width), OPENAI_PATCH_PX) * patches(u64::from(height), OPENAI_PATCH_PX),
+    )
+}
+
+/// What one image of `width × height` costs at `target`.
+///
+/// Anthropic is charged at the **high-resolution** tier, and the cheaper
+/// standard tier is never claimed: which tier a model is on is a property of its
+/// generation (*"Claude 4.7 and later models"*), and the only way to decide it
+/// from a model id is a hard-coded list of names that goes stale the week after
+/// it is written — where being stale means charging 1568 tokens for an image
+/// that costs 4784, and under-counting is what lets a request overflow its
+/// window. Over-counting only compacts a little early.
+fn visual_tokens(width: u32, height: u32, target: TokenTarget) -> u32 {
+    match target {
+        TokenTarget::Anthropic => anthropic_visual_tokens(
+            width,
+            height,
+            HIGH_RES_MAX_EDGE_PX,
+            HIGH_RES_MAX_IMAGE_TOKENS,
+        ),
+        TokenTarget::OpenAi => openai_patch_tokens(width, height),
     }
 }
 
@@ -474,14 +596,33 @@ fn pdf_tokens(bytes: &[u8]) -> u32 {
         .saturating_mul(PDF_TOKENS_PER_PAGE)
 }
 
-/// What `bytes` will cost in the prompt, as [`Attachment::new`] records it once.
-fn estimate_tokens(media_type: MediaType, bytes: &[u8]) -> u32 {
+/// Everything about an attachment's cost that reading its bytes can settle —
+/// what [`Attachment::new`] keeps, so [`Attachment::estimated_tokens`] never has
+/// to open the payload again.
+///
+/// Not a token count: an image's cost depends on the endpoint the message is
+/// bound for ([`TokenTarget`]), and one attachment outlives any one estimate of
+/// it — the same bytes are re-priced every round, and a `/model` switch to
+/// another provider re-prices them differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cost {
+    /// An image's decoded pixel dimensions, or `None` for a header
+    /// [`image_dimensions`] could not read (charged [`UNKNOWN_IMAGE_TOKENS`]).
+    Image(Option<(u32, u32)>),
+    /// A PDF's page-derived cost ([`pdf_tokens`]). A token count rather than a
+    /// page count because no target prices a page differently — OpenAI's
+    /// vision documentation gives no per-page figure at all — and because the
+    /// count behind it comes from parsing the file, which is the one part of
+    /// this that must not run once per estimate.
+    Pdf(u32),
+}
+
+/// What reading `bytes` settles about their cost.
+fn cost_of(media_type: MediaType, bytes: &[u8]) -> Cost {
     if media_type == MediaType::Pdf {
-        return pdf_tokens(bytes);
-    }
-    match image_dimensions(media_type, bytes) {
-        Some((w, h)) => visual_tokens(w, h, CHARGED_MAX_EDGE_PX, CHARGED_MAX_IMAGE_TOKENS),
-        None => UNKNOWN_IMAGE_TOKENS,
+        Cost::Pdf(pdf_tokens(bytes))
+    } else {
+        Cost::Image(image_dimensions(media_type, bytes))
     }
 }
 
@@ -503,9 +644,9 @@ pub struct Attachment {
     bytes: Arc<[u8]>,
     media_type: MediaType,
     filename: String,
-    /// [`Self::estimated_tokens`], computed once at construction — see there for
-    /// why it is stored rather than recomputed.
-    estimated_tokens: u32,
+    /// What reading the payload settled about its cost, read once at
+    /// construction — see [`Cost`] for why it is this rather than a token count.
+    cost: Cost,
 }
 
 /// Prints the shape, never the payload: [`ChatMessage`] derives `Debug` and is
@@ -517,7 +658,7 @@ impl std::fmt::Debug for Attachment {
             .field("filename", &self.filename)
             .field("media_type", &self.media_type)
             .field("bytes", &self.bytes.len())
-            .field("tokens", &self.estimated_tokens)
+            .field("cost", &self.cost)
             .finish()
     }
 }
@@ -550,12 +691,12 @@ impl Attachment {
                 actual,
             });
         }
-        let estimated_tokens = estimate_tokens(media_type, &bytes);
+        let cost = cost_of(media_type, &bytes);
         Ok(Self {
             bytes,
             media_type,
             filename,
-            estimated_tokens,
+            cost,
         })
     }
 
@@ -564,29 +705,33 @@ impl Attachment {
         self.media_type
     }
 
-    /// What this attachment adds to a request's prompt, in tokens — the figure
-    /// the agent's context accounting adds per message
+    /// What this attachment adds to a request's prompt at `target`, in tokens —
+    /// the figure the agent's context accounting adds per message
     /// (`hrdr_agent::estimate_tokens_in_messages`), so an image-heavy session
     /// compacts on time and its context gauge is not describing the text alone.
     ///
-    /// An estimate, deliberately Anthropic's: an image costs
-    /// `⌈width / 28⌉ × ⌈height / 28⌉` visual tokens there (see
-    /// [`visual_tokens`]), while OpenAI charges 32×32 patches against its own
-    /// per-model budgets, so one formula is an approximation for somebody
-    /// whichever is picked — and this is a budget estimate, not a bill. The
-    /// server's own usage numbers replace it entirely whenever the endpoint
-    /// reports any (`hrdr_agent::Agent::account_usage`); this is the fallback
-    /// for the endpoints that report none.
+    /// An estimate, and per target because the two dialects genuinely differ:
+    /// Anthropic charges 28×28 patches under a tier ceiling, OpenAI 32×32
+    /// patches (see [`visual_tokens`]), which is a ~3× spread on a 4K screenshot
+    /// and decides when a conversation gets compacted. It is still a budget
+    /// estimate rather than a bill — the server's own usage numbers replace it
+    /// entirely whenever the endpoint reports any
+    /// (`hrdr_agent::Agent::account_usage`); this is the fallback for the
+    /// endpoints that report none.
     ///
-    /// **Computed once, at construction.** It is a pure function of bytes that
-    /// are immutable for the attachment's life (`Arc<[u8]>`, validated then only
-    /// ever read, and every construction path goes through [`Self::new`]), so
-    /// there is nothing for a stored copy to fall out of date with. The
-    /// accounting it feeds runs over the whole history on every round, and
-    /// re-walking a JPEG's segment markers or rescanning a 20 MB PDF each time
-    /// would put a file parse on that path once per attachment per round.
-    pub fn estimated_tokens(&self) -> u32 {
-        self.estimated_tokens
+    /// **Priced here, parsed once.** The expensive half is reading the payload —
+    /// walking a JPEG's segment markers, following a 20 MB PDF's
+    /// cross-reference chain — and that answer does not depend on the target, so
+    /// it is settled at construction and held as a [`Cost`]. What is left is a
+    /// bounded search over patch counts, which this path can afford: it runs
+    /// over the whole history every round, and a stored token count could not
+    /// survive a `/model` switch to another provider.
+    pub fn estimated_tokens(&self, target: TokenTarget) -> u32 {
+        match self.cost {
+            Cost::Pdf(tokens) => tokens,
+            Cost::Image(Some((width, height))) => visual_tokens(width, height, target),
+            Cost::Image(None) => UNKNOWN_IMAGE_TOKENS,
+        }
     }
 
     /// The original file name, as the dialects that send one spell it.
@@ -1659,28 +1804,47 @@ pub(crate) mod tests {
     /// Anthropic's published reference points, both tiers — the only numbers
     /// that can show the formula is transcribed correctly, since they come from
     /// the vendor rather than from this implementation.
+    ///
+    /// Every figure below is a row of the "downsized resolution and visual-token
+    /// cost for several image sizes on each tier" table in the vision guide.
     #[test]
-    fn visual_tokens_match_the_published_reference_points() {
-        let standard = |w, h| visual_tokens(w, h, STANDARD_MAX_EDGE_PX, STANDARD_MAX_IMAGE_TOKENS);
+    fn anthropic_visual_tokens_match_the_published_reference_points() {
+        let standard =
+            |w, h| anthropic_visual_tokens(w, h, STANDARD_MAX_EDGE_PX, STANDARD_MAX_IMAGE_TOKENS);
         // The high-resolution tier (Claude 4.7 and later): 2576 px on the long
-        // edge, 4784 visual tokens. Not what an attachment is charged — see
-        // `Attachment::estimated_tokens` — but the second set of published
+        // edge, 4784 visual tokens. What an attachment is actually charged (see
+        // `visual_tokens`); the standard tier is the second set of published
         // numbers, and so the second check on the same arithmetic.
-        let high_res = |w, h| visual_tokens(w, h, 2_576, 4_784);
+        let high_res =
+            |w, h| anthropic_visual_tokens(w, h, HIGH_RES_MAX_EDGE_PX, HIGH_RES_MAX_IMAGE_TOKENS);
 
-        // Under both caps: the bare ⌈w/28⌉ × ⌈h/28⌉.
+        // Not resized on either tier: the bare ⌈w/28⌉ × ⌈h/28⌉.
+        assert_eq!(standard(200, 200), 64);
+        assert_eq!(high_res(200, 200), 64);
         assert_eq!(standard(1000, 1000), 1296);
         assert_eq!(high_res(1000, 1000), 1296);
         assert_eq!(standard(1092, 1092), 1521);
         assert_eq!(high_res(1092, 1092), 1521);
         // 1080p: over the standard tier's token cap even after the long-edge
-        // downscale, and under the high-res tier's caps entirely.
+        // downscale (to 1456x819 there), and under the high-res tier's caps
+        // entirely.
         assert_eq!(standard(1920, 1080), 1560);
         assert_eq!(high_res(1920, 1080), 2691);
+        // 3 megapixels, 4:3: the standard tier's token cap bites while both
+        // edges are still inside its 1568 px edge cap — the case a long-edge
+        // scale alone gets wrong.
+        assert_eq!(standard(2000, 1500), 1564);
+        assert_eq!(high_res(2000, 1500), 3888);
         // 4K: both tiers downscale, and the aspect ratio is 1080p's, so the
         // standard tier lands on the same figure.
         assert_eq!(standard(3840, 2160), 1560);
         assert_eq!(high_res(3840, 2160), 4784);
+        // The worked example from "How Claude resizes and pads images": an A4
+        // page at 130 DPI is inside the standard tier's edge cap on both sides
+        // and still resized, because "it costs 39 × 55 = 2145 visual tokens".
+        assert_eq!(39 * 55, 2145);
+        assert!(standard(1075, 1520) < 2145);
+        assert_eq!(high_res(1075, 1520), 2145);
 
         // Neither tier can be talked over its ceiling, whichever edge is long.
         for (w, h) in [(8000, 8000), (12000, 400), (400, 12000)] {
@@ -1688,47 +1852,131 @@ pub(crate) mod tests {
                 standard(w, h) <= STANDARD_MAX_IMAGE_TOKENS as u32,
                 "{w}x{h}"
             );
-            assert!(high_res(w, h) <= 4_784, "{w}x{h}");
+            assert!(
+                high_res(w, h) <= HIGH_RES_MAX_IMAGE_TOKENS as u32,
+                "{w}x{h}"
+            );
         }
         // Rotating an image cannot change what it costs.
-        for (w, h) in [(1920, 1080), (1500, 1000), (37, 4000)] {
+        for (w, h) in [(1920, 1080), (1500, 1000), (2000, 1500), (37, 4000)] {
             assert_eq!(standard(w, h), standard(h, w), "{w}x{h}");
+            assert_eq!(high_res(w, h), high_res(h, w), "{w}x{h}");
         }
     }
 
-    /// An attachment carries its own cost, computed once from the bytes: an
-    /// image's visual tokens, and the tier ceiling for a header this cannot
-    /// read — never zero, which is what let an image-heavy history look empty.
+    /// Round-half-to-even, on its own: the published reference points cannot
+    /// pin it (no image in Anthropic's table lands on a tie that changes its
+    /// patch count), so the rule is asserted where it is implemented. Halves go
+    /// to the even neighbour in both directions; everything else is ordinary
+    /// nearest.
+    #[test]
+    fn halves_round_to_the_even_neighbour() {
+        // Ties: 0.5 → 0, 1.5 → 2, 2.5 → 2, 3.5 → 4 — never all-up, never
+        // all-down.
+        assert_eq!(div_round_ties_even(1, 2), 0);
+        assert_eq!(div_round_ties_even(3, 2), 2);
+        assert_eq!(div_round_ties_even(5, 2), 2);
+        assert_eq!(div_round_ties_even(7, 2), 4);
+        assert_eq!(div_round_ties_even(3, 6), 0);
+        assert_eq!(div_round_ties_even(9, 6), 2);
+        // Not ties: nearest, either way.
+        assert_eq!(div_round_ties_even(4, 3), 1);
+        assert_eq!(div_round_ties_even(5, 3), 2);
+        assert_eq!(div_round_ties_even(6, 3), 2);
+        assert_eq!(div_round_ties_even(0, 7), 0);
+        // The magnitudes this is actually called with — a long edge times a
+        // short edge, over a long edge — and its exact-arithmetic ceiling.
+        assert_eq!(div_round_ties_even(2_576 * 1_449, 2_576), 1_449);
+        assert_eq!(
+            div_round_ties_even(
+                u64::from(u32::MAX) * u64::from(u32::MAX),
+                u64::from(u32::MAX)
+            ),
+            u64::from(u32::MAX)
+        );
+    }
+
+    /// OpenAI's patch count, from the worked examples in its images-and-vision
+    /// guide — `ceil(width/32) × ceil(height/32)`, which is what hrdr charges
+    /// with no budget applied (see [`openai_patch_tokens`]).
+    #[test]
+    fn openai_patch_tokens_match_the_published_worked_examples() {
+        // "A 1024 × 1024 image has a post-resize patch count of 1024":
+        // "original_patch_count = ceil(1024 / 32) * ceil(1024 / 32) = 32 * 32 =
+        // 1024", and 1024 "is below the 1,536 patch budget, so no resize is
+        // needed" — the case where budget or no budget is the same answer.
+        assert_eq!(openai_patch_tokens(1024, 1024), 1024);
+        // "original_patch_count = ceil(1800 / 32) * ceil(2400 / 32) = 57 * 75 =
+        // 4275". The doc's example then resizes that to 1452 patches for a
+        // 1,536-budget model; hrdr charges the 4275, which is what the same
+        // image costs with `"detail": "auto"` on the newest family, where the
+        // service "uses the original patch count without resizing the image to a
+        // patch budget or pixel-dimension limit".
+        assert_eq!(openai_patch_tokens(1800, 2400), 4275);
+        assert_eq!(57 * 75, 4275);
+        // A partial patch is still a patch, on both edges.
+        assert_eq!(openai_patch_tokens(1, 1), 1);
+        assert_eq!(openai_patch_tokens(33, 32), 2);
+        assert_eq!(openai_patch_tokens(32, 33), 2);
+    }
+
+    /// The same image costs two different numbers at the two targets, and the
+    /// difference is the endpoint rather than the bytes: this is the whole point
+    /// of threading a [`TokenTarget`] through the estimator, so a fixture where
+    /// both formulas happen to agree would prove nothing.
+    #[test]
+    fn an_attachment_is_priced_for_the_endpoint_it_is_bound_for() {
+        // 1080p: 69 × 39 patches of 28 px on Anthropic, 60 × 34 of 32 px on
+        // OpenAI.
+        let shot = Attachment::new(jpeg_sized(1920, 1080), MediaType::Jpeg, "s.jpg").unwrap();
+        assert_eq!(shot.estimated_tokens(TokenTarget::Anthropic), 2691);
+        assert_eq!(shot.estimated_tokens(TokenTarget::OpenAi), 60 * 34);
+        assert_ne!(
+            shot.estimated_tokens(TokenTarget::Anthropic),
+            shot.estimated_tokens(TokenTarget::OpenAi)
+        );
+
+        // 4K, where the two disagree by ~3× in the other direction: Anthropic's
+        // high-resolution ceiling binds, and OpenAI's uncapped patch count does
+        // not.
+        let uhd = Attachment::new(png_sized(3840, 2160), MediaType::Png, "4k.png").unwrap();
+        assert_eq!(uhd.estimated_tokens(TokenTarget::Anthropic), 4784);
+        assert_eq!(uhd.estimated_tokens(TokenTarget::OpenAi), 120 * 68);
+
+        // Which endpoint gets which target is
+        // `client::tests::the_token_target_follows_the_detected_backend`.
+    }
+
+    /// An attachment carries what reading its bytes settled, and prices it on
+    /// demand: an image's visual tokens, and the conservative fallback for a
+    /// header this cannot read — never zero, which is what let an image-heavy
+    /// history look empty.
     #[test]
     fn an_attachment_estimates_its_own_tokens() {
-        // Charged at the high-resolution tier (see `CHARGED_MAX_EDGE_PX`): both
-        // sit under its 2576 px edge and 4784 token ceilings, so neither is
+        // Charged at the high-resolution tier (see `visual_tokens`): both sit
+        // under its 2576 px edge and 4784 token ceilings, so neither is
         // downscaled and each costs its raw patch count.
         // ⌈1500/28⌉ × ⌈1000/28⌉ = 54 × 36.
         let shot = Attachment::new(png_sized(1500, 1000), MediaType::Png, "shot.png").unwrap();
-        assert_eq!(shot.estimated_tokens(), 54 * 36);
-        // The published figure for 1920×1080 on the high-resolution tier — the
-        // standard tier would charge 1560 for the same screenshot.
-        assert_eq!(
-            Attachment::new(jpeg_sized(1920, 1080), MediaType::Jpeg, "s.jpg")
-                .unwrap()
-                .estimated_tokens(),
-            2691
-        );
+        assert_eq!(shot.estimated_tokens(TokenTarget::Anthropic), 54 * 36);
 
         // A PNG whose IHDR is filler rather than a real header: the fallback,
-        // which is the most the tier can charge for one image.
+        // which is the most the Anthropic tier can charge for one image, and is
+        // the same figure at either target.
         let unreadable = png_attachment("a.png");
-        assert_eq!(unreadable.estimated_tokens(), UNKNOWN_IMAGE_TOKENS);
-        assert!(unreadable.estimated_tokens() > 0);
-
-        // A tiny image is one patch, not zero.
-        assert_eq!(
-            Attachment::new(png_sized(1, 1), MediaType::Png, "dot.png")
-                .unwrap()
-                .estimated_tokens(),
-            1
-        );
+        for target in [TokenTarget::Anthropic, TokenTarget::OpenAi] {
+            // The literal, not `UNKNOWN_IMAGE_TOKENS`: comparing the fallback
+            // against the constant it is defined as passes whatever that
+            // constant becomes, including zero.
+            assert_eq!(unreadable.estimated_tokens(target), 4_784);
+            // A tiny image is one patch, not zero.
+            assert_eq!(
+                Attachment::new(png_sized(1, 1), MediaType::Png, "dot.png")
+                    .unwrap()
+                    .estimated_tokens(target),
+                1
+            );
+        }
     }
 
     /// The two fallbacks behind the parser: the byte scan for a file with no
@@ -1744,7 +1992,12 @@ pub(crate) mod tests {
         }
         assert_eq!(pdf_page_count(&doc), 3);
         let a = Attachment::new(doc, MediaType::Pdf, "r.pdf").unwrap();
-        assert_eq!(a.estimated_tokens(), 3 * PDF_TOKENS_PER_PAGE);
+        // A page costs the same wherever it is going: OpenAI's images-and-vision
+        // guide prices patches and tiles and says nothing about a PDF page, so
+        // there is no second figure to charge.
+        for target in [TokenTarget::Anthropic, TokenTarget::OpenAi] {
+            assert_eq!(a.estimated_tokens(target), 3 * PDF_TOKENS_PER_PAGE);
+        }
 
         // The spacing-free spelling, and names that merely start with `/Page`.
         assert_eq!(pdf_page_count(b"<</Type/Page>><</Type /PageLabels>>"), 1);
@@ -1756,11 +2009,14 @@ pub(crate) mod tests {
         assert_eq!(
             Attachment::new(opaque, MediaType::Pdf, "o.pdf")
                 .unwrap()
-                .estimated_tokens(),
+                .estimated_tokens(TokenTarget::Anthropic),
             PDF_TOKENS_PER_PAGE
         );
         let big = Attachment::new(pdf(PDF_BYTES_PER_PAGE * 4), MediaType::Pdf, "b.pdf").unwrap();
-        assert_eq!(big.estimated_tokens(), 5 * PDF_TOKENS_PER_PAGE);
+        assert_eq!(
+            big.estimated_tokens(TokenTarget::Anthropic),
+            5 * PDF_TOKENS_PER_PAGE
+        );
     }
 
     /// A real page tree outranks both fallbacks — in the two directions they
@@ -1775,7 +2031,7 @@ pub(crate) mod tests {
         assert_eq!(
             Attachment::new(compressed, MediaType::Pdf, "c.pdf")
                 .unwrap()
-                .estimated_tokens(),
+                .estimated_tokens(TokenTarget::Anthropic),
             11 * PDF_TOKENS_PER_PAGE
         );
 
@@ -1786,7 +2042,7 @@ pub(crate) mod tests {
         assert_eq!(
             Attachment::new(noisy, MediaType::Pdf, "n.pdf")
                 .unwrap()
-                .estimated_tokens(),
+                .estimated_tokens(TokenTarget::Anthropic),
             3 * PDF_TOKENS_PER_PAGE
         );
     }

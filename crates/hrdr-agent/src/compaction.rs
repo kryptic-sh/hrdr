@@ -12,7 +12,7 @@
 //! One cache invalidation that summarizes beats several that only defer.
 
 use anyhow::{Result, bail};
-use hrdr_llm::{CompactionReason, ToolDef};
+use hrdr_llm::{CompactionReason, TokenTarget, ToolDef};
 
 use std::sync::Arc;
 
@@ -366,31 +366,32 @@ fn estimate_stage_history(
     stage: ShrinkStage,
     full: &[ChatMessage],
     elided: &mut Option<Vec<ChatMessage>>,
+    target: TokenTarget,
 ) -> u32 {
     if stage == ShrinkStage::Full {
-        return estimate_tokens_in_messages(full);
+        return estimate_tokens_in_messages(full, target);
     }
     let elided = elided.get_or_insert_with(|| elide_tool_results(full));
     match stage {
         // `Full` returned above; naming it (rather than a catch-all) is what
         // makes a new stage a compile error here instead of silently taking
         // whichever arm was written last.
-        ShrinkStage::Full | ShrinkStage::Elided => estimate_tokens_in_messages(elided),
-        ShrinkStage::Half => estimate_tail_window(elided, 2),
-        ShrinkStage::Quarter => estimate_tail_window(elided, 4),
-        ShrinkStage::Eighth => estimate_tail_window(elided, 8),
+        ShrinkStage::Full | ShrinkStage::Elided => estimate_tokens_in_messages(elided, target),
+        ShrinkStage::Half => estimate_tail_window(elided, 2, target),
+        ShrinkStage::Quarter => estimate_tail_window(elided, 4, target),
+        ShrinkStage::Eighth => estimate_tail_window(elided, 8, target),
     }
 }
 
 /// The token estimate of [`tail_window`] plus [`carry_prior_summary`] for
 /// `div`, without building either: the window is a slice and the carried
 /// summary is one message, both counted in place.
-fn estimate_tail_window(msgs: &[ChatMessage], div: usize) -> u32 {
+fn estimate_tail_window(msgs: &[ChatMessage], div: usize, target: TokenTarget) -> u32 {
     let keep = (msgs.len() / div.max(1))
         .min(msgs.len())
         .max(2.min(msgs.len()));
     let start = align_past_tool_results(msgs, msgs.len() - keep);
-    let mut est = estimate_tokens_in_messages(&msgs[start..]);
+    let mut est = estimate_tokens_in_messages(&msgs[start..], target);
     // Mirror `carry_prior_summary`: a cut window dropped the previous summary
     // at its front, and the request would re-attach it.
     if start > 0
@@ -398,7 +399,10 @@ fn estimate_tail_window(msgs: &[ChatMessage], div: usize) -> u32 {
             .first()
             .filter(|m| matches!(m.origin, MessageOrigin::Summary(_)))
     {
-        est = est.saturating_add(estimate_tokens_in_messages(std::slice::from_ref(summary)));
+        est = est.saturating_add(estimate_tokens_in_messages(
+            std::slice::from_ref(summary),
+            target,
+        ));
     }
     est
 }
@@ -493,6 +497,7 @@ pub(crate) fn compaction_tail_start(
     msgs: &[ChatMessage],
     tail_turns: usize,
     preserve_tokens: u32,
+    target: TokenTarget,
 ) -> usize {
     if tail_turns == 0 {
         return msgs.len();
@@ -508,7 +513,7 @@ pub(crate) fn compaction_tail_start(
     let mut tail_start = msgs.len();
     let mut tokens = 0u32;
     for &start in candidates.iter().rev() {
-        let turn_tokens = estimate_tokens_in_messages(&msgs[start..tail_start]);
+        let turn_tokens = estimate_tokens_in_messages(&msgs[start..tail_start], target);
         // Always keep the newest turn; stop before an older turn that busts the
         // budget.
         if start != newest && tokens + turn_tokens > preserve_tokens {
@@ -555,6 +560,7 @@ pub(crate) fn mega_turn_tail_start(
     msgs: &[ChatMessage],
     turn_start: usize,
     preserve_tokens: u32,
+    target: TokenTarget,
 ) -> usize {
     if turn_start >= msgs.len() {
         return turn_start;
@@ -562,7 +568,7 @@ pub(crate) fn mega_turn_tail_start(
     let mut tail_start = msgs.len();
     let mut tokens = 0u32;
     for i in (turn_start..msgs.len()).rev() {
-        let msg_tokens = estimate_tokens_in_messages(&msgs[i..=i]);
+        let msg_tokens = estimate_tokens_in_messages(&msgs[i..=i], target);
         // Always keep the newest message; stop before an older one that busts
         // the budget.
         if tail_start != msgs.len() && tokens + msg_tokens > preserve_tokens {
@@ -650,14 +656,21 @@ pub(crate) fn estimate_tokens_in_tools(tools: &[ToolDef]) -> u32 {
 /// The attachments are counted because they contribute no *text*: a screenshot
 /// costs the request more than a page of prose and was landing in this sum as
 /// zero, so an image-heavy session's gauge read near-empty and its compaction
-/// trigger fired late or never. Each attachment's cost is a pure
-/// function of its bytes and is computed once when it is constructed
-/// ([`hrdr_llm::media::Attachment::estimated_tokens`]) — this sum runs over the
-/// whole history on every round, so it must stay a field read.
+/// trigger fired late or never.
+///
+/// `target` is what an image costs where this history is going — the endpoint's
+/// dialect, from `Client::token_target` at every call site that has an agent to
+/// ask. The two dialects charge an image differently enough to move the
+/// compaction trigger (a 4K screenshot is ~3× dearer on Anthropic than on
+/// OpenAI), so pricing every attachment at the dearer one made an
+/// OpenAI-endpoint session compact early on nothing but its own arithmetic. It
+/// is a parameter rather than a property of the attachment because the same
+/// bytes outlive any one estimate: a `/model` switch to another provider
+/// re-prices the whole history.
 ///
 /// Messages only — the `tools[]` block is [`estimate_tokens_in_tools`]'s job,
 /// because it is per-turn state rather than per-message and callers cache it.
-pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
+pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage], target: TokenTarget) -> u32 {
     messages
         .iter()
         .map(|m| {
@@ -674,7 +687,7 @@ pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
             let attached: u32 = m
                 .attachments
                 .iter()
-                .map(|a| a.estimated_tokens())
+                .map(|a| a.estimated_tokens(target))
                 .fold(0, u32::saturating_add);
             ((content + calls) as u32 / 4 + 4).saturating_add(attached)
         })
@@ -754,6 +767,7 @@ impl Agent {
             &self.messages,
             self.compaction_tail_turns,
             self.preserve_recent_tokens,
+            self.client.token_target(),
         );
         if tail_start <= 2 {
             // No earlier turn boundary exists before the tail: the newest (and
@@ -769,7 +783,12 @@ impl Agent {
             // granularity (the turn itself is the only unit available), landing
             // only on a non-`Role::Tool` boundary so no tool_use/tool_result
             // pair is torn apart.
-            tail_start = mega_turn_tail_start(&self.messages, 1, self.preserve_recent_tokens);
+            tail_start = mega_turn_tail_start(
+                &self.messages,
+                1,
+                self.preserve_recent_tokens,
+                self.client.token_target(),
+            );
             if tail_start <= 1 {
                 // Splitting bought nothing — the lone turn already fits the
                 // tail budget, or there's truly nothing beyond the system
@@ -831,8 +850,9 @@ impl Agent {
         // below still handles: this only skips stages that plainly cannot fit.
         // The prefix rides on every stage and cannot be shrunk by any of them,
         // so it comes off the budget rather than being sized against it.
-        let prefix_tokens = estimate_tokens_in_messages(&self.messages[..1])
-            .saturating_add(estimate_tokens_in_tools(&defs));
+        let prefix_tokens =
+            estimate_tokens_in_messages(&self.messages[..1], self.client.token_target())
+                .saturating_add(estimate_tokens_in_tools(&defs));
         let mut stage = self.first_viable_compact_stage(&full, &mut elided, prefix_tokens);
         // Bounded retry (with the same backoff the main turn loop uses) for a
         // transient 429/503 hitting the summarization request itself — without
@@ -967,7 +987,7 @@ impl Agent {
         // summary + tail, plus the tools block. The pre-compaction provider
         // reading described the history that was just replaced, so this
         // estimate is the figure a frontend gauge should show once it lands.
-        let context_after = estimate_tokens_in_messages(&self.messages)
+        let context_after = estimate_tokens_in_messages(&self.messages, self.client.token_target())
             .saturating_add(estimate_tokens_in_tools(&self.tools.defs()));
         Ok(CompactionReport {
             reason,
@@ -1024,9 +1044,10 @@ impl Agent {
             // model that may still have room. Let the escalation decide.
             return ShrinkStage::Full;
         }
+        let target = self.client.token_target();
         ShrinkStage::LADDER
             .into_iter()
-            .find(|&stage| estimate_stage_history(stage, full, elided) <= budget)
+            .find(|&stage| estimate_stage_history(stage, full, elided, target) <= budget)
             .unwrap_or(ShrinkStage::Eighth)
     }
 
@@ -1273,7 +1294,8 @@ pub(crate) mod tests {
     #[test]
     fn the_estimator_counts_what_attachments_cost() {
         let plain = ChatMessage::user("look at this");
-        let text_only = estimate_tokens_in_messages(std::slice::from_ref(&plain));
+        let text_only =
+            estimate_tokens_in_messages(std::slice::from_ref(&plain), TokenTarget::Anthropic);
 
         let shot = hrdr_llm::media::Attachment::new(
             png_sized(1_000, 1_000),
@@ -1281,15 +1303,30 @@ pub(crate) mod tests {
             "shot.png",
         )
         .expect("a valid png");
-        let cost = shot.estimated_tokens();
+        let cost = shot.estimated_tokens(TokenTarget::Anthropic);
         assert!(cost > 1_000, "a 1000x1000 image is not a rounding error");
 
         let mut with_image = plain.clone();
         with_image.attachments = vec![shot.clone(), shot];
         assert_eq!(
-            estimate_tokens_in_messages(&[with_image]),
+            estimate_tokens_in_messages(std::slice::from_ref(&with_image), TokenTarget::Anthropic),
             text_only + 2 * cost,
             "every attachment on the message counts, and the text still does"
+        );
+
+        // And the target reaches the attachments rather than being carried and
+        // dropped: the same two images cost 36×36 patches of 28 px each on
+        // Anthropic and 32×32 patches of 32 px each on OpenAI, with the text
+        // unchanged between them.
+        let openai = estimate_tokens_in_messages(
+            std::slice::from_ref(&with_image),
+            hrdr_llm::TokenTarget::OpenAi,
+        );
+        assert_eq!(openai, text_only + 2 * 32 * 32);
+        assert_eq!(cost, 36 * 36);
+        assert!(
+            openai < text_only + 2 * cost,
+            "an OpenAI-bound history is not charged Anthropic's patch size"
         );
 
         // A message with no attachments estimates exactly what it always did:
@@ -1328,7 +1365,8 @@ pub(crate) mod tests {
         );
         assert!(elided.is_some(), "the elided copy is memoized");
         assert!(
-            estimate_tokens_in_messages(&elided_stage) < estimate_tokens_in_messages(&whole),
+            estimate_tokens_in_messages(&elided_stage, TokenTarget::Anthropic)
+                < estimate_tokens_in_messages(&whole, TokenTarget::Anthropic),
             "eliding tool results must shrink the request"
         );
 
@@ -1373,10 +1411,11 @@ pub(crate) mod tests {
                 let mut built_elided = None;
                 let built = compact_stage_history(stage, &full, &mut built_elided);
                 let mut est_elided = None;
-                let estimate = estimate_stage_history(stage, &full, &mut est_elided);
+                let estimate =
+                    estimate_stage_history(stage, &full, &mut est_elided, TokenTarget::Anthropic);
                 assert_eq!(
                     estimate,
-                    estimate_tokens_in_messages(&built),
+                    estimate_tokens_in_messages(&built, TokenTarget::Anthropic),
                     "{}: the estimator agrees with the built history",
                     stage.label()
                 );

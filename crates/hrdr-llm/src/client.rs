@@ -955,6 +955,20 @@ impl Client {
         &self.base_url
     }
 
+    /// How this endpoint prices an image
+    /// ([`crate::media::Attachment::estimated_tokens`]).
+    ///
+    /// Reads the backend already detected for the wire format rather than
+    /// re-deciding from the URL, so a request's shape and its cost estimate can
+    /// never disagree about which provider they are talking to — including
+    /// through [`Client::set_backend_for_test`], where the URL says nothing.
+    pub fn token_target(&self) -> crate::media::TokenTarget {
+        match self.backend {
+            Backend::Anthropic => crate::media::TokenTarget::Anthropic,
+            Backend::OpenAi | Backend::Codex => crate::media::TokenTarget::OpenAi,
+        }
+    }
+
     /// Repoint the client at a different endpoint (for mid-session provider switch).
     pub fn set_base_url(&mut self, base_url: impl Into<String>) {
         self.base_url = base_url.into().trim_end_matches('/').to_string();
@@ -2628,6 +2642,31 @@ mod tests {
             detect_backend("https://chatgpt.com/backend-api"),
             Backend::OpenAi
         );
+    }
+
+    /// How an image is priced follows the detected backend and nothing else, so
+    /// a request's shape and its token estimate cannot disagree about which
+    /// provider they are talking to. Both OpenAI dialects price alike; only the
+    /// native Messages API is charged Anthropic's 28px patches.
+    #[test]
+    fn the_token_target_follows_the_detected_backend() {
+        let target = |url: &str| Client::new(url, None, "m").token_target();
+        assert_eq!(
+            target("https://api.anthropic.com/v1"),
+            crate::media::TokenTarget::Anthropic
+        );
+        for url in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:8080/v1",
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            assert_eq!(target(url), crate::media::TokenTarget::OpenAi, "{url}");
+        }
+        // Forced past detection, the estimate follows the force.
+        let mut client = Client::new("http://127.0.0.1:9/v1", None, "m");
+        client.set_backend_for_test(Backend::Anthropic);
+        assert_eq!(client.token_target(), crate::media::TokenTarget::Anthropic);
     }
 
     #[test]
