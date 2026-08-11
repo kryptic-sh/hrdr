@@ -135,7 +135,7 @@ fn save_entry_at(auth_json: &Path, key: &str, entry: AuthEntry) -> Result<()> {
         .with_context(|| format!("creating {}", parent.display()))?;
     // Acquire the write lock BEFORE the read and hold it across the whole
     // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
-    let _lock = StoreLock::acquire(auth_json)?;
+    let _lock = StoreLock::acquire(auth_json, crate::store_lock::StoreKind::SmallFileRewrite)?;
     let mut map: HashMap<String, AuthEntry> = match std::fs::read_to_string(auth_json) {
         Ok(text) => serde_json::from_str(&text).with_context(|| {
             format!("parsing existing credential store {}", auth_json.display())

@@ -2156,7 +2156,7 @@ fn lock_config(path: &std::path::Path) -> Result<crate::store_lock::StoreLock> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    crate::store_lock::StoreLock::acquire(path)
+    crate::store_lock::StoreLock::acquire(path, crate::store_lock::StoreKind::SmallFileRewrite)
 }
 
 /// Parse the config file into an editable document, preserving comments and

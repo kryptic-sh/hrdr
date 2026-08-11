@@ -223,9 +223,6 @@ pub(crate) enum TurnMsg {
     /// atomically on disk, or the error. Sent by the save task spawned by
     /// [`App::enqueue_save`]; the coalescer's in-flight flag clears here.
     SaveDone(Result<String, String>),
-    /// An event from a sub-agent being driven directly from its pane. Carried per
-    /// pane key so it lands in that agent's transcript and nowhere else.
-    SubAgent(u64, AgentEvent),
     /// Out-of-band system line (e.g. async `/models` result).
     System(String),
     /// A slash command's data output (`/status`, `/cost`, `/help`, …) from a
@@ -2216,9 +2213,9 @@ impl App {
     /// so it lives in `AgentRegistry::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     ///
-    /// `WhenIdle::Decline` is the one thing it asks for, and it asks for exactly
-    /// what `task_steer` asks for: **a sub-agent that has finished is steered by
-    /// nobody**, whether the message comes from the user or from the main agent.
+    /// The rule it gets is the one `task_steer` gets: **a sub-agent that has
+    /// finished is steered by nobody**, whether the message comes from the user
+    /// or from the main agent.
     /// Idle and finished are one state for a sub-agent — it is registered running
     /// and only ever goes idle by its delegated run ending — and that ending is
     /// also where its report is captured for the main agent, in the same breath as
@@ -2251,24 +2248,13 @@ impl App {
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
         // is folded into the transcript here — doing it in both places would show
         // every message twice.
-        let tx = self.tx.clone();
-        let delivered =
-            self.registry
-                .send_prompt(key, steer, hrdr_agent::WhenIdle::Decline, move |ev| {
-                    // The events go to the agent's log; this only wakes the UI so the next
-                    // frame picks them up. Sync callback — can't await; and since the
-                    // event is already durably in the agent's log, a dropped wake (full
-                    // channel) only defers a redraw, never loses data.
-                    let _ = tx.try_send(TurnMsg::SubAgent(key, ev));
-                });
+        let delivered = self.registry.send_prompt(key, steer);
         self.sync_panes();
         match delivered {
             // It is the sub-agent's message now, so the transcript says what it
             // carried — after the send, because a row naming an image the agent
             // never received would be a claim about state that is not true.
-            Some(
-                hrdr_agent::PromptDelivery::Steered | hrdr_agent::PromptDelivery::StartedTurn(_),
-            ) => {
+            Some(hrdr_agent::PromptDelivery::Steered) => {
                 self.note_attachments(&carried);
             }
             // Finished, and its report is already the main agent's (see above).
@@ -3063,11 +3049,6 @@ impl App {
                     agent.lock().await.set_context_window(Some(tokens));
                 });
             }
-            // A sub-agent's events are recorded on its own registry entry, and
-            // `sync_panes` replays them into its pane. This message carries no
-            // transcript work of its own — it exists to wake the UI so the next
-            // frame shows them.
-            TurnMsg::SubAgent(_key, _ev) => self.sync_panes(),
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
             TurnMsg::ModelCatalog {
                 generation,

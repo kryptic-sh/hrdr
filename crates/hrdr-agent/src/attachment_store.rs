@@ -194,8 +194,16 @@ pub fn blob_dir_in(session_dir: &Path) -> PathBuf {
 ///   contended would cost the user an attachment, or the whole session file —
 ///   far worse than the race the lock closes, which [`BLOB_GRACE_SECS`] still
 ///   covers as a fallback.
+///
+/// [`StoreKind::BlobStore`](crate::store_lock::StoreKind::BlobStore) is what
+/// makes the lock survive the save that holds it: a save writes blobs and a
+/// session file, not one small file, so it is held far longer than a credential
+/// store's read-modify-write and must not be reapable on that store's schedule.
 pub(crate) fn lock_blob_store(session_dir: &Path) -> Result<crate::store_lock::StoreLock> {
-    crate::store_lock::StoreLock::acquire(&blob_dir_in(session_dir))
+    crate::store_lock::StoreLock::acquire(
+        &blob_dir_in(session_dir),
+        crate::store_lock::StoreKind::BlobStore,
+    )
 }
 
 /// Describe every attachment in `messages`, one entry per message that has any.

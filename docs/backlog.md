@@ -626,15 +626,6 @@ Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three
 dialects, `@file` and `Ctrl+]` construct them, blobs persist beside the session,
 and `estimate_tokens_in_messages` prices them. What the six slices left open:
 
-- **`WhenIdle::StartTurn` has no production caller left.** The pane now passes
-  `Decline` like `task_steer` does (see the note below), so the only users of
-  the variant — and of the whole idle branch behind it: `SendOutcome::Idle`,
-  `PromptDelivery::StartedTurn`, and `send_prompt`'s spawn after the lock — are
-  `registry.rs`'s and `lib.rs`'s own tests. Either delete the branch and let
-  `send_prompt` be "steer or refuse", which is what it now means, or keep the
-  seam because a second frontend may want it. Deliberately not decided here: it
-  is a public API of `hrdr-agent` and the change is bigger than the defect that
-  exposed it.
 - **What each path may attach is still spelled differently, on purpose.** The
   user writes `@shot.png` and gets `@dir/`, todo refs and `:command` expansion
   with it; the model passes an explicit `attachments: [path]` array. Reusing `@`
@@ -644,23 +635,27 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   inlines text files, and `@` is ordinary punctuation in prose a model writes.
   Both feed one builder, so the difference is input rather than a second
   implementation — pinned by `the_two_paths_build_the_same_message`.
-- **The blob store's lock can be reaped mid-save on Windows.** The store now
-  takes `attachment_store::lock_blob_store` on both sides — a save holds it
-  across writing blobs and writing the session file, the collector across mark
-  and sweep — so the collector cannot observe the gap between the two. The
-  residual is `store_lock`'s staleness rule: `process_alive` has no
-  dependency-free probe on Windows and reports every pid dead, so a lock held
-  longer than `STALE_LOCK_AGE_SECS` (60s) is reapable there. A credential
-  read-modify-write never approaches that; a save writing tens of megabytes of
-  attachments to a slow filesystem could. The consequence is bounded — the
-  reaped save falls back to `BLOB_GRACE_SECS`, exactly as a save that could not
-  take the lock at all does — so this is a note, not a defect to fix blind. A
-  real Windows probe (or a longer age for this caller) is the fix if it is ever
-  observed.
-- **No cross-process test of the lock.** All four tests hold the guard from the
-  test thread of one process; exclusion between processes rests on `O_EXCL` and
-  on `store_lock`'s own tests. Spawning a second process would need a test
-  binary that can be re-entered, which the suite has no harness for.
+- **A real Windows liveness probe is still the better fix for `store_lock`.**
+  The staleness age is now per-`StoreKind` (`SmallFileRewrite` keeps 60s,
+  `BlobStore` gets a span sized from a save's own worst case), which is what
+  keeps a save's lock from being stolen mid-write on a platform where
+  `process_alive` cannot tell. But the age only matters at all _because_
+  `process_alive` has no dependency-free probe on Windows and reports every pid
+  dead; everywhere else a live owner is never reaped whatever its age. An
+  `OpenProcess`/`GetExitCodeProcess` probe would make both ages a formality —
+  and needs a Windows API dependency, which is the owner's call. Not taken here
+  for that reason alone.
+- **Half the cross-process lock coverage is unix-only, and one thing is untested
+  everywhere.** `store_lock`'s tests now re-execute the test binary
+  (`LockHolder`, driving the `#[ignore]`d `child_process_holds_the_lock`), so
+  `O_EXCL` exclusion between real processes and the guard's cross-process
+  release are checked on every platform.
+  `a_dead_holders_lock_is_reaped_by_the_next_process` is `#[cfg(unix)]`: reaping
+  turns on `process_alive`, which on Windows answers `false` for every pid, so
+  there it would pass while proving nothing. What no test covers on any platform
+  is a lock genuinely aged past its window in real time — every staleness test
+  backdates the timestamp, so the clock arithmetic is exercised but a minute of
+  real waiting is not.
 - **Token estimates are charged at Anthropic's high-resolution tier for every
   dialect** (`CHARGED_MAX_EDGE_PX` in `media.rs`). OpenAI uses 32×32 patches
   with its own budgets, so one formula is an approximation either way; the
@@ -679,9 +674,9 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   entry's `delivered` later (when the parent's next request folds the row in),
   so there IS a window where an entry is idle and not yet delivered, but the
   report the parent will receive is already fixed in that window: nothing a
-  later turn produces can reach it either way. So `WhenIdle::Decline` — defined
-  on idleness — implements the owner's rule, which names delivery, without
-  widening it. If a sub-agent ever gains a path to idleness that is not
+  later turn produces can reach it either way. So `send_prompt`'s refusal —
+  defined on idleness — implements the owner's rule, which names delivery,
+  without widening it. If a sub-agent ever gains a path to idleness that is not
   "finished", that equality breaks and this is the note that says so.
 - **`Ctrl+D` on a box holding only a pasted image still quits**, dropping the
   bytes: it reads `editor.content().trim()` directly rather than

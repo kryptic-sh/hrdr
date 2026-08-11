@@ -62,8 +62,8 @@ pub use provider_catalog::{
 };
 mod registry;
 pub use registry::{
-    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, WhenIdle,
-    age_completed_todos, event_log,
+    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, age_completed_todos,
+    event_log,
 };
 mod transcript;
 mod transcript_log;
@@ -13679,7 +13679,7 @@ mod tests {
         ///
         /// Regression: the per-event writer used to live inside the delegated
         /// run's `sub.run(...)` callback, so only the delegated run was written —
-        /// a later steered turn (driven through `send_prompt`, a different task)
+        /// a later turn (driven through `start_turn`, a different task)
         /// vanished from the on-disk transcript. The writer now rides on the live
         /// registry entry and is driven from `record`, which BOTH paths call, so
         /// the durable transcript is complete regardless of which drove the turn.
@@ -13740,16 +13740,16 @@ mod tests {
             assert!(result.contains("delegated answer"), "delivered: {result}");
 
             // The sub-agent is idle and still registered — drive a FURTHER turn on
-            // it. `send_prompt` spawns the turn; the closure signals when its
+            // it, the way the registry drives any turn: the prompt onto the queue
+            // `run` drains, then `start_turn`. The closure signals when its
             // `TurnDone` lands, so the assertions run only after the reply is
             // recorded (and flushed).
             let key = live.with(|v| v[0].key);
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             let mut tx = Some(tx);
-            let delivery = live.send_prompt(
+            live.enqueue(key, crate::Steer::plain("now summarise"));
+            live.start_turn(
                 key,
-                crate::Steer::plain("now summarise"),
-                crate::WhenIdle::StartTurn,
                 move |ev| {
                     if matches!(ev, crate::AgentEvent::TurnDone)
                         && let Some(tx) = tx.take()
@@ -13757,8 +13757,9 @@ mod tests {
                         let _ = tx.send(());
                     }
                 },
-            );
-            assert!(delivery.is_some_and(|d| d.started_turn()));
+                |_| async {},
+            )
+            .expect("the retained sub-agent can be driven again");
             rx.await.expect("the steered turn runs to completion");
 
             // The jsonl now carries the steered turn AFTER the delegated run's End

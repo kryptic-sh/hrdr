@@ -626,8 +626,8 @@ async fn spawn_background(
                 // The crash unwound this agent's run wherever it was, which
                 // includes between a tool call's `ToolStart` and its `ToolEnd` —
                 // leaving that call open in its pane and in its jsonl, spinning
-                // for a tool that is never coming back. A steered turn on this
-                // same agent settles that in `start_turn_on`; a delegated run
+                // for a tool that is never coming back. A turn on this same
+                // agent settles that in `AgentRegistry::start_turn`; a delegated run
                 // has its own guard, so it settles it here, through the same
                 // `record` its events travelled, and before the terminal `End`
                 // record below so the transcript closes in order.
@@ -1820,23 +1820,12 @@ impl hrdr_tools::Tool for SteerTool {
         // sub-agent is a message from the user in lieu of the user, so it takes
         // the user's path rather than a parallel one.
         let message = Steer::plain(prompt).with_labelled_attachments(attachments);
-        // `Decline` is the one thing this asks for that the user's path does not,
-        // and it is asked for here rather than decided here: a fresh turn on a
-        // finished sub-agent would answer nobody. The user typing into its pane
-        // reads the answer there — and their viewing is the only reason the
-        // finished agent is still retained at all. The main agent hears from a
-        // background sub-agent through its background-task row, and that row was
-        // delivered and dropped when the run landed, so a turn started here would
-        // run, spend tokens, and report into a void.
-        match self
-            .live
-            .send_prompt(key, message, WhenIdle::Decline, |_| {})
-        {
+        match self.live.send_prompt(key, message) {
             Some(PromptDelivery::Steered) => Ok(format!("Steered background task #{id}.")),
-            // `WhenIdle::Decline` above is what makes this the idle case: finished,
-            // but still retained. Its result is already on its way to the parent,
-            // so the answer is to read that rather than to retry with another id.
-            Some(_) => anyhow::bail!(
+            // Idle, which for a sub-agent means finished but still retained. Its
+            // result is already on its way to the parent, so the answer is to read
+            // that rather than to retry with another id.
+            Some(PromptDelivery::Declined) => anyhow::bail!(
                 "background task #{id} has finished, so there is nothing to steer — its result \
                  is delivered to you automatically. {}",
                 running_tasks_hint(&self.live)
@@ -2899,13 +2888,13 @@ mod attachment_tests {
     }
 
     /// **A finished sub-agent is left alone, and told about.** The delivery rule
-    /// is `AgentRegistry::send_prompt`'s for both senders; what `task_steer` asks
-    /// for is `WhenIdle::Decline`, because the main agent's route home for a
-    /// background sub-agent's answer — the background-task row — was delivered
-    /// and dropped when the run landed. So no turn is started, nothing is left on
-    /// the queue to be picked up by something later, and the model is told the
-    /// result is already on its way rather than left waiting on a turn nobody
-    /// would read.
+    /// is `AgentRegistry::send_prompt`'s, for this sender and for the user's pane
+    /// alike: an idle sub-agent is refused, because the main agent's route home
+    /// for a background sub-agent's answer — the background-task row — was
+    /// delivered and dropped when the run landed. So no turn is started, nothing
+    /// is left on the queue to be picked up by something later, and the model is
+    /// told the result is already on its way rather than left waiting on a turn
+    /// nobody would read.
     #[tokio::test]
     async fn steering_a_finished_sub_agent_starts_nothing_and_queues_nothing() {
         let dir = tempfile::tempdir().unwrap();

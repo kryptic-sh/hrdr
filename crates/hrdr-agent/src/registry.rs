@@ -133,41 +133,8 @@ pub fn event_log() -> EventLog {
 pub enum PromptDelivery {
     /// A turn was already in flight, so the prompt was injected into it.
     Steered,
-    /// The agent was idle, so a fresh turn was started on it. The handle aborts
-    /// that turn, so a frontend can offer cancellation on any agent's turn.
-    StartedTurn(JoinHandle<()>),
-    /// The agent was idle and the sender asked for [`WhenIdle::Decline`]:
-    /// **nothing was delivered** and no turn was started.
+    /// The agent was idle: **nothing was delivered** and no turn was started.
     Declined,
-}
-
-/// A sender's answer to "and if that agent is idle?", read under the very lock
-/// that decides it — so the two halves of the routing rule cannot disagree, and
-/// nothing can slip between the question and the answer.
-///
-/// This is the one place the user's path and the main agent's path differ, and
-/// it is a difference in what they *ask for*, not a second copy of the rule: a
-/// fresh turn needs a reader for the answer it produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WhenIdle {
-    /// Drive a fresh turn on the retained agent. For a sender that will read
-    /// what comes back — a frontend showing that agent's pane, which is also the
-    /// only thing keeping a finished sub-agent from being pruned.
-    StartTurn,
-    /// Leave the agent alone and report the prompt undelivered
-    /// ([`PromptDelivery::Declined`]). For a sender whose route home for the
-    /// answer is gone: the main agent hears from a background sub-agent through
-    /// its background-task row, and a finished run's row has already been
-    /// delivered and dropped, so a turn started here would answer nobody.
-    Decline,
-}
-
-impl PromptDelivery {
-    /// Whether a fresh turn was started (rather than the prompt being steered into
-    /// one already running).
-    pub fn started_turn(&self) -> bool {
-        matches!(self, Self::StartedTurn(_))
-    }
 }
 
 /// How a turn ended, for whoever asked for it.
@@ -191,22 +158,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "unknown panic".to_string()
     }
-}
-
-/// The decision `send_prompt` reaches while holding the entry lock: the entry is
-/// gone, the steer was enqueued on a running turn, or the agent is idle and a
-/// fresh turn must be started (with `input` handed back so the spawn happens
-/// outside the lock). Carrying `input` back out keeps the running-check and the
-/// enqueue atomic without holding the lock across the turn spawn.
-enum SendOutcome {
-    Unknown,
-    Steered,
-    Declined,
-    Idle {
-        agent: Arc<tokio::sync::Mutex<crate::Agent>>,
-        steering: crate::SteeringQueue,
-        input: crate::Steer,
-    },
 }
 
 /// One agent the frontend can address — the session's own, or a delegated one.
@@ -333,9 +284,9 @@ pub struct AgentRegistry {
     /// whenever the runtime next polls the aborted task, which can be *after*
     /// its replacement has already started. Without this, the dying turn's
     /// guard marks the agent idle while the live one is mid-flight: the loader
-    /// stops, the status bar lies, and `send_prompt` takes its idle branch and
-    /// starts a second concurrent turn on the one agent. The guard carries the
-    /// generation it was born with and stands down when it no longer matches.
+    /// stops, the status bar lies, and a steer sent to it is refused as if the
+    /// agent had finished. The guard carries the generation it was born with and
+    /// stands down when it no longer matches.
     turns: Arc<Mutex<std::collections::HashMap<u64, u64>>>,
 }
 
@@ -822,75 +773,34 @@ impl AgentRegistry {
     /// * a turn is **in flight** → the prompt is *steering*. It goes into the very
     ///   queue that agent's `run` is draining, so the model reads it before its next
     ///   request. Identical to steering the main agent.
-    /// * the agent is **idle** (its delegated task already landed) → `when_idle`
-    ///   decides, because that is the one thing the sender knows and this does not:
-    ///   whether there is anyone to read a fresh turn's answer. See [`WhenIdle`].
-    ///
-    /// Beyond that a sender supplies only `on_event` — how to *surface* what comes
-    /// back. It makes no routing decision and holds no rule of its own.
+    /// * the agent is **idle** → the prompt is **refused**
+    ///   ([`PromptDelivery::Declined`]) and nothing is queued. Idle and finished
+    ///   are one state for a sub-agent — it is registered running and only goes
+    ///   idle by its delegated run ending, which is the same moment its report is
+    ///   captured for the main agent — so a fresh turn started here would answer
+    ///   nobody, whoever sent the message.
     ///
     /// `None` when the sub-agent has already been released (finished, delivered and
     /// pruned), so a caller can say so rather than swallow the prompt.
-    pub fn send_prompt<F>(
-        &self,
-        key: u64,
-        input: crate::Steer,
-        when_idle: WhenIdle,
-        on_event: F,
-    ) -> Option<PromptDelivery>
-    where
-        F: FnMut(crate::AgentEvent) + Send + 'static,
-    {
+    pub fn send_prompt(&self, key: u64, input: crate::Steer) -> Option<PromptDelivery> {
         // Decide and enqueue under the SAME entry lock the worker takes in
         // `continue_or_finish`, so a steer can't be pushed into the queue
         // *after* the worker has read it empty and marked the turn finished (a
-        // lost message wrongly reported as `Steered`). The running-branch push
-        // happens inside the closure; the idle branch hands `input` back out so a
-        // fresh turn can be started without holding the lock across the spawn.
-        let outcome = self.with(move |v| {
-            let Some(e) = v.iter().find(|e| e.key == key) else {
-                return SendOutcome::Unknown;
-            };
-            if e.running {
-                // Poison-tolerant like every other lock here: a queue whose
-                // mutex was poisoned by an unrelated panic must not silently
-                // eat the message while this reports it delivered.
-                e.steering
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push_back(input);
-                SendOutcome::Steered
-            } else if when_idle == WhenIdle::Decline {
-                SendOutcome::Declined
-            } else {
-                SendOutcome::Idle {
-                    agent: Arc::clone(&e.agent),
-                    steering: Arc::clone(&e.steering),
-                    input,
-                }
+        // lost message wrongly reported as `Steered`).
+        self.with(move |v| {
+            let e = v.iter().find(|e| e.key == key)?;
+            if !e.running {
+                return Some(PromptDelivery::Declined);
             }
-        });
-        let (agent, steering, input) = match outcome {
-            SendOutcome::Unknown => return None,
-            SendOutcome::Steered => return Some(PromptDelivery::Steered),
-            SendOutcome::Declined => return Some(PromptDelivery::Declined),
-            SendOutcome::Idle {
-                agent,
-                steering,
-                input,
-            } => (agent, steering, input),
-        };
-
-        // Idle: a further turn on the agent we kept alive for exactly this.
-        //
-        // Enqueue the prompt as the turn's opening onto the very queue `run`
-        // drains; `run` pops it, emits `Steered`, and pushes it into history — so
-        // the question lands in the agent's record (and any pane rebuilt from it)
-        // exactly like a mid-turn steer, through one path. A single turn, no
-        // continuation loop.
-        self.enqueue(key, input);
-        let handle = self.start_turn_on(key, agent, steering, on_event, |_| async {});
-        Some(PromptDelivery::StartedTurn(handle))
+            // Poison-tolerant like every other lock here: a queue whose
+            // mutex was poisoned by an unrelated panic must not silently
+            // eat the message while this reports it delivered.
+            e.steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(input);
+            Some(PromptDelivery::Steered)
+        })
     }
 
     /// **Run a turn on agent `key`.** The one turn driver: whatever asked for the
@@ -918,30 +828,11 @@ impl AgentRegistry {
         Fut: std::future::Future<Output = ()> + Send,
     {
         let (agent, steering) = self.handle(key)?;
-        Some(self.start_turn_on(key, agent, steering, on_event, on_done))
-    }
-
-    /// [`Self::start_turn`] with the agent handle already in hand — the path
-    /// `send_prompt` takes, where the handle was read under the same lock that
-    /// decided the agent was idle.
-    fn start_turn_on<F, D, Fut>(
-        &self,
-        key: u64,
-        agent: Arc<tokio::sync::Mutex<Agent>>,
-        steering: crate::SteeringQueue,
-        on_event: F,
-        on_done: D,
-    ) -> JoinHandle<()>
-    where
-        F: FnMut(crate::AgentEvent) + Send + 'static,
-        D: FnOnce(TurnOutcome) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
-    {
         // The turn clock belongs to the agent whose turn it is, so a frontend
         // showing that agent shows its loader.
         let generation = self.begin_turn(key);
         let live = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // The guard marks the agent idle again on every exit — including
             // cancellation, where nothing after the await below would run. It
             // carries this turn's generation so an aborted predecessor, whose
@@ -999,7 +890,8 @@ impl AgentRegistry {
                 on_event(crate::AgentEvent::TurnDone);
             }
             on_done(outcome).await;
-        })
+        });
+        Some(handle)
     }
 
     /// Drop every entry that is finished, delivered, and unpinned. Called by the
@@ -1236,12 +1128,7 @@ mod tests {
         live.register(entry(1)); // `entry` is running
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
-        let delivery = live.send_prompt(
-            1,
-            crate::Steer::plain("look at auth too"),
-            WhenIdle::StartTurn,
-            |_| {},
-        );
+        let delivery = live.send_prompt(1, crate::Steer::plain("look at auth too"));
         assert!(matches!(delivery, Some(PromptDelivery::Steered)));
         assert_eq!(
             steering
@@ -1259,11 +1146,16 @@ mod tests {
         );
     }
 
-    /// A prompt to an *idle* agent starts a further turn on it. This is what
-    /// retaining the agent was for: it is still alive with its history, so the
-    /// conversation continues rather than being re-delegated from scratch.
+    /// An *idle* agent is left alone: nothing is started and nothing is queued,
+    /// so the message is reported back undelivered rather than run into a void.
+    ///
+    /// The other half of the one routing rule, and it is one rule for every
+    /// sender — the main agent's route home for a background sub-agent's answer
+    /// is the background-task row that was delivered and dropped when the run
+    /// landed, and the user's pane is reading a run the parent already has its
+    /// answer from.
     #[tokio::test]
-    async fn a_prompt_to_an_idle_agent_starts_a_further_turn_on_it() {
+    async fn an_idle_agent_is_left_alone() {
         let live = AgentRegistry::new();
         live.register(entry(1));
         // Its delegated task has landed.
@@ -1271,48 +1163,9 @@ mod tests {
             e.running = false;
             e.done = true;
         });
-
-        let delivery = live.send_prompt(
-            1,
-            crate::Steer::plain("now summarise"),
-            WhenIdle::StartTurn,
-            |_| {},
-        );
-        assert!(
-            delivery.is_some_and(|d| d.started_turn()),
-            "an idle agent is driven, not steered into a void"
-        );
-        assert!(
-            live.with(|v| v[0].running),
-            "and it is marked busy, so the next prompt steers instead"
-        );
-        // The turn itself runs against an unreachable endpoint and fails; the
-        // RunGuard is what returns it to idle, which the cancellation test covers.
-    }
-
-    /// The same idle agent, asked for by a sender that cannot read what a fresh
-    /// turn would produce: nothing is started and nothing is queued, so the
-    /// message is reported back undelivered rather than run into a void.
-    ///
-    /// This is `task_steer`'s half of the one routing rule — the main agent's
-    /// route home for a background sub-agent's answer is the background-task row
-    /// that was delivered and dropped when the run landed.
-    #[tokio::test]
-    async fn an_idle_agent_is_left_alone_when_the_sender_declines() {
-        let live = AgentRegistry::new();
-        live.register(entry(1));
-        live.update(1, |e| {
-            e.running = false;
-            e.done = true;
-        });
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
-        let delivery = live.send_prompt(
-            1,
-            crate::Steer::plain("now summarise"),
-            WhenIdle::Decline,
-            |_| {},
-        );
+        let delivery = live.send_prompt(1, crate::Steer::plain("now summarise"));
         assert!(matches!(delivery, Some(PromptDelivery::Declined)));
         assert!(!live.with(|v| v[0].running), "no turn was started on it");
         assert!(
@@ -1379,13 +1232,8 @@ mod tests {
     fn a_prompt_to_a_released_agent_is_reported_not_swallowed() {
         let live = AgentRegistry::new();
         assert!(
-            live.send_prompt(
-                99,
-                crate::Steer::plain("hello?"),
-                WhenIdle::StartTurn,
-                |_| {}
-            )
-            .is_none()
+            live.send_prompt(99, crate::Steer::plain("hello?"))
+                .is_none()
         );
     }
 
@@ -1420,8 +1268,7 @@ mod tests {
     /// Regression: `cancel_turn` aborts, then immediately starts the next turn.
     /// Without the generation check the dying turn's guard flipped `running` to
     /// false under the new turn — stopping the loader, lying in the status bar,
-    /// and letting `send_prompt` take its idle branch and start a *second*
-    /// concurrent turn on the one agent.
+    /// and making `send_prompt` refuse a steer for a turn that was still going.
     #[test]
     fn a_late_guard_from_a_cancelled_turn_does_not_end_its_successor() {
         let live = AgentRegistry::new();

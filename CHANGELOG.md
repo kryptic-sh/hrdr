@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **`hrdr_agent::WhenIdle` is gone, and `AgentRegistry::send_prompt` is now
+  `send_prompt(key, input)`.** Sending to a sub-agent means "steer a turn in
+  flight, refuse one that has finished" — both callers already asked for the
+  refusal, so the alternative was a branch nothing outside tests could reach.
+  The `when_idle` and `on_event` parameters are removed (`on_event` only ever
+  surfaced events from the turn the idle branch started, and no turn is started
+  here now), as is `PromptDelivery::StartedTurn` and its `started_turn()`
+  accessor; `PromptDelivery` is `Steered` or `Declined`. Drive a further turn on
+  a retained agent with `AgentRegistry::enqueue` + `AgentRegistry::start_turn`,
+  which is what the removed branch did internally.
 - **"Skills" are now "commands", end to end.** The industry settled on _skill_
   meaning a `<name>/SKILL.md` directory bundle; hrdr's `:name` markdown prompt
   templates are commands, and are named that everywhere now.
