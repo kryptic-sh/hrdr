@@ -114,9 +114,15 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
 /// looking at; [`Self::into_text`] is for a caller that cannot carry them, and
 /// drops the labels along with the bytes. Text that names an image the request
 /// never carried would tell the model it had been shown something it had not.
+///
+/// The label block itself is rendered by
+/// [`hrdr_agent::Steer::with_labelled_attachments`] — the same call the main
+/// agent's own `task` / `task_steer` messages go through, so a sub-agent's
+/// message reads the same whoever sent it.
 #[derive(Debug, Clone, Default)]
 pub struct Outgoing {
-    /// The expanded text, *without* the attachment labels — see [`Self::labels`].
+    /// The expanded text, *without* the attachment labels — those are appended by
+    /// [`Self::into_steer`], and only when the attachments travel with it.
     text: String,
     attachments: Vec<hrdr_tools::Attachment>,
     inlined: Vec<PathBuf>,
@@ -151,41 +157,12 @@ impl Outgoing {
     /// Attach `more` alongside whatever the text's own `@mentions` produced.
     ///
     /// For attachments that have no mention to come from — bytes pasted off the
-    /// clipboard, which never had a path — so they pick up the same labels
-    /// ([`Self::labels`]) and travel on the same [`Self::into_steer`] as a
-    /// mentioned file. They land after the mentioned ones, which is the order
-    /// the labels then number them in.
+    /// clipboard, which never had a path — so they pick up the same labels and
+    /// travel on the same [`Self::into_steer`] as a mentioned file. They land
+    /// after the mentioned ones, which is the order the labels then number them
+    /// in.
     pub fn attach(&mut self, more: Vec<hrdr_tools::Attachment>) {
         self.attachments.extend(more);
-    }
-
-    /// The label block naming each attachment, appended to the text whenever the
-    /// attachments travel with it.
-    ///
-    /// Every dialect renders attachments *before* the message text, so this
-    /// trailing block is what maps the images the model has just seen back onto
-    /// file names — without it, "what does this show?" has no referent and the
-    /// model cannot say which of two screenshots it is describing. Numbered per
-    /// kind ("Image 1", "Document 1"), matching the order the blocks render in
-    /// and Anthropic's own recommendation to prefix each image with `Image N:`.
-    /// One short line per file: an attachment's whole cost in text tokens.
-    fn labels(&self) -> String {
-        if self.attachments.is_empty() {
-            return String::new();
-        }
-        let mut out = String::from("\n\n--- Attached files ---\n");
-        let (mut images, mut docs) = (0, 0);
-        for a in &self.attachments {
-            let label = if a.media_type().is_image() {
-                images += 1;
-                format!("Image {images}")
-            } else {
-                docs += 1;
-                format!("Document {docs}")
-            };
-            out.push_str(&format!("{label}: {}\n", a.filename()));
-        }
-        out
     }
 
     /// The text alone, for a caller with no way to carry attachments.
@@ -199,10 +176,13 @@ impl Outgoing {
 
     /// The message as one queued [`hrdr_agent::Steer`] — labelled text and the
     /// attachments it names, together. `display` is what the user typed.
+    ///
+    /// The labelling is [`hrdr_agent::Steer::with_labelled_attachments`], the
+    /// one renderer of that block: the same call `task` and `task_steer` make
+    /// for a message the main agent sends on the user's behalf. Nothing about
+    /// the message a sub-agent receives may depend on which of the two sent it.
     pub fn into_steer(self, display: impl Into<String>) -> hrdr_agent::Steer {
-        let labels = self.labels();
-        hrdr_agent::Steer::new(format!("{}{labels}", self.text), display)
-            .with_attachments(self.attachments)
+        hrdr_agent::Steer::new(self.text, display).with_labelled_attachments(self.attachments)
     }
 }
 
@@ -1582,6 +1562,68 @@ mod tests {
             steer.sent
         );
         assert_eq!(steer.attachments.len(), 2);
+    }
+
+    /// **The user's path and the main agent's path build the same message.** A
+    /// message the main agent sends to a sub-agent is a message from the user in
+    /// lieu of the user, so the same text and the same file must reach that
+    /// sub-agent as the same `Steer` — same content string including the label
+    /// block, same attachments — whichever of the two sent it.
+    ///
+    /// The two are compared as whole values against each other, never against a
+    /// written-out expectation: the failure this exists to catch is the two paths
+    /// agreeing with two copies of the format until one copy is edited.
+    ///
+    /// * the user's side is the real thing: `expand_mentions_tracked` on typed
+    ///   input, then `into_steer`.
+    /// * the model's side is `Steer::plain(prompt).with_labelled_attachments(…)`
+    ///   over `read_attach_media`, which is what `task` and `task_steer` do with
+    ///   their `prompt` and `attachments` arguments. That those tools do exactly
+    ///   this — and add nothing of their own — is pinned next to them, by
+    ///   `hrdr_agent`'s `a_steer_is_the_shared_builders_own_output`; their
+    ///   `SteerTool` is crate-private and cannot be driven from here.
+    #[test]
+    fn the_two_paths_build_the_same_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
+        // One text, carrying one file. The user names it with a mention; the
+        // model passes the same text and names the file in `attachments`. That
+        // difference is in the *input* — it is how each says which file it means
+        // — and is the only difference there is.
+        let text = "what is this @shot.png";
+
+        let user = expand_mentions_tracked(text, root).into_steer(text);
+
+        let attached = hrdr_tools::read_attach_media("shot.png", root)
+            .unwrap()
+            .expect("a png");
+        let agent = hrdr_agent::Steer::plain(text).with_labelled_attachments(vec![attached]);
+
+        assert_eq!(
+            user, agent,
+            "the same message, whichever of the two sent it"
+        );
+        assert!(
+            user.sent.contains("--- Attached files ---"),
+            "and it really carries the block being compared: {:?}",
+            user.sent
+        );
+    }
+
+    /// The same comparison with nothing attached: no label block on either path,
+    /// so a plain message is untouched by the labelling both now go through.
+    #[test]
+    fn the_two_paths_agree_on_a_message_with_no_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "just a question";
+
+        let user = expand_mentions_tracked(text, dir.path()).into_steer(text);
+        let agent = hrdr_agent::Steer::plain(text).with_labelled_attachments(Vec::new());
+
+        assert_eq!(user, agent);
+        assert_eq!(user.sent, text, "and nothing was appended to it");
+        assert!(user.attachments.is_empty());
     }
 
     /// `attach` on a message with no mentions at all is the pure clipboard case:

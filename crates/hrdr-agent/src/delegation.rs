@@ -1795,45 +1795,53 @@ impl hrdr_tools::Tool for SteerTool {
             .and_then(|v| v.as_str())
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("task_steer needs a non-empty `prompt`"))?;
-        // The model this steer is headed for, so its attachments are judged
-        // against the sub-agent's own model rather than the parent's — they can
-        // differ, `task` takes a `model` argument. An id naming nothing skips the
-        // read entirely: the `queued` match below has the right thing to say
-        // about it, and a file error about a task that does not exist would send
-        // the model off fixing the wrong problem.
-        let model = self.live.with(|entries| {
+        // Which agent this id names, and the model it runs on — one lookup, so
+        // the attachments are judged against the sub-agent's own model rather
+        // than the parent's (they can differ, `task` takes a `model` argument).
+        // An id naming nothing stops here, before the files are read: a file
+        // error about a task that does not exist would send the model off fixing
+        // the wrong problem.
+        let target = self.live.with(|entries| {
             entries
                 .iter()
                 .find(|e| e.bg_id == Some(id))
-                .map(|e| e.model.clone())
+                .map(|e| (e.key, e.model.clone()))
         });
-        let attachments = match &model {
-            Some(model) => attachments_arg(&args, ctx, model, self.max_attachment_bytes)?,
-            None => Vec::new(),
+        let Some((key, model)) = target else {
+            anyhow::bail!(
+                "no background task #{id}. Ids come from `task`'s own return value. {}",
+                running_tasks_hint(&self.live)
+            );
         };
+        let attachments = attachments_arg(&args, ctx, &model, self.max_attachment_bytes)?;
+        // Built by the one builder a user's own message goes through
+        // (`hrdr_app::Outgoing::into_steer`), and delivered by the one deliverer
+        // (`AgentRegistry::send_prompt`): a message the main agent sends to a
+        // sub-agent is a message from the user in lieu of the user, so it takes
+        // the user's path rather than a parallel one.
         let message = Steer::plain(prompt).with_labelled_attachments(attachments);
-        let queued = self.live.with(move |entries| {
-            let entry = entries.iter().find(|e| e.bg_id == Some(id))?;
-            if !entry.running {
-                return Some(false);
-            }
-            entry
-                .steering
-                .lock()
-                .ok()
-                .map(|mut queue| queue.push_back(message))?;
-            Some(true)
-        });
-        match queued {
-            Some(true) => Ok(format!("Steered background task #{id}.")),
-            // Three arms, three different things to say. A finished task cannot be
-            // steered but its result is already on its way to you; an unknown id is
-            // probably a misremembered number; nothing running at all means stop.
-            Some(false) => anyhow::bail!(
+        // `Decline` is the one thing this asks for that the user's path does not,
+        // and it is asked for here rather than decided here: a fresh turn on a
+        // finished sub-agent would answer nobody. The user typing into its pane
+        // reads the answer there — and their viewing is the only reason the
+        // finished agent is still retained at all. The main agent hears from a
+        // background sub-agent through its background-task row, and that row was
+        // delivered and dropped when the run landed, so a turn started here would
+        // run, spend tokens, and report into a void.
+        match self
+            .live
+            .send_prompt(key, message, WhenIdle::Decline, |_| {})
+        {
+            Some(PromptDelivery::Steered) => Ok(format!("Steered background task #{id}.")),
+            // `WhenIdle::Decline` above is what makes this the idle case: finished,
+            // but still retained. Its result is already on its way to the parent,
+            // so the answer is to read that rather than to retry with another id.
+            Some(_) => anyhow::bail!(
                 "background task #{id} has finished, so there is nothing to steer — its result \
                  is delivered to you automatically. {}",
                 running_tasks_hint(&self.live)
             ),
+            // Released between the lookup above and the send: gone, not finished.
             None => anyhow::bail!(
                 "no background task #{id}. Ids come from `task`'s own return value. {}",
                 running_tasks_hint(&self.live)
@@ -2766,18 +2774,13 @@ mod attachment_tests {
         );
     }
 
-    /// A running sub-agent can be handed a picture mid-run: `task_steer` reads
-    /// the file and queues it on the very queue that agent's `run` is draining,
-    /// labelled so the sub-agent can tell which file it is looking at.
-    #[tokio::test]
-    async fn a_steer_carries_its_attachments_to_the_running_sub_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
-        let live = AgentRegistry::new();
+    /// A registered sub-agent addressable as `task#bg_id`, running or not.
+    /// Returns its frontend key.
+    fn register_probe(live: &AgentRegistry, bg_id: u64, running: bool) -> u64 {
         let key = AgentRegistry::next_key();
         live.register(crate::AgentEntry {
             key,
-            bg_id: Some(42),
+            bg_id: Some(bg_id),
             tool_id: None,
             label: "probe".to_string(),
             model: "some-model".to_string(),
@@ -2797,13 +2800,27 @@ mod attachment_tests {
                 Agent::new(AgentConfig::default()).unwrap(),
             )),
             steering: steering_queue(),
-            running: true,
+            running,
             compacting: false,
-            done: false,
-            delivered: false,
+            // A finished run is done, and its answer already reached the parent
+            // — the state `task_steer` meets when it is too late to steer.
+            done: !running,
+            delivered: !running,
             pinned: false,
             transcript: None,
         });
+        key
+    }
+
+    /// A running sub-agent can be handed a picture mid-run: `task_steer` reads
+    /// the file and queues it on the very queue that agent's `run` is draining,
+    /// labelled so the sub-agent can tell which file it is looking at.
+    #[tokio::test]
+    async fn a_steer_carries_its_attachments_to_the_running_sub_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
+        let live = AgentRegistry::new();
+        let key = register_probe(&live, 42, true);
         let tool = SteerTool {
             live: live.clone(),
             max_attachment_bytes: None,
@@ -2843,6 +2860,81 @@ mod attachment_tests {
         );
     }
 
+    /// **`task_steer` adds nothing of its own to the message.** What lands on the
+    /// sub-agent's queue is exactly what the shared builder produces from the same
+    /// prompt and the same file — the builder `hrdr_app::Outgoing::into_steer`
+    /// puts a user's typed message through. This is the model half of the parity
+    /// chain; `hrdr_app::util`'s `the_two_paths_build_the_same_message` is the
+    /// other half, and it compares that builder against the user's real path.
+    ///
+    /// Compared as whole values, not against a written-out string: a second
+    /// spelling of the label block is precisely what this must catch.
+    #[tokio::test]
+    async fn a_steer_is_the_shared_builders_own_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
+        let live = AgentRegistry::new();
+        let key = register_probe(&live, 42, true);
+        let tool = SteerTool {
+            live: live.clone(),
+            max_attachment_bytes: None,
+        };
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+        let args = serde_json::json!({
+            "id": 42, "prompt": "here is the failure", "attachments": ["shot.png"]
+        });
+
+        tool.execute(args.clone(), &ctx).await.expect("queued");
+        let queued = live.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.steering.lock().ok().and_then(|mut q| q.pop_front()))
+                .expect("the message reached the sub-agent's queue")
+        });
+
+        let built = crate::Steer::plain("here is the failure").with_labelled_attachments(
+            attachments_arg(&args, &ctx, "some-model", None).expect("attached"),
+        );
+        assert_eq!(queued, built, "the tool builds nothing of its own");
+    }
+
+    /// **A finished sub-agent is left alone, and told about.** The delivery rule
+    /// is `AgentRegistry::send_prompt`'s for both senders; what `task_steer` asks
+    /// for is `WhenIdle::Decline`, because the main agent's route home for a
+    /// background sub-agent's answer — the background-task row — was delivered
+    /// and dropped when the run landed. So no turn is started, nothing is left on
+    /// the queue to be picked up by something later, and the model is told the
+    /// result is already on its way rather than left waiting on a turn nobody
+    /// would read.
+    #[tokio::test]
+    async fn steering_a_finished_sub_agent_starts_nothing_and_queues_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = AgentRegistry::new();
+        let key = register_probe(&live, 42, false);
+        let tool = SteerTool {
+            live: live.clone(),
+            max_attachment_bytes: None,
+        };
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        let err = tool
+            .execute(
+                serde_json::json!({"id": 42, "prompt": "one more thing"}),
+                &ctx,
+            )
+            .await
+            .expect_err("a finished task cannot be steered")
+            .to_string();
+        assert!(err.contains("background task #42 has finished"), "{err}");
+
+        let (running, queued) = live.with(|v| {
+            let e = v.iter().find(|e| e.key == key).expect("still retained");
+            (e.running, e.steering.lock().unwrap().len())
+        });
+        assert!(!running, "no turn was started on it");
+        assert_eq!(queued, 0, "and the message was not left on its queue");
+    }
+
     /// An id naming nothing is answered as an id problem, even when the call
     /// also names a file that could never be attached. Reading the file first
     /// would send the model off fixing a path for a task that does not exist.
@@ -2871,14 +2963,14 @@ mod attachment_tests {
     /// `task` and the same file the user attaches by typing `@shot.png` are one
     /// `Attachment`, because both go through `hrdr_tools::read_attach_media` —
     /// there is no second answer to "what is attachable" and no second reader.
-    /// The label line is the same too, and is asserted here in the exact form
-    /// `hrdr_tui`'s `an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent`
-    /// asserts for the typed path.
+    /// The label line is the same too — necessarily, since both paths render it
+    /// with [`crate::Steer::with_labelled_attachments`]; the literal below is
+    /// what that one renderer produces, written out once so the wire format has
+    /// somewhere it is stated rather than only computed.
     ///
-    /// The user's half of that comparison lives two crates up (`hrdr_app`'s
-    /// `expand_mentions_tracked`), which cannot be called from here; what this
-    /// pins is that the model's path adds no transformation of its own to the
-    /// shared reader's answer.
+    /// The user's half of the comparison lives a crate up (`hrdr_app`'s
+    /// `expand_mentions_tracked`), which cannot be called from here; `hrdr_app`'s
+    /// own `the_two_paths_build_the_same_message` is the head-to-head.
     #[test]
     fn the_model_attaches_a_file_exactly_as_the_user_does() {
         let dir = tempfile::tempdir().unwrap();

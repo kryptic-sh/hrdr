@@ -62,8 +62,8 @@ pub use provider_catalog::{
 };
 mod registry;
 pub use registry::{
-    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, age_completed_todos,
-    event_log,
+    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, WhenIdle,
+    age_completed_todos, event_log,
 };
 mod transcript;
 mod transcript_log;
@@ -913,11 +913,11 @@ impl Steer {
     /// what the model wrote), and a frontend showing them the label block would
     /// be showing them text they did not write.
     ///
-    /// **`hrdr_app::Outgoing::labels` renders this same block** for the user's
-    /// own `@shot.png` path and predates this method. It lives a crate above, so
-    /// it can call this and this cannot call it; repointing it here is what stops
-    /// the two spellings drifting, and until that happens the format is written
-    /// twice.
+    /// **This is the only renderer of that block.** The user's own `@shot.png`
+    /// path arrives here too, through `hrdr_app::Outgoing::into_steer` a crate
+    /// above — a message the main agent sends to a sub-agent is a message from
+    /// the user in lieu of the user, so it is built by this, not by a second
+    /// implementation that happens to agree today.
     pub fn with_labelled_attachments(
         mut self,
         attachments: Vec<hrdr_llm::media::Attachment>,
@@ -13746,13 +13746,18 @@ mod tests {
             let key = live.with(|v| v[0].key);
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             let mut tx = Some(tx);
-            let delivery = live.send_prompt(key, crate::Steer::plain("now summarise"), move |ev| {
-                if matches!(ev, crate::AgentEvent::TurnDone)
-                    && let Some(tx) = tx.take()
-                {
-                    let _ = tx.send(());
-                }
-            });
+            let delivery = live.send_prompt(
+                key,
+                crate::Steer::plain("now summarise"),
+                crate::WhenIdle::StartTurn,
+                move |ev| {
+                    if matches!(ev, crate::AgentEvent::TurnDone)
+                        && let Some(tx) = tx.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                },
+            );
             assert!(delivery.is_some_and(|d| d.started_turn()));
             rx.await.expect("the steered turn runs to completion");
 

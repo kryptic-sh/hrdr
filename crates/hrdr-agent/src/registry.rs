@@ -136,6 +136,30 @@ pub enum PromptDelivery {
     /// The agent was idle, so a fresh turn was started on it. The handle aborts
     /// that turn, so a frontend can offer cancellation on any agent's turn.
     StartedTurn(JoinHandle<()>),
+    /// The agent was idle and the sender asked for [`WhenIdle::Decline`]:
+    /// **nothing was delivered** and no turn was started.
+    Declined,
+}
+
+/// A sender's answer to "and if that agent is idle?", read under the very lock
+/// that decides it — so the two halves of the routing rule cannot disagree, and
+/// nothing can slip between the question and the answer.
+///
+/// This is the one place the user's path and the main agent's path differ, and
+/// it is a difference in what they *ask for*, not a second copy of the rule: a
+/// fresh turn needs a reader for the answer it produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhenIdle {
+    /// Drive a fresh turn on the retained agent. For a sender that will read
+    /// what comes back — a frontend showing that agent's pane, which is also the
+    /// only thing keeping a finished sub-agent from being pruned.
+    StartTurn,
+    /// Leave the agent alone and report the prompt undelivered
+    /// ([`PromptDelivery::Declined`]). For a sender whose route home for the
+    /// answer is gone: the main agent hears from a background sub-agent through
+    /// its background-task row, and a finished run's row has already been
+    /// delivered and dropped, so a turn started here would answer nobody.
+    Decline,
 }
 
 impl PromptDelivery {
@@ -177,6 +201,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 enum SendOutcome {
     Unknown,
     Steered,
+    Declined,
     Idle {
         agent: Arc<tokio::sync::Mutex<crate::Agent>>,
         steering: crate::SteeringQueue,
@@ -788,19 +813,21 @@ impl AgentRegistry {
 
     /// Send a user prompt to sub-agent `key`.
     ///
-    /// The whole decision lives here, not in a frontend, because it is not a
-    /// frontend's decision — it is the same rule for any agent, driven by anything:
+    /// **Every message a sub-agent receives comes through here** — the user's,
+    /// typed into its pane, and the main agent's `task_steer`, which is a message
+    /// from the user in lieu of the user. The whole decision lives here, not in a
+    /// frontend and not in a tool, because it is not theirs: it is the same rule
+    /// for any agent, driven by anything.
     ///
     /// * a turn is **in flight** → the prompt is *steering*. It goes into the very
     ///   queue that agent's `run` is draining, so the model reads it before its next
     ///   request. Identical to steering the main agent.
-    /// * the agent is **idle** (its delegated task already landed) → drive a **new
-    ///   turn** on it. This is what retaining the agent was for: it is still alive
-    ///   with its full history, so a further turn continues the conversation instead
-    ///   of re-delegating from scratch.
+    /// * the agent is **idle** (its delegated task already landed) → `when_idle`
+    ///   decides, because that is the one thing the sender knows and this does not:
+    ///   whether there is anyone to read a fresh turn's answer. See [`WhenIdle`].
     ///
-    /// A frontend supplies only `on_event` — how to *surface* what comes back. It
-    /// makes no routing decision and holds no rule of its own.
+    /// Beyond that a sender supplies only `on_event` — how to *surface* what comes
+    /// back. It makes no routing decision and holds no rule of its own.
     ///
     /// `None` when the sub-agent has already been released (finished, delivered and
     /// pruned), so a caller can say so rather than swallow the prompt.
@@ -808,6 +835,7 @@ impl AgentRegistry {
         &self,
         key: u64,
         input: crate::Steer,
+        when_idle: WhenIdle,
         on_event: F,
     ) -> Option<PromptDelivery>
     where
@@ -824,10 +852,16 @@ impl AgentRegistry {
                 return SendOutcome::Unknown;
             };
             if e.running {
-                if let Ok(mut q) = e.steering.lock() {
-                    q.push_back(input);
-                }
+                // Poison-tolerant like every other lock here: a queue whose
+                // mutex was poisoned by an unrelated panic must not silently
+                // eat the message while this reports it delivered.
+                e.steering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(input);
                 SendOutcome::Steered
+            } else if when_idle == WhenIdle::Decline {
+                SendOutcome::Declined
             } else {
                 SendOutcome::Idle {
                     agent: Arc::clone(&e.agent),
@@ -839,6 +873,7 @@ impl AgentRegistry {
         let (agent, steering, input) = match outcome {
             SendOutcome::Unknown => return None,
             SendOutcome::Steered => return Some(PromptDelivery::Steered),
+            SendOutcome::Declined => return Some(PromptDelivery::Declined),
             SendOutcome::Idle {
                 agent,
                 steering,
@@ -1201,7 +1236,12 @@ mod tests {
         live.register(entry(1)); // `entry` is running
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
-        let delivery = live.send_prompt(1, crate::Steer::plain("look at auth too"), |_| {});
+        let delivery = live.send_prompt(
+            1,
+            crate::Steer::plain("look at auth too"),
+            WhenIdle::StartTurn,
+            |_| {},
+        );
         assert!(matches!(delivery, Some(PromptDelivery::Steered)));
         assert_eq!(
             steering
@@ -1232,7 +1272,12 @@ mod tests {
             e.done = true;
         });
 
-        let delivery = live.send_prompt(1, crate::Steer::plain("now summarise"), |_| {});
+        let delivery = live.send_prompt(
+            1,
+            crate::Steer::plain("now summarise"),
+            WhenIdle::StartTurn,
+            |_| {},
+        );
         assert!(
             delivery.is_some_and(|d| d.started_turn()),
             "an idle agent is driven, not steered into a void"
@@ -1243,6 +1288,37 @@ mod tests {
         );
         // The turn itself runs against an unreachable endpoint and fails; the
         // RunGuard is what returns it to idle, which the cancellation test covers.
+    }
+
+    /// The same idle agent, asked for by a sender that cannot read what a fresh
+    /// turn would produce: nothing is started and nothing is queued, so the
+    /// message is reported back undelivered rather than run into a void.
+    ///
+    /// This is `task_steer`'s half of the one routing rule — the main agent's
+    /// route home for a background sub-agent's answer is the background-task row
+    /// that was delivered and dropped when the run landed.
+    #[tokio::test]
+    async fn an_idle_agent_is_left_alone_when_the_sender_declines() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        live.update(1, |e| {
+            e.running = false;
+            e.done = true;
+        });
+        let steering = live.with(|v| Arc::clone(&v[0].steering));
+
+        let delivery = live.send_prompt(
+            1,
+            crate::Steer::plain("now summarise"),
+            WhenIdle::Decline,
+            |_| {},
+        );
+        assert!(matches!(delivery, Some(PromptDelivery::Declined)));
+        assert!(!live.with(|v| v[0].running), "no turn was started on it");
+        assert!(
+            steering.lock().unwrap().is_empty(),
+            "and nothing was left on its queue to be picked up later"
+        );
     }
 
     /// **A turn that fails reports it and ends.** The turn driver is shared, so
@@ -1303,8 +1379,13 @@ mod tests {
     fn a_prompt_to_a_released_agent_is_reported_not_swallowed() {
         let live = AgentRegistry::new();
         assert!(
-            live.send_prompt(99, crate::Steer::plain("hello?"), |_| {})
-                .is_none()
+            live.send_prompt(
+                99,
+                crate::Steer::plain("hello?"),
+                WhenIdle::StartTurn,
+                |_| {}
+            )
+            .is_none()
         );
     }
 

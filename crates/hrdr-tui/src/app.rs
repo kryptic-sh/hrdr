@@ -2184,6 +2184,10 @@ impl App {
     /// — is not the TUI's to own: it is the same for any agent driven by anything,
     /// so it lives in `AgentRegistry::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
+    ///
+    /// `WhenIdle::StartTurn` is the one thing it asks for: this pane is on screen,
+    /// so a fresh turn on a finished sub-agent has a reader — and this pane being
+    /// on screen is also the only reason that agent is still retained.
     fn send_to_subagent(&mut self, key: u64, input: String) {
         // Expanded with the main agent's cwd/names, but delivered to the
         // sub-agent — so no `@file` read-state marking on this handle. The
@@ -2199,13 +2203,15 @@ impl App {
         // is folded into the transcript here — doing it in both places would show
         // every message twice.
         let tx = self.tx.clone();
-        let delivered = self.registry.send_prompt(key, input, move |ev| {
-            // The events go to the agent's log; this only wakes the UI so the next
-            // frame picks them up. Sync callback — can't await; and since the
-            // event is already durably in the agent's log, a dropped wake (full
-            // channel) only defers a redraw, never loses data.
-            let _ = tx.try_send(TurnMsg::SubAgent(key, ev));
-        });
+        let delivered =
+            self.registry
+                .send_prompt(key, input, hrdr_agent::WhenIdle::StartTurn, move |ev| {
+                    // The events go to the agent's log; this only wakes the UI so the next
+                    // frame picks them up. Sync callback — can't await; and since the
+                    // event is already durably in the agent's log, a dropped wake (full
+                    // channel) only defers a redraw, never loses data.
+                    let _ = tx.try_send(TurnMsg::SubAgent(key, ev));
+                });
         self.sync_panes();
         if delivered.is_none() {
             // Released while we were looking at it (finished, delivered, and the
