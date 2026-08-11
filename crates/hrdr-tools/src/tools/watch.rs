@@ -226,8 +226,8 @@ impl Tool for WatchTool {
             format!("{timeout}s")
         };
         Ok(format!(
-            "watching #{id} — polls `{check}` every {interval}s, up to {timeout_display}; I'll be \
-             woken when it completes. End your turn. Cancel with `task_cancel {id}`."
+            "watching #{id} — polls `{check}` every {interval}s, up to {timeout_display}; you'll \
+             be woken when it completes. End your turn. Cancel with `task_cancel {id}`."
         ))
     }
 }
