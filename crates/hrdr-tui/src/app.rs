@@ -413,6 +413,17 @@ impl EventSender {
     }
 }
 
+/// One draft put aside with Ctrl+S: the message being written, whole.
+///
+/// The text alone was not the draft — a pasted image sits beside it on the
+/// composer and is just as much part of the message — so stashing only the text
+/// left the image behind for whatever draft was popped next, reuniting words and
+/// a picture that were never typed together.
+pub(crate) struct StashedDraft {
+    text: String,
+    attachments: Vec<hrdr_tools::Attachment>,
+}
+
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
     /// Every agent this session can show: the main one, plus each retained
@@ -721,9 +732,9 @@ pub(crate) struct App {
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
     /// Drafts put aside with Ctrl+S, newest last — an empty-box Ctrl+S pops the
-    /// last one back into the editor. Session-lifetime only, like the editor
+    /// last one back into the composer. Session-lifetime only, like the editor
     /// buffer itself.
-    pub(crate) stash: Vec<String>,
+    pub(crate) stash: Vec<StashedDraft>,
     /// Set after one Esc pressed against something in flight; a second
     /// consecutive Esc interrupts it. Any other key (or a mouse action) disarms
     /// it, so a stray Esc can't kill a long turn.
@@ -1228,9 +1239,7 @@ impl App {
                     // A pasted image is part of the half-written message, so a
                     // box holding one is not empty: Ctrl+C discards it with the
                     // text, and the bytes go with it.
-                    if !self.editor.content().trim().is_empty()
-                        || !self.pending_attachments.is_empty()
-                    {
+                    if !self.composer_is_empty() {
                         self.editor.set_content("");
                         self.pending_attachments.clear();
                         self.quit_armed = false;
@@ -1250,19 +1259,27 @@ impl App {
                 }
                 // Ctrl+L clears + repaints the screen (fix terminal corruption).
                 KeyCode::Char('l') => return Action::Redraw,
-                // Ctrl+S puts the draft aside and takes it back: a non-empty box
-                // is pushed onto the stash and cleared, an empty one pops the
-                // newest stash back. A stack, so several drafts can wait at once
-                // (last stashed is first back). Same `trim()` reasoning as the
-                // Ctrl+D arm below.
+                // Ctrl+S puts the draft aside and takes it back: a composer with
+                // anything in it is pushed onto the stash and cleared, an empty
+                // one pops the newest draft back. A stack, so several drafts can
+                // wait at once (last stashed is first back).
+                //
+                // The whole composer travels, text and attachments together —
+                // and a box holding only a pasted image counts as a draft here
+                // for the same reason it does for Ctrl+C
+                // ([`Self::composer_is_empty`]). Popping onto it would have to
+                // either merge the image into an unrelated draft or discard it.
                 KeyCode::Char('s') => {
-                    let draft = self.editor.content();
-                    if draft.trim().is_empty() {
+                    if self.composer_is_empty() {
                         if let Some(stashed) = self.stash.pop() {
-                            self.editor.set_content(&stashed);
+                            self.editor.set_content(&stashed.text);
+                            self.pending_attachments = stashed.attachments;
                         }
                     } else {
-                        self.stash.push(draft);
+                        self.stash.push(StashedDraft {
+                            text: self.editor.content(),
+                            attachments: std::mem::take(&mut self.pending_attachments),
+                        });
                         self.editor.set_content("");
                     }
                     return Action::None;
@@ -1751,6 +1768,20 @@ impl App {
         }
     }
 
+    /// Whether the composer is holding nothing at all: no text, and no
+    /// attachment waiting to travel with it.
+    ///
+    /// A box that is textually empty but holds a pasted image is **not** empty —
+    /// the bytes are as much the half-written message as the words are — and
+    /// every key that acts on "the draft" has to give one answer to that or one
+    /// of them drops an image another kept.
+    ///
+    /// `trim()` rather than `is_empty()`: the vim engine's `content()` always
+    /// carries a trailing newline, even in a buffer nothing was ever typed into.
+    pub(crate) fn composer_is_empty(&self) -> bool {
+        self.editor.content().trim().is_empty() && self.pending_attachments.is_empty()
+    }
+
     /// The message `input` becomes on the wire, carrying both what its own
     /// `@mentions` attached and whatever the composer was holding.
     ///
@@ -2180,14 +2211,28 @@ impl App {
 
     /// Send `input` to the sub-agent whose pane is on screen.
     ///
-    /// The routing rule — steer a turn in flight, start a new one on an idle agent
-    /// — is not the TUI's to own: it is the same for any agent driven by anything,
+    /// The routing rule — steer a turn in flight, refuse one that has finished —
+    /// is not the TUI's to own: it is the same for any agent driven by anything,
     /// so it lives in `AgentRegistry::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     ///
-    /// `WhenIdle::StartTurn` is the one thing it asks for: this pane is on screen,
-    /// so a fresh turn on a finished sub-agent has a reader — and this pane being
-    /// on screen is also the only reason that agent is still retained.
+    /// `WhenIdle::Decline` is the one thing it asks for, and it asks for exactly
+    /// what `task_steer` asks for: **a sub-agent that has finished is steered by
+    /// nobody**, whether the message comes from the user or from the main agent.
+    /// Idle and finished are one state for a sub-agent — it is registered running
+    /// and only ever goes idle by its delegated run ending — and that ending is
+    /// also where its report is captured for the main agent, in the same breath as
+    /// `done` (`delegation::spawn_background`). So from the moment there is
+    /// anything to decline, nothing a further turn produces can reach the main
+    /// agent: the pane would be talking to a copy of a run the parent already has
+    /// its answer from.
+    ///
+    /// Retention is unchanged — a finished sub-agent is still kept while its pane
+    /// is on screen, so its transcript can be *read*. Only steering it is refused.
+    ///
+    /// Nothing delivered means nothing lost: the composer gets its text and its
+    /// attachments back, so a refused message can be redirected or edited rather
+    /// than vanishing with the keystroke.
     fn send_to_subagent(&mut self, key: u64, input: String) {
         // Expanded with the main agent's cwd/names, but delivered to the
         // sub-agent — so no `@file` read-state marking on this handle. The
@@ -2195,9 +2240,13 @@ impl App {
         // pane is the sub-agent.
         let mut out =
             hrdr_app::prepare_outgoing_relayed(&self.agent, &input, self.project_instructions);
-        out.attach(std::mem::take(&mut self.pending_attachments));
-        self.note_attachments(out.attachments());
-        let input = out.into_steer(input);
+        // Taken off the composer, but kept in hand until delivery is settled: an
+        // `Attachment`'s bytes live behind an `Arc`, so the copy costs a pointer,
+        // and it is what lets a refused message go back whole.
+        let pending = std::mem::take(&mut self.pending_attachments);
+        out.attach(pending.clone());
+        let carried = out.attachments().to_vec();
+        let steer = out.into_steer(input.clone());
         // What was said and everything that comes back is recorded on the agent's
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
         // is folded into the transcript here — doing it in both places would show
@@ -2205,7 +2254,7 @@ impl App {
         let tx = self.tx.clone();
         let delivered =
             self.registry
-                .send_prompt(key, input, hrdr_agent::WhenIdle::StartTurn, move |ev| {
+                .send_prompt(key, steer, hrdr_agent::WhenIdle::Decline, move |ev| {
                     // The events go to the agent's log; this only wakes the UI so the next
                     // frame picks them up. Sync callback — can't await; and since the
                     // event is already durably in the agent's log, a dropped wake (full
@@ -2213,12 +2262,48 @@ impl App {
                     let _ = tx.try_send(TurnMsg::SubAgent(key, ev));
                 });
         self.sync_panes();
-        if delivered.is_none() {
+        match delivered {
+            // It is the sub-agent's message now, so the transcript says what it
+            // carried — after the send, because a row naming an image the agent
+            // never received would be a claim about state that is not true.
+            Some(
+                hrdr_agent::PromptDelivery::Steered | hrdr_agent::PromptDelivery::StartedTurn(_),
+            ) => {
+                self.note_attachments(&carried);
+            }
+            // Finished, and its report is already the main agent's (see above).
+            // Distinct from the release below: this agent is still here to read.
+            Some(hrdr_agent::PromptDelivery::Declined) => {
+                self.restore_composer(&input, pending);
+                self.system(
+                    "that sub-agent has finished, so it can't be steered — send it to the main \
+                     agent instead"
+                        .to_string(),
+                );
+            }
             // Released while we were looking at it (finished, delivered, and the
-            // prune won the race). Fall back rather than swallow what was typed.
-            self.focus_pane(hrdr_app::PaneId::MAIN);
-            self.system("that sub-agent has finished and been released".to_string());
+            // prune won the race). Fall back rather than swallow what was typed —
+            // and move panes *before* the draft goes back, since focusing a pane
+            // restores that pane's own draft over whatever is in the box.
+            None => {
+                self.focus_pane(hrdr_app::PaneId::MAIN);
+                self.restore_composer(&input, pending);
+                self.system("that sub-agent has finished and been released".to_string());
+            }
         }
+    }
+
+    /// Put a message nothing accepted back where it was typed — its text and the
+    /// attachments the composer was holding for it.
+    ///
+    /// Both undeliverable cases go through here so they cannot drift: a refused
+    /// message costs the user the keystroke and nothing else, and an image that
+    /// was never sent is still on the composer to send somewhere that will take
+    /// it. (The composer was emptied when the message was built, so this is an
+    /// assignment rather than an append.)
+    fn restore_composer(&mut self, text: &str, attachments: Vec<hrdr_tools::Attachment>) {
+        self.editor.set_content(text);
+        self.pending_attachments = attachments;
     }
 
     /// Switch the view to `id`: the transcript, the reader's place in it, and the

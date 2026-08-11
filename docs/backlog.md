@@ -626,20 +626,15 @@ Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three
 dialects, `@file` and `Ctrl+]` construct them, blobs persist beside the session,
 and `estimate_tokens_in_messages` prices them. What the six slices left open:
 
-- **A finished-but-retained sub-agent can be steered by the user and not by the
-  main agent** — one rule, deliberately asymmetric, worth re-reading before
-  anyone "fixes" it. `send_prompt` takes a `WhenIdle`: the frontend passes
-  `StartTurn` because the pane the user typed into is watching, and is the only
-  reason the finished sub-agent was retained at all; `task_steer` passes
-  `Decline` because the main agent hears from a background sub-agent through a
-  `BackgroundTask` row that `turn_state` drops once the answer is delivered
-  (`v.retain(|t| !(t.delivered || t.cancelled))`), so a turn started there would
-  spend a model call answering nobody while reporting success. Full parity needs
-  either the follow-up turn's report piped back as the tool result (blocking the
-  parent on a call the model expects to be instant) or a re-armed background row
-  — which is `task_revive`, removed on purpose ("re-briefing beats resuming",
-  `delegation.rs`). Revisit only if the retained context is worth paying for one
-  of those.
+- **`WhenIdle::StartTurn` has no production caller left.** The pane now passes
+  `Decline` like `task_steer` does (see the note below), so the only users of
+  the variant — and of the whole idle branch behind it: `SendOutcome::Idle`,
+  `PromptDelivery::StartedTurn`, and `send_prompt`'s spawn after the lock — are
+  `registry.rs`'s and `lib.rs`'s own tests. Either delete the branch and let
+  `send_prompt` be "steer or refuse", which is what it now means, or keep the
+  seam because a second frontend may want it. Deliberately not decided here: it
+  is a public API of `hrdr-agent` and the change is bigger than the defect that
+  exposed it.
 - **What each path may attach is still spelled differently, on purpose.** The
   user writes `@shot.png` and gets `@dir/`, todo refs and `:command` expansion
   with it; the model passes an explicit `attachments: [path]` array. Reusing `@`
@@ -675,12 +670,25 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   model-aware means caching dimensions instead and pricing at estimate time.
 - **A PDF's page count is a byte scan for `/Type /Page`.** A compressed page
   tree (most real PDFs) falls back to file size at 50 KB/page. Both err high.
-- **`Ctrl+S` stashes the draft text but leaves a pending attachment on the
-  composer**, so popping the stash reunites them. Correct enough to leave, but
-  it is an unstated coupling between two pieces of composer state.
-- **A prompt relayed to a released sub-agent loses its attachments with its
-  text.** `send_to_subagent` takes the attachments before `registry.send_prompt`
-  can return `None`. Same fate the text already had — pre-existing, not new.
+- **Idle and delivered are one state for a sub-agent, which is why the pane
+  refuses on idleness.** Established while making the pane refuse to steer a
+  finished sub-agent: `delegation.rs` registers every sub-agent `running: true`
+  and only `spawn_background`'s guard clears it, so `!running` is reachable only
+  by the run having ended — and that same block fills the `BackgroundTask` row's
+  `result` in the breath before it. `turn_state::drain_background` flips the
+  entry's `delivered` later (when the parent's next request folds the row in),
+  so there IS a window where an entry is idle and not yet delivered, but the
+  report the parent will receive is already fixed in that window: nothing a
+  later turn produces can reach it either way. So `WhenIdle::Decline` — defined
+  on idleness — implements the owner's rule, which names delivery, without
+  widening it. If a sub-agent ever gains a path to idleness that is not
+  "finished", that equality breaks and this is the note that says so.
+- **`Ctrl+D` on a box holding only a pasted image still quits**, dropping the
+  bytes: it reads `editor.content().trim()` directly rather than
+  `App::composer_is_empty`, which Ctrl+C and Ctrl+S now share. Left alone
+  deliberately — Ctrl+D is the shell-style EOF quit, and quitting discards the
+  composer whatever is on it — but it is the third answer to "is the composer
+  empty" and the one that disagrees.
 - **Considered and declined: auto-attaching a pasted file path.** Dragging a
   file onto a terminal and typing about a path are the same keystrokes, so
   `Event::Paste` leaves text as text. The two deliberate spellings are `@path`

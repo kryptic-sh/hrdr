@@ -116,10 +116,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     other outcome says which it was rather than doing nothing: no clipboard, an
     empty one, an image type hrdr cannot attach, or a backend that cannot read
     images at all (OSC 52 over ssh). A pasted image is held in memory until the
-    message is sent, and `Ctrl+C` discards it with the draft. The composer's
-    status row names what the message is carrying, and a transcript row records
-    it beside the message. A file path pasted as _text_ stays text — prefix it
-    with `@` to attach it.
+    message is sent; `Ctrl+C` discards it with the draft, and `Ctrl+S` stashes
+    it with the draft, so a stashed draft comes back with its own image and
+    never with another draft's. A composer holding an image and no text yet
+    counts as a draft for both keys. The composer's status row names what the
+    message is carrying, and a transcript row records it beside the message. A
+    file path pasted as _text_ stays text — prefix it with `@` to attach it.
   - **They count against the context window.** An attachment carries no text, so
     on an endpoint that reports no usage of its own a screenshot cost the prompt
     estimate nothing at all: the context gauge read near-empty on an image-heavy
@@ -216,6 +218,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   via `gh`, GitLab via `glab`, JIRA via `acli` (the repo's remote decides).
   Existing tickets are found by search and updated with a comment rather than
   duplicated; only genuinely new items are created.
+
+### Changed
+
+- **A sub-agent that has finished can no longer be steered from its pane.**
+  Typing into the pane of a sub-agent whose run was over started a fresh turn on
+  it (since 0.10.0); it is now refused, which is the refusal the main agent's
+  own `task_steer` has always had, and for the same reason: a sub-agent's report
+  is captured for the parent the moment its run ends, so a later turn can only
+  answer whoever happens to be watching the pane. A turn still **in flight** is
+  steered from its pane exactly as before, and a finished sub-agent is still
+  kept alive while its pane is on screen — the change is to steering it, not to
+  reading it. Nothing typed is lost either way: a refused message, and one typed
+  to a sub-agent that was released out from under it, both put their text **and
+  the images pasted onto the composer** back in the box, to send to the main
+  agent instead.
 
 ### Performance
 

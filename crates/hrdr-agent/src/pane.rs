@@ -463,17 +463,28 @@ struct LiveSnapshot {
     delegation: Option<String>,
 }
 
-/// Test-only count of snapshot builds, so the diff's observable: a no-op sync
-/// must build none, a one-entry change exactly one.
 #[cfg(test)]
-static SNAPSHOT_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Test-only count of snapshot builds, so the diff's observable: a no-op
+    /// sync must build none, a one-entry change exactly one.
+    ///
+    /// **Thread-local, not a global.** A process-wide counter is shared with
+    /// every other test in this binary, and `cargo test` runs them in parallel
+    /// — so any concurrent test that happened to call [`PaneSet::sync`] between
+    /// one of these tests zeroing the counter and reading it back inflated the
+    /// count, failing an assertion about a registry that test never touched.
+    /// Per-thread, each test counts only its own builds, whatever else is
+    /// running. Nothing outside a test reads it, so counting per thread costs
+    /// the production path nothing.
+    static SNAPSHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// What [`PaneSet::sync`] reads off one registry entry — the full snapshot, for
 /// the entries the diff judged changed.
 impl From<&AgentEntry> for LiveSnapshot {
     fn from(e: &AgentEntry) -> Self {
         #[cfg(test)]
-        SNAPSHOT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(n.get() + 1));
         Self {
             key: e.key,
             label: e.label.clone(),
@@ -1059,20 +1070,20 @@ mod tests {
         panes.sync(&live);
 
         // Nothing changed since the pane was built: the next sync builds none.
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
         assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            SNAPSHOT_BUILDS.with(std::cell::Cell::get),
             0,
             "an unchanged agent costs no snapshot build"
         );
 
         // One field changes: exactly that entry rebuilds, and the pane sees it.
         live.update(1, |e| e.model = "other".into());
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
         assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            SNAPSHOT_BUILDS.with(std::cell::Cell::get),
             1,
             "only the changed entry rebuilds"
         );
@@ -1093,22 +1104,19 @@ mod tests {
         panes.main_mut().state.name = "The Session".to_string();
         panes.sync(&live);
 
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
         assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+            SNAPSHOT_BUILDS.with(std::cell::Cell::get),
             0,
             "an unchanged main agent costs no snapshot build"
         );
 
         // A changed main agent still rebuilds.
         live.update(crate::MAIN_KEY, |e| e.running = true);
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
-        assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
         assert_eq!(panes.main().status, PaneStatus::Running);
     }
 
@@ -1127,12 +1135,9 @@ mod tests {
                 .unwrap()
                 .push_back(crate::Steer::new("<expanded @file blob>", "check auth"));
         });
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
-        assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
         assert_eq!(
             panes.subs()[0].pending,
             vec!["check auth".to_string()],
@@ -1140,12 +1145,9 @@ mod tests {
         );
 
         // Nothing new was steered: no rebuild.
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
-        assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 0);
 
         // A second steer is picked up in order, queue and pane aligned.
         live.update(1, |e| {
@@ -1154,12 +1156,9 @@ mod tests {
                 .unwrap()
                 .push_back(crate::Steer::plain("one more"));
         });
-        SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
         panes.sync(&live);
-        assert_eq!(
-            SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
         assert_eq!(
             panes.subs()[0].pending,
             vec!["check auth".to_string(), "one more".to_string()]

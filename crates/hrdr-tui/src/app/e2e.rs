@@ -1831,6 +1831,74 @@ async fn ctrl_s_stashes_and_pops_drafts() {
     assert!(h.app.stash.is_empty());
 }
 
+/// Ctrl+S stashes the whole composer, not only its words: a draft put aside with
+/// an image on it comes back with that image, and the draft stashed on top of it
+/// comes back with nothing.
+///
+/// The text and the pending attachments were two pieces of composer state and
+/// only one of them was stashed, so popping a *different* draft handed it an
+/// image that was never typed with it.
+#[tokio::test]
+async fn the_stash_carries_each_drafts_own_attachments() {
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(64)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    // A draft with a picture on it, put aside…
+    h.type_str("what is in this");
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1, "the composer holds it");
+    h.ctrl('s');
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "the image went into the stash with the draft it belongs to"
+    );
+
+    // …then a plain one on top of it.
+    h.type_str("no picture here");
+    h.ctrl('s');
+    assert_eq!(h.app.stash.len(), 2, "the stash stacks up");
+
+    // Newest first: the plain draft comes back plain.
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "no picture here");
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "no image leaked out of the draft underneath it"
+    );
+
+    // And the one under it comes back with the image it was typed with.
+    h.app.editor.set_content("");
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "what is in this");
+    assert_eq!(h.app.pending_attachments.len(), 1, "its own image is back");
+    assert_eq!(h.app.pending_attachments[0].filename(), "pasted-1.png");
+
+    // A box holding only an image is a draft too, so Ctrl+S stashes it rather
+    // than reading the empty text as "pop" — which would have to either merge the
+    // image into whichever draft came back or drop it.
+    h.app.editor.set_content("");
+    assert_eq!(h.app.pending_attachments.len(), 1, "still on the composer");
+    h.ctrl('s');
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "an image with no text is stashed, not popped over"
+    );
+    assert_eq!(h.app.stash.len(), 1);
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "");
+    assert_eq!(h.app.pending_attachments.len(), 1, "and it comes back");
+}
+
 /// The input pane's top padding line is a status line for the box: blank while
 /// there is nothing to report, "N drafts stashed" while Ctrl+S drafts wait, and
 /// "history N/M" while Up/Down browse the recall list (N counting from the
@@ -10228,6 +10296,101 @@ async fn an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent() {
         "the main agent was not sent the sub-agent's message"
     );
     h.pump().await;
+}
+
+/// A sub-agent that has finished is not steered from its pane either.
+///
+/// The same refusal `task_steer` gets, and for the same reason: a sub-agent goes
+/// idle by finishing, and finishing is where its report is captured for the main
+/// agent, so a further turn could only answer the pane. The user is told, in the
+/// pane they typed into — and told something other than "released", which means
+/// the agent is gone rather than merely finished. What was typed survives the
+/// refusal whole: the text and the image pasted onto the composer are both back
+/// in the box, to redirect or edit.
+#[tokio::test]
+async fn a_finished_sub_agent_is_not_steered_and_the_draft_comes_back() {
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(64)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    // Finished, its answer already the main agent's, and kept only because this
+    // pane is on screen — the state the pane used to drive a fresh turn on.
+    let sub_key = 9_u64;
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
+    h.app.registry.register(hrdr_agent::AgentEntry {
+        key: sub_key,
+        bg_id: Some(1),
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        sandbox: hrdr_tools::SandboxMode::None,
+        todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
+        turn: hrdr_agent::TurnStats::default(),
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
+        steering: hrdr_agent::steering_queue(),
+        running: false,
+        compacting: false,
+        done: true,
+        delivered: true,
+        pinned: false,
+        transcript: None,
+    });
+    h.app.sync_panes();
+    h.app.focus_pane(hrdr_app::PaneId(sub_key));
+
+    h.type_str("one more thing");
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1, "the composer holds it");
+    h.press(KeyCode::Enter);
+
+    assert!(
+        h.app.registry.take_pending(sub_key).is_none(),
+        "nothing was handed to a finished sub-agent"
+    );
+    assert!(
+        !h.app
+            .registry
+            .with(|v| v.iter().any(|e| e.key == sub_key && e.running)),
+        "and no fresh turn was started on it"
+    );
+    assert_eq!(
+        h.app.toasts.last_body(),
+        Some(
+            "that sub-agent has finished, so it can't be steered — send it to the main agent \
+             instead"
+        ),
+        "the user is told, and told it is finished rather than gone"
+    );
+    assert_eq!(
+        h.app.panes.active(),
+        hrdr_app::PaneId(sub_key),
+        "still on its pane: a finished sub-agent is kept to be read"
+    );
+    assert_eq!(
+        h.app.editor.content().trim(),
+        "one more thing",
+        "the text is back in the box"
+    );
+    assert_eq!(h.app.pending_attachments.len(), 1, "and so is the image");
+    assert_eq!(h.app.pending_attachments[0].filename(), "pasted-1.png");
 }
 
 /// Ctrl+] with an image on the clipboard attaches it to the message being
