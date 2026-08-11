@@ -19,6 +19,7 @@ mod client;
 mod codex;
 pub mod fs;
 pub mod media;
+mod pdf;
 mod retry;
 pub mod sse;
 mod types;

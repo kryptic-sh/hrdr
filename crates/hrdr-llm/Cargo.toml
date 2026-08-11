@@ -23,6 +23,10 @@ async-stream.workspace = true
 # Already in the tree (reqwest runs on it, every other crate depends on it) —
 # this promotes it from a dev-dependency, it does not add a crate.
 tokio.workspace = true
+# Inflating a PDF's object and cross-reference streams (src/pdf.rs), which is
+# how every PDF written this decade stores its page tree. Already in the tree
+# transitively — this promotes it to a direct dependency, it does not add one.
+flate2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for `owner_only_options_no_follow` (src/fs.rs, used by the wire-log

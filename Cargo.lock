@@ -1414,6 +1414,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "base64 0.23.1",
+ "flate2",
  "futures-util",
  "hjkl-xdg",
  "hrdr-test-support",

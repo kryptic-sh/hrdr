@@ -131,9 +131,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     dimensions in its PNG, JPEG, GIF or WebP header; a PDF by its page count at
     3,000 tokens a page — and `estimate_tokens_in_messages` adds it, so the
     compaction trigger, the shrink ladder's stage sizing and the gauge all see
-    it. A header this cannot parse costs the per-image ceiling rather than
-    nothing, and a PDF whose page tree is compressed is counted from its size:
-    both err high, because an estimate that runs low is the one that lets a
+    it. The page count is read out of the file rather than guessed at: the
+    cross-reference chain is parsed (classic `xref` tables and cross-reference
+    streams, `/Prev` chains back through incremental updates, and catalogs and
+    page trees stored inside compressed object streams) down to the `/Count` the
+    page tree declares, so a PDF written this decade is priced exactly instead
+    of by a bytes-per-page constant that could be an order of magnitude out
+    either way. A file that cannot be read with certainty — encrypted,
+    malformed, or using a feature the reader does not implement — falls back to
+    scanning for page objects and then to the file's size. A header this cannot
+    parse costs the per-image ceiling rather than nothing, and both PDF
+    fallbacks err high, because an estimate that runs low is the one that lets a
     request overflow the window. The figure is computed once, when the
     attachment is built.
   - **The main agent can delegate them, not just describe them.** `task` and

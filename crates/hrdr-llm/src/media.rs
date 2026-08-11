@@ -225,9 +225,9 @@ const UNKNOWN_IMAGE_TOKENS: u32 = CHARGED_MAX_IMAGE_TOKENS as u32;
 /// the one that lets a request overflow the window.
 const PDF_TOKENS_PER_PAGE: u32 = 3_000;
 
-/// Bytes per page assumed when a PDF's page tree cannot be counted (see
-/// [`pdf_page_count`]) — a middling figure for a compressed PDF, between a
-/// text-only page of a few KB and a scanned page of a few hundred.
+/// Bytes per page assumed when neither [`crate::pdf::page_count`] nor
+/// [`pdf_page_count`] can produce one — a middling figure for a compressed PDF,
+/// between a text-only page of a few KB and a scanned page of a few hundred.
 const PDF_BYTES_PER_PAGE: usize = 50_000;
 
 /// The pixel dimensions in an image's header, or `None` for a header that is
@@ -418,13 +418,17 @@ fn visual_tokens(width: u32, height: u32, max_edge_px: u64, max_tokens: u64) -> 
     }
 }
 
-/// Pages declared by a PDF's page tree: `/Type /Page` objects, with the
-/// `/Type /Pages` tree nodes excluded.
+/// `/Type /Page` objects in the raw bytes, with the `/Type /Pages` tree nodes
+/// excluded — the **fallback** for a file [`crate::pdf::page_count`] could not
+/// read, not the primary count.
 ///
-/// Zero for a PDF whose objects live in compressed object streams, which most
-/// modern ones do — reading those means inflating the file, which is a PDF
-/// parser and a dependency. That is the degradation this is written for: the
-/// caller falls back to a byte-derived page count rather than believing a zero.
+/// It is a scan, so it is wrong in both directions, which is why it is second
+/// in line: zero for a PDF whose objects live in compressed object streams
+/// (most of them, this decade), and too many for one where the text appears in
+/// a content stream, a string or a comment. It stays because it costs one pass
+/// over the bytes and is right for the flat, uncompressed files that a real
+/// parse also gets right — so when it fires at all, it beats dividing by a
+/// constant.
 fn pdf_page_count(bytes: &[u8]) -> usize {
     const TYPE: &[u8] = b"/Type";
     let mut count = 0usize;
@@ -445,20 +449,25 @@ fn pdf_page_count(bytes: &[u8]) -> usize {
     count
 }
 
-/// An **approximate** token cost for a PDF: its page count times
-/// [`PDF_TOKENS_PER_PAGE`].
+/// A token cost for a PDF: its page count times [`PDF_TOKENS_PER_PAGE`].
 ///
-/// Nothing here parses PDF. The page count is [`pdf_page_count`]'s scan of the
-/// uncompressed page tree, and a compressed one (a zero) falls back to the
-/// file's size over [`PDF_BYTES_PER_PAGE`] — so the figure is exact in page
-/// *count* only for the PDFs whose tree is readable, and a guess otherwise.
+/// The page count comes from three places, in falling order of how much they
+/// know. [`crate::pdf::page_count`] parses the file's cross-reference chain and
+/// reads the `/Count` the page tree declares — exact, for every file it can
+/// read at all. Failing that, [`pdf_page_count`]'s byte scan. Failing that, the
+/// file's size over [`PDF_BYTES_PER_PAGE`], which is a guess and is documented
+/// as one.
+///
 /// Both the per-page rate and the byte fallback are chosen to err high: a
-/// document that is charged more than it costs makes the agent compact early,
-/// while one charged less lets a request overflow the window.
+/// document charged more than it costs makes the agent compact early, while one
+/// charged less lets a request overflow the window.
 fn pdf_tokens(bytes: &[u8]) -> u32 {
-    let pages = match pdf_page_count(bytes) {
-        0 => bytes.len().div_ceil(PDF_BYTES_PER_PAGE).max(1),
-        counted => counted,
+    let pages = match crate::pdf::page_count(bytes) {
+        Some(declared) => declared as usize,
+        None => match pdf_page_count(bytes) {
+            0 => bytes.len().div_ceil(PDF_BYTES_PER_PAGE).max(1),
+            scanned => scanned,
+        },
     };
     u32::try_from(pages)
         .unwrap_or(u32::MAX)
@@ -1722,12 +1731,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// The PDF estimate: the declared page count when the page tree is
-    /// readable, a byte-derived count when it is not, and never zero.
+    /// The two fallbacks behind the parser: the byte scan for a file with no
+    /// cross-reference chain to follow, and the file's size for one that
+    /// declares nothing at all. Never zero.
     #[test]
     fn a_pdf_is_charged_by_its_pages() {
-        // An uncompressed page tree: three leaves under one `/Pages` node, which
-        // must not itself be counted.
+        // A fragment of a page tree with no trailer, so nothing to parse: three
+        // leaves under one `/Pages` node, which must not itself be counted.
         let mut doc = b"%PDF-1.7\n1 0 obj<</Type /Pages/Kids[2 0 R 3 0 R 4 0 R]/Count 3>>".to_vec();
         for _ in 0..3 {
             doc.extend_from_slice(b"\nobj<</Type /Page/Parent 1 0 R>>");
@@ -1751,6 +1761,34 @@ pub(crate) mod tests {
         );
         let big = Attachment::new(pdf(PDF_BYTES_PER_PAGE * 4), MediaType::Pdf, "b.pdf").unwrap();
         assert_eq!(big.estimated_tokens(), 5 * PDF_TOKENS_PER_PAGE);
+    }
+
+    /// A real page tree outranks both fallbacks — in the two directions they
+    /// get it wrong.
+    #[test]
+    fn a_real_page_count_beats_the_scan_and_the_guess() {
+        // Compressed: the scan sees no page objects at all, and the file is
+        // small, so both fallbacks would charge a single page for eleven.
+        let compressed = crate::pdf::fixtures::xref_stream_objstm(11, true);
+        assert_eq!(pdf_page_count(&compressed), 0);
+        assert!(compressed.len() < PDF_BYTES_PER_PAGE);
+        assert_eq!(
+            Attachment::new(compressed, MediaType::Pdf, "c.pdf")
+                .unwrap()
+                .estimated_tokens(),
+            11 * PDF_TOKENS_PER_PAGE
+        );
+
+        // `/Type /Page` in a string and in a content stream: the scan counts
+        // twelve pages in a three-page document.
+        let noisy = crate::pdf::fixtures::page_text_in_content();
+        assert_eq!(pdf_page_count(&noisy), 12);
+        assert_eq!(
+            Attachment::new(noisy, MediaType::Pdf, "n.pdf")
+                .unwrap()
+                .estimated_tokens(),
+            3 * PDF_TOKENS_PER_PAGE
+        );
     }
 
     /// `Debug` prints the byte *count*, never the bytes — a `ChatMessage` with
