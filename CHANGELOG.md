@@ -45,12 +45,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the text in all three. Requests are refused before they are sent when the
   model's models.dev `modalities.input` list does not cover the attachment (a
   model the catalog does not list is allowed through, so self-hosted endpoints
-  still work), when an image exceeds 5 MB of base64, when the request totals
-  over 32 MB, or when it carries more than 100 images. **Nothing constructs an
-  attachment yet** — there is no way to attach a file from the UI, and
-  attachments are not written to the session file, so they do not survive a
+  still work), when one attachment is over the size ceiling below, when the
+  request totals over 32 MB, or when it carries more than 100 images. **Nothing
+  constructs an attachment yet** — there is no way to attach a file from the UI,
+  and attachments are not written to the session file, so they do not survive a
   resume. A message with no attachments serializes exactly as before on all
   three dialects.
+- **`max_attachment_bytes` — the per-attachment size ceiling is configurable**
+  (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
+  limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64
+  payload the providers count, ~4/3 the file on disk. Unset, each kind keeps the
+  tightest cap of the dialects hrdr speaks — 5 MB for an image (Anthropic's
+  per-image limit) and the 32 MB request budget for a PDF, which no dialect caps
+  separately — so a legal 20 MB PDF is not refused by a limit hrdr invented. Set
+  it for an endpoint with different limits (OpenAI allows 50 MB per file) and it
+  applies to images and PDFs alike. `0` is refused: a hard error in
+  `config.toml`, a warning that keeps the current value from the environment.
+  The 32 MB request total and the 100-image count stay fixed — they are protocol
+  limits, and raising one would only trade a clear local refusal for a 413.
 - **Agent Skills — `<name>/SKILL.md` bundles, the format Claude Code, Codex and
   opencode already read.** A skill is a directory holding a `SKILL.md` plus the
   files it references (`references/`, `scripts/`, `assets/`), and hrdr now

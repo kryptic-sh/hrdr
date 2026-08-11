@@ -532,6 +532,11 @@ pub struct Client {
     /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
     /// the OpenAI chat-completions wire, just a different URL + auth).
     api_version: Option<String>,
+    /// The user's per-attachment size ceiling (`max_attachment_bytes`), or
+    /// `None` for the provider defaults. Applied by [`Client::check_attachments`]
+    /// — the gate every request passes through — see
+    /// [`crate::media::check_attachments`].
+    max_attachment_bytes: Option<usize>,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
     /// What [`UNNAMED_MODEL`] resolved to at this endpoint, once asked.
@@ -700,6 +705,7 @@ impl Client {
             prompt_cache_key: None,
             system_cache_split: None,
             api_version: None,
+            max_attachment_bytes: None,
             backend,
             resolved_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -879,6 +885,21 @@ impl Client {
 
     pub fn set_api_version(&mut self, api_version: Option<String>) {
         self.api_version = api_version;
+    }
+
+    /// Set the per-attachment size ceiling in encoded bytes (the user's
+    /// `max_attachment_bytes`), or `None` to use each type's provider default.
+    /// Enforced in [`Client::check_attachments`], ahead of every request.
+    pub fn set_max_attachment_bytes(&mut self, max: Option<usize>) {
+        self.max_attachment_bytes = max;
+    }
+
+    /// The per-attachment ceiling currently in force — so a caller that
+    /// configured one can assert the value it installed is the value the gate
+    /// will use (a dropped cap is invisible until a request the user meant to
+    /// refuse goes out).
+    pub fn max_attachment_bytes(&self) -> Option<usize> {
+        self.max_attachment_bytes
     }
 
     /// Build a request URL for `path` (e.g. `chat/completions`), appending the
@@ -1165,9 +1186,11 @@ impl Client {
         json
     }
 
-    /// Refuse a request whose attachments the model cannot take, before it goes
-    /// out. See [`crate::media::check_attachments`] — including why a model the
-    /// catalog has never heard of is allowed through.
+    /// Refuse a request whose attachments the model cannot take, or that are
+    /// over the configured per-attachment ceiling, before it goes out. See
+    /// [`crate::media::check_attachments`] — including why the size cap is
+    /// enforced here rather than at construction, and why a model the catalog
+    /// has never heard of is allowed through.
     ///
     /// Reported as a [`ChatError`] with [`ChatErrorKind::Other`] rather than a
     /// bare error: that is the shape hrdr-agent already classifies, and `Other`
@@ -1179,7 +1202,13 @@ impl Client {
         // the stream about to open. `None` (no catalog, or no entry) is the
         // allow case.
         let accepts = crate::catalog::input_modalities_cached(None, &self.model);
-        crate::media::check_attachments(&self.model, accepts.as_deref(), messages).map_err(|e| {
+        crate::media::check_attachments(
+            &self.model,
+            accepts.as_deref(),
+            messages,
+            self.max_attachment_bytes,
+        )
+        .map_err(|e| {
             anyhow::Error::new(ChatError {
                 status: None,
                 retry_after: None,
@@ -1898,6 +1927,44 @@ mod tests {
             );
             assert_eq!(chat.status, None, "{url}: nothing was sent");
         }
+    }
+
+    /// The configured per-attachment ceiling is the number the send path
+    /// actually enforces: the same client refuses an attachment it accepted a
+    /// moment earlier, and the message names the configured value.
+    #[tokio::test]
+    async fn the_configured_attachment_cap_is_what_the_send_path_enforces() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("what is this");
+        m.attachments = vec![png_attachment("a.png")];
+        let encoded = m.attachments[0].encoded_len();
+
+        // A closed port: past the gate this fails with a connection error, which
+        // is not a typed `ChatError` — that is how "allowed through" is told
+        // apart from "refused".
+        let mut client = Client::new("http://127.0.0.1:1/v1", None, "qwen3-vl-local");
+        let Err(err) = client.chat_stream(std::slice::from_ref(&m), &[]).await else {
+            panic!("a closed port cannot answer");
+        };
+        assert!(
+            err.downcast_ref::<ChatError>().is_none(),
+            "with no cap configured this attachment is fine: {err:#}"
+        );
+
+        client.set_max_attachment_bytes(Some(encoded - 1));
+        assert_eq!(client.max_attachment_bytes(), Some(encoded - 1));
+        let Err(err) = client.chat_stream(std::slice::from_ref(&m), &[]).await else {
+            panic!("the configured cap must refuse it");
+        };
+        let chat: &ChatError = err
+            .downcast_ref()
+            .unwrap_or_else(|| panic!("expected a typed ChatError, got {err:#}"));
+        assert_eq!(chat.status, None, "nothing was sent");
+        assert!(
+            chat.message.contains(&(encoded - 1).to_string()),
+            "the refusal names the configured cap: {}",
+            chat.message
+        );
     }
 
     /// A model the catalog has never heard of — a local server, an unlisted id

@@ -25,9 +25,11 @@ use serde_json::{Value, json};
 
 use crate::types::{ChatMessage, Role};
 
-/// Anthropic's per-image cap: **5 MB of base64**. The tightest of the three
-/// dialects — OpenAI Responses allows 50 MB per file — so it is the one worth
-/// enforcing, since the same [`Attachment`] may be rendered for any of them.
+/// Anthropic's per-image cap: **5 MB of base64** — the per-attachment ceiling
+/// for an image when the user configured none. The tightest of the three
+/// dialects (OpenAI Responses allows 50 MB per file), so it is the value that
+/// makes hrdr's local refusal match the remote one, since the same
+/// [`Attachment`] may be rendered for any of them.
 ///
 /// Decimal MB rather than MiB: Anthropic's docs say "5MB" without saying which,
 /// and the smaller reading is the one that can only ever refuse early rather
@@ -35,13 +37,28 @@ use crate::types::{ChatMessage, Role};
 ///
 /// The check is on the **encoded** size ([`Attachment::encoded_len`]), which is
 /// 4/3 of the raw bytes: an image that fits raw can still be over once encoded.
-const MAX_IMAGE_BASE64_BYTES: usize = 5_000_000;
+///
+/// **This one is a knob** (`max_attachment_bytes`, `$HRDR_MAX_ATTACHMENT_BYTES`
+/// — [`check_attachments`]'s `max_attachment_bytes` argument), because it is the
+/// only one of the three that is not the same everywhere: OpenAI allows 50 MB
+/// per file and a self-hosted server allows whatever it was built to. The other
+/// two below stay constants deliberately — they are protocol limits of the
+/// request itself, and a user raising one past what the provider accepts would
+/// only trade a clear local refusal for an opaque 413 a round later.
+const DEFAULT_MAX_IMAGE_BASE64_BYTES: usize = 5_000_000;
 
 /// Anthropic's per-**request** cap: **32 MB** (published as the PDF limit, and
 /// the only whole-request byte limit any of the three dialects states). Applied
-/// twice: to a single PDF at construction — one attachment cannot exceed the
-/// budget for the whole request — and to the sum of every attachment in
-/// [`check_attachments`].
+/// twice in [`check_attachments`]: to a single PDF, which is otherwise
+/// unconstrained — one attachment cannot exceed the budget for the whole request
+/// — and to the sum of every attachment.
+///
+/// It is also the *default* per-attachment ceiling for a PDF, which is why a PDF
+/// and an image do not share one: Anthropic caps images at 5 MB but says nothing
+/// about a single PDF beyond this request budget, so defaulting both to 5 MB
+/// would refuse a 20 MB PDF the provider would have accepted. A configured
+/// `max_attachment_bytes` is a ceiling the *user* stated, so it does apply to
+/// both — see [`per_attachment_limit`].
 const MAX_REQUEST_BASE64_BYTES: usize = 32_000_000;
 
 /// Anthropic's per-request image count for 200k-context models: **100**.
@@ -157,8 +174,17 @@ impl std::fmt::Debug for Attachment {
 
 impl Attachment {
     /// Build an attachment, refusing bytes that are not what `media_type`
-    /// claims ([`MediaType::sniff`]) or that are over the size cap for their
-    /// type.
+    /// claims ([`MediaType::sniff`]).
+    ///
+    /// **Size is not checked here.** How large an attachment may be is a
+    /// property of where it is going — the endpoint's limit, and the user's
+    /// `max_attachment_bytes` over it — not of the bytes, which are
+    /// dialect-neutral and may be legal against one endpoint and not another.
+    /// Checking it here would mean either hardcoding one provider's number into
+    /// construction, or taking a limit argument every caller is free to widen.
+    /// It lives in [`check_attachments`] instead: the gate every request passes
+    /// through before anything is sent (`Client::chat_stream`), where the
+    /// configured value is in scope and no caller can construct around it.
     pub fn new(
         bytes: impl Into<Arc<[u8]>>,
         media_type: MediaType,
@@ -174,26 +200,11 @@ impl Attachment {
                 actual,
             });
         }
-        let attachment = Self {
+        Ok(Self {
             bytes,
             media_type,
             filename,
-        };
-        let limit = if media_type.is_image() {
-            MAX_IMAGE_BASE64_BYTES
-        } else {
-            MAX_REQUEST_BASE64_BYTES
-        };
-        let encoded = attachment.encoded_len();
-        if encoded > limit {
-            return Err(AttachmentError::TooLarge {
-                filename: attachment.filename,
-                media_type,
-                encoded,
-                limit,
-            });
-        }
-        Ok(attachment)
+        })
     }
 
     /// The validated media type.
@@ -279,8 +290,9 @@ impl Attachment {
     }
 }
 
-/// Why an attachment was refused — at construction ([`Attachment::new`]) or
-/// before a request goes out ([`check_attachments`]).
+/// Why an attachment was refused — for the bytes not matching their declared
+/// type ([`Attachment::new`]), or by the gate a request passes through before it
+/// goes out ([`check_attachments`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentError {
     /// The bytes are not what the declared type says they are.
@@ -291,7 +303,10 @@ pub enum AttachmentError {
         /// at all (including a header too short to identify).
         actual: Option<MediaType>,
     },
-    /// One attachment is over the per-attachment cap for its type.
+    /// One attachment is over the per-attachment cap in force for its type —
+    /// the configured `max_attachment_bytes`, or the provider default (see
+    /// [`per_attachment_limit`]). `limit` is the number actually applied, so the
+    /// message names the user's value when they set one.
     TooLarge {
         filename: String,
         media_type: MediaType,
@@ -338,8 +353,8 @@ impl std::fmt::Display for AttachmentError {
                 limit,
             } => write!(
                 f,
-                "{filename}: {encoded} bytes once base64-encoded, over the {limit}-byte limit \
-                 for {media_type} (Anthropic)"
+                "{filename}: {encoded} bytes once base64-encoded, over the {limit}-byte \
+                 per-attachment limit for {media_type}"
             ),
             Self::RequestTooLarge { encoded, limit } => write!(
                 f,
@@ -367,11 +382,37 @@ impl std::fmt::Display for AttachmentError {
 
 impl std::error::Error for AttachmentError {}
 
-/// Refuse a request whose attachments the provider would reject anyway.
+/// The per-attachment ceiling in force for `media_type`.
+///
+/// A configured `max_attachment_bytes` applies to **every** attachment: it is a
+/// ceiling the user stated — "nothing over this goes out" — and honouring it for
+/// images while letting a PDF past would make the setting mean something other
+/// than what it says.
+///
+/// With nothing configured each type gets the provider's own documented cap
+/// ([`DEFAULT_MAX_IMAGE_BASE64_BYTES`] for an image, [`MAX_REQUEST_BASE64_BYTES`]
+/// for a PDF, which Anthropic bounds only by the request budget). One shared
+/// default of 5 MB would refuse a 20 MB PDF that is perfectly legal — a limit
+/// hrdr invented, on a request the provider would have taken.
+fn per_attachment_limit(media_type: MediaType, max_attachment_bytes: Option<usize>) -> usize {
+    max_attachment_bytes.unwrap_or(if media_type.is_image() {
+        DEFAULT_MAX_IMAGE_BASE64_BYTES
+    } else {
+        MAX_REQUEST_BASE64_BYTES
+    })
+}
+
+/// Refuse a request whose attachments the provider would reject anyway — and the
+/// one place the per-attachment size cap is enforced, so nothing that constructs
+/// an [`Attachment`] can get around it.
 ///
 /// `accepts` is the model's models.dev input-modality list
 /// ([`crate::catalog::input_modalities_cached`]), or `None` when the catalog
 /// has no entry for the model.
+///
+/// `max_attachment_bytes` is the user's configured per-attachment ceiling
+/// (`max_attachment_bytes` in config, `$HRDR_MAX_ATTACHMENT_BYTES`), or `None`
+/// for the provider defaults — see [`per_attachment_limit`].
 ///
 /// **The unknown model is allowed through.** hrdr points at llama.cpp, vLLM,
 /// Ollama and any other OpenAI-compatible endpoint, and none of their model ids
@@ -388,6 +429,7 @@ pub fn check_attachments(
     model: &str,
     accepts: Option<&[String]>,
     messages: &[ChatMessage],
+    max_attachment_bytes: Option<usize>,
 ) -> Result<(), AttachmentError> {
     let mut total = 0usize;
     let mut images = 0usize;
@@ -407,7 +449,17 @@ pub fn check_attachments(
                     media_type: a.media_type,
                 });
             }
-            total = total.saturating_add(a.encoded_len());
+            let encoded = a.encoded_len();
+            let limit = per_attachment_limit(a.media_type, max_attachment_bytes);
+            if encoded > limit {
+                return Err(AttachmentError::TooLarge {
+                    filename: a.filename.clone(),
+                    media_type: a.media_type,
+                    encoded,
+                    limit,
+                });
+            }
+            total = total.saturating_add(encoded);
             if a.media_type.is_image() {
                 images += 1;
             }
@@ -542,44 +594,144 @@ pub(crate) mod tests {
         }
     }
 
-    /// The per-image cap is on the **encoded** size, and it is a boundary: the
-    /// largest image that fits passes, one byte more fails, and the error names
-    /// the limit.
+    /// One user message carrying `attachments` — what the gate walks.
+    pub(crate) fn message_with(attachments: Vec<Attachment>) -> Vec<ChatMessage> {
+        let mut m = ChatMessage::user("here");
+        m.attachments = attachments;
+        vec![m]
+    }
+
+    /// Construction validates the bytes and nothing else: an image far over
+    /// every cap builds fine, because how big is too big belongs to the endpoint
+    /// it is headed for, not to the bytes. The refusal comes from the gate.
     #[test]
-    fn the_per_image_cap_is_exact_at_the_boundary() {
+    fn construction_does_not_check_the_size() {
+        let huge = Attachment::new(png(MAX_REQUEST_BASE64_BYTES), MediaType::Png, "huge.png")
+            .expect("size is not a construction-time property");
+        assert!(huge.encoded_len() > MAX_REQUEST_BASE64_BYTES);
+        assert!(check_attachments("m", None, &message_with(vec![huge]), None).is_err());
+    }
+
+    /// With nothing configured, the per-image cap is Anthropic's 5 MB, measured
+    /// on the **encoded** size, and it is a boundary: the largest image that fits
+    /// passes, one byte more is refused, and the error names the limit.
+    #[test]
+    fn the_default_per_image_cap_is_exact_at_the_boundary() {
         // 4 encoded bytes per 3 raw: the largest raw size encoding to exactly
         // the cap.
-        let at_limit = MAX_IMAGE_BASE64_BYTES / 4 * 3;
+        let at_limit = DEFAULT_MAX_IMAGE_BASE64_BYTES / 4 * 3;
         let a = Attachment::new(png(at_limit - 8), MediaType::Png, "big.png").unwrap();
-        assert_eq!(a.encoded_len(), MAX_IMAGE_BASE64_BYTES);
+        assert_eq!(a.encoded_len(), DEFAULT_MAX_IMAGE_BASE64_BYTES);
+        assert_eq!(
+            check_attachments("m", None, &message_with(vec![a]), None),
+            Ok(())
+        );
 
-        let err = Attachment::new(png(at_limit - 8 + 1), MediaType::Png, "big.png").unwrap_err();
+        let over = Attachment::new(png(at_limit - 8 + 1), MediaType::Png, "big.png").unwrap();
+        let err = check_attachments("m", None, &message_with(vec![over]), None).unwrap_err();
         let AttachmentError::TooLarge { encoded, limit, .. } = &err else {
             panic!("expected TooLarge, got {err:?}");
         };
-        assert_eq!(*limit, MAX_IMAGE_BASE64_BYTES);
-        assert!(*encoded > MAX_IMAGE_BASE64_BYTES);
+        assert_eq!(*limit, DEFAULT_MAX_IMAGE_BASE64_BYTES);
+        assert!(*encoded > DEFAULT_MAX_IMAGE_BASE64_BYTES);
         assert!(
             err.to_string()
-                .contains(&MAX_IMAGE_BASE64_BYTES.to_string()),
+                .contains(&DEFAULT_MAX_IMAGE_BASE64_BYTES.to_string()),
             "the error names the limit: {err}"
         );
 
-        // A PDF the same size is fine — the 5 MB cap is Anthropic's *image*
-        // limit; a PDF is bounded by the 32 MB request budget instead.
-        assert!(Attachment::new(pdf(at_limit), MediaType::Pdf, "big.pdf").is_ok());
+        // A PDF the same size is fine — the 5 MB default is Anthropic's *image*
+        // limit; a PDF is bounded by the 32 MB request budget instead. Sharing
+        // one default would refuse a document the provider accepts.
+        let doc = Attachment::new(pdf(at_limit), MediaType::Pdf, "big.pdf").unwrap();
+        assert_eq!(
+            check_attachments("m", None, &message_with(vec![doc]), None),
+            Ok(())
+        );
     }
 
-    /// A single PDF cannot exceed the whole request's byte budget.
+    /// A single PDF cannot exceed the whole request's byte budget — its default
+    /// per-attachment ceiling, since one attachment cannot be bigger than the
+    /// request carrying it.
     #[test]
     fn a_single_pdf_cannot_exceed_the_request_budget() {
         let at_limit = MAX_REQUEST_BASE64_BYTES / 4 * 3;
-        assert!(Attachment::new(pdf(at_limit - 8), MediaType::Pdf, "ok.pdf").is_ok());
-        let err = Attachment::new(pdf(at_limit - 8 + 1), MediaType::Pdf, "over.pdf").unwrap_err();
+        let ok = Attachment::new(pdf(at_limit - 8), MediaType::Pdf, "ok.pdf").unwrap();
+        assert_eq!(
+            check_attachments("m", None, &message_with(vec![ok]), None),
+            Ok(())
+        );
+
+        let over = Attachment::new(pdf(at_limit - 8 + 1), MediaType::Pdf, "over.pdf").unwrap();
+        let err = check_attachments("m", None, &message_with(vec![over]), None).unwrap_err();
+        let AttachmentError::TooLarge { limit, .. } = &err else {
+            panic!("expected TooLarge, got {err:?}");
+        };
+        assert_eq!(*limit, MAX_REQUEST_BASE64_BYTES);
         assert!(
             err.to_string()
                 .contains(&MAX_REQUEST_BASE64_BYTES.to_string()),
             "the error names the limit: {err}"
+        );
+    }
+
+    /// A configured `max_attachment_bytes` is the ceiling actually applied, and
+    /// it applies to images and PDFs alike: the refusal names the user's number,
+    /// not the built-in default.
+    #[test]
+    fn a_configured_cap_is_the_one_enforced_for_every_type() {
+        // Small enough that a filler PNG/PDF is comfortably over it.
+        let cap = 200usize;
+        let fits = Attachment::new(png(4), MediaType::Png, "small.png").unwrap();
+        assert!(fits.encoded_len() <= cap);
+        assert_eq!(
+            check_attachments("m", None, &message_with(vec![fits]), Some(cap)),
+            Ok(())
+        );
+
+        for (bytes, media_type, name) in [
+            (png(400), MediaType::Png, "over.png"),
+            (pdf(400), MediaType::Pdf, "over.pdf"),
+        ] {
+            let a = Attachment::new(bytes, media_type, name).unwrap();
+            let encoded = a.encoded_len();
+            let err = check_attachments("m", None, &message_with(vec![a]), Some(cap)).unwrap_err();
+            assert_eq!(
+                err,
+                AttachmentError::TooLarge {
+                    filename: name.to_string(),
+                    media_type,
+                    encoded,
+                    limit: cap,
+                }
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("200"),
+                "the error names the configured cap: {msg}"
+            );
+            assert!(
+                !msg.contains(&DEFAULT_MAX_IMAGE_BASE64_BYTES.to_string())
+                    && !msg.contains(&MAX_REQUEST_BASE64_BYTES.to_string()),
+                "the default must not appear once a cap is configured: {msg}"
+            );
+        }
+    }
+
+    /// The knob raises as well as lowers — the point of having it, for an
+    /// endpoint whose own limit is higher than Anthropic's (OpenAI allows 50 MB
+    /// per file, a self-hosted server whatever it was built for).
+    #[test]
+    fn a_configured_cap_can_raise_the_image_limit() {
+        let raw = DEFAULT_MAX_IMAGE_BASE64_BYTES / 4 * 3 + 3_000;
+        let big = Attachment::new(png(raw), MediaType::Png, "big.png").unwrap();
+        assert!(big.encoded_len() > DEFAULT_MAX_IMAGE_BASE64_BYTES);
+        let msgs = message_with(vec![big]);
+        assert!(check_attachments("m", None, &msgs, None).is_err());
+        assert_eq!(
+            check_attachments("m", None, &msgs, Some(8_000_000)),
+            Ok(()),
+            "a raised cap lets through what the default refused"
         );
     }
 
@@ -594,14 +746,14 @@ pub(crate) mod tests {
         let mut m = ChatMessage::user("here");
         m.attachments = vec![half.clone(), half.clone()];
         assert_eq!(
-            check_attachments("m", None, std::slice::from_ref(&m)),
+            check_attachments("m", None, std::slice::from_ref(&m), None),
             Ok(())
         );
 
         // One more group of three raw bytes pushes it over.
         let over = Attachment::new(pdf(half_raw - 8 + 3), MediaType::Pdf, "half.pdf").unwrap();
         m.attachments = vec![half, over];
-        let err = check_attachments("m", None, &[m]).unwrap_err();
+        let err = check_attachments("m", None, &[m], None).unwrap_err();
         let AttachmentError::RequestTooLarge { encoded, limit } = &err else {
             panic!("expected RequestTooLarge, got {err:?}");
         };
@@ -621,21 +773,21 @@ pub(crate) mod tests {
         let mut m = ChatMessage::user("look");
         m.attachments = vec![img.clone(); MAX_IMAGES_PER_REQUEST];
         assert_eq!(
-            check_attachments("m", None, std::slice::from_ref(&m)),
+            check_attachments("m", None, std::slice::from_ref(&m), None),
             Ok(())
         );
 
         // A PDF on top of a full complement of images is still fine.
         m.attachments.push(pdf_attachment("a.pdf"));
         assert_eq!(
-            check_attachments("m", None, std::slice::from_ref(&m)),
+            check_attachments("m", None, std::slice::from_ref(&m), None),
             Ok(())
         );
 
         // One image over, spread across two messages, is not.
         let mut second = ChatMessage::user("and this");
         second.attachments = vec![img];
-        let err = check_attachments("m", None, &[m, second]).unwrap_err();
+        let err = check_attachments("m", None, &[m, second], None).unwrap_err();
         assert_eq!(
             err,
             AttachmentError::TooManyImages {
@@ -665,7 +817,8 @@ pub(crate) mod tests {
             check_attachments(
                 "claude-opus-4-6",
                 Some(&vision),
-                std::slice::from_ref(&with_image)
+                std::slice::from_ref(&with_image),
+                None
             ),
             Ok(())
         );
@@ -673,7 +826,8 @@ pub(crate) mod tests {
             check_attachments(
                 "claude-opus-4-6",
                 Some(&vision),
-                std::slice::from_ref(&with_pdf)
+                std::slice::from_ref(&with_pdf),
+                None
             ),
             Ok(())
         );
@@ -683,6 +837,7 @@ pub(crate) mod tests {
             "deepseek-v4-pro",
             Some(&text_only),
             std::slice::from_ref(&with_image),
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -704,7 +859,8 @@ pub(crate) mod tests {
             check_attachments(
                 "gpt-4-turbo",
                 Some(&images_only),
-                std::slice::from_ref(&with_image)
+                std::slice::from_ref(&with_image),
+                None
             ),
             Ok(())
         );
@@ -712,7 +868,8 @@ pub(crate) mod tests {
             check_attachments(
                 "gpt-4-turbo",
                 Some(&images_only),
-                std::slice::from_ref(&with_pdf)
+                std::slice::from_ref(&with_pdf),
+                None
             )
             .is_err()
         );
@@ -724,7 +881,10 @@ pub(crate) mod tests {
     fn an_unknown_model_is_allowed_to_take_attachments() {
         let mut m = ChatMessage::user("what is this");
         m.attachments = vec![png_attachment("a.png"), pdf_attachment("a.pdf")];
-        assert_eq!(check_attachments("qwen3-vl-local", None, &[m]), Ok(()));
+        assert_eq!(
+            check_attachments("qwen3-vl-local", None, &[m], None),
+            Ok(())
+        );
     }
 
     /// A message with no attachments never trips the gate, whatever the model
@@ -739,10 +899,13 @@ pub(crate) mod tests {
             ChatMessage::tool_result("t1", "output"),
         ];
         assert_eq!(
-            check_attachments("deepseek-v4-pro", Some(&text_only), &msgs),
+            check_attachments("deepseek-v4-pro", Some(&text_only), &msgs, None),
             Ok(())
         );
-        assert_eq!(check_attachments("deepseek-v4-pro", None, &msgs), Ok(()));
+        assert_eq!(
+            check_attachments("deepseek-v4-pro", None, &msgs, None),
+            Ok(())
+        );
     }
 
     /// Attachments on anything but a user turn are refused before the request
@@ -755,7 +918,7 @@ pub(crate) mod tests {
             m.role = role;
             m.attachments = vec![png_attachment("a.png")];
             assert_eq!(
-                check_attachments("m", None, &[m]),
+                check_attachments("m", None, &[m], None),
                 Err(AttachmentError::NotUserMessage { role })
             );
         }

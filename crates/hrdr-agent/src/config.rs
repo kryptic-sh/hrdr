@@ -317,6 +317,24 @@ pub struct AgentConfig {
     /// `--max-write-subagents`). Lower than the read-only cap: they share the
     /// main agent's working tree.
     pub max_write_subagents: usize,
+    /// Ceiling on ONE attachment (image or PDF), in **base64-encoded** bytes —
+    /// the unit every provider states its own limits in, and roughly 4/3 the
+    /// size of the file on disk (`max_attachment_bytes`,
+    /// `HRDR_MAX_ATTACHMENT_BYTES`).
+    ///
+    /// `None` — the default — gives each type the cap of the provider hrdr's
+    /// dialects are tightest against: 5 MB for an image (Anthropic's per-image
+    /// limit), the 32 MB request budget for a PDF (which Anthropic does not cap
+    /// separately). Set it for an endpoint with different limits — OpenAI allows
+    /// 50 MB per file, a self-hosted server whatever it was built for — and it
+    /// then applies to images and PDFs alike, because it is a ceiling the user
+    /// stated rather than one hrdr inferred.
+    ///
+    /// Enforced in `hrdr_llm::media::check_attachments`, the gate every request
+    /// passes through. A tiny value is legal and does mean "effectively no
+    /// attachments"; `0` is refused, since it reads as a forgotten field rather
+    /// than a choice.
+    pub max_attachment_bytes: Option<usize>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
@@ -794,6 +812,9 @@ pub(crate) struct FileConfig {
     pub(crate) compaction_reserved: Option<u32>,
     pub(crate) max_readonly_subagents: Option<usize>,
     pub(crate) max_write_subagents: Option<usize>,
+    /// Per-attachment ceiling in base64-encoded bytes; see
+    /// [`AgentConfig::max_attachment_bytes`].
+    pub(crate) max_attachment_bytes: Option<usize>,
     /// `sandbox = "write" | "read" | "none"`. A misspelling is a hard TOML parse
     /// error (the enum's serde derive), matching the file-values-are-errors rule.
     pub(crate) sandbox: Option<SandboxMode>,
@@ -877,6 +898,11 @@ impl FileConfig {
             self.max_write_subagents.map(|v| v as u64),
             "max_write_subagents",
             "it would refuse every write-capable sub-agent",
+        );
+        require_min1(
+            self.max_attachment_bytes.map(|v| v as u64),
+            "max_attachment_bytes",
+            "it would refuse every attachment",
         );
         if let Some(to) = &self.tool_output {
             require_min1(
@@ -1010,6 +1036,7 @@ impl Default for AgentConfig {
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
             max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
             max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
+            max_attachment_bytes: None,
             providers: HashMap::new(),
             guardrails: Vec::new(),
             hooks: Vec::new(),
@@ -1671,6 +1698,9 @@ impl AgentConfig {
         if let Some(v) = fc.max_write_subagents {
             self.max_write_subagents = v;
         }
+        if let Some(v) = fc.max_attachment_bytes {
+            self.max_attachment_bytes = Some(v);
+        }
         if let Some(v) = fc.sandbox {
             self.sandbox = v;
         }
@@ -1901,6 +1931,14 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
             );
         }
         c.max_write_subagents = n;
+        Ok(())
+    }),
+    ("HRDR_MAX_ATTACHMENT_BYTES", |c, v| {
+        let n: usize = env_parse(v, "a whole number of base64 bytes ≥ 1")?;
+        if n == 0 {
+            return Err("must be at least 1 (0 would refuse every attachment)".to_string());
+        }
+        c.max_attachment_bytes = Some(n);
         Ok(())
     }),
     ("HRDR_COMPACTION_RESERVED", |c, v| {

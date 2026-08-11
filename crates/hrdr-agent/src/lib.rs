@@ -1908,6 +1908,10 @@ impl Agent {
         });
         client.set_headers(resolved.headers().to_vec());
         client.set_system_cache_split(system_cache_split);
+        // The per-attachment ceiling belongs to the user, not to the identity:
+        // it stays put across a `/model` switch (unlike the endpoint, key and
+        // headers reset in `set_model_ref`), so it is set once, here.
+        client.set_max_attachment_bytes(config.max_attachment_bytes);
         // One key for this agent's whole conversation — see the field docs and
         // `new_prompt_cache_key`. Set unconditionally: the client only puts it on
         // the wire for the two OpenAI-shaped backends, so there is nothing to gate
@@ -7478,6 +7482,7 @@ mod tests {
             max_write_subagents: Some(0),
             context_window: Some(0),
             max_tokens: Some(0),
+            max_attachment_bytes: Some(0),
             tool_output: Some(ToolOutputConfig {
                 max_lines: Some(0),
                 max_bytes: Some(0),
@@ -7490,6 +7495,7 @@ mod tests {
             "max_write_subagents",
             "context_window",
             "max_tokens",
+            "max_attachment_bytes",
             "tool_output.max_lines",
             "tool_output.max_bytes",
         ] {
@@ -7501,7 +7507,7 @@ mod tests {
             );
         }
         // Every problem is reported together — not first-error-wins.
-        assert_eq!(errors.len(), 6, "{errors:?}");
+        assert_eq!(errors.len(), 7, "{errors:?}");
     }
 
     /// Valid file values (including the documented `request_timeout = 0` and a
@@ -7558,6 +7564,94 @@ mod tests {
         // The documented disable sentinel for the timeout is accepted.
         assert!(find_setter("HRDR_REQUEST_TIMEOUT")(&mut cfg, "0").is_ok());
         assert_eq!(cfg.request_timeout, Some(0));
+    }
+
+    /// `max_attachment_bytes` walks the whole ladder in one pass: unset by
+    /// default (each media type keeps its provider cap), then `config.toml`, then
+    /// `$HRDR_MAX_ATTACHMENT_BYTES` over the file — and a value the env cannot
+    /// parse is a **warning** naming the var, leaving the configured number in
+    /// force. There is no CLI flag on purpose: this is a wire limit of the
+    /// endpoint, like `max_tokens` / `top_p` / `request_timeout`, none of which
+    /// have one — the flags are for per-run session shape (sandbox, sub-agent
+    /// caps, retention).
+    ///
+    /// `set_var` is process-global, so this holds a lock and restores what it
+    /// found.
+    #[test]
+    fn max_attachment_bytes_walks_default_then_config_then_env() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const VAR: &str = "HRDR_MAX_ATTACHMENT_BYTES";
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(VAR);
+        // SAFETY: the lock makes this the only thread touching VAR, and nothing
+        // else in the process reads it. Same for every `set_var` below.
+        unsafe { std::env::remove_var(VAR) };
+        let warning_for = |warnings: Vec<String>| -> Option<String> {
+            warnings.into_iter().find(|w| w.contains(VAR))
+        };
+
+        // Rung 1 — nothing set: no ceiling of hrdr's own, so `check_attachments`
+        // applies each type's provider default.
+        let mut cfg = AgentConfig::default();
+        assert_eq!(cfg.max_attachment_bytes, None);
+
+        // Rung 2 — config.toml.
+        let fc: FileConfig = toml::from_str("max_attachment_bytes = 20000000\n").unwrap();
+        assert!(fc.validate().is_empty(), "{:?}", fc.validate());
+        cfg.apply_file(fc);
+        assert_eq!(cfg.max_attachment_bytes, Some(20_000_000));
+
+        // Rung 3 — the env var, over the file.
+        unsafe { std::env::set_var(VAR, "1500000") };
+        assert_eq!(warning_for(cfg.apply_env()), None);
+        assert_eq!(cfg.max_attachment_bytes, Some(1_500_000));
+
+        // Not a number: warned about by name, and the value already resolved
+        // stays — an env typo must not brick a session.
+        unsafe { std::env::set_var(VAR, "5MB") };
+        let warning = warning_for(cfg.apply_env()).expect("an unparseable value must warn");
+        assert!(
+            warning.contains("\"5MB\"")
+                && warning.contains("expected a whole number")
+                && warning.contains("keeping the current value"),
+            "{warning}"
+        );
+        assert_eq!(cfg.max_attachment_bytes, Some(1_500_000));
+
+        // Zero is refused here too — but as a warning, not the hard error the
+        // same value in the file is.
+        unsafe { std::env::set_var(VAR, "0") };
+        let warning = warning_for(cfg.apply_env()).expect("zero must warn");
+        assert!(warning.contains("at least 1"), "{warning}");
+        assert_eq!(cfg.max_attachment_bytes, Some(1_500_000));
+
+        // A tiny value is legal, and does mean "effectively no attachments":
+        // that is a choice, where `0` reads as a field left unfilled.
+        unsafe { std::env::set_var(VAR, "1") };
+        assert_eq!(warning_for(cfg.apply_env()), None);
+        assert_eq!(cfg.max_attachment_bytes, Some(1));
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var(VAR, v) },
+            None => unsafe { std::env::remove_var(VAR) },
+        }
+    }
+
+    /// …and the resolved value reaches the client that enforces it. The gate
+    /// reads it off the client, so a ceiling that stopped at the config struct
+    /// would refuse nothing at all.
+    #[test]
+    fn the_configured_attachment_cap_reaches_the_client() {
+        let agent = Agent::new(AgentConfig {
+            max_attachment_bytes: Some(1_234_567),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(agent.client().max_attachment_bytes(), Some(1_234_567));
+
+        // Unset stays unset: the provider defaults, not a number hrdr invented.
+        let agent = Agent::new(AgentConfig::default()).unwrap();
+        assert_eq!(agent.client().max_attachment_bytes(), None);
     }
 
     /// The diagnostics container separates errors from warnings and renders each

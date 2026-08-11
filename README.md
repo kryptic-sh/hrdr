@@ -645,10 +645,24 @@ stop = ["<END>"]         # stop sequences
 stream_usage = true      # set false only if a server rejects stream_options
 prompt_cache_ttl = "5m"  # or "1h" for the extended cache TTL
 request_timeout = 120    # seconds; connect + idle-read timeout (default: none)
+max_attachment_bytes = 5000000  # ceiling on ONE image/PDF, in base64 bytes
 ```
 
 Scalars also honor `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED` /
-`$HRDR_STREAM_USAGE` / `$HRDR_PROMPT_CACHE_TTL` / `$HRDR_REQUEST_TIMEOUT`.
+`$HRDR_STREAM_USAGE` / `$HRDR_PROMPT_CACHE_TTL` / `$HRDR_REQUEST_TIMEOUT` /
+`$HRDR_MAX_ATTACHMENT_BYTES`.
+
+`max_attachment_bytes` is measured on the **base64** payload the providers count
+(~4/3 the size of the file on disk), and a request carrying more than that in
+one attachment is refused before it is sent. Left unset, each kind gets the
+tightest cap of the dialects hrdr speaks: 5 MB for an image (Anthropic's
+per-image limit) and the 32 MB per-request budget for a PDF, which no dialect
+caps separately. Set it for an endpoint with different limits — OpenAI allows 50
+MB per file, a self-hosted server whatever it was built for — and it then
+applies to images and PDFs alike. The 32 MB per-request total and the
+100-image-per-request count stay fixed: those are protocol limits, and raising
+one past what the provider accepts would only trade a clear local refusal for
+a 413.
 
 A failing model call is retried up to 10 times — waits of 5s, 10s, 20s, 40s,
 then 60s, honoring a server's `Retry-After` when it sends one. That whole
