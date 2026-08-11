@@ -57,9 +57,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     saved with no extension still attaches — and anything the sniffer does not
     recognise keeps the text path it had.
   - The message text carries one short line per attached file under
-    `--- Attached files (via @) ---` (`Image 1: shot.png`), since every dialect
-    renders the attachments _before_ the text and the model otherwise has no way
-    to say which screenshot it is describing.
+    `--- Attached files ---` (`Image 1: shot.png`), since every dialect renders
+    the attachments _before_ the text and the model otherwise has no way to say
+    which screenshot it is describing.
   - The 100 KB `@file` cap does not apply to them: it is a context-window guard
     for inlined **text**, and an image's bytes never enter the text. A 200 KB
     screenshot attaches; what bounds it is `max_attachment_bytes`, enforced at
@@ -71,11 +71,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     return an `Outgoing` (text + attachments + inlined paths) rather than a
     `(String, Vec<PathBuf>)` tuple, and `hrdr_agent::Steer` carries the
     attachments to the user message it belongs to.
-  - **The TUI cannot attach one yet**: its send path takes text only
-    (`Outgoing::into_text`, which drops the labels along with the attachments,
-    so an image mention reads as it always did — as nothing). `hrdr -p` is the
-    path that sends them today. Attachments are still not written to the session
-    file, so they do not survive a resume.
+  - **The TUI sends them too.** `hrdr_app::prepare_outgoing_via` and
+    `prepare_outgoing_relayed` now return the whole `Outgoing` rather than its
+    text, and every TUI send path — a fresh turn, a message queued mid-turn, and
+    a message typed into a sub-agent's pane — builds its message with
+    `Outgoing::into_steer`, so the bytes and the label lines travel together.
+    Attachments are still not written to the session file, so they do not
+    survive a resume.
+  - **`Ctrl+]` pastes an image, not just text.** The existing paste key now
+    takes whatever is on the clipboard: image or PDF bytes (a screenshot tool, a
+    browser's "copy image") attach to the message being written, a
+    `text/uri-list` naming a file — what a file manager's copy leaves, and the
+    usual shape on Linux — is read off disk by the same byte-sniffing path an
+    `@mention` uses, and anything else pastes as the text it always did. Every
+    other outcome says which it was rather than doing nothing: no clipboard, an
+    empty one, an image type hrdr cannot attach, or a backend that cannot read
+    images at all (OSC 52 over ssh). A pasted image is held in memory until the
+    message is sent, and `Ctrl+C` discards it with the draft. The composer's
+    status row names what the message is carrying, and a transcript row records
+    it beside the message. A file path pasted as _text_ stays text — prefix it
+    with `@` to attach it.
 - **`max_attachment_bytes` — the per-attachment size ceiling is configurable**
   (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
   limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64

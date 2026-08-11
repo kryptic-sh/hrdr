@@ -1620,6 +1620,13 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     // stashed (Ctrl+S) or history is being browsed (Up/Down), it says so here
     // instead of staying blank. Nothing to report — the row stays empty.
     let mut bits: Vec<String> = Vec::new();
+    // What the message is carrying beside its text — the only place a pasted
+    // image is visible before it is sent, since it has no path in the box.
+    match app.pending_attachments.as_slice() {
+        [] => {}
+        [one] => bits.push(format!("attached {}", hrdr_app::attachment_summary(one))),
+        many => bits.push(format!("{} files attached", many.len())),
+    }
     let stashed = app.stash.len();
     if stashed > 0 {
         bits.push(format!(

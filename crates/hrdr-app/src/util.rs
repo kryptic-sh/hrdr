@@ -148,6 +148,17 @@ impl Outgoing {
         &self.inlined
     }
 
+    /// Attach `more` alongside whatever the text's own `@mentions` produced.
+    ///
+    /// For attachments that have no mention to come from — bytes pasted off the
+    /// clipboard, which never had a path — so they pick up the same labels
+    /// ([`Self::labels`]) and travel on the same [`Self::into_steer`] as a
+    /// mentioned file. They land after the mentioned ones, which is the order
+    /// the labels then number them in.
+    pub fn attach(&mut self, more: Vec<hrdr_tools::Attachment>) {
+        self.attachments.extend(more);
+    }
+
     /// The label block naming each attachment, appended to the text whenever the
     /// attachments travel with it.
     ///
@@ -162,7 +173,7 @@ impl Outgoing {
         if self.attachments.is_empty() {
             return String::new();
         }
-        let mut out = String::from("\n\n--- Attached files (via @) ---\n");
+        let mut out = String::from("\n\n--- Attached files ---\n");
         let (mut images, mut docs) = (0, 0);
         for a in &self.attachments {
             let label = if a.media_type().is_image() {
@@ -1335,7 +1346,7 @@ mod tests {
         let steer = out.into_steer("what is @shot.png and @report.pdf");
         assert_eq!(
             steer.sent,
-            "what is @shot.png and @report.pdf\n\n--- Attached files (via @) ---\n\
+            "what is @shot.png and @report.pdf\n\n--- Attached files ---\n\
              Image 1: shot.png\nDocument 1: report.pdf\n"
         );
         assert_eq!(steer.attachments.len(), 2);
@@ -1541,8 +1552,53 @@ mod tests {
         // The label block trails the delegation directive it belongs to.
         let sent = out.into_steer("@explore what is @shot.png").sent;
         assert!(
-            sent.ends_with("--- Attached files (via @) ---\nImage 1: shot.png\n"),
+            sent.ends_with("--- Attached files ---\nImage 1: shot.png\n"),
             "{sent}"
+        );
+    }
+
+    /// `attach` puts an attachment with no mention behind it — clipboard bytes —
+    /// on the same footing as a mentioned file: it rides the same `Steer` and
+    /// earns its own label line, numbered after the mentioned ones.
+    #[test]
+    fn attach_adds_unmentioned_attachments_with_their_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
+
+        let mut out = expand_mentions_tracked("compare @shot.png with this", root);
+        let pasted =
+            hrdr_tools::Attachment::new(png_bytes(8), hrdr_tools::MediaType::Png, "pasted-1.png")
+                .unwrap();
+        out.attach(vec![pasted]);
+        assert_eq!(out.attachments().len(), 2);
+
+        let steer = out.into_steer("compare @shot.png with this");
+        assert!(
+            steer
+                .sent
+                .ends_with("--- Attached files ---\nImage 1: shot.png\nImage 2: pasted-1.png\n"),
+            "{}",
+            steer.sent
+        );
+        assert_eq!(steer.attachments.len(), 2);
+    }
+
+    /// `attach` on a message with no mentions at all is the pure clipboard case:
+    /// the text is untouched and the label block is the attachment's only trace.
+    #[test]
+    fn attach_alone_labels_the_message_that_had_no_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = expand_mentions_tracked("what is this", dir.path());
+        assert!(out.attachments().is_empty());
+        out.attach(vec![
+            hrdr_tools::Attachment::new(png_bytes(8), hrdr_tools::MediaType::Png, "pasted-1.png")
+                .unwrap(),
+        ]);
+        let steer = out.into_steer("what is this");
+        assert_eq!(
+            steer.sent,
+            "what is this\n\n--- Attached files ---\nImage 1: pasted-1.png\n"
         );
     }
 }

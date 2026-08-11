@@ -484,6 +484,21 @@ pub(crate) struct App {
     config_mtime: Option<SystemTime>,
     /// OS clipboard for `/copy` (None if unavailable).
     clipboard: Option<Clipboard>,
+    /// Images/PDFs the composer is holding for the message being written —
+    /// clipboard pastes, which have no path for an `@mention` to name.
+    ///
+    /// **In memory, deliberately.** An [`hrdr_tools::Attachment`] holds its bytes
+    /// behind an `Arc`, so this costs one screenshot of resident memory and
+    /// nothing else; a temp file would need a lifetime policy of its own for
+    /// every way a message can end (sent, cancelled with Ctrl+C, abandoned by
+    /// quitting, lost to a crash), and would leave litter behind the first one
+    /// that was missed. Dropping the vector *is* the cleanup. Persisting a
+    /// pasted image across a resume needs somewhere durable and is its own
+    /// slice; until then the bytes live exactly as long as the composer does.
+    pub(crate) pending_attachments: Vec<hrdr_tools::Attachment>,
+    /// Serial for naming pasted bytes (`pasted-1.png`), so two images pasted into
+    /// one message — or one session — are told apart by the model and the reader.
+    paste_seq: u64,
     /// Selected row in the completion popup (slash command or `@file`).
     pub(crate) completion_idx: usize,
     /// When true, `active_completions()` returns `None` so Up/Down keys
@@ -865,6 +880,8 @@ impl App {
             cfg,
             config_mtime: current_config_mtime(),
             clipboard: Clipboard::new().ok(),
+            pending_attachments: Vec::new(),
+            paste_seq: 0,
             completion_idx: 0,
             suppress_completions: false,
             history: hrdr_app::HistoryBrowser::load(),
@@ -1208,8 +1225,14 @@ impl App {
                 // interrupt what is in flight, else arm quit — and a second
                 // consecutive Ctrl+C on that armed, idle, empty state quits.
                 KeyCode::Char('c') => {
-                    if !self.editor.content().trim().is_empty() {
+                    // A pasted image is part of the half-written message, so a
+                    // box holding one is not empty: Ctrl+C discards it with the
+                    // text, and the bytes go with it.
+                    if !self.editor.content().trim().is_empty()
+                        || !self.pending_attachments.is_empty()
+                    {
                         self.editor.set_content("");
+                        self.pending_attachments.clear();
                         self.quit_armed = false;
                     } else if self.cancel_in_flight() {
                         self.quit_armed = false;
@@ -1248,19 +1271,7 @@ impl App {
                 // (and remote sessions) where the terminal's own paste doesn't
                 // reach the app as a bracketed paste.
                 KeyCode::Char(']') => {
-                    match hrdr_app::clipboard_read_text(&self.clipboard) {
-                        Some(text) if !text.is_empty() => {
-                            let chars = text.chars().count();
-                            self.on_paste(&text);
-                            self.toasts.info(format!("pasted {chars} chars"));
-                        }
-                        Some(_) => {
-                            self.toasts.warn("clipboard is empty");
-                        }
-                        None => {
-                            self.toasts.warn("clipboard unavailable");
-                        }
-                    }
+                    self.paste_clipboard();
                     return Action::None;
                 }
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
@@ -1459,10 +1470,8 @@ impl App {
                 // model reads them together. If the model ends the turn instead,
                 // nothing drains it and `Done` re-sends it as a turn of its own.
                 // (While compacting, nothing is in `run()` to drain it at all.)
-                let sent =
-                    hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
-                self.registry
-                    .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
+                let steer = self.steer_for_main(input);
+                self.registry.enqueue(hrdr_agent::MAIN_KEY, steer);
             } else {
                 self.spawn_turn(input);
             }
@@ -1685,6 +1694,14 @@ impl App {
     /// Route pasted text: the `/login` key field takes it whole (an API key
     /// paste must not leak into the editor/history); otherwise it goes to the
     /// input editor.
+    ///
+    /// A terminal paste that happens to be a file path stays text, even when the
+    /// path is an image — dragging a file onto a terminal and typing about it are
+    /// the same keystrokes, so attaching on sight would guess at an intent the
+    /// user never stated, and would have to either swallow the text they meant to
+    /// send or leave a path the message now duplicates. The two deliberate
+    /// spellings are already there: prefix it with `@`, or press Ctrl+]
+    /// ([`Self::paste_clipboard`]), which reads the clipboard's *file* flavour.
     pub(crate) fn on_paste(&mut self, text: &str) {
         self.disarm();
         if let Some(LoginModal::Key { input, .. }) = &mut self.login_modal {
@@ -1692,6 +1709,88 @@ impl App {
             return;
         }
         self.editor.paste(text);
+    }
+
+    /// Ctrl+] — paste what is on the system clipboard, whatever it turns out to
+    /// be: an image or PDF becomes an attachment on the message being written,
+    /// and anything else is the text paste this key has always done.
+    ///
+    /// One key rather than two. Every free `Ctrl+<letter>` in the input area is
+    /// already spoken for by one of the two editor engines (plain: `Ctrl+A/E/W/U`;
+    /// vim: `Ctrl+V` visual-block, `Ctrl+R` redo), so a second binding could only
+    /// be taken from the composer — and "paste" is one intent anyway: hrdr looks
+    /// at what is actually on the clipboard instead of asking the user to know.
+    /// A text-only clipboard behaves exactly as it did.
+    fn paste_clipboard(&mut self) {
+        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let stem = format!("pasted-{}", self.paste_seq + 1);
+        match hrdr_app::clipboard_paste(&self.clipboard, &cwd, &stem) {
+            hrdr_app::ClipboardPaste::Media(a) => {
+                self.paste_seq += 1;
+                // "pasted …", the sibling of the text paste's "pasted N chars";
+                // "attached …" is reserved for the composer's own status line and
+                // the transcript row, which say what the message is carrying.
+                self.toasts
+                    .info(format!("pasted image {}", hrdr_app::attachment_summary(&a)));
+                self.pending_attachments.push(a);
+            }
+            hrdr_app::ClipboardPaste::Text(text) => {
+                let chars = text.chars().count();
+                self.on_paste(&text);
+                self.toasts.info(format!("pasted {chars} chars"));
+            }
+            hrdr_app::ClipboardPaste::Empty => {
+                self.toasts.warn("clipboard is empty");
+            }
+            hrdr_app::ClipboardPaste::Unavailable => {
+                self.toasts.warn("clipboard unavailable");
+            }
+            hrdr_app::ClipboardPaste::Refused(why) => {
+                self.toasts.warn(why);
+            }
+        }
+    }
+
+    /// The message `input` becomes on the wire, carrying both what its own
+    /// `@mentions` attached and whatever the composer was holding.
+    ///
+    /// Taking the pending attachments is what hands them over: they belong to the
+    /// message from here on, so a second Enter does not send the same image
+    /// twice. Every path that *sends* to the session's agent goes through here —
+    /// the mid-turn steer and the fresh turn alike — so neither can quietly drop
+    /// what the other carries.
+    fn steer_for_main(&mut self, input: String) -> hrdr_agent::Steer {
+        let mut out =
+            hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
+        out.attach(std::mem::take(&mut self.pending_attachments));
+        self.note_attachments(out.attachments());
+        out.into_steer(input)
+    }
+
+    /// Put a line in the transcript naming what a message is carrying beside its
+    /// text, so an image the model was shown is visible to the reader too.
+    ///
+    /// A [`EntryKind::Notice`] rather than a `System` line: notices are session
+    /// chrome and are never written to the session file, which is the honest
+    /// shape while the attachments themselves do not survive a resume either. A
+    /// persisted "attached shot.png" on a resumed session that no longer carries
+    /// the bytes would be a claim about state that is no longer true.
+    fn note_attachments(&mut self, attachments: &[hrdr_tools::Attachment]) {
+        if attachments.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = attachments
+            .iter()
+            .map(|a| format!("attached {}", hrdr_app::attachment_summary(a)))
+            .collect();
+        // Into the conversation the message was actually sent to — which on a
+        // sub-agent pane is not the main one. Replay only ever *appends* to a
+        // pane's transcript, so an entry put here survives the next sync.
+        self.panes
+            .active_pane_mut()
+            .transcript_mut()
+            .push(Entry::notice(lines.join("\n")));
+        self.prune_scrollback();
     }
 
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
@@ -2087,10 +2186,14 @@ impl App {
     /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
         // Expanded with the main agent's cwd/names, but delivered to the
-        // sub-agent — so no `@file` read-state marking on this handle.
-        let sent =
+        // sub-agent — so no `@file` read-state marking on this handle. The
+        // composer's pasted images go wherever the message goes, which on this
+        // pane is the sub-agent.
+        let mut out =
             hrdr_app::prepare_outgoing_relayed(&self.agent, &input, self.project_instructions);
-        let input = hrdr_agent::Steer::new(sent, input);
+        out.attach(std::mem::take(&mut self.pending_attachments));
+        self.note_attachments(out.attachments());
+        let input = out.into_steer(input);
         // What was said and everything that comes back is recorded on the agent's
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
         // is folded into the transcript here — doing it in both places would show
@@ -2497,15 +2600,14 @@ impl App {
     fn spawn_turn(&mut self, input: String) {
         // Prepare the outgoing message: expand `@file` mentions and route any
         // `@agent` mention to the matching sub-agent via a delegation directive.
-        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
+        let steer = self.steer_for_main(input);
         // Reserve the session id from what the user actually sent (seeds the saved
         // mirror so a first save is named), then enqueue the message as the turn's
         // opener onto the agent's own queue — the same queue a mid-turn steer lands
         // on. `run` drains it, emits `Steered`, and the frontend folds that into the
         // user entry; nothing is pushed into the transcript here.
-        self.reserve_session_id(&sent);
-        self.registry
-            .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
+        self.reserve_session_id(&steer.sent);
+        self.registry.enqueue(hrdr_agent::MAIN_KEY, steer);
         self.launch_turn();
     }
 

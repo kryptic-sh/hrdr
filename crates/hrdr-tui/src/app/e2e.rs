@@ -9993,3 +9993,359 @@ async fn resumed_session_panels_are_not_cut_off_with_a_finished_subagent() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attachments: `@image.png`, and pasting one off the clipboard
+// ---------------------------------------------------------------------------
+
+/// A PNG header plus filler — the smallest byte string that sniffs as one.
+fn png_bytes(pad: usize) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.resize(v.len() + pad, 0);
+    v
+}
+
+/// A clipboard backend answering only what the test programs into it.
+fn mock_clipboard(
+    caps: hjkl_clipboard::Capabilities,
+) -> hjkl_clipboard::backend::mock::MockBackend {
+    hjkl_clipboard::backend::mock::MockBackend::new(hjkl_clipboard::BackendKind::Mock, caps)
+}
+
+/// The attachments on the last user message the agent actually holds — what
+/// went to the model, read off the conversation rather than off the queue.
+async fn sent_attachments(h: &Harness) -> Vec<hrdr_tools::Attachment> {
+    let a = h.app.agent.lock().await;
+    a.messages()
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, hrdr_agent::MessageRole::User))
+        .map(|m| m.attachments.clone())
+        .unwrap_or_default()
+}
+
+/// **The slice's point.** An `@image.png` typed into the TUI travels to the
+/// model as image bytes on the user message — not as text, and not as nothing.
+#[tokio::test]
+async fn an_at_mentioned_image_is_sent_as_an_attachment() {
+    let mut h = Harness::new(vec![MockReply::Text("a screenshot".to_string())]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    std::fs::write(cwd.join("shot.png"), png_bytes(64)).unwrap();
+
+    h.submit("what is @shot.png").await;
+
+    let sent = sent_attachments(&h).await;
+    assert_eq!(sent.len(), 1, "the image rode along with the message");
+    assert_eq!(sent[0].filename(), "shot.png");
+    assert_eq!(sent[0].media_type(), hrdr_tools::MediaType::Png);
+
+    // …and the text names it, so the model can say which picture it means.
+    let labelled = {
+        let a = h.app.agent.lock().await;
+        a.messages()
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, hrdr_agent::MessageRole::User))
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        labelled.contains("Image 1: shot.png"),
+        "the label block travels with the bytes: {labelled}"
+    );
+}
+
+/// The same, when the message is queued as a steer rather than opening a turn:
+/// the busy path carries attachments too, or an image typed mid-turn vanishes.
+#[tokio::test]
+async fn an_image_mentioned_mid_turn_rides_the_steer() {
+    let mut h = Harness::new(vec![
+        MockReply::Text("first".to_string()),
+        MockReply::Text("second".to_string()),
+    ])
+    .await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    std::fs::write(cwd.join("shot.png"), png_bytes(64)).unwrap();
+
+    // Open a turn, then type a second message while it is still running.
+    h.type_str("start");
+    h.press(KeyCode::Enter);
+    h.type_str("and look at @shot.png");
+    h.press(KeyCode::Enter);
+
+    let queued = h
+        .app
+        .registry
+        .take_pending(hrdr_agent::MAIN_KEY)
+        .expect("the mid-turn message is on the agent's queue");
+    assert_eq!(queued.attachments.len(), 1, "queued with its image");
+    assert_eq!(queued.attachments[0].filename(), "shot.png");
+    h.pump().await;
+}
+
+/// A message with nothing attached is untouched: no attachments on the wire,
+/// no label block bolted onto the text, and the transcript reads as before.
+#[tokio::test]
+async fn a_message_with_no_attachments_is_unchanged() {
+    let mut h = Harness::new(vec![MockReply::Text("hi back".to_string())]).await;
+    h.submit("plain hello").await;
+
+    assert!(
+        sent_attachments(&h).await.is_empty(),
+        "nothing attached to a plain message"
+    );
+    let sent = {
+        let a = h.app.agent.lock().await;
+        a.messages()
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, hrdr_agent::MessageRole::User))
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default()
+    };
+    // The stamp the send path already adds is the only thing between what was
+    // typed and what was sent — no label block, no attachment chrome.
+    assert!(
+        sent.ends_with("plain hello") && !sent.contains("Attached files"),
+        "the text is what was typed: {sent:?}"
+    );
+    let screen = h.render();
+    assert!(screen.contains("plain hello"), "{screen}");
+    assert!(
+        !screen.contains("attached"),
+        "no attachment chrome anywhere: {screen}"
+    );
+}
+
+/// Ctrl+] with an image on the clipboard attaches it to the message being
+/// written, and the composer says so.
+#[tokio::test]
+async fn pasting_an_image_attaches_it_and_the_composer_shows_it() {
+    let mut h = Harness::new(vec![MockReply::Text("that's a cat".to_string())]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(3000)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    h.type_str("what is this");
+    h.ctrl(']');
+
+    assert_eq!(h.app.pending_attachments.len(), 1, "held by the composer");
+    assert_eq!(h.app.pending_attachments[0].filename(), "pasted-1.png");
+    let screen = h.render();
+    assert!(
+        screen.contains("attached pasted-1.png (image/png,"),
+        "the composer names what it is holding:\n{screen}"
+    );
+
+    // Sending hands it over: the model gets the bytes, the transcript gets a row.
+    h.press(KeyCode::Enter);
+    h.pump().await;
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "the composer let go of it"
+    );
+    let sent = sent_attachments(&h).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].filename(), "pasted-1.png");
+    // Immediately above the message it belongs to, naming the file and its size.
+    let kinds: Vec<&EntryKind> = h.app.transcript().iter().map(|e| &e.kind).collect();
+    let at = kinds
+        .iter()
+        .position(|k| matches!(k, EntryKind::Notice(t) if t == "attached pasted-1.png (image/png, 2.9 KB)"))
+        .unwrap_or_else(|| panic!("no attachment row in the transcript: {kinds:?}"));
+    assert!(
+        matches!(kinds[at + 1], EntryKind::User(t) if t == "what is this"),
+        "the row sits with the message it belongs to: {kinds:?}"
+    );
+}
+
+/// A file copied in a file manager reaches the clipboard as a `text/uri-list`,
+/// not as bytes — the common case on Linux — and pastes as that file.
+#[tokio::test]
+async fn pasting_a_copied_file_uri_attaches_the_file_it_names() {
+    let mut h = Harness::new(vec![]).await;
+    let shot = std::path::PathBuf::from(h.app.current_cwd()).join("copied.png");
+    std::fs::write(&shot, png_bytes(64)).unwrap();
+
+    // Spell the uri-list the way this platform spells it.
+    let writer = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    let handle = writer.handle();
+    hjkl_clipboard::Clipboard::with_backend(Box::new(writer))
+        .set_uri_list(
+            hjkl_clipboard::Selection::Clipboard,
+            &[hjkl_clipboard::Uri::File(shot)],
+        )
+        .unwrap();
+    let uri_bytes = handle.set_calls()[0].bytes.clone();
+
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::UriList]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::UriList,
+        Ok(uri_bytes),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1);
+    assert_eq!(
+        h.app.pending_attachments[0].filename(),
+        "copied.png",
+        "named for the file, not for the paste serial"
+    );
+}
+
+/// Text on the clipboard pastes as text, exactly as it did before images
+/// existed — nothing is attached and the editor gets the characters.
+#[tokio::test]
+async fn pasting_text_is_untouched() {
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Text]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Text,
+        Ok(b"pasted words".to_vec()),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    h.ctrl(']');
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "text is not an attachment"
+    );
+    assert!(
+        h.app.editor.content().contains("pasted words"),
+        "it went into the box: {:?}",
+        h.app.editor.content()
+    );
+    let screen = h.render();
+    assert!(screen.contains("pasted 12 chars"), "{screen}");
+}
+
+/// Every way a paste can fail to produce an attachment says so, and none of
+/// them attaches anything or panics.
+#[tokio::test]
+async fn a_paste_that_cannot_attach_says_why() {
+    use hjkl_clipboard::{Capabilities, Clipboard, MimeType, Selection};
+
+    // No clipboard at all.
+    let mut h = Harness::new(vec![]).await;
+    h.app.clipboard = None;
+    h.ctrl(']');
+    assert!(h.app.pending_attachments.is_empty());
+    assert!(h.render().contains("clipboard unavailable"));
+
+    // An image-capable clipboard holding nothing.
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(Capabilities::all());
+    m.preset_get(Selection::Clipboard, MimeType::Text, Ok(Vec::new()));
+    h.app.clipboard = Some(Clipboard::with_backend(Box::new(m)));
+    h.ctrl(']');
+    assert!(h.app.pending_attachments.is_empty());
+    assert!(h.render().contains("clipboard is empty"));
+
+    // An image type hrdr cannot attach.
+    let mut h = Harness::new(vec![]).await;
+    let bmp = MimeType::Custom("image/bmp".to_string());
+    let m = mock_clipboard(Capabilities::all());
+    m.preset_available(Selection::Clipboard, Ok(vec![bmp.clone()]));
+    m.preset_get(
+        Selection::Clipboard,
+        bmp,
+        Ok(b"BM\x00\x00\x00\x00".to_vec()),
+    );
+    h.app.clipboard = Some(Clipboard::with_backend(Box::new(m)));
+    h.ctrl(']');
+    assert!(h.app.pending_attachments.is_empty());
+    let screen = h.render();
+    assert!(screen.contains("PNG, JPEG"), "{screen}");
+
+    // A backend with no IMAGE capability (OSC 52 over ssh, say).
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(Capabilities::READ | Capabilities::WRITE);
+    m.preset_get(Selection::Clipboard, MimeType::Text, Ok(Vec::new()));
+    h.app.clipboard = Some(Clipboard::with_backend(Box::new(m)));
+    h.ctrl(']');
+    assert!(h.app.pending_attachments.is_empty());
+    let screen = h.render();
+    assert!(screen.contains("can't read images"), "{screen}");
+}
+
+/// Ctrl+C on a message with a pasted image discards the image with the text:
+/// nothing is left holding the bytes, and the next message carries none.
+#[tokio::test]
+async fn cancelling_a_message_drops_its_pending_attachment() {
+    let mut h = Harness::new(vec![MockReply::Text("ok".to_string())]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(64)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    h.type_str("what is this");
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1);
+
+    h.ctrl('c');
+    assert!(
+        h.app.pending_attachments.is_empty(),
+        "the bytes went with the draft"
+    );
+    assert!(h.app.editor.content().trim().is_empty());
+    let screen = h.render();
+    assert!(
+        !screen.contains("attached pasted-1.png"),
+        "and the composer stopped claiming to hold one:\n{screen}"
+    );
+
+    // The next message is a plain one.
+    h.submit("never mind").await;
+    assert!(sent_attachments(&h).await.is_empty());
+}
+
+/// Ctrl+C on an *empty* box with an image pending clears the image rather than
+/// arming the quit: a composer holding a picture is not an empty composer.
+#[tokio::test]
+async fn ctrl_c_with_only_an_attachment_pending_clears_it_instead_of_arming_quit() {
+    let mut h = Harness::new(vec![]).await;
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(64)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1);
+    h.ctrl('c');
+    assert!(h.app.pending_attachments.is_empty());
+    assert!(!h.app.quit_armed, "the quit offer was not armed");
+    assert!(!h.app.should_quit);
+}
