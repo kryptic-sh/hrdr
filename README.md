@@ -144,7 +144,9 @@ captured rather than dropped and on-disk use stays bounded at 2× the cap (≈20
 MiB).
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
-names (routing the message to that agent) and file paths (attaching the file),
+names (routing the message to that agent) and file paths (attaching the file —
+an image or PDF is sent as the file itself, decided by its leading bytes rather
+than its extension, and `Ctrl+]` attaches one straight off the clipboard),
 typing `/` opens a slash-command menu, `:` invokes a custom command, and `!`
 runs a shell command directly (`!git status` — output streams into the
 transcript as a tool block and is recorded into the model's context, so the next
@@ -296,21 +298,21 @@ Run `scripts/notes.sh` for the changelog draft.
 
 ### Keybindings
 
-| Key                       | Action                                                                                                   |
-| ------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `Enter`                   | Send; **while a reply runs, queues it** (delivered with the next tool result, else sent as its own turn) |
-| `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)                                                    |
-| `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu                                                 |
-| `@name` / `@path`         | Mention a sub-agent (routes to it), attach a file, or attach a directory's listing                       |
-| `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
-| `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
-| Drag in the transcript    | Select text; releasing copies it to the clipboard (a toast confirms)                                     |
-| `Ctrl+]`                  | Paste the clipboard into the input                                                                       |
-| `Ctrl+L`                  | Clear + repaint the screen                                                                               |
-| `Ctrl+S`                  | Stash the input (a stack); on an empty input, pop the newest stash back                                  |
-| `Ctrl+C`                  | Clear a non-empty input; on an empty one, interrupt the running turn or `!command`                       |
-| `Esc` twice               | Interrupt the running turn or `!command`                                                                 |
-| `Ctrl+C` twice / `Ctrl+D` | Quit when idle with an empty input (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                  |
+| Key                       | Action                                                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Enter`                   | Send; **while a reply runs, queues it** (delivered with the next tool result, else sent as its own turn)                                   |
+| `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)                                                                                      |
+| `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu                                                                                   |
+| `@name` / `@path`         | Mention a sub-agent (routes to it), attach a file (an image or PDF goes as the file, not its bytes), or attach a directory's listing       |
+| `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                                                    |
+| `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                                                     |
+| Drag in the transcript    | Select text; releasing copies it to the clipboard (a toast confirms)                                                                       |
+| `Ctrl+]`                  | Paste the clipboard: text into the input, image or PDF bytes as an attachment, a copied file (`text/uri-list`) read from disk and attached |
+| `Ctrl+L`                  | Clear + repaint the screen                                                                                                                 |
+| `Ctrl+S`                  | Stash the input (a stack); on an empty input, pop the newest stash back                                                                    |
+| `Ctrl+C`                  | Clear a non-empty input; on an empty one, interrupt the running turn or `!command`                                                         |
+| `Esc` twice               | Interrupt the running turn or `!command`                                                                                                   |
+| `Ctrl+C` twice / `Ctrl+D` | Quit when idle with an empty input (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                                                    |
 
 Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
 the input pane instead of the default plain input.

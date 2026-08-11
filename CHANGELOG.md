@@ -110,6 +110,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     status row names what the message is carrying, and a transcript row records
     it beside the message. A file path pasted as _text_ stays text — prefix it
     with `@` to attach it.
+  - **They count against the context window.** An attachment carries no text, so
+    on an endpoint that reports no usage of its own a screenshot cost the prompt
+    estimate nothing at all: the context gauge read near-empty on an image-heavy
+    session, `/cost` under-reported it, and auto-compaction fired late or never.
+    `Attachment::estimated_tokens` now prices each one — an image by Anthropic's
+    published rule (`⌈width / 28⌉ × ⌈height / 28⌉` visual tokens, after the
+    high-resolution tier's downscale to 2576 px on the long edge and 4784 tokens
+    in total, the tier Claude 4.7 and later use automatically), from the
+    dimensions in its PNG, JPEG, GIF or WebP header; a PDF by its page count at
+    3,000 tokens a page — and `estimate_tokens_in_messages` adds it, so the
+    compaction trigger, the shrink ladder's stage sizing and the gauge all see
+    it. A header this cannot parse costs the per-image ceiling rather than
+    nothing, and a PDF whose page tree is compressed is counted from its size:
+    both err high, because an estimate that runs low is the one that lets a
+    request overflow the window. The figure is computed once, when the
+    attachment is built.
 - **`max_attachment_bytes` — the per-attachment size ceiling is configurable**
   (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
   limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64

@@ -645,7 +645,15 @@ pub(crate) fn estimate_tokens_in_tools(tools: &[ToolDef]) -> u32 {
 
 /// Estimate the prompt tokens of a whole request: each message's content and any
 /// tool-call names/arguments, plus a small per-message overhead for the role and
-/// structural tokens the chat template adds.
+/// structural tokens the chat template adds, plus what any attachments cost.
+///
+/// The attachments are counted because they contribute no *text*: a screenshot
+/// costs the request more than a page of prose and was landing in this sum as
+/// zero, so an image-heavy session's gauge read near-empty and its compaction
+/// trigger fired late or never. Each attachment's cost is a pure
+/// function of its bytes and is computed once when it is constructed
+/// ([`hrdr_llm::media::Attachment::estimated_tokens`]) — this sum runs over the
+/// whole history on every round, so it must stay a field read.
 ///
 /// Messages only — the `tools[]` block is [`estimate_tokens_in_tools`]'s job,
 /// because it is per-turn state rather than per-message and callers cache it.
@@ -663,7 +671,12 @@ pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
                         .sum::<usize>()
                 })
                 .unwrap_or(0);
-            (content + calls) as u32 / 4 + 4
+            let attached: u32 = m
+                .attachments
+                .iter()
+                .map(|a| a.estimated_tokens())
+                .fold(0, u32::saturating_add);
+            ((content + calls) as u32 / 4 + 4).saturating_add(attached)
         })
         .sum()
 }
@@ -1228,7 +1241,7 @@ impl Agent {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hrdr_llm::ChatMessage;
 
@@ -1240,6 +1253,48 @@ mod tests {
             Role::User => ChatMessage::user(body),
             _ => ChatMessage::assistant(body),
         }
+    }
+
+    /// A PNG whose `IHDR` declares `width × height`, so it has a real visual
+    /// cost rather than the unreadable-header fallback.
+    pub(crate) fn png_sized(width: u32, height: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&13u32.to_be_bytes());
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&width.to_be_bytes());
+        v.extend_from_slice(&height.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        v
+    }
+
+    /// An attachment weighs on the estimate, because it weighs on the request:
+    /// it contributes no text at all, so before this a screenshot-heavy history
+    /// was measured as if the screenshots were not there.
+    #[test]
+    fn the_estimator_counts_what_attachments_cost() {
+        let plain = ChatMessage::user("look at this");
+        let text_only = estimate_tokens_in_messages(std::slice::from_ref(&plain));
+
+        let shot = hrdr_llm::media::Attachment::new(
+            png_sized(1_000, 1_000),
+            hrdr_llm::media::MediaType::Png,
+            "shot.png",
+        )
+        .expect("a valid png");
+        let cost = shot.estimated_tokens();
+        assert!(cost > 1_000, "a 1000x1000 image is not a rounding error");
+
+        let mut with_image = plain.clone();
+        with_image.attachments = vec![shot.clone(), shot];
+        assert_eq!(
+            estimate_tokens_in_messages(&[with_image]),
+            text_only + 2 * cost,
+            "every attachment on the message counts, and the text still does"
+        );
+
+        // A message with no attachments estimates exactly what it always did:
+        // its text over four bytes, plus the per-message structural overhead.
+        assert_eq!(text_only, ("look at this".len() / 4 + 4) as u32);
     }
 
     /// The stage ladder: full history, elided tool results, then successively

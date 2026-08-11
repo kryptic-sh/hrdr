@@ -236,6 +236,70 @@ mod tests {
         );
     }
 
+    /// The wiring, end to end: a history whose **text** sits comfortably under
+    /// the compaction trigger, but which carries images, is over it once the
+    /// images are counted — so the agent compacts instead of walking into a
+    /// context-overflow 400.
+    ///
+    /// This is the path a real turn takes on an endpoint that reports no usage:
+    /// `account_usage` estimates the prompt, the turn loop stores it as
+    /// `last_prompt_tokens`, and `should_auto_compact` — the one predicate the
+    /// agent and every frontend gauge share — reads it. An attachment used to
+    /// contribute nothing to that number at all.
+    #[tokio::test]
+    async fn attachments_push_a_history_over_the_compaction_trigger() {
+        const WINDOW: u32 = 131_072;
+        const RESERVED: u32 = 8_192;
+        let trigger = crate::compaction::compaction_trigger(WINDOW, RESERVED);
+        let acc = Accumulator::new();
+
+        // What the agent's own system prompt already costs, so the turn below
+        // can be sized to land just under the trigger rather than against a
+        // number this test would have to guess.
+        let baseline = Agent::new(AgentConfig::default())
+            .unwrap()
+            .account_usage(&acc, 0)
+            .await
+            .prompt_tokens;
+
+        // Text alone: 1,000 tokens clear of the trigger.
+        let text_tokens = trigger - baseline - 1_000;
+        let mut msg = ChatMessage::user("x".repeat(text_tokens as usize * 4));
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        Arc::make_mut(&mut agent.messages).push(msg.clone());
+        let text_only = agent.account_usage(&acc, 0).await.prompt_tokens;
+        assert!(
+            !crate::compaction::should_auto_compact(Some(text_only), Some(WINDOW), RESERVED, true),
+            "the text alone must be under the trigger, or this test proves nothing \
+             ({text_only} vs {trigger})"
+        );
+
+        // The same turn with a screenshot on it: 1000x1000 costs 1,296 visual
+        // tokens, and no text changed.
+        msg.attachments = vec![
+            hrdr_llm::media::Attachment::new(
+                crate::compaction::tests::png_sized(1_000, 1_000),
+                hrdr_llm::media::MediaType::Png,
+                "shot.png",
+            )
+            .expect("a valid png"),
+        ];
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        Arc::make_mut(&mut agent.messages).push(msg);
+        let with_image = agent.account_usage(&acc, 0).await.prompt_tokens;
+
+        assert!(
+            crate::compaction::should_auto_compact(Some(with_image), Some(WINDOW), RESERVED, true),
+            "the image is what takes this history over the trigger \
+             ({with_image} vs {trigger})"
+        );
+        assert_eq!(
+            with_image,
+            text_only + 1_296,
+            "and it is charged its visual tokens, nothing else having changed"
+        );
+    }
+
     /// The server-reported path is untouched: its number already counts the
     /// tools, so adding an estimate on top would double-count them.
     #[tokio::test]
