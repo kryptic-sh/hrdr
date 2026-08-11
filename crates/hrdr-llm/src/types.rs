@@ -141,12 +141,12 @@ pub struct ChatMessage {
     /// it from reaching a server as an unknown field. Each dialect renders it
     /// explicitly instead.
     ///
-    /// Also `skip_deserializing`: session persistence is **not wired yet**, so
-    /// nothing ever writes this field and nothing can read it back. A session
-    /// resumed today comes back with its attachments gone. Giving them a
-    /// persisted encoding is its own piece of work — it decides whether a
-    /// session file carries megabytes of base64 — and is deliberately not
-    /// decided here.
+    /// Also `skip_deserializing`, for the same reason and one more: a session
+    /// file does not carry the bytes either. Attachments run to megabytes and a
+    /// session is rewritten on every tool round, so the bytes are stored
+    /// content-addressed beside the session file and only a reference to each is
+    /// persisted — see `hrdr_agent::attachment_store`, which is also what puts
+    /// them back on this field when a session is resumed.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub attachments: Vec<crate::media::Attachment>,
     /// Internal origin marker — distinguishes real user turns from synthetic

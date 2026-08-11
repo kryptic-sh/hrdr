@@ -491,6 +491,12 @@ impl super::App {
     /// is not valid. The bar said one thing; the socket did another. A conversation's
     /// provider is part of the conversation.
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
+        // Attachments the load could not restore. Taken before the state is
+        // adopted, and reported below once the swap is done — a resumed message
+        // still carries the "--- Attached files ---" block naming the file, so a
+        // drop the user is not told about leaves them (and the model) reading a
+        // label for something that is not there. Every resume path lands here.
+        let losses = state.attachment_losses.clone();
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
         // The identity in force right now — the provider an OLD session file (one
@@ -599,5 +605,12 @@ impl super::App {
         // state (opened thoughts) from the session we left is meaningless here.
         self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
+
+        for loss in &losses {
+            self.system(format!(
+                "attachment not restored — {loss}; the message now says so, \
+                 re-attach the file if the model still needs it"
+            ));
+        }
     }
 }

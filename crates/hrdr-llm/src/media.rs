@@ -103,6 +103,22 @@ impl MediaType {
         if self.is_image() { "image" } else { "pdf" }
     }
 
+    /// The type a MIME string names, or `None` for one this enum does not
+    /// cover. The exact inverse of [`Self::mime`], and the read side of session
+    /// persistence: a stored attachment records its type as the MIME string,
+    /// and that string has to come back as the same closed enum variant it went
+    /// out as.
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        match mime {
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/png" => Some(Self::Png),
+            "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::Webp),
+            "application/pdf" => Some(Self::Pdf),
+            _ => None,
+        }
+    }
+
     /// The type `bytes` actually are, by leading magic number, or `None` for
     /// anything not in this enum.
     ///
@@ -215,6 +231,17 @@ impl Attachment {
     /// The original file name, as the dialects that send one spell it.
     pub fn filename(&self) -> &str {
         &self.filename
+    }
+
+    /// The raw payload — the bytes that were validated against
+    /// [`Self::media_type`] at construction.
+    ///
+    /// For persistence: a session stores these beside its file, content-addressed
+    /// by their digest, rather than inlining them (see `hrdr_agent::session`).
+    /// Hashing happens there, not here — this crate has no digest dependency, and
+    /// an attachment is a wire concern.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// How many bytes this becomes once base64-encoded: 4 bytes per 3-byte

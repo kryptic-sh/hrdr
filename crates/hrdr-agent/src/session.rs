@@ -6,7 +6,7 @@
 //! directory: each lives at `sessions/<cwd-slug>/<name-slug>.json`, so the
 //! files are easy to manage by hand and startup auto-resume scopes to a project.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -125,6 +125,27 @@ pub struct SessionState {
     /// Token counters for the status bar (see [`SessionUsage`]).
     #[serde(default)]
     pub usage: SessionUsage,
+    /// Attachment references read out of the file, one entry per message that
+    /// had any — the bytes themselves live in the blob store beside it
+    /// ([`crate::attachment_store`]).
+    ///
+    /// Transient, and never serialized from here: [`Session::load_path`] takes
+    /// this the moment it has a path to resolve against, turns each reference
+    /// back into a real `Attachment` on `messages`, and leaves it empty. The
+    /// *write* side never reads it either — a save describes the attachments
+    /// actually on the messages (see [`SessionBody`]), so a message whose
+    /// attachment was dropped stops being described.
+    #[serde(skip)]
+    pub attachment_refs: Vec<crate::MessageAttachments>,
+    /// Attachments this load could NOT restore. Empty in the normal case.
+    ///
+    /// Also transient — it is a fact about one read, not about the conversation.
+    /// The frontend prints one line per entry when it adopts the state, which is
+    /// the only reason a resume can be trusted: the message text says a file was
+    /// attached, so a resume that quietly dropped it would leave the model
+    /// looking at a label with nothing behind it.
+    #[serde(skip)]
+    pub attachment_losses: Vec<crate::AttachmentLoss>,
 }
 
 impl Default for SessionState {
@@ -142,6 +163,8 @@ impl Default for SessionState {
             todos: Vec::new(),
             transcript: Vec::new(),
             usage: SessionUsage::default(),
+            attachment_refs: Vec::new(),
+            attachment_losses: Vec::new(),
         }
     }
 }
@@ -189,6 +212,11 @@ impl<'de> Deserialize<'de> for SessionState {
             transcript: Vec<Entry>,
             #[serde(default)]
             usage: SessionUsage,
+            /// Attachment references, one entry per message that has any.
+            /// Absent on any file whose conversation had no attachments — which
+            /// is every file written before the blob store existed.
+            #[serde(default)]
+            attachments: Vec<crate::MessageAttachments>,
         }
 
         let raw = Raw::deserialize(d)?;
@@ -244,6 +272,8 @@ impl<'de> Deserialize<'de> for SessionState {
             todos: raw.todos,
             transcript: raw.transcript,
             usage: raw.usage,
+            attachment_refs: raw.attachments,
+            attachment_losses: Vec::new(),
         })
     }
 }
@@ -386,7 +416,13 @@ impl SessionState {
 pub const MAX_SESSION_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A saved conversation: file metadata plus the [`SessionState`] it carries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Serialize` is hand-written rather than derived so that there is exactly ONE
+/// on-disk shape ([`SessionBody`]): serializing a `Session` directly and letting
+/// [`Session::save`] write it must not be able to produce different files, and a
+/// derived impl would have quietly omitted the attachment references (which are
+/// derived from the messages, not stored on the struct).
+#[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     pub version: u32,
     /// Unix seconds.
@@ -414,13 +450,27 @@ impl Session {
     /// time). Borrowed, so a save serializes without cloning the whole state —
     /// the message history and transcript used to be deep-cloned once per write
     /// just to patch one `u64`.
-    fn body(&self, created: u64) -> SessionBody<'_> {
+    /// `attachments` describes the attachments currently on `state.messages`;
+    /// [`Session::save`] passes the set it has just written blobs for, so a save
+    /// hashes each attachment exactly once.
+    fn body(&self, created: u64, attachments: Vec<crate::MessageAttachments>) -> SessionBody<'_> {
         SessionBody {
             version: self.version,
             created,
             updated: self.updated,
+            attachments,
             state: &self.state,
         }
+    }
+}
+
+impl Serialize for Session {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.body(
+            self.created,
+            crate::attachment_store::attachment_refs(&self.state.messages),
+        )
+        .serialize(s)
     }
 }
 
@@ -431,6 +481,16 @@ struct SessionBody<'a> {
     version: u32,
     created: u64,
     updated: u64,
+    /// Where each message's attachments are stored — the message's index, plus
+    /// the name, media type, length and SHA-256 that names the blob
+    /// ([`crate::attachment_store`]). The bytes are NOT here: a session file is
+    /// rewritten on every tool round, and inlining base64 would re-serialize
+    /// them all every time.
+    ///
+    /// Omitted entirely when there are none, so a conversation without
+    /// attachments writes the same bytes it wrote before the store existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<crate::MessageAttachments>,
     #[serde(flatten)]
     state: &'a SessionState,
 }
@@ -810,7 +870,18 @@ impl Session {
         // tool round — pretty-printing spends ~15-30% more bytes and serialize CPU
         // per save for indentation no one reads (idle files are zstd-compressed by
         // retention anyway).
-        let json = serde_json::to_string(&self.body(created)).context("serializing session")?;
+        // Attachment bytes go into the content-addressed store beside the file
+        // BEFORE the file naming them lands, so a crash between the two leaves
+        // blobs nothing references (collected by retention) rather than a session
+        // referencing blobs that were never written.
+        let attachments = crate::attachment_store::attachment_refs(&self.state.messages);
+        crate::attachment_store::write_blobs(
+            &crate::attachment_store::blob_dir(&path),
+            &self.state.messages,
+            &attachments,
+        )?;
+        let json = serde_json::to_string(&self.body(created, attachments))
+            .context("serializing session")?;
         crate::write_atomic(&path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         // If retention had compressed this session, the plaintext we just wrote
@@ -862,8 +933,20 @@ impl Session {
                 c
             }
         };
+        // Attachment blobs first, exactly as `save` does — a sub-agent's snapshot
+        // gets its own `blobs/` beside it. Nothing puts attachments on a
+        // sub-agent's messages today (a `task` prompt and a `task_steer` prompt
+        // are both plain strings), so in practice this writes nothing; wiring it
+        // anyway is what keeps the two save paths from diverging the day one can.
+        let attachments = crate::attachment_store::attachment_refs(&self.state.messages);
+        crate::attachment_store::write_blobs(
+            &crate::attachment_store::blob_dir(path),
+            &self.state.messages,
+            &attachments,
+        )?;
         // Compact, not pretty — see the note in `save`.
-        let json = serde_json::to_string(&self.body(created)).context("serializing session")?;
+        let json = serde_json::to_string(&self.body(created, attachments))
+            .context("serializing session")?;
         crate::write_atomic(path, json.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
@@ -892,6 +975,50 @@ impl Session {
     /// on the metadata length *and* on the bytes actually read (in case the
     /// file grew between the checks).
     pub fn load_path(path: &Path) -> Result<Session> {
+        let mut session = Self::parse_path(path)?;
+        // The transcript is no longer embedded in the `.json` (see
+        // `SessionState::transcript`). Rebuild it from the sibling `<id>.jsonl` —
+        // the append-only fold of the agent's event stream — through the SAME
+        // reducer the live path uses, so a resumed transcript renders identically.
+        // `with_file_name` gives the sibling regardless of `.json` vs `.json.zst`.
+        // An older file that still carries an embedded transcript and has no jsonl
+        // keeps the one it deserialized (the fallback branch does nothing).
+        if let Some(stem) = session.state.id.as_deref() {
+            let jsonl = path.with_file_name(format!("{stem}.jsonl"));
+            if jsonl.exists() {
+                session.state.transcript = crate::transcript_log::read_transcript(&jsonl);
+            }
+        }
+        // Put the attachment bytes back on the messages that reference them,
+        // verifying each blob against the digest the file recorded. Anything that
+        // does not come back is dropped and REPORTED — never silently — because
+        // the message text still names it (see `resolve_attachments`).
+        let refs = std::mem::take(&mut session.state.attachment_refs);
+        if !refs.is_empty() {
+            session.state.attachment_losses = crate::attachment_store::resolve_attachments(
+                &crate::attachment_store::blob_dir(path),
+                &refs,
+                &mut session.state.messages,
+            );
+        }
+        // A load always knows the true `created` for this path — remember it,
+        // so a later `save` (an autosave, a rename, …) doesn't have to re-read
+        // the file just to preserve it.
+        if let Ok(mut cache) = created_cache().lock() {
+            cache.insert(path.to_path_buf(), session.created);
+        }
+        Ok(session)
+    }
+
+    /// Read and parse a session file, and nothing more: no transcript fold, and
+    /// attachment references left AS references, in
+    /// [`SessionState::attachment_refs`].
+    ///
+    /// [`Self::load_path`] is this plus the resolution steps. The blob GC
+    /// (`sweep_dir`) wants the unresolved form on its own — its mark phase only
+    /// needs to know which digests are still spoken for, and resolving would pull
+    /// every attachment in every surviving session into memory to learn it.
+    fn parse_path(path: &Path) -> Result<Session> {
         let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let len = f
             .metadata()
@@ -938,25 +1065,6 @@ impl Session {
         let mut session: Session =
             serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
         session.state.id = session_id_from_path(path);
-        // The transcript is no longer embedded in the `.json` (see
-        // `SessionState::transcript`). Rebuild it from the sibling `<id>.jsonl` —
-        // the append-only fold of the agent's event stream — through the SAME
-        // reducer the live path uses, so a resumed transcript renders identically.
-        // `with_file_name` gives the sibling regardless of `.json` vs `.json.zst`.
-        // An older file that still carries an embedded transcript and has no jsonl
-        // keeps the one it deserialized (the fallback branch does nothing).
-        if let Some(stem) = session.state.id.as_deref() {
-            let jsonl = path.with_file_name(format!("{stem}.jsonl"));
-            if jsonl.exists() {
-                session.state.transcript = crate::transcript_log::read_transcript(&jsonl);
-            }
-        }
-        // A load always knows the true `created` for this path — remember it,
-        // so a later `save` (an autosave, a rename, …) doesn't have to re-read
-        // the file just to preserve it.
-        if let Ok(mut cache) = created_cache().lock() {
-            cache.insert(path.to_path_buf(), session.created);
-        }
         Ok(session)
     }
 
@@ -1189,7 +1297,11 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
             }
         }
         let id = session_id_from_path(&path).unwrap_or_default();
-        match Session::load_path(&path) {
+        // The unresolved parse, not `load_path`: a listing wants three metadata
+        // fields, and resolving would read every attachment of every session in
+        // the store into memory — on every keystroke of a `/resume` argument —
+        // to produce a name, a cwd and a timestamp.
+        match Session::parse_path(&path) {
             Ok(s) => {
                 let meta = SessionMeta {
                     id,
@@ -1292,6 +1404,10 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // Set once a purge actually deletes something, so the blob GC below — which
+    // has to re-read every surviving session in the directory — only runs when
+    // there is a reason to.
+    let mut purged = false;
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -1334,6 +1450,10 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(dir.join(format!("{id}.jsonl")));
                     let _ = std::fs::remove_dir_all(dir.join("subagents").join(&id));
+                    // Its attachment blobs are shared with every other session in
+                    // this directory, so they cannot be deleted from here — the
+                    // GC below decides, once every survivor has been consulted.
+                    purged = true;
                     continue;
                 }
                 // User-named → keep. It may still be a compression candidate below.
@@ -1346,6 +1466,50 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
             let _ = compress_session_file(&path);
         }
     }
+    if purged {
+        collect_blob_garbage(dir);
+    }
+}
+
+/// Delete the attachment blobs in `dir` that no session left in `dir` still
+/// references — the cleanup half of a purge.
+///
+/// Blobs are content-addressed and shared: two sessions that attached the same
+/// image name the same file, so a purged session's references are not its
+/// property to delete. The set of live digests is therefore rebuilt from the
+/// survivors (mark), and only what is in no survivor is unlinked (sweep).
+///
+/// **A directory with any unreadable session is left completely alone.** An
+/// incomplete mark set does not produce a smaller cleanup, it produces deletion
+/// of blobs something still needs — and `sweep_dir` deliberately keeps
+/// unparseable session files rather than deleting them, so this case is real.
+fn collect_blob_garbage(dir: &Path) {
+    let blobs = crate::attachment_store::blob_dir_in(dir);
+    if !blobs.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut keep: HashSet<String> = HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_session = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.ends_with(".json") || n.ends_with(".json.zst"));
+        if !is_session {
+            continue;
+        }
+        // The unresolved parse: the mark phase needs the digests, not the bytes.
+        let Ok(session) = Session::parse_path(&path) else {
+            return; // a session we cannot read may reference anything — do nothing
+        };
+        for entry in &session.state.attachment_refs {
+            keep.extend(entry.files.iter().map(|r| r.sha256.clone()));
+        }
+    }
+    crate::attachment_store::sweep_blobs(&blobs, &keep);
 }
 
 /// Compress a plaintext `<id>.json` to `<id>.json.zst` (zstd level 3), atomically
@@ -2729,6 +2893,379 @@ mod tests {
             assert!(bad.cwd.is_empty(), "corrupt entry has no cwd");
         });
     }
+
+    // ── attachments: blobs beside the session ─────────────────────────────────
+
+    use hrdr_llm::media::{Attachment, MediaType};
+
+    /// A PNG whose bytes are decided by `tag`, so two calls with different tags
+    /// are genuinely different content (and different digests).
+    fn png_bytes(tag: u8, pad: usize) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend(std::iter::repeat_n(tag, pad));
+        v
+    }
+
+    fn png(tag: u8, name: &str) -> Attachment {
+        Attachment::new(png_bytes(tag, 64), MediaType::Png, name).expect("a valid png")
+    }
+
+    /// The state `state()` builds, with `attachments` on its one user message.
+    fn state_with(name: &str, cwd: &str, attachments: Vec<Attachment>) -> SessionState {
+        let mut st = state(name, cwd);
+        st.messages[0].attachments = attachments;
+        st
+    }
+
+    fn blobs_in(cwd: &str) -> Vec<String> {
+        let dir = crate::attachment_store::blob_dir_in(&session_dir(cwd));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// How every dialect renders one message's attachments — the thing that
+    /// actually goes on the wire, and so the thing a resume has to reproduce.
+    /// Asserting on this rather than on the struct is the point: a resumed
+    /// attachment that is "equal" but renders differently is still a regression.
+    fn rendered(m: &Message) -> Vec<serde_json::Value> {
+        m.attachments
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "anthropic": a.anthropic_block(),
+                    "responses": a.responses_item(),
+                    "openai": a.openai_part(),
+                })
+            })
+            .collect()
+    }
+
+    /// The whole point of the slice: bytes attached before a save are the same
+    /// bytes, rendering the same blocks, after a resume.
+    #[test]
+    fn attachments_survive_a_save_and_resume() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let pdf =
+                Attachment::new(b"%PDF-1.7 body".to_vec(), MediaType::Pdf, "report.pdf").unwrap();
+            let st = state_with("Chat", &cwd, vec![png(1, "shot.png"), pdf]);
+            let before = rendered(&st.messages[0]);
+            let raw: Vec<Vec<u8>> = st.messages[0]
+                .attachments
+                .iter()
+                .map(|a| a.bytes().to_vec())
+                .collect();
+
+            Session::new(st).save("att").unwrap();
+            let back = Session::load(&cwd, "att").unwrap();
+
+            let m = &back.state.messages[0];
+            assert!(back.state.attachment_losses.is_empty(), "nothing was lost");
+            assert_eq!(m.attachments.len(), 2);
+            assert_eq!(
+                m.attachments
+                    .iter()
+                    .map(|a| a.bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                raw,
+                "the bytes come back identical"
+            );
+            assert_eq!(
+                m.attachments
+                    .iter()
+                    .map(|a| a.media_type())
+                    .collect::<Vec<_>>(),
+                vec![MediaType::Png, MediaType::Pdf],
+            );
+            assert_eq!(
+                m.attachments
+                    .iter()
+                    .map(|a| a.filename())
+                    .collect::<Vec<_>>(),
+                vec!["shot.png", "report.pdf"],
+            );
+            assert_eq!(rendered(m), before, "every dialect renders it as before");
+            // And the text is untouched — nothing was lost, so nothing is annotated.
+            assert_eq!(m.content.as_deref(), Some("hi"));
+            assert_eq!(blobs_in(&cwd).len(), 2, "one blob per distinct attachment");
+        });
+    }
+
+    /// Content addressing: the same image on two messages is one file, and both
+    /// messages get it back.
+    #[test]
+    fn one_image_on_two_messages_is_stored_once() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state_with("Chat", &cwd, vec![png(7, "first.png")]);
+            // A second user turn attaching byte-identical content under another name.
+            let mut second = Message::user("again");
+            second.attachments = vec![png(7, "second.png")];
+            st.messages.push(second);
+
+            Session::new(st).save("dup").unwrap();
+            assert_eq!(blobs_in(&cwd).len(), 1, "identical bytes → one blob");
+
+            let back = Session::load(&cwd, "dup").unwrap();
+            assert!(back.state.attachment_losses.is_empty());
+            let names: Vec<&str> = back
+                .state
+                .messages
+                .iter()
+                .flat_map(|m| m.attachments.iter().map(|a| a.filename()))
+                .collect();
+            assert_eq!(
+                names,
+                vec!["first.png", "second.png"],
+                "both messages resolve the shared blob, each keeping its own name"
+            );
+            for m in &back.state.messages {
+                assert_eq!(m.attachments[0].bytes(), &png_bytes(7, 64)[..]);
+            }
+        });
+    }
+
+    /// The regression that matters: a conversation with no attachments writes
+    /// exactly the file it wrote before the blob store existed — no extra key,
+    /// and no `blobs/` directory.
+    #[test]
+    fn a_session_without_attachments_writes_the_same_file() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let path = Session::new(state("Chat", &cwd)).save("plain").unwrap();
+
+            let json = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !json.contains("attachments"),
+                "no attachment key is written: {json}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "base_url",
+                    "created",
+                    "cwd",
+                    "messages",
+                    "model",
+                    "name",
+                    "named_by_user",
+                    "read_only",
+                    "todos",
+                    "updated",
+                    "usage",
+                    "version",
+                ],
+                "the on-disk shape is unchanged"
+            );
+            assert!(
+                !crate::attachment_store::blob_dir(&path).exists(),
+                "no blob directory is created for a session with nothing to store"
+            );
+        });
+    }
+
+    /// A blob deleted behind the session's back. The attachment is dropped — and
+    /// BOTH readers are told: the user, through the returned loss list (the TUI
+    /// prints one line per entry), and the model, through the message text, which
+    /// still carries the "--- Attached files ---" block naming the file.
+    #[test]
+    fn a_missing_blob_is_reported_not_swallowed() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state_with("Chat", &cwd, vec![png(3, "gone.png")]);
+            st.messages[0].content =
+                Some("what is this\n\n--- Attached files ---\nImage 1: gone.png\n".into());
+            let path = Session::new(st).save("lost").unwrap();
+
+            // Delete the one blob, by name, exactly as a `rm` on the store would.
+            let blobs = blobs_in(&cwd);
+            assert_eq!(blobs.len(), 1);
+            std::fs::remove_file(crate::attachment_store::blob_dir(&path).join(&blobs[0])).unwrap();
+
+            let back = Session::load(&cwd, "lost").unwrap();
+            let m = &back.state.messages[0];
+            assert!(
+                m.attachments.is_empty(),
+                "the attachment is dropped, not resurrected empty"
+            );
+            assert_eq!(
+                back.state.attachment_losses,
+                vec![crate::AttachmentLoss {
+                    filename: "gone.png".into(),
+                    reason: crate::AttachmentLossReason::Missing,
+                }],
+                "the loss is surfaced for the user"
+            );
+            let text = m.content.as_deref().unwrap();
+            assert!(
+                text.contains("--- Attachments unavailable ---")
+                    && text.contains("gone.png: its stored copy is missing"),
+                "the message itself stops claiming an image it no longer has: {text}"
+            );
+
+            // Saving again records no reference for it, so a second resume has
+            // nothing left to lose and does not annotate the text twice.
+            Session::new(back.state.clone()).save("lost").unwrap();
+            let again = Session::load(&cwd, "lost").unwrap();
+            assert!(again.state.attachment_losses.is_empty());
+            assert_eq!(again.state.messages[0].content.as_deref(), Some(text));
+        });
+    }
+
+    /// A blob whose bytes were corrupted is never handed to a model as an image:
+    /// the digest check catches it and it is reported like any other loss.
+    #[test]
+    fn a_corrupt_blob_is_never_rendered() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let path = Session::new(state_with("Chat", &cwd, vec![png(5, "bad.png")]))
+                .save("corrupt")
+                .unwrap();
+            let name = blobs_in(&cwd).remove(0);
+            // Still a valid PNG header, still the right length — only the checksum
+            // can tell. Overwritten in place, as filesystem damage would.
+            std::fs::write(
+                crate::attachment_store::blob_dir(&path).join(&name),
+                png_bytes(6, 64),
+            )
+            .unwrap();
+
+            let back = Session::load(&cwd, "corrupt").unwrap();
+            assert_eq!(
+                back.state.attachment_losses,
+                vec![crate::AttachmentLoss {
+                    filename: "bad.png".into(),
+                    reason: crate::AttachmentLossReason::Corrupt,
+                }]
+            );
+            assert!(
+                back.state.messages[0].attachments.is_empty(),
+                "nothing to render, so nothing reaches a request body"
+            );
+            assert!(rendered(&back.state.messages[0]).is_empty());
+        });
+    }
+
+    /// Retention's purge takes the purged session's blobs with it — but a blob
+    /// the surviving session also references is not the purged session's to
+    /// delete, and stays.
+    #[test]
+    fn purging_a_session_collects_only_its_own_blobs() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let month = 30 * 24 * 60 * 60;
+
+            // Auto-named and old → purged. Holds a shared image and one of its own.
+            let mut doomed = state_with("doomed", &cwd, vec![png(1, "shared.png")]);
+            let mut only_mine = Message::user("mine");
+            only_mine.attachments = vec![png(2, "only-mine.png")];
+            doomed.messages.push(only_mine);
+            Session::new(doomed).save("doomed").unwrap();
+
+            // User-named → survives the purge (it is compressed instead), and
+            // references the same image bytes as the doomed one.
+            let mut keeper = state_with("keeper", &cwd, vec![png(1, "shared.png")]);
+            keeper.named_by_user = true;
+            Session::new(keeper).save("keeper").unwrap();
+
+            let shared = crate::AttachmentRef::of(&png(1, "x.png")).sha256;
+            let orphan = crate::AttachmentRef::of(&png(2, "x.png")).sha256;
+            assert_eq!(blobs_in(&cwd), {
+                let mut v = vec![shared.clone(), orphan.clone()];
+                v.sort();
+                v
+            });
+
+            // Age everything past the purge threshold — the session files so the
+            // sweep acts, the blobs so they are outside the GC's grace window.
+            age_file(&session_file_path(&cwd, "doomed"), month + 1000);
+            age_file(&session_file_path(&cwd, "keeper"), month + 1000);
+            let blob_dir = crate::attachment_store::blob_dir_in(&session_dir(&cwd));
+            age_file(&blob_dir.join(&shared), month + 1000);
+            age_file(&blob_dir.join(&orphan), month + 1000);
+
+            sweep_sessions(Some(7 * 24 * 60 * 60), Some(month));
+
+            assert!(
+                !session_file_path(&cwd, "doomed").exists(),
+                "the auto-named session was purged"
+            );
+            assert_eq!(
+                blobs_in(&cwd),
+                vec![shared.clone()],
+                "the purged session's own blob is collected; the shared one is not"
+            );
+            // And the survivor still resolves it.
+            let kept = Session::load(&cwd, "keeper").unwrap();
+            assert!(kept.state.attachment_losses.is_empty());
+            assert_eq!(
+                kept.state.messages[0].attachments[0].bytes(),
+                &png_bytes(1, 64)[..],
+                "the shared blob still serves the session that survived"
+            );
+        });
+    }
+
+    /// A session file the sweep cannot parse may reference anything, so the GC
+    /// refuses to run at all rather than guess.
+    #[test]
+    fn an_unreadable_session_stops_the_blob_gc() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let month = 30 * 24 * 60 * 60;
+            Session::new(state_with("doomed", &cwd, vec![png(1, "a.png")]))
+                .save("doomed")
+                .unwrap();
+            let digest = crate::AttachmentRef::of(&png(1, "a.png")).sha256;
+            std::fs::write(session_dir(&cwd).join("broken.json"), "not valid json").unwrap();
+
+            age_file(&session_file_path(&cwd, "doomed"), month + 1000);
+            age_file(
+                &crate::attachment_store::blob_dir_in(&session_dir(&cwd)).join(&digest),
+                month + 1000,
+            );
+
+            sweep_sessions(None, Some(month));
+
+            assert!(!session_file_path(&cwd, "doomed").exists(), "still purged");
+            assert_eq!(
+                blobs_in(&cwd),
+                vec![digest],
+                "the blob is kept: a session we cannot read might need it"
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2802,6 +3339,10 @@ mod roundtrip_audit {
                 context_window: Some(1000),
                 ..Default::default()
             },
+            // Both are per-load scratch, not conversation state: a save describes
+            // the attachments on the messages, and a load fills these in.
+            attachment_refs: Vec::new(),
+            attachment_losses: Vec::new(),
         };
 
         let json = serde_json::to_string(&Session::new(state.clone())).unwrap();

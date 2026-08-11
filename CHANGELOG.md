@@ -76,8 +76,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     text, and every TUI send path — a fresh turn, a message queued mid-turn, and
     a message typed into a sub-agent's pane — builds its message with
     `Outgoing::into_steer`, so the bytes and the label lines travel together.
-    Attachments are still not written to the session file, so they do not
-    survive a resume.
+  - **They survive a save and a resume.** The bytes are stored beside the
+    session file in a shared `blobs/` directory, named by their own SHA-256, and
+    the session records only a reference per attachment (file name, media type,
+    length, digest) — a session file is rewritten on every tool round, so
+    inlining base64 would re-serialize megabytes every round for the rest of the
+    conversation. Content addressing means one image attached twice, or shared
+    by two sessions in the same working directory, is stored once. A resume
+    verifies each blob against its digest before the bytes go anywhere near a
+    request. A conversation with no attachments writes exactly the file it wrote
+    before, key for key.
+  - **An attachment that cannot be restored is never restored silently.** A blob
+    that is missing, truncated, or does not match its recorded checksum is
+    dropped with a message naming the file and the reason, and the message's own
+    text gains an `--- Attachments unavailable ---` line — the text still
+    carries the `--- Attached files ---` block naming the file, so a silent drop
+    would leave the model reading a label for an image that is not there.
+  - Retention collects blobs too: when the purge phase deletes an auto-named
+    session, blobs that no surviving session in that directory still references
+    are deleted with it. A blob shared with a session that survived is kept, and
+    a directory holding any session file that cannot be parsed is left entirely
+    alone rather than guessed at.
   - **`Ctrl+]` pastes an image, not just text.** The existing paste key now
     takes whatever is on the clipboard: image or PDF bytes (a screenshot tool, a
     browser's "copy image") attach to the message being written, a

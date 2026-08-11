@@ -68,6 +68,10 @@ pub use registry::{
 mod transcript;
 mod transcript_log;
 pub use transcript::*;
+mod attachment_store;
+pub use attachment_store::{
+    AttachmentLoss, AttachmentLossReason, AttachmentRef, MessageAttachments,
+};
 mod session;
 pub use session::*;
 mod pane;

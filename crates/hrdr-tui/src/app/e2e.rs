@@ -2829,6 +2829,43 @@ async fn a_model_pick_is_what_a_later_resume_restores() {
     );
 }
 
+/// An attachment whose stored bytes are gone is dropped on resume — and the user
+/// is TOLD, by name and by reason. Dropping it silently would leave the message's
+/// own "--- Attached files ---" block naming an image the model cannot see, which
+/// is worse than never having attached it.
+#[tokio::test]
+async fn a_resume_reports_an_attachment_it_could_not_restore() {
+    let mut h = Harness::new(vec![]).await;
+    let mut saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        messages: vec![hrdr_agent::Message::user(
+            "what is this\n\n--- Attached files ---\nImage 1: gone.png\n",
+        )],
+        ..Default::default()
+    };
+    // What `Session::load_path` hands over when a blob could not be read back.
+    saved.attachment_losses = vec![hrdr_agent::AttachmentLoss {
+        filename: "gone.png".into(),
+        reason: hrdr_agent::AttachmentLossReason::Missing,
+    }];
+
+    h.app.auto_resume_state(saved, "old".to_string());
+
+    assert!(
+        h.app.toasts.history().any(|t| {
+            t.body.contains("attachment not restored")
+                && t.body.contains("gone.png")
+                && t.body.contains("its stored copy is missing")
+        }),
+        "the loss reaches the user, naming the file and why: {:?}",
+        h.app
+            .toasts
+            .history()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A session whose provider isn't usable HERE (unknown, or its key is gone) is the one
 /// case a resume cannot honour: the agent stays where it is — talking to an endpoint
 /// that works — and says so. It never silently sends the conversation somewhere it
