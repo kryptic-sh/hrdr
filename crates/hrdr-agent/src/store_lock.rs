@@ -1,11 +1,18 @@
-//! Cross-process write lock for the credential stores.
+//! Cross-process write lock for hrdr's on-disk stores.
 //!
-//! The credential store (`auth.json`) is updated read-modify-
-//! write: read the whole store, change one entry, then atomically rename a temp
-//! over the target. The atomic rename protects *readers* — nobody ever sees a
-//! half-written file — but it does NOT serialize *writers*. Two processes can
-//! each read the same old store, add a different provider, and both rename; the
-//! second rename wins and the first process's new entry is lost.
+//! Two stores use it, for the same underlying reason — an atomic rename protects
+//! *readers* but does not serialize *writers*:
+//!
+//! * The **credential store** (`auth.json`) is updated read-modify-write: read
+//!   the whole store, change one entry, then atomically rename a temp over the
+//!   target. Two processes can each read the same old store, add a different
+//!   provider, and both rename; the second rename wins and the first process's
+//!   new entry is lost.
+//! * The **attachment blob store** (`sessions/<cwd-slug>/blobs/`) is garbage
+//!   collected mark-and-sweep, while another process may be writing a blob and
+//!   the session file that references it. Both sides take this lock — the writer
+//!   across blob write + session write, the collector across mark + sweep — so
+//!   the collector never observes the gap between the two.
 //!
 //! This module closes that gap with an advisory cross-process lock built on the
 //! same zero-dependency `O_EXCL` reservation scheme the session store uses (see
@@ -33,7 +40,7 @@
 //!   claim the lock it returns an error rather than blocking forever — an
 //!   unwritable directory or a wedged peer surfaces cleanly instead of hanging.
 //!
-//! ## Policy
+//! ## Policy (credential store)
 //!
 //! Same-key concurrent writers are **last-writer-wins**: two processes both
 //! logging in to the *same* provider serialize on the lock, and whichever runs
@@ -65,7 +72,7 @@ const LOCK_ACQUIRE_ATTEMPTS: u32 = 100;
 /// a truly stuck lock.
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// RAII cross-process write lock for a credential store file.
+/// RAII cross-process write lock for one on-disk store.
 ///
 /// Held for the duration of one read-modify-write. Dropping it releases the lock
 /// (removes the lock file) on every exit path, so a failed or panicking write
@@ -108,11 +115,12 @@ impl Drop for StoreLock {
 }
 
 impl StoreLock {
-    /// Acquire the write lock for the store at `store_path`, blocking (with a
-    /// bounded retry loop) until it is free or [`LOCK_ACQUIRE_ATTEMPTS`] is
-    /// exhausted.
+    /// Acquire the write lock for the store at `store_path` — a file or a
+    /// directory, whichever the store is — blocking (with a bounded retry loop)
+    /// until it is free or [`LOCK_ACQUIRE_ATTEMPTS`] is exhausted.
     ///
-    /// The parent directory must already exist (the callers `create_dir_all` it
+    /// The lock itself is the sibling `<store_path>.lock`, so `store_path` need
+    /// not exist; its parent directory must (the callers `create_dir_all` it
     /// before locking). Returns an error — never hangs — when the lock stays
     /// contended past the retry budget or the directory is unwritable.
     pub fn acquire(store_path: &Path) -> Result<Self> {
@@ -164,15 +172,12 @@ impl StoreLock {
                 Err(e) => {
                     // A non-contention error (e.g. an unwritable directory) will
                     // not fix itself by retrying — surface it right away.
-                    return Err(anyhow!(
-                        "acquiring credential-store lock {}: {e}",
-                        lock_path.display()
-                    ));
+                    return Err(anyhow!("acquiring lock {}: {e}", lock_path.display()));
                 }
             }
         }
         Err(anyhow!(
-            "timed out acquiring credential-store lock {} (held by another process?)",
+            "timed out acquiring lock {} (held by another process?)",
             lock_path.display()
         ))
     }

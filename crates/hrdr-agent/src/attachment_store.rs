@@ -41,12 +41,15 @@ const BLOB_SUBDIR: &str = "blobs";
 /// How recently a blob must have been written or re-referenced to be spared by
 /// [`sweep_blobs`], regardless of what the mark phase found.
 ///
-/// The sweep and a live hrdr are different processes with no lock between them
-/// on the blob store, so a session can be written referencing a blob in the
-/// window between the sweep collecting references and the sweep deleting. One
-/// hour is comfortably longer than that window (the retention worker itself runs
-/// hourly), and a blob that is genuinely garbage is simply collected on the next
-/// pass instead of this one.
+/// Exclusion is [`lock_blob_store`]'s job: mark, sweep and every save that
+/// touches blobs run under it, so a session referencing a blob cannot land in
+/// the window between the sweep collecting references and the sweep deleting.
+/// This window is the fallback for the one case that lock cannot cover — a save
+/// whose acquire failed proceeds unguarded rather than losing the user's
+/// attachment, and it is this grace period that then keeps its blobs alive. One
+/// hour is comfortably longer than any such save (the retention worker itself
+/// runs hourly), and a blob that is genuinely garbage is simply collected on the
+/// next pass instead of this one.
 const BLOB_GRACE_SECS: u64 = 60 * 60;
 
 /// Where one message's attachments are stored — an entry per message that has
@@ -166,6 +169,33 @@ pub fn blob_dir(session_path: &Path) -> PathBuf {
 /// The blob directory inside a directory of session files.
 pub fn blob_dir_in(session_dir: &Path) -> PathBuf {
     session_dir.join(BLOB_SUBDIR)
+}
+
+/// Take the exclusive cross-process lock on the blob store under `session_dir`.
+///
+/// Blobs are shared by every session filed under one working directory, and two
+/// hrdr processes can be live in that directory at once. Everything that writes
+/// blobs holds this, and so does the mark-and-sweep collector across *both* of
+/// its phases — which is what stops the collector from observing the gap between
+/// a peer writing a blob and writing the session file that names it.
+///
+/// The lock file is the sibling `<session_dir>/blobs.lock`, not something inside
+/// `blobs/`: a lock file in a directory the sweep enumerates would be needless
+/// confusion, and `blobs/` may not exist yet whereas both callers have already
+/// created the session directory.
+///
+/// **The two sides deliberately differ on failure, and neither is a bug:**
+///
+/// * The collector (`session::collect_blob_garbage`) **skips entirely**.
+///   Its mark set is only trustworthy while nothing else writes here, and
+///   nothing is lost by waiting — the retention worker runs hourly, so the
+///   garbage goes on the next pass.
+/// * A save **proceeds without the guard**. Failing a save because a lock was
+///   contended would cost the user an attachment, or the whole session file —
+///   far worse than the race the lock closes, which [`BLOB_GRACE_SECS`] still
+///   covers as a fallback.
+pub(crate) fn lock_blob_store(session_dir: &Path) -> Result<crate::store_lock::StoreLock> {
+    crate::store_lock::StoreLock::acquire(&blob_dir_in(session_dir))
 }
 
 /// Describe every attachment in `messages`, one entry per message that has any.
@@ -304,13 +334,14 @@ pub fn resolve_attachments(
 /// referenced by every session that survived in that directory — so a blob two
 /// sessions share outlives the one that was purged. A blob written or
 /// re-referenced within [`BLOB_GRACE_SECS`] is spared whatever the mark phase
-/// said, which is what keeps a session saved by another hrdr process mid-sweep
-/// from losing its bytes.
+/// said, which is what keeps the bytes of a save that could not take the store
+/// lock (see [`lock_blob_store`]) from being collected under it.
 ///
 /// Best-effort: an unreadable directory or a failed unlink skips that entry.
-/// **The caller must be sure `keep` is complete** — a caller that could not read
-/// some session in the directory must not call this at all, since an incomplete
-/// mark set turns a live blob into a victim.
+/// **The caller must hold [`lock_blob_store`], and must be sure `keep` is
+/// complete** — a caller that could not read some session in the directory must
+/// not call this at all, since an incomplete mark set turns a live blob into a
+/// victim.
 pub fn sweep_blobs(dir: &Path, keep: &HashSet<String>) {
     let now = hrdr_tools::unix_now();
     let Ok(entries) = std::fs::read_dir(dir) else {

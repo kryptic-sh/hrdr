@@ -649,12 +649,23 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   inlines text files, and `@` is ordinary punctuation in prose a model writes.
   Both feed one builder, so the difference is input rather than a second
   implementation — pinned by `the_two_paths_build_the_same_message`.
-- **The blob store has no lock.** Two hrdr processes and the retention sweeper
-  share `sessions/<cwd-slug>/blobs/` with no coordination. The mark phase is the
-  real protection (a purged session's digests are collected only if no surviving
-  session names them); a 1-hour mtime grace covers the write-between-mark-and-
-  sweep window. If blob loss is ever observed, the honest fix is a lock, not a
-  longer grace.
+- **The blob store's lock can be reaped mid-save on Windows.** The store now
+  takes `attachment_store::lock_blob_store` on both sides — a save holds it
+  across writing blobs and writing the session file, the collector across mark
+  and sweep — so the collector cannot observe the gap between the two. The
+  residual is `store_lock`'s staleness rule: `process_alive` has no
+  dependency-free probe on Windows and reports every pid dead, so a lock held
+  longer than `STALE_LOCK_AGE_SECS` (60s) is reapable there. A credential
+  read-modify-write never approaches that; a save writing tens of megabytes of
+  attachments to a slow filesystem could. The consequence is bounded — the
+  reaped save falls back to `BLOB_GRACE_SECS`, exactly as a save that could not
+  take the lock at all does — so this is a note, not a defect to fix blind. A
+  real Windows probe (or a longer age for this caller) is the fix if it is ever
+  observed.
+- **No cross-process test of the lock.** All four tests hold the guard from the
+  test thread of one process; exclusion between processes rests on `O_EXCL` and
+  on `store_lock`'s own tests. Spawning a second process would need a test
+  binary that can be re-entered, which the suite has no harness for.
 - **Token estimates are charged at Anthropic's high-resolution tier for every
   dialect** (`CHARGED_MAX_EDGE_PX` in `media.rs`). OpenAI uses 32×32 patches
   with its own budgets, so one formula is an approximation either way; the

@@ -875,6 +875,16 @@ impl Session {
         // blobs nothing references (collected by retention) rather than a session
         // referencing blobs that were never written.
         let attachments = crate::attachment_store::attachment_refs(&self.state.messages);
+        // Both halves under the blob store's lock, so a peer's garbage collector
+        // sees either no blob yet or the session that references it, never the
+        // gap between (the guard lives to the end of this function, past the
+        // `write_atomic` below). No attachments → no lock: that save adds
+        // nothing to the collector's mark set, and it is the path taken on every
+        // tool round. Contended → save anyway and fall back to the sweep's grace
+        // window; see `lock_blob_store`.
+        let _blob_lock = (!attachments.is_empty())
+            .then(|| crate::attachment_store::lock_blob_store(&dir).ok())
+            .flatten();
         crate::attachment_store::write_blobs(
             &crate::attachment_store::blob_dir(&path),
             &self.state.messages,
@@ -940,6 +950,16 @@ impl Session {
         // `task_steer` take an `attachments` argument, so a sub-agent's history
         // can hold them whoever sent them.
         let attachments = crate::attachment_store::attachment_refs(&self.state.messages);
+        // Under the blob store's lock across both writes, on the same terms as
+        // `save` — see the note there and on `lock_blob_store`.
+        let _blob_lock = (!attachments.is_empty())
+            .then(|| {
+                crate::attachment_store::lock_blob_store(
+                    path.parent().unwrap_or_else(|| Path::new(".")),
+                )
+                .ok()
+            })
+            .flatten();
         crate::attachment_store::write_blobs(
             &crate::attachment_store::blob_dir(path),
             &self.state.messages,
@@ -1484,11 +1504,19 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
 /// incomplete mark set does not produce a smaller cleanup, it produces deletion
 /// of blobs something still needs — and `sweep_dir` deliberately keeps
 /// unparseable session files rather than deleting them, so this case is real.
+///
+/// **The store's lock is held across mark AND sweep**, so no peer can write a
+/// blob and the session naming it in between the two. A lock we cannot take
+/// means a peer is writing right now, which is exactly when a mark set goes
+/// stale: skip the whole collection, and let the next hourly pass do it.
 fn collect_blob_garbage(dir: &Path) {
     let blobs = crate::attachment_store::blob_dir_in(dir);
     if !blobs.is_dir() {
         return;
     }
+    let Ok(_lock) = crate::attachment_store::lock_blob_store(dir) else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -3233,6 +3261,145 @@ mod tests {
                 "the shared blob still serves the session that survived"
             );
         });
+    }
+
+    // ── attachments: the blob store's cross-process lock ──────────────────────
+
+    /// The GC is exclusive. While a peer holds the store lock it may be mid-save
+    /// — writing a blob, not yet the session file that names it — so a mark set
+    /// built now can miss a live digest. The collection is skipped whole.
+    #[test]
+    fn the_blob_gc_skips_a_locked_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let blobs = crate::attachment_store::blob_dir_in(dir);
+        std::fs::create_dir_all(&blobs).unwrap();
+        let orphan = "a".repeat(64);
+        std::fs::write(blobs.join(&orphan), b"x").unwrap();
+        // Far past the sweep's grace window, so the lock is the only thing that
+        // can spare it — and a lock is what a live peer holds.
+        age_file(&blobs.join(&orphan), 30 * 24 * 60 * 60);
+
+        let held = crate::attachment_store::lock_blob_store(dir).unwrap();
+        collect_blob_garbage(dir);
+        assert!(
+            blobs.join(&orphan).exists(),
+            "no sweeping while the store is locked"
+        );
+
+        // …and the same call collects it once the store is free, so the test
+        // above is passing on the lock and not on a sweep that never works.
+        drop(held);
+        collect_blob_garbage(dir);
+        assert!(
+            !blobs.join(&orphan).exists(),
+            "an unlocked store is collected as before"
+        );
+    }
+
+    /// A contended lock must degrade, never abort: losing the user's attachment
+    /// (or their whole session file) would be far worse than the race the lock
+    /// closes. The save waits out its acquire budget, gives up, and writes.
+    #[test]
+    fn a_save_with_attachments_waits_for_the_lock_then_writes_anyway() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let dir = session_dir(&cwd);
+            std::fs::create_dir_all(&dir).unwrap();
+            let _held = crate::attachment_store::lock_blob_store(&dir).unwrap();
+
+            let started = std::time::Instant::now();
+            Session::new(state_with("Chat", &cwd, vec![png(1, "shot.png")]))
+                .save("att")
+                .unwrap();
+            let elapsed = started.elapsed();
+
+            // A timing assertion, and deliberately a loose one: an acquire that
+            // never succeeds sleeps `LOCK_ACQUIRE_ATTEMPTS` × `LOCK_RETRY_DELAY`
+            // (≈5s in `store_lock`) before giving up, while a save that never
+            // tried for the lock returns in milliseconds. Two seconds sits far
+            // from both ends, so neither a loaded runner (which only ever makes
+            // the contended case slower) nor a fast one can cross it.
+            assert!(
+                elapsed >= std::time::Duration::from_secs(2),
+                "the save contended for the blob lock, taking {elapsed:?}"
+            );
+            assert!(
+                session_file_path(&cwd, "att").exists(),
+                "the session file still landed"
+            );
+            assert_eq!(
+                blobs_in(&cwd),
+                vec![crate::AttachmentRef::of(&png(1, "shot.png")).sha256],
+                "and so did its blob"
+            );
+        });
+    }
+
+    /// The overwhelmingly common save — no attachments at all, once per tool
+    /// round — contributes nothing to the GC's mark set and must not pay for the
+    /// lock. Nothing in the filesystem can show a lock that was never taken, so
+    /// the observable is time: this save cannot have waited on the held lock.
+    #[test]
+    fn a_save_without_attachments_does_not_take_the_lock() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let dir = session_dir(&cwd);
+            std::fs::create_dir_all(&dir).unwrap();
+            let _held = crate::attachment_store::lock_blob_store(&dir).unwrap();
+
+            let started = std::time::Instant::now();
+            Session::new(state("Chat", &cwd)).save("plain").unwrap();
+            let elapsed = started.elapsed();
+
+            // The same timing assertion from the other side (see the note there):
+            // one second is a fifth of the ≈5s a contended acquire would burn, and
+            // twenty times what writing a one-message session costs.
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "no lock was waited on, taking {elapsed:?}"
+            );
+            assert!(session_file_path(&cwd, "plain").exists());
+        });
+    }
+
+    /// A sub-agent's snapshot goes through `save_to_path`, which owns a second
+    /// copy of the guard — and locks the store beside the file it is writing, not
+    /// the file itself. Same contract as `save`: it waits, then writes regardless.
+    #[test]
+    fn save_to_path_locks_the_blob_store_beside_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subagents").join("child");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let _held = crate::attachment_store::lock_blob_store(&dir).unwrap();
+
+        let started = std::time::Instant::now();
+        Session::new(state_with("Child", "/tmp", vec![png(3, "shot.png")]))
+            .save_to_path(&path)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        // Timing again, and for the same reason (see the note in
+        // `a_save_with_attachments_waits_for_the_lock_then_writes_anyway`): it is
+        // the only way to tell a lock that was taken from one that was not.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "it contended for the store beside the file, taking {elapsed:?}"
+        );
+        assert!(path.exists(), "the snapshot still landed");
+        assert!(
+            crate::attachment_store::blob_dir(&path)
+                .join(crate::AttachmentRef::of(&png(3, "shot.png")).sha256)
+                .exists(),
+            "and so did its blob"
+        );
     }
 
     /// A session file the sweep cannot parse may reference anything, so the GC
