@@ -126,6 +126,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     both err high, because an estimate that runs low is the one that lets a
     request overflow the window. The figure is computed once, when the
     attachment is built.
+  - **The main agent can delegate them, not just describe them.** `task` and
+    `task_steer` take an `attachments` argument — a list of image/PDF paths —
+    and the named files land on the sub-agent's opening message (or on the
+    steer) as bytes, labelled the same way the user's `@shot.png` is. So a main
+    agent handed a screenshot of the failure can pass the screenshot to the
+    sub-agent that fixes it, instead of retelling it in prose. The harness reads
+    the paths on the model's behalf through the same reader the `@` path uses
+    (`hrdr_tools::read_attach_media`: leading bytes, never the extension, and
+    secret files refused) and through the same sandbox check the `read` tool
+    applies, so a confined agent gains no reach it did not have. Everything that
+    could go wrong is answered in the tool result, before a sub-agent is
+    spawned: a missing, unreadable or wrong-typed path, a file over
+    `max_attachment_bytes`, or an image bound for a sub-agent whose model takes
+    no image input — that last checked against the model the delegation resolved
+    to, which `task`'s own `model` argument may have changed. A call with no
+    `attachments` behaves exactly as before.
 - **`max_attachment_bytes` — the per-attachment size ceiling is configurable**
   (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
   limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64

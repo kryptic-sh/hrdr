@@ -24,11 +24,17 @@ Delegating with `task`:
   task already covers what you are about to do, wait for its result instead of
   racing it.
 - A sub-agent starts fresh. It CANNOT see this conversation or anything you have
-  figured out — it gets only its own system prompt and the `prompt` you send. It
-  can inspect any file in the working directory, including your uncommitted
-  work, because it shares that directory with you. Put the goal, relevant paths,
-  constraints, and exactly what to report in the prompt. A vague prompt gets a
-  vague result.
+  figured out — it gets only its own system prompt, the `prompt` you send, and
+  the files you list in `attachments`. It can inspect any file in the working
+  directory, including your uncommitted work, because it shares that directory
+  with you. Put the goal, relevant paths, constraints, and exactly what to
+  report in the prompt. A vague prompt gets a vague result.
+- IF THE WORK IS ABOUT A PICTURE, SEND THE PICTURE. `task` and `task_steer` both
+  take `attachments`: a list of image or PDF paths the sub-agent SEES, exactly
+  as you see one attached to a message. A screenshot of the failure, a design
+  mock, a scanned spec — attach it. Your prose description of an image is a
+  lossy retelling, and it is the only thing a sub-agent gets when you leave the
+  file out; a screenshot you were sent is one you can pass on.
 - A sub-agent spawns already inside YOUR working directory, so a brief needs
   only project-relative paths (`crates/foo/src/bar.rs`); it never needs a full
   path, and you never need to tell it to `cd`.

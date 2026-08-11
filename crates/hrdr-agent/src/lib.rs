@@ -898,6 +898,48 @@ impl Steer {
         self.attachments = attachments;
         self
     }
+
+    /// The same message carrying `attachments`, with the block that NAMES them
+    /// appended to `sent` — for a caller that has bytes and no text mentioning
+    /// them.
+    ///
+    /// Every dialect renders attachments *before* the message text, so without
+    /// this block the receiving model is shown pictures with nothing tying them
+    /// to file names, and "the screenshot" in the brief has no referent it can
+    /// resolve. Numbered per kind ("Image 1", "Document 1"), matching the order
+    /// the blocks render in.
+    ///
+    /// `display` is left alone: it is what a human wrote (or, for a delegation,
+    /// what the model wrote), and a frontend showing them the label block would
+    /// be showing them text they did not write.
+    ///
+    /// **`hrdr_app::Outgoing::labels` renders this same block** for the user's
+    /// own `@shot.png` path and predates this method. It lives a crate above, so
+    /// it can call this and this cannot call it; repointing it here is what stops
+    /// the two spellings drifting, and until that happens the format is written
+    /// twice.
+    pub fn with_labelled_attachments(
+        mut self,
+        attachments: Vec<hrdr_llm::media::Attachment>,
+    ) -> Self {
+        if attachments.is_empty() {
+            return self;
+        }
+        self.sent.push_str("\n\n--- Attached files ---\n");
+        let (mut images, mut docs) = (0, 0);
+        for a in &attachments {
+            let label = if a.media_type().is_image() {
+                images += 1;
+                format!("Image {images}")
+            } else {
+                docs += 1;
+                format!("Document {docs}")
+            };
+            self.sent.push_str(&format!("{label}: {}\n", a.filename()));
+        }
+        self.attachments = attachments;
+        self
+    }
 }
 
 /// Current time in epoch milliseconds.
@@ -1641,6 +1683,7 @@ impl Agent {
             // cheaper to reason about and likelier to work.
             tools.register(Arc::new(SteerTool {
                 live: registry.clone(),
+                max_attachment_bytes: config.max_attachment_bytes,
             }));
             tools.register(Arc::new(TaskCancelTool {
                 bg_handles: Arc::clone(&bg_handles),
@@ -13241,6 +13284,96 @@ mod tests {
             assert!(
                 prompt.len() - "fix the keymap".len() <= crate::delegation::WORKSPACE_MAP_MAX + 2,
                 "and it stays within the cap: {prompt}"
+            );
+        }
+
+        /// **A delegated sub-agent SEES the image it was handed.** The whole
+        /// point of the model-facing `attachments` argument: the file the parent
+        /// named is read, put on the sub-agent's opening user message as bytes
+        /// (not as a description of bytes), labelled so the sub-agent can tell
+        /// which file it is looking at — and persisted with that message, so the
+        /// snapshot beside its transcript loads back carrying the same image.
+        ///
+        /// Asserted on the sibling `<stem>.json` because that is the sub-agent's
+        /// own model-facing history round-tripped through the real save/load
+        /// path: it proves both that the message carried the attachment and that
+        /// a resume gets it back.
+        #[tokio::test]
+        async fn a_delegated_subagent_is_handed_the_image_it_was_given() {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "I see it"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.resize(bytes.len() + 64, 7);
+            std::fs::write(cwd.path().join("shot.png"), &bytes).unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            tool.execute(
+                json!({
+                    "prompt": "what is wrong in this screenshot?",
+                    "description": "probe",
+                    "attachments": ["shot.png"],
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let result = await_background(&tool, &ctx).await;
+            assert!(result.contains("I see it"), "delivered: {result}");
+
+            let json_path = std::fs::read_dir(ts_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .expect("a sibling <stem>.json state file was written");
+            let session = crate::Session::load_path(&json_path).expect("the snapshot loads back");
+            assert!(
+                session.state.attachment_losses.is_empty(),
+                "nothing was lost on the way back: {:?}",
+                session.state.attachment_losses
+            );
+            let opening = session
+                .state
+                .messages
+                .iter()
+                .find(|m| m.role == hrdr_llm::Role::User)
+                .expect("the sub-agent's opening user message");
+            assert_eq!(
+                opening.attachments.len(),
+                1,
+                "the image is ON the message, not described in it: {opening:?}"
+            );
+            assert_eq!(opening.attachments[0].filename(), "shot.png");
+            assert_eq!(
+                opening.attachments[0].media_type(),
+                hrdr_llm::media::MediaType::Png
+            );
+            assert_eq!(
+                opening.attachments[0].bytes(),
+                bytes.as_slice(),
+                "the same bytes that were on disk"
+            );
+            let text = opening.content.as_deref().unwrap_or_default();
+            // The brief comes first (behind the timestamp every user message
+            // carries), the label block after it.
+            let brief = text
+                .find("what is wrong in this screenshot?")
+                .expect("the brief is in the message");
+            assert!(
+                brief < text.find("--- Attached files ---").unwrap_or(usize::MAX),
+                "the brief comes before the label block: {text}"
+            );
+            assert!(
+                text.contains("Image 1: shot.png"),
+                "and the image is named, since every dialect renders it before the text: {text}"
             );
         }
 

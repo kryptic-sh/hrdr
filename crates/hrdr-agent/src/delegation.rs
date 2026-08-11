@@ -173,10 +173,131 @@ impl RunSnapshot {
     }
 }
 
+/// The JSON schema entry both `task` and `task_steer` publish for their
+/// `attachments` argument — one spelling, so a model that learned it on one has
+/// learned it on the other.
+fn attachments_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional image/PDF files to hand the sub-agent, by path (relative to your working directory, or absolute). It SEES them, exactly as you see an image you were sent — so pass the screenshot of the failure, the design mock, the scanned spec, instead of describing it. Only real PNG/JPEG/GIF/WebP images and PDFs qualify, decided by the file's bytes and never its extension; anything else is text the sub-agent can `read` itself. A path that is missing, unreadable, of another type, too large, or that the sub-agent's model cannot see fails this call and starts nothing — fix it and call again."
+    })
+}
+
+/// The `attachments` argument, read off disk into the images/PDFs a delegated
+/// message will carry.
+///
+/// The model can only name paths — it has no way to hand over bytes — so the
+/// reading happens here on its behalf, and therefore under the same guards its
+/// own `read` tool passes:
+///
+/// * [`hrdr_tools::ToolContext::resolve_read`] answers the sandbox, so a jailed
+///   agent can attach only what it may read. Without it this would be a second,
+///   unguarded way to get a file's contents in front of a model.
+/// * [`hrdr_tools::read_attach_media`] refuses secret/credential files and
+///   decides the type by leading bytes rather than extension. It is the same
+///   function an `@shot.png` mention goes through, which is what makes a file
+///   attached by the model and the same file attached by the user the same
+///   [`Attachment`](hrdr_llm::media::Attachment) — one reader, no second
+///   spelling of what "attachable" means.
+///
+/// The whole set then goes through the REAL request gate
+/// ([`hrdr_llm::media::check_attachments`]), called with what the receiving
+/// sub-agent's own client will call it with: its model, that model's input
+/// modalities, and the configured per-attachment ceiling. So an oversized PDF or
+/// an image bound for a text-only sub-agent is refused HERE, in a tool result the
+/// model reads and can act on, instead of several rounds later when the
+/// sub-agent's first request is built and the run dies with nothing done. No
+/// limit is restated: the check is a call to the gate that would have judged it.
+///
+/// All-or-nothing, and before anything is spawned: a sub-agent briefed to look at
+/// a screenshot it was never handed does the wrong work confidently, and this
+/// error is the last place that can still say so.
+fn attachments_arg(
+    args: &serde_json::Value,
+    ctx: &hrdr_tools::ToolContext,
+    model: &str,
+    max_attachment_bytes: Option<usize>,
+) -> Result<Vec<hrdr_llm::media::Attachment>> {
+    // Cache-only, provider-agnostic: the same lookup
+    // `hrdr_llm::Client::check_attachments` makes when it builds the sub-agent's
+    // first request, so this refuses exactly what that would refuse and no more
+    // — a model the catalog has never heard of is allowed through on both paths.
+    let accepts = hrdr_llm::catalog::input_modalities_cached(None, model);
+    attachments_arg_against(args, ctx, model, accepts.as_deref(), max_attachment_bytes)
+}
+
+/// [`attachments_arg`] with the receiving model's input modalities already in
+/// hand.
+///
+/// Split out for the tests, which have no other way in: the catalog those
+/// modalities come from is pinned by a process-global env var
+/// (`HRDR_MODELS_PATH`), so a test that seeded one would change what every other
+/// test in the binary reads from it.
+fn attachments_arg_against(
+    args: &serde_json::Value,
+    ctx: &hrdr_tools::ToolContext,
+    model: &str,
+    accepts: Option<&[String]>,
+    max_attachment_bytes: Option<usize>,
+) -> Result<Vec<hrdr_llm::media::Attachment>> {
+    let Some(value) = args.get("attachments").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`attachments` takes an array of file paths, e.g. [\"docs/shot.png\"] — got {value}"
+        )
+    })?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let path = item
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "every `attachments` entry is one file path, e.g. [\"docs/shot.png\"] — got {item}"
+                )
+            })?;
+        // The sandbox first: this must not reach a file the `read` tool would
+        // refuse this agent.
+        ctx.resolve_read(path)?;
+        match hrdr_tools::read_attach_media(path, &ctx.cwd) {
+            Ok(Some(attachment)) => out.push(attachment),
+            Ok(None) => bail!(
+                "can't attach {path}: its leading bytes are not PNG, JPEG, GIF, WebP or PDF (the \
+                 extension is never consulted). Only those five can be attached — put anything \
+                 else in `prompt`, or name the path there and let the sub-agent `read` it."
+            ),
+            Err(e) => bail!("can't attach {path}: {e:#}"),
+        }
+    }
+    if !out.is_empty() {
+        let mut probe = hrdr_llm::ChatMessage::user("");
+        probe.attachments = out.clone();
+        hrdr_llm::media::check_attachments(
+            model,
+            accepts,
+            std::slice::from_ref(&probe),
+            max_attachment_bytes,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "can't attach that to a sub-agent on {model}: {e}. Nothing was started — drop \
+                 that file from `attachments` (describe it in `prompt` instead), or run the \
+                 sub-agent on a model that takes it."
+            )
+        })?;
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_background(
     cfg: AgentConfig,
     prompt: String,
+    attachments: Vec<hrdr_llm::media::Attachment>,
     label: String,
     tool_id: Option<String>,
     slot: SubagentSlot,
@@ -299,6 +420,11 @@ async fn spawn_background(
         path: transcript_path.as_ref().map(|p| p.with_extension("json")),
         ..snapshot
     };
+    // The run's opening message, whole: the brief plus whatever images or PDFs
+    // the delegating agent attached to it, labelled so the sub-agent can tell
+    // which file each one is. Built once here so the transcript's `Start` frame
+    // records the same text the model is actually handed.
+    let opening = crate::Steer::plain(prompt).with_labelled_attachments(attachments);
     // The `Start` frame is written synchronously here, BEFORE the run task is
     // spawned, so it precedes every event `record` appends for the run.
     if let Some(ts) = &transcript
@@ -307,7 +433,7 @@ async fn spawn_background(
         t.write(&transcript_log::Record::Start {
             model: model_for_live.clone(),
             label: label.clone(),
-            prompt: prompt.clone(),
+            prompt: opening.sent.clone(),
         });
     }
     if let Ok(mut v) = registry.lock() {
@@ -359,7 +485,7 @@ async fn spawn_background(
                 // pushes it into history — so its record opens with the question and
                 // not just the answer, exactly as a steered follow-up turn does.
                 let generation = live.begin_turn(live_key);
-                live.enqueue(live_key, crate::Steer::plain(prompt));
+                live.enqueue(live_key, opening);
                 let _run_guard = RunGuard::new(live.clone(), live_key, generation);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
@@ -1078,8 +1204,9 @@ impl SubagentTool {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
             "Delegate a self-contained sub-task to a fresh sub-agent with its own context. It \
-             CANNOT see this conversation or anything you know — it gets only its system prompt \
-             and the `prompt` you pass — so make `prompt` complete and standalone. Use it to \
+             CANNOT see this conversation or anything you know — it gets only its system prompt, \
+             the `prompt` you pass and the files you list in `attachments` — so make `prompt` \
+             complete and standalone, and attach the picture rather than describing it. Use it to \
              keep the main context clean: broad exploration, or a focused piece of \
              implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
              but can't itself delegate. Every task runs in the **background**: this call returns \
@@ -1217,6 +1344,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 "description": "Optional model override, named as `provider://model` or as a bare model id. A bare id (`gpt-5.5-mini`, `deepseek/deepseek-chat`) is that model on the provider you are already on. A `provider://model` (`openrouter://deepseek/deepseek-chat`) also switches the provider — it must be one that is configured and authenticated (a built-in name or a [providers.*] entry); `provider://` on its own uses that provider's configured default model. Defaults to the profile's / configured subagent model, else the main model."
             }
         });
+        props["attachments"] = attachments_schema();
         if !self.profiles.is_empty() {
             let names: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
             props["agent"] = serde_json::json!({
@@ -1365,6 +1493,13 @@ impl hrdr_tools::Tool for SubagentTool {
             .unwrap_or("sub-task")
             .to_string();
 
+        // Read the attached files now — before a slot is taken and before
+        // anything is spawned — and judge them against the model this delegation
+        // actually resolved to. A refusal here costs the parent one tool result;
+        // the same refusal at the sub-agent's first request costs a slot, a run,
+        // and several rounds before the parent learns why.
+        let attachments = attachments_arg(&args, ctx, cfg.model.model(), cfg.max_attachment_bytes)?;
+
         // Every task runs **detached**: spawn and return immediately so the
         // sub-agent never blocks the main conversation. The run loop delivers its
         // result when it lands (the frontend shows live progress). There is no
@@ -1439,6 +1574,7 @@ impl hrdr_tools::Tool for SubagentTool {
         let ack = spawn_background(
             cfg,
             prompt,
+            attachments,
             label,
             ctx.call_id.clone(),
             slot,
@@ -1605,6 +1741,14 @@ fn workspace_members(root: &std::path::Path) -> Option<Vec<String>> {
 
 pub(crate) struct SteerTool {
     pub(crate) live: AgentRegistry,
+    /// The configured per-attachment ceiling
+    /// ([`AgentConfig::max_attachment_bytes`](crate::AgentConfig::max_attachment_bytes)),
+    /// so a steer's attachments meet the same gate the sub-agent's own client
+    /// will apply. Held here because a running sub-agent's `Agent` (and so its
+    /// client) is locked for the whole run — the one state a steer is ever sent
+    /// in — and every sub-agent inherits this value from the session's config
+    /// anyway.
+    pub(crate) max_attachment_bytes: Option<usize>,
 }
 
 #[async_trait::async_trait]
@@ -1613,7 +1757,8 @@ impl hrdr_tools::Tool for SteerTool {
         "task_steer"
     }
     fn description(&self) -> &'static str {
-        "Give additional instructions to a running background sub-agent. The message is queued \
+        "Give additional instructions — and, with `attachments`, images or PDFs — to a running \
+         background sub-agent. The message is queued \
          on the sub-agent's active turn and reaches it before its next model request; if its current \
          response finishes first, the retained sub-agent starts a follow-up turn with the message. \
          Use the task id `task` returned when it started the run; finished or unknown tasks cannot \
@@ -1624,7 +1769,8 @@ impl hrdr_tools::Tool for SteerTool {
             "type": "object",
             "properties": {
                 "id": { "type": "integer", "description": "The running task id, as returned by `task`." },
-                "prompt": { "type": "string", "description": "Additional instructions for the sub-agent." }
+                "prompt": { "type": "string", "description": "Additional instructions for the sub-agent." },
+                "attachments": attachments_schema()
             },
             "required": ["id", "prompt"]
         })
@@ -1635,7 +1781,7 @@ impl hrdr_tools::Tool for SteerTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &hrdr_tools::ToolContext,
+        ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
         let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1649,7 +1795,24 @@ impl hrdr_tools::Tool for SteerTool {
             .and_then(|v| v.as_str())
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("task_steer needs a non-empty `prompt`"))?;
-        let queued = self.live.with(|entries| {
+        // The model this steer is headed for, so its attachments are judged
+        // against the sub-agent's own model rather than the parent's — they can
+        // differ, `task` takes a `model` argument. An id naming nothing skips the
+        // read entirely: the `queued` match below has the right thing to say
+        // about it, and a file error about a task that does not exist would send
+        // the model off fixing the wrong problem.
+        let model = self.live.with(|entries| {
+            entries
+                .iter()
+                .find(|e| e.bg_id == Some(id))
+                .map(|e| e.model.clone())
+        });
+        let attachments = match &model {
+            Some(model) => attachments_arg(&args, ctx, model, self.max_attachment_bytes)?,
+            None => Vec::new(),
+        };
+        let message = Steer::plain(prompt).with_labelled_attachments(attachments);
+        let queued = self.live.with(move |entries| {
             let entry = entries.iter().find(|e| e.bg_id == Some(id))?;
             if !entry.running {
                 return Some(false);
@@ -1658,7 +1821,7 @@ impl hrdr_tools::Tool for SteerTool {
                 .steering
                 .lock()
                 .ok()
-                .map(|mut queue| queue.push_back(Steer::plain(prompt)))?;
+                .map(|mut queue| queue.push_back(message))?;
             Some(true)
         });
         match queued {
@@ -2320,6 +2483,470 @@ mod scoped_cwd_tests {
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
         assert!(err.contains("your own working directory"), "{err}");
+    }
+}
+
+/// What the model may hand a sub-agent: the `attachments` argument on `task`
+/// and `task_steer`, and every way it can be refused.
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use hrdr_tools::Tool;
+
+    /// A real PNG header plus filler, so the byte sniffer accepts it and the
+    /// size is ours to choose.
+    fn png_bytes(pad: usize) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.resize(v.len() + pad, 0);
+        v
+    }
+
+    /// A `task` tool over `cfg`, built the way `Agent::new` builds one.
+    fn task_tool(cfg: AgentConfig) -> SubagentTool {
+        let runtime = crate::new_delegation_runtime(&cfg, &crate::ResolvedModel::from_config(&cfg));
+        SubagentTool::new(
+            cfg,
+            runtime,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(0.0f64)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            None,
+            AgentRegistry::new(),
+        )
+    }
+
+    /// A config that will spawn read-only sub-agents in `cwd` on a named model.
+    fn cfg_in(cwd: &std::path::Path) -> AgentConfig {
+        AgentConfig {
+            model: "openai://gpt-main".parse().expect("a model ref"),
+            cwd: cwd.to_path_buf(),
+            read_only: true,
+            ..Default::default()
+        }
+    }
+
+    /// Every way an `attachments` entry can be unusable, refused with a message
+    /// that names the path and what was wrong with it — and, in every case, with
+    /// **nothing spawned**. A sub-agent briefed to look at a picture it was never
+    /// handed does the wrong work confidently; the tool error is the last place
+    /// that can still say so, so it has to be legible enough to correct.
+    #[tokio::test]
+    async fn a_file_that_cannot_be_attached_fails_the_call_and_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "plain text").unwrap();
+        std::fs::write(dir.path().join("liar.png"), "not a png at all").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let tool = task_tool(cfg_in(dir.path()));
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        // (path or JSON value, the substrings the model must be told)
+        let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
+            // Missing.
+            (
+                serde_json::json!(["gone.png"]),
+                vec!["can't attach gone.png", "can't open", "gone.png"],
+            ),
+            // A real file, but not a type that can be attached — and the reason
+            // says the extension was never the question.
+            (
+                serde_json::json!(["notes.txt"]),
+                vec![
+                    "can't attach notes.txt",
+                    "not PNG, JPEG, GIF, WebP or PDF",
+                    "extension is never consulted",
+                ],
+            ),
+            // …including one whose name claims otherwise.
+            (
+                serde_json::json!(["liar.png"]),
+                vec!["can't attach liar.png", "leading bytes"],
+            ),
+            // A secret file is refused here exactly as `read` refuses it.
+            (
+                serde_json::json!([".env"]),
+                vec![
+                    "can't attach .env",
+                    "secret/credential files are off-limits",
+                ],
+            ),
+            // The wrong shape entirely.
+            (
+                serde_json::json!("shot.png"),
+                vec!["`attachments` takes an array of file paths"],
+            ),
+            (
+                serde_json::json!([""]),
+                vec!["every `attachments` entry is one file path"],
+            ),
+            (
+                serde_json::json!([7]),
+                vec!["every `attachments` entry is one file path"],
+            ),
+        ];
+
+        for (attachments, expected) in cases {
+            let err = tool
+                .execute(
+                    serde_json::json!({"prompt": "look", "attachments": attachments}),
+                    &ctx,
+                )
+                .await
+                .expect_err("an unusable attachment must fail the call")
+                .to_string();
+            for want in expected {
+                assert!(err.contains(want), "{attachments}: {err}");
+            }
+            assert_eq!(
+                tool.bg_handles.lock().unwrap().len(),
+                0,
+                "{attachments}: nothing may be spawned when the attachment is refused"
+            );
+            assert!(
+                ctx.background_tasks.lock().unwrap().is_empty(),
+                "{attachments}: and no task row is left behind"
+            );
+        }
+    }
+
+    /// **The attach path is a read path, so the sandbox judges it.** A jailed
+    /// agent may attach only what it may read, enforced through the same
+    /// `resolve_read` the `read` tool calls — otherwise this argument would be a
+    /// second way to get a confined agent's forbidden file in front of a model.
+    ///
+    /// Jail strips `task` and `task_steer` from the tool set today
+    /// (`cap_to_jail_set`), so no jailed agent can reach this in production. That
+    /// is what makes the check cheap to keep and expensive to leave out: it is
+    /// the difference between the confinement holding by construction and holding
+    /// only for as long as nobody grants a jailed agent a `task`.
+    #[test]
+    fn a_confined_agent_can_attach_only_what_it_may_read() {
+        let root = tempfile::tempdir().unwrap();
+        let root = hrdr_tools::canonicalize_nearest(root.path());
+        let inside = root.join("audited");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("in.png"), png_bytes(32)).unwrap();
+        std::fs::write(root.join("out.png"), png_bytes(32)).unwrap();
+
+        let mut ctx = hrdr_tools::ToolContext::new(&inside);
+        ctx.sandbox = Arc::new(hrdr_tools::SandboxPolicy::for_agent(
+            hrdr_tools::SandboxMode::Jail,
+            &inside,
+            &[],
+        ));
+
+        // Inside its readable root: attached.
+        let ok = attachments_arg(
+            &serde_json::json!({"attachments": ["in.png"]}),
+            &ctx,
+            "some-model",
+            None,
+        )
+        .expect("a file inside the jail attaches");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].filename(), "in.png");
+
+        // One directory up: refused, with the sandbox's own words.
+        let err = attachments_arg(
+            &serde_json::json!({"attachments": ["../out.png"]}),
+            &ctx,
+            "some-model",
+            None,
+        )
+        .expect_err("a jailed agent must not attach outside its readable roots")
+        .to_string();
+        assert!(err.contains("sandbox: refusing to read"), "{err}");
+
+        // And the same file is attachable by an unconfined agent — proving the
+        // refusal above is the sandbox talking, not a broken path.
+        let ctx = hrdr_tools::ToolContext::new(&inside);
+        assert_eq!(
+            attachments_arg(
+                &serde_json::json!({"attachments": ["../out.png"]}),
+                &ctx,
+                "some-model",
+                None,
+            )
+            .expect("unconfined, it reads fine")
+            .len(),
+            1
+        );
+    }
+
+    /// **The size ceiling is checked before anything is spawned**, by calling the
+    /// very gate the sub-agent's own request would hit — so the model learns
+    /// about its 40 MB PDF from this tool result, not from a run that dies at its
+    /// first request several rounds later.
+    #[tokio::test]
+    async fn an_oversized_attachment_is_refused_before_the_sub_agent_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.png"), png_bytes(4096)).unwrap();
+        let mut cfg = cfg_in(dir.path());
+        // The user's own ceiling, in base64 bytes — well under the file.
+        cfg.max_attachment_bytes = Some(512);
+        let tool = task_tool(cfg);
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt": "look", "attachments": ["big.png"]}),
+                &ctx,
+            )
+            .await
+            .expect_err("over the configured ceiling")
+            .to_string();
+        assert!(err.contains("big.png"), "{err}");
+        assert!(
+            err.contains("over the 512-byte per-attachment limit"),
+            "the gate's own words, naming the configured value: {err}"
+        );
+        assert!(
+            err.contains("Nothing was started"),
+            "and the model is told the delegation did not happen: {err}"
+        );
+        assert!(
+            tool.bg_handles.lock().unwrap().is_empty(),
+            "which is only true because it did not"
+        );
+
+        // The same file with no ceiling configured: fine.
+        let tool = task_tool(cfg_in(dir.path()));
+        assert!(
+            attachments_arg(
+                &serde_json::json!({"attachments": ["big.png"]}),
+                &ctx,
+                tool.base.model.model(),
+                None,
+            )
+            .is_ok(),
+            "the refusal above was the ceiling, not the file"
+        );
+    }
+
+    /// **A sub-agent may run a different model from yours, and it might not have
+    /// eyes.** `task` takes a `model` argument, so an image can be delegated to
+    /// a text-only model — which the request gate would refuse when the run
+    /// makes its first request, by which point a slot is taken, a run is
+    /// started, and the parent hears about it several rounds later as a failed
+    /// task. Asked and answered here instead, against the model the delegation
+    /// actually resolved to, where the parent can pick another model or drop the
+    /// file.
+    ///
+    /// The refusal is the gate's own, so it cannot be stricter than the request:
+    /// a model whose modalities nothing knows (`None` — no catalog cached, or an
+    /// endpoint the catalog has never heard of) is allowed through here exactly
+    /// as it is allowed through there.
+    #[test]
+    fn an_image_bound_for_a_text_only_sub_agent_is_refused_at_delegation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+        let args = serde_json::json!({"attachments": ["shot.png"]});
+
+        let text_only = ["text".to_string()];
+        let err = attachments_arg_against(&args, &ctx, "eyeless-1", Some(&text_only), None)
+            .expect_err("a text-only sub-agent cannot be shown a picture")
+            .to_string();
+        assert!(
+            err.contains("model eyeless-1 does not accept image/png input"),
+            "named, so the parent knows which model to change: {err}"
+        );
+        assert!(
+            err.contains("Nothing was started"),
+            "and that the delegation did not happen: {err}"
+        );
+
+        // A model that DOES take images, and one nothing knows about: both fine.
+        let sighted = ["text".to_string(), "image".to_string()];
+        assert!(attachments_arg_against(&args, &ctx, "eyed-1", Some(&sighted), None).is_ok());
+        assert!(
+            attachments_arg_against(&args, &ctx, "who-knows", None, None).is_ok(),
+            "an unlisted model is allowed through here exactly as at the request gate"
+        );
+    }
+
+    /// A running sub-agent can be handed a picture mid-run: `task_steer` reads
+    /// the file and queues it on the very queue that agent's `run` is draining,
+    /// labelled so the sub-agent can tell which file it is looking at.
+    #[tokio::test]
+    async fn a_steer_carries_its_attachments_to_the_running_sub_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
+        let live = AgentRegistry::new();
+        let key = AgentRegistry::next_key();
+        live.register(crate::AgentEntry {
+            key,
+            bg_id: Some(42),
+            tool_id: None,
+            label: "probe".to_string(),
+            model: "some-model".to_string(),
+            provider: None,
+            base_url: String::new(),
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            sandbox: hrdr_tools::SandboxMode::None,
+            todos: Default::default(),
+            usage: crate::AgentUsage::default(),
+            events: registry::event_log(),
+            reasoning_open: false,
+            pending_notices: Vec::new(),
+            turn: TurnStats::default(),
+            agent: Arc::new(tokio::sync::Mutex::new(
+                Agent::new(AgentConfig::default()).unwrap(),
+            )),
+            steering: steering_queue(),
+            running: true,
+            compacting: false,
+            done: false,
+            delivered: false,
+            pinned: false,
+            transcript: None,
+        });
+        let tool = SteerTool {
+            live: live.clone(),
+            max_attachment_bytes: None,
+        };
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        let ack = tool
+            .execute(
+                serde_json::json!({"id": 42, "prompt": "here is the failure", "attachments": ["shot.png"]}),
+                &ctx,
+            )
+            .await
+            .expect("the steer is queued");
+        assert!(ack.contains("Steered background task #42"), "{ack}");
+
+        let queued = live.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.steering.lock().ok().and_then(|mut q| q.pop_front()))
+                .expect("the message reached the sub-agent's queue")
+        });
+        assert_eq!(queued.attachments.len(), 1);
+        assert_eq!(queued.attachments[0].filename(), "shot.png");
+        assert_eq!(
+            queued.attachments[0].media_type(),
+            hrdr_llm::media::MediaType::Png
+        );
+        assert!(
+            queued.sent.starts_with("here is the failure"),
+            "the brief comes first: {:?}",
+            queued.sent
+        );
+        assert!(
+            queued.sent.contains("Image 1: shot.png"),
+            "and the image is named, since every dialect renders it before the text: {:?}",
+            queued.sent
+        );
+    }
+
+    /// An id naming nothing is answered as an id problem, even when the call
+    /// also names a file that could never be attached. Reading the file first
+    /// would send the model off fixing a path for a task that does not exist.
+    #[tokio::test]
+    async fn steering_an_unknown_task_reports_the_id_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SteerTool {
+            live: AgentRegistry::new(),
+            max_attachment_bytes: None,
+        };
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        let err = tool
+            .execute(
+                serde_json::json!({"id": 7, "prompt": "hi", "attachments": ["gone.png"]}),
+                &ctx,
+            )
+            .await
+            .expect_err("no such task")
+            .to_string();
+        assert!(err.contains("no background task #7"), "{err}");
+        assert!(!err.contains("gone.png"), "not a file error: {err}");
+    }
+
+    /// **Parity with the user's own path.** A file the model attaches through
+    /// `task` and the same file the user attaches by typing `@shot.png` are one
+    /// `Attachment`, because both go through `hrdr_tools::read_attach_media` —
+    /// there is no second answer to "what is attachable" and no second reader.
+    /// The label line is the same too, and is asserted here in the exact form
+    /// `hrdr_tui`'s `an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent`
+    /// asserts for the typed path.
+    ///
+    /// The user's half of that comparison lives two crates up (`hrdr_app`'s
+    /// `expand_mentions_tracked`), which cannot be called from here; what this
+    /// pins is that the model's path adds no transformation of its own to the
+    /// shared reader's answer.
+    #[test]
+    fn the_model_attaches_a_file_exactly_as_the_user_does() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), png_bytes(64)).unwrap();
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+
+        // What an `@shot.png` mention produces.
+        let theirs = hrdr_tools::read_attach_media("shot.png", dir.path())
+            .unwrap()
+            .expect("a png");
+        // What `attachments: ["shot.png"]` produces.
+        let mine = attachments_arg(
+            &serde_json::json!({"attachments": ["shot.png"]}),
+            &ctx,
+            "some-model",
+            None,
+        )
+        .expect("attached");
+
+        assert_eq!(mine, vec![theirs], "one file, one attachment, either way");
+        assert_eq!(
+            crate::Steer::plain("brief")
+                .with_labelled_attachments(mine)
+                .sent,
+            "brief\n\n--- Attached files ---\nImage 1: shot.png\n",
+            "and labelled in the form the user's path uses"
+        );
+    }
+
+    /// A call with no `attachments` is the call it always was: no argument, a
+    /// null one and an empty list all produce nothing, and nothing is appended
+    /// to the brief.
+    #[test]
+    fn a_delegation_with_no_attachments_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = hrdr_tools::ToolContext::new(dir.path());
+        for args in [
+            serde_json::json!({"prompt": "p"}),
+            serde_json::json!({"prompt": "p", "attachments": null}),
+            serde_json::json!({"prompt": "p", "attachments": []}),
+        ] {
+            assert!(
+                attachments_arg(&args, &ctx, "some-model", None)
+                    .expect("no attachments is not an error")
+                    .is_empty(),
+                "{args}"
+            );
+        }
+        assert_eq!(
+            crate::Steer::plain("p").with_labelled_attachments(Vec::new()),
+            crate::Steer::plain("p"),
+            "no attachments, no label block"
+        );
+    }
+
+    /// Both tools publish the same argument, so a model that learned it on one
+    /// has learned it on the other.
+    #[test]
+    fn task_and_task_steer_declare_the_same_attachments_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = task_tool(cfg_in(dir.path()));
+        let steer = SteerTool {
+            live: AgentRegistry::new(),
+            max_attachment_bytes: None,
+        };
+        let of = |v: serde_json::Value| v["properties"]["attachments"].clone();
+        assert_eq!(of(task.parameters()), of(steer.parameters()));
+        assert_eq!(of(task.parameters()), attachments_schema());
     }
 }
 
