@@ -3141,6 +3141,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(
                 ids.iter()
@@ -8579,6 +8580,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -8619,6 +8621,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,

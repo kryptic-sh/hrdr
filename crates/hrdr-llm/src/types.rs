@@ -131,6 +131,24 @@ pub struct ChatMessage {
     /// chat-completions wire or the Anthropic wire.
     #[serde(default, skip_serializing)]
     pub responses_reasoning_items: Vec<serde_json::Value>,
+    /// Images and PDFs attached to a **user** turn, rendered per dialect by
+    /// [`crate::media`] (Anthropic `image`/`document` blocks, Responses
+    /// `input_image`/`input_file` items, chat-completions content parts).
+    ///
+    /// **Never serialized** — same invariant as `anthropic_thinking_blocks` and
+    /// `responses_reasoning_items`, and for the same reason: the OpenAI wire has
+    /// no `attachments` key, so leaving it out of the derived body is what keeps
+    /// it from reaching a server as an unknown field. Each dialect renders it
+    /// explicitly instead.
+    ///
+    /// Also `skip_deserializing`: session persistence is **not wired yet**, so
+    /// nothing ever writes this field and nothing can read it back. A session
+    /// resumed today comes back with its attachments gone. Giving them a
+    /// persisted encoding is its own piece of work — it decides whether a
+    /// session file carries megabytes of base64 — and is deliberately not
+    /// decided here.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub attachments: Vec<crate::media::Attachment>,
     /// Internal origin marker — distinguishes real user turns from synthetic
     /// user-role context injected by the agent (tool products, nudges,
     /// compaction summaries). Defaults to [`MessageOrigin::User`], a real user
@@ -169,6 +187,7 @@ impl ChatMessage {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -184,6 +203,7 @@ impl ChatMessage {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
@@ -951,6 +971,7 @@ impl Accumulator {
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
             anthropic_thinking_blocks: self.anthropic_thinking_blocks,
             responses_reasoning_items: self.responses_reasoning_items,
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: (!self.calls.is_empty()).then_some(self.calls),
             tool_call_id: None,
@@ -1919,6 +1940,7 @@ mod tests {
                 "signature": "SIG_ABCDEF"
             })],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -1982,6 +2004,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![item.clone()],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,

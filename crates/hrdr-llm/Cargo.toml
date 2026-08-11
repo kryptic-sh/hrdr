@@ -9,6 +9,10 @@ authors.workspace = true
 
 [dependencies]
 reqwest.workspace = true
+# Attachment payloads go on every provider wire base64-encoded (src/media.rs).
+# Already a workspace dependency and already built for hrdr-agent — this wires
+# the existing crate in, it does not add one.
+base64.workspace = true
 hjkl-xdg.workspace = true
 serde.workspace = true
 serde_json.workspace = true

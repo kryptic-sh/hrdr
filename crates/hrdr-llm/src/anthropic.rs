@@ -460,7 +460,7 @@ fn split_system_and_messages(messages: &[ChatMessage]) -> (Vec<Value>, Vec<Value
                     system.push(json!({ "type": "text", "text": text }));
                 }
             }
-            Role::User => append_blocks(&mut out, "user", user_text_blocks(m)),
+            Role::User => append_blocks(&mut out, "user", user_blocks(m)),
             Role::Tool => append_blocks(&mut out, "user", vec![tool_result_block(m)]),
             Role::Assistant => append_blocks(&mut out, "assistant", assistant_blocks(m)),
         }
@@ -483,11 +483,29 @@ fn append_blocks(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     out.push(json!({ "role": role, "content": blocks }));
 }
 
-fn user_text_blocks(m: &ChatMessage) -> Vec<Value> {
-    match &m.content {
-        Some(t) if !t.is_empty() => vec![json!({ "type": "text", "text": t })],
-        _ => Vec::new(),
+/// User turn → one `image`/`document` block per attachment, then the text.
+///
+/// The attachments come **first** deliberately: Anthropic's docs say images
+/// placed before the text produce better results, and a message that is only
+/// attachments (no text at all) is still a message worth sending, so the text
+/// block is the optional part here rather than the anchor.
+///
+/// An attachment on any other role never reaches this function; it is refused
+/// before the request is built ([`crate::media::check_attachments`]) rather than
+/// dropped here, since Anthropic assistant content has no block that could
+/// carry one.
+fn user_blocks(m: &ChatMessage) -> Vec<Value> {
+    let mut blocks: Vec<Value> = m
+        .attachments
+        .iter()
+        .map(crate::media::Attachment::anthropic_block)
+        .collect();
+    if let Some(t) = &m.content
+        && !t.is_empty()
+    {
+        blocks.push(json!({ "type": "text", "text": t }));
     }
+    blocks
 }
 
 /// A `tool_result` block bound to its call id. Non-string tool output isn't a
@@ -1074,6 +1092,91 @@ mod tests {
         ChatMessage::user(t)
     }
 
+    /// `build_body` with everything optional left off — the shape every
+    /// attachment test below needs.
+    fn body_of(messages: &[ChatMessage]) -> Value {
+        build_body(
+            "claude",
+            1024,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            messages,
+            &[],
+        )
+    }
+
+    /// A user turn with attachments: `image`/`document` blocks first, text
+    /// last. The exact block shapes are asserted in [`crate::media`]; what this
+    /// pins is the ordering and that they land in the user message at all.
+    #[test]
+    fn attachments_render_before_the_text_block() {
+        use crate::media::tests::{pdf_attachment, png_attachment};
+        let mut m = ChatMessage::user("what is in these");
+        m.attachments = vec![png_attachment("a.png"), pdf_attachment("b.pdf")];
+        let body = body_of(&[m]);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[1]["type"], "document");
+        assert_eq!(content[1]["source"]["media_type"], "application/pdf");
+        assert_eq!(
+            content[2],
+            json!({ "type": "text", "text": "what is in these" }),
+            "the text block comes last: {body}"
+        );
+    }
+
+    /// Two images on one turn keep their order, and an attachment-only message
+    /// (no text at all) is still a message.
+    #[test]
+    fn two_images_keep_their_order_and_need_no_text() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("");
+        m.content = None;
+        m.attachments = vec![png_attachment("first.png"), png_attachment("second.png")];
+        let body = body_of(&[m]);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "no text block was invented: {body}");
+        assert!(content.iter().all(|b| b["type"] == "image"));
+    }
+
+    /// The regression that matters most: a history with no attachments
+    /// serializes byte-for-byte as it did before attachments existed.
+    #[test]
+    fn a_history_without_attachments_is_unchanged() {
+        let msgs = vec![
+            sys("you are hrdr"),
+            user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::tool_result("t1", "output"),
+            user(""),
+        ];
+        let body = body_of(&msgs);
+        // Written out rather than compared against a second `build_body` call,
+        // which would pass even if both sides were wrong.
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "hello" }] },
+                { "role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "t1", "content": "output",
+                }]},
+            ])
+        );
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "you are hrdr" }])
+        );
+    }
+
     #[test]
     fn system_is_hoisted_and_messages_alternate() {
         let msgs = vec![sys("you are hrdr"), user("hi"), user("still me")];
@@ -1109,6 +1212,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
@@ -1160,6 +1264,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
@@ -1724,6 +1829,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_bad".into(),
@@ -1754,6 +1860,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_cached".into(),
@@ -1999,6 +2106,7 @@ mod tests {
                 json!({"type":"thinking","thinking":"I should call read","signature":"SIG123"}),
             ],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_x".into(),
@@ -2195,6 +2303,7 @@ mod tests {
                 "signature": "SIG_ROUND_TRIP"
             })],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_rt".into(),

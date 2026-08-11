@@ -1088,20 +1088,22 @@ impl Client {
 
     /// Whether the OpenAI request body needs a post-serialization graft:
     /// cache breakpoints (Ephemeral mode), the `prompt_cache_key` routing hint,
-    /// or the DeepSeek `reasoning_content` replay. With none of these the body
-    /// is the request serialized as-is — which is what `chat_stream`'s fast
-    /// path sends, skipping the `serde_json::Value` tree entirely. The single
-    /// source of truth for both [`Self::body_json`] and that fast path.
-    fn grafts_needed(&self) -> bool {
+    /// the DeepSeek `reasoning_content` replay, or attachments to render into
+    /// content parts. With none of these the body is the request serialized
+    /// as-is — which is what `chat_stream`'s fast path sends, skipping the
+    /// `serde_json::Value` tree entirely. The single source of truth for both
+    /// [`Self::body_json`] and that fast path.
+    fn grafts_needed(&self, messages: &[ChatMessage]) -> bool {
         self.cache == CacheMode::Ephemeral
             || (self.prompt_cache_key.is_some() && self.consumes_prompt_cache_key())
             || is_deepseek(&self.base_url)
+            || messages.iter().any(|m| !m.attachments.is_empty())
     }
 
     /// Serialize a request and apply cache breakpoints per the active [`CacheMode`].
     fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
         let mut json = serde_json::to_value(body).unwrap_or_default();
-        if !self.grafts_needed() {
+        if !self.grafts_needed(&body.messages) {
             return json;
         }
         if self.cache == CacheMode::Ephemeral {
@@ -1159,7 +1161,32 @@ impl Client {
                 }
             }
         }
+        graft_attachments(&mut json, &body.messages);
         json
+    }
+
+    /// Refuse a request whose attachments the model cannot take, before it goes
+    /// out. See [`crate::media::check_attachments`] — including why a model the
+    /// catalog has never heard of is allowed through.
+    ///
+    /// Reported as a [`ChatError`] with [`ChatErrorKind::Other`] rather than a
+    /// bare error: that is the shape hrdr-agent already classifies, and `Other`
+    /// is terminal — no amount of retrying makes a text-only model see a
+    /// picture.
+    fn check_attachments(&self, messages: &[ChatMessage]) -> Result<()> {
+        // Cache-only, deliberately: this runs while building a request inside a
+        // live turn, where an out-of-band catalog fetch would interleave with
+        // the stream about to open. `None` (no catalog, or no entry) is the
+        // allow case.
+        let accepts = crate::catalog::input_modalities_cached(None, &self.model);
+        crate::media::check_attachments(&self.model, accepts.as_deref(), messages).map_err(|e| {
+            anyhow::Error::new(ChatError {
+                status: None,
+                retry_after: None,
+                kind: ChatErrorKind::Other,
+                message: e.to_string(),
+            })
+        })
     }
 
     /// Streaming completion. Yields decoded chunks as they arrive. Dispatches to
@@ -1174,6 +1201,9 @@ impl Client {
         messages: &[ChatMessage],
         tools: &[ToolDef],
     ) -> Result<ChatStream> {
+        // Before anything is built or sent, and ahead of the backend split so
+        // all three dialects answer identically.
+        self.check_attachments(messages)?;
         // The native backends build, log, and send their own requests — see the
         // `log_wire` calls in `crate::anthropic` / `crate::codex`. Logging here
         // instead would only ever record a request that already succeeded.
@@ -1238,7 +1268,7 @@ impl Client {
         // prompt-cache key, not DeepSeek) the tree is pure intermediate — the
         // request serializes straight to bytes, byte-identical to the Value
         // path's output (both are the same Serialize impl, compact).
-        let body = if self.grafts_needed() {
+        let body = if self.grafts_needed(&request.messages) {
             let json = self.body_json(&request);
             log_wire("request", || {
                 serde_json::json!({
@@ -1528,6 +1558,52 @@ impl Client {
     }
 }
 
+/// Rewrite `content` into a content-parts array for every message carrying
+/// attachments, and leave every other message untouched.
+///
+/// A post-serialization graft, for the same reason the DeepSeek
+/// `reasoning_content` replay above is one: `ChatMessage.attachments` is
+/// `skip_serializing`, so the derived body never mentions it, and each dialect
+/// renders it itself. Keyed by index off the ORIGINAL messages — which still
+/// hold the attachments — exactly as that graft is.
+///
+/// Runs **after** [`crate::types::apply_cache_breakpoints`], and handles the
+/// array `content` that leaves behind by prepending to it rather than replacing
+/// it: the breakpoint has already been placed on the text part, and rebuilding
+/// the array would silently drop it. Attachments go first, matching the other
+/// two dialects.
+fn graft_attachments(json: &mut serde_json::Value, originals: &[ChatMessage]) {
+    let Some(messages) = json
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for (msg, original) in messages.iter_mut().zip(originals) {
+        if original.attachments.is_empty() {
+            continue;
+        }
+        let mut parts: Vec<serde_json::Value> = original
+            .attachments
+            .iter()
+            .map(crate::media::Attachment::openai_part)
+            .collect();
+        match msg.get_mut("content") {
+            // Already a parts array (a cache breakpoint landed here): keep it.
+            Some(serde_json::Value::Array(existing)) => parts.append(existing),
+            // The ordinary case: a plain string becomes a `text` part.
+            Some(serde_json::Value::String(text)) => parts.push(serde_json::json!({
+                "type": "text",
+                "text": std::mem::take(text),
+            })),
+            // Absent or null — an attachment-only message. The parts array is
+            // the whole content.
+            _ => {}
+        }
+        msg["content"] = serde_json::Value::Array(parts);
+    }
+}
+
 // --- /v1/models response types (local to this module) ---
 
 #[derive(Deserialize)]
@@ -1670,6 +1746,181 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The chat-completions body for `messages`, through the same path a real
+    /// request takes.
+    fn openai_body(messages: &[ChatMessage]) -> serde_json::Value {
+        let client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
+        client.body_json(&client.request(Some(client.model.clone()), messages, &[], true))
+    }
+
+    /// A message with attachments has its string `content` rewritten into a
+    /// content-parts array, attachments first.
+    #[test]
+    fn attachments_become_content_parts_ahead_of_the_text() {
+        use crate::media::tests::{pdf_attachment, png_attachment};
+        let mut m = ChatMessage::user("what is in these");
+        m.attachments = vec![png_attachment("a.png"), pdf_attachment("b.pdf")];
+        let body = openai_body(&[m]);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["detail"], "auto");
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "{body}"
+        );
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["file"]["filename"], "b.pdf");
+        assert_eq!(
+            parts[2],
+            json!({ "type": "text", "text": "what is in these" })
+        );
+        // The role is untouched, and the graft never invents an `attachments`
+        // key on the wire.
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(!body.to_string().contains("attachments"), "{body}");
+    }
+
+    /// An attachment-only message becomes a parts array with no `text` part —
+    /// `content` was absent from the serialized message entirely.
+    #[test]
+    fn an_attachment_only_message_becomes_a_bare_parts_array() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("");
+        m.content = None;
+        m.attachments = vec![png_attachment("a.png"), png_attachment("b.png")];
+        let body = openai_body(&[m]);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{body}");
+        assert!(parts.iter().all(|p| p["type"] == "image_url"));
+    }
+
+    /// The attachment graft runs after the cache breakpoints and must not
+    /// destroy one: a marked message's parts array is prepended to, not
+    /// replaced.
+    #[test]
+    fn a_cache_breakpoint_survives_the_attachment_graft() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("look at this");
+        m.attachments = vec![png_attachment("a.png")];
+        let mut client = Client::new("https://api.anthropic.com/v1/openai", None, "claude");
+        client.set_cache(CacheMode::Ephemeral);
+        let body = client.body_json(&client.request(Some(client.model.clone()), &[m], &[], true));
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{body}");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[1]["type"], "text");
+        assert_eq!(
+            parts[1]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "the rolling breakpoint is still on the text part: {body}"
+        );
+    }
+
+    /// The regression that matters most: with no attachments anywhere, the
+    /// serialized body is exactly what it was before attachments existed —
+    /// plain string `content`, no `attachments` key, and no graft taken.
+    #[test]
+    fn a_history_without_attachments_serializes_unchanged() {
+        let messages = vec![
+            ChatMessage::system("you are hrdr"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::tool_result("t1", "output"),
+        ];
+        let client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
+        assert!(
+            !client.grafts_needed(&messages),
+            "the fast path is still taken"
+        );
+        let body = openai_body(&messages);
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "system", "content": "you are hrdr" },
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "hello" },
+                { "role": "tool", "content": "output", "tool_call_id": "t1" },
+            ])
+        );
+        // The field must never reach the wire, empty or not — asserted on the
+        // serialized JSON, not on the struct.
+        assert!(!body.to_string().contains("attachments"), "{body}");
+
+        // And an attachment anywhere in the history *does* take the graft path,
+        // so the assertion above is about the absence of attachments and not
+        // about `grafts_needed` never firing.
+        let mut with = messages.clone();
+        with[1].attachments = vec![crate::media::tests::png_attachment("a.png")];
+        assert!(client.grafts_needed(&with));
+    }
+
+    /// The gate is wired into the send path for every backend, and reports a
+    /// **terminal** [`ChatError`] rather than a bare one.
+    ///
+    /// Driven by a refusal that needs no catalog (an attachment on an assistant
+    /// message), because the modality rules themselves are covered in
+    /// [`crate::media`] — what is under test here is that `chat_stream` asks at
+    /// all, ahead of the backend split, and how it reports the answer.
+    #[tokio::test]
+    async fn the_gate_refuses_before_any_backend_builds_a_request() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::assistant("here you go");
+        m.attachments = vec![png_attachment("a.png")];
+
+        // One per backend, all pointed at a port nobody is listening on: a
+        // request that got past the gate would fail with a connection error
+        // instead, which is what the `downcast` below distinguishes.
+        for url in [
+            "http://127.0.0.1:1/v1",
+            "https://api.anthropic.com/v1",
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            let client = Client::new(url, None, "some-model");
+            let Err(err) = client.chat_stream(std::slice::from_ref(&m), &[]).await else {
+                panic!("{url}: the gate must refuse an attachment on an assistant turn");
+            };
+            let chat: &ChatError = err
+                .downcast_ref()
+                .unwrap_or_else(|| panic!("{url}: expected a typed ChatError, got {err:#}"));
+            assert_eq!(
+                chat.kind,
+                ChatErrorKind::Other,
+                "{url}: terminal — retrying cannot help"
+            );
+            assert!(
+                chat.message.contains("user message"),
+                "{url}: {}",
+                chat.message
+            );
+            assert_eq!(chat.status, None, "{url}: nothing was sent");
+        }
+    }
+
+    /// A model the catalog has never heard of — a local server, an unlisted id
+    /// — is **not** refused. The sandboxed XDG roots mean there is no cached
+    /// catalog here at all, which is exactly the unknown case.
+    #[tokio::test]
+    async fn an_unknown_model_may_still_carry_attachments() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("what is this");
+        m.attachments = vec![png_attachment("a.png")];
+
+        // Gets as far as a connection failure to a closed port — the point
+        // being that the gate did not stop it first.
+        let client = Client::new("http://127.0.0.1:1/v1", None, "qwen3-vl-local");
+        let Err(err) = client.chat_stream(&[m], &[]).await else {
+            panic!("a closed port cannot answer");
+        };
+        assert!(
+            err.downcast_ref::<ChatError>().is_none(),
+            "an unknown model must not be refused by the gate: {err:#}"
+        );
+    }
+
     #[test]
     fn effort_getter_preserves_display_only_values_and_clear() {
         let mut client = Client::new("http://localhost/v1", None, "model");
@@ -1750,6 +2001,7 @@ mod tests {
                 reasoning_content: Some(reasoning.to_string()),
                 anthropic_thinking_blocks: vec![],
                 responses_reasoning_items: vec![],
+                attachments: vec![],
                 origin: Default::default(),
                 tool_calls: None,
                 tool_call_id: None,

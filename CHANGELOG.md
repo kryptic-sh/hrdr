@@ -36,6 +36,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Groundwork for image and PDF attachments — the wire half only.** A new
+  `hrdr_llm::media` module adds `Attachment` (raw bytes + a `MediaType` the
+  bytes were checked to match by magic number + the file name) and a
+  `ChatMessage.attachments` field, and every provider dialect now renders it:
+  Anthropic `image`/`document` blocks, Responses `input_image`/`input_file`
+  items, and chat-completions content parts, with the attachments placed ahead
+  of the text in all three. Requests are refused before they are sent when the
+  model's models.dev `modalities.input` list does not cover the attachment (a
+  model the catalog does not list is allowed through, so self-hosted endpoints
+  still work), when an image exceeds 5 MB of base64, when the request totals
+  over 32 MB, or when it carries more than 100 images. **Nothing constructs an
+  attachment yet** — there is no way to attach a file from the UI, and
+  attachments are not written to the session file, so they do not survive a
+  resume. A message with no attachments serializes exactly as before on all
+  three dialects.
 - **Agent Skills — `<name>/SKILL.md` bundles, the format Claude Code, Codex and
   opencode already read.** A skill is a directory holding a `SKILL.md` plus the
   files it references (`references/`, `scripts/`, `assets/`), and hrdr now

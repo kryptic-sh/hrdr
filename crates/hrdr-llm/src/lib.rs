@@ -18,6 +18,7 @@ pub mod catalog;
 mod client;
 mod codex;
 pub mod fs;
+pub mod media;
 mod retry;
 pub mod sse;
 mod types;
@@ -31,6 +32,7 @@ pub use fs::{
     owner_only_options, owner_only_options_no_follow, sibling_with_suffix, unique_sibling_path,
     write_atomic,
 };
+pub use media::{Attachment, AttachmentError, MediaType};
 pub use retry::{
     MAX_BACKOFF, RetryAttempt, RetryBudget, RetryPolicy, UnsupportedParam, is_context_overflow,
     is_transient, retry_after_hint, unsupported_param,

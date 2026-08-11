@@ -177,11 +177,23 @@ fn split_instructions_and_input(messages: &[ChatMessage]) -> (String, Vec<Value>
                 }
             }
             Role::User => {
+                // Attachments first, then the text — the same order the
+                // Anthropic builder uses, for the same documented reason.
+                let mut content: Vec<Value> = m
+                    .attachments
+                    .iter()
+                    .map(crate::media::Attachment::responses_item)
+                    .collect();
                 if let Some(text) = &m.content {
-                    input.push(json!({
-                        "role": "user",
-                        "content": [{ "type": "input_text", "text": text }],
-                    }));
+                    content.push(json!({ "type": "input_text", "text": text }));
+                }
+                // A message carrying only attachments still has to be sent:
+                // gating this on `content` being `Some`, as it used to, would
+                // have dropped an image the user attached without typing
+                // anything. Empty content (no text *and* no attachments) is
+                // still skipped, exactly as before.
+                if !content.is_empty() {
+                    input.push(json!({ "role": "user", "content": content }));
                 }
             }
             Role::Assistant => {
@@ -769,6 +781,79 @@ mod tests {
         ChatMessage::user(t)
     }
 
+    /// `build_body` with everything optional left off.
+    fn body_of(messages: &[ChatMessage]) -> Value {
+        build_body("gpt-5.5", None, None, None, None, None, messages, &[])
+    }
+
+    /// Attachments become `input_image` / `input_file` items ahead of the
+    /// `input_text` one.
+    #[test]
+    fn attachments_render_before_the_input_text_item() {
+        use crate::media::tests::{pdf_attachment, png_attachment};
+        let mut m = ChatMessage::user("what is in these");
+        m.attachments = vec![png_attachment("a.png"), pdf_attachment("b.pdf")];
+        let body = body_of(&[m]);
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "input_image");
+        assert!(
+            content[0]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "{body}"
+        );
+        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(content[1]["filename"], "b.pdf");
+        assert_eq!(
+            content[2],
+            json!({ "type": "input_text", "text": "what is in these" })
+        );
+    }
+
+    /// A message with attachments and **no** text is still sent. The old code
+    /// pushed a user item only when `content` was `Some`, which would have
+    /// dropped an image attached without typing anything — this is the
+    /// assertion that fails on that version.
+    #[test]
+    fn an_attachment_only_message_is_still_sent() {
+        use crate::media::tests::png_attachment;
+        let mut m = ChatMessage::user("");
+        m.content = None;
+        m.attachments = vec![png_attachment("first.png"), png_attachment("second.png")];
+        let body = body_of(&[m]);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "the message reached the wire: {body}");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "two images, no invented text: {body}");
+        assert!(content.iter().all(|i| i["type"] == "input_image"));
+    }
+
+    /// A history with no attachments serializes exactly as it did before
+    /// attachments existed — including the empty-string user turn, which has
+    /// always produced an `input_text` item rather than being skipped.
+    #[test]
+    fn a_history_without_attachments_is_unchanged() {
+        let body = body_of(&[
+            sys("you are hrdr"),
+            user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::tool_result("t1", "output"),
+            user(""),
+        ]);
+        assert_eq!(
+            body["input"],
+            json!([
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                { "role": "assistant", "content": [{ "type": "output_text", "text": "hello" }] },
+                { "type": "function_call_output", "call_id": "t1", "output": "output" },
+                { "role": "user", "content": [{ "type": "input_text", "text": "" }] },
+            ])
+        );
+        assert_eq!(body["instructions"], "you are hrdr");
+    }
+
     #[test]
     fn serializes_system_user_toolcall_and_result() {
         let assistant = ChatMessage {
@@ -777,6 +862,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
@@ -1432,6 +1518,7 @@ mod tests {
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
             responses_reasoning_items: vec![rs1.clone(), rs2.clone()],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
@@ -1484,6 +1571,7 @@ mod tests {
             reasoning_content: Some("some plaintext thinking".into()),
             anthropic_thinking_blocks: vec![json!({"type": "thinking", "thinking": "x"})],
             responses_reasoning_items: vec![],
+            attachments: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,

@@ -257,6 +257,75 @@ pub fn lookup_max_output(catalog: &Value, provider: Option<&str>, model: &str) -
     catalog.as_object()?.values().filter_map(output).min()
 }
 
+/// The input modalities `model` accepts, from the already-cached catalog — no
+/// network, no await, for callers building a request inside a live turn.
+///
+/// Same shape as [`context_window_cached`], reading `modalities.input` instead.
+/// `None` when the catalog isn't cached or doesn't know the model; the caller
+/// (the attachment gate, [`crate::media::check_attachments`]) then decides what
+/// an unknown model may do, and deliberately lets it through.
+///
+/// No async twin, unlike [`context_window`]: the only caller is that gate, and
+/// it runs while a request is being built inside a live turn, where an
+/// out-of-band fetch would interleave with the stream about to open — the same
+/// reason [`max_output_cached`] has no async twin either.
+pub fn input_modalities_cached(provider: Option<&str>, model: &str) -> Option<Vec<String>> {
+    lookup_input_modalities(load_cached()?.as_ref(), provider, model)
+}
+
+/// Find `model`'s input modalities in an already-loaded catalog. Pure, so the
+/// resolution rules are testable without a cache or a network.
+///
+/// models.dev publishes these as `modalities.input`, an array of strings —
+/// `["text", "image", "pdf"]` for the Claude family, `["text"]` for DeepSeek,
+/// and `video`/`audio` also appear. Note this is *not* the sibling `attachment`
+/// boolean: the two disagree for thousands of entries in the live catalog
+/// (models listing `image` with `attachment: false`, and text-only models with
+/// `attachment: true`), and the modality array is the one that says which kind
+/// of input.
+///
+/// Resolution starts like [`lookup`] — the configured provider's own entry wins
+/// — but the cross-provider fallback takes the **union** rather than the
+/// smallest, which is the opposite direction from the window and output caps.
+/// Those are numbers a provider genuinely serves differently; whether a model
+/// can see an image is a property of the model, and a provider entry that omits
+/// `image` for a model every other provider lists with it is catalog noise. The
+/// permissive read matches what the gate does with an unknown model, and for
+/// the same reason.
+pub fn lookup_input_modalities(
+    catalog: &Value,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<Vec<String>> {
+    let modalities = |p: &Value| -> Option<Vec<String>> {
+        let values: Vec<String> = p
+            .get("models")?
+            .get(model)?
+            .get("modalities")?
+            .get("input")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        (!values.is_empty()).then_some(values)
+    };
+    if let Some(name) = provider
+        && let Some(p) = catalog.get(name)
+        && let Some(v) = modalities(p)
+    {
+        return Some(v);
+    }
+    let mut union: Vec<String> = Vec::new();
+    for v in catalog.as_object()?.values().filter_map(modalities) {
+        for m in v {
+            if !union.contains(&m) {
+                union.push(m);
+            }
+        }
+    }
+    (!union.is_empty()).then_some(union)
+}
+
 /// A model's price card: **USD per million tokens**, from the catalog's
 /// `cost` object. `cache_read` is the discounted rate for prompt tokens served
 /// from the provider's prompt cache; `cache_write` the *premium* rate for
@@ -745,6 +814,73 @@ mod tests {
         assert!(
             (published.call_cost(1_000_000, 0, None, Some(1_000_000), true) - 3.0).abs() < 1e-9
         );
+    }
+
+    /// Input-modality resolution: the configured provider's own
+    /// `modalities.input` wins; without one the **union** across providers is
+    /// used, so one provider's omission can't make a vision model look
+    /// text-only. Unknown models yield `None`, which the gate reads as "allow".
+    #[test]
+    fn lookup_input_modalities_prefers_provider_then_unions() {
+        let c = json!({
+            "anthropic": { "models": {
+                "claude-opus-4-6": { "modalities": {
+                    "input": ["text", "image", "pdf"], "output": ["text"],
+                }},
+            }},
+            "some-reseller": { "models": {
+                // The same model, listed text-only — catalog noise, not a real
+                // difference in what the model can see.
+                "claude-opus-4-6": { "modalities": { "input": ["text"] } },
+            }},
+            "deepseek": { "models": {
+                "deepseek-v4-pro": { "modalities": { "input": ["text"] } },
+                // An entry with no modalities at all.
+                "weird": { "id": "weird" },
+                // An empty list is a missing one, not "accepts nothing".
+                "empty": { "modalities": { "input": [] } },
+            }},
+        });
+        assert_eq!(
+            lookup_input_modalities(&c, Some("anthropic"), "claude-opus-4-6"),
+            Some(vec![
+                "text".to_string(),
+                "image".to_string(),
+                "pdf".to_string()
+            ])
+        );
+        assert_eq!(
+            lookup_input_modalities(&c, Some("some-reseller"), "claude-opus-4-6"),
+            Some(vec!["text".to_string()]),
+            "a provider that lists the model answers for it"
+        );
+        // No provider, or one the catalog doesn't carry: the union, deduped and
+        // in first-seen order.
+        for provider in [None, Some("not-in-catalog")] {
+            assert_eq!(
+                lookup_input_modalities(&c, provider, "claude-opus-4-6"),
+                Some(vec![
+                    "text".to_string(),
+                    "image".to_string(),
+                    "pdf".to_string()
+                ])
+            );
+        }
+        // A text-only model stays text-only however it is resolved.
+        assert_eq!(
+            lookup_input_modalities(&c, None, "deepseek-v4-pro"),
+            Some(vec!["text".to_string()])
+        );
+        // Unknown model, no modalities, and an empty list are all `None`.
+        assert_eq!(lookup_input_modalities(&c, None, "no-such-model"), None);
+        assert_eq!(
+            lookup_input_modalities(&c, Some("deepseek"), "weird"),
+            None,
+            "the named provider knows the model but not its modalities"
+        );
+        assert_eq!(lookup_input_modalities(&c, None, "empty"), None);
+        assert_eq!(lookup_input_modalities(&json!({}), None, "m"), None);
+        assert_eq!(lookup_input_modalities(&json!([1, 2]), None, "m"), None);
     }
 
     /// Effort-level resolution: the configured provider wins, else the first
