@@ -600,6 +600,44 @@ fn is_deepseek(base_url: &str) -> bool {
     url_host(base_url) == "api.deepseek.com"
 }
 
+/// Whether `base_url` is OpenRouter — the one endpoint that takes a `plugins`
+/// array on the chat-completions body (see [`openrouter_pdf_plugins`]).
+///
+/// Suffix-matched on the host, not the URL: `openrouter.ai.evil.com` is a
+/// different site, and `gateway.openrouter.ai` is not.
+fn is_openrouter(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    host == "openrouter.ai" || host.ends_with(".openrouter.ai")
+}
+
+/// The `plugins` array an OpenRouter request carrying a PDF needs, or `None`
+/// for the requests that are better off without one.
+///
+/// OpenRouter parses a PDF itself for models that cannot read one, and picks
+/// the parser when the request names none: *"If you don't explicitly specify an
+/// engine, OpenRouter will default first to the model's native file processing
+/// capabilities, and if that's not available, we will use the `mistral-ocr`
+/// engine"* — which is *"$2 per 1,000 pages"*, and billed to the OpenRouter
+/// account even under BYOK. So the field is sent exactly when that fallback is
+/// what would otherwise happen, naming the free engine instead
+/// (*"cloudflare-ai: Converts PDFs to markdown using Cloudflare Workers AI
+/// (Free)"*).
+///
+/// `accepts` is the model's models.dev input-modality list — the same list the
+/// attachment gate reads. A model listed with `pdf` takes the file natively, so
+/// no plugin is sent and OpenRouter's own native default applies: pinning an
+/// engine there would replace the model's own reading of the pages with
+/// markdown text. A model the catalog does not know (the gate lets those
+/// through — see [`crate::media::check_attachments`]) is the case the free
+/// engine is for.
+///
+/// <https://openrouter.ai/docs/features/multimodal/pdfs>
+fn openrouter_pdf_plugins(accepts: Option<&[String]>) -> Option<serde_json::Value> {
+    let native = accepts.is_some_and(|a| a.iter().any(|m| m == "pdf"));
+    (!native)
+        .then(|| serde_json::json!([{ "id": "file-parser", "pdf": { "engine": "cloudflare-ai" } }]))
+}
+
 /// Detect the wire protocol from `base_url`:
 /// - `api.anthropic.com` → native Anthropic Messages API (unlocks caching).
 /// - `chatgpt.com` with a `/codex/` path → the OpenAI Responses API (the
@@ -1110,7 +1148,8 @@ impl Client {
     /// Whether the OpenAI request body needs a post-serialization graft:
     /// cache breakpoints (Ephemeral mode), the `prompt_cache_key` routing hint,
     /// the DeepSeek `reasoning_content` replay, or attachments to render into
-    /// content parts. With none of these the body is the request serialized
+    /// content parts (which is also what carries OpenRouter's PDF-parser
+    /// selection). With none of these the body is the request serialized
     /// as-is — which is what `chat_stream`'s fast path sends, skipping the
     /// `serde_json::Value` tree entirely. The single source of truth for both
     /// [`Self::body_json`] and that fast path.
@@ -1183,6 +1222,27 @@ impl Client {
             }
         }
         graft_attachments(&mut json, &body.messages);
+        // OpenRouter's PDF parser selection, once a PDF is actually on the wire
+        // — a top-level field, so unlike the attachment parts above it neither
+        // reads nor disturbs what the cache breakpoints did to `messages`. See
+        // [`openrouter_pdf_plugins`] for why it is conditional on the model.
+        if is_openrouter(&self.base_url)
+            && body
+                .messages
+                .iter()
+                .flat_map(|m| &m.attachments)
+                .any(|a| a.media_type() == crate::media::MediaType::Pdf)
+        {
+            // Cache-only, for the reason [`Self::check_attachments`] gives: this
+            // runs inside a live turn, where an out-of-band catalog fetch would
+            // interleave with the stream about to open.
+            let accepts = crate::catalog::input_modalities_cached(None, &self.model);
+            if let Some(plugins) = openrouter_pdf_plugins(accepts.as_deref())
+                && let Some(obj) = json.as_object_mut()
+            {
+                obj.insert("plugins".to_string(), plugins);
+            }
+        }
         json
     }
 
@@ -1885,6 +1945,85 @@ mod tests {
         let mut with = messages.clone();
         with[1].attachments = vec![crate::media::tests::png_attachment("a.png")];
         assert!(client.grafts_needed(&with));
+    }
+
+    /// OpenRouter's `plugins` array rides on the body of a request that carries
+    /// a PDF — and on no other request, and to no other host.
+    ///
+    /// The model id is one no catalog can carry, which is the unknown-model case
+    /// [`openrouter_pdf_plugins`] exists for: without the field OpenRouter falls
+    /// back to `mistral-ocr` at $2 per 1,000 pages.
+    #[test]
+    fn the_openrouter_pdf_plugin_rides_only_on_an_openrouter_request_with_a_pdf() {
+        use crate::media::tests::{pdf_attachment, png_attachment};
+        let with_pdf = |name: &str| {
+            let mut m = ChatMessage::user("read this");
+            m.attachments = vec![pdf_attachment(name)];
+            m
+        };
+        let body = |url: &str, messages: &[ChatMessage]| {
+            let client = Client::new(url, None, "hrdr-test/no-such-model");
+            client.body_json(&client.request(Some(client.model.clone()), messages, &[], true))
+        };
+
+        let sent = body("https://openrouter.ai/api/v1", &[with_pdf("spec.pdf")]);
+        assert_eq!(
+            sent["plugins"],
+            json!([{ "id": "file-parser", "pdf": { "engine": "cloudflare-ai" } }]),
+            "{sent}"
+        );
+        // Additive: the PDF itself still goes out as a content part.
+        assert_eq!(sent["messages"][0]["content"][0]["type"], "file");
+
+        // An image on the same host needs no parser.
+        let mut image_only = ChatMessage::user("look");
+        image_only.attachments = vec![png_attachment("a.png")];
+        let images = body("https://openrouter.ai/api/v1", &[image_only]);
+        assert!(images.get("plugins").is_none(), "{images}");
+
+        // No attachments at all, and every other host: no `plugins` field. A
+        // server that rejects unknown top-level keys must see the body it always
+        // saw.
+        let bare = body("https://openrouter.ai/api/v1", &[ChatMessage::user("hi")]);
+        assert!(bare.get("plugins").is_none(), "{bare}");
+        for url in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com",
+            "http://localhost:8080/v1",
+            // A lookalike host is not OpenRouter.
+            "https://openrouter.ai.evil.com/v1",
+        ] {
+            let other = body(url, &[with_pdf("spec.pdf")]);
+            assert!(other.get("plugins").is_none(), "{url}: {other}");
+        }
+    }
+
+    /// Which engine the plugin names, per what the catalog says the model can
+    /// read: a model listed with `pdf` keeps OpenRouter's native path (no field
+    /// at all), anything else gets the free parser.
+    #[test]
+    fn the_openrouter_pdf_engine_follows_the_models_dev_modalities() {
+        let modalities =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_string()).collect() };
+        let native = modalities(&["text", "image", "pdf"]);
+        assert_eq!(openrouter_pdf_plugins(Some(&native)), None);
+
+        for accepts in [
+            Some(modalities(&["text"])),
+            Some(modalities(&["text", "image"])),
+        ] {
+            assert_eq!(
+                openrouter_pdf_plugins(accepts.as_deref()),
+                Some(json!([{ "id": "file-parser", "pdf": { "engine": "cloudflare-ai" } }])),
+                "a model that cannot read a PDF itself needs the parser named"
+            );
+        }
+        // A model the catalog has never heard of is the same case: OpenRouter
+        // would otherwise pick the billed engine.
+        assert_eq!(
+            openrouter_pdf_plugins(None),
+            Some(json!([{ "id": "file-parser", "pdf": { "engine": "cloudflare-ai" } }]))
+        );
     }
 
     /// The gate is wired into the send path for every backend, and reports a

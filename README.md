@@ -657,7 +657,7 @@ Scalars also honor `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED` /
 `max_attachment_bytes` is measured on the **base64** payload the providers count
 (~4/3 the size of the file on disk), and a request carrying more than that in
 one attachment is refused before it is sent. Left unset, each kind gets the
-tightest cap of the dialects hrdr speaks: 5 MB for an image (Anthropic's
+tightest cap of the dialects hrdr speaks: 10 MB for an image (Anthropic's
 per-image limit) and the 32 MB per-request budget for a PDF, which no dialect
 caps separately. Set it for an endpoint with different limits — OpenAI allows 50
 MB per file, a self-hosted server whatever it was built for — and it then

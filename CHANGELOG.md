@@ -48,6 +48,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still work), when one attachment is over the size ceiling below, when the
   request totals over 32 MB, or when it carries more than 100 images. A message
   with no attachments serializes exactly as before on all three dialects.
+  - **A PDF sent through OpenRouter names its own parser.** OpenRouter picks one
+    when the request names none — the model's native file support if it has any,
+    otherwise `mistral-ocr` at $2 per 1,000 pages, billed to the OpenRouter
+    account even under BYOK. A chat-completions body bound for `openrouter.ai`
+    that actually carries a PDF now sends
+    `plugins: [{ "id": "file-parser", "pdf": { "engine": "cloudflare-ai" } }]`,
+    the free engine, unless models.dev lists the model with `pdf` input — there
+    nothing is sent, so OpenRouter's native path (the one that shows the model
+    the pages themselves) is left alone. No other provider, and no request
+    without a PDF, sees the field.
   - **An `@shot.png` or `@report.pdf` mention now becomes one of these** instead
     of being dropped: the text path reads a file as UTF-8, so an image failed
     and the mention silently reached the model as bare text, while a PDF whose
@@ -146,7 +156,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (config key, `$HRDR_MAX_ATTACHMENT_BYTES`; no CLI flag, like the other wire
   limits `max_tokens` / `top_p` / `request_timeout`). Measured on the base64
   payload the providers count, ~4/3 the file on disk. Unset, each kind keeps the
-  tightest cap of the dialects hrdr speaks — 5 MB for an image (Anthropic's
+  tightest cap of the dialects hrdr speaks — 10 MB for an image (Anthropic's
   per-image limit) and the 32 MB request budget for a PDF, which no dialect caps
   separately — so a legal 20 MB PDF is not refused by a limit hrdr invented. Set
   it for an endpoint with different limits (OpenAI allows 50 MB per file) and it

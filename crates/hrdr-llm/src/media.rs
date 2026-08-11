@@ -31,15 +31,22 @@ use serde_json::{Value, json};
 
 use crate::types::{ChatMessage, Role};
 
-/// Anthropic's per-image cap: **5 MB of base64** — the per-attachment ceiling
+/// Anthropic's per-image cap: **10 MB of base64** — the per-attachment ceiling
 /// for an image when the user configured none. The tightest of the three
-/// dialects (OpenAI Responses allows 50 MB per file), so it is the value that
-/// makes hrdr's local refusal match the remote one, since the same
-/// [`Attachment`] may be rendered for any of them.
+/// dialects (OpenAI allows 50 MB per file), so it is the value that makes
+/// hrdr's local refusal match the remote one, since the same [`Attachment`] may
+/// be rendered for any of them.
 ///
-/// Decimal MB rather than MiB: Anthropic's docs say "5MB" without saying which,
-/// and the smaller reading is the one that can only ever refuse early rather
-/// than let through something the API then rejects.
+/// The vision docs give three numbers under "The maximum size per image is":
+/// "10 MB (base64-encoded) when using the Claude API directly", "5 MB
+/// (base64-encoded) on Amazon Bedrock and Google Cloud", and "10 MB on
+/// claude.ai". The direct-API number is the one that applies: hrdr speaks the
+/// native Messages API only to `*.anthropic.com`
+/// (`crate::client::detect_backend`), never to a Bedrock or Vertex endpoint.
+///
+/// Decimal MB rather than MiB: the docs say "10 MB" without saying which, and
+/// the smaller reading is the one that can only ever refuse early rather than
+/// let through something the API then rejects.
 ///
 /// The check is on the **encoded** size ([`Attachment::encoded_len`]), which is
 /// 4/3 of the raw bytes: an image that fits raw can still be over once encoded.
@@ -51,7 +58,7 @@ use crate::types::{ChatMessage, Role};
 /// two below stay constants deliberately — they are protocol limits of the
 /// request itself, and a user raising one past what the provider accepts would
 /// only trade a clear local refusal for an opaque 413 a round later.
-const DEFAULT_MAX_IMAGE_BASE64_BYTES: usize = 5_000_000;
+const DEFAULT_MAX_IMAGE_BASE64_BYTES: usize = 10_000_000;
 
 /// Anthropic's per-**request** cap: **32 MB** (published as the PDF limit, and
 /// the only whole-request byte limit any of the three dialects states). Applied
@@ -60,14 +67,21 @@ const DEFAULT_MAX_IMAGE_BASE64_BYTES: usize = 5_000_000;
 /// — and to the sum of every attachment.
 ///
 /// It is also the *default* per-attachment ceiling for a PDF, which is why a PDF
-/// and an image do not share one: Anthropic caps images at 5 MB but says nothing
-/// about a single PDF beyond this request budget, so defaulting both to 5 MB
-/// would refuse a 20 MB PDF the provider would have accepted. A configured
+/// and an image do not share one: Anthropic caps one image
+/// ([`DEFAULT_MAX_IMAGE_BASE64_BYTES`]) but says nothing about a single PDF
+/// beyond this request budget, so defaulting both to the image cap would refuse
+/// a 20 MB PDF the provider would have accepted. A configured
 /// `max_attachment_bytes` is a ceiling the *user* stated, so it does apply to
 /// both — see [`per_attachment_limit`].
 const MAX_REQUEST_BASE64_BYTES: usize = 32_000_000;
 
 /// Anthropic's per-request image count for 200k-context models: **100**.
+///
+/// The docs give two figures — "100 per request on the API, for models with a
+/// 200k-token context window" and "600 per request on the API, for all other
+/// models" — and this is the smaller one, deliberately: the gate is handed a
+/// model name, not a context window, so the figure that cannot be wrong in the
+/// direction of a 413 is the one it applies.
 const MAX_IMAGES_PER_REQUEST: usize = 100;
 
 /// The media types hrdr can attach: the four image formats every dialect
@@ -757,8 +771,8 @@ impl std::error::Error for AttachmentError {}
 /// With nothing configured each type gets the provider's own documented cap
 /// ([`DEFAULT_MAX_IMAGE_BASE64_BYTES`] for an image, [`MAX_REQUEST_BASE64_BYTES`]
 /// for a PDF, which Anthropic bounds only by the request budget). One shared
-/// default of 5 MB would refuse a 20 MB PDF that is perfectly legal — a limit
-/// hrdr invented, on a request the provider would have taken.
+/// default at the image cap would refuse a 20 MB PDF that is perfectly legal —
+/// a limit hrdr invented, on a request the provider would have taken.
 fn per_attachment_limit(media_type: MediaType, max_attachment_bytes: Option<usize>) -> usize {
     max_attachment_bytes.unwrap_or(if media_type.is_image() {
         DEFAULT_MAX_IMAGE_BASE64_BYTES
@@ -951,6 +965,38 @@ pub(crate) mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Every media type hrdr can attach, with a valid fixture and the MIME
+    /// string it must put on the wire — the table the three dialect shape tests
+    /// walk, so a mapping slip for a type no other test renders cannot pass.
+    fn every_media_type() -> Vec<(MediaType, Vec<u8>, &'static str)> {
+        vec![
+            (MediaType::Png, png(1), "image/png"),
+            (MediaType::Jpeg, jpeg_sized(8, 8), "image/jpeg"),
+            (MediaType::Gif, gif_sized(8, 8), "image/gif"),
+            (MediaType::Webp, webp_lossy(8, 8), "image/webp"),
+            (MediaType::Pdf, pdf(1), "application/pdf"),
+        ]
+    }
+
+    /// Five bytes that, appended to an 8-byte file header, make the standard
+    /// base64 of the whole use every part of the alphabet: `+`, `/` and `=`
+    /// padding all appear in the encodings below. A URL-safe or unpadded
+    /// encoder produces none of the three.
+    const ALPHABET_SUFFIX: [u8; 5] = [0xBF, 0x0F, 0x4F, 0x88, 0x2F];
+
+    /// `STANDARD.encode(b"\x89PNG\r\n\x1a\n" ++ ALPHABET_SUFFIX)`.
+    const ALPHABET_PNG_BASE64: &str = "iVBORw0KGgq/D0+ILw==";
+
+    /// `STANDARD.encode(b"%PDF-1.7" ++ ALPHABET_SUFFIX)`.
+    const ALPHABET_PDF_BASE64: &str = "JVBERi0xLje/D0+ILw==";
+
+    /// A file header plus [`ALPHABET_SUFFIX`].
+    fn alphabet_bytes(header: &[u8]) -> Vec<u8> {
+        let mut v = header.to_vec();
+        v.extend_from_slice(&ALPHABET_SUFFIX);
+        v
+    }
+
     /// Each signature is recognized, and only from offset 0.
     #[test]
     fn sniff_recognizes_every_supported_signature() {
@@ -1052,9 +1098,10 @@ pub(crate) mod tests {
         assert!(check_attachments("m", None, &message_with(vec![huge]), None).is_err());
     }
 
-    /// With nothing configured, the per-image cap is Anthropic's 5 MB, measured
-    /// on the **encoded** size, and it is a boundary: the largest image that fits
-    /// passes, one byte more is refused, and the error names the limit.
+    /// With nothing configured, the per-image cap is Anthropic's documented
+    /// per-image size, measured on the **encoded** size, and it is a boundary:
+    /// the largest image that fits passes, one byte more is refused, and the
+    /// error names the limit.
     #[test]
     fn the_default_per_image_cap_is_exact_at_the_boundary() {
         // 4 encoded bytes per 3 raw: the largest raw size encoding to exactly
@@ -1080,9 +1127,9 @@ pub(crate) mod tests {
             "the error names the limit: {err}"
         );
 
-        // A PDF the same size is fine — the 5 MB default is Anthropic's *image*
-        // limit; a PDF is bounded by the 32 MB request budget instead. Sharing
-        // one default would refuse a document the provider accepts.
+        // A PDF the same size is fine — that default is Anthropic's *image*
+        // limit; a PDF is bounded by the request budget instead. Sharing one
+        // default would refuse a document the provider accepts.
         let doc = Attachment::new(pdf(at_limit), MediaType::Pdf, "big.pdf").unwrap();
         assert_eq!(
             check_attachments("m", None, &message_with(vec![doc]), None),
@@ -1169,7 +1216,7 @@ pub(crate) mod tests {
         let msgs = message_with(vec![big]);
         assert!(check_attachments("m", None, &msgs, None).is_err());
         assert_eq!(
-            check_attachments("m", None, &msgs, Some(8_000_000)),
+            check_attachments("m", None, &msgs, Some(DEFAULT_MAX_IMAGE_BASE64_BYTES * 2)),
             Ok(()),
             "a raised cap lets through what the default refused"
         );
@@ -1364,83 +1411,123 @@ pub(crate) mod tests {
         }
     }
 
-    /// The Anthropic block shapes, exactly as the Messages API spells them.
+    /// The Anthropic block shapes, exactly as the Messages API spells them: an
+    /// `image` block for each image type, a `document` block for a PDF, each
+    /// carrying an inline `base64` source and **nothing else**.
+    ///
+    /// Compared whole, and that is the point of the assertion rather than a
+    /// convenience: the Messages API's image block takes `type`/`source` (plus
+    /// an optional `cache_control` that belongs to the caching layer, not
+    /// here), so a stray `detail`, `filename` or `title` this renderer invented
+    /// fails the comparison exactly as a missing `media_type` would. Same for
+    /// the source object, which must be the base64 variant's three fields.
     #[test]
     fn anthropic_blocks_match_the_documented_shape() {
-        let img = Attachment::new(png(1), MediaType::Png, "a.png").unwrap();
-        assert_eq!(
-            img.anthropic_block(),
-            json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": "iVBORw0KGgoA",
-                },
-            })
-        );
-        let doc = Attachment::new(pdf(1), MediaType::Pdf, "a.pdf").unwrap();
-        assert_eq!(
-            doc.anthropic_block(),
-            json!({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": "JVBERi0xLjcA",
-                },
-            })
-        );
+        for (media_type, bytes, mime) in every_media_type() {
+            let a = Attachment::new(bytes.clone(), media_type, "attachment.bin").unwrap();
+            let kind = if media_type == MediaType::Pdf {
+                "document"
+            } else {
+                "image"
+            };
+            assert_eq!(
+                a.anthropic_block(),
+                json!({
+                    "type": kind,
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": STANDARD.encode(&bytes),
+                    },
+                }),
+                "{media_type} block"
+            );
+        }
     }
 
-    /// The Responses item shapes.
+    /// The Responses item shapes: `input_image` with `image_url` as a bare
+    /// **string** (not the chat-completions object) and a sibling `detail`,
+    /// `input_file` with the file name beside the payload. Compared whole, for
+    /// the reason [`anthropic_blocks_match_the_documented_shape`] gives.
     #[test]
     fn responses_items_match_the_documented_shape() {
-        let img = Attachment::new(png(1), MediaType::Png, "a.png").unwrap();
-        assert_eq!(
-            img.responses_item(),
-            json!({
-                "type": "input_image",
-                "image_url": "data:image/png;base64,iVBORw0KGgoA",
-                "detail": "auto",
-            })
-        );
-        let doc = Attachment::new(pdf(1), MediaType::Pdf, "doc.pdf").unwrap();
-        assert_eq!(
-            doc.responses_item(),
-            json!({
-                "type": "input_file",
-                "filename": "doc.pdf",
-                "file_data": "data:application/pdf;base64,JVBERi0xLjcA",
-            })
-        );
+        for (media_type, bytes, mime) in every_media_type() {
+            let a = Attachment::new(bytes.clone(), media_type, "attachment.bin").unwrap();
+            let payload = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+            let expected = if media_type == MediaType::Pdf {
+                json!({
+                    "type": "input_file",
+                    "filename": "attachment.bin",
+                    "file_data": payload,
+                })
+            } else {
+                json!({
+                    "type": "input_image",
+                    "image_url": payload,
+                    "detail": "auto",
+                })
+            };
+            assert_eq!(a.responses_item(), expected, "{media_type} item");
+        }
     }
 
-    /// The chat-completions part shapes.
+    /// The chat-completions part shapes: `image_url` as an **object** holding
+    /// `url` + `detail`, `file` as an object holding `filename` + `file_data`
+    /// (and no `file_id`, which names an upload this client never makes).
+    /// Compared whole, for the reason
+    /// [`anthropic_blocks_match_the_documented_shape`] gives.
     #[test]
     fn openai_parts_match_the_documented_shape() {
-        let img = Attachment::new(png(1), MediaType::Png, "a.png").unwrap();
+        for (media_type, bytes, mime) in every_media_type() {
+            let a = Attachment::new(bytes.clone(), media_type, "attachment.bin").unwrap();
+            let payload = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+            let expected = if media_type == MediaType::Pdf {
+                json!({
+                    "type": "file",
+                    "file": { "filename": "attachment.bin", "file_data": payload },
+                })
+            } else {
+                json!({
+                    "type": "image_url",
+                    "image_url": { "url": payload, "detail": "auto" },
+                })
+            };
+            assert_eq!(a.openai_part(), expected, "{media_type} part");
+        }
+    }
+
+    /// The payload form is per dialect and is not the same one twice: Anthropic
+    /// takes **raw** base64 in `source.data`, both OpenAI dialects take a
+    /// `data:<mime>;base64,` URL. The shape tests above build their expectation
+    /// with the same encoder the renderers use, so they cannot see the encoder
+    /// itself change; these literals can — the fixtures encode to `+`, `/` and
+    /// `=` padding, none of which a URL-safe or unpadded engine emits.
+    #[test]
+    fn each_dialect_encodes_the_payload_the_way_it_documents() {
+        let img = Attachment::new(
+            alphabet_bytes(b"\x89PNG\r\n\x1a\n"),
+            MediaType::Png,
+            "a.png",
+        )
+        .unwrap();
+        let doc = Attachment::new(alphabet_bytes(b"%PDF-1.7"), MediaType::Pdf, "a.pdf").unwrap();
+        let img_url = format!("data:image/png;base64,{ALPHABET_PNG_BASE64}");
+        let doc_url = format!("data:application/pdf;base64,{ALPHABET_PDF_BASE64}");
+
+        // Anthropic: raw base64, no `data:` prefix.
         assert_eq!(
-            img.openai_part(),
-            json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": "data:image/png;base64,iVBORw0KGgoA",
-                    "detail": "auto",
-                },
-            })
+            img.anthropic_block()["source"]["data"],
+            json!(ALPHABET_PNG_BASE64)
         );
-        let doc = Attachment::new(pdf(1), MediaType::Pdf, "doc.pdf").unwrap();
         assert_eq!(
-            doc.openai_part(),
-            json!({
-                "type": "file",
-                "file": {
-                    "filename": "doc.pdf",
-                    "file_data": "data:application/pdf;base64,JVBERi0xLjcA",
-                },
-            })
+            doc.anthropic_block()["source"]["data"],
+            json!(ALPHABET_PDF_BASE64)
         );
+        // Responses and chat-completions: the data URL, mime included.
+        assert_eq!(img.responses_item()["image_url"], json!(img_url));
+        assert_eq!(doc.responses_item()["file_data"], json!(doc_url));
+        assert_eq!(img.openai_part()["image_url"]["url"], json!(img_url));
+        assert_eq!(doc.openai_part()["file"]["file_data"], json!(doc_url));
     }
 
     /// Every format's header is read for the exact dimensions it declares.

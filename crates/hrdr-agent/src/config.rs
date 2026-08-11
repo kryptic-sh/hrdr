@@ -323,7 +323,7 @@ pub struct AgentConfig {
     /// `HRDR_MAX_ATTACHMENT_BYTES`).
     ///
     /// `None` — the default — gives each type the cap of the provider hrdr's
-    /// dialects are tightest against: 5 MB for an image (Anthropic's per-image
+    /// dialects are tightest against: 10 MB for an image (Anthropic's per-image
     /// limit), the 32 MB request budget for a PDF (which Anthropic does not cap
     /// separately). Set it for an endpoint with different limits — OpenAI allows
     /// 50 MB per file, a self-hosted server whatever it was built for — and it

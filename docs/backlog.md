@@ -693,6 +693,43 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   dialect assertion is on the JSON hrdr builds, so the shapes are pinned against
   the docs, not against a live endpoint that accepted them.
 
+### Left by the vendor-doc audit, 2026-08-11
+
+Every field of `anthropic_block` / `responses_item` / `openai_part` was checked
+against the current vendor docs and matches them; the per-image ceiling was
+raised to Anthropic's documented 10 MB (it had been 5 MB, which is the
+Bedrock/Google-Cloud number, and hrdr never speaks the Messages API to either).
+What that audit did not close:
+
+- **No dimension check anywhere.** The vision docs cap an image at 8000x8000 px,
+  and apply a stricter per-image dimension limit once a request carries more
+  than 20 images ("resize each image so that neither dimension exceeds 2000
+  px"). `image_dimensions` already reads width and height for the token
+  estimate, so the check is cheap to add — it was left out because a refusal
+  hrdr invents is worse than a provider error hrdr reports, and nobody has hit
+  it.
+- **The image-count cap is the conservative branch.** 100 is the documented
+  limit for 200k-context models; other models take 600. The gate is handed a
+  model name, not a window, so it applies the smaller one.
+- **OpenRouter's parser can read a PDF that the model itself cannot, and the
+  gate refuses that request first.** `file-parser` turns a PDF into text for any
+  model, so a text-only model on OpenRouter could take one — but
+  `check_attachments` refuses on the models.dev modality list before the body is
+  built, so the plugin only ever rides on requests for models the catalog does
+  not know. Widening the gate for one provider means teaching it which provider
+  it is talking to, which it deliberately is not; leave it unless someone asks.
+- **Doc is silent: whether OpenAI's chat-completions `file.file_data` wants a
+  bare base64 string or a `data:` URL.** The API reference says only "The base64
+  encoded file data"; the PDF guide's examples are all Responses-API. hrdr sends
+  the `data:` URL, which is what OpenRouter documents explicitly for the same
+  field, and what the Responses examples use.
+- **DeepSeek and OpenCode Zen document nothing about attachments.** DeepSeek's
+  chat-completion reference types a user message's `content` as a string with no
+  content-part array at all, so its models are text-only and the modality gate
+  is what refuses them; Zen's page describes a gateway to other vendors' models
+  and never mentions image or file input. Neither claim comes from a vendor
+  sentence about attachments, because neither vendor writes one.
+
 ## Deferred 2026-08-10 — the guardrail audit
 
 The slice shipped: git global options no longer defeat the git rules, whole-tree
