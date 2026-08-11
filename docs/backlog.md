@@ -110,35 +110,43 @@ is a Windows-only backend in real use.
 ## Correctness review 2026-08-04
 
 `:review` (low depth) over the whole tree, split across two passes (hrd-agent +
-hrd-llm; hrdr-tools + hrdr-tui + hrdr-app + hrdr-editor + apps/hrdr). The
-finding below was re-traced at the cited lines; everything else the passes
-suspected was disproved or is hardening, and both lists are now under Cleared
-and Hardening notes.
+hrd-llm; hrdr-tools + hrdr-tui + hrdr-app + hrdr-editor + apps/hrdr). Everything
+the passes suspected was disproved, shipped, or is hardening; the lists are
+under Cleared and Hardening notes.
 
-**Status: finding 1 open (needs direction); finding 2 shipped.**
+**Status: both findings shipped.**
 
-1. **`memory` descriptions containing a newline are silently truncated, and the
-   truncation becomes permanent on the first edit.** (low) **[needs direction —
-   pick the fix: quote+escape in `emit_memory` (format change, existing files
-   must keep parsing) vs reject newlines in descriptions]**
-   `hrdr-tools/src/memory.rs`: `emit_memory` (`:416-429`) writes
-   `description: {value}` unquoted, one line; `parse_memory` (`:365-397`) reads
-   per line via `split_once(':')`, so a value whose second line has no colon is
-   dropped; `parse_scalar` (`:350-360`) additionally strips literal edge quotes
-   that `emit` never adds. The index (`rebuild_index` at `:464` via
-   `load_memories`) and `search`/`recall` then see only the first line, and
-   `edit` (`:256-272`) re-emits the parsed (truncated) value when no new
-   description is given.
+## Deferred 2026-08-10 — strict YAML memory frontmatter
 
-   ```
-   Repro: memory write {name:"x", description:"Build it\nThen deploy"} then memory edit {name:"x", body:"…"}
-   Expect: description "Build it\nThen deploy" survives write → edit → index.
-   Actual: index/search/recall show "Build it"; the edit rewrites the file with
-           "Build it", deleting "Then deploy" permanently.
-   ```
+The slice shipped: `memory` frontmatter is parsed and emitted with
+`serde_yaml_ng` (`parse_frontmatter` / the `Frontmatter` serialize struct in
+`hrdr-tools/src/memory.rs`), a block the parser rejects is an error rather than
+a silent empty memory, `load_memories` returns a `Store` carrying `skipped`, and
+`flatten_line` collapses newlines at each one-line render site. The owner's live
+store was migrated with the same emitter (two files needed quoting) and every
+file re-verified against the strict path. Decisions worth not re-litigating:
 
-   Fix: quote and escape the description in `emit_memory` (and parse
-   accordingly), or reject control newlines in descriptions at write time.
+- **The no-frontmatter path stays.** A file with no `---` block at all (legacy
+  Claude Code / OKF notes) is a different supported input, not malformed YAML,
+  and still reads as `type: reference` with the description inferred from its
+  first non-empty line. Strictness applies only to a block that claims to be
+  YAML and is not.
+- **`recall` says nothing about skipped files**, by decision — it is injected
+  into every turn and is not a place to spend tokens on maintenance chatter. The
+  skip is reported in the `MEMORY.md` index, the scope listing and `search`, all
+  of which a user reads deliberately.
+- **`write` may proceed where `view`/`edit` refuse.** Unparseable content cannot
+  round-trip, so `backup_if_drifted` always copies it aside first; nothing is
+  lost by replacing a file that has been backed up.
+- **Frontmatter is handed to the parser including its opening `---`**, which
+  YAML accepts as a document-start marker. That is what makes the reported
+  `line L column C` count from the top of the file rather than from inside the
+  block — do not "tidy" it by stripping the fence.
+- **`MAX_SLUG_LEN` is 200**, chosen against the 255-byte component cap with
+  headroom for the longer `<slug>.<unix_ts>-<n>.bak` names the tool derives.
+- **Not covered:** exact `recall_score` ordering among several equally-matching
+  memories. The search-ranking test discriminates the shared `relevance_score`
+  path; a separate ordering test was judged redundant.
 
 ## Performance review 2026-08-06
 
@@ -402,29 +410,38 @@ live here:
 
 ## Owed right now
 
-- **v0.11.0 is not on the AUR.** Every other channel published on 2026-08-03 —
-  the GitHub release with all its assets, the seven crates on crates.io,
-  Homebrew, Scoop, Alpine — and `Publish AUR (hrdr-bin)` failed on run
-  `30767495527` with `The AUR is down due to maintenance`, an outage on Arch's
-  side with nothing wrong in this tree. `hrdr-bin` still reads `0.10.0-1`.
-  Probed for an hour afterwards and it was still down: note that the package
-  page and the RPC endpoint stay **up** through this, so neither one tells you
-  whether it has cleared — the check that answers is
-  `git ls-remote ssh://aur@aur.archlinux.org/hrdr-bin.git`, and SSH auth
-  succeeding says nothing either (the login banner works while the git backend
-  refuses). **The fix is `gh run rerun 30767495527 --failed`, not a new tag**;
-  the job stages the PKGBUILD and exits 0 when the diff is empty, so re-running
-  it is safe. The tag run stays red until it lands, which is
-  `tag-release status` working as intended. Probed again 2026-08-06: the RPC
-  still reports `0.10.0-1`. Probed again 2026-08-07:
-  `gh run rerun 30767495527 --failed` ran and the job failed with the same
-  banner — the outage is still up (the https git endpoint answers `ls-remote`
-  while the SSH one the job pushes through refuses). The RPC still reports
-  `0.10.0-1`. Probed again 2026-08-09: the RPC still reports
-  `Version: 0.10.0-1`, and
-  `git ls-remote ssh://aur@aur.archlinux.org/hrdr-bin.git` still answers
-  `The AUR is down due to maintenance. We will be back soon.` **Delete this
-  entry once the RPC reports `0.11.0-1`.**
+- **THREE releases are not on the AUR: v0.11.0, v0.11.1 and v0.12.0.** Every
+  other channel published each of them — the GitHub release with all its assets,
+  the crates on crates.io, Homebrew, Scoop, Alpine — while
+  `Publish AUR (hrdr-bin)` failed on all three (runs `30767495527`,
+  `30827340210`, `31142520670`), each with
+  `The AUR is down due to maintenance. We will be back soon.` and
+  `fatal: Could not read from remote repository.` Nothing is wrong in this tree;
+  it is one continuous outage on Arch's side, open since 2026-08-03 — the
+  v0.12.0 log carries the identical banner, so it is the same outage rather than
+  a new failure mode. `hrdr-bin` still reads `0.10.0-1`.
+
+  **Only one check answers "is it back".** The package page and the RPC endpoint
+  stay **up** throughout, so neither tells you anything, and SSH auth succeeding
+  says nothing either (the login banner works while the git backend refuses).
+  The check is `git ls-remote ssh://aur@aur.archlinux.org/hrdr-bin.git` — the
+  endpoint the publish job actually pushes through.
+
+  **The fix is three reruns, not new tags:**
+
+  ```
+  gh run rerun 30767495527 --failed   # v0.11.0
+  gh run rerun 30827340210 --failed   # v0.11.1
+  gh run rerun 31142520670 --failed   # v0.12.0
+  ```
+
+  Each stages the PKGBUILD and exits 0 on an empty diff, so re-running is safe;
+  oldest-first keeps the AUR history sensible. Until they land, all three tag
+  runs stay red on `tag-release status`, which is that gate working as intended.
+  A rerun while the outage is up just fails again the same way (tried
+  2026-08-07). Probed 2026-08-06, -07, -09, -10 and -11: still down every time.
+  **Delete this entry once the RPC reports `0.12.0-1`.**
+
 - **Tracked elsewhere, not here:** the Codex catalog compatibility pin
   (`CODEX_CATALOG_COMPAT_VERSION`) is GitHub issue #2, still open there.
 
