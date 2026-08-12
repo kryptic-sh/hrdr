@@ -1358,11 +1358,17 @@ decision, not work — except the last, which is a missing feature.
   unprotected set from real behaviour, so both deleting an arm and quietly
   adding a needle fail loudly. Giving them needles is a behaviour change nobody
   has asked for — decide, don't drift.
-- **Every mid-stream error path hardcodes `retry_after: None`** (`client.rs`,
-  `anthropic.rs`, `codex.rs`), and `retry_after_hint` reads a typed error's
-  field directly — so a rate limit delivered _mid-stream_ never has its
-  requested delay honoured on any backend. Only the HTTP-status path
-  (`error_from_response`) does. Asserted and commented, not fixed.
+- **`retry_after_hint`'s text scan matches exactly one phrasing.** The
+  mid-stream half of the rate-limit fix rests on it — a mid-stream error arrives
+  inside a 200, which rarely carries `Retry-After`, so the delay usually exists
+  only in the message the gateway wrote — and the scan splits on the literal
+  `retry-after:` and reads the digits after it. A provider that writes
+  `try again in 12s`, `please retry after 12 seconds` or names an absolute time
+  is not matched, and hrdr falls back to its own backoff exactly as before.
+  Widening it is a parser change with a false-positive surface (any number in
+  any error message that happens to follow a matching phrase), so it wants a
+  real provider message to justify each spelling added rather than a guess at
+  the set. Nobody has collected those messages.
 - **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
   because `wire_model` runs after their early returns. Pinned as a known
   limitation. Erroring early is worth doing, but at provider-selection time in
