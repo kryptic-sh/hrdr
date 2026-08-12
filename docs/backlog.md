@@ -1332,15 +1332,24 @@ decision, not work — except the last, which is a missing feature.
   it. Recording that provenance is the real prerequisite; decide it before
   widening again.
 
-  **Worth knowing before diagnosing the next report: enforcement is
-  intermittent.** Measured off the saved session that produced the 400 — the
-  main agent made five requests after a `reasoning_content`-bearing turn and all
-  five succeeded; one sub-agent survived four and failed the fifth; another
-  failed its first. Same model, same endpoint, same codepath. The error body
-  names an upstream (`Error from provider (Console)`), so Zen fans out and only
-  some upstreams enforce the rule. A model reading its own transcript concluded
-  the model "fails deterministically at the gateway" and burned two further
-  delegations switching models on that belief.
+  **Worth knowing before diagnosing the next report, because two plausible
+  explanations were wrong first.** The failure looks intermittent — in the
+  session that reported it, the main agent survived five requests after a
+  `reasoning_content`-bearing turn while one sub-agent survived four and failed
+  the fifth, on the same model, endpoint and codepath. It is not intermittent.
+  The requirement is per assistant TURN, not per thought: once a conversation is
+  in thinking mode every assistant message must carry the field, and a turn the
+  model answered without thinking has none to carry, so a run dies exactly when
+  its history first contains such a turn. Two theories were entertained and
+  killed by measurement against the live endpoint: that Zen fans out and only
+  some upstreams enforce the rule (the error body names one,
+  `Error from provider (Console)`), and that Zen streams reasoning under the
+  `reasoning` key that `Delta` does not read — it streams `reasoning_content`,
+  confirmed on the wire. **Replay the endpoint before theorising**: a two-round
+  tool-calling conversation, once with the field omitted and once with it
+  present, answers this in one command. Note also that a model reading its own
+  transcript concluded the model "fails deterministically at the gateway" and
+  burned two further delegations switching models on that belief.
 
 - **408/522/524 are retryable only because `classify_status` says so.**
   `is_transient`'s text fallback has needles for the other six transient
