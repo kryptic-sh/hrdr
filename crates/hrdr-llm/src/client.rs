@@ -1429,6 +1429,14 @@ impl Client {
             return Err(error_from_response(resp).await);
         }
 
+        // The response's own `Retry-After`, read before the body is consumed and
+        // carried into every error the stream can end with, so a rate limit
+        // delivered *mid-stream* still tells the retry loop how long to wait
+        // (see `retry::retry_after_hint`). The header is uncommon on a 200 —
+        // which is what a mid-stream error arrives inside — so this is right
+        // when it is there rather than the usual rescue; the text scan in
+        // `retry_after_hint` is what catches the common phrasing.
+        let retry_after = retry_after_from_headers(resp.headers());
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             // Feed raw byte chunks into the SSE decoder, which buffers per-line
@@ -1450,7 +1458,7 @@ impl Client {
                         // slip past the classifier.
                         let bytes = chunk.map_err(|e| ChatError {
                             status: None,
-                            retry_after: None,
+                            retry_after,
                             kind: ChatErrorKind::Transient,
                             message: format!(
                                 "incomplete stream: transport error mid-response \
@@ -1461,7 +1469,7 @@ impl Client {
                             let _ = decoder.drain(); // discard truncated events
                             Err(ChatError {
                                 status: None,
-                                retry_after: None,
+                                retry_after,
                                 kind: ChatErrorKind::Other,
                                 message: SseOverflow.to_string(),
                             })?;
@@ -1475,7 +1483,7 @@ impl Client {
                             Ok(events) => events,
                             Err(_) => Err(ChatError {
                                 status: None,
-                                retry_after: None,
+                                retry_after,
                                 kind: ChatErrorKind::Other,
                                 message: SseOverflow.to_string(),
                             })?,
@@ -1545,7 +1553,7 @@ impl Client {
                             };
                             Err(ChatError {
                                 status: None,
-                                retry_after: None,
+                                retry_after,
                                 kind,
                                 message: format!("mid-stream error: {msg}"),
                             })?;
@@ -1568,7 +1576,7 @@ impl Client {
             // transient so the agent retry loop can re-request.
             Err(ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind: ChatErrorKind::Transient,
                 message: "incomplete stream: OpenAI stream ended without [DONE] \
                           (partial response, safe to retry)"
@@ -1813,6 +1821,18 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 /// mock to assert the wire log's `sse` and `error_response` records.
 #[doc(hidden)]
 pub async fn serve_response(status_line: &'static str, body: &'static str) -> String {
+    serve_response_with_headers(status_line, "", body).await
+}
+
+/// [`serve_response`] with `extra_headers` inserted verbatim after the status
+/// line — each one `Name: value\r\n`-terminated, or `""` for none. Needed to
+/// serve a `Retry-After` alongside a 200 SSE body, which is how a rate limit
+/// delivered mid-stream carries its delay.
+pub(crate) async fn serve_response_with_headers(
+    status_line: &'static str,
+    extra_headers: &'static str,
+    body: &'static str,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1854,6 +1874,7 @@ pub async fn serve_response(status_line: &'static str, body: &'static str) -> St
         }
         let resp = format!(
             "{status_line}\r\n\
+             {extra_headers}\
              Content-Type: text/event-stream\r\n\
              Connection: close\r\n\
              \r\n\
@@ -2965,14 +2986,31 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
     }
 
+    /// The `Retry-After` every [`stream_error`] mock answers with, in the two
+    /// forms the test needs it — the raw header line, and the delay the errors
+    /// it produces must carry. `stream_error` asserts they agree.
+    const MOCK_RETRY_AFTER_HEADER: &str = "Retry-After: 30\r\n";
+    const MOCK_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Drive a canned SSE body through the real [`Client::chat_stream`] on a
     /// forced backend and return the typed error the stream ended with.
     ///
     /// The forced backend is what makes one helper serve all three: a mock bound
     /// to `127.0.0.1` is `Backend::OpenAi` to [`detect_backend`], so the native
     /// paths are unreachable from a test without it.
+    ///
+    /// The response is a **200** carrying [`MOCK_RETRY_AFTER`] — the shape a
+    /// mid-stream rate limit arrives in, where the status never says "429" and
+    /// the header is the only place the server's requested delay can be read
+    /// from before the body is consumed.
     async fn stream_error(backend: Backend, body: &'static str) -> ChatError {
-        let base_url = serve_once(body).await;
+        assert_eq!(
+            MOCK_RETRY_AFTER_HEADER,
+            format!("Retry-After: {}\r\n", MOCK_RETRY_AFTER.as_secs()),
+            "the header the mock serves and the delay the assertions expect must be the same value"
+        );
+        let base_url =
+            serve_response_with_headers("HTTP/1.1 200 OK", MOCK_RETRY_AFTER_HEADER, body).await;
         let mut client = Client::new(base_url, Some("test-key".to_string()), "test-model");
         client.set_backend_for_test(backend);
         let mut stream = client
@@ -3019,15 +3057,17 @@ mod tests {
     /// nothing is known to hit it on the native paths — but the asymmetry is
     /// real and this is where it is recorded.
     ///
-    /// Also asserted, and the reason `retry_after` is in the loop below: all
-    /// three mid-stream paths hardcode `retry_after: None` (the `ChatError`
-    /// literals in `Client::chat_stream`, `anthropic::map_event`'s `"error"`
-    /// arm, and `codex::map_event`'s), so a rate limit delivered mid-stream
-    /// never carries the delay the server asked for. `retry::retry_after_hint`
-    /// returns a typed error's field directly without falling back to its text
-    /// scan, and these messages carry no `retry-after:` suffix either, so the
-    /// agent backs off on its own schedule. Only the HTTP-status path
-    /// (`error_from_response`) honours `Retry-After`. Recorded, not fixed.
+    /// Also asserted, and the reason `retry_after` is in the loop below: every
+    /// mid-stream error carries the streaming response's own `Retry-After`
+    /// ([`MOCK_RETRY_AFTER`], which the mock serves on the 200 the body arrives
+    /// in). Each backend reads that header once, before the body is consumed,
+    /// and hands it to every `ChatError` its stream can end with — the literals
+    /// in `Client::chat_stream`, `anthropic::map_event`'s `"error"` arm, and
+    /// `codex::map_event`'s two. This used to be hardcoded `None` on all three,
+    /// so a rate limit delivered mid-stream was retried on hrdr's own backoff
+    /// instead of the delay the server asked for; the header is only half the
+    /// fix, since a gateway that names its delay in the message text alone is
+    /// caught by `retry::retry_after_hint`'s text scan instead.
     #[tokio::test]
     async fn one_failure_classifies_the_same_on_all_three_backends() {
         for (situation, backend, body, expected) in [
@@ -3185,9 +3225,12 @@ mod tests {
                 err.kind, err.message
             );
             assert_eq!(
-                err.retry_after, None,
-                "{situation} on {backend:?}: no mid-stream path sets retry_after \
-                 (see this test's doc comment) — if one now does, the comment is stale"
+                err.retry_after,
+                Some(MOCK_RETRY_AFTER),
+                "{situation} on {backend:?} dropped the response's Retry-After, so the \
+                 retry loop falls back to hrdr's own backoff instead of the delay the \
+                 server asked for: {}",
+                err.message
             );
         }
     }

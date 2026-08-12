@@ -634,6 +634,14 @@ pub(crate) async fn chat_stream(
         return Err(crate::client::error_from_response(resp).await);
     }
 
+    // The response's own `Retry-After`, read before the body is consumed and
+    // carried into every error the stream can end with, so a rate limit
+    // delivered *mid-stream* still tells the retry loop how long to wait (see
+    // `retry::retry_after_hint`). The header is uncommon on a 200 — which is
+    // what a mid-stream error arrives inside — so this is right when it is there
+    // rather than the usual rescue; the text scan in `retry_after_hint` is what
+    // catches the common phrasing.
+    let retry_after = crate::client::retry_after_from_headers(resp.headers());
     let stream = async_stream::try_stream! {
         let mut bytes = resp.bytes_stream();
         // Anthropic content-block index → our flat tool-call index.
@@ -665,7 +673,7 @@ pub(crate) async fn chat_stream(
                     // retry classifier.
                     let chunk = chunk.map_err(|e| crate::client::ChatError {
                         status: None,
-                        retry_after: None,
+                        retry_after,
                         kind: crate::client::ChatErrorKind::Transient,
                         message: format!(
                             "incomplete stream: transport error mid-response \
@@ -676,7 +684,7 @@ pub(crate) async fn chat_stream(
                         let _ = decoder.drain(); // discard truncated events
                         Err(crate::client::ChatError {
                             status: None,
-                            retry_after: None,
+                            retry_after,
                             kind: crate::client::ChatErrorKind::Other,
                             message: SseOverflow.to_string(),
                         })?;
@@ -690,7 +698,7 @@ pub(crate) async fn chat_stream(
                         Ok(events) => events,
                         Err(_) => Err(crate::client::ChatError {
                             status: None,
-                            retry_after: None,
+                            retry_after,
                             kind: crate::client::ChatErrorKind::Other,
                             message: SseOverflow.to_string(),
                         })?,
@@ -713,6 +721,7 @@ pub(crate) async fn chat_stream(
                     &mut thinking_slot,
                     &mut redacted_order,
                     &mut message_stop_seen,
+                    retry_after,
                 )? {
                     yield out;
                 }
@@ -748,7 +757,7 @@ pub(crate) async fn chat_stream(
         if !message_stop_seen {
             Err(crate::client::ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind: crate::client::ChatErrorKind::Transient,
                 message: "incomplete stream: Anthropic stream ended without message_stop \
                           (partial response, safe to retry)"
@@ -789,6 +798,9 @@ fn beta_headers(
 
 /// Translate one Anthropic stream event into a [`ChatChunk`] (or `None` for
 /// events with nothing for the accumulator: `ping`, `content_block_stop`, …).
+///
+/// `retry_after` is the streaming response's own `Retry-After`, which the
+/// `"error"` arm hands to the retry loop; see [`chat_stream`].
 fn map_event(
     ev: &Value,
     tool_slot: &mut std::collections::HashMap<u64, usize>,
@@ -796,6 +808,7 @@ fn map_event(
     thinking_slot: &mut std::collections::HashMap<u64, (String, String)>,
     redacted_order: &mut Vec<(u64, Value)>,
     message_stop_seen: &mut bool,
+    retry_after: Option<std::time::Duration>,
 ) -> Result<Option<ChatChunk>> {
     let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
@@ -990,7 +1003,7 @@ fn map_event(
             };
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind,
                 message: err_msg,
             }))
@@ -1901,6 +1914,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap();
         assert!(
@@ -2001,6 +2015,7 @@ mod tests {
                 &mut thinking,
                 &mut redacted,
                 &mut stop_seen,
+                None,
             )
             .unwrap()
         };
@@ -2043,7 +2058,8 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
-                &mut stop_seen
+                &mut stop_seen,
+                None,
             )
             .unwrap()
             .is_none()
@@ -2058,6 +2074,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2075,7 +2092,8 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
-                &mut stop_seen
+                &mut stop_seen,
+                None,
             )
             .unwrap()
             .is_none()
@@ -2090,6 +2108,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap();
 
@@ -2182,6 +2201,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2195,6 +2215,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2208,6 +2229,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2224,6 +2246,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2242,6 +2265,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2254,7 +2278,8 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
-                &mut stop_seen
+                &mut stop_seen,
+                None,
             )
             .unwrap()
             .is_none()
@@ -2268,6 +2293,7 @@ mod tests {
                 &mut thinking,
                 &mut redacted,
                 &mut stop_seen,
+                None,
             )
             .is_err()
         );
@@ -2392,6 +2418,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
@@ -2424,6 +2451,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
@@ -2454,6 +2482,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
@@ -2485,6 +2514,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
@@ -2514,6 +2544,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
@@ -2534,6 +2565,7 @@ mod tests {
             &mut thinking,
             &mut redacted,
             &mut stop_seen,
+            None,
         )
         .unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();

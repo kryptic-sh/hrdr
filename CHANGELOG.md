@@ -326,6 +326,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A rate limit that arrives mid-stream now waits as long as the provider
+  asked, instead of falling back to hrdr's own backoff.** Only a rate limit
+  delivered as an HTTP status ever honoured the wait: an error object that
+  arrives inside an already-`200` stream — how OpenRouter, LiteLLM and the
+  native Anthropic and Codex endpoints report one — was built with no delay at
+  all, so the retry loop used its own 5/10/20/40/60s schedule and hammered a
+  provider that had said "come back in 90 seconds". Two things changed: each
+  backend now reads the streaming response's `Retry-After` before consuming the
+  body and carries it into every error that stream can end with, and
+  `retry_after_hint` no longer stops at a typed error that has no delay — it
+  falls through to the text scan, which picks the delay out of the message the
+  gateway wrote (`… (retry-after: 12s)`). A delay the server sent in a header
+  still wins over one parsed from prose, and the wait is still capped at 60s.
 - **A DeepSeek model reached through a gateway no longer dies mid-session with
   `400 Bad Request: The reasoning_content in the thinking mode must be passed back to the API.`**
   DeepSeek requires each assistant turn's `reasoning_content` back on every

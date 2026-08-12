@@ -456,10 +456,18 @@ pub fn unsupported_param(e: &anyhow::Error) -> Option<UnsupportedParam> {
 /// form is ignored).
 ///
 /// Checks the typed [`ChatError`](crate::ChatError) first; falls back to a text
-/// scan of the display string for errors that predate the typed form.
+/// scan of the display string for errors that predate the typed form — and for
+/// typed errors whose `retry_after` is empty. That fall-through is what rescues
+/// a mid-stream rate limit: the response carried a 200, so there was no
+/// `Retry-After` header to read, and the delay a gateway asked for lives only in
+/// the message text. A typed error that *does* carry a delay still wins outright
+/// — a header the server sent beats a number parsed out of prose.
 pub fn retry_after_hint(e: &anyhow::Error) -> Option<Duration> {
-    if let Some(ce) = e.downcast_ref::<crate::ChatError>() {
-        return ce.retry_after;
+    if let Some(d) = e
+        .downcast_ref::<crate::ChatError>()
+        .and_then(|ce| ce.retry_after)
+    {
+        return Some(d);
     }
     let msg = e.to_string().to_ascii_lowercase();
     let after = msg.split("retry-after:").nth(1)?;
@@ -821,6 +829,44 @@ mod tests {
         assert_eq!(retry_after_hint(&big).map(|d| d.as_secs()), Some(60));
         // Absent → None (falls back to exponential backoff).
         assert_eq!(retry_after_hint(&anyhow::anyhow!("returned 500")), None);
+    }
+
+    /// The half of the mid-stream rate-limit fix that fires in practice. A
+    /// mid-stream error arrives inside a response that already returned 200, so
+    /// there is usually no `Retry-After` header to carry: the typed error is
+    /// built with `retry_after: None` and the delay exists only in the text the
+    /// gateway wrote. The typed error must not end the lookup there.
+    #[test]
+    fn a_typed_error_without_a_delay_falls_through_to_the_text_scan() {
+        let mid_stream = anyhow::Error::new(ChatError {
+            status: None,
+            kind: ChatErrorKind::Transient,
+            retry_after: None,
+            message: "mid-stream error: rate limited (retry-after: 12s)".to_string(),
+        });
+        assert_eq!(
+            retry_after_hint(&mid_stream),
+            Some(Duration::from_secs(12)),
+            "a typed error carrying no delay must fall through to the text scan, \
+             not short-circuit the lookup"
+        );
+    }
+
+    /// Precedence: a delay the server actually sent beats one parsed out of
+    /// prose. The two values differ so the assertion can tell which was used.
+    #[test]
+    fn an_explicit_delay_wins_over_a_number_in_the_message_text() {
+        let both = anyhow::Error::new(ChatError {
+            status: Some(429),
+            kind: ChatErrorKind::Transient,
+            retry_after: Some(Duration::from_secs(7)),
+            message: "chat endpoint returned 429: slow down (retry-after: 99s)".to_string(),
+        });
+        assert_eq!(
+            retry_after_hint(&both),
+            Some(Duration::from_secs(7)),
+            "the typed field is the server's own header; the text scan must not override it"
+        );
     }
 
     #[test]

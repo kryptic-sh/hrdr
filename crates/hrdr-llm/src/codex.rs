@@ -296,6 +296,14 @@ pub(crate) async fn chat_stream(
         return Err(crate::client::error_from_response(resp).await);
     }
 
+    // The response's own `Retry-After`, read before the body is consumed and
+    // carried into every error the stream can end with, so a rate limit
+    // delivered *mid-stream* still tells the retry loop how long to wait (see
+    // `retry::retry_after_hint`). The header is uncommon on a 200 — which is
+    // what a mid-stream error arrives inside — so this is right when it is there
+    // rather than the usual rescue; the text scan in `retry_after_hint` is what
+    // catches the common phrasing.
+    let retry_after = crate::client::retry_after_from_headers(resp.headers());
     let stream = async_stream::try_stream! {
         let mut bytes = resp.bytes_stream();
         let mut state = StreamState::default();
@@ -315,7 +323,7 @@ pub(crate) async fn chat_stream(
                     // retry classifier.
                     let chunk = chunk.map_err(|e| crate::client::ChatError {
                         status: None,
-                        retry_after: None,
+                        retry_after,
                         kind: crate::client::ChatErrorKind::Transient,
                         message: format!(
                             "incomplete stream: transport error mid-response \
@@ -326,7 +334,7 @@ pub(crate) async fn chat_stream(
                         let _ = decoder.drain(); // discard truncated events
                         Err(crate::client::ChatError {
                             status: None,
-                            retry_after: None,
+                            retry_after,
                             kind: crate::client::ChatErrorKind::Other,
                             message: SseOverflow.to_string(),
                         })?;
@@ -340,7 +348,7 @@ pub(crate) async fn chat_stream(
                         Ok(events) => events,
                         Err(_) => Err(crate::client::ChatError {
                             status: None,
-                            retry_after: None,
+                            retry_after,
                             kind: crate::client::ChatErrorKind::Other,
                             message: SseOverflow.to_string(),
                         })?,
@@ -358,7 +366,7 @@ pub(crate) async fn chat_stream(
                 // with `response.completed`/`.incomplete`/`.failed`.
                 let ev: Value = serde_json::from_str(data)
                     .with_context(|| format!("decoding stream event: {data}"))?;
-                if let Some(out) = map_event(&mut state, &ev)? {
+                if let Some(out) = map_event(&mut state, &ev, retry_after)? {
                     yield out;
                 }
             }
@@ -383,7 +391,7 @@ pub(crate) async fn chat_stream(
         if !state.terminal_seen {
             Err(crate::client::ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind: crate::client::ChatErrorKind::Transient,
                 message: "incomplete stream: Responses stream ended without \
                           response.completed (partial response, safe to retry)"
@@ -421,7 +429,14 @@ struct StreamState {
 /// Translate one Responses stream event into a [`ChatChunk`] (or `None` for
 /// events with nothing for the accumulator). `response.failed`/`error` return
 /// `Err` (terminal, non-retryable), mirroring the OpenAI + Anthropic paths.
-fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
+///
+/// `retry_after` is the streaming response's own `Retry-After`, which the two
+/// error arms hand to the retry loop; see [`chat_stream`].
+fn map_event(
+    state: &mut StreamState,
+    ev: &Value,
+    retry_after: Option<std::time::Duration>,
+) -> Result<Option<ChatChunk>> {
     let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         // Incremental assistant text.
@@ -557,7 +572,7 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind: {
                     let k = classify_codex_error(code);
                     if k == crate::client::ChatErrorKind::Transient
@@ -603,7 +618,7 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             });
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
-                retry_after: None,
+                retry_after,
                 kind: {
                     let k = classify_codex_error(code);
                     if k == crate::client::ChatErrorKind::Transient
@@ -1051,7 +1066,7 @@ mod tests {
         let mut state = StreamState::default();
         let mut acc = Accumulator::new();
         for ev in &events {
-            if let Some(chunk) = map_event(&mut state, ev).unwrap() {
+            if let Some(chunk) = map_event(&mut state, ev, None).unwrap() {
                 acc.push(&chunk).unwrap();
             }
         }
@@ -1095,7 +1110,7 @@ mod tests {
         let mut state = StreamState::default();
         let mut acc = Accumulator::new();
         for ev in &events {
-            if let Some(chunk) = map_event(&mut state, ev).unwrap() {
+            if let Some(chunk) = map_event(&mut state, ev, None).unwrap() {
                 acc.push(&chunk).unwrap();
             }
         }
@@ -1112,7 +1127,7 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 5}
         }});
         let mut state = StreamState::default();
-        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        let chunk = map_event(&mut state, &ev, None).unwrap().unwrap();
         assert!(state.terminal_seen);
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
     }
@@ -1130,7 +1145,7 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 5}
         }});
         let mut state = StreamState::default();
-        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        let chunk = map_event(&mut state, &ev, None).unwrap().unwrap();
         assert!(state.terminal_seen);
         assert_eq!(
             chunk.choices[0].finish_reason.as_deref(),
@@ -1150,7 +1165,7 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 5}
         }});
         let mut state = StreamState::default();
-        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        let chunk = map_event(&mut state, &ev, None).unwrap().unwrap();
         assert!(state.terminal_seen);
         let mut acc = Accumulator::new();
         acc.push(&chunk).unwrap();
@@ -1165,7 +1180,9 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 5}
         }});
         let mut state2 = StreamState::default();
-        let chunk2 = map_event(&mut state2, &ev_no_details).unwrap().unwrap();
+        let chunk2 = map_event(&mut state2, &ev_no_details, None)
+            .unwrap()
+            .unwrap();
         let mut acc2 = Accumulator::new();
         acc2.push(&chunk2).unwrap();
         assert!(
@@ -1180,7 +1197,7 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 5}
         }});
         let mut state = StreamState::default();
-        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        let chunk = map_event(&mut state, &ev, None).unwrap().unwrap();
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
@@ -1190,7 +1207,7 @@ mod tests {
         let failed = json!({"type": "response.failed", "response": {
             "error": {"code": "rate_limit_exceeded", "message": "slow down"}
         }});
-        let err = map_event(&mut state, &failed).unwrap_err();
+        let err = map_event(&mut state, &failed, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
@@ -1205,7 +1222,7 @@ mod tests {
         );
 
         let top = json!({"type": "error", "code": "server_error", "message": "boom"});
-        let err = map_event(&mut state, &top).unwrap_err();
+        let err = map_event(&mut state, &top, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
@@ -1220,7 +1237,7 @@ mod tests {
             "code": "server_is_overloaded",
             "message": "Our servers are currently overloaded. Please try again later."
         });
-        let err = map_event(&mut state, &overloaded).unwrap_err();
+        let err = map_event(&mut state, &overloaded, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
     }
@@ -1234,7 +1251,7 @@ mod tests {
         let failed = json!({"type": "response.failed", "response": {
             "error": {"code": "rate_limit_exceeded", "message": "you have reached your usage quota"}
         }});
-        let err = map_event(&mut state, &failed).unwrap_err();
+        let err = map_event(&mut state, &failed, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(crate::retry::is_transient(&err));
@@ -1246,7 +1263,7 @@ mod tests {
 
         let top = json!({"type": "error", "code": "rate_limit_exceeded",
             "message": "you have reached your usage quota"});
-        let err = map_event(&mut state, &top).unwrap_err();
+        let err = map_event(&mut state, &top, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(crate::retry::is_transient(&err));
@@ -1262,7 +1279,7 @@ mod tests {
         let nested = json!({"type": "error", "error": {
             "code": "server_error", "message": "overloaded"
         }});
-        let err = map_event(&mut state, &nested).unwrap_err();
+        let err = map_event(&mut state, &nested, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
@@ -1284,7 +1301,7 @@ mod tests {
             "code": "server_error",
             "error": {"message": "try later"}
         });
-        let err = map_event(&mut state, &hybrid).unwrap_err();
+        let err = map_event(&mut state, &hybrid, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
@@ -1304,7 +1321,7 @@ mod tests {
             "message": "try later",
             "error": {"code": "server_error"}
         });
-        let err = map_event(&mut state, &hybrid).unwrap_err();
+        let err = map_event(&mut state, &hybrid, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
@@ -1321,7 +1338,7 @@ mod tests {
     fn unrecognized_error_event_carries_the_raw_payload() {
         let mut state = StreamState::default();
         let opaque = json!({"type": "error", "detail": {"reason": "socket reset"}});
-        let err = map_event(&mut state, &opaque).unwrap_err();
+        let err = map_event(&mut state, &opaque, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
         assert!(
@@ -1340,7 +1357,7 @@ mod tests {
         let failed = json!({"type": "response.failed", "response": {
             "error": {"code": "invalid_api_key", "message": "bad key"}
         }});
-        let err = map_event(&mut state, &failed).unwrap_err();
+        let err = map_event(&mut state, &failed, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
         assert!(
@@ -1351,7 +1368,7 @@ mod tests {
 
         let top =
             json!({"type": "error", "code": "invalid_request_error", "message": "bad params"});
-        let err = map_event(&mut state, &top).unwrap_err();
+        let err = map_event(&mut state, &top, None).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
         assert!(
@@ -1367,14 +1384,14 @@ mod tests {
         // `output_item.added` must be dropped, not routed to slot 0.
         let mut state = StreamState::default();
         let ev = json!({"type": "response.function_call_arguments.delta", "item_id": "fc_ghost", "delta": "{\"x\""});
-        assert!(map_event(&mut state, &ev).unwrap().is_none());
+        assert!(map_event(&mut state, &ev, None).unwrap().is_none());
     }
 
     #[test]
     fn reasoning_deltas_map_to_reasoning_channel() {
         let mut state = StreamState::default();
         let ev = json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_0", "delta": "thinking"});
-        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        let chunk = map_event(&mut state, &ev, None).unwrap().unwrap();
         assert_eq!(
             chunk.choices[0].delta.reasoning_content.as_deref(),
             Some("thinking")
@@ -1396,7 +1413,7 @@ mod tests {
         });
         let ev = json!({"type": "response.output_item.done", "item": item});
         assert!(
-            map_event(&mut state, &ev).unwrap().is_none(),
+            map_event(&mut state, &ev, None).unwrap().is_none(),
             "a reasoning item emits no chunk at capture time"
         );
         // Stored verbatim — the blob is opaque and must go back unmodified.
@@ -1412,7 +1429,7 @@ mod tests {
         let ev = json!({"type": "response.output_item.added", "item": {
             "type": "reasoning", "id": "rs_1", "summary": []
         }});
-        assert!(map_event(&mut state, &ev).unwrap().is_none());
+        assert!(map_event(&mut state, &ev, None).unwrap().is_none());
         assert!(state.reasoning_items.is_empty());
     }
 
@@ -1429,7 +1446,7 @@ mod tests {
             json!({"type": "reasoning", "id": "rs_3", "summary": [], "encrypted_content": null}),
         ] {
             let ev = json!({"type": "response.output_item.done", "item": item});
-            assert!(map_event(&mut state, &ev).unwrap().is_none());
+            assert!(map_event(&mut state, &ev, None).unwrap().is_none());
         }
         assert!(
             state.reasoning_items.is_empty(),
@@ -1447,7 +1464,7 @@ mod tests {
             let ev = json!({"type": "response.output_item.done", "item": {
                 "type": "reasoning", "id": id, "summary": [], "encrypted_content": enc
             }});
-            map_event(&mut state, &ev).unwrap();
+            map_event(&mut state, &ev, None).unwrap();
         }
         let ids: Vec<&str> = state
             .reasoning_items
@@ -1479,7 +1496,7 @@ mod tests {
         let mut state = StreamState::default();
         let mut acc = Accumulator::new();
         for ev in &events {
-            if let Some(chunk) = map_event(&mut state, ev).unwrap() {
+            if let Some(chunk) = map_event(&mut state, ev, None).unwrap() {
                 acc.push(&chunk).unwrap();
             }
         }
