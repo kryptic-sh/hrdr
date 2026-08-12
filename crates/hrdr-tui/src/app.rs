@@ -1297,6 +1297,18 @@ impl App {
                 // `.is_empty()`) because the vim engine's `content()` always
                 // carries a trailing newline, even on a freshly-opened,
                 // never-typed-in buffer.
+                //
+                // Text only, deliberately — this is the one key that does NOT
+                // ask [`Self::composer_is_empty`], because a pasted image must
+                // not stand between the user and the exit. Quitting discards the
+                // composer whole and always has: the draft, the stash and any
+                // pending attachment live on `App` for the life of the process
+                // and appear nowhere in `SessionState`, so the final autosave on
+                // the way out writes messages and their attachments and nothing
+                // of what was half-typed. Nothing is left behind to clear, and a
+                // pasted image that was never sent never reached the disk (it
+                // sits behind the `Arc` on the composer, by design — see the
+                // backlog on why a temp file was declined).
                 KeyCode::Char('d') if self.editor.content().trim().is_empty() => {
                     self.request_quit();
                     return Action::None;
