@@ -47,8 +47,20 @@ impl Agent {
 
     /// Zero the session cost counter (session reset — the counter tracks the
     /// *session*, not the process).
+    ///
+    /// Clears the partial flag with it: the unpriced call that set it belonged
+    /// to the conversation being thrown away, and a latch that outlives its
+    /// total renders a brand-new fully-priced conversation as `≥ $X` forever
+    /// (the frontend tally latches on the flag the agent reports). Only the
+    /// *reset* clears it — [`set_session_cost`](Self::set_session_cost) seeds a
+    /// resumed conversation, whose restored total is still as partial as it was
+    /// when it was saved. Clearing the shared `Arc` here is safe because the one
+    /// caller, [`Agent::clear`](crate::Agent::clear), aborts background
+    /// sub-agents before it.
     pub fn reset_session_cost(&self) {
         self.set_session_cost(0.0);
+        self.cost_partial
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Seed the cost counter — a resumed conversation has already spent something,
@@ -333,6 +345,38 @@ mod tests {
             "the server's prompt count is used verbatim"
         );
         assert_eq!(spend.completion_tokens, 77);
+    }
+
+    /// A session reset takes the partial latch with the total it qualifies.
+    ///
+    /// The bug: `/clear` (`Agent::clear`) zeroed `cost_total` and left the flag
+    /// set, so the next `Usage` event still shipped `cost_partial: true` and the
+    /// frontend tally re-latched on it — a brand-new, fully-priced conversation
+    /// rendering as `≥ $X` for the rest of the process. Seeding a *resumed*
+    /// total is the other case and must keep the flag: that total really is
+    /// partial.
+    #[test]
+    fn resetting_the_session_cost_clears_the_partial_latch() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let agent = Agent::new(AgentConfig::default()).unwrap();
+        agent.cost_partial.store(true, Relaxed);
+        agent.set_session_cost(0.42);
+
+        agent.reset_session_cost();
+        assert_eq!(agent.session_cost(), 0.0);
+        assert!(
+            !agent.session_cost_partial(),
+            "the unpriced call that set this belonged to the cleared conversation"
+        );
+
+        // Resume seeding is not a reset: a restored partial total stays partial.
+        agent.cost_partial.store(true, Relaxed);
+        agent.set_session_cost(0.42);
+        assert!(
+            agent.session_cost_partial(),
+            "seeding a resumed total must not clear the latch"
+        );
     }
 
     /// The cache-write premium is priced, not swallowed. `account_usage` has no

@@ -131,11 +131,24 @@ pub fn default_guardrails() -> Vec<Guardrail> {
         ),
         (
             // `-i`/`--interactive` and `-p`/`--patch` (patch mode is interactive
-            // too — it prompts per hunk). On these three subcommands a `p` in a
+            // too — it prompts per hunk). On these subcommands a `p` in a
             // short-flag cluster means exactly that: `git add -p`, `git commit -p`,
-            // and `git rebase -p` (the removed `--preserve-merges`, which modern
-            // git rejects anyway).
-            git_rule(r"(rebase|add|commit)\b[^&|;]*\s(--interactive\b|--patch\b|-[a-zA-Z]*[ip]\b)"),
+            // `git checkout -p`, `git restore -p`, `git reset -p`, and
+            // `git rebase -p` (the removed `--preserve-merges`, which modern git
+            // rejects anyway). The hunk-selecting subcommands past the first
+            // three sat outside the alternation and hung the shell on a prompt it
+            // has no TTY to answer.
+            //
+            // `stash` is deliberately NOT here, though `git stash -p` prompts:
+            // anything between the subcommand and the flag matches, so it would
+            // also refuse `git stash show -p`, which only prints a diff. The
+            // regex crate has no lookaround to say "not `show`", and refusing a
+            // command that never prompts — with a message claiming it needs a
+            // TTY — is worse than letting the rare interactive stash hit the
+            // shell timeout.
+            git_rule(
+                r"(rebase|add|commit|checkout|restore|reset)\b[^&|;]*\s(--interactive\b|--patch\b|-[a-zA-Z]*[ip]\b)",
+            ),
             "interactive git commands need a TTY, which this shell doesn't have — use the non-interactive form",
         ),
         (
@@ -762,16 +775,36 @@ mod tests {
     }
 
     /// `git add -p` is interactive too — the prompt has always named it, and the
-    /// rule now matches it. `-p` on these three subcommands is patch mode or (on
+    /// rule now matches it. `-p` on these subcommands is patch mode or (on
     /// `rebase`) the removed `--preserve-merges`; neither is a flag to keep.
     #[test]
     fn patch_mode_is_interactive_too() {
         assert!(blocked("git add -p"));
         assert!(blocked("git add --patch"));
         assert!(blocked("git commit -p"));
+        // The other subcommands that offer hunk selection prompt on a TTY the
+        // same way, and each used to sail straight through into a hung shell.
+        assert!(blocked("git checkout -p"));
+        assert!(blocked("git checkout --patch"));
+        assert!(blocked("git restore -p"));
+        assert!(blocked("git restore --patch -- src/main.rs"));
+        assert!(blocked("git reset -p"));
+        // …and the non-interactive neighbours still run: the widening is on the
+        // flag, not on the subcommand.
         assert!(!blocked("git add src/main.rs"));
         assert!(!blocked("git commit --amend --no-edit"));
         assert!(!blocked("git rebase --continue"));
+        assert!(!blocked("git checkout main"));
+        assert!(!blocked("git checkout -b feature"));
+        assert!(!blocked("git restore --source=HEAD -- src/main.rs"));
+        assert!(!blocked("git reset --soft HEAD~1"));
+        // `stash` stays out of the rule, and this is the assertion that says so:
+        // the flag arm matches anything between the subcommand and the `-p`, so
+        // adding `stash` refuses `git stash show -p` — a command that only
+        // prints a diff — with a message claiming it needs a TTY. Whoever adds
+        // it will land here.
+        assert!(!blocked("git stash show -p"));
+        assert!(!blocked("git stash pop"));
     }
 
     /// `git rebase HEAD` rebases a branch onto its own tip: a no-op wherever it

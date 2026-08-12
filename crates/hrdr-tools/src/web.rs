@@ -615,11 +615,11 @@ fn is_internal_host_literal(host: &str) -> bool {
     false
 }
 
-/// Whether `ip` is a loopback/private/shared/link-local/unique-local address —
-/// covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16
-/// (incl. the cloud metadata endpoint 169.254.169.254), `::1`, `fc00::/7`,
-/// `fe80::/10`, and an IPv4-mapped IPv6 address whose embedded v4 address is
-/// any of the above.
+/// Whether `ip` is a loopback/private/shared/link-local/unique-local or
+/// unspecified address — covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16,
+/// 100.64/10, 169.254/16 (incl. the cloud metadata endpoint 169.254.169.254),
+/// 0.0.0.0, `::1`, `fc00::/7`, `fe80::/10`, `::`, and an IPv4-mapped IPv6
+/// address whose embedded v4 address is any of the above.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -628,6 +628,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 return is_blocked_ipv4(mapped);
             }
             v6.is_loopback() // ::1
+                || v6.is_unspecified() // ::, which a connect() lands on localhost
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
         }
@@ -963,6 +964,13 @@ mod tests {
         assert!(is_blocked_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_blocked_ip("fc00::1".parse().unwrap()));
         assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        // The unspecified address, both families: a connect to either lands on
+        // localhost, so `::` is the same hole `0.0.0.0` is blocked for.
+        assert!(is_blocked_ip("0.0.0.0".parse().unwrap()));
+        assert!(is_blocked_ip("::".parse().unwrap()));
+        // And the literal reaches the guard through the URL layer too, brackets
+        // and all.
+        assert!(is_blocked_host("http://[::]/x"));
         assert!(is_blocked_ip("100.100.0.1".parse().unwrap())); // 100.64/10 (RFC 6598)
         assert!(!is_blocked_ip("100.128.0.1".parse().unwrap())); // just past the /10
         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));

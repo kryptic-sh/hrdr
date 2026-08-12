@@ -316,6 +316,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The SSRF guard blocks the IPv6 unspecified address `::`.** The v4 half has
+  always refused `0.0.0.0`, but the v6 half tested only `::1`, `fc00::/7` and
+  `fe80::/10` — and a connect to `::` lands on localhost just as `0.0.0.0` does,
+  so `fetch` on `http://[::]:9200/` reached a service bound to the loopback.
+  Both entry points are covered: the literal check that strips the URL's
+  brackets, and the connect-time `SsrfGuardResolver` that filters resolved
+  addresses.
+- **`git checkout -p`, `git restore -p` and `git reset -p` are refused by the
+  interactive-git guardrail.** It named only `rebase`, `add` and `commit`, so
+  hunk selection on the other subcommands reached a `shell` tool with no TTY and
+  hung the turn until its timeout. `--patch` and short-flag clusters were
+  already handled on the named subcommands; only the subcommand list was short.
+  Non-interactive neighbours (`git checkout main`, `git checkout -b`,
+  `git reset --soft`) still run, and `stash` is deliberately left out — the rule
+  matches anything between the subcommand and the flag, so including it would
+  also refuse `git stash show -p`, which just prints a diff.
+- **`/clear` clears the "cost is only a floor" flag with the total.** An
+  unpriced call (`--allow-unpriced`) latches the session total as partial so
+  frontends render `≥ $X`; the reset zeroed the total but left the latch, and
+  the frontend tally re-latches on every `Usage` event, so every conversation
+  after the first unpriced call showed `≥` for the rest of the process even when
+  fully priced. Resume seeding (`set_session_cost`) still keeps the flag — a
+  restored partial total is genuinely partial.
 - **A `memory` description is no longer truncated to its first line.** The tool
   wrote and read frontmatter as one unquoted `key: value` line each, so a
   `description` containing a newline was written across two lines and everything
