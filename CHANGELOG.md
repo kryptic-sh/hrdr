@@ -460,6 +460,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other.** The `<stem>.<unix_ts>.bak` name is whole seconds, so a second
   hand-edit detected within the same second silently replaced the first backup;
   the name is now claimed with a `-1`, `-2` … suffix until one is free.
+- **A thought left open by a resume or a cancel no longer spins forever.** A
+  reasoning block is closed by the next event that arrives, so a session saved
+  or interrupted while the model was still thinking came back with the block
+  never closed: the transcript showed an animated `⠹ Thinking for …` that ticked
+  up from the moment of the resume and never stopped, for a thought that had
+  finished long ago. Resuming a session and cancelling a turn now settle an open
+  thought the same way they already settled a tool call left mid-run. A
+  cancelled thought is stamped with the time it really ran; a restored one reads
+  `✓ Thought for 0s`, because a transcript read back from disk carries no record
+  of when the block opened and no duration is invented for it.
 
 ## [0.12.0] - 2026-08-07
 

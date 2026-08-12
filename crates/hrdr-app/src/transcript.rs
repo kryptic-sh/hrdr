@@ -8,7 +8,7 @@
 
 pub use hrdr_agent::{
     Entry, EntryKind, ToolBody, ToolDisplay, apply_event, extract_shell_command, find_hits,
-    settle_restored_tools, time_from_system, time_from_unix, tool_display, transcript_to_text,
+    settle_restored_entries, time_from_system, time_from_unix, tool_display, transcript_to_text,
 };
 
 /// What a `/find`, `/next`, or `/prev` resolved to: a status line to show, or

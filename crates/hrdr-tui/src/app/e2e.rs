@@ -1540,6 +1540,97 @@ async fn resume_settles_a_tool_call_that_was_still_running() {
     assert!(!*ok);
 }
 
+/// A thought still streaming when the session was saved restores settled, for
+/// the same reason a running tool call does: nothing can close it now, so its
+/// summary would animate forever — and it would animate off the *fold* time,
+/// counting `Thinking for …` up from the moment of the resume.
+#[tokio::test]
+async fn resume_settles_a_thought_that_was_still_streaming() {
+    let mut h = Harness::new(vec![]).await;
+    let state = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        messages: vec![hrdr_agent::Message::system("sys")],
+        transcript: vec![Entry::now(EntryKind::Reasoning {
+            text: "an interrupted thought".into(),
+            took_ms: None,
+        })],
+        ..Default::default()
+    };
+    h.app
+        .apply_session("interrupted".to_string(), hrdr_app::Session::new(state));
+
+    let EntryKind::Reasoning { took_ms, .. } = &h.app.transcript()[0].kind else {
+        panic!("reasoning entry lost");
+    };
+    assert_eq!(*took_ms, Some(0), "settled with the placeholder duration");
+    let screen = h.render();
+    assert!(
+        screen.contains("Thought for"),
+        "the restored summary reads settled:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thinking for"),
+        "never the live loader, which would tick forever:\n{screen}"
+    );
+}
+
+/// Cancelling a turn settles a thought left open at the tail, exactly as it
+/// settles a tool call left mid-run: only the *next* event closes a reasoning
+/// block, and after a cancel no next event is coming.
+///
+/// And it settles it with the duration the block actually ran. The entries here
+/// are the live ones the stream built, so their timestamps are real open times —
+/// stamping the restored path's placeholder instead would put `Thought for 0s`
+/// on a thought that ran twelve seconds, which is the reason the measurement
+/// lives in the reducer at all.
+#[tokio::test]
+async fn cancelling_settles_a_thought_left_streaming() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    // Opened twelve seconds ago, so a real elapsed is distinguishable from the
+    // placeholder zero.
+    let opened = chrono::Local::now() - chrono::Duration::seconds(12);
+    h.app.push_entry(Entry::at(
+        EntryKind::Reasoning {
+            text: "a half-finished thought".into(),
+            took_ms: None,
+        },
+        opened,
+    ));
+    let screen = h.render();
+    assert!(
+        screen.contains("Thinking for"),
+        "it animates while the turn is in flight:\n{screen}"
+    );
+
+    h.app.cancel_turn();
+
+    let took = h.app.transcript().iter().find_map(|e| match &e.kind {
+        EntryKind::Reasoning { took_ms, .. } => Some(*took_ms),
+        _ => None,
+    });
+    let took = took.expect("the thought survives the cancel");
+    let took = took.expect("the cancelled thought is settled");
+    assert!(
+        took >= 12_000,
+        "settled with the elapsed it really ran, not the restore path's \
+         placeholder: {took}ms"
+    );
+    let screen = h.render();
+    assert!(
+        screen.contains("Thought for"),
+        "the summary reads settled after the cancel:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thought for 0s"),
+        "and not as an instant thought:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Thinking for"),
+        "the loader is gone for good:\n{screen}"
+    );
+}
+
 /// An auto-save persists the state the app is already holding — every entry the
 /// user saw, not just the ones reconstructible from the chat messages.
 #[tokio::test]

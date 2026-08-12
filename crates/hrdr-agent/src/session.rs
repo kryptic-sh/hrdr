@@ -386,11 +386,11 @@ impl SessionState {
             .any(|m| m.role == crate::MessageRole::User)
     }
 
-    /// Adopt a loaded session, settling any tool call that was mid-run when it
-    /// was saved (nothing can finish it now, and a running block would spin its
-    /// spinner forever).
+    /// Adopt a loaded session, settling any tool call or thought that was
+    /// mid-run when it was saved (nothing can finish it now, and a running
+    /// block would spin its spinner forever).
     pub fn restored(mut self) -> Self {
-        crate::settle_restored_tools(&mut self.transcript);
+        crate::settle_restored_entries(&mut self.transcript);
         // `Entry::content_hash` is not persisted (it is derived), so every restored
         // entry arrives with a zeroed one. Rebuild them.
         //

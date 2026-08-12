@@ -471,7 +471,7 @@ impl AgentRegistry {
     /// A turn that crashes unwinds between a call's `ToolStart` and the
     /// `ToolEnd` its completion would have emitted, so every view of that agent
     /// is left painting the call as still running: a spinner that never stops.
-    /// That is the same shape [`crate::transcript::settle_restored_tools`]
+    /// That is the same shape [`crate::transcript::settle_restored_entries`]
     /// repairs for a session read back from disk, but it cannot be the same
     /// repair: that one edits already-folded [`crate::Entry`]s, and a *live*
     /// crash has to settle the thing the entries are folded FROM. So this hands

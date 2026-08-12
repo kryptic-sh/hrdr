@@ -207,15 +207,37 @@ impl Entry {
     }
 }
 
-/// A tool call restored from disk can never finish, so `done: false` would spin
-/// its spinner forever — settle it as failed instead.
-pub fn settle_restored_tools(entries: &mut [Entry]) {
+/// Settle every block a restored or cancelled transcript left open. Nothing can
+/// finish these now, so a still-running one would spin its spinner forever: a
+/// tool call settles as failed, a thought settles as ended.
+///
+/// A thought's duration is *not* measured here, because this runs where the
+/// entry's own timestamp does not mean what [`finish_open_reasoning`] needs it
+/// to mean. On the jsonl fold the entry is rebuilt with [`Entry::now`] — the
+/// durable [`crate::transcript_log::Record`] carries no timestamps — so its
+/// `time` is when it was folded, and `now - time` would be an elapsed measured
+/// from the resume; on an older session file with an embedded transcript the
+/// `time` is the original one, and the same subtraction yields days. So the
+/// stamped `took_ms` is a placeholder zero rather than a measurement, chosen
+/// the same way the tool arm picks `ok: false`: it puts the block in its
+/// settled form (`✓ Thought for 0s`) instead of inventing a plausible number.
+///
+/// A caller that still has the live entries — where `time` is the real open
+/// time — settles the thought with [`finish_open_reasoning`] *first*; the
+/// `None` guard here then skips it, and this arm is left for the blocks whose
+/// duration genuinely cannot be recovered.
+pub fn settle_restored_entries(entries: &mut [Entry]) {
     for e in entries {
-        if let EntryKind::Tool { ok, done, .. } = &mut e.kind
-            && !*done
-        {
-            *done = true;
-            *ok = false;
+        match &mut e.kind {
+            EntryKind::Tool { ok, done, .. } if !*done => {
+                *done = true;
+                *ok = false;
+            }
+            EntryKind::Reasoning {
+                took_ms: took @ None,
+                ..
+            } => *took = Some(0),
+            _ => {}
         }
     }
 }
@@ -506,7 +528,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
     // Close an open reasoning block as soon as anything else arrives, so its
     // duration label stops streaming.
     if !matches!(ev, AgentEvent::Reasoning(_)) {
-        finish_reasoning(transcript);
+        finish_open_reasoning(transcript);
     }
     match ev {
         AgentEvent::Text(t) => {
@@ -613,12 +635,20 @@ fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry>
     })
 }
 
-/// Stamp a duration on the reasoning block at the tail of the transcript — the
-/// one that is still streaming. The block's own timestamp is the opened time;
-/// the reducer stamps this because the reducer is what closes the block: every
-/// agent's thinking time is then measured the same way, wherever its events
-/// were folded.
-fn finish_reasoning(transcript: &mut [Entry]) {
+/// Close the still-streaming reasoning block at the tail of the transcript,
+/// stamping how long it was open. A no-op when the tail is anything else.
+///
+/// The tail is the whole search because only a reasoning block can be open, and
+/// any event that is not `Reasoning` closes it on its way through
+/// [`apply_event`] — so an open thought is either last, or already closed.
+///
+/// Normally the reducer calls this, which is why it is measured here at all:
+/// every agent's thinking time is then computed the same way, wherever its
+/// events were folded. It is public for the one caller that has to close a
+/// block the reducer never will — a cancelled turn, where the next event that
+/// would have closed it is never coming, but the entry is still the live one
+/// the stream built, so its `time` is a genuine open time.
+pub fn finish_open_reasoning(transcript: &mut [Entry]) {
     let Some(entry) = transcript.last_mut() else {
         return;
     };

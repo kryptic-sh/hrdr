@@ -2608,11 +2608,23 @@ impl App {
         // checkpoint uses (skips if the agent lock is still busy; a later
         // save, or the one on quit, catches up).
         self.autosave();
-        // Settle any tool calls left mid-execution when the turn was cancelled.
-        // The turn was aborted before `finish_tool_call` could emit a `ToolEnd`
-        // event, so those entries keep `done: false` and spin forever.
+        // Settle whatever the cancelled turn left open. The turn was aborted
+        // before `finish_tool_call` could emit a `ToolEnd` event, so those
+        // entries keep `done: false` and spin forever; a thought is in the same
+        // position, since only the next event closes a reasoning block and no
+        // next event is coming.
+        //
+        // The thought is closed first, and by the reducer's own routine, because
+        // these entries are the live ones the stream built: their timestamps are
+        // real open times, so the block gets the duration it actually ran rather
+        // than the placeholder a restored transcript has to settle for. (A
+        // thought reading `Thought for 0s` after twelve seconds of thinking is
+        // the exact bug that moved this measurement into the reducer.) Anything
+        // it does not reach — a tool call, or a thought some frontend-pushed
+        // entry has pushed off the tail — is then settled below.
         self.sync_panes();
-        hrdr_agent::settle_restored_tools(&mut self.panes.main_mut().state.transcript);
+        hrdr_agent::finish_open_reasoning(&mut self.panes.main_mut().state.transcript);
+        hrdr_agent::settle_restored_entries(&mut self.panes.main_mut().state.transcript);
         // If the user typed while the turn was running, those messages are still
         // in the steering queue. They are neither dropped nor sent: they go back
         // into the composer, where the user can edit, resend or clear them.
