@@ -410,38 +410,6 @@ live here:
 
 ## Owed right now
 
-- **THREE releases are not on the AUR: v0.11.0, v0.11.1 and v0.12.0.** Every
-  other channel published each of them — the GitHub release with all its assets,
-  the crates on crates.io, Homebrew, Scoop, Alpine — while
-  `Publish AUR (hrdr-bin)` failed on all three (runs `30767495527`,
-  `30827340210`, `31142520670`), each with
-  `The AUR is down due to maintenance. We will be back soon.` and
-  `fatal: Could not read from remote repository.` Nothing is wrong in this tree;
-  it is one continuous outage on Arch's side, open since 2026-08-03 — the
-  v0.12.0 log carries the identical banner, so it is the same outage rather than
-  a new failure mode. `hrdr-bin` still reads `0.10.0-1`.
-
-  **Only one check answers "is it back".** The package page and the RPC endpoint
-  stay **up** throughout, so neither tells you anything, and SSH auth succeeding
-  says nothing either (the login banner works while the git backend refuses).
-  The check is `git ls-remote ssh://aur@aur.archlinux.org/hrdr-bin.git` — the
-  endpoint the publish job actually pushes through.
-
-  **The fix is three reruns, not new tags:**
-
-  ```
-  gh run rerun 30767495527 --failed   # v0.11.0
-  gh run rerun 30827340210 --failed   # v0.11.1
-  gh run rerun 31142520670 --failed   # v0.12.0
-  ```
-
-  Each stages the PKGBUILD and exits 0 on an empty diff, so re-running is safe;
-  oldest-first keeps the AUR history sensible. Until they land, all three tag
-  runs stay red on `tag-release status`, which is that gate working as intended.
-  A rerun while the outage is up just fails again the same way (tried
-  2026-08-07). Probed 2026-08-06, -07, -09, -10 and -11: still down every time.
-  **Delete this entry once the RPC reports `0.12.0-1`.**
-
 - **Tracked elsewhere, not here:** the Codex catalog compatibility pin
   (`CODEX_CATALOG_COMPAT_VERSION`) is GitHub issue #2, still open there.
 
@@ -693,12 +661,6 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   defined on idleness — implements the owner's rule, which names delivery,
   without widening it. If a sub-agent ever gains a path to idleness that is not
   "finished", that equality breaks and this is the note that says so.
-- **`Ctrl+D` on a box holding only a pasted image still quits**, dropping the
-  bytes: it reads `editor.content().trim()` directly rather than
-  `App::composer_is_empty`, which Ctrl+C and Ctrl+S now share. Left alone
-  deliberately — Ctrl+D is the shell-style EOF quit, and quitting discards the
-  composer whatever is on it — but it is the third answer to "is the composer
-  empty" and the one that disagrees.
 - **Considered and declined: auto-attaching a pasted file path.** Dragging a
   file onto a terminal and typing about a path are the same keystrokes, so
   `Event::Paste` leaves text as text. The two deliberate spellings are `@path`
@@ -758,10 +720,16 @@ is reported, and the prompt-to-rail drift test runs both directions
 (`PROMPT_PROHIBITIONS` in `prompt.rs`, every row either a rail-enforced command
 or a mandatory prompt-only reason). What it left open:
 
-- **`git checkout -p` is not caught**, only `rebase`/`add`/`commit` carry the
-  interactive rule. It is patch mode and equally TTY-dependent; the prompt does
-  not name it either, so neither half covers it. One alternation to widen if it
-  ever shows up.
+- **`git stash -p` is still not caught**, and deliberately so — the rest of that
+  gap closed by widening the interactive rule's alternation to `checkout`,
+  `restore` and `reset`. `stash` cannot join them as the rule stands: the flag
+  arm matches anything between the subcommand and the `-p`, so including it also
+  refuses `git stash show -p`, which only prints a diff, with a message claiming
+  it needs a TTY. The regex crate has no lookaround to say "not `show`", and a
+  hung shell hits its own timeout while a false refusal never resolves.
+  `patch_mode_is_interactive_too` asserts `git stash show -p` runs, so whoever
+  widens it lands there. Closing it properly wants the parsed-command work in
+  the peer-comparison section, not a longer regex.
 - **`:(top)`, git's long-form spelling of the `:/` repo-root pathspec, is not in
   the whole-tree set.** Rare enough that widening the alternation was judged not
   worth the false-positive surface.
@@ -1349,6 +1317,31 @@ re-verified against the tree.
 Each is pinned by a test and commented in the source; what is missing is a
 decision, not work — except the last, which is a missing feature.
 
+- **Whether a reasoning replay should follow the FIELD rather than the model
+  name.** The `reasoning_content` graft in `Client::body_json` was keyed on
+  DeepSeek's own host, which meant every gateway serving DeepSeek — OpenCode
+  Zen, OpenRouter, Together — dropped the field and got
+  `The reasoning_content in the thinking mode must be passed back to the API`
+  back as a 400. The gate now also fires on a wire model id naming deepseek,
+  which covers the gateways. What is still keyed on a NAME is the general case:
+  any provider streaming `reasoning_content` may want it echoed, and a model id
+  is a guess about that. The alternative — replay whenever the assistant message
+  carries reasoning the endpoint itself produced — was NOT taken because a
+  mid-session model switch would then send one model's reasoning to another
+  model's API, and nothing on a `ChatMessage` records which endpoint produced
+  it. Recording that provenance is the real prerequisite; decide it before
+  widening again.
+
+  **Worth knowing before diagnosing the next report: enforcement is
+  intermittent.** Measured off the saved session that produced the 400 — the
+  main agent made five requests after a `reasoning_content`-bearing turn and all
+  five succeeded; one sub-agent survived four and failed the fifth; another
+  failed its first. Same model, same endpoint, same codepath. The error body
+  names an upstream (`Error from provider (Console)`), so Zen fans out and only
+  some upstreams enforce the rule. A model reading its own transcript concluded
+  the model "fails deterministically at the gateway" and burned two further
+  delegations switching models on that belief.
+
 - **408/522/524 are retryable only because `classify_status` says so.**
   `is_transient`'s text fallback has needles for the other six transient
   statuses and none for these, so those three arms are the only thing making a
@@ -1511,9 +1504,8 @@ forever, giving a spurious permanent busy error; `openai_refresh` requires
 `refresh_token` in the response (`oauth.rs:361`) — a spec-minimal server forces
 a re-login; the wrap-up round shares `overflow_compacted`
 (`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
-turn; `cost_partial` is a process-lifetime latch (`budget.rs:44`) that
-`reset_session_cost` doesn't clear; `parse_scalar` quote-stripping loses
-legitimately edge-quoted values (cosmetic until finding 1's edit truncates).
+turn; `parse_scalar` quote-stripping loses legitimately edge-quoted values
+(cosmetic until finding 1's edit truncates).
 
 **From the 2026-08-05 correctness pass:** history persist spawns one OS thread
 per `record` (`history.rs:148-163`; chain joins previous handle so writes never
@@ -1604,8 +1596,10 @@ overrides it). Residual, recorded as hardening below.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path (`mutation.rs:150-153`); a symlink swap
   between the two could redirect a write. Same-user, no privilege boundary.
-- `is_blocked_ip` has no IPv6 `::` arm — harmless today (connect fails); one
-  line to make symmetric with the v4 `0.0.0.0` block.
+- `is_blocked_ip` still has no arm for the IPv4-compatible (`::127.0.0.1`),
+  NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) forms of an internal address —
+  the same class as the unspecified `::` that was closed, and each reachable by
+  spelling a loopback or private v4 address inside a v6 literal.
 - `grep_line_is_secret`'s `-`-delimited token parse (`lib.rs:1261-1276`) can
   mis-attribute a line to a wrong path prefix — a crafted filename can false-
   negative the courtesy filter.

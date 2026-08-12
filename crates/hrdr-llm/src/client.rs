@@ -593,11 +593,30 @@ pub fn url_host(base_url: &str) -> &str {
         .unwrap_or(authority)
 }
 
-/// Whether `base_url` is DeepSeek's own API host — the one endpoint that
-/// requires the assistant's `reasoning_content` to be passed back on
-/// subsequent requests when `tools` is present (400 without it).
-fn is_deepseek(base_url: &str) -> bool {
-    url_host(base_url) == "api.deepseek.com"
+/// Whether a request to `base_url` for `model` must pass each assistant turn's
+/// `reasoning_content` back to the API.
+///
+/// DeepSeek's thinking mode returns its chain-of-thought as
+/// `reasoning_content`, and for requests carrying `tools` — always, in hrdr's
+/// agent loop — it requires every assistant turn's `reasoning_content` back on
+/// every subsequent request. Omitting it is a 400: *"The reasoning_content in
+/// the thinking mode must be passed back to the API."*
+///
+/// That requirement follows the MODEL wherever it is served, so testing the
+/// host alone is not enough — gateways are how most people reach DeepSeek, and
+/// each has a host of its own while proxying the same upstream that 400s:
+/// OpenCode Zen (`deepseek-v4-flash-free`), OpenRouter
+/// (`deepseek/deepseek-chat`), Together (`deepseek-ai/DeepSeek-R1`), LiteLLM.
+/// So the wire model id is matched by name, case-insensitively (`DeepSeek-R1`
+/// counts), and DeepSeek's own host stays in the test for the ids a name test
+/// would miss — a served-model alias, the [`UNNAMED_MODEL`] sentinel.
+///
+/// Kept this narrow deliberately: replaying whatever reasoning a provider
+/// streamed us on every endpoint would send `reasoning_content` to whichever
+/// model the session is switched to next, and to OpenAI-compatible servers
+/// that reject unknown message fields.
+fn replays_reasoning_content(base_url: &str, model: &str) -> bool {
+    url_host(base_url) == "api.deepseek.com" || model.to_ascii_lowercase().contains("deepseek")
 }
 
 /// Whether `base_url` is OpenRouter — the one endpoint that takes a `plugins`
@@ -1161,7 +1180,8 @@ impl Client {
 
     /// Whether the OpenAI request body needs a post-serialization graft:
     /// cache breakpoints (Ephemeral mode), the `prompt_cache_key` routing hint,
-    /// the DeepSeek `reasoning_content` replay, or attachments to render into
+    /// the DeepSeek `reasoning_content` replay (see
+    /// [`replays_reasoning_content`]), or attachments to render into
     /// content parts (which is also what carries OpenRouter's PDF-parser
     /// selection). With none of these the body is the request serialized
     /// as-is — which is what `chat_stream`'s fast path sends, skipping the
@@ -1170,7 +1190,7 @@ impl Client {
     fn grafts_needed(&self, messages: &[ChatMessage]) -> bool {
         self.cache == CacheMode::Ephemeral
             || (self.prompt_cache_key.is_some() && self.consumes_prompt_cache_key())
-            || is_deepseek(&self.base_url)
+            || replays_reasoning_content(&self.base_url, &self.model)
             || messages.iter().any(|m| !m.attachments.is_empty())
     }
 
@@ -1208,17 +1228,15 @@ impl Client {
         {
             obj.insert("prompt_cache_key".to_string(), serde_json::json!(key));
         }
-        // DeepSeek's thinking mode returns chain-of-thought as
-        // `reasoning_content`, and for requests carrying `tools` — always, in
-        // hrdr's agent loop — the API requires each assistant turn's
-        // `reasoning_content` to be passed back on every subsequent request;
-        // omitting it is a 400. `ChatMessage.reasoning_content` is
-        // `skip_serializing` for every other backend, so the graft is the only
-        // route, and it happens here keyed by index off the ORIGINAL messages
-        // (which still hold the field) — DeepSeek's host only, so an
-        // OpenAI-compatible server that rejects unknown message fields sees
-        // the unchanged body.
-        if is_deepseek(&self.base_url)
+        // DeepSeek's `reasoning_content` replay, for the endpoints and models
+        // that 400 without it — see [`replays_reasoning_content`].
+        // `ChatMessage.reasoning_content` is `skip_serializing` for every other
+        // backend, so the graft is the only route, and it happens here keyed by
+        // index off the ORIGINAL messages (which still hold the field). Only an
+        // assistant turn that really produced reasoning grows the field, and
+        // only for a DeepSeek model or host, so an OpenAI-compatible server
+        // that rejects unknown message fields sees the unchanged body.
+        if replays_reasoning_content(&self.base_url, &self.model)
             && let Some(messages) = json
                 .get_mut("messages")
                 .and_then(serde_json::Value::as_array_mut)
@@ -2204,16 +2222,23 @@ mod tests {
 
     /// DeepSeek's thinking mode requires an assistant turn's
     /// `reasoning_content` back on every subsequent request when `tools` is
-    /// present (hrdr's agent loop always sends tools) — omitting it is a 400.
-    /// The field must be grafted onto assistant messages in a body built for
-    /// `api.deepseek.com` only: `ChatMessage.reasoning_content` is
-    /// `skip_serializing` for exactly that reason, and any other
-    /// OpenAI-compatible server rejecting unknown message fields is the
-    /// failure the pass-back must not reintroduce.
+    /// present (hrdr's agent loop always sends tools) — omitting it is a 400
+    /// reading *"The reasoning_content in the thinking mode must be passed back
+    /// to the API."*
+    ///
+    /// The graft is keyed on the model OR the host, not the host alone: the
+    /// same model reached through a gateway — OpenCode Zen, OpenRouter,
+    /// Together — 400s identically from a host that is not `api.deepseek.com`.
+    /// `ChatMessage.reasoning_content` is `skip_serializing`, so the graft is
+    /// the only thing that puts the field on the wire, and it must stay off
+    /// every other body: an OpenAI-compatible server rejecting unknown message
+    /// fields is the failure the pass-back must not reintroduce.
     #[test]
-    fn reasoning_content_is_grafted_only_for_the_deepseek_host() {
+    fn reasoning_content_is_grafted_for_the_deepseek_model_or_host() {
         // A reasoning assistant turn, an assistant turn with no reasoning, and
-        // a user turn — only the first may grow the field.
+        // a user turn holding the field on the struct — `reasoning_content`
+        // deserializes on any role, so a resumed session can carry one, and
+        // only the assistant turn may grow it on the wire.
         fn assistant_with_reasoning(content: &str, reasoning: &str) -> ChatMessage {
             ChatMessage {
                 role: Role::Assistant,
@@ -2228,52 +2253,66 @@ mod tests {
                 name: None,
             }
         }
+        let mut user = ChatMessage::user("ok");
+        user.reasoning_content = Some("a user turn's field is never replayed".to_string());
         let messages = vec![
             assistant_with_reasoning("Let me check that.", "I should verify the docs first."),
             ChatMessage::assistant("No reasoning here."),
-            ChatMessage::user("ok"),
+            user,
         ];
 
-        let deepseek = Client::new("https://api.deepseek.com", None, "deepseek-v4-pro");
-        assert!(is_deepseek(&deepseek.base_url));
-        let body = deepseek.body_json(&deepseek.request(
-            Some(deepseek.model.clone()),
-            &messages,
-            &[],
-            true,
-        ));
-        let msgs = body["messages"].as_array().expect("messages array");
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0]["role"], "assistant");
-        assert_eq!(
-            msgs[0]["reasoning_content"],
-            "I should verify the docs first."
-        );
-        // The graft is additive — the serialized message is otherwise intact.
-        assert_eq!(msgs[0]["content"], "Let me check that.");
-        // No reasoning on the field-less assistant turn or the user turn.
-        assert!(
-            msgs[1].get("reasoning_content").is_none(),
-            "an assistant message with no reasoning must stay bare: {body}"
-        );
-        assert!(
-            msgs[2].get("reasoning_content").is_none(),
-            "a user message must never carry reasoning_content: {body}"
-        );
-
-        // The same request through any other host omits the field entirely.
-        for url in [
-            "https://api.openai.com",
-            "https://openrouter.ai/api/v1",
-            "http://localhost:8080/v1",
+        // DeepSeek's own host, plus the gateways that serve DeepSeek models
+        // under a hostname of their own — the second row is the session that
+        // reported the 400, the next two are vendor-prefixed ids, and the last
+        // one matches only once the id is folded to lower case.
+        for (url, model) in [
+            ("https://api.deepseek.com", "deepseek-v4-pro"),
+            ("https://opencode.ai/zen/v1", "deepseek-v4-flash-free"),
+            ("https://openrouter.ai/api/v1", "deepseek/deepseek-chat"),
+            ("https://api.together.xyz/v1", "deepseek-ai/DeepSeek-R1"),
+            ("https://models.github.ai/inference", "DeepSeek-R1"),
         ] {
-            let other = Client::new(url, None, "deepseek-v4-pro");
-            assert!(!is_deepseek(&other.base_url));
+            let client = Client::new(url, None, model);
+            assert!(
+                replays_reasoning_content(&client.base_url, &client.model),
+                "{url} / {model} must replay reasoning_content"
+            );
+            let body =
+                client.body_json(&client.request(Some(client.model.clone()), &messages, &[], true));
+            let msgs = body["messages"].as_array().expect("messages array");
+            assert_eq!(msgs.len(), 3);
+            assert_eq!(msgs[0]["role"], "assistant");
+            assert_eq!(
+                msgs[0]["reasoning_content"], "I should verify the docs first.",
+                "{url} / {model} must carry the assistant's reasoning: {body}"
+            );
+            // The graft is additive — the serialized message is otherwise intact.
+            assert_eq!(msgs[0]["content"], "Let me check that.");
+            // No reasoning on the field-less assistant turn or the user turn.
+            assert!(
+                msgs[1].get("reasoning_content").is_none(),
+                "an assistant message with no reasoning must stay bare: {body}"
+            );
+            assert!(
+                msgs[2].get("reasoning_content").is_none(),
+                "a user message must never carry reasoning_content: {body}"
+            );
+        }
+
+        // Neither the host nor the model is DeepSeek's: the field never reaches
+        // the wire, on any of them.
+        for (url, model) in [
+            ("https://api.openai.com", "gpt-5.6"),
+            ("https://openrouter.ai/api/v1", "qwen/qwen3-coder"),
+            ("http://localhost:8080/v1", "glm-5"),
+        ] {
+            let other = Client::new(url, None, model);
+            assert!(!replays_reasoning_content(&other.base_url, &other.model));
             let body =
                 other.body_json(&other.request(Some(other.model.clone()), &messages, &[], true));
             assert!(
                 !body.to_string().contains("reasoning_content"),
-                "{url} must not receive reasoning_content: {body}"
+                "{url} / {model} must not receive reasoning_content: {body}"
             );
         }
     }
@@ -3296,9 +3335,10 @@ mod tests {
 
     /// The graft path still routes through `body_json`: with a graft in force,
     /// the fast path must not run, or the graft would be missing from the wire.
-    /// Ephemeral cache is used here because the other grafts are host-gated
-    /// (`prompt_cache_key` only goes to OpenAI's hosts; DeepSeek is one host) —
-    /// cache breakpoints apply to every host.
+    /// Ephemeral cache is used here because the other grafts are gated on the
+    /// endpoint (`prompt_cache_key` only goes to OpenAI's hosts; the
+    /// `reasoning_content` replay needs a DeepSeek model or host) — cache
+    /// breakpoints apply to every host.
     #[tokio::test]
     async fn a_graft_reaches_the_wire_through_body_json() {
         let stream_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\

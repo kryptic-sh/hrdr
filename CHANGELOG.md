@@ -316,6 +316,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A DeepSeek model reached through a gateway no longer dies mid-session with
+  `400 Bad Request: The reasoning_content in the thinking mode must be passed back to the API.`**
+  DeepSeek requires each assistant turn's `reasoning_content` back on every
+  subsequent request that carries `tools` — which, in hrdr's agent loop, is all
+  of them — and hrdr replayed it only when the base URL was `api.deepseek.com`.
+  So every gateway that fronts DeepSeek dropped the field: OpenCode Zen
+  (`zen://deepseek-v4-flash-free`), OpenRouter (`deepseek/deepseek-chat`),
+  Together (`deepseek-ai/DeepSeek-R1`), a LiteLLM proxy. Expect it to have
+  looked intermittent rather than broken — a gateway fans out across upstreams
+  and only some enforce the rule, so a run could survive several thinking turns
+  and then lose one, which reads like a flaky endpoint. The replay is now keyed
+  on the host **or** a wire model id naming deepseek (matched
+  case-insensitively), since the requirement follows the model wherever it is
+  served. Every other endpoint's body is unchanged — the field is added only to
+  an assistant message that really produced reasoning, and only for a DeepSeek
+  model or host.
 - **The SSRF guard blocks the IPv6 unspecified address `::`.** The v4 half has
   always refused `0.0.0.0`, but the v6 half tested only `::1`, `fc00::/7` and
   `fe80::/10` — and a connect to `::` lands on localhost just as `0.0.0.0` does,
