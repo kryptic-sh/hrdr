@@ -302,6 +302,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   once when the picker opens — and once when an async catalog load replaces the
   rows — so a typed character only runs the subsequence walk against the stored
   strings.
+- **Input history is persisted by one writer thread instead of one per submit.**
+  Every recorded submission used to spawn an OS thread that parked on the
+  previous write's `join`, so a burst of submits held a thread and a full copy
+  of the history list apiece, each waking in turn to do its own two fsyncs. A
+  single long-lived thread now drains a queue that keeps only the newest
+  snapshot per file — every write is the whole list, so a superseded snapshot
+  would just write bytes the next one overwrites — which collapses a burst into
+  one write. Ordering is unchanged (that thread is the only consumer), as is the
+  write being fire-and-forget: nothing joins it, so a write racing process exit
+  is still dropped.
 
 - **Guardrails for a delete the model cannot see the target of.** A `rm` whose
   argument is a whole `$VAR`, `${VAR}`, `$(…)` or `` `…` ``, a `find … -delete`,

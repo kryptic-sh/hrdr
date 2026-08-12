@@ -141,9 +141,9 @@ impl HistoryBrowser {
 
 /// Persist input history (one entry per line; multi-line entries are skipped to
 /// keep the line-based file well-formed). Best-effort — filesystem errors are
-/// silently ignored. Runs on a detached thread: the write ends in two fsyncs
-/// (`write_atomic`), and the caller of [`HistoryBrowser::record`] is the TUI's
-/// event loop.
+/// silently ignored. Handed to the history-writer thread: the write ends in two
+/// fsyncs (`write_atomic`), and the caller of [`HistoryBrowser::record`] is the
+/// TUI's event loop.
 pub fn persist_history(history: &[String]) {
     let Some(path) = history_path() else {
         return;
@@ -151,32 +151,99 @@ pub fn persist_history(history: &[String]) {
     persist_history_async(path, history.to_vec());
 }
 
-/// Fire-and-forget history write, serialized behind any still-running one so
-/// two rapid submits can't land out of order (each write waits for the previous
-/// to finish before renaming its own file). A write that loses the race with
-/// process exit is dropped — same as a crash, and the in-memory list is
-/// unaffected.
+/// Queue a history snapshot for the writer thread. Never blocks the caller —
+/// not on the disk, and not on a busy queue.
+///
+/// Writes land in submit order because [`HistoryWriter`]'s thread is the only
+/// consumer of the queue.
+///
+/// A write that loses the race with process exit is dropped: nobody joins the
+/// writer thread, so a queued or in-flight snapshot dies with the process —
+/// same as a crash, and the in-memory list is unaffected.
 fn persist_history_async(path: PathBuf, entries: Vec<String>) {
-    let writer = HISTORY_WRITER.get_or_init(|| std::sync::Mutex::new(None));
-    let prev = writer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    let handle = std::thread::spawn(move || {
-        if let Some(prev) = prev {
-            let _ = prev.join();
-        }
-        persist_history_to(&path, &entries);
-    });
-    *writer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    HISTORY_WRITER
+        .get_or_init(HistoryWriter::spawn)
+        .queue(path, entries);
 }
 
-/// One history-writer slot: the join handle of the most recent persist, chained
-/// by the next one so writes never reorder.
-static HISTORY_WRITER: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
-    std::sync::OnceLock::new();
+/// The process-wide history writer.
+static HISTORY_WRITER: std::sync::OnceLock<HistoryWriter> = std::sync::OnceLock::new();
+
+/// Snapshots waiting to be written, at most one per path.
+type Pending = std::sync::Mutex<Vec<(PathBuf, Vec<String>)>>;
+
+/// One long-lived thread that performs every history write, fed by a queue of
+/// pending snapshots and a wakeup channel.
+///
+/// Shaped like [`crate::watch_config`]'s debounce thread — an `mpsc` channel and
+/// one worker — except the channel carries a wakeup and the snapshots live in
+/// `pending`. That split is what lets a busy writer neither stall the UI thread
+/// (which a bounded `send` would) nor lose the newest state (which a bounded
+/// `try_send` would, by dropping exactly the snapshot that describes the list as
+/// it now stands). Superseding a snapshot inside `pending` discards only an
+/// older one, and then the wakeup channel can be capacity-1: a full one means
+/// the worker has a wakeup coming that will find whatever was just stored.
+struct HistoryWriter {
+    /// The queue, shared with the writer thread. A later snapshot for a path
+    /// *replaces* the one queued for it, because every write is a full snapshot
+    /// of the list — [`persist_history_to`] renders the whole slice and
+    /// `write_atomic` replaces the file — so a superseded snapshot would only
+    /// write bytes the next one immediately overwrites. Coalescing turns a burst
+    /// of submits into one write; it would be wrong if a write were a delta.
+    /// Keyed by path so one file's snapshot can never displace another's.
+    pending: std::sync::Arc<Pending>,
+    /// Wakes the writer thread. Capacity 1 — see the type docs.
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+impl HistoryWriter {
+    /// Start the writer thread. The sender lives in a `static`, so it is never
+    /// dropped and the thread runs until the process exits.
+    fn spawn() -> Self {
+        let pending = std::sync::Arc::<Pending>::default();
+        let (wake, rx) = std::sync::mpsc::sync_channel(1);
+        let queue = std::sync::Arc::clone(&pending);
+        std::thread::spawn(move || history_writer_loop(&rx, &queue));
+        Self { pending, wake }
+    }
+
+    /// Queue `entries` as the snapshot for `path` and wake the writer.
+    fn queue(&self, path: PathBuf, entries: Vec<String>) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pending.iter_mut().find(|(queued, _)| *queued == path) {
+            Some(slot) => slot.1 = entries,
+            None => pending.push((path, entries)),
+        }
+        // Ping while still holding the lock, so a dropped ping is never a
+        // dropped write: the worker locks the queue only *after* taking a
+        // wakeup, so `Full` here means a wakeup it has not taken yet, and by the
+        // time it does this snapshot is in the queue. The lock covers a move and
+        // a send, never the write itself.
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// Write queued history snapshots until the sender is dropped (in practice,
+/// until the process exits). Draining the whole queue per wakeup is what makes
+/// the coalescing in [`HistoryWriter::pending`] pay off: snapshots queued while
+/// a write was in flight have already collapsed to the newest per path.
+fn history_writer_loop(rx: &std::sync::mpsc::Receiver<()>, pending: &Pending) {
+    while rx.recv().is_ok() {
+        // May be empty: a wakeup can arrive for a snapshot the previous drain
+        // already picked up.
+        let queued = std::mem::take(
+            &mut *pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (path, entries) in queued {
+            persist_history_to(&path, &entries);
+        }
+    }
+}
 
 /// Persist input history to an explicit path. Best-effort — filesystem errors
 /// are silently ignored. The write goes through [`hrdr_agent::write_atomic`],
@@ -308,7 +375,26 @@ mod tests {
         assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
     }
 
-    /// The persist `record` triggers runs on a detached thread and lands in
+    /// Poll `path` until it reads exactly `want`, or fail after a deadline so
+    /// generous that only a write that never happens can trip it: the writer has
+    /// one small file to render and rename, and the bound allows seconds of
+    /// scheduling delay on a loaded machine.
+    fn wait_for_file(path: &std::path::Path, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = std::fs::read_to_string(path);
+            if got.as_deref().ok() == Some(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history file never reached {want:?} (last read: {got:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The persist `record` triggers runs on the writer thread and lands in
     /// order. It must not run synchronously on the caller's thread — that was
     /// the per-Enter UI stall — so poll for the file rather than reading it
     /// right after `record`.
@@ -322,20 +408,67 @@ mod tests {
             vec!["one".into(), "two".into(), "three".into()],
         );
 
-        // The writes are chained, so the file can never regress from the fuller
-        // list to the shorter one — but it may legitimately read the shorter
-        // list while the second write is still in flight, so only the final
-        // state is asserted.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::fs::read_to_string(&path).as_deref().ok() == Some("one\ntwo\nthree") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the detached history write never reached disk"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // One consumer writes both snapshots in submit order (and may coalesce
+        // them into just the second), so the file can never end on the shorter
+        // list — but it may legitimately read the shorter list while the second
+        // write is still in flight, so only the final state is asserted.
+        wait_for_file(&path, "one\ntwo\nthree");
+    }
+
+    /// A burst of submits converges on the *last* snapshot, even when that
+    /// snapshot is shorter than the ones it superseded — coalescing keeps the
+    /// newest, not the biggest, and a queued snapshot never lands after the one
+    /// that replaced it.
+    ///
+    /// A regression guard as much as a test of the coalescing: the old
+    /// thread-per-write implementation converged on the same content, just at
+    /// the cost of a thread and two fsyncs per submit. What it does discriminate
+    /// is the new machinery going wrong — a snapshot stored without a wakeup, or
+    /// a drain that picks the wrong queued entry.
+    #[test]
+    fn a_burst_of_persists_converges_on_the_last() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        let mut entries: Vec<String> = Vec::new();
+        for i in 0..200 {
+            entries.push(format!("entry {i}"));
+            persist_history_async(path.clone(), entries.clone());
         }
+        // Last one wins even though it is the shortest of the burst.
+        persist_history_async(path.clone(), vec!["last".into()]);
+
+        wait_for_file(&path, "last");
+    }
+
+    /// The writer thread outlives the queue going empty: a submit that arrives
+    /// long after an earlier one has landed still gets written. (The old
+    /// implementation spawned a thread per write, so it could not fail this; the
+    /// single worker can, by returning once it has drained the queue.)
+    #[test]
+    fn the_writer_thread_serves_submits_after_going_idle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        persist_history_async(path.clone(), vec!["first".into()]);
+        wait_for_file(&path, "first");
+
+        // The queue is empty and the worker is parked on the wakeup channel.
+        persist_history_async(path.clone(), vec!["first".into(), "second".into()]);
+        wait_for_file(&path, "first\nsecond");
+    }
+
+    /// Two paths never displace each other in the queue: coalescing is per file,
+    /// so a burst on one history file cannot swallow another's snapshot.
+    #[test]
+    fn snapshots_for_different_paths_all_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("history-a");
+        let b = dir.path().join("history-b");
+        for i in 0..50 {
+            persist_history_async(a.clone(), vec![format!("a {i}")]);
+            persist_history_async(b.clone(), vec![format!("b {i}")]);
+        }
+
+        wait_for_file(&a, "a 49");
+        wait_for_file(&b, "b 49");
     }
 }
