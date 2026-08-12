@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-13
+
 ### Breaking
 
 - **`hrdr_agent::WhenIdle` is gone, and `AgentRegistry::send_prompt` is now
@@ -7139,7 +7141,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/kryptic-sh/hrdr/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kryptic-sh/hrdr/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/hrdr/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/hrdr/compare/v0.10.0...v0.11.0
