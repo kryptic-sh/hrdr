@@ -333,15 +333,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of them — and hrdr replayed it only when the base URL was `api.deepseek.com`.
   So every gateway that fronts DeepSeek dropped the field: OpenCode Zen
   (`zen://deepseek-v4-flash-free`), OpenRouter (`deepseek/deepseek-chat`),
-  Together (`deepseek-ai/DeepSeek-R1`), a LiteLLM proxy. Expect it to have
-  looked intermittent rather than broken — a gateway fans out across upstreams
-  and only some enforce the rule, so a run could survive several thinking turns
-  and then lose one, which reads like a flaky endpoint. The replay is now keyed
+  Together (`deepseek-ai/DeepSeek-R1`), a LiteLLM proxy. The replay is now keyed
   on the host **or** a wire model id naming deepseek (matched
   case-insensitively), since the requirement follows the model wherever it is
-  served. Every other endpoint's body is unchanged — the field is added only to
-  an assistant message that really produced reasoning, and only for a DeepSeek
-  model or host.
+  served. The field is also required on **every** assistant turn rather than on
+  the ones that thought: a turn the model answered without reasoning now sends
+  `reasoning_content: ""`, which both DeepSeek's own host and the gateways
+  accept. That second half is why the failure looked intermittent rather than
+  broken — a run died only once its history happened to contain a turn that
+  produced no reasoning, so the same model and endpoint could work for a while
+  and then stop. Every other endpoint's body is unchanged, and no non-assistant
+  message grows the field anywhere.
 - **The SSRF guard blocks the IPv6 unspecified address `::`.** The v4 half has
   always refused `0.0.0.0`, but the v6 half tested only `::1`, `fc00::/7` and
   `fe80::/10` — and a connect to `::` lands on localhost just as `0.0.0.0` does,

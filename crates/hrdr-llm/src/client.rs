@@ -1232,10 +1232,19 @@ impl Client {
         // that 400 without it — see [`replays_reasoning_content`].
         // `ChatMessage.reasoning_content` is `skip_serializing` for every other
         // backend, so the graft is the only route, and it happens here keyed by
-        // index off the ORIGINAL messages (which still hold the field). Only an
-        // assistant turn that really produced reasoning grows the field, and
-        // only for a DeepSeek model or host, so an OpenAI-compatible server
-        // that rejects unknown message fields sees the unchanged body.
+        // index off the ORIGINAL messages (which still hold the field). It runs
+        // only for a DeepSeek model or host, so an OpenAI-compatible server that
+        // rejects unknown message fields sees the unchanged body.
+        //
+        // The field is required per assistant TURN, not per thought: once the
+        // conversation is in thinking mode every assistant message must carry
+        // `reasoning_content`, and a turn the model answered without thinking
+        // carries the empty string. Grafting only where reasoning exists is what
+        // made the 400 look intermittent — a run died exactly when some turn in
+        // its history happened to produce none. Both DeepSeek's own host and the
+        // gateways were measured accepting the empty string, on assistant turns
+        // with and without tool calls. Non-assistant messages never grow the
+        // field on any endpoint.
         if replays_reasoning_content(&self.base_url, &self.model)
             && let Some(messages) = json
                 .get_mut("messages")
@@ -1243,9 +1252,9 @@ impl Client {
         {
             for (msg, original) in messages.iter_mut().zip(&body.messages) {
                 if original.role == Role::Assistant
-                    && let Some(reasoning) = &original.reasoning_content
                     && let Some(obj) = msg.as_object_mut()
                 {
+                    let reasoning = original.reasoning_content.as_deref().unwrap_or_default();
                     obj.insert(
                         "reasoning_content".to_string(),
                         serde_json::json!(reasoning),
@@ -2233,6 +2242,10 @@ mod tests {
     /// the only thing that puts the field on the wire, and it must stay off
     /// every other body: an OpenAI-compatible server rejecting unknown message
     /// fields is the failure the pass-back must not reintroduce.
+    ///
+    /// The requirement is per assistant TURN, so the fixture's second assistant
+    /// message — the one that produced no reasoning — is the case that 400d: it
+    /// must go out carrying the empty string, not bare.
     #[test]
     fn reasoning_content_is_grafted_for_the_deepseek_model_or_host() {
         // A reasoning assistant turn, an assistant turn with no reasoning, and
@@ -2288,10 +2301,18 @@ mod tests {
             );
             // The graft is additive — the serialized message is otherwise intact.
             assert_eq!(msgs[0]["content"], "Let me check that.");
-            // No reasoning on the field-less assistant turn or the user turn.
-            assert!(
-                msgs[1].get("reasoning_content").is_none(),
-                "an assistant message with no reasoning must stay bare: {body}"
+            // An assistant turn that did no thinking still has to carry the
+            // field — omitting it on ANY assistant message once the
+            // conversation is in thinking mode is the 400, and the empty
+            // string is what such a turn sends.
+            assert_eq!(
+                msgs[1]["role"], "assistant",
+                "the fixture's second message must be the no-reasoning assistant turn: {body}"
+            );
+            assert_eq!(
+                msgs[1]["reasoning_content"], "",
+                "an assistant message with no reasoning must carry an empty \
+                 reasoning_content, not omit the field: {body}"
             );
             assert!(
                 msgs[2].get("reasoning_content").is_none(),
