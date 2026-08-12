@@ -822,11 +822,11 @@ impl App {
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
              Ctrl+G opens $EDITOR. Type @path to attach a file. /help for commands; \
-             /exit (Ctrl+C twice, or Ctrl+D on an empty line) to quit."
+             /exit (Ctrl+C twice, or Ctrl+Q) to quit."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
              (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Type @path to \
-             attach a file. /help for commands; /exit (Ctrl+C twice, or Ctrl+D on an empty line) \
+             attach a file. /help for commands; /exit (Ctrl+C twice, or Ctrl+Q) \
              to quit. Submit while a reply runs to queue follow-ups; Up on an empty box \
              takes the last one back to edit."
         };
@@ -1290,31 +1290,16 @@ impl App {
                 }
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
                 KeyCode::Char('g') if !self.running() => return Action::OpenEditor,
-                // Ctrl+D on an empty input quits (shell-style EOF) — checked
-                // before the vim Normal-mode scroll arm below so it fires even
-                // in Normal mode, matching the welcome banner's advertised
-                // "Ctrl+D on an empty line" behavior. `.trim()` (not just
-                // `.is_empty()`) because the vim engine's `content()` always
-                // carries a trailing newline, even on a freshly-opened,
-                // never-typed-in buffer.
-                //
-                // Text only, deliberately — this is the one key that does NOT
-                // ask [`Self::composer_is_empty`], because a pasted image must
-                // not stand between the user and the exit. Quitting discards the
-                // composer whole and always has: the draft, the stash and any
-                // pending attachment live on `App` for the life of the process
-                // and appear nowhere in `SessionState`, so the final autosave on
-                // the way out writes messages and their attachments and nothing
-                // of what was half-typed. Nothing is left behind to clear, and a
-                // pasted image that was never sent never reached the disk (it
-                // sits behind the `Arc` on the composer, by design — see the
-                // backlog on why a temp file was declined).
-                KeyCode::Char('d') if self.editor.content().trim().is_empty() => {
-                    self.request_quit();
-                    return Action::None;
-                }
                 // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only
                 // (plain mode uses these for line editing; PageUp/Down scroll).
+                //
+                // Ctrl+D used to quit on an empty input, shell-style, and that
+                // arm sat above this one so it won even in Normal mode. It is
+                // gone: a key whose meaning flips between "scroll" and "end the
+                // session" on whether the box happens to be empty is one
+                // keystroke from ending a session by accident, and the two keys
+                // are a pair — Ctrl+U never quit anything. Quitting is Ctrl+Q,
+                // Ctrl+C twice, or `/exit`, all of which say so.
                 KeyCode::Char('u') if self.editor.mode_label() == "NORMAL" => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_add(half);
@@ -2661,7 +2646,7 @@ impl App {
 
     /// Quit the session. If a turn is running, cancel it first — which
     /// autosaves the in-progress transcript — so quitting mid-turn (Ctrl+Q,
-    /// double Ctrl+C, Ctrl+D on empty input, `/exit`) never drops the visible
+    /// double Ctrl+C, `/exit`) never drops the visible
     /// user message or a partial reply.
     fn request_quit(&mut self) {
         if self.running() {

@@ -7497,7 +7497,7 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
     );
 }
 
-/// Quitting mid-turn (Ctrl+Q, double Ctrl+C, Ctrl+D on empty input, `/exit`)
+/// Quitting mid-turn (Ctrl+Q, double Ctrl+C, `/exit`)
 /// must not lose the in-progress transcript either: `App::request_quit`
 /// cancels the running turn first (which autosaves) before arming
 /// `should_quit`.
@@ -7605,16 +7605,19 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     );
 }
 
-/// In vim mode, Ctrl+D on an empty input line quits — as the welcome banner
-/// advertises ("Ctrl+D on an empty line") — even in Normal mode, where Ctrl+D
-/// would otherwise scroll the transcript half a page. With a non-empty draft,
-/// Normal-mode Ctrl+D still scrolls as before.
+/// Ctrl+D scrolls and never quits, whatever the box holds.
 ///
-/// Regression: the Normal-mode scroll arm for Ctrl+D was checked before the
-/// empty-input quit arm, so Normal mode always won and the advertised
-/// "Ctrl+D on an empty line" quit never fired there.
+/// It used to end the session on an empty input, shell-style, from an arm that
+/// sat above the Normal-mode scroll so it won in every mode. That is gone: a key
+/// that scrolls or quits depending on whether the box happens to be empty ends
+/// sessions by accident, and its pair Ctrl+U never quit anything. Quitting is
+/// Ctrl+Q, Ctrl+C twice, or `/exit`.
+///
+/// Empty *and* non-empty are both asserted, because the old behaviour differed
+/// between them — a test that only tried one would still pass with the quit arm
+/// back in place.
 #[tokio::test]
-async fn vim_normal_mode_ctrl_d_quits_only_on_empty_input() {
+async fn ctrl_d_scrolls_and_never_quits() {
     let mut h = Harness::new(vec![]).await;
     h.app.editor = Box::new(hrdr_editor::VimEngine::new());
     assert_eq!(
@@ -7622,26 +7625,52 @@ async fn vim_normal_mode_ctrl_d_quits_only_on_empty_input() {
         "NORMAL",
         "vim starts in Normal mode"
     );
-
-    // Non-empty draft: Normal-mode Ctrl+D scrolls (down — it *decreases* the
-    // from-bottom offset), same as always. Start scrolled up so the decrease
-    // is observable.
-    h.app.editor.set_content("a draft in progress");
     h.app.transcript_height = 20;
+
+    // A non-empty draft scrolls down — the offset is measured from the bottom,
+    // so scrolling down *decreases* it. Start scrolled up to see the move.
+    h.app.editor.set_content("a draft in progress");
     h.app.scroll_offset = 10;
     h.app
         .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     assert!(!h.app.should_quit, "a non-empty draft must not quit");
-    assert!(h.app.scroll_offset < 10, "Normal-mode Ctrl+D still scrolls");
+    assert!(h.app.scroll_offset < 10, "Normal-mode Ctrl+D scrolls");
 
-    // Empty input: Ctrl+D quits, matching the welcome banner.
+    // The case that used to quit: an empty box scrolls exactly the same way.
     h.app.editor.set_content("");
-    h.app.scroll_offset = 0;
+    h.app.scroll_offset = 10;
     h.app
         .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(!h.app.should_quit, "an empty box must not quit either");
     assert!(
-        h.app.should_quit,
-        "Ctrl+D on an empty line must quit even in Normal mode"
+        h.app.scroll_offset < 10,
+        "an empty box scrolls rather than quitting"
+    );
+
+    // And a box holding only a pasted image — the state that made the old
+    // text-only emptiness test disagree with every other key — is no different,
+    // because nothing about Ctrl+D asks what the composer holds any more.
+    let m = mock_clipboard(hjkl_clipboard::Capabilities::all());
+    m.preset_available(
+        hjkl_clipboard::Selection::Clipboard,
+        Ok(vec![hjkl_clipboard::MimeType::Png]),
+    );
+    m.preset_get(
+        hjkl_clipboard::Selection::Clipboard,
+        hjkl_clipboard::MimeType::Png,
+        Ok(png_bytes(64)),
+    );
+    h.app.clipboard = Some(hjkl_clipboard::Clipboard::with_backend(Box::new(m)));
+    h.ctrl(']');
+    assert_eq!(h.app.pending_attachments.len(), 1, "the paste landed");
+    h.app.scroll_offset = 10;
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(!h.app.should_quit, "a pending image must not quit either");
+    assert_eq!(
+        h.app.pending_attachments.len(),
+        1,
+        "and the image is still on the composer"
     );
 }
 

@@ -587,18 +587,18 @@ fn escape_cancels_a_turn_without_killing_the_app() -> Result<(), String> {
     Ok(())
 }
 
-/// 9. A resize while idle does not crash the TUI, and a shell-style EOF
-///    (Ctrl+D on an empty input) restores the terminal and exits cleanly.
+/// 9. A resize while idle does not crash the TUI, and a deliberate quit
+///    restores the terminal and exits cleanly.
 ///
 /// Note on "closing stdin": in a pty, stdin *is* the terminal, so dropping the
 /// pty master doesn't deliver a plain stdin EOF — it hangs the terminal up
 /// (SIGHUP), which the kernel turns into a signal-kill, not the clean
-/// `EventStream`-ended exit the TUI's `None => break` arm handles. The faithful,
-/// clean "input reached EOF" path is Ctrl+D, which hrdr treats as a shell-style
-/// EOF quit (and which the welcome banner advertises), so that is what this
-/// asserts exits cleanly with the terminal restored.
+/// `EventStream`-ended exit the TUI's `None => break` arm handles. So the exit
+/// this asserts is the one a user actually types: Ctrl+Q, the immediate quit the
+/// welcome banner advertises. (It used to be Ctrl+D, back when an empty input
+/// made that a shell-style EOF quit; Ctrl+D only scrolls now.)
 #[test]
-fn resize_is_survived_and_eof_exits_cleanly() -> Result<(), String> {
+fn resize_is_survived_and_a_quit_exits_cleanly() -> Result<(), String> {
     if skip_for_want_of_a_pty() {
         return Ok(());
     }
@@ -622,17 +622,17 @@ fn resize_is_survived_and_eof_exits_cleanly() -> Result<(), String> {
         s.snapshot()
     );
 
-    // Ctrl+D on the (empty) input: a shell-style EOF quit.
-    s.send("\x04");
+    // Ctrl+Q: the immediate, deliberate quit.
+    s.send("\x11");
     let status = s.wait_exit(EXIT);
     assert!(
         status.success(),
-        "Ctrl+D on empty input must exit cleanly, got {status:?}. Screen:\n{}",
+        "Ctrl+Q must exit cleanly, got {status:?}. Screen:\n{}",
         s.snapshot()
     );
     assert!(
         !s.snapshot().contains("panicked at"),
-        "the TUI panicked on EOF quit. Screen:\n{}",
+        "the TUI panicked on quit. Screen:\n{}",
         s.snapshot()
     );
     Ok(())

@@ -312,7 +312,7 @@ Run `scripts/notes.sh` for the changelog draft.
 | `Ctrl+S`                  | Stash the input (a stack); on an empty input, pop the newest stash back                                                                    |
 | `Ctrl+C`                  | Clear a non-empty input; on an empty one, interrupt the running turn or `!command`                                                         |
 | `Esc` twice               | Interrupt the running turn or `!command`                                                                                                   |
-| `Ctrl+C` twice / `Ctrl+D` | Quit when idle with an empty input (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                                                    |
+| `Ctrl+C` twice            | Quit when idle with an empty input; `Ctrl+Q` quits at once                                                                                 |
 
 Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
 the input pane instead of the default plain input.

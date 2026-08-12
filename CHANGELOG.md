@@ -243,6 +243,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`Ctrl+D` no longer quits, in any mode — it only scrolls.** It used to end
+  the session when the input was empty (shell-style EOF), from a binding checked
+  ahead of the vim Normal-mode scroll so it won everywhere. A key whose meaning
+  flips between "scroll half a page" and "end the session" on whether the box
+  happens to be empty is one keystroke from closing a session by accident, and
+  its pair `Ctrl+U` never quit anything. In vim Normal mode `Ctrl+U`/`Ctrl+D`
+  scroll as before, now whatever the box holds; elsewhere `Ctrl+D` does nothing
+  and plain mode keeps `Ctrl+U` as kill-to-line-start. Quit with `Ctrl+Q`,
+  `Ctrl+C` twice, or `/exit` — the welcome banner and the README key table say
+  so now.
 - **A sub-agent that has finished can no longer be steered from its pane.**
   Typing into the pane of a sub-agent whose run was over started a fresh turn on
   it (since 0.10.0); it is now refused, which is the refusal the main agent's
