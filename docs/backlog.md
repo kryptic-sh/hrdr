@@ -24,6 +24,57 @@ Conventions:
 
 ---
 
+## Frame cost measured 2026-08-13 — one fix shipped, one left open
+
+Prompted by "lag as the context gets bigger". Measured with a throwaway probe
+driving the real `Harness` in `--release`, against a synthetic transcript and
+against a real 4800-entry session (14.7MB jsonl, folded through
+`Session::load_path`). The probe was deleted; the numbers below are from those
+runs.
+
+**Shipped:** `viewport_rows` in `hrdr-tui/src/ui.rs` — the frame copies one
+screenful of rows instead of every row of the blocks the viewport overlaps. A
+20,000-row tool result on screen went 38.8ms → 0.23ms a frame. See the changelog
+entry.
+
+1. **The frame still walks every transcript entry, on-screen or not.** **[open —
+   real but small; unbounded]** `transcript_chunks` builds a `Chunk` for every
+   entry each frame (cache-key hash, two `HashMap` lookups, an `Rc` bump, a
+   `Vec` push), and only then does the viewport slice. Cost measured at a
+   constant tail viewport with the transcript behind it varied: 50 entries
+   160µs, 500 entries 222µs, 2000 entries 465µs, 4800 entries 946µs — ~0.17µs
+   per off-screen entry per frame, linear and unbounded. At today's sizes it is
+   under a millisecond, so it is NOT what makes a session feel slow; it is worth
+   doing only when something else needs that code opened. Fix shape: extend the
+   existing `ChunkRows::Lazy` (which the session header already uses to keep its
+   height while deferring its rows) to every cached block, so an off-screen
+   entry costs a height lookup and nothing else. The risk is the scroll and
+   hit-testing maths, which is all keyed off `cum` — the same 120 e2e tests that
+   caught a one-row window shift would catch a height regression.
+
+**Measured and cleared — do not re-investigate without new evidence.** Each of
+these was a plausible theory that the numbers killed:
+
+- **Render cost per frame.** Real 4800-entry session: 0.94ms warm, and 1.0ms
+  mean while streaming a reply token by token. Keystroke handling 178ns. Not the
+  lag.
+- **`Arc::make_mut` on the agent history deep-copying the context per push.**
+  `Agent::history_strong_count` was added temporarily to observe it: the
+  refcount is 1 before and after a turn, so `make_mut` mutates in place, and a
+  deep clone of a 3.9MB history is 181µs anyway.
+- **Session autosave.** Per turn, off the UI thread; 1.5ms at a 3.9MB history.
+- **Memory.** RSS 56MB with the real 4800-entry session loaded and rendered —
+  the per-entry render caches are not a leak at realistic sizes.
+- **Whole-turn overhead**, mock endpoint, so hrdr's own CPU only: 1.8ms at 321KB
+  of history, 14.9ms at 3.9MB.
+
+**Coverage gap:** everything above is hrdr's own CPU against a local mock
+endpoint. Time-to-first-token, streaming throughput over ssh, and terminal write
+cost were NOT measured, and a big context makes the provider's own prefill
+slower regardless of anything hrdr does. If the lag is still felt after this
+fix, that is where to look next — start by asking which lag it is (typing,
+scrolling, or waiting for the reply).
+
 ## Performance review — second pass 2026-08-04
 
 A fresh `:perf` run over the whole tree (working tree clean at the time). Items

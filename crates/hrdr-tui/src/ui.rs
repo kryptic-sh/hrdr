@@ -1126,14 +1126,23 @@ fn draw_chunks(
     // row `scroll`, `last` the one past the final visible row.
     let first = cum.partition_point(|&c| c <= scroll_us).saturating_sub(1);
     let last = cum.partition_point(|&c| c < view_end).min(chunks.len());
-    let mut visible: Vec<Line<'static>> = chunks
-        .get(first..last.max(first))
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|c| c.rows.rows().iter().cloned().collect::<Vec<_>>())
-        .collect();
+    // …and only the ROWS it can show, not every row of the blocks it overlaps. A
+    // block is not a screenful: one `read` of a large file or one big diff is a
+    // single block tens of thousands of rows tall, and copying all of them so
+    // `Paragraph` could scroll past them cost ~2µs per row on EVERY frame — a
+    // 20,000-row result was ~39ms a frame with 25 of its rows on screen, which is
+    // felt as lag on every keystroke while it is in view.
+    //
+    // The window is exact rather than approximate: `render_block` emits rows
+    // already wrapped and padded to the render width, which is what lets the
+    // heights above be a plain row count, and lets this skip and take by row.
     // Rows of the first visible block that sit above the viewport.
-    let inner_scroll = clamp_u16(scroll_us.saturating_sub(cum[first.min(chunks.len())]));
+    let skip = scroll_us.saturating_sub(cum[first.min(chunks.len())]);
+    let mut visible = viewport_rows(
+        chunks.get(first..last.max(first)).unwrap_or_default(),
+        skip,
+        area.height as usize,
+    );
 
     // Highlight the active /find query. Only the rows about to be painted need it,
     // and it only restyles them — the blocks in the cache stay as they were.
@@ -1153,8 +1162,10 @@ fn draw_chunks(
         }
     }
 
+    // No `scroll` here: the rows handed over ARE the viewport's, starting at its
+    // first one.
     let para = Paragraph::new(visible).wrap(Wrap { trim: false });
-    f.render_widget(para.scroll((inner_scroll, 0)), text_area);
+    f.render_widget(para, text_area);
 
     TranscriptFrame {
         scroll_offset: offset as usize,
@@ -1162,6 +1173,30 @@ fn draw_chunks(
         tool_hits,
         row_hits,
     }
+}
+
+/// One viewport of rows out of `chunks`: at most `take`, starting `skip` rows
+/// into the first one.
+///
+/// The bound is the point. A chunk is a whole block, and a block can be far
+/// taller than the screen — one `read` of a large file, one big diff — so
+/// copying every row of the blocks the viewport overlaps made a frame cost the
+/// size of the CONTENT rather than the size of the screen, on every frame the
+/// block stayed in view.
+fn viewport_rows(chunks: &[Chunk<'_>], skip: usize, take: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(take);
+    let mut skip = skip;
+    for c in chunks {
+        if out.len() == take {
+            break;
+        }
+        let rows = c.rows.rows();
+        let from = skip.min(rows.len());
+        skip -= from;
+        let room = take - out.len();
+        out.extend(rows[from..].iter().take(room).cloned());
+    }
+    out
 }
 
 /// The scrollbar: total session length, and where the reader is within it.
@@ -4463,6 +4498,55 @@ mod block_tests {
     #[test]
     fn render_block_of_an_empty_body_is_empty() {
         assert!(render_block(Vec::new(), 20, Color::Reset, None).is_empty());
+    }
+
+    /// A chunk of `n` rows, each naming its own index.
+    fn rows_chunk(tag: &str, n: usize) -> Chunk<'static> {
+        let rows: Vec<Line<'static>> = (0..n)
+            .map(|i| Line::from(Span::raw(format!("{tag}{i}"))))
+            .collect();
+        Chunk::plain(ChunkRows::Ready(Rc::new(rows)), None)
+    }
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The viewport copies a SCREENFUL, never a blockful. A block is not bounded
+    /// by the screen — one large `read` result or diff is tens of thousands of
+    /// rows — and copying all of them per frame is what made a big block on
+    /// screen lag every keystroke.
+    #[test]
+    fn the_viewport_copies_one_screen_of_rows_not_the_whole_block() {
+        let chunks = vec![rows_chunk("a", 20_000)];
+        let rows = viewport_rows(&chunks, 5_000, 30);
+        assert_eq!(rows.len(), 30, "copied more than the viewport holds");
+        assert_eq!(
+            row_text(&rows[0]),
+            "a5000",
+            "window started at the wrong row"
+        );
+        assert_eq!(row_text(&rows[29]), "a5029");
+    }
+
+    /// The window spans blocks: it starts partway into the first and stops
+    /// partway into the last, which is what scrolling between two blocks does.
+    #[test]
+    fn the_viewport_window_spans_consecutive_blocks() {
+        let chunks = vec![rows_chunk("a", 4), rows_chunk("b", 4)];
+        let rows = viewport_rows(&chunks, 3, 3);
+        let text: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(text, vec!["a3", "b0", "b1"]);
+    }
+
+    /// Fewer rows available than the viewport holds — a short transcript — is
+    /// not an error and must not pad or loop.
+    #[test]
+    fn the_viewport_takes_what_there_is_when_the_rows_run_out() {
+        let chunks = vec![rows_chunk("a", 2)];
+        assert_eq!(viewport_rows(&chunks, 0, 30).len(), 2);
+        // Skipping past the end yields nothing rather than underflowing.
+        assert!(viewport_rows(&chunks, 99, 30).is_empty());
     }
 
     /// Content is laid out at width minus one padding column per side, so a body

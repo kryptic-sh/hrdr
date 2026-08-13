@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **A large tool result or diff on screen no longer slows the whole UI down.**
+  The transcript painted every row of every block the viewport overlapped and
+  let `Paragraph` scroll past the ones above it — so the cost of a frame was the
+  size of the _content_ in view, not the size of the screen. One block is not
+  bounded by the screen: a `read` of a large file, a big diff or an expanded
+  tool result (`/verbose on`, or a click) is a single block tens of thousands of
+  rows tall, and each frame copied all of them to show twenty-five. A 20,000-row
+  result cost ~39ms a frame, which is felt as lag on every keystroke, scroll and
+  streamed token while it is in view. The frame now copies one screenful: the
+  same block measures ~0.23ms, and the cost no longer depends on how big the
+  thing on screen is.
+
 ## [0.13.0] - 2026-08-13
 
 ### Breaking
