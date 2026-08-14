@@ -317,11 +317,11 @@ impl FmValue {
 
 /// Split a leading `---` … `---` frontmatter fence off `text`, returning
 /// `(frontmatter_text, body)`. Strips an optional leading BOM before looking
-/// for the opening fence, and tolerates a CRLF line ending on the opening
-/// fence (`---\r\n`) as well as a closing fence with trailing whitespace
-/// (`--- `) and/or a CRLF ending. Returns `None` when there's no (properly
-/// opened and terminated) fence — the caller then treats the *original*
-/// input as the whole body.
+/// for the opening fence, and tolerates a CRLF line ending (`---\r\n`) or
+/// trailing whitespace (`--- `) on the opening fence as well as a closing
+/// fence with trailing whitespace (`--- `) and/or a CRLF ending. Returns
+/// `None` when there's no (properly opened and terminated) fence — the caller
+/// then treats the *original* input as the whole body.
 ///
 /// Shared by `hrdr-agent`'s agent-file frontmatter (which further parses the
 /// returned frontmatter text as YAML via [`split_frontmatter`]) and
@@ -332,10 +332,12 @@ pub fn split_fence(text: &str) -> Option<(&str, &str)> {
     let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rest = trimmed.strip_prefix("---")?;
     // The opening fence must be its own line. Tolerate a CRLF line ending
-    // (`---\r\n`): without this, a CRLF-authored file fails the `\n` match
-    // and the ENTIRE file — including a `read_only: true` / `tools:`
-    // allow-list — is returned as the body, loading the agent with no
-    // restrictions and the raw YAML as its system prompt.
+    // (`---\r\n`) and trailing whitespace on the fence line (`--- `, `---\t`):
+    // without this, such a file fails the `\n` match and the ENTIRE file —
+    // including a `read_only: true` / `tools:` allow-list — is returned as the
+    // body, loading the agent with no restrictions and the raw YAML as its
+    // system prompt.
+    let rest = rest.trim_start_matches([' ', '\t']);
     let rest = rest.strip_prefix('\r').unwrap_or(rest);
     let rest = rest.strip_prefix('\n')?;
     // Find the closing fence line (`---` on its own line).
@@ -728,6 +730,31 @@ mod tests {
 
         // Opening fence with no closing fence → None (unterminated).
         assert!(split_fence("---\nname: x\nno closing fence\n").is_none());
+    }
+
+    /// The opening fence tolerates trailing whitespace (`--- `, `---\t`) the
+    /// same way the closing fence does — a fail-open regression: without it,
+    /// such a file fails the `\n` match and the ENTIRE file — `read_only: true`
+    /// / `tools:` allow-list included — is returned as the body, loading the
+    /// agent with no restrictions and raw YAML in its prompt (where
+    /// `split_frontmatter` fails CLOSED on the same shape).
+    #[test]
+    fn split_fence_opening_fence_tolerates_trailing_whitespace() {
+        // Space after the opening fence: frontmatter is kept, restriction intact.
+        let (fm, body) = split_fence("--- \nread_only: true\n---\nbody").unwrap();
+        assert!(
+            fm.contains("read_only: true"),
+            "frontmatter must keep the restriction: {fm:?}"
+        );
+        assert_eq!(body, "body", "body must not include the YAML");
+
+        // Tab after the opening fence.
+        let (fm, body) = split_fence("---\t\nread_only: true\n---\nbody").unwrap();
+        assert!(
+            fm.contains("read_only: true"),
+            "frontmatter must keep the restriction: {fm:?}"
+        );
+        assert_eq!(body, "body", "body must not include the YAML");
     }
 
     /// The prettier form: `description:` with nothing on that line, followed

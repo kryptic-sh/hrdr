@@ -43,6 +43,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   errors past either, mirroring the existing overflow handling. The
   `Accumulator` also charges its thinking-block/reasoning-item sidecars against
   its budget, closing the no-choices early-return gap.
+- **Agent and command files with trailing whitespace on the opening frontmatter
+  fence load their restrictions again.** `split_fence` failed open on an
+  opening `---` fence with a trailing space or tab (`"--- "`, `"---\t"`): the
+  whole file — `read_only: true` / `tools:` allow-list included — was returned
+  as the body, loading the agent with no restrictions and raw YAML in its
+  prompt. The opening fence now tolerates trailing whitespace exactly like the
+  closing one does.
 
 ### Performance
 
