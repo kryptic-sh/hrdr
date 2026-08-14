@@ -2322,3 +2322,485 @@ Promoted here when the effort that taught them was deleted:
   a constant or trait import that had moved between `windows-sys` releases,
   never the token or SID logic. Spell a fixed ABI value out locally instead of
   importing it and the class disappears.
+
+## Correctness review 2026-08-14
+
+`:review` (low depth) over the whole tree (working tree clean at the time),
+split across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
+hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
+candidate the passes raised was re-traced at its cited lines by the sweep lead;
+nothing survived as a defect. **Status: no findings — all items below are
+hardening (correct today, fragile), none must change first.**
+
+**Hardening (open — triage):**
+
+1. **Windows: live session locks are reapable and `Drop` deletes the new owner's
+   file.** `owner_process_alive` returns `false` on non-unix
+   (`hrdr-agent/src/session.rs`), so past `STALE_LOCK_AGE_SECS` (60s) a _live_
+   second instance reaps a session's open-lock, and the first instance's
+   `Reservation`/`SessionLock` `Drop` then removes the second's lock — the exact
+   two-window lost-update the lock exists to prevent. `store_lock.rs` guards its
+   `Drop` with a pid check; `session.rs`'s two guards do not. If Windows is
+   supported, port the `StoreLock` pid-ownership check to `Reservation` /
+   `SessionLock`, or implement a real `OpenProcess` probe.
+2. **`split_fence`'s opening fence tolerates no trailing whitespace**
+   (`hrdr-agent/src/agents_dir.rs`). The _closing_ fence matches
+   `trim_end() == "---"`, but an opening fence written `"--- "` fails the `\n`
+   match and the whole file — including a `read_only: true` / `tools:`
+   allow-list — is returned as the body: the agent loads with no restrictions
+   and raw YAML in its prompt. Fail-open where the `split_frontmatter` path is
+   fail-closed. Fix: `trim_end()` the opening fence too, or reject the file.
+3. **The budget-exhausted wrap-up round's failure leaves its user message in
+   history without a `History` event** (`hrdr-agent/src/turn_loop.rs`). The
+   "[The tool-call budget…]" `ChatMessage::user` is pushed to `self.messages`
+   and the round's snapshot emitted before `connect_and_drain`; if that errors,
+   `run` returns `Err` with the message already pushed — agent history and the
+   persisted transcript diverge until the next round, and the message counts as
+   a user turn (`is_user_turn`) and could seed a session name. Transient and
+   self-healing; fix shape: emit one more `History` event after the push.
+4. **`compaction_tail_start` charges the always-kept newest turn against the
+   preserve budget** (`hrdr-agent/src/compaction.rs`). `tokens` accumulates
+   newest-first, so once the newest turn alone exceeds `preserve_recent_tokens`
+   the walk breaks at the first older turn — no older turns are kept even if
+   each is tiny, and the tail can be far smaller than the budget suggests.
+   Matches the documented walk; worth revisiting only if a large newest turn is
+   seen to starve the tail.
+5. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
+   any message ending in `\` never submits on plain Enter (it becomes a newline
+   and eats the backslash); sending needs a second Enter. Documented escape
+   design (Alt/Shift+Enter also newline), so deliberate — noted for a Windows
+   path / LaTeX-heavy user.
+6. **`Accumulator`'s byte budget does not count `anthropic_thinking_blocks` /
+   `responses_reasoning_items`** (`crates/hrdr-llm/src/types.rs`): both sidecar
+   `Vec`s extend with no byte charge, while `bytes` is the documented ceiling
+   against a hostile endpoint streaming many small events. A malicious provider
+   can grow those vectors past the 64 MiB budget. Same provider-trust class as
+   the next item.
+7. **`StreamState` grows per distinct `fc_…` id with no cap**
+   (`crates/hrdr-llm/src/codex.rs`): `tool_slot` (HashMap) and `args_streamed`
+   (HashSet) insert per new output-item id, and once the flat index passes 1024
+   the accumulator drops the deltas — so no byte charge accrues against the map
+   growth. Two small events per id can build an unbounded map within the 300 s
+   window.
+8. **`read_capped_text` drops the truncation marker on a transport error
+   mid-body** (`crates/hrdr-llm/src/capped_read.rs`): `Err(_) => break` leaves
+   `truncated` false, so a truncated diagnostic body is returned as if complete.
+   Cosmetic (the error path continues regardless).
+
+**Cleared (suspected, traced, safe — do not re-investigate):** Anthropic
+cache-token accounting (`message_start_usage`:
+`input_tokens + cache_read + cache_write` is the correct total per the
+provider's wire semantics, and the `call_cost` partition + `Accumulator::push`
+merge preserve all three fields — the "breakdown, not addition" comment is
+confusing but defensible); SSE overflow handling (`sse.rs` line-buffer cap,
+`data:` fold cap with char-boundary truncation, discard-after-overflow contract
+— all test-pinned); the mid-stream rate-limit 429-only classification asymmetry
+(deliberately pinned by the test table in `client.rs`); `edit` over a stale read
+(refuses when the anchor only fuzzy-matches — the conservative direction); the
+viewport paint-one-screenful math (`first`/`last` via `partition_point` over
+`cum`, rows pre-wrapped to `inner_width` — test-pinned); read/write
+`covered_through`/`clipped` sig model; `Retry-After` delta-seconds + IMF-fixdate
+parsing (clamped, pinned against the RFC's worked example);
+`mentions_identifier` (a token cannot match inside
+`max_output_tokens`/`max_completion_tokens` — not substrings); `Accumulator`
+tool-call index (≥1024 skipped before resize; id-less calls get nonce-qualified
+synthetic ids so replays don't collide); `read_capped_text` exact-cap vs
+oversized distinction (one extra chunk read decides); proc tree-kill disarm +
+unix group-kill `pid > 1` guard; `compaction_tail_start`'s empty/leaderless
+return (`compact` guards `before <= 2` upstream, so the >len index is never
+reached); `command_arg_offset`'s `+1` (the sigil byte, traced with
+`"/verbose   off"`); `extract_agent_mention` byte-offset splicing (token walk
+lands on the real mention; `foo@explore` correctly not matched); u32 overflow in
+the token estimators (needs >4G estimated tokens ≈ 17 GB of text — a hardening
+note at most); `coordinated_oauth_access` single-flight race (waiter registers
+under the state lock before `refreshing` is set, so `notify_waiters()` cannot
+fire between decision and await; `RefresherGuard` clears on every exit including
+cancellation); cross-process session/store lock correctness on Linux/macOS (PID
+TIMESTAMP format, mtime fallback, dead-owner probe, re-exec child-process
+tests); `compute_wrapped_layout` (wide-glyph, zero-width, whitespace-crossing,
+hard-break paths agree with tests); `run()`'s budget-exhausted wrap-up and
+mid-stream retry (no text duplication; overflow recovery compacts canonical
+history); `last_prompt_tokens` surviving `/clear` (one no-op
+`maybe_self_compact`, no wasted model call); `is_quit_command("q")` (deliberate
+cross-CLI design, tested); `budget.rs` / `usage.rs` / `turn.rs` arithmetic (no
+underflow/overflow path); `session.rs` v1-v2 deserialization, `sanitize_name`,
+`session_id_from_path`, `persisted_messages` wire-vs-file serialization
+(`#[serde(default)]` covers every re-added field); history-writer coalescing and
+the config watcher's ping-under-lock ordering; `parse_imf_fixdate` tolerating
+`Feb 31`/`hour 99` (computes a wrong-but-clamped delay — harmless).
+
+**Coverage:** reviewed in full — hrdr-agent (all modules; prompt _text_ skimmed,
+`chatgpt_models.rs` skimmed — catalog mapping), hrdr-app, hrdr-editor, hrdr-llm
+(`client.rs`, `types.rs`, `retry.rs`, `sse.rs`, `capped_read.rs`, `fs.rs`,
+`lib.rs`, `anthropic.rs` 1-1096, `codex.rs` 1-788, `media.rs`, `pdf.rs` 1-1300,
+`catalog.rs` 1-590), hrdr-tools (`lib.rs` 1-2800, `tools/shell.rs`, `read.rs`,
+`write.rs`, `edit.rs`, `mutation.rs`, `grep.rs` 1-460, `mod.rs` 1-800,
+`sandbox.rs` 1-1600, `memory.rs` 1-730, `lsp.rs` 1-1150, `proc.rs`), hrdr-tui
+(`ui.rs` draw/viewport/block-render core, `app.rs` EventSender +
+prune/clear/apply), hrdr-test-support, `apps/hrdr/src/main.rs`. Skimmed, not
+line-by-line: `tools/replace.rs`, `todo.rs`, `tree.rs`, `ls.rs`, `find.rs`,
+`verify.rs`, `watch.rs`, `secret_diff.rs`, `gate.rs`, `guardrails.rs`,
+`hooks.rs`, `web.rs`, `verification.rs`, `ansi.rs`, `test_nudge.rs`, `mcp/*`,
+the remaining TUI (selectors, popups, theme, tui.rs, trust_prompt.rs), the bulk
+of test modules, and all integration-test dirs. GAP: `hrdr-app/src/login.rs`
+structure and routing skimmed (wizard flow, browser-login completion lines) —
+not line-by-line. Security-specific classes were out of scope for this pass (the
+audit covers them).
+
+## Security audit 2026-08-14
+
+`:audit` (low depth) over the whole tree (working tree clean at the time), split
+across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
+hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate was
+re-traced at its cited lines by the sweep lead. **Status: 1 medium + 3 low — the
+medium and one low (sweep escape) are the fix-first items.**
+
+**Findings (ranked):**
+
+1. **MEDIUM — native-backend "capture for replay" collections are outside every
+   memory cap; a hostile Anthropic/Codex endpoint can OOM the client.**
+   `thinking_slot` (`crates/hrdr-llm/src/anthropic.rs`, one
+   `HashMap<u64, (String,String)>` entry per distinct `content_block_start`
+   index, no cap on entry count; `signature_delta` accumulates inside the entry
+   and is never yielded, so it is unbudgeted even for a single block),
+   `redacted_order` (each item clones a `data` string up to the 32 MiB per-event
+   SSE cap, unlimited count), and `codex.rs`'s `reasoning_items` (full `Value`
+   clone of `encrypted_content` per item, unlimited) all grow with no byte
+   budget — the Accumulator's 64 MiB total (`types.rs`) never counts them, and
+   the `responses_reasoning_items` extend it receives is also outside the check.
+   The per-event SSE cap and the Accumulator total protect every other payload
+   but not this path. Repro: hostile endpoint streams `content_block_start`
+   events with ever-increasing `index` for the 300 s request window →
+   `thinking_slot` grows to ~10⁶–10⁷ entries ≈ 1 GB+, no check trips. Fix:
+   charge these against a total cap (bound map sizes / byte totals, or route
+   captured bytes through the Accumulator budget) and error the stream past it,
+   mirroring the existing overflow handling.
+2. **LOW — retention sweep deletes outside its target when a session file's name
+   derives to `"."`/`".."`/empty id.** `sweep_dir` builds the purge's delete
+   paths from `session_id_from_path` (raw file stem, `session.rs`) with no
+   validation, and `remove_dir_all(dir.join("subagents").join(&id))` escapes
+   `subagents/` for crafted stems: `..json.zst` → id `".."` → resolves to the
+   session directory itself (wholesale deletion of every session file and
+   transcript for that cwd); `.json` / `..json` → id `""`/`"."` → the whole
+   `subagents/` tree. All three pass the `.ends_with` filters and
+   `Session::load_path` parses them; the lock path is sanitized but the delete
+   id is not. Not an escalation (needs write access to the user's own session
+   dir), but an accident becomes destruction of the cwd's session history.
+   Repro:
+   ```
+   Input:  sessions/<cwd-slug>/..json.zst  (valid session JSON, named_by_user
+           false, mtime 31 days old)
+   Run:    retention sweep (hourly worker)
+   Expect: that one session file is purged
+   Actual: remove_dir_all(<cwd-slug>/subagents/..) deletes the entire <cwd-slug>
+   ```
+   Fix: validate the stem-derived id (`""`, `"."`, `".."`, separators, `.`) or
+   route through `sanitize_name` before joining; unit-test a `..json.zst` file.
+3. **LOW — fixed-port loopback OAuth; the browser opens before the callback
+   listener binds.** `browser_login_start` calls `open_browser`
+   (`hrdr-app/ src/login.rs`) before the future that binds the listener
+   (`await_oauth_code_within`, `hrdr-agent/src/oauth.rs`) runs, and the ports
+   are fixed constants (OpenAI 1455, OpenRouter 1456). Any local process can
+   pre-squat the port: the browser's redirect (carrying `code` + `state`) lands
+   on the attacker's listener and hrdr's bind then fails — a login DoS. The
+   `code` is only useful with the PKCE `code_verifier` that never leaves hrdr's
+   memory, so for a PKCE-enforcing token endpoint the squatted code is useless;
+   the credential-theft arm is conditional on a provider that does not enforce
+   the verifier (unverified). Fix: bind the listener (failing the login on bind
+   error) _before_ opening the browser; use an ephemeral port where the provider
+   allows it; document reliance on provider-side PKCE enforcement.
+4. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
+   with no control-character filtering.** `AgentEvent::Text` is `print!`-ed raw
+   and `ToolOutput` chunks go through `chrome_fragment` raw
+   (`apps/hrdr/src/main.rs`); `--json` embeds the raw bytes in `tool_end.result`
+   too. In TUI sessions ratatui filters control chars (verified: `ratatui-core`
+   `buffer.rs` drops graphemes containing `char::is_control`), and shell output
+   is ANSI-stripped at ingest (`tools/shell.rs`), but `read` / `grep` / `fetch`
+   results and the model's own reply are not. A hostile file the model is
+   induced to reproduce verbatim (the jail-mode threat model), or a
+   hostile/broken provider emitting ESC bytes, executes an OSC sequence in the
+   user's terminal — clipboard poisoning, title spoofing, display corruption.
+   Fix: filter C0/ESC bytes from the headless sinks (reuse the tools crate's
+   ansi strip, or a `char::is_control` filter) while keeping tab/newline.
+
+**Hardening (open — triage):**
+
+- **Uncapped sibling transcript read.** `Session::load_path` caps the session
+  `.json`/`.json.zst` at 100 MiB, but the transcript rebuild folds the sibling
+  `<id>.jsonl` through `read_transcript` (`hrdr-agent/src/transcript_log.rs`)
+  with no bound — a long session's own jsonl grows unboundedly and a corrupt or
+  oversized file means unbounded memory on every resume. Fix: bound the read
+  like `parse_path`.
+- **Newline in a directory path corrupts the trusted-dirs store**
+  (`hrdr-agent/src/trust.rs`): `writeln!` writes the canonical path verbatim
+  into a newline-delimited store; a name containing `\n` (legal on Linux) splits
+  its own entry. Fails safe (reads as untrusted, user re-asked). Fix: reject or
+  encode paths containing newlines.
+- **`gate.rs` parses untrusted CI YAML** (`serde_yaml_ng::from_str` over up to
+  16 × 512 KiB workflow files) with no explicit alias/recursion limit — a
+  malicious repo's `ci.yml` could burn CPU during gate detection. Bounded size;
+  cheap DoS-of-one-turn at most.
+- **`context_from_models` trusts a server-advertised window**
+  (`hrdr-llm/src/client.rs`): a hostile local server claiming a huge
+  `max_model_len` raises the compaction threshold. Bounded `u32`; impact is an
+  overflow, not a compromise — worth a sanity cap against the catalog.
+- **`Client::new`'s `.expect("reqwest client")`** (`hrdr-llm/src/client.rs`)
+  aborts on TLS-backend init failure; `web.rs` deliberately uses the fallible
+  builder pattern — the LLM client could adopt it.
+- **`untrusted_nonce` uses `DefaultHasher`** (`hrdr-tools/src/lib.rs`) — sound
+  because the final `contains` check makes a collision a redraw, not a boundary
+  failure; keep it that way (never hash the body itself).
+
+**Cleared (suspected, traced, safe — do not re-investigate):** TUI terminal
+injection via tool results/model text (ratatui drops control-char graphemes on
+every render path — the only unfiltered sinks are the headless ones in finding
+4); SSRF in `fetch`/`search` (connect-time `SsrfGuardResolver` filters resolved
+addresses with no check→use gap, redirects disabled, bodies capped); SSE /
+Accumulator memory caps on the OpenAI path (32 MiB per-event, 64 MiB total,
+tool-call index capped at 1024 — finding 1 is the native-backend gap around it);
+`pdf.rs` (checked offsets, 16 MiB inflate cap, xref/length verification, no deep
+recursion — returns `None` on anything hostile); media image headers (bounded
+walks, zero-dimension rejected); sandbox escapes (`resolve_read` /
+`resolve_write` canonicalize through `canonicalize_nearest` before
+`starts_with`; Landlock inode-anchored and fail-closed; macOS pinned by absolute
+path; Windows refuses to run unconfined on failure; jail holds only the 5
+read-only tools); shell command construction (`bash -c <model text>` is the
+documented purpose; guardrails word-split with quote awareness and nested
+`sh -c` re-scan; output line-capped and ANSI-cleaned); `secret_file_reason`
+deny-list + shell-output redaction (structural path matching, open-then-
+`guard_not_swapped` on reads); API-key handling (key only in headers, stripped
+from provider config, 0600 wire log with `O_NOFOLLOW`, keys masked in the login
+modal); memory-tool path traversal (`safe_stem` rejects separators / lengths /
+device names); LSP/MCP framing (body/header/line caps, wall-clock read bounds,
+SSE `endpoint` host-matched against the base, id-space collision fixed);
+panics/unwraps on untrusted input (none in library code — the non-test `expect`s
+are TLS init, infallible YAML serialization, compile-time regexes, a
+provably-set `settle_until`); command injection (no shell string building;
+`kill -0` and `touch` are arg-vector); YAML frontmatter caps + fail-closed
+parsing (a `read_only`/`tools` restriction is never silently dropped); session
+load TOCTOU (one-handle read), atomic writes, `O_EXCL` locks with dead-PID
+reaping; OAuth CSPRNG PKCE + state with constant-time comparison, listener bound
+to 127.0.0.1 only, HTML-escaped error pages, no secret echoed in errors;
+`auth.json` 0600/dir 0700 with atomic locked read-modify-write; kind +
+canonical-endpoint double-gated credential resolution; jail mode skips project
+AGENTS.md/commands and is re-asserted on `set_cwd`; attachment-store digest +
+length verification and 64-hex-only sweep; `Retry-After` parsing (strict,
+clamped, cannot stall or panic).
+
+**Coverage:** walked in full — hrdr-agent (agents*dir, commands, skills, trust,
+attachment_store, session load/save/locks/sweep/compression, auth_store, auth,
+oauth both flows + refresh coordinator, store_lock, transcript_log, registry,
+config, resolve, provider_catalog, prompt, turn_loop, delegation, hooks,
+history), hrdr-app (config/sessions/login/util), hrdr-editor, hrdr-llm (client,
+anthropic, codex, sse, capped_read, retry, types, media, pdf, fs, catalog),
+hrdr-tools (lib, sandbox, shell, web, memory, lsp, hooks, proc, guardrails,
+gate, mcp/*, the tool implementations), hrdr-tui (render paths, trust*prompt),
+`apps/hrdr/src/main.rs`. Skimmed, not line-by-line: `chatgpt_models.rs`
+account-catalog fetch, compaction summarization internals, budget.rs, MCP client
+wiring, the TUI's `app.rs` input-handler detail and selectors,
+`apps/hrdr/tests/*`beyond the headless suite. GAP:`hrdr-app/src/login.rs`wizard/browser-login completion lines and`hrdr-agent/src/prompt.rs`prompt *text* — read, not audited line-by-line.`apps/hrdr/src/main.rs`
+beyond the trust gate was not audited by chunk 1 (covered by chunk 2).
+
+## Tidy review 2026-08-14
+
+`:tidy` over the whole tree (working tree clean at the time), split across two
+sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
+hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read at its cited
+lines by the sweep lead; behavior-preserving only.
+`cargo check --workspace --all-targets` is clean — the only true dead code is
+the two items below. **Status: 12 candidates, all open; two are
+workspace-internal API decisions.**
+
+1. **Five byte-identical fuzzy-filter functions — extract one shared helper.**
+   `filter_effort_choices` (`hrdr-app/src/effort.rs`), `filter_themes`
+   (`themes.rs`), `filter_sessions` (`sessions.rs`), `filter_login_providers`
+   (`login.rs`), `filter_model_choices` (`hrdr-agent/src/models.rs`) — all five
+   are the same empty-query → `(0..len)`, else trim/lowercase char vec +
+   `filter_map(fuzzy_match_hay)` (the models.rs copy just writes the empty check
+   after building `q` — same outcome). A 6th copy, `filter_prompt_entries`
+   (`hrdr-app/src/commands/prompt_commands.rs`), is the same family. Action: add
+   `pub fn fuzzy_filter(haystacks: &[String], query: &str) -> Vec<usize>` beside
+   `fuzzy_match_hay` (`hrdr-agent/src/models.rs`) and make each a one-line
+   delegate. Public surfaces preserved.
+2. **Dead pub functions — delete.** `save_agent_session` and
+   `latest_session_for_cwd` (`hrdr-app/src/sessions.rs`) — zero callers in the
+   whole workspace (the TUI uses the locked `open_latest_session_for_cwd`;
+   CHANGELOG confirms the non-locked variant's TUI use is historical). hrdr-app
+   is not published → plain deletion, not an external-API decision.
+3. **Dead pub method — delete.** `ToolContext::mark_read_partial`
+   (`hrdr-tools/src/lib.rs`) — zero callers; the paged-read bookkeeping is done
+   by `record_read` and `mark_read` has ~30 callers. hrdr-tools is a workspace
+   crate (not published), so no out-of-workspace consumer breaks — treat as a
+   workspace-internal API decision.
+4. **Duplicated stale-lock predicate — delegate session.rs to store_lock.rs.**
+   `session.rs`'s `is_stale_lock` + `owner_process_alive` vs `store_lock.rs`'s
+   `is_stale_lock` + `process_alive` are the same logic (store_lock's own
+   comment says it "mirrors" session's); store_lock's is parameterized by the
+   staleness age, session's hardcodes `STALE_LOCK_AGE_SECS`. Action: make
+   `store_lock::is_stale_lock` `pub(crate)` and call it from session.rs's
+   `try_reserve` / `acquire_open_lock` with `STALE_LOCK_AGE_SECS`; delete the
+   two session.rs fns. Identical predicate, same constant.
+5. **Duplicated SHA-256 hex helper — share one.** `digest_hex`
+   (`attachment_store.rs`) and `account_digest` (`chatgpt_models.rs`) are the
+   same lowercase-hex SHA-256. Action: make `digest_hex` `pub(crate)` and have
+   `account_digest` call it. Identical output.
+6. **Per-keystroke allocations in `is_known_command`** (`hrdr-app/src/lib.rs`):
+   `resolve_alias` runs once on the input and again per ~37 registry entry, on
+   every keystroke of `/…` completion and per submit. `resolve_alias` is
+   idempotent on canonical names (verified — none of the alias arms match a
+   canonical name), so the `any()` is exactly set membership. Action: precompute
+   the resolved canonical-name set once (`OnceLock`) and check membership.
+   Behavior unchanged.
+7. **Needless allocation in `is_test_path`** (`hrdr-tools/src/test_nudge.rs`):
+   `full.rsplit('/').next().unwrap_or_default().to_string()` is only used via
+   `&str` methods — drop `.to_string()`, let `name` borrow `full`.
+8. **Redundant `let cap = max_bytes;`** (`hrdr-llm/src/capped_read.rs`, in both
+   capped readers) — use the parameter directly. Private fns, no API impact.
+9. **Needless clone in an error path** (`apps/hrdr/src/main.rs`):
+   `cli.model.clone().unwrap_or_default()` inside `map_err` →
+   `cli.model.as_deref().unwrap_or_default()`, formats identically.
+10. **`CompletionShell::generate` — six near-identical calls**
+    (`apps/hrdr/src/main.rs`): map `self` to the clap `Shell` in one match then
+    a single `generate` call — with the caveat that the Nushell arm uses
+    `clap_complete_nushell::Nushell`, a different type, so it stays separate.
+    Low value (readability only).
+11. **Unneeded `pub` on an internal-only re-export** (`hrdr-editor/src/lib.rs`:
+    `pub use host::HrdrHost`) — no consumer outside hrdr-editor; only used
+    inside lib.rs (VimEngine's field type). Could be a private `use`. Trivial.
+12. **`push_str(&format!("\t{desc}"))` — temporary String for a segment**
+    (`hrdr-tools/src/mcp/client.rs`, two sites):
+    `out.push('\t'); out.push_str(desc);`. Micro.
+
+**Dropped as not-tidy:** `auth_key` vs `ProviderName::auth_key` (deliberately
+returns the raw input spelling for custom names — delegating would change
+stored-key lookup); `short_file_list` vs `sample` (same join shape, different
+output strings); `plain.rs` `paste` override (deliberate direct-insert path);
+`try_reserve` vs store `acquire` (different contention policies — only the
+staleness predicate is duplicated, which is item 4); `blob_dir` vs `blob_dir_in`
+(thin wrapper, both used, adds meaning); `redact_secret_diffs` vs `DiffRedactor`
+(same state machine, different emitted bytes — unifying changes output);
+`write_atomic` vs `atomic_write` (different crates, different semantics —
+symlink targets, permission carry); the codebase-wide `push_str(&format!(…))`
+idiom (30+ sites, clippy's `format_push_string` not enabled); `ask_to_trust`
+wrapper (documented seam feeding the testable `trust_gate_with`); sandbox's
+`#[cfg_attr(allow(dead_code))]` items (platform-gated macOS/Windows code);
+`mcp/mod.rs` `#[allow(unused_imports)]` (`parse_sse_for_id` used via `super::*`
+in tests — the allow is load-bearing); 3× duplicated mock-server `args` vec
+(test code, each site different).
+
+**Coverage:** hrdr-agent, hrdr-app, hrdr-editor, hrdr-llm, hrdr-tools (all
+modules incl. tools/ and mcp/), hrdr-tui, hrdr-test-support, apps/hrdr —
+fn-reference scan over all non-test modules; every `#[allow(dead_code)]` item
+accounted for; all single-use helpers checked for real call sites. GAP: the bulk
+of `hrdr-tui/src/app/e2e.rs` (10.7k lines of tests) was not scanned for
+test-side duplication.
+
+## Performance review 2026-08-14
+
+`:perf` over the whole tree (working tree clean at the time), split across two
+sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
+hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced at its cited
+lines by the sweep lead. **Status: 7 findings, all open — the TUI idle redraw
+and the per-round history clone are the top two.**
+
+1. **The whole message history is deep-cloned per committed round — O(history)
+   per round, O(N²) across a session.** `crates/hrdr-agent/src/delegation.rs` —
+   on every `AgentEvent::History` (once per tool round), a sub-agent run does
+   `(**messages).clone()` and hands it to `RunSnapshot::save`, which then
+   serializes it (`Session::save_to_path`). The event carries
+   `Arc<Vec<ChatMessage>>` precisely so the agent's `Arc::make_mut` stays cheap;
+   every consumer immediately defeats it. Fix: the save/snapshot entry points
+   should take the `Arc<Vec<ChatMessage>>` (or `&[ChatMessage]`) and serialize
+   by borrowing. Note: the same-shape clone on the autosave path
+   (`hrdr-app/src/sessions.rs:20` `messages_owned()`) is on `save_agent_session`
+   — dead code, deleted by the tidy pass's candidate 2, so it dies with it. The
+   live autosave copies are in `hrdr-tui/src/app/session.rs` and the UI-thread
+   `app.rs` History handler; those are the payoff sites if the TUI gets a pass.
+   The sub-agent snapshot itself is a documented open question (a write per
+   committed round is already tracked in this backlog); this finding is the
+   extra clone on top of that known write.
+2. **The TUI redraws the full frame ~8.3×/sec even when completely idle, and
+   completion re-ranks the whole file index every frame.**
+   `hrdr-tui/src/ tui.rs` draws unconditionally at the top of every loop
+   iteration with a 120 ms `interval` ticker armed unconditionally — so with
+   zero input, zero messages and no turn running, the whole `draw()` (transcript
+   walk, status bar, input render) runs ~8.3×/sec. It is the frequency amplifier
+   for every per-frame cost in `ui.rs`, including the already-tracked
+   chunk-per-entry walk — fixing that walk leaves the idle redraw. And while an
+   `@` token is in the input, `draw()` → `active_completions()` →
+   `rank_file_matches` scans every indexed path (capped at 20,000) and fully
+   sorts the hits **each frame and each keystroke** (`ui.rs`,
+   `app/completion.rs`, `hrdr-app/src/ completion.rs` — the index is built once
+   but ranked fresh per call). Fixes: draw only on change (dirty flag from
+   `on_key`/`on_turn_msg`/mouse/paste; arm the ticker only while a spinner is
+   live), and memoize the completion set keyed on the editor content so the scan
+   is per-keystroke at worst.
+3. **Every attachment is re-SHA-256'd on every save.** `AttachmentRef::of`
+   (`hrdr-agent/src/attachment_store.rs`) digests the full bytes of every
+   attachment; called from `attachment_refs` on every per-round save
+   (`session.rs`). The blob write is skipped when the file exists, but the hash
+   is recomputed regardless; the `Attachment` instance is stable across saves,
+   so its digest is stable. Fix: memoize the digest on the `Attachment` at
+   attach time; or cache the ref per message index. Only materializes for
+   sessions that carry attachments, but for one it is a full read of every
+   attached byte per round.
+4. **Tool-call arguments are parsed twice, serialized once, and cloned once per
+   call.** `turn_loop.rs`: `serde_json::from_str` on `call.function.arguments`
+   (:1072), re-serialized as the recorded form (:1076), the raw string cloned
+   (:1098), then parsed a second time inside the spawned task (:1119). For a
+   `write`/`edit` with a large payload that is ~3–4 full passes over the args on
+   the path from model output to tool execution. Fix: parse once and move the
+   `Value` into the spawned future (it is `Send`); `repeat.refusal` can key on
+   the parsed value or the cloned name. Modest but free.
+5. **The full tool result is cloned into `ToolEnd`, then copied again into the
+   recorded message.** `turn_loop.rs:1002` (`result: body.clone()` — a `read` of
+   a large file or a big `grep` result is MBs) and `:1025`
+   (`format!("{body}\n\n(took …)")`, a second copy). One full copy per tool call
+   on the hot path. Fix: build the recorded string first and move it into the
+   event, or share the result behind an `Arc<str>` between the event and the
+   message (the only two owners). Bounded per call, below 1–4.
+6. **O(k·n) line-number recount in the multiline grep walk.**
+   `hrdr-tools/src/tools/grep.rs` — per match,
+   `text[..hit.start()].bytes().filter(|b| *b == b'\n').count()` rescans from
+   byte 0 (and again to `hit.end()`). With k matches over an n-byte file that is
+   ~2·k·n byte scans; the 200-match cap still allows ~200 rescans of a multi-MB
+   file. Runs in `spawn_blocking` (no runtime stall) but is the wall-clock cost
+   of the tool's hot case. Fix: build a newline-offset `Vec` once per file and
+   `partition_point` per hit — O(n + k log n).
+7. **Per-turn lowercase copies of every memory body**
+   (`hrdr-tools/src/ memory.rs`): `relevance_score` lowercases
+   name/description/body per needle (per recall token), and the mtime-cache hit
+   `cloned()`s the whole memory before the mtime filter. Runs once per opening
+   user message; tens of memories × a few tokens × body-size copies is
+   sub-millisecond, dwarfed by the LLM round trip. Borderline micro — fix while
+   touching the code (lowercase each body once, serve the cached memory by
+   `Arc`/`Rc`).
+
+**Already optimized (traced and cleared — do not re-hunt):** session save path
+(created-cache, compact JSON, transcript in a sibling jsonl, off-thread);
+session listing per `/resume` keystroke (mtime-keyed `meta_cache`); compaction
+(single elision build, estimator, ladder pre-sizing, `compaction_tail_start`
+bounded by `DEFAULT_TAIL_TURNS = 2`); streaming transcript fold (per-chunk hash
+fold, coalesced jsonl writes); per-turn tool-token estimate hoisted out of the
+round loop; memory recall mtime-cache; memoized cost rates; probed-once context
+window; editor wrap-layout memo per frame; file index lowercased once at build;
+SSE decode (`Cow::Borrowed` for valid UTF-8); catalog `cached_read` (mtime +
+`Arc`); shell ingest (memoized secret check, bounded to tool calls); sandbox
+`is_under_any` (linear over a handful of roots, per tool call).
+
+**Coverage:** traced end-to-end — hrdr-llm (sse, capped_read, client stream,
+retry, catalog, media, pdf), hrdr-tools (read, replace, shell, watch, find,
+tree, ls, sandbox, lsp, gate, guardrails, hooks, web, mcp, ansi, proc),
+hrdr-agent (session save/load, compaction, transcript fold, turn_loop, budget,
+delegation snapshot, oauth refresh), hrdr-app (completion, session listing,
+status), hrdr-editor, hrdr-tui frame/input path, apps/hrdr (startup only). Not
+settled without profiling: the full per-frame transcript render cost in
+`hrdr-tui` (the frame loop is out of both chunks' scope; the walk itself is the
+already-tracked backlog item, and finding 2 is its frequency amplifier),
+hrdr-llm request serialization per round, selector filter functions
+(per-keystroke over small lists — tens/hundreds), `status_sections` per-frame
+formatting. Dropped as noise: per-chunk `Reasoning`/`Text` event clones
+(inherent to event ownership, coalesced downstream); `refresh_oauth_if_needed`'s
+per-round `auth.json` read (small file, ChatGPT-identity only); `find_hits`
+re-lowering per `/next`/`/prev` (command-frequency, not per-keystroke). GAP:
+`hrdr-tui/src/app/e2e.rs` is test-only, skipped.
