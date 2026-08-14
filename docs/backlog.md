@@ -2330,7 +2330,9 @@ split across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate the passes raised was re-traced at its cited lines by the sweep lead;
 nothing survived as a defect. **Status: no findings — all items below are
-hardening (correct today, fragile), none must change first.**
+hardening (correct today, fragile). Three shipped 2026-08-14: `split_fence`
+opening-fence whitespace, the wrap-up History gap, and the `read_capped_text`
+truncation marker.**
 
 **Hardening (open — triage):**
 
@@ -2343,37 +2345,18 @@ hardening (correct today, fragile), none must change first.**
    `Drop` with a pid check; `session.rs`'s two guards do not. If Windows is
    supported, port the `StoreLock` pid-ownership check to `Reservation` /
    `SessionLock`, or implement a real `OpenProcess` probe.
-2. **`split_fence`'s opening fence tolerates no trailing whitespace**
-   (`hrdr-agent/src/agents_dir.rs`). The _closing_ fence matches
-   `trim_end() == "---"`, but an opening fence written `"--- "` fails the `\n`
-   match and the whole file — including a `read_only: true` / `tools:`
-   allow-list — is returned as the body: the agent loads with no restrictions
-   and raw YAML in its prompt. Fail-open where the `split_frontmatter` path is
-   fail-closed. Fix: `trim_end()` the opening fence too, or reject the file.
-3. **The budget-exhausted wrap-up round's failure leaves its user message in
-   history without a `History` event** (`hrdr-agent/src/turn_loop.rs`). The
-   "[The tool-call budget…]" `ChatMessage::user` is pushed to `self.messages`
-   and the round's snapshot emitted before `connect_and_drain`; if that errors,
-   `run` returns `Err` with the message already pushed — agent history and the
-   persisted transcript diverge until the next round, and the message counts as
-   a user turn (`is_user_turn`) and could seed a session name. Transient and
-   self-healing; fix shape: emit one more `History` event after the push.
-4. **`compaction_tail_start` charges the always-kept newest turn against the
+2. **`compaction_tail_start` charges the always-kept newest turn against the
    preserve budget** (`hrdr-agent/src/compaction.rs`). `tokens` accumulates
    newest-first, so once the newest turn alone exceeds `preserve_recent_tokens`
    the walk breaks at the first older turn — no older turns are kept even if
    each is tiny, and the tail can be far smaller than the budget suggests.
    Matches the documented walk; worth revisiting only if a large newest turn is
    seen to starve the tail.
-5. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
+3. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
    any message ending in `\` never submits on plain Enter (it becomes a newline
    and eats the backslash); sending needs a second Enter. Documented escape
    design (Alt/Shift+Enter also newline), so deliberate — noted for a Windows
    path / LaTeX-heavy user.
-6. **`read_capped_text` drops the truncation marker on a transport error
-   mid-body** (`crates/hrdr-llm/src/capped_read.rs`): `Err(_) => break` leaves
-   `truncated` false, so a truncated diagnostic body is returned as if complete.
-   Cosmetic (the error path continues regardless).
 
 **Cleared (suspected, traced, safe — do not re-investigate):** Anthropic
 cache-token accounting (`message_start_usage`:
