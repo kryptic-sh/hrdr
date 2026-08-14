@@ -2430,28 +2430,13 @@ medium.)**
 
 **Hardening (open — triage):**
 
-- **Uncapped sibling transcript read.** `Session::load_path` caps the session
-  `.json`/`.json.zst` at 100 MiB, but the transcript rebuild folds the sibling
-  `<id>.jsonl` through `read_transcript` (`hrdr-agent/src/transcript_log.rs`)
-  with no bound — a long session's own jsonl grows unboundedly and a corrupt or
-  oversized file means unbounded memory on every resume. Fix: bound the read
-  like `parse_path`.
-- **Newline in a directory path corrupts the trusted-dirs store**
-  (`hrdr-agent/src/trust.rs`): `writeln!` writes the canonical path verbatim
-  into a newline-delimited store; a name containing `\n` (legal on Linux) splits
-  its own entry. Fails safe (reads as untrusted, user re-asked). Fix: reject or
-  encode paths containing newlines.
 - **`gate.rs` parses untrusted CI YAML** (`serde_yaml_ng::from_str` over up to
-  16 × 512 KiB workflow files) with no explicit alias/recursion limit — a
-  malicious repo's `ci.yml` could burn CPU during gate detection. Bounded size;
-  cheap DoS-of-one-turn at most.
-- **`context_from_models` trusts a server-advertised window**
-  (`hrdr-llm/src/client.rs`): a hostile local server claiming a huge
-  `max_model_len` raises the compaction threshold. Bounded `u32`; impact is an
-  overflow, not a compromise — worth a sanity cap against the catalog.
-- **`Client::new`'s `.expect("reqwest client")`** (`hrdr-llm/src/client.rs`)
-  aborts on TLS-backend init failure; `web.rs` deliberately uses the fallible
-  builder pattern — the LLM client could adopt it.
+  16 × 512 KiB workflow files). Investigated 2026-08-14: `serde_yaml_ng`'s
+  deserializer has an inherent 128-level recursion limit (`de.rs`), and the
+  input is size-capped — the residual surface (alias expansion within those
+  bounds) is a one-turn CPU blip on a repo the user chose to open, and the crate
+  exposes no knob to tighten. Declined; revisit only with evidence of a real
+  attempt.
 - **`untrusted_nonce` uses `DefaultHasher`** (`hrdr-tools/src/lib.rs`) — sound
   because the final `contains` check makes a collision a redraw, not a boundary
   failure; keep it that way (never hash the body itself).
