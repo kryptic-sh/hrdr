@@ -25,6 +25,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   redirect URI is registered with the provider at that port). A port that is
   already taken fails the login with a message instead of opening the browser at
   all.
+- **Headless `hrdr run` output can no longer run escape sequences in your
+  terminal.** The raw stdout/stderr sinks printed model text and streamed tool
+  chunks verbatim — a file the model reproduces (the jail-mode threat model) or
+  a hostile provider's reply could carry an OSC sequence (`ESC ] 52 ; …` writes
+  the clipboard), title spoofing, or display corruption into the terminal. Both
+  sinks now strip control characters while keeping tabs and newlines. The TUI
+  was already safe (ratatui drops control-char graphemes), and `--json` output
+  was already safe (serde escapes control chars).
 
 ### Performance
 

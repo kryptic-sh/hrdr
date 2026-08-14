@@ -2452,9 +2452,9 @@ audit covers them).
 `:audit` (low depth) over the whole tree (working tree clean at the time), split
 across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate was
-re-traced at its cited lines by the sweep lead. **Status: 1 medium + 1 low — the
-medium is the fix-first item. (The retention-sweep escape and the OAuth
-bind-order low shipped 2026-08-14.)**
+re-traced at its cited lines by the sweep lead. **Status: 1 medium — the medium
+is the fix-first item. (All three lows shipped 2026-08-14: retention-sweep
+escape, OAuth bind-order, headless terminal escape.)**
 
 **Findings (ranked):**
 
@@ -2476,19 +2476,6 @@ bind-order low shipped 2026-08-14.)**
    charge these against a total cap (bound map sizes / byte totals, or route
    captured bytes through the Accumulator budget) and error the stream past it,
    mirroring the existing overflow handling.
-2. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
-   with no control-character filtering.** `AgentEvent::Text` is `print!`-ed raw
-   and `ToolOutput` chunks go through `chrome_fragment` raw
-   (`apps/hrdr/src/main.rs`); `--json` embeds the raw bytes in `tool_end.result`
-   too. In TUI sessions ratatui filters control chars (verified: `ratatui-core`
-   `buffer.rs` drops graphemes containing `char::is_control`), and shell output
-   is ANSI-stripped at ingest (`tools/shell.rs`), but `read` / `grep` / `fetch`
-   results and the model's own reply are not. A hostile file the model is
-   induced to reproduce verbatim (the jail-mode threat model), or a
-   hostile/broken provider emitting ESC bytes, executes an OSC sequence in the
-   user's terminal — clipboard poisoning, title spoofing, display corruption.
-   Fix: filter C0/ESC bytes from the headless sinks (reuse the tools crate's
-   ansi strip, or a `char::is_control` filter) while keeping tab/newline.
 
 **Hardening (open — triage):**
 

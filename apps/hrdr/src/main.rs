@@ -76,6 +76,22 @@ fn chrome_line(colour: crossterm::style::Color, styled: &str, rest: &str) {
     }
 }
 
+/// Strip control characters that could act on the user's terminal — an OSC
+/// sequence (`ESC ] 52 ; …` writes the clipboard), title spoofing, cursor
+/// motion — from text headed for a headless stdout/stderr sink, keeping the
+/// layout whitespace (`\t`, `\n`). The TUI path never needs this (ratatui
+/// drops control-char graphemes), but `hrdr run` / `hrdr -p` print raw
+/// strings: a file the model reproduces verbatim, or a hostile provider's
+/// reply, would otherwise reach the terminal unfiltered. Borrowed when the
+/// text is already clean, so the hot path allocates nothing.
+fn sanitize_terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let keep = |c: char| c == '\t' || c == '\n' || !c.is_control();
+    if text.chars().all(keep) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.chars().filter(|&c| keep(c)).collect())
+}
+
 /// A chrome fragment with no newline — streamed tool output, which arrives in
 /// chunks that must not each become a line.
 fn chrome_fragment(colour: crossterm::style::Color, text: &str) {
@@ -990,7 +1006,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
             }
             match ev {
                 AgentEvent::Text(t) => {
-                    print!("{t}");
+                    print!("{}", sanitize_terminal_text(&t));
                     let _ = std::io::stdout().flush();
                 }
                 AgentEvent::Reasoning(_) => {}
@@ -1002,7 +1018,10 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                     );
                 }
                 AgentEvent::ToolOutput { chunk, .. } if !quiet => {
-                    chrome_fragment(crossterm::style::Color::DarkGrey, &chunk);
+                    chrome_fragment(
+                        crossterm::style::Color::DarkGrey,
+                        &sanitize_terminal_text(&chunk),
+                    );
                     let _ = std::io::stderr().flush();
                 }
                 AgentEvent::Notice(text) if !quiet => chrome_line(crossterm::style::Color::DarkGrey, &format!("[{text}]"), ""),
@@ -1538,5 +1557,44 @@ mod cli_tests {
         let cli = Cli::parse_from(["hrdr"]);
         assert!(cli.command.is_none());
         assert!(cli.input.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_terminal_text;
+    use std::borrow::Cow;
+
+    /// An OSC 52 clipboard-write sequence's ESC and BEL are control chars and
+    /// drop; without the ESC prefix the payload `]52;c;ZGVtbw==` is inert
+    /// printed text, so no clipboard write reaches the terminal. The
+    /// surrounding text survives.
+    #[test]
+    fn osc_52_clipboard_write_is_stripped() {
+        assert_eq!(
+            sanitize_terminal_text("hi \x1b]52;c;ZGVtbw==\x07 there"),
+            "hi ]52;c;ZGVtbw== there"
+        );
+    }
+
+    /// Layout whitespace survives the filter.
+    #[test]
+    fn tab_and_newline_survive() {
+        assert_eq!(sanitize_terminal_text("a\tb\nc"), "a\tb\nc");
+    }
+
+    /// Clean text is returned borrowed — the hot path allocates nothing.
+    #[test]
+    fn clean_text_is_borrowed() {
+        assert!(matches!(
+            sanitize_terminal_text("plain text"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// A standalone BEL and DEL are both dropped.
+    #[test]
+    fn bel_and_del_are_dropped() {
+        assert_eq!(sanitize_terminal_text("a\x07b\x7fc"), "abc");
     }
 }
