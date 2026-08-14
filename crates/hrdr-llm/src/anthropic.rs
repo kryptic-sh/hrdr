@@ -652,6 +652,11 @@ pub(crate) async fn chat_stream(
         // byte loop so the accumulator can store them for the next request.
         let mut thinking_slot: std::collections::HashMap<u64, (String, String)> =
             std::collections::HashMap::new();
+        // Running byte total of capture-for-replay payload (redacted `data`,
+        // thinking deltas, signatures) — bounded by MAX_ACCUMULATED_BYTES like
+        // the Accumulator's own budget, because none of it flows through the
+        // Accumulator's per-chunk counting (see the caps in `map_event`).
+        let mut captured_bytes: usize = 0;
         // Redacted thinking blocks — full `data` arrives in content_block_start,
         // no deltas. Collected in stream order alongside their block index.
         let mut redacted_order: Vec<(u64, Value)> = Vec::new();
@@ -720,6 +725,7 @@ pub(crate) async fn chat_stream(
                     &mut next_tool,
                     &mut thinking_slot,
                     &mut redacted_order,
+                    &mut captured_bytes,
                     &mut message_stop_seen,
                     retry_after,
                 )? {
@@ -796,17 +802,41 @@ fn beta_headers(
     betas
 }
 
+/// The overflow error for capture-for-replay state exceeding a cap — mirrors
+/// the [`crate::Accumulator`] byte-budget error's wording, since both are the
+/// same flooding-endpoint guard on the same data.
+fn capture_overflow_error() -> crate::client::ChatError {
+    crate::client::ChatError {
+        status: None,
+        retry_after: None,
+        kind: crate::client::ChatErrorKind::Other,
+        message: format!(
+            "stream overflow: captured-for-replay data exceeding {} MiB limit; \
+             broken or hostile server",
+            crate::types::MAX_ACCUMULATED_BYTES / (1024 * 1024)
+        ),
+    }
+}
+
 /// Translate one Anthropic stream event into a [`ChatChunk`] (or `None` for
 /// events with nothing for the accumulator: `ping`, `content_block_stop`, …).
 ///
+/// `captured_bytes` is the running serialized-byte total of capture-for-replay
+/// payload (redacted `data`, thinking deltas, signatures); the growth sites
+/// below enforce [`crate::types::MAX_ACCUMULATED_BYTES`] and
+/// [`crate::types::MAX_CAPTURED_ENTRIES`] on it before accumulating, because
+/// none of that data flows through the [`Accumulator`]'s own byte budget.
+///
 /// `retry_after` is the streaming response's own `Retry-After`, which the
 /// `"error"` arm hands to the retry loop; see [`chat_stream`].
+#[allow(clippy::too_many_arguments)] // mirrors `build_body`'s signature
 fn map_event(
     ev: &Value,
     tool_slot: &mut std::collections::HashMap<u64, usize>,
     next_tool: &mut usize,
     thinking_slot: &mut std::collections::HashMap<u64, (String, String)>,
     redacted_order: &mut Vec<(u64, Value)>,
+    captured_bytes: &mut usize,
     message_stop_seen: &mut bool,
     retry_after: Option<std::time::Duration>,
 ) -> Result<Option<ChatChunk>> {
@@ -821,6 +851,9 @@ fn map_event(
             let block = ev.get("content_block");
             let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
             if block_type == Some("tool_use") {
+                if tool_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
+                    return Err(anyhow::Error::new(capture_overflow_error()));
+                }
                 let slot = *next_tool;
                 tool_slot.insert(idx, slot);
                 *next_tool += 1;
@@ -836,6 +869,9 @@ fn map_event(
                     .to_string();
                 Ok(Some(tool_call_chunk(slot, Some(id), Some(name), None)))
             } else if block_type == Some("thinking") {
+                if thinking_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
+                    return Err(anyhow::Error::new(capture_overflow_error()));
+                }
                 thinking_slot.insert(idx, (String::new(), String::new()));
                 Ok(None)
             } else if block_type == Some("redacted_thinking") {
@@ -844,6 +880,12 @@ fn map_event(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                *captured_bytes = captured_bytes.saturating_add(data.len());
+                if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES
+                    || redacted_order.len() >= crate::types::MAX_CAPTURED_ENTRIES
+                {
+                    return Err(anyhow::Error::new(capture_overflow_error()));
+                }
                 redacted_order.push((idx, json!({"type": "redacted_thinking", "data": data})));
                 Ok(None)
             } else {
@@ -863,6 +905,10 @@ fn map_event(
                         .and_then(|d| d.get("thinking"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    *captured_bytes = captured_bytes.saturating_add(t.len());
+                    if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES {
+                        return Err(anyhow::Error::new(capture_overflow_error()));
+                    }
                     // An unknown block index (no matching `content_block_start`
                     // recorded it) must not silently default to thinking slot 0 —
                     // a stray delta belonging to a different block would corrupt
@@ -878,6 +924,10 @@ fn map_event(
                         .and_then(|d| d.get("signature"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    *captured_bytes = captured_bytes.saturating_add(sig.len());
+                    if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES {
+                        return Err(anyhow::Error::new(capture_overflow_error()));
+                    }
                     if let Some(entry) = thinking_slot.get_mut(&idx) {
                         entry.1.push_str(sig);
                     }
@@ -1913,6 +1963,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2014,6 +2065,7 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
+                &mut 0usize,
                 &mut stop_seen,
                 None,
             )
@@ -2058,6 +2110,7 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
+                &mut 0usize,
                 &mut stop_seen,
                 None,
             )
@@ -2073,6 +2126,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2092,6 +2146,7 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
+                &mut 0usize,
                 &mut stop_seen,
                 None,
             )
@@ -2107,6 +2162,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2200,6 +2256,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2214,6 +2271,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2228,6 +2286,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2245,6 +2304,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2264,6 +2324,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2278,6 +2339,7 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
+                &mut 0usize,
                 &mut stop_seen,
                 None,
             )
@@ -2292,10 +2354,117 @@ mod tests {
                 &mut next,
                 &mut thinking,
                 &mut redacted,
+                &mut 0usize,
                 &mut stop_seen,
                 None,
             )
             .is_err()
+        );
+    }
+
+    /// A flooding endpoint can emit arbitrarily many `content_block_start`
+    /// thinking events, each inserting a fresh map entry even when its payload
+    /// is empty — the byte cap alone wouldn't bound that (an empty entry is
+    /// ~90 bytes of map overhead), so the distinct-entry count is capped.
+    #[test]
+    fn too_many_distinct_thinking_blocks_error_the_stream() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+        let mut captured = 0usize;
+        for i in 0..crate::types::MAX_CAPTURED_ENTRIES {
+            let ev =
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"thinking"}});
+            map_event(
+                &ev,
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut captured,
+                &mut stop_seen,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(thinking.len(), crate::types::MAX_CAPTURED_ENTRIES);
+        // The (MAX_CAPTURED_ENTRIES + 1)-th distinct block trips the cap.
+        let ev = json!({"type":"content_block_start","index":crate::types::MAX_CAPTURED_ENTRIES,"content_block":{"type":"thinking"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut captured,
+            &mut stop_seen,
+            None,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("stream overflow"),
+            "{}",
+            chat_err.message
+        );
+        assert!(
+            chat_err.message.contains("captured-for-replay"),
+            "{}",
+            chat_err.message
+        );
+    }
+
+    /// The `redacted_thinking` blocks each store a full `data` string; a
+    /// flooding endpoint growing the `redacted_order` vec beyond any legitimate
+    /// turn trips the same entry cap (the byte accounting for the payloads is
+    /// covered by `MAX_ACCUMULATED_BYTES` in the same guard).
+    #[test]
+    fn too_many_redacted_thinking_blocks_error_the_stream() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+        let mut captured = 0usize;
+        for i in 0..crate::types::MAX_CAPTURED_ENTRIES {
+            let ev = json!({"type":"content_block_start","index":i,"content_block":{"type":"redacted_thinking","data":"d"}});
+            map_event(
+                &ev,
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut captured,
+                &mut stop_seen,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(redacted.len(), crate::types::MAX_CAPTURED_ENTRIES);
+        // The (MAX_CAPTURED_ENTRIES + 1)-th redacted block trips the entry cap.
+        let ev = json!({"type":"content_block_start","index":crate::types::MAX_CAPTURED_ENTRIES,"content_block":{"type":"redacted_thinking","data":"d"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut captured,
+            &mut stop_seen,
+            None,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("stream overflow"),
+            "{}",
+            chat_err.message
         );
     }
 
@@ -2417,6 +2586,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2450,6 +2620,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2481,6 +2652,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2513,6 +2685,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2543,6 +2716,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )
@@ -2564,6 +2738,7 @@ mod tests {
             &mut next,
             &mut thinking,
             &mut redacted,
+            &mut 0usize,
             &mut stop_seen,
             None,
         )

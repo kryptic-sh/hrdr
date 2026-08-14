@@ -2370,19 +2370,7 @@ hardening (correct today, fragile), none must change first.**
    and eats the backslash); sending needs a second Enter. Documented escape
    design (Alt/Shift+Enter also newline), so deliberate — noted for a Windows
    path / LaTeX-heavy user.
-6. **`Accumulator`'s byte budget does not count `anthropic_thinking_blocks` /
-   `responses_reasoning_items`** (`crates/hrdr-llm/src/types.rs`): both sidecar
-   `Vec`s extend with no byte charge, while `bytes` is the documented ceiling
-   against a hostile endpoint streaming many small events. A malicious provider
-   can grow those vectors past the 64 MiB budget. Same provider-trust class as
-   the next item.
-7. **`StreamState` grows per distinct `fc_…` id with no cap**
-   (`crates/hrdr-llm/src/codex.rs`): `tool_slot` (HashMap) and `args_streamed`
-   (HashSet) insert per new output-item id, and once the flat index passes 1024
-   the accumulator drops the deltas — so no byte charge accrues against the map
-   growth. Two small events per id can build an unbounded map within the 300 s
-   window.
-8. **`read_capped_text` drops the truncation marker on a transport error
+6. **`read_capped_text` drops the truncation marker on a transport error
    mid-body** (`crates/hrdr-llm/src/capped_read.rs`): `Err(_) => break` leaves
    `truncated` false, so a truncated diagnostic body is returned as if complete.
    Cosmetic (the error path continues regardless).
@@ -2453,29 +2441,9 @@ audit covers them).
 across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate was
 re-traced at its cited lines by the sweep lead. **Status: 1 medium — the medium
-is the fix-first item. (All three lows shipped 2026-08-14: retention-sweep
-escape, OAuth bind-order, headless terminal escape.)**
-
-**Findings (ranked):**
-
-1. **MEDIUM — native-backend "capture for replay" collections are outside every
-   memory cap; a hostile Anthropic/Codex endpoint can OOM the client.**
-   `thinking_slot` (`crates/hrdr-llm/src/anthropic.rs`, one
-   `HashMap<u64, (String,String)>` entry per distinct `content_block_start`
-   index, no cap on entry count; `signature_delta` accumulates inside the entry
-   and is never yielded, so it is unbudgeted even for a single block),
-   `redacted_order` (each item clones a `data` string up to the 32 MiB per-event
-   SSE cap, unlimited count), and `codex.rs`'s `reasoning_items` (full `Value`
-   clone of `encrypted_content` per item, unlimited) all grow with no byte
-   budget — the Accumulator's 64 MiB total (`types.rs`) never counts them, and
-   the `responses_reasoning_items` extend it receives is also outside the check.
-   The per-event SSE cap and the Accumulator total protect every other payload
-   but not this path. Repro: hostile endpoint streams `content_block_start`
-   events with ever-increasing `index` for the 300 s request window →
-   `thinking_slot` grows to ~10⁶–10⁷ entries ≈ 1 GB+, no check trips. Fix:
-   charge these against a total cap (bound map sizes / byte totals, or route
-   captured bytes through the Accumulator budget) and error the stream past it,
-   mirroring the existing overflow handling.
+is the fix-first item. (All four findings shipped 2026-08-14: retention-sweep
+escape, OAuth bind-order, headless terminal escape, and the capture-cap
+medium.)**
 
 **Hardening (open — triage):**
 

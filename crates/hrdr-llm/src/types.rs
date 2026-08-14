@@ -787,7 +787,31 @@ static NEXT_ACCUMULATOR_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// hostile endpoint can emit many small complete events for the whole request
 /// timeout — without this, memory grows network-bound × 300 s and the inflated
 /// message then rides in history for the next request.
-const MAX_ACCUMULATED_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ACCUMULATED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ceiling on distinct capture-for-replay entries (thinking blocks, redacted
+/// blocks, tool slots, reasoning items) a native-backend stream may hold for
+/// replay; far beyond any legitimate turn (Anthropic streams 1-3 thinking
+/// blocks; tool-call batches are tens), and it bounds the per-entry map/set/Vec
+/// overhead a flooding endpoint could otherwise grow unboundedly even when
+/// every entry's payload is empty.
+pub(crate) const MAX_CAPTURED_ENTRIES: usize = 4096;
+
+/// The overflow error shared by both byte-budget checks in [`Accumulator::push`]
+/// (the main content path and the capture-for-replay sidecars) — one message so
+/// the two guards read as the same failure.
+fn stream_overflow_error() -> ChatError {
+    ChatError {
+        status: None,
+        retry_after: None,
+        kind: ChatErrorKind::Other,
+        message: format!(
+            "stream overflow: accumulated response exceeding {} MiB limit; \
+             broken or hostile server",
+            MAX_ACCUMULATED_BYTES / (1024 * 1024)
+        ),
+    }
+}
 
 impl Accumulator {
     pub fn new() -> Self {
@@ -856,6 +880,21 @@ impl Accumulator {
             self.responses_reasoning_items
                 .extend(chunk.responses_reasoning_items.iter().cloned());
         }
+        // Both sidecars are capture-for-replay data that the early return below
+        // would otherwise exempt from the byte budget — a flooding endpoint
+        // could stash unbounded replay state in a chunk the accumulator never
+        // counts. Charge their serialized size into the same budget. The charge
+        // runs once per stream on the synthetic chunk, so serializing here is
+        // irrelevant to cost.
+        for v in &chunk.anthropic_thinking_blocks {
+            self.bytes += serde_json::to_vec(v).map_or(0, |b| b.len());
+        }
+        for v in &chunk.responses_reasoning_items {
+            self.bytes += serde_json::to_vec(v).map_or(0, |b| b.len());
+        }
+        if self.bytes > self.budget {
+            return Err(stream_overflow_error());
+        }
         let Some(choice) = chunk.choices.first() else {
             return Ok(None);
         };
@@ -909,16 +948,7 @@ impl Accumulator {
             self.content.push_str(text);
         }
         if self.bytes > self.budget {
-            return Err(ChatError {
-                status: None,
-                retry_after: None,
-                kind: ChatErrorKind::Other,
-                message: format!(
-                    "stream overflow: accumulated response exceeding {} MiB limit; \
-                     broken or hostile server",
-                    MAX_ACCUMULATED_BYTES / (1024 * 1024)
-                ),
-            });
+            return Err(stream_overflow_error());
         }
         Ok(delta)
     }
@@ -1459,6 +1489,50 @@ mod tests {
             Some(text.clone())
         );
         assert_eq!(acc.content, text);
+    }
+
+    #[test]
+    fn accumulator_errors_past_the_byte_budget_on_replay_sidecars() {
+        // The synthetic chunks that carry Anthropic thinking blocks / Responses
+        // reasoning items have no `choices`, so the usual budget check is
+        // skipped by the early return — a flooding endpoint could stash
+        // unbounded replay state there. The sidecars must count against the
+        // same byte budget as everything else.
+        let mut acc = Accumulator::with_budget(16);
+        let chunk = ChatChunk {
+            choices: vec![],
+            usage: None,
+            anthropic_thinking_blocks: vec![json!({
+                "type": "thinking",
+                "thinking": "x".repeat(64),
+                "signature": "SIG",
+            })],
+            responses_reasoning_items: vec![],
+        };
+        let err = acc.push(&chunk).unwrap_err();
+        assert_eq!(err.kind, ChatErrorKind::Other);
+        assert!(
+            err.message.contains("accumulated response exceeding"),
+            "{}",
+            err.message
+        );
+
+        // The reasoning-items sidecar is charged the same way.
+        let mut acc = Accumulator::with_budget(16);
+        let chunk = ChatChunk {
+            choices: vec![],
+            usage: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "x".repeat(64),
+            })],
+        };
+        let err = acc.push(&chunk).unwrap_err();
+        assert_eq!(err.kind, ChatErrorKind::Other);
+        assert!(err.message.contains("accumulated response exceeding"));
     }
 
     #[test]

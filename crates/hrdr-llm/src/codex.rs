@@ -424,6 +424,11 @@ struct StreamState {
     /// replay in the next request's `input[]` (see [`build_body`]). Only items
     /// carrying `encrypted_content` land here.
     reasoning_items: Vec<Value>,
+    /// Running serialized-byte total of captured reasoning items, bounded by
+    /// [`crate::types::MAX_ACCUMULATED_BYTES`] like the [`Accumulator`]'s own
+    /// budget — the synthetic chunk that carries these has no choices, so the
+    /// Accumulator's byte check never sees them (see `capture_reasoning_item`).
+    captured_bytes: usize,
 }
 
 /// Translate one Responses stream event into a [`ChatChunk`] (or `None` for
@@ -467,7 +472,7 @@ fn map_event(
                 .unwrap_or(&fc_id)
                 .to_string();
             let name = item_str(item, "name");
-            let slot = state.assign_slot(&fc_id);
+            let slot = state.assign_slot(&fc_id)?;
             state.saw_function_call = true;
             Ok(Some(tool_call_chunk(slot, Some(call_id), Some(name), None)))
         }
@@ -503,7 +508,7 @@ fn map_event(
             // `.done` — not `.added` — is the point at which a reasoning item is
             // whole (`.added` announces it before `encrypted_content` exists).
             if item_type == Some("reasoning") {
-                capture_reasoning_item(state, item);
+                capture_reasoning_item(state, item)?;
                 return Ok(None);
             }
             if item_type != Some("function_call") {
@@ -531,7 +536,7 @@ fn map_event(
                         .unwrap_or(&fc_id)
                         .to_string();
                     let name = item_str(item, "name");
-                    let slot = state.assign_slot(&fc_id);
+                    let slot = state.assign_slot(&fc_id)?;
                     state.saw_function_call = true;
                     Ok(Some(tool_call_chunk(
                         slot,
@@ -636,6 +641,22 @@ fn map_event(
     }
 }
 
+/// The overflow error for capture-for-replay state exceeding a cap — mirrors
+/// the [`crate::Accumulator`] byte-budget error's wording, since both are the
+/// same flooding-endpoint guard on the same data.
+fn capture_overflow_error() -> crate::client::ChatError {
+    crate::client::ChatError {
+        status: None,
+        retry_after: None,
+        kind: crate::client::ChatErrorKind::Other,
+        message: format!(
+            "stream overflow: captured-for-replay data exceeding {} MiB limit; \
+             broken or hostile server",
+            crate::types::MAX_ACCUMULATED_BYTES / (1024 * 1024)
+        ),
+    }
+}
+
 /// Stash a completed `{"type":"reasoning", …}` output item for replay in the
 /// next request's `input[]`, preserving stream order.
 ///
@@ -650,28 +671,50 @@ fn map_event(
 /// variant may emit reasoning items without it, and replaying one of those is
 /// precisely the request the endpoint rejects. Dropping it costs a little
 /// context; sending it would fail the whole turn.
-fn capture_reasoning_item(state: &mut StreamState, item: Option<&Value>) {
-    let Some(item) = item else { return };
+///
+/// The stored items never flow through the [`Accumulator`]'s byte budget (the
+/// synthetic chunk that carries them has no choices), so the entry count and
+/// serialized-byte total are capped here instead.
+fn capture_reasoning_item(
+    state: &mut StreamState,
+    item: Option<&Value>,
+) -> Result<(), crate::client::ChatError> {
+    let Some(item) = item else { return Ok(()) };
     let has_state = item
         .get("encrypted_content")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty());
     if !has_state {
-        return;
+        return Ok(());
+    }
+    state.captured_bytes = state
+        .captured_bytes
+        .saturating_add(serde_json::to_vec(item).map_or(0, |b| b.len()));
+    if state.captured_bytes > crate::types::MAX_ACCUMULATED_BYTES
+        || state.reasoning_items.len() >= crate::types::MAX_CAPTURED_ENTRIES
+    {
+        return Err(capture_overflow_error());
     }
     state.reasoning_items.push(item.clone());
+    Ok(())
 }
 
 impl StreamState {
     /// Return the flat tool index for `fc_id`, assigning a fresh one if unseen.
-    fn assign_slot(&mut self, fc_id: &str) -> usize {
+    /// Errors once the slot map hits [`crate::types::MAX_CAPTURED_ENTRIES`]:
+    /// each entry is per-distinct-`fc_…`-id map overhead a flooding endpoint
+    /// could grow unboundedly (and `args_streamed` is bounded only by this).
+    fn assign_slot(&mut self, fc_id: &str) -> Result<usize, crate::client::ChatError> {
         if let Some(&slot) = self.tool_slot.get(fc_id) {
-            return slot;
+            return Ok(slot);
+        }
+        if self.tool_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
+            return Err(capture_overflow_error());
         }
         let slot = self.next_tool;
         self.tool_slot.insert(fc_id.to_string(), slot);
         self.next_tool += 1;
-        slot
+        Ok(slot)
     }
 }
 
@@ -1472,6 +1515,72 @@ mod tests {
             .map(|i| i["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["rs_1", "rs_2", "rs_3"]);
+    }
+
+    /// A flooding endpoint can emit arbitrarily many `response.output_item.added`
+    /// function-call events, each inserting a fresh `tool_slot` map entry (and
+    /// an `args_streamed` set entry) — bounded by the distinct-id cap.
+    #[test]
+    fn too_many_distinct_function_call_ids_error_the_stream() {
+        let mut state = StreamState::default();
+        for i in 0..crate::types::MAX_CAPTURED_ENTRIES {
+            let ev = json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "id": format!("fc_{i}"), "call_id": format!("call_{i}"), "name": "read"
+            }});
+            map_event(&mut state, &ev, None).unwrap();
+        }
+        assert_eq!(state.tool_slot.len(), crate::types::MAX_CAPTURED_ENTRIES);
+        // A fresh id past the cap trips the entry guard.
+        let ev = json!({"type": "response.output_item.added", "item": {
+            "type": "function_call", "id": "fc_overflow", "call_id": "call_overflow", "name": "read"
+        }});
+        let err = map_event(&mut state, &ev, None).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("stream overflow"),
+            "{}",
+            chat_err.message
+        );
+        assert!(
+            chat_err.message.contains("captured-for-replay"),
+            "{}",
+            chat_err.message
+        );
+    }
+
+    /// Reasoning items are captured verbatim for replay; a flooding endpoint
+    /// growing `reasoning_items` beyond any legitimate turn trips the same cap
+    /// (the serialized-byte ceiling guards the 32 MiB-per-item payloads).
+    #[test]
+    fn too_many_captured_reasoning_items_error_the_stream() {
+        let mut state = StreamState::default();
+        for i in 0..crate::types::MAX_CAPTURED_ENTRIES {
+            let ev = json!({"type": "response.output_item.done", "item": {
+                "type": "reasoning", "id": format!("rs_{i}"), "summary": [], "encrypted_content": "E"
+            }});
+            map_event(&mut state, &ev, None).unwrap();
+        }
+        assert_eq!(
+            state.reasoning_items.len(),
+            crate::types::MAX_CAPTURED_ENTRIES
+        );
+        let ev = json!({"type": "response.output_item.done", "item": {
+            "type": "reasoning", "id": "rs_overflow", "summary": [], "encrypted_content": "E"
+        }});
+        let err = map_event(&mut state, &ev, None).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Other);
+        assert!(
+            chat_err.message.contains("stream overflow"),
+            "{}",
+            chat_err.message
+        );
+        assert!(
+            chat_err.message.contains("captured-for-replay"),
+            "{}",
+            chat_err.message
+        );
     }
 
     /// End-to-end capture: reasoning items interleaved with a function call

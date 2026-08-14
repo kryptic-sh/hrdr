@@ -33,6 +33,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sinks now strip control characters while keeping tabs and newlines. The TUI
   was already safe (ratatui drops control-char graphemes), and `--json` output
   was already safe (serde escapes control chars).
+- **Native Anthropic/Codex streams can no longer grow memory without bound.**
+  The "capture for replay" state (Anthropic thinking/redacted blocks and their
+  signatures, Codex reasoning items, and the per-call slot maps) grew outside
+  every existing cap: the 32 MiB per-event SSE bound and the 64 MiB accumulated
+  payload bound never counted it, so a flooding or hostile endpoint could grow
+  it to gigabytes within the 300 s request window. The captures now count
+  against the same 64 MiB byte budget plus a 4096-entry ceiling, and the stream
+  errors past either, mirroring the existing overflow handling. The
+  `Accumulator` also charges its thinking-block/reasoning-item sidecars against
+  its budget, closing the no-choices early-return gap.
 
 ### Performance
 
