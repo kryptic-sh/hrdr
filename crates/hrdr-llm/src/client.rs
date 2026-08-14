@@ -738,18 +738,33 @@ pub(crate) fn apply_extra_headers(
 impl Client {
     /// `base_url` should include the `/v1` suffix where the provider uses one,
     /// e.g. `http://localhost:8080/v1`.
+    ///
+    /// Panics only when the HTTP client cannot be built — the one failure
+    /// [`Self::try_new`] returns, which is normally a TLS backend that fails to
+    /// initialize. Use `try_new` where aborting on that is unacceptable.
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
         model: impl Into<String>,
     ) -> Self {
+        Self::try_new(base_url, api_key, model).expect("reqwest client")
+    }
+
+    /// [`Self::new`], but fallible: building the HTTP client can fail when the
+    /// TLS backend cannot initialize, and that failure is returned instead of
+    /// aborting the process. Identical in every other way.
+    pub fn try_new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+    ) -> Result<Client> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let backend = detect_backend(&base_url);
-        Self {
+        Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
                 .build()
-                .expect("reqwest client"),
+                .context("building the HTTP client")?,
             base_url,
             api_key,
             model: model.into(),
@@ -765,7 +780,7 @@ impl Client {
             max_attachment_bytes: None,
             backend,
             resolved_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
+        })
     }
 
     pub fn with_temperature(mut self, t: f32) -> Self {
@@ -1771,6 +1786,10 @@ struct ModelEntry {
 ///   agent would fill a window four times larger than the one that exists. The
 ///   loaded figure comes from `/props` instead — see
 ///   [`Client::context_from_props`]. Do not "fix" this omission.
+///
+/// The result is clamped at [`MAX_ADVERTISED_CONTEXT`]: a hostile or
+/// misconfigured local server could otherwise advertise a window of up to
+/// `u32::MAX` and inflate the compaction threshold.
 fn context_field(v: &serde_json::Value) -> Option<u32> {
     const KEYS: &[&str] = &[
         "max_model_len",      // vLLM
@@ -1789,8 +1808,16 @@ fn context_field(v: &serde_json::Value) -> Option<u32> {
     // OpenRouter nests a second copy of the window under `top_provider`
     // (`top_provider.context_length`), which is the one that survives when the
     // top-level field is absent for a given entry.
-    find(v).or_else(|| v.get("top_provider").and_then(find))
+    find(v)
+        .or_else(|| v.get("top_provider").and_then(find))
+        .map(|n| n.min(MAX_ADVERTISED_CONTEXT))
 }
+
+/// Sanity ceiling on a server-advertised context window. No real model
+/// approaches this (the largest shipped windows are ~2M tokens), so a larger
+/// claim is a misconfiguration or a hostile local server — clamping it keeps
+/// the compaction threshold sane without rejecting the server.
+const MAX_ADVERTISED_CONTEXT: u32 = 4_000_000;
 
 /// Read a `u32` from a JSON number or numeric string.
 fn json_u32(v: &serde_json::Value) -> Option<u32> {
@@ -1902,6 +1929,13 @@ mod tests {
     fn openai_body(messages: &[ChatMessage]) -> serde_json::Value {
         let client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
         client.body_json(&client.request(Some(client.model.clone()), messages, &[], true))
+    }
+
+    /// The fallible constructor succeeds for a normal base URL — same happy
+    /// path as `new`, without the panic-on-TLS-failure.
+    #[test]
+    fn try_new_succeeds_with_a_normal_base_url() {
+        assert!(Client::try_new("https://api.openai.com/v1", None, "gpt-5.6").is_ok());
     }
 
     /// A message with attachments has its string `content` rewritten into a
@@ -3605,6 +3639,20 @@ mod tests {
     #[test]
     fn context_field_empty_object_is_none() {
         assert_eq!(context_field(&json!({})), None);
+    }
+
+    /// A server claiming an implausibly large window is clamped to the sanity
+    /// ceiling; an ordinary window passes through untouched.
+    #[test]
+    fn context_field_clamps_absurd_advertisements() {
+        assert_eq!(
+            context_field(&json!({"max_model_len": 4_000_000_000u64})),
+            Some(MAX_ADVERTISED_CONTEXT)
+        );
+        assert_eq!(
+            context_field(&json!({"max_model_len": 128_000})),
+            Some(128_000)
+        );
     }
 
     // ── Log hardening ───────────────────────────────────────────────────
