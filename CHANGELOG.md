@@ -58,6 +58,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already fired before the push) — the two diverged until the next round, and
   the message sat uncounted as a user turn. A `History` snapshot now follows
   the push, so a failing wrap-up still persists the message.
+- **Truncated diagnostics are marked even when a transport error cuts them
+  short.** `read_capped_text` appended its `… [truncated]` marker only when
+  the byte cap was hit; a connection that died mid-body (partial bytes, then a
+  stream error) came back looking complete. The marker now appears for both
+  kinds of truncation.
 
 ### Performance
 

@@ -49,7 +49,9 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated]";
 pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read up to `max_bytes` from a [`reqwest::Response`] body and return as
-/// [`String`]. Appends [`TRUNCATION_MARKER`] when the body exceeds the limit.
+/// [`String`]. Appends [`TRUNCATION_MARKER`] when the body exceeds the limit
+/// or the read is cut short by a transport error mid-body — a partial
+/// diagnostic that ends without the marker reads as complete.
 ///
 /// Intended for diagnostic/error text — the caller should supply a
 /// generous-but-finite bound such as [`MAX_DIAGNOSTIC_BYTES`].
@@ -64,7 +66,10 @@ pub async fn read_capped_text(resp: reqwest::Response, max_bytes: usize) -> Stri
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
-            Err(_) => break,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
         };
         let remaining = cap.saturating_sub(buf.len());
         if chunk.len() > remaining {
@@ -176,6 +181,48 @@ mod tests {
         reqwest::get(&base).await.unwrap()
     }
 
+    /// Like [`serve`], but the declared `Content-Length` exceeds the bytes
+    /// actually written: the connection closes mid-body, so the client's body
+    /// stream yields the bytes it got and then a transport error — the "read
+    /// cut short" failure [`read_capped_text`] must mark truncated.
+    async fn serve_erroring_body(first: &'static [u8], declared_len: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {declared_len}\r\n\
+                 Connection: close\r\n\
+                 \r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(first).await;
+            // Dropping the stream closes the connection with `declared_len`
+            // bytes still owed — the next read is an incomplete-body error.
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
     // ── read_capped_text ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -223,6 +270,21 @@ mod tests {
         assert!(!text.is_empty(), "non-utf8 should produce lossy output");
         // The text should contain replacement characters (U+FFFD = �)
         assert!(text.contains('\u{FFFD}'), "lossy replacement expected");
+    }
+
+    #[tokio::test]
+    async fn capped_text_marks_a_transport_error_mid_body_as_truncated() {
+        // Declared Content-Length (100) far exceeds the 12 bytes actually sent:
+        // the connection dies mid-body, so the stream yields the partial bytes
+        // and then a transport error. A diagnostic cut short must carry the
+        // truncation marker — without it, a partial body reads as complete.
+        let base = serve_erroring_body(b"partial body", 100).await;
+        let resp = reqwest::get(&base).await.unwrap();
+        let text = read_capped_text(resp, 1024).await;
+        assert!(
+            text.ends_with(TRUNCATION_MARKER),
+            "mid-body transport error must be marked truncated: {text:?}"
+        );
     }
 
     // ── read_capped_json ─────────────────────────────────────────────────
