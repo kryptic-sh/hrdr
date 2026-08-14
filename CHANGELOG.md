@@ -70,16 +70,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Performance
 
-- **An idle TUI no longer redraws ~8.3×/sec.** The run loop drew the full
-  frame on a fixed 120 ms ticker whether or not anything was happening, so a
+- **An idle TUI no longer redraws ~8.3×/sec.** The run loop drew the full frame
+  on a fixed 120 ms ticker whether or not anything was happening, so a
   completely idle session burned the frame build (transcript walk, status bar,
   input render) continuously. The ticker is now polled only while an animated
   element is on screen — the inference loader, a running turn or `!command`, a
   delegated sub-agent still working, an in-progress todo row — and the loop
   otherwise blocks on real events, which still each draw exactly as before.
-  Completion popups also re-ranked the whole `@file` index (up to 20,000
-  paths) on every frame and keystroke; that computation is now memoized on the
-  editor content and invalidated whenever its inputs change.
+  Completion popups also re-ranked the whole `@file` index (up to 20,000 paths)
+  on every frame and keystroke; that computation is now memoized on the editor
+  content and invalidated whenever its inputs change.
 - **A large tool result or diff on screen no longer slows the whole UI down.**
   The transcript painted every row of every block the viewport overlapped and
   let `Paragraph` scroll past the ones above it — so the cost of a frame was the

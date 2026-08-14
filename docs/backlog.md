@@ -2603,8 +2603,9 @@ test-side duplication.
 `:perf` over the whole tree (working tree clean at the time), split across two
 sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
 hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced at its cited
-lines by the sweep lead. **Status: 7 findings, all open — the TUI idle redraw
-and the per-round history clone are the top two.**
+lines by the sweep lead. **Status: 4 shipped 2026-08-14 — the TUI idle redraw +
+completion memo, tool-args parse-once, ToolEnd move, and the grep newline
+offsets. 3 open (deferred, reasons inline).**
 
 1. **The whole message history is deep-cloned per committed round — O(history)
    per round, O(N²) across a session.** `crates/hrdr-agent/src/delegation.rs` —
@@ -2621,24 +2622,13 @@ and the per-round history clone are the top two.**
    `app.rs` History handler; those are the payoff sites if the TUI gets a pass.
    The sub-agent snapshot itself is a documented open question (a write per
    committed round is already tracked in this backlog); this finding is the
-   extra clone on top of that known write.
-2. **The TUI redraws the full frame ~8.3×/sec even when completely idle, and
-   completion re-ranks the whole file index every frame.**
-   `hrdr-tui/src/ tui.rs` draws unconditionally at the top of every loop
-   iteration with a 120 ms `interval` ticker armed unconditionally — so with
-   zero input, zero messages and no turn running, the whole `draw()` (transcript
-   walk, status bar, input render) runs ~8.3×/sec. It is the frequency amplifier
-   for every per-frame cost in `ui.rs`, including the already-tracked
-   chunk-per-entry walk — fixing that walk leaves the idle redraw. And while an
-   `@` token is in the input, `draw()` → `active_completions()` →
-   `rank_file_matches` scans every indexed path (capped at 20,000) and fully
-   sorts the hits **each frame and each keystroke** (`ui.rs`,
-   `app/completion.rs`, `hrdr-app/src/ completion.rs` — the index is built once
-   but ranked fresh per call). Fixes: draw only on change (dirty flag from
-   `on_key`/`on_turn_msg`/mouse/paste; arm the ticker only while a spinner is
-   live), and memoize the completion set keyed on the editor content so the scan
-   is per-keystroke at worst.
-3. **Every attachment is re-SHA-256'd on every save.** `AttachmentRef::of`
+   extra clone on top of that known write. **Deferred 2026-08-14: the fix needs
+   the save/snapshot entry points to serialize by borrowing, which means
+   `Session::save_to_path` API surgery on the load-bearing persistence path —
+   bigger than the win for sub-agent snapshots; the live autosave copies are in
+   `hrdr-tui` (app.rs History handler, session.rs), the payoff sites if the TUI
+   gets a dedicated pass.**
+2. **Every attachment is re-SHA-256'd on every save.** `AttachmentRef::of`
    (`hrdr-agent/src/attachment_store.rs`) digests the full bytes of every
    attachment; called from `attachment_refs` on every per-round save
    (`session.rs`). The blob write is skipped when the file exists, but the hash
@@ -2646,38 +2636,19 @@ and the per-round history clone are the top two.**
    so its digest is stable. Fix: memoize the digest on the `Attachment` at
    attach time; or cache the ref per message index. Only materializes for
    sessions that carry attachments, but for one it is a full read of every
-   attached byte per round.
-4. **Tool-call arguments are parsed twice, serialized once, and cloned once per
-   call.** `turn_loop.rs`: `serde_json::from_str` on `call.function.arguments`
-   (:1072), re-serialized as the recorded form (:1076), the raw string cloned
-   (:1098), then parsed a second time inside the spawned task (:1119). For a
-   `write`/`edit` with a large payload that is ~3–4 full passes over the args on
-   the path from model output to tool execution. Fix: parse once and move the
-   `Value` into the spawned future (it is `Send`); `repeat.refusal` can key on
-   the parsed value or the cloned name. Modest but free.
-5. **The full tool result is cloned into `ToolEnd`, then copied again into the
-   recorded message.** `turn_loop.rs:1002` (`result: body.clone()` — a `read` of
-   a large file or a big `grep` result is MBs) and `:1025`
-   (`format!("{body}\n\n(took …)")`, a second copy). One full copy per tool call
-   on the hot path. Fix: build the recorded string first and move it into the
-   event, or share the result behind an `Arc<str>` between the event and the
-   message (the only two owners). Bounded per call, below 1–4.
-6. **O(k·n) line-number recount in the multiline grep walk.**
-   `hrdr-tools/src/tools/grep.rs` — per match,
-   `text[..hit.start()].bytes().filter(|b| *b == b'\n').count()` rescans from
-   byte 0 (and again to `hit.end()`). With k matches over an n-byte file that is
-   ~2·k·n byte scans; the 200-match cap still allows ~200 rescans of a multi-MB
-   file. Runs in `spawn_blocking` (no runtime stall) but is the wall-clock cost
-   of the tool's hot case. Fix: build a newline-offset `Vec` once per file and
-   `partition_point` per hit — O(n + k log n).
-7. **Per-turn lowercase copies of every memory body**
+   attached byte per round. **Deferred 2026-08-14: the clean fix (a digest field
+   on `Attachment`, computed once at `Attachment::new`) needs `sha2` in
+   `hrdr-llm`, which does not depend on it — adding a dependency is the user's
+   call.**
+3. **Per-turn lowercase copies of every memory body**
    (`hrdr-tools/src/ memory.rs`): `relevance_score` lowercases
    name/description/body per needle (per recall token), and the mtime-cache hit
    `cloned()`s the whole memory before the mtime filter. Runs once per opening
    user message; tens of memories × a few tokens × body-size copies is
-   sub-millisecond, dwarfed by the LLM round trip. Borderline micro — fix while
-   touching the code (lowercase each body once, serve the cached memory by
-   `Arc`/`Rc`).
+   sub-millisecond, dwarfed by the LLM round trip. **Deferred 2026-08-14: the
+   review's own label is "borderline micro — fix while touching the code", and
+   no other item touches `memory.rs`; fix it when something else opens the file
+   (lowercase each body once, serve the cached memory by `Arc`/`Rc`).**
 
 **Already optimized (traced and cleared — do not re-hunt):** session save path
 (created-cache, compact JSON, transcript in a sibling jsonl, off-thread);
