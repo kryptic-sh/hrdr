@@ -1456,6 +1456,14 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
         let Some(id) = session_id_from_path(&path) else {
             continue;
         };
+        // A session file hrdr writes always carries a sanitized id. A stem that
+        // does not round-trip (empty, `.`/`..`, uppercase, embedded separators)
+        // is not one of ours — skip it rather than delete derived data under a
+        // path derived from an unsanitized id (`subagents/..` would resolve to
+        // the session directory itself and wipe the whole cwd's sessions).
+        if id != sanitize_name(&id) {
+            continue;
+        }
         // Take the session's open-lock. Busy → a live instance is using it, or
         // another sweeper is on it; either way, skip. Held for the whole action.
         let Ok(_lock) = acquire_open_lock(dir, &id) else {
@@ -2466,6 +2474,78 @@ mod tests {
             sweep_sessions(Some(month / 4), Some(month));
             assert!(json.exists(), "a busy session is skipped");
             assert!(!json.with_extension("json.zst").exists());
+        });
+    }
+
+    #[test]
+    fn sweep_skips_a_session_file_whose_id_does_not_round_trip_through_sanitize() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let month = 30 * 24 * 60 * 60;
+            // A fresh auto-named session sharing the directory, plus the
+            // `subagents/` dir with a marker — the sibling data the escape would
+            // wipe. The crafted file below is a zstd-compressed copy of the real
+            // session's body, so it parses as a valid auto-named session.
+            Session::new(state("kept", &cwd)).save("kept").unwrap();
+            let dir = session_dir(&cwd);
+            let subagents = dir.join("subagents");
+            std::fs::create_dir_all(&subagents).unwrap();
+            let marker = subagents.join("marker.txt");
+            std::fs::write(&marker, "keep me").unwrap();
+
+            // `..json.zst` reads back id `".."` (see `session_id_from_path`).
+            // Without the round-trip guard the purge would delete derived data
+            // via `subagents/..` — which resolves to the session dir itself and
+            // wipes every session in this cwd. It must instead be skipped whole.
+            let src = std::fs::read(session_file_path(&cwd, "kept")).unwrap();
+            let crafted = dir.join("..json.zst");
+            std::fs::write(&crafted, zstd::encode_all(&src[..], 3).unwrap()).unwrap();
+            age_file(&crafted, month + 1000);
+
+            sweep_sessions(Some(month / 4), Some(month));
+
+            assert!(
+                crafted.exists(),
+                "the crafted file is skipped, never purged"
+            );
+            assert!(
+                session_file_path(&cwd, "kept").exists(),
+                "every real session file survives"
+            );
+            assert!(marker.exists(), "the subagents dir is not wiped");
+        });
+    }
+
+    #[test]
+    fn sweep_purges_derived_data_beside_an_old_auto_named_session() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let month = 30 * 24 * 60 * 60;
+            // A genuine hrdr-written session (sanitized id) old enough to purge,
+            // with the sibling transcript and the subagents dir it owns — both
+            // must go with it, so the round-trip guard is not too broad.
+            Session::new(state("gone", &cwd)).save("gone").unwrap();
+            age_file(&session_file_path(&cwd, "gone"), month + 1000);
+            let transcript = session_transcript_path(&cwd, "gone");
+            std::fs::write(&transcript, "transcript").unwrap();
+            let sub = child_transcript_dir(&cwd, "gone");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("sub.jsonl"), "sub").unwrap();
+
+            sweep_sessions(Some(month / 4), Some(month));
+
+            assert!(
+                !session_file_path(&cwd, "gone").exists(),
+                "old auto-named session purged"
+            );
+            assert!(!transcript.exists(), "sibling jsonl purged with it");
+            assert!(!sub.exists(), "subagents dir purged with it");
         });
     }
 

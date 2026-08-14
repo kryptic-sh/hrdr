@@ -2452,8 +2452,9 @@ audit covers them).
 `:audit` (low depth) over the whole tree (working tree clean at the time), split
 across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate was
-re-traced at its cited lines by the sweep lead. **Status: 1 medium + 3 low — the
-medium and one low (sweep escape) are the fix-first items.**
+re-traced at its cited lines by the sweep lead. **Status: 1 medium + 2 low — the
+medium is the fix-first item. (The retention-sweep escape, formerly finding 2,
+shipped 2026-08-14.)**
 
 **Findings (ranked):**
 
@@ -2475,28 +2476,7 @@ medium and one low (sweep escape) are the fix-first items.**
    charge these against a total cap (bound map sizes / byte totals, or route
    captured bytes through the Accumulator budget) and error the stream past it,
    mirroring the existing overflow handling.
-2. **LOW — retention sweep deletes outside its target when a session file's name
-   derives to `"."`/`".."`/empty id.** `sweep_dir` builds the purge's delete
-   paths from `session_id_from_path` (raw file stem, `session.rs`) with no
-   validation, and `remove_dir_all(dir.join("subagents").join(&id))` escapes
-   `subagents/` for crafted stems: `..json.zst` → id `".."` → resolves to the
-   session directory itself (wholesale deletion of every session file and
-   transcript for that cwd); `.json` / `..json` → id `""`/`"."` → the whole
-   `subagents/` tree. All three pass the `.ends_with` filters and
-   `Session::load_path` parses them; the lock path is sanitized but the delete
-   id is not. Not an escalation (needs write access to the user's own session
-   dir), but an accident becomes destruction of the cwd's session history.
-   Repro:
-   ```
-   Input:  sessions/<cwd-slug>/..json.zst  (valid session JSON, named_by_user
-           false, mtime 31 days old)
-   Run:    retention sweep (hourly worker)
-   Expect: that one session file is purged
-   Actual: remove_dir_all(<cwd-slug>/subagents/..) deletes the entire <cwd-slug>
-   ```
-   Fix: validate the stem-derived id (`""`, `"."`, `".."`, separators, `.`) or
-   route through `sanitize_name` before joining; unit-test a `..json.zst` file.
-3. **LOW — fixed-port loopback OAuth; the browser opens before the callback
+2. **LOW — fixed-port loopback OAuth; the browser opens before the callback
    listener binds.** `browser_login_start` calls `open_browser`
    (`hrdr-app/ src/login.rs`) before the future that binds the listener
    (`await_oauth_code_within`, `hrdr-agent/src/oauth.rs`) runs, and the ports
@@ -2509,7 +2489,7 @@ medium and one low (sweep escape) are the fix-first items.**
    the verifier (unverified). Fix: bind the listener (failing the login on bind
    error) _before_ opening the browser; use an ephemeral port where the provider
    allows it; document reliance on provider-side PKCE enforcement.
-4. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
+3. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
    with no control-character filtering.** `AgentEvent::Text` is `print!`-ed raw
    and `ToolOutput` chunks go through `chrome_fragment` raw
    (`apps/hrdr/src/main.rs`); `--json` embeds the raw bytes in `tool_end.result`

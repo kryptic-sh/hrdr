@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The retention sweep can no longer wipe a whole cwd's sessions.** The purge
+  built its derived-data delete paths from the raw session-file stem, so a file
+  whose name derived to `"."`, `".."` or an empty id (`..json.zst`, `.json`,
+  `..json`) made `remove_dir_all(sessions/<cwd>/subagents/..)` resolve to the
+  session directory itself and delete every session file and transcript for that
+  cwd. The sweep now skips any file whose id does not round-trip through
+  `sanitize_name` — the same guard that fixes the derived-data deletes missing
+  their targets for ids hrdr itself would never write.
+
 ### Performance
 
 - **A large tool result or diff on screen no longer slows the whole UI down.**
