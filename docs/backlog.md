@@ -2497,9 +2497,9 @@ beyond the trust gate was not audited by chunk 1 (covered by chunk 2).
 sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
 hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read at its cited
 lines by the sweep lead; behavior-preserving only.
-`cargo check --workspace --all-targets` is clean — the only true dead code is
-the two items below. **Status: 12 candidates, all open; two are
-workspace-internal API decisions.**
+`cargo check --workspace --all-targets` is clean — the only true dead code was
+the three deleted items. **Status: all 13 items shipped 2026-08-14 (commit
+057c5a4).**
 
 1. **Five byte-identical fuzzy-filter functions — extract one shared helper.**
    `filter_effort_choices` (`hrdr-app/src/effort.rs`), `filter_themes`
@@ -2564,6 +2564,15 @@ workspace-internal API decisions.**
     bind-first fix — `hrdr-agent/src/oauth.rs`): no caller remains now that the
     login flows use `await_oauth_code_on`. hrdr-agent is a workspace crate (not
     published) — delete, or keep only as a thin wrapper.
+
+**Shipped 2026-08-14 (057c5a4):** shared `fuzzy_filter` behind the six filter
+fns; deleted `save_agent_session`/`latest_session_for_cwd`/`mark_read_partial`/
+`await_oauth_code`; session.rs's stale-lock predicate delegated to the
+parameterized `store_lock` one; shared `digest_hex`; `is_known_command`'s
+canonical-name set precomputed; `is_test_path` borrow; `capped_read` cap
+rebinding dropped; `as_deref` in the `--model` error path;
+`CompletionShell::generate` collapsed (Nushell separate); `HrdrHost` re-export
+made private; two `format!` temporaries replaced with `push('\t')`.
 
 **Dropped as not-tidy:** `auth_key` vs `ProviderName::auth_key` (deliberately
 returns the raw input spelling for custom names — delegating would change
