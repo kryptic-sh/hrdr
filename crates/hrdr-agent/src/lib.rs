@@ -11010,6 +11010,75 @@ mod tests {
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }
 
+        /// The wrap-up user message (pushed when the tool-round budget is
+        /// exhausted) is a user turn the round's snapshot — emitted at the top
+        /// of the loop, before the push — does not cover. It is snapshotted
+        /// again right after the push, so a FAILING wrap-up round still leaves
+        /// agent history and the persisted transcript in agreement: `run`
+        /// returns `Err` with that message already in `self.messages`, and the
+        /// extra snapshot is the only thing that carried it to the frontend.
+        #[tokio::test]
+        async fn wrap_up_round_failure_snapshots_the_wrap_up_message() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let server = MockServer::start(vec![
+                // One tool round, so the budget (max_steps = 1) is exhausted
+                // with the loop still going; the wrap-up round's request then
+                // finds the queue empty, so the connection closes with no
+                // response — a transport error mid-round, like any other.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 1;
+            let mut agent = Agent::new(cfg).unwrap();
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            let err = agent
+                .run_input("hello", |ev| events.push(ev))
+                .await
+                .expect_err("the wrap-up round fails: no response is queued for it");
+            assert!(
+                !err.to_string().is_empty(),
+                "the failure is a real error, not a silent success"
+            );
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::Notice(n) if n.contains("tool-round limit reached"))
+                ),
+                "the wrap-up path was reached: {events:?}"
+            );
+
+            let last_history = events
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    AgentEvent::History(msgs) => Some(msgs),
+                    _ => None,
+                })
+                .expect("a History event snapshots the wrap-up push");
+            let snapshotted = last_history.iter().any(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("tool-call budget"))
+            });
+            assert!(
+                snapshotted,
+                "the failing wrap-up round must still be snapshotted, carrying its message: {events:?}"
+            );
+        }
+
         /// A notice raised when there was no turn to carry it — the model pre-flight,
         /// at construction or on a `/model` switch — reaches the user at the top of
         /// the next turn, and exactly once.

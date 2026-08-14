@@ -50,6 +50,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the body, loading the agent with no restrictions and raw YAML in its
   prompt. The opening fence now tolerates trailing whitespace exactly like the
   closing one does.
+- **A failed budget wrap-up no longer leaves the transcript missing its user
+  message.** When the tool-round budget is exhausted, hrdr pushes a
+  "[The tool-call budget…]" user message and runs one final no-tools round. If
+  that round failed, the message stayed in the agent's history but was never
+  snapshotted to the frontend/persisted transcript (the per-round snapshot had
+  already fired before the push) — the two diverged until the next round, and
+  the message sat uncounted as a user turn. A `History` snapshot now follows
+  the push, so a failing wrap-up still persists the message.
 
 ### Performance
 

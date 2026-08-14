@@ -840,6 +840,11 @@ impl Agent {
              calls. Summarize what you accomplished and what remains to be done.]"
                 .to_string(),
         ));
+        // The push is a user turn the round's snapshot (emitted at the top of
+        // the loop) does not cover — snapshot it now so a failure in the
+        // wrap-up round below cannot leave agent history and the persisted
+        // transcript diverging. Idempotent when the round succeeds.
+        on_event(AgentEvent::History(Arc::clone(&self.messages)));
         // No `tools` are sent for this round (the model must answer in text),
         // but the turn's history is full of tool_use/tool_result blocks from
         // the rounds that already ran — the native Anthropic backend 400s any
