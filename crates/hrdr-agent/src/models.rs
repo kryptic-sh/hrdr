@@ -793,6 +793,23 @@ pub fn fuzzy_match_hay(q: &[char], haystack: &str) -> bool {
     q.iter().all(|&c| it.any(|h| h == c))
 }
 
+/// The shared shape of every picker's case-insensitive fuzzy filter: the
+/// query's characters must appear in order somewhere within each haystack.
+/// Returns the matching indices in their original order; an empty query
+/// matches everything. The app-crate picker filters (`filter_effort_choices`,
+/// `filter_themes`, …) all delegate here so one fix lands in one place.
+pub fn fuzzy_filter(haystacks: &[String], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..haystacks.len()).collect();
+    }
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    haystacks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hay)| fuzzy_match_hay(&q, hay).then_some(i))
+        .collect()
+}
+
 /// The lowercase haystack [`filter_model_choices`] matches against: the
 /// space-joined `"model_label provider_label provider://model"`, precomputed
 /// once per picker open so a keystroke's refilter never re-derives it.
@@ -817,15 +834,7 @@ pub fn model_choice_haystack(c: &ModelChoice) -> String {
 /// original (sorted) order; an empty query matches everything. The haystacks
 /// are a parallel array of the choices, so index `i` answers for choice `i`.
 pub fn filter_model_choices(haystacks: &[String], query: &str) -> Vec<usize> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
-        return (0..haystacks.len()).collect();
-    }
-    haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, hay)| fuzzy_match_hay(&q, hay).then_some(i))
-        .collect()
+    fuzzy_filter(haystacks, query)
 }
 
 #[cfg(test)]

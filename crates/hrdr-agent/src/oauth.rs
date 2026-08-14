@@ -107,19 +107,10 @@ pub fn generate_state() -> String {
 
 // ── Localhost callback server ───────────────────────────────────────────────
 
-/// Bind `127.0.0.1:<port>` and wait (up to 5 minutes) for the browser's OAuth
-/// redirect, returning the `code` once `state` matches `expected_state`.
-///
-/// A minimal HTTP handler: it reads each request's request line, ignores
-/// anything without a `code`/`error` query (favicon probes and the like), and
-/// on the real callback returns a small success (or error) page to the browser.
-pub async fn await_oauth_code(port: u16, expected_state: &str) -> Result<String> {
-    await_oauth_code_within(port, expected_state, CALLBACK_TIMEOUT).await
-}
-
-/// Like [`await_oauth_code`] but with a caller-chosen deadline. OpenRouter keeps
-/// the 5-minute [`CALLBACK_TIMEOUT`]; ChatGPT passes a larger bound because its
-/// whole flow is wrapped in the [`CHATGPT_LOGIN_BACKSTOP`] by the caller.
+/// Like [`await_oauth_code_on`] but binding its own listener first, with a
+/// caller-chosen deadline. OpenRouter keeps the 5-minute [`CALLBACK_TIMEOUT`];
+/// ChatGPT passes a larger bound because its whole flow is wrapped in the
+/// [`CHATGPT_LOGIN_BACKSTOP`] by the caller.
 pub async fn await_oauth_code_within(
     port: u16,
     expected_state: &str,

@@ -94,15 +94,7 @@ pub fn theme_choice_haystack(c: &ThemeChoice) -> String {
 /// within the haystack. Returns matching indices in input order; an empty query
 /// matches everything.
 pub fn filter_themes(haystacks: &[String], query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..haystacks.len()).collect();
-    }
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
-        .collect()
+    hrdr_agent::fuzzy_filter(haystacks, query)
 }
 
 #[cfg(test)]

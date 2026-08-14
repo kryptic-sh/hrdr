@@ -5,42 +5,13 @@
 //! Resuming itself is per-frontend (it swaps in the saved
 //! [`crate::SessionState`]), so that stays in the frontends.
 
-use crate::{SaveOutcome, Session, SessionState, save_session};
-
-/// Async wrapper over [`save_session`]: refresh the state's mirrors of the
-/// agent-owned data (chat messages, TODOs, cwd) under the lock, then persist.
-/// The shared core for every auto-save that runs off the UI thread.
-pub async fn save_agent_session(
-    agent: std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>,
-    mut state: SessionState,
-) -> anyhow::Result<Option<SaveOutcome>> {
-    let (msgs, cwd, todos) = {
-        let a = agent.lock().await;
-        let todos = a.todos_owned();
-        (a.messages_owned(), a.cwd().display().to_string(), todos)
-    };
-    state.sync_from(msgs, todos, cwd);
-    save_session(&state)
-}
-
-/// The most recent saved session for `cwd` that has actual conversation
-/// content (more than just the system prompt) — the startup auto-resume
-/// lookup, independent of renderer. `None` = nothing to resume, start fresh.
-pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, Session)> {
-    let cur = hrdr_agent::cwd_slug(cwd);
-    let meta = crate::list_sessions()
-        .into_iter()
-        .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)?;
-    let session = Session::load_path(&meta.path).ok()?;
-    (session.state.messages.len() > 1).then_some((meta.id, session))
-}
+use crate::Session;
 
 /// The most recent resumable session for `cwd`, **opened under its open-lock**
-/// so the resumed session is owned exclusively — the locked counterpart to
-/// [`latest_session_for_cwd`], used by startup auto-resume.
+/// so the resumed session is owned exclusively — the locked counterpart used by
+/// startup auto-resume.
 ///
-/// Selection matches [`latest_session_for_cwd`] (newest for the cwd, more than a
-/// bare system prompt). Returns:
+/// Selection: newest for the cwd, more than a bare system prompt. Returns:
 /// * `Ok(Some((id, session, lock)))` — resume this and hold the guard;
 /// * `Ok(None)` — nothing worth resuming here (no candidate, corrupt newest, or
 ///   content too thin);
@@ -68,8 +39,6 @@ pub fn open_latest_session_for_cwd(
             }
         }
         Err(crate::OpenError::Busy { pid, started }) => Err(crate::SessionBusy { pid, started }),
-        // A corrupt/unreadable newest session is skipped, exactly as
-        // `latest_session_for_cwd`'s `.ok()?` did.
         Err(crate::OpenError::Load(_)) => Ok(None),
     }
 }
@@ -124,20 +93,13 @@ pub fn session_haystack(m: &crate::SessionMeta) -> String {
 /// [`crate::list_sessions`]'s newest-first list); an empty query matches
 /// everything.
 pub fn filter_sessions(haystacks: &[String], query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..haystacks.len()).collect();
-    }
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
-        .collect()
+    hrdr_agent::fuzzy_filter(haystacks, query)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SessionState, save_session};
     use hrdr_agent::Message;
 
     /// A saveable state: one user message, named, rooted at `cwd`.

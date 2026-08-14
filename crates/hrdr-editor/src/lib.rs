@@ -30,7 +30,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use unicode_width::UnicodeWidthChar;
 
-pub use host::HrdrHost;
+use host::HrdrHost;
 pub use plain::PlainEngine;
 
 /// The seam's renderer-agnostic key DTO — hjkl's own toolkit-neutral

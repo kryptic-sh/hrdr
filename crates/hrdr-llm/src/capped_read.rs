@@ -59,8 +59,7 @@ pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Non-UTF-8 sequences are replaced with `U+FFFD` (lossy conversion), which is
 /// acceptable for diagnostic display.
 pub async fn read_capped_text(resp: reqwest::Response, max_bytes: usize) -> String {
-    let cap = max_bytes;
-    let mut buf = Vec::with_capacity(cap.min(4096));
+    let mut buf = Vec::with_capacity(max_bytes.min(4096));
     let mut truncated = false;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -71,16 +70,16 @@ pub async fn read_capped_text(resp: reqwest::Response, max_bytes: usize) -> Stri
                 break;
             }
         };
-        let remaining = cap.saturating_sub(buf.len());
+        let remaining = max_bytes.saturating_sub(buf.len());
         if chunk.len() > remaining {
             buf.extend_from_slice(&chunk[..remaining]);
             truncated = true;
             break;
         }
         buf.extend_from_slice(&chunk);
-        if buf.len() == cap {
+        if buf.len() == max_bytes {
             // Read one more chunk to distinguish an exactly-at-limit response
-            // from an oversized one while retaining at most `cap` bytes.
+            // from an oversized one while retaining at most `max_bytes` bytes.
             match stream.next().await {
                 Some(Ok(chunk)) if !chunk.is_empty() => truncated = true,
                 _ => {}
@@ -106,16 +105,15 @@ pub async fn read_capped_json<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     max_bytes: usize,
 ) -> Result<T> {
-    let cap = max_bytes;
-    let mut buf = Vec::with_capacity(cap.min(4096));
+    let mut buf = Vec::with_capacity(max_bytes.min(4096));
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        let remaining = cap.saturating_sub(buf.len());
+        let remaining = max_bytes.saturating_sub(buf.len());
         if chunk.len() > remaining {
             bail!(
                 "response body exceeds {} byte limit (already buffered {}, chunk was {})",
-                cap,
+                max_bytes,
                 buf.len(),
                 chunk.len(),
             );

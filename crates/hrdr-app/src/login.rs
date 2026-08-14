@@ -169,15 +169,7 @@ pub fn login_provider_haystack(c: &LoginProviderChoice) -> String {
 /// Case-insensitive fuzzy filter over precomputed login haystacks (built by
 /// [`login_provider_haystack`]).
 pub fn filter_login_providers(haystacks: &[String], query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..haystacks.len()).collect();
-    }
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
-        .collect()
+    hrdr_agent::fuzzy_filter(haystacks, query)
 }
 
 /// Outcome of picking a provider in the login flow.

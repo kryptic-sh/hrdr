@@ -68,7 +68,7 @@ impl TestNudgeState {
 /// than being assumed either way.
 fn is_test_path(path: &Path) -> bool {
     let full = path.to_string_lossy().replace('\\', "/");
-    let name = full.rsplit('/').next().unwrap_or_default().to_string();
+    let name = full.rsplit('/').next().unwrap_or_default();
     full.contains("/tests/")
         || full.contains("/test/")
         || full.starts_with("tests/")

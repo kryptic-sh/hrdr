@@ -535,69 +535,6 @@ impl Drop for Reservation {
     }
 }
 
-/// Returns `true` when the lock file at `path` was written by a process that
-/// is no longer alive (or that started it long enough ago to be considered
-/// abandoned).
-///
-/// A lock whose content doesn't parse as `PID TIMESTAMP` (e.g. one written by
-/// an earlier hrdr build, which left the file empty) falls back to the file's
-/// mtime for the age check: without that, an unparseable lock could never be
-/// judged stale and would burn its slug forever.
-fn is_stale_lock(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let mut parts = content.split_whitespace();
-    let parsed: Option<(u32, u64)> = parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .zip(parts.next().and_then(|t| t.parse().ok()));
-    let Some((pid, ts)) = parsed else {
-        // Unparseable owner: age by mtime alone — no PID to probe, so old
-        // enough means stale.
-        let age = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok());
-        return age.is_some_and(|a| a.as_secs() >= STALE_LOCK_AGE_SECS);
-    };
-    let now = hrdr_tools::unix_now();
-    // Not old enough — definitely not stale.
-    if now < ts || now.saturating_sub(ts) < STALE_LOCK_AGE_SECS {
-        return false;
-    }
-    // Old enough: reap only if the owning process is really gone.
-    !owner_process_alive(pid)
-}
-
-/// Best-effort, zero-dependency check for whether process `pid` is still alive.
-/// Errs toward "alive" when the probe is unavailable so a live writer's lock is
-/// never stolen on a platform without a cheap liveness check.
-fn owner_process_alive(pid: u32) -> bool {
-    // Linux: `/proc/<pid>` exists iff the process exists — no syscall crate.
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    // macOS / other Unix: `kill -0` probes existence without sending a signal.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true)
-    }
-    // No cheap dependency-free probe on Windows. The caller only reaches here
-    // once the lock is already older than STALE_LOCK_AGE_SECS, so assume the
-    // owner is gone — a crashed writer's lock can still be reaped.
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
 /// Atomically claim `cand` via `O_EXCL` lock file (after reaping any stale
 /// lock for the same candidate).
 fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
@@ -619,7 +556,7 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
                 return Ok(Reservation { lock_path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if is_stale_lock(&lock_path) {
+                if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
                     // Reap the stale lock and retry O_EXCL.
                     let _ = std::fs::remove_file(&lock_path);
                     continue;
@@ -641,7 +578,7 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
 /// lock file `.{id}.open.lock` in the session directory, released on drop
 /// (a clean swap, `/new`, or process exit). A crash can't run `Drop`, so the
 /// dead-PID lock it leaves behind is reaped on the next open (see
-/// [`acquire_open_lock`] / [`is_stale_lock`]).
+/// [`acquire_open_lock`]).
 ///
 /// This is a **distinct** file from the brief `.{id}.lock` id-reservation that
 /// [`unique_session_id`] takes and [`Session::save`] deletes: save's cleanup
@@ -688,7 +625,7 @@ fn read_open_lock_owner(path: &Path) -> SessionBusy {
 ///
 /// `O_EXCL`-creates `.{id}.open.lock` and writes `PID TIMESTAMP` (the exact
 /// format [`try_reserve`] uses). When the lock already exists this distinguishes
-/// two cases via [`is_stale_lock`]:
+/// two cases via the staleness check:
 ///
 /// * **stale** — the owner PID is gone (or the lock is older than
 ///   [`STALE_LOCK_AGE_SECS`] with no live owner): reap it and retry the create.
@@ -718,7 +655,7 @@ pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBus
                 return Ok(SessionLock { lock_path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if is_stale_lock(&lock_path) {
+                if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
                     // Dead-PID / abandoned lock: reap and retry the O_EXCL create.
                     let _ = std::fs::remove_file(&lock_path);
                     continue;

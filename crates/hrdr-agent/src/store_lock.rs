@@ -251,13 +251,14 @@ impl StoreLock {
 /// than `stale_age_secs`, or unparseable and that old by mtime.
 ///
 /// `stale_age_secs` comes from the holder's [`StoreKind`], since how long a lock
-/// may honestly be held is decided by the work under it.
+/// may honestly be held is decided by the work under it. The session store's
+/// open-lock and id-reservation paths call this too (with their own
+/// `STALE_LOCK_AGE_SECS`), so one predicate serves both lock schemes.
 ///
-/// Mirrors the session store's `is_stale_lock`: parse `PID TIMESTAMP`, and if
-/// the content doesn't parse (empty/truncated lock) fall back to the file's
-/// mtime so an unparseable lock can still be aged out rather than wedging the
-/// store forever.
-fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
+/// Parses `PID TIMESTAMP`; if the content doesn't parse (empty/truncated lock)
+/// it falls back to the file's mtime so an unparseable lock can still be aged
+/// out rather than wedging the store forever.
+pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         // The lock vanished between the failed create and this read — treat it
         // as not-stale; the next acquire attempt will re-race the create.
@@ -291,7 +292,7 @@ fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
 /// Best-effort check for whether process `pid` is still alive, zero-dependency.
 /// Errs on the side of "alive" (returns `true` when it can't tell) so a live
 /// writer's lock is never stolen on a platform where the probe is unavailable.
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     // `/proc/<pid>` exists iff the process exists — no syscall crate needed.
     #[cfg(target_os = "linux")]
     {

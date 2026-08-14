@@ -142,7 +142,7 @@ impl std::fmt::Display for AttachmentLoss {
 }
 
 /// Lowercase-hex SHA-256, the form a blob is named by.
-fn digest_hex(bytes: &[u8]) -> String {
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))

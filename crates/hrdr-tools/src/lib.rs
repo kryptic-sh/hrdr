@@ -396,27 +396,6 @@ impl ToolContext {
         );
     }
 
-    /// Like [`mark_read`](Self::mark_read), but records a **partial** read
-    /// (paged with `offset`/`limit`, or truncated): enough for `edit`,
-    /// which re-read the file and operate on its live content, but not for a
-    /// `write` that would overwrite the unseen remainder.
-    pub fn mark_read_partial(&self, path: &std::path::Path) {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let sig = file_sig(&canon);
-        self.clear_modifier(&canon);
-        let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
-        // Seen something, but not to the end (`covered_through` below `total`).
-        map.insert(
-            canon,
-            ReadRecord {
-                covered_through: 0,
-                total: usize::MAX,
-                clipped: false,
-                sig,
-            },
-        );
-    }
-
     /// Record that lines `[first, last]` (1-based, inclusive) of a `total`-line
     /// file were just read, extending the contiguous-from-line-1 coverage when
     /// this read is adjacent to or overlaps what was already seen. `clipped` marks

@@ -129,14 +129,24 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The canonical names of every registered slash command (aliases resolved),
+/// precomputed once — [`is_known_command`]'s membership set.
+static KNOWN_COMMANDS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
 /// registered slash command at all — used by frontends to tell "command I
 /// don't support" apart from "not a command, send it to the model".
 pub fn is_known_command(cmd: &str) -> bool {
     let c = resolve_alias(cmd.trim().trim_start_matches('/'));
-    SLASH_COMMANDS
-        .iter()
-        .any(|(n, _)| resolve_alias(n.trim_start_matches('/')) == c)
+    KNOWN_COMMANDS
+        .get_or_init(|| {
+            SLASH_COMMANDS
+                .iter()
+                .map(|(n, _)| resolve_alias(n.trim_start_matches('/')))
+                .collect()
+        })
+        .contains(&c)
 }
 
 /// Resolve a slash-command name to its canonical, lowercase form (aliases

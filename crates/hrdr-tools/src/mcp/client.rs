@@ -565,7 +565,8 @@ impl McpClient {
             let desc = r.get("description").and_then(Value::as_str).unwrap_or("");
             out.push_str(&format!("{uri}\t{name}"));
             if !desc.is_empty() {
-                out.push_str(&format!("\t{desc}"));
+                out.push('\t');
+                out.push_str(desc);
             }
             out.push('\n');
         }
@@ -623,7 +624,8 @@ impl McpClient {
                 .unwrap_or_default();
             out.push_str(&format!("{name}({})", args.join(", ")));
             if !desc.is_empty() {
-                out.push_str(&format!("\t{desc}"));
+                out.push('\t');
+                out.push_str(desc);
             }
             out.push('\n');
         }

@@ -298,18 +298,19 @@ impl CompletionShell {
     fn generate(self, cmd: &mut clap::Command) {
         use clap_complete::Shell;
         let out = &mut std::io::stdout();
-        match self {
-            CompletionShell::Bash => clap_complete::generate(Shell::Bash, cmd, "hrdr", out),
-            CompletionShell::Zsh => clap_complete::generate(Shell::Zsh, cmd, "hrdr", out),
-            CompletionShell::Fish => clap_complete::generate(Shell::Fish, cmd, "hrdr", out),
-            CompletionShell::Powershell => {
-                clap_complete::generate(Shell::PowerShell, cmd, "hrdr", out)
-            }
-            CompletionShell::Elvish => clap_complete::generate(Shell::Elvish, cmd, "hrdr", out),
+        let shell = match self {
+            CompletionShell::Bash => Shell::Bash,
+            CompletionShell::Zsh => Shell::Zsh,
+            CompletionShell::Fish => Shell::Fish,
+            CompletionShell::Powershell => Shell::PowerShell,
+            CompletionShell::Elvish => Shell::Elvish,
+            // Nushell is a different generator crate, so it generates separately.
             CompletionShell::Nushell => {
-                clap_complete::generate(clap_complete_nushell::Nushell, cmd, "hrdr", out)
+                clap_complete::generate(clap_complete_nushell::Nushell, cmd, "hrdr", out);
+                return;
             }
-        }
+        };
+        clap_complete::generate(shell, cmd, "hrdr", out)
     }
 }
 
@@ -574,7 +575,9 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(str::parse::<hrdr_agent::ModelSpec>)
         .transpose()
-        .map_err(|e| anyhow::anyhow!("--model {}: {e}", cli.model.clone().unwrap_or_default()))?;
+        .map_err(|e| {
+            anyhow::anyhow!("--model {}: {e}", cli.model.as_deref().unwrap_or_default())
+        })?;
     let named_specs = hrdr_agent::named_model_specs();
     let specs: Vec<hrdr_agent::ModelSpec> =
         named_specs.iter().chain(cli_spec.iter()).cloned().collect();

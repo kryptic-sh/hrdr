@@ -21,7 +21,6 @@ use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::{
     CHATGPT_CODEX_BASE_URL, CHATGPT_DEFAULT_CONTEXT_WINDOW, CHATGPT_DEFAULT_MODEL, OAuthAccess,
@@ -97,8 +96,7 @@ struct CacheFile {
 
 /// Lowercase-hex SHA-256 of an account id.
 fn account_digest(account_id: &str) -> String {
-    let digest = Sha256::digest(account_id.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::attachment_store::digest_hex(account_id.as_bytes())
 }
 
 /// The per-account catalog cache path, `<XDG cache>/hrdr/chatgpt_models.json`.

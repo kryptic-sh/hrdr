@@ -104,15 +104,7 @@ pub fn effort_choice_haystack(c: &EffortChoice) -> String {
 /// within the haystack. Returns matching indices in input order; an empty query
 /// matches everything.
 pub fn filter_effort_choices(haystacks: &[String], query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..haystacks.len()).collect();
-    }
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    haystacks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, hay)| hrdr_agent::fuzzy_match_hay(&q, hay).then_some(i))
-        .collect()
+    hrdr_agent::fuzzy_filter(haystacks, query)
 }
 
 /// The reasoning effort a provider applies when no override is set — what the

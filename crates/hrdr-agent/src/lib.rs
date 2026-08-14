@@ -26,10 +26,10 @@ pub use auth::{
 mod oauth;
 pub use oauth::{
     CALLBACK_TIMEOUT, CHATGPT_LOGIN_BACKSTOP, OAuthAccess, OAuthCreds, OPENAI_CLIENT_ID,
-    OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI, OpenAiTokens, await_oauth_code,
-    await_oauth_code_on, await_oauth_code_within, bind_callback_listener, canonical_oauth_key,
-    coordinated_oauth_access, generate_pkce, generate_state, has_oauth_credentials, load_oauth,
-    load_oauth_for, oauth_file_path, openai_authorize_url, openai_exchange, openai_refresh,
+    OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI, OpenAiTokens, await_oauth_code_on,
+    await_oauth_code_within, bind_callback_listener, canonical_oauth_key, coordinated_oauth_access,
+    generate_pkce, generate_state, has_oauth_credentials, load_oauth, load_oauth_for,
+    oauth_file_path, openai_authorize_url, openai_exchange, openai_refresh,
     openrouter_authorize_url, openrouter_callback_url, openrouter_exchange, parse_account_id,
     save_oauth, save_oauth_for, valid_access_token,
 };
@@ -180,8 +180,8 @@ pub(crate) use config::{
 };
 pub use models::{
     AvailableModel, LastModels, ModelChoice, ModelSource, available_models, builtin_catalog_key,
-    chatgpt_model_choices, filter_model_choices, fuzzy_match, fuzzy_match_hay, last_model_on,
-    load_last_model, load_last_models, load_model_usage, merge_chatgpt_choices,
+    chatgpt_model_choices, filter_model_choices, fuzzy_filter, fuzzy_match, fuzzy_match_hay,
+    last_model_on, load_last_model, load_last_models, load_model_usage, merge_chatgpt_choices,
     model_choice_haystack, model_choices, model_for_provider, model_for_provider_in,
     model_for_resolved_provider, model_for_resolved_provider_in, record_last_model,
     record_model_use,
