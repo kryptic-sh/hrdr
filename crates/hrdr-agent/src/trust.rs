@@ -85,6 +85,14 @@ pub fn is_trusted(dir: &Path) -> bool {
 pub fn trust(dir: &Path) -> Result<()> {
     let path = trusted_dirs_path().context("no cache directory to store trusted directories in")?;
     let k = key(dir);
+    // A path containing a line break would split its own entry in the
+    // newline-delimited store and could never match again — refuse to record
+    // it rather than silently corrupting the file (fail-safe: the directory
+    // stays untrusted and the user is re-asked, as today's corrupted-entry
+    // outcome, minus the corruption).
+    if k.contains(['\n', '\r']) {
+        anyhow::bail!("cannot trust a directory whose path contains a newline");
+    }
     if stored().contains(&k) {
         return Ok(());
     }
@@ -200,5 +208,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(trusted_dirs_path().is_some_and(|p| !p.exists()));
         assert!(!is_trusted(dir.path()));
+    }
+
+    /// A path containing a line break would split its own entry in the
+    /// newline-delimited store and never match again, so trusting it is refused
+    /// up front rather than silently corrupting the store.
+    #[test]
+    fn trusting_a_path_with_a_newline_is_refused() {
+        let (_store, _lock) = private_store();
+        let parent = tempfile::tempdir().unwrap();
+        let weird = parent.path().join("bad\nname");
+        std::fs::create_dir(&weird).unwrap();
+
+        let err = trust(&weird).unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "the error should name the reason: {err}"
+        );
+        assert!(
+            !stored().contains(&key(&weird)),
+            "the refused path must not be recorded in the store"
+        );
     }
 }
