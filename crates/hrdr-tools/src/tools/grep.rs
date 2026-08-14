@@ -350,6 +350,7 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
                 continue;
             };
             let lines: Vec<&str> = text.lines().collect();
+            let newlines: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
             if lines.is_empty() {
                 continue;
             }
@@ -361,9 +362,9 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
                     break;
                 }
                 matches += 1;
-                let start = text[..hit.start()].bytes().filter(|b| *b == b'\n').count();
+                let start = newlines.partition_point(|&nl| nl < hit.start());
                 let last_byte = hit.end().saturating_sub(1).max(hit.start());
-                let end = text[..last_byte].bytes().filter(|b| *b == b'\n').count();
+                let end = newlines.partition_point(|&nl| nl < last_byte);
                 for line in start..=end.min(lines.len().saturating_sub(1)) {
                     matched_lines.insert(line);
                     if matched_lines.len() >= max_output_lines {

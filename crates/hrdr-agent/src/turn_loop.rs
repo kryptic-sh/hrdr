@@ -1001,10 +1001,20 @@ impl Agent {
         ) {
             body.push_str(&nudge);
         }
+        // Record the call's wall-clock cost for the MODEL, appended after
+        // (outside) any untrusted-content wrapper the tool added — trusted
+        // harness metadata, present on failures too. Kept out of the ToolEnd
+        // display event below: `(took 0ms)` on every instant tool is just noise
+        // in the transcript, and the model is what asked for the timing.
+        //
+        // The mutation result is handed to the model in full: the diff is how
+        // it verifies its own edit landed as intended and repairs what it did
+        // wrong.
+        let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
         on_event(AgentEvent::ToolEnd {
             id: call.id.clone(),
             name: call.function.name.clone(),
-            result: body.clone(),
+            result: body, // moved, not cloned
             ok,
         });
         // The `todo` tool replaces the shared list; emit the new state so every
@@ -1018,16 +1028,6 @@ impl Agent {
                 .clone();
             on_event(AgentEvent::TodoUpdated(todos));
         }
-        // Record the call's wall-clock cost for the MODEL, appended after
-        // (outside) any untrusted-content wrapper the tool added — trusted
-        // harness metadata, present on failures too. Kept out of the ToolEnd
-        // display event above: `(took 0ms)` on every instant tool is just noise
-        // in the transcript, and the model is what asked for the timing.
-        //
-        // The mutation result is handed to the model in full: the diff is how
-        // it verifies its own edit landed as intended and repairs what it did
-        // wrong.
-        let recorded = format!("{body}\n\n(took {})", format_duration(elapsed));
         Arc::make_mut(&mut self.messages).push(ChatMessage::tool_result(call.id.clone(), recorded));
     }
 
@@ -1074,13 +1074,22 @@ impl Agent {
             // what actually happened. Unparseable arguments are passed through —
             // the tool is about to reject them, and the record should show what it
             // was given.
-            let recorded = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            // Parse once; the recorded form borrows the result and the spawned task
+            // consumes it — no second parse, no clone of the raw string for the future.
+            // Empty arguments still record as the raw string (a parse of `""` fails,
+            // exactly as before) and execute as `{}` via `args_are_empty` below.
+            let raw_args = &call.function.arguments;
+            let parsed: Result<serde_json::Value, serde_json::Error> =
+                serde_json::from_str(raw_args);
+            let args_are_empty = raw_args.trim().is_empty();
+            let recorded = parsed
+                .as_ref()
                 .ok()
-                .and_then(|parsed| {
+                .and_then(|p| {
                     let tool = self.tools.get(&call.function.name)?;
-                    serde_json::to_string(&tool.recorded_args(&parsed, &self.ctx)).ok()
+                    serde_json::to_string(&tool.recorded_args(p, &self.ctx)).ok()
                 })
-                .unwrap_or_else(|| call.function.arguments.clone());
+                .unwrap_or_else(|| raw_args.clone());
             on_event(AgentEvent::ToolStart {
                 id: call.id.clone(),
                 name: call.function.name.clone(),
@@ -1100,7 +1109,6 @@ impl Agent {
             // transcript entry it came from.
             ctx.call_id = Some(call.id.clone());
             let name = call.function.name.clone();
-            let raw_args = call.function.arguments.clone();
             // Cheap clone (Arc-backed registry) so the futures don't borrow
             // `self` — results are recorded with `&mut self` right after.
             let tools = self.tools.clone();
@@ -1108,7 +1116,7 @@ impl Agent {
             // A refused call (repeat breaker) resolves immediately instead of
             // executing; boxing keeps the join order == call order.
             let fut: std::pin::Pin<Box<dyn std::future::Future<Output = TimedResult> + Send>> =
-                match repeat.refusal(&name, &raw_args) {
+                match repeat.refusal(&name, raw_args) {
                     // A refused call never ran, so its cost is zero.
                     Some(msg) => {
                         Box::pin(
@@ -1118,10 +1126,10 @@ impl Agent {
                     None => Box::pin(async move {
                         let start = std::time::Instant::now();
                         let res: Result<String> = async move {
-                            let args: serde_json::Value = if raw_args.trim().is_empty() {
+                            let args = if args_are_empty {
                                 serde_json::json!({})
                             } else {
-                                match serde_json::from_str(&raw_args) {
+                                match parsed {
                                     Ok(v) => v,
                                     Err(e) => {
                                         return Err(anyhow::anyhow!(
