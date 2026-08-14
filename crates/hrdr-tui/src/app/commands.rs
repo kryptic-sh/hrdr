@@ -811,8 +811,16 @@ impl super::App {
             let mut host = TuiHost { app: self };
             hrdr_app::browser_login_start(name, id, &mut host)
         };
-        let Some(start) = start else {
-            return;
+        let start = match start {
+            Ok(Some(start)) => start,
+            // Not a browser provider — nothing to launch.
+            Ok(None) => return,
+            // The callback listener could not be bound (e.g. a pre-squatted
+            // port): surface it and abort — the browser must not open.
+            Err(msg) => {
+                self.system(format!("login failed: {msg}"));
+                return;
+            }
         };
         let provider = start.provider.clone();
         let tx = self.tx.clone();

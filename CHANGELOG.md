@@ -16,6 +16,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cwd. The sweep now skips any file whose id does not round-trip through
   `sanitize_name` — the same guard that fixes the derived-data deletes missing
   their targets for ids hrdr itself would never write.
+- **Browser OAuth logins bind the callback listener before opening the
+  browser.** The listener used to bind only after the browser launched, on a
+  fixed port (1455 for ChatGPT, 1456 for OpenRouter) — so another local process
+  could pre-squat the port, capture the browser's redirect (with the
+  authorization `code`), and leave hrdr's own bind to fail: a login DoS.
+  OpenRouter now uses an OS-assigned ephemeral port; ChatGPT must keep 1455 (its
+  redirect URI is registered with the provider at that port). A port that is
+  already taken fails the login with a message instead of opening the browser at
+  all.
 
 ### Performance
 

@@ -446,30 +446,45 @@ impl LoginWizard {
 /// opened here (via `open_browser`) and deliberately not carried in the returned
 /// value. `login_id` lets the caller reject a stale/duplicate login's result.
 ///
-/// `None` only when `name` is not a browser-login provider (caller should have
+/// The callback listener is bound BEFORE the browser opens, so a port that is
+/// already taken — e.g. pre-squatted by another local process — fails the login
+/// here (`Err`) instead of capturing the browser's redirect.
+///
+/// `Ok(None)` only when `name` is not a browser-login provider (caller should have
 /// routed via the chosen row's [`LoginRoute`] first; see [`browser_login_provider`]).
 pub fn browser_login_start(
     name: &str,
     login_id: u64,
     host: &mut dyn CommandHost,
-) -> Option<BrowserLoginStart> {
+) -> Result<Option<BrowserLoginStart>, String> {
     // A browser login has only two shapes, keyed off the target slot.
-    let target = browser_login_provider(name)?;
+    let Some(target) = browser_login_provider(name) else {
+        return Ok(None);
+    };
     let (verifier, challenge) = hrdr_agent::generate_pkce();
 
     if target == "openrouter" {
         let label = "OpenRouter";
+        // Bind the callback listener BEFORE opening the browser: a port that is
+        // already taken must fail the login here, not capture the redirect.
+        // OpenRouter's callback URL is constructed by us and handed to the
+        // provider, so any port works — ask the OS for an ephemeral one.
+        let listener = hrdr_agent::bind_callback_listener(0)
+            .map_err(|e| format!("cannot bind the OAuth callback listener: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("cannot read the OAuth callback listener port: {e}"))?
+            .port();
         // OpenRouter's OAuth PKCE flow carries `state` in the callback URL and
         // echoes it back with `code` — mint one for CSRF defence, so a local
         // prober can't inject a forged callback with an attacker's code.
-        const PORT: u16 = 1456;
         let state = hrdr_agent::generate_state();
-        let callback = hrdr_agent::openrouter_callback_url(PORT, &state);
+        let callback = hrdr_agent::openrouter_callback_url(port, &state);
         let url = hrdr_agent::openrouter_authorize_url(&callback, &challenge);
         open_browser(&url, label, "5 minutes", host);
         let future = Box::pin(async move {
             let (token_saved, error) =
-                match openrouter_exchange_and_save(PORT, &verifier, &state).await {
+                match openrouter_exchange_and_save(listener, &verifier, &state).await {
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e.to_string())),
                 };
@@ -480,17 +495,28 @@ pub fn browser_login_start(
                 error,
             }
         });
-        return Some(BrowserLoginStart {
+        return Ok(Some(BrowserLoginStart {
             login_id,
             provider: "openrouter".to_string(),
             future,
-        });
+        }));
     }
 
     // The merged `openai` slot (target == "openai"): a ChatGPT (Codex)
     // subscription login. The whole callback+exchange+save is wrapped in the
     // 60-minute backstop (not the 5-minute OpenRouter deadline).
     let label = "ChatGPT subscription";
+    // The OpenAI redirect URI is registered with the provider at this exact
+    // port, so it must bind 1455 — and must bind BEFORE the browser opens, so a
+    // pre-squatted port fails the login here instead of capturing the redirect.
+    let listener =
+        hrdr_agent::bind_callback_listener(hrdr_agent::OPENAI_OAUTH_PORT).map_err(|e| {
+            format!(
+                "cannot bind the OAuth callback listener on port {} (is another process using \
+                 it?): {e}",
+                hrdr_agent::OPENAI_OAUTH_PORT
+            )
+        })?;
     let state = hrdr_agent::generate_state();
     let redirect = hrdr_agent::OPENAI_REDIRECT_URI.to_string();
     let url = hrdr_agent::openai_authorize_url(&redirect, &challenge, &state);
@@ -499,7 +525,7 @@ pub fn browser_login_start(
     );
     open_browser(&url, label, "60 minutes", host);
     let future = Box::pin(async move {
-        let flow = chatgpt_exchange_and_save(&verifier, &state, &redirect);
+        let flow = chatgpt_exchange_and_save(listener, &verifier, &state, &redirect);
         let (token_saved, error) =
             match tokio::time::timeout(hrdr_agent::CHATGPT_LOGIN_BACKSTOP, flow).await {
                 Ok(Ok(())) => (true, None),
@@ -516,11 +542,11 @@ pub fn browser_login_start(
             error,
         }
     });
-    Some(BrowserLoginStart {
+    Ok(Some(BrowserLoginStart {
         login_id,
         provider: "openai".to_string(),
         future,
-    })
+    }))
 }
 
 /// The provider slot a browser login targets, or `None` when `name` is not a
@@ -607,8 +633,15 @@ pub fn record_oauth_default_model(provider: &str) {
 /// the exchange/save future resolves. The TUI does not use this — it owns the
 /// typed pending state and the live switch.
 fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
-    let Some(start) = browser_login_start(name, 0, host) else {
-        return true;
+    let start = match browser_login_start(name, 0, host) {
+        Ok(Some(start)) => start,
+        // Not a browser provider, or the callback listener could not be bound
+        // (already reported) — either way, no login started.
+        Ok(None) => return true,
+        Err(msg) => {
+            host.info(format!("login failed: {msg}"));
+            return true;
+        }
     };
     host.spawn_line(Box::pin(async move {
         let outcome = start.future.await;
@@ -636,13 +669,15 @@ fn open_browser(url: &str, label: &str, deadline: &str, host: &mut dyn CommandHo
 
 /// OpenRouter (5-minute callback deadline): wait for the callback code, exchange
 /// it for a normal API key, and save it to the credential store. Exchange/save
-/// only — the caller persists the default provider.
+/// only — the caller persists the default provider. The listener is bound by the
+/// caller before the browser opened.
 async fn openrouter_exchange_and_save(
-    port: u16,
+    listener: std::net::TcpListener,
     verifier: &str,
     state: &str,
 ) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code(port, state).await?;
+    let code =
+        hrdr_agent::await_oauth_code_on(listener, state, hrdr_agent::CALLBACK_TIMEOUT).await?;
     let key = hrdr_agent::openrouter_exchange(&code, verifier).await?;
     hrdr_agent::save_auth_token("openrouter", &key)?;
     Ok(())
@@ -654,17 +689,15 @@ async fn openrouter_exchange_and_save(
 /// merged `openai` slot (via the trust-gated [`hrdr_agent::save_oauth_for`], which
 /// canonicalizes `ChatGptOAuth` onto `openai` — the same slot resolution reads).
 /// Exchange/save only — the caller persists the default + performs the switch.
+/// The listener is bound by the caller before the browser opened.
 async fn chatgpt_exchange_and_save(
+    listener: std::net::TcpListener,
     verifier: &str,
     state: &str,
     redirect: &str,
 ) -> anyhow::Result<()> {
-    let code = hrdr_agent::await_oauth_code_within(
-        hrdr_agent::OPENAI_OAUTH_PORT,
-        state,
-        hrdr_agent::CHATGPT_LOGIN_BACKSTOP,
-    )
-    .await?;
+    let code = hrdr_agent::await_oauth_code_on(listener, state, hrdr_agent::CHATGPT_LOGIN_BACKSTOP)
+        .await?;
     let tokens = hrdr_agent::openai_exchange(&code, redirect, verifier).await?;
     let account_id = tokens
         .id_token
@@ -873,6 +906,35 @@ mod tests {
         }
     }
 
+    /// A pre-squatted OpenAI callback port must fail the login BEFORE the
+    /// browser opens — the redirect would otherwise land on the squatter's
+    /// listener, and our own bind would fail afterwards anyway. The host's
+    /// recorded `info` lines are the observable: `open_browser` announces
+    /// itself, so its line must never appear.
+    #[test]
+    fn browser_login_refuses_a_pre_squatted_openai_port() {
+        let _squatter = std::net::TcpListener::bind(("127.0.0.1", hrdr_agent::OPENAI_OAUTH_PORT))
+            .expect("the test pre-squats the OpenAI callback port");
+        let mut host = RouteTestHost::new();
+        let result = browser_login_start("openai", 0, &mut host);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a pre-squatted port must fail the login, not start one"),
+        };
+        assert!(
+            err.contains("cannot bind the OAuth callback listener"),
+            "got: {err}"
+        );
+        assert!(
+            !host
+                .info_lines
+                .iter()
+                .any(|l| l.contains("Opening your browser")),
+            "the browser must never open when the bind failed: {:?}",
+            host.info_lines
+        );
+    }
+
     /// The picker dispatches on the CHOSEN row's route: a Key row → key entry (for
     /// the exact provider), a Keyless row → applied (its provider-model picker
     /// opens). Driven through [`login_pick_choice`], the picker's entry point.
@@ -946,7 +1008,8 @@ mod tests {
     }
 
     /// A minimal [`CommandHost`] for the routing tests: real provider resolution
-    /// (so the built-ins resolve), a recording `begin_model_selector_for`, and a
+    /// (so the built-ins resolve), a recording `begin_model_selector_for` and
+    /// `info` (so a test can assert what was — or was never — announced), and a
     /// no-op `persist_setting` (never touch the real config). Everything else is a
     /// harmless stub — proving, by never being hit, that these tests exercise only
     /// the routing they mean to.
@@ -955,6 +1018,7 @@ mod tests {
         agent: std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>,
         model: hrdr_agent::ModelRef,
         model_picker_for: Option<String>,
+        info_lines: Vec<String>,
     }
 
     impl RouteTestHost {
@@ -970,12 +1034,15 @@ mod tests {
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 model,
                 model_picker_for: None,
+                info_lines: Vec::new(),
             }
         }
     }
 
     impl CommandHost for RouteTestHost {
-        fn info(&mut self, _line: String) {}
+        fn info(&mut self, line: String) {
+            self.info_lines.push(line);
+        }
         fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
             self.cfg.resolve_provider(name)
         }

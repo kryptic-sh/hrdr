@@ -47,7 +47,7 @@ const PKCE_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 /// Verifier length. Sits comfortably inside the spec's 43–128 range.
 const PKCE_VERIFIER_LEN: usize = 64;
 /// The OpenRouter callback server gives up after this long (matches codex.ts).
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Generous outer backstop for the whole ChatGPT browser login (callback +
 /// token exchange + save): the subscription flow can involve MFA and account
@@ -125,9 +125,37 @@ pub async fn await_oauth_code_within(
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
+    let listener = bind_callback_listener(port)
         .with_context(|| format!("binding 127.0.0.1:{port} for the OAuth callback"))?;
+    await_oauth_code_on(listener, expected_state, timeout).await
+}
+
+/// Bind `127.0.0.1:<port>` as the OAuth callback listener, returning the
+/// synchronous std listener. `port == 0` asks the OS for an ephemeral port —
+/// read the actual port back via [`local_addr`](std::net::TcpListener::local_addr).
+///
+/// The caller MUST bind BEFORE opening the browser: a port that is already
+/// taken — e.g. pre-squatted by another local process — fails the login right
+/// here, instead of letting the browser's redirect land on the squatter's
+/// listener and then failing our own bind (a login DoS).
+pub fn bind_callback_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+    // `TcpListener::from_std` (in `await_oauth_code_on`) panics on a blocking
+    // socket; non-blocking mode is exactly what the tokio listener needs.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Like [`await_oauth_code_within`] but on an already-bound listener (see
+/// [`bind_callback_listener`]): wait up to `timeout` for the browser's OAuth
+/// redirect and return the `code` once `state` matches `expected_state`.
+pub async fn await_oauth_code_on(
+    listener: std::net::TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let listener =
+        TcpListener::from_std(listener).context("converting the OAuth callback listener")?;
     match tokio::time::timeout(timeout, accept_callback(&listener, expected_state)).await {
         Ok(res) => res,
         Err(_) => bail!(
@@ -1420,6 +1448,30 @@ mod tests {
             last = Some(msg);
         }
         panic!("never reached the deadline path; last error: {last:?}");
+    }
+
+    #[test]
+    fn bind_callback_listener_binds_an_ephemeral_port() {
+        // Port 0 = OS-assigned: the OpenRouter flow's callback URL is built by
+        // us and handed to the provider, so any port works.
+        let listener = bind_callback_listener(0).expect("an ephemeral callback port binds");
+        assert_ne!(
+            listener.local_addr().unwrap().port(),
+            0,
+            "an ephemeral bind reports a real port"
+        );
+    }
+
+    #[test]
+    fn bind_callback_listener_refuses_an_in_use_port() {
+        // A pre-squatted port must fail the bind — this is what turns a
+        // squatter's capture of the browser redirect into a login failure
+        // instead of a login DoS.
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let err = bind_callback_listener(port)
+            .expect_err("binding a port another listener already holds must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "got: {err}");
     }
 
     #[tokio::test]

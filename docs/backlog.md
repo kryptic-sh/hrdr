@@ -2452,9 +2452,9 @@ audit covers them).
 `:audit` (low depth) over the whole tree (working tree clean at the time), split
 across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate was
-re-traced at its cited lines by the sweep lead. **Status: 1 medium + 2 low — the
-medium is the fix-first item. (The retention-sweep escape, formerly finding 2,
-shipped 2026-08-14.)**
+re-traced at its cited lines by the sweep lead. **Status: 1 medium + 1 low — the
+medium is the fix-first item. (The retention-sweep escape and the OAuth
+bind-order low shipped 2026-08-14.)**
 
 **Findings (ranked):**
 
@@ -2476,20 +2476,7 @@ shipped 2026-08-14.)**
    charge these against a total cap (bound map sizes / byte totals, or route
    captured bytes through the Accumulator budget) and error the stream past it,
    mirroring the existing overflow handling.
-2. **LOW — fixed-port loopback OAuth; the browser opens before the callback
-   listener binds.** `browser_login_start` calls `open_browser`
-   (`hrdr-app/ src/login.rs`) before the future that binds the listener
-   (`await_oauth_code_within`, `hrdr-agent/src/oauth.rs`) runs, and the ports
-   are fixed constants (OpenAI 1455, OpenRouter 1456). Any local process can
-   pre-squat the port: the browser's redirect (carrying `code` + `state`) lands
-   on the attacker's listener and hrdr's bind then fails — a login DoS. The
-   `code` is only useful with the PKCE `code_verifier` that never leaves hrdr's
-   memory, so for a PKCE-enforcing token endpoint the squatted code is useless;
-   the credential-theft arm is conditional on a provider that does not enforce
-   the verifier (unverified). Fix: bind the listener (failing the login on bind
-   error) _before_ opening the browser; use an ephemeral port where the provider
-   allows it; document reliance on provider-side PKCE enforcement.
-3. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
+2. **LOW — headless `hrdr run` writes model text and tool chunks to the terminal
    with no control-character filtering.** `AgentEvent::Text` is `print!`-ed raw
    and `ToolOutput` chunks go through `chrome_fragment` raw
    (`apps/hrdr/src/main.rs`); `--json` embeds the raw bytes in `tool_end.result`
@@ -2650,6 +2637,10 @@ workspace-internal API decisions.**
 12. **`push_str(&format!("\t{desc}"))` — temporary String for a segment**
     (`hrdr-tools/src/mcp/client.rs`, two sites):
     `out.push('\t'); out.push_str(desc);`. Micro.
+13. **`await_oauth_code` is newly unused** (came with the 2026-08-14 OAuth
+    bind-first fix — `hrdr-agent/src/oauth.rs`): no caller remains now that the
+    login flows use `await_oauth_code_on`. hrdr-agent is a workspace crate (not
+    published) — delete, or keep only as a thin wrapper.
 
 **Dropped as not-tidy:** `auth_key` vs `ProviderName::auth_key` (deliberately
 returns the raw input spelling for custom names — delegating would change
