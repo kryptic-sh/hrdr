@@ -11,12 +11,33 @@ impl super::App {
     /// starts with `/`, else sub-agent names + `@file` paths when an `@…`
     /// token is being typed. Both feed the same popup; only how the accepted
     /// item is inserted differs (see [`CompletionKind`]).
+    ///
+    /// Memoized on the editor content + [`super::App::completion_generation`]:
+    /// the `@file` branch re-scans and re-ranks the whole index (up to 20,000
+    /// paths) per call, which used to happen on every frame and every
+    /// keystroke. The cached value is cloned (it is small) and recomputed only
+    /// when the content or a completion input (`commands`, `skills`, sub-agent
+    /// names, `file_index`) changed.
     pub(crate) fn active_completions(&mut self) -> Option<Completions> {
         if self.suppress_completions {
             return None;
         }
         let content = self.editor.content();
-        let slash = slash_completions(&content);
+        if let Some((cached_content, cached_gen, cached)) = &self.completion_cache
+            && *cached_content == content
+            && *cached_gen == self.completion_generation
+        {
+            return cached.clone();
+        }
+        let result = self.compute_completions(&content);
+        self.completion_cache = Some((content, self.completion_generation, result.clone()));
+        result
+    }
+
+    /// Compute the completion popup from scratch — the expensive half of
+    /// [`Self::active_completions`], which memoizes this.
+    fn compute_completions(&mut self, content: &str) -> Option<Completions> {
+        let slash = slash_completions(content);
         if !slash.is_empty() {
             return Some(Completions {
                 kind: CompletionKind::Slash,
@@ -27,7 +48,7 @@ impl super::App {
                     .collect(),
             });
         }
-        let invocations = prompt_completions(&content, &self.commands, &self.skills.skills);
+        let invocations = prompt_completions(content, &self.commands, &self.skills.skills);
         if !invocations.is_empty() {
             return Some(Completions {
                 kind: CompletionKind::Command,
@@ -37,7 +58,7 @@ impl super::App {
         }
         // Argument completion: "/cmd partial" / ":command partial" — enum
         // values, theme names, session ids, or a command's declared `args:`.
-        if let Some((start, items)) = arg_completions(&content, &self.commands) {
+        if let Some((start, items)) = arg_completions(content, &self.commands) {
             return Some(Completions {
                 kind: CompletionKind::Arg { token_start: start },
                 anchor_col: content[..start].chars().count(),
@@ -45,7 +66,7 @@ impl super::App {
             });
         }
         // File-path arguments for the commands that take one.
-        if let Some((start, query)) = file_arg_token(&content) {
+        if let Some((start, query)) = file_arg_token(content) {
             let items = self.file_completion_items(&query);
             if !items.is_empty() {
                 return Some(Completions {
@@ -55,7 +76,7 @@ impl super::App {
                 });
             }
         }
-        if let Some((start, query)) = active_file_token(&content) {
+        if let Some((start, query)) = active_file_token(content) {
             // Sub-agents first (an accepted `@name` routes the message to that
             // agent), then file paths.
             let mut items: Vec<(String, String)> =
@@ -198,6 +219,7 @@ impl super::App {
     pub(super) fn on_file_index_dirty(&mut self) {
         self.file_index_dirty = true;
         self.file_index_cwd = None;
+        self.bump_completion_generation();
     }
 
     /// (Re)start the recursive watcher on `dir` that feeds
@@ -247,6 +269,7 @@ fn file_arg_token(input: &str) -> Option<(usize, String)> {
 }
 
 /// The active completion popup's contents and kind.
+#[derive(Clone)]
 pub(crate) struct Completions {
     pub(crate) kind: CompletionKind,
     /// Char column (within the token's own line) where the completed token
@@ -256,6 +279,7 @@ pub(crate) struct Completions {
     pub(crate) items: Vec<(String, String)>,
 }
 /// Which completion is active, and how to apply the selection.
+#[derive(Clone)]
 pub(crate) enum CompletionKind {
     /// Replace the whole input with the chosen command.
     Slash,

@@ -589,6 +589,17 @@ pub(crate) struct App {
     /// `:name` namespace, refreshed alongside `commands`. The invalid ones ride
     /// along because the `/commands` picker shows them with their reason.
     pub(crate) skills: hrdr_app::DiscoveredSkills,
+    /// Memoized completion popup: the last editor content + generation that
+    /// [`active_completions`](Self::active_completions) was computed for, and
+    /// its result. Without this, a frame that draws with an unchanged input
+    /// re-scans and re-ranks the `@file` index (up to 20,000 entries) again —
+    /// once per frame and once per keystroke. Recomputed whenever the content
+    /// or the generation changes.
+    completion_cache: Option<(String, u64, Option<Completions>)>,
+    /// Bumped by every site that mutates what [`active_completions`](Self::active_completions)
+    /// reads — `commands`, `skills`, the sub-agent names, or `file_index` — so a
+    /// stale cache entry (same content, changed inputs) is never served.
+    completion_generation: u64,
     /// Whether this session may read project-scoped commands and skills at all
     /// — the session agent's own [`hrdr_agent::Agent::project_instructions`],
     /// which every discovery this frontend runs has to be given (completion
@@ -916,6 +927,8 @@ impl App {
             user_shell: None,
             commands: hrdr_app::discover_commands(&cwd_for_commands, project_instructions),
             skills: hrdr_app::discover_skills(&cwd_for_commands, project_instructions),
+            completion_cache: None,
+            completion_generation: 0,
             project_instructions,
             pending_goto: None,
             pending_scroll_entry: None,
@@ -2152,6 +2165,52 @@ impl App {
         self.running() || self.user_shell.is_some()
     }
 
+    /// Whether any animated element is on screen: the inference loader (the
+    /// visible pane's model is generating, or the agent is compacting), a turn
+    /// in flight on any pane (running tool blocks, streaming reasoning, and the
+    /// agent switcher's running rows), a running `!command` (its open tool
+    /// block), or an in-progress todo row. The run loop polls its spinner
+    /// ticker only while this is true, so an idle screen stops redrawing at
+    /// ~8.3 Hz.
+    pub(crate) fn spinner_live(&self) -> bool {
+        let pane = self.panes.active_pane();
+        // The loader on the visible pane — the one animated element that can be
+        // live while the registry reports nothing running: a `/compact` on an
+        // idle agent is not a turn.
+        if pane.compacting || pane.turn.inferring() {
+            return true;
+        }
+        // A turn in flight on any pane — the visible transcript's running tool
+        // blocks and streaming reasoning, and a running row in the switcher (a
+        // delegated sub-agent still working under an idle main).
+        if self.panes.main().status == hrdr_app::PaneStatus::Running
+            || self
+                .panes
+                .subs()
+                .iter()
+                .any(|p| p.status == hrdr_app::PaneStatus::Running)
+        {
+            return true;
+        }
+        // A `!command` shell's open tool block on the main transcript.
+        if self.user_shell.is_some() {
+            return true;
+        }
+        // The todo panel's in-progress row.
+        pane.todos
+            .lock()
+            .map(|todos| todos.iter().any(|t| t.status == "in_progress"))
+            .unwrap_or(false)
+    }
+
+    /// Invalidate the memoized completion set: any site that mutates what
+    /// [`Self::active_completions`] reads — `commands`, `skills`, the sub-agent
+    /// names, or the `@file` index — must bump this, or a stale popup survives
+    /// the change.
+    fn bump_completion_generation(&mut self) {
+        self.completion_generation += 1;
+    }
+
     /// Interrupt whatever [`Self::in_flight`] reports, and say whether there was
     /// anything to interrupt. The one cancel path behind both Esc and Ctrl+C.
     fn cancel_in_flight(&mut self) -> bool {
@@ -2510,6 +2569,7 @@ impl App {
         self.arm_file_watcher(&new);
         self.commands = hrdr_app::discover_commands(&new, self.project_instructions);
         self.skills = hrdr_app::discover_skills(&new, self.project_instructions);
+        self.bump_completion_generation();
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does
@@ -3021,6 +3081,7 @@ impl App {
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;
+                self.bump_completion_generation();
                 self.file_index_building = false;
                 if self.file_index_dirty {
                     // A filesystem change landed while the walk was running —

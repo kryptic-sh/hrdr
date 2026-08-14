@@ -184,6 +184,7 @@ impl super::App {
         let cwd = std::path::PathBuf::from(self.current_cwd());
         self.commands = hrdr_app::discover_commands(&cwd, self.project_instructions);
         self.skills = hrdr_app::discover_skills(&cwd, self.project_instructions);
+        self.bump_completion_generation();
     }
     /// `/find <text>` — search the transcript and jump to the next match
     /// (case-insensitive). No arg cycles to the next match of the current query;
@@ -419,6 +420,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
         self.app.arm_file_watcher(new);
         self.app.commands = hrdr_app::discover_commands(new, self.app.project_instructions);
+        self.app.bump_completion_generation();
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl

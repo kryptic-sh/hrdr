@@ -153,7 +153,11 @@ pub(crate) async fn run_loop(
                     app.on_turn_msg(msg);
                 }
             }
-            _ = ticker.tick() => {}
+            // Polled only while something animated is on screen: with the guard
+            // false the arm is disabled and the interval is never polled, so it
+            // does not advance — the loop blocks on real events instead of
+            // redrawing the idle frame at ~8.3 Hz forever.
+            _ = ticker.tick(), if app.spinner_live() => {}
         }
     }
     Ok(())
