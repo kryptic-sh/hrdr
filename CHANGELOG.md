@@ -44,25 +44,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Accumulator` also charges its thinking-block/reasoning-item sidecars against
   its budget, closing the no-choices early-return gap.
 - **Agent and command files with trailing whitespace on the opening frontmatter
-  fence load their restrictions again.** `split_fence` failed open on an
-  opening `---` fence with a trailing space or tab (`"--- "`, `"---\t"`): the
-  whole file — `read_only: true` / `tools:` allow-list included — was returned
-  as the body, loading the agent with no restrictions and raw YAML in its
-  prompt. The opening fence now tolerates trailing whitespace exactly like the
-  closing one does.
+  fence load their restrictions again.** `split_fence` failed open on an opening
+  `---` fence with a trailing space or tab (`"--- "`, `"---\t"`): the whole file
+  — `read_only: true` / `tools:` allow-list included — was returned as the body,
+  loading the agent with no restrictions and raw YAML in its prompt. The opening
+  fence now tolerates trailing whitespace exactly like the closing one does.
 - **A failed budget wrap-up no longer leaves the transcript missing its user
-  message.** When the tool-round budget is exhausted, hrdr pushes a
-  "[The tool-call budget…]" user message and runs one final no-tools round. If
-  that round failed, the message stayed in the agent's history but was never
+  message.** When the tool-round budget is exhausted, hrdr pushes a "[The
+  tool-call budget…]" user message and runs one final no-tools round. If that
+  round failed, the message stayed in the agent's history but was never
   snapshotted to the frontend/persisted transcript (the per-round snapshot had
   already fired before the push) — the two diverged until the next round, and
-  the message sat uncounted as a user turn. A `History` snapshot now follows
-  the push, so a failing wrap-up still persists the message.
+  the message sat uncounted as a user turn. A `History` snapshot now follows the
+  push, so a failing wrap-up still persists the message.
 - **Truncated diagnostics are marked even when a transport error cuts them
-  short.** `read_capped_text` appended its `… [truncated]` marker only when
-  the byte cap was hit; a connection that died mid-body (partial bytes, then a
+  short.** `read_capped_text` appended its `… [truncated]` marker only when the
+  byte cap was hit; a connection that died mid-body (partial bytes, then a
   stream error) came back looking complete. The marker now appears for both
   kinds of truncation.
+- **Resuming a session whose transcript exceeds 100 MiB no longer loads it all
+  into memory.** The sibling `<id>.jsonl` transcript was folded with no size
+  bound, so a corrupt or runaway file meant unbounded memory on every resume.
+  The read is now capped at the same 100 MiB the session file itself is — a
+  pathological transcript folds only its first 100 MiB.
 
 ### Performance
 

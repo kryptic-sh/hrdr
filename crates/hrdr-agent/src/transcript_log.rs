@@ -505,10 +505,16 @@ fn ends_mid_line(path: &Path) -> bool {
 /// write can cut a multi-byte character in half (an interrupted append is not
 /// character-aligned), so one damaged line must not be able to truncate a resumed
 /// transcript. Decoded lossily and left for the caller to parse-or-skip.
+///
+/// The read is bounded at [`crate::session::MAX_SESSION_FILE_BYTES`] — the same
+/// cap the session `.json` load applies — so a transcript past the cap folds
+/// only its first 100 MiB. A file that large is pathological, and a partial
+/// resume beats unbounded memory.
 fn text_lines(path: &Path) -> Option<impl Iterator<Item = String>> {
     let file = File::open(path).ok()?;
     Some(
         BufReader::new(file)
+            .take(crate::session::MAX_SESSION_FILE_BYTES + 1)
             .split(b'\n')
             .map_while(Result::ok)
             .map(|b| String::from_utf8_lossy(&b).into_owned()),
