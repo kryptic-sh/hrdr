@@ -150,27 +150,10 @@ pub struct StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        // Remove the lock file only if it still holds OUR pid. Deleting by path
-        // alone is the race: a holder that was reaped as stale (Windows has no
-        // liveness probe, so `process_alive` reports every pid dead past the
-        // staleness age) has its lock reclaimed by a second process, and the
-        // original holder's Drop then deletes the *new* holder's lock mid-write
-        // — the lost-update this module exists to prevent. A lock we cannot
-        // parse to our own pid, or that no longer exists, needs no removal.
-        let owned = match std::fs::read_to_string(&self.lock_path) {
-            Ok(content) => {
-                content
-                    .split_whitespace()
-                    .next()
-                    .and_then(|p| p.parse::<u32>().ok())
-                    == Some(self.pid)
-            }
-            // No lock to read — already removed or never reclaimed — nothing to do.
-            Err(_) => false,
-        };
-        if owned {
-            let _ = std::fs::remove_file(&self.lock_path);
-        }
+        // Release only a lock this guard still owns — see
+        // `remove_lock_file_if_owned` for the reap/reclaim race that check is
+        // there for.
+        remove_lock_file_if_owned(&self.lock_path, self.pid);
     }
 }
 
@@ -287,6 +270,32 @@ pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
         return false;
     }
     true
+}
+
+/// Remove the lock file at `lock_path` — but only if it still names `pid` as
+/// its owner.
+///
+/// Deleting by path alone is the race: a holder that was reaped as stale
+/// (Windows has no liveness probe, so [`process_alive`] reports every pid dead
+/// past the staleness age) has its lock reclaimed by a second process, and the
+/// original holder's `Drop` then deletes the *new* holder's lock mid-write —
+/// the lost-update these locks exist to prevent. A lock we cannot parse to
+/// `pid`, or that no longer exists, needs no removal.
+pub(crate) fn remove_lock_file_if_owned(lock_path: &Path, pid: u32) {
+    let owned = match std::fs::read_to_string(lock_path) {
+        Ok(content) => {
+            content
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<u32>().ok())
+                == Some(pid)
+        }
+        // No lock to read — already removed or never reclaimed — nothing to do.
+        Err(_) => false,
+    };
+    if owned {
+        let _ = std::fs::remove_file(lock_path);
+    }
 }
 
 /// Best-effort check for whether process `pid` is still alive, zero-dependency.

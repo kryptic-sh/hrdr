@@ -2330,21 +2330,21 @@ split across two sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate the passes raised was re-traced at its cited lines by the sweep lead;
 nothing survived as a defect. **Status: no findings — all items below are
-hardening (correct today, fragile). Three shipped 2026-08-14: `split_fence`
-opening-fence whitespace, the wrap-up History gap, and the `read_capped_text`
-truncation marker.**
+hardening (correct today, fragile). Four shipped 2026-08-14/15: `split_fence`
+opening-fence whitespace, the wrap-up History gap, the `read_capped_text`
+truncation marker, and the Windows lock pid-ownership guard (residual below).**
 
 **Hardening (open — triage):**
 
-1. **Windows: live session locks are reapable and `Drop` deletes the new owner's
-   file.** `owner_process_alive` returns `false` on non-unix
-   (`hrdr-agent/src/session.rs`), so past `STALE_LOCK_AGE_SECS` (60s) a _live_
-   second instance reaps a session's open-lock, and the first instance's
-   `Reservation`/`SessionLock` `Drop` then removes the second's lock — the exact
-   two-window lost-update the lock exists to prevent. `store_lock.rs` guards its
-   `Drop` with a pid check; `session.rs`'s two guards do not. If Windows is
-   supported, port the `StoreLock` pid-ownership check to `Reservation` /
-   `SessionLock`, or implement a real `OpenProcess` probe.
+1. **Windows: a live session lock is still reapable past 60 s.** The
+   pid-ownership guard shipped 2026-08-15 (all three locks remove their file
+   only while it names their own pid), which closes the destructive half — a
+   reaped/re-claimed lock survives its original holder's `Drop`. What remains is
+   the reap itself: Windows has no liveness probe, so past `STALE_LOCK_AGE_SECS`
+   a _live_ second instance can still steal a session's open-lock (the first
+   instance then runs on without its lock). Full fix: a real
+   `OpenProcess`/`GetExitCodeProcess` probe via `windows-sys` in hrdr-agent —
+   needs a Windows CI round trip to verify.
 2. **`compaction_tail_start` charges the always-kept newest turn against the
    preserve budget** (`hrdr-agent/src/compaction.rs`). `tokens` accumulates
    newest-first, so once the newest turn alone exceeds `preserve_recent_tokens`

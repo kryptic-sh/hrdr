@@ -527,11 +527,17 @@ pub struct SessionMeta {
 #[derive(Debug)]
 pub struct Reservation {
     lock_path: PathBuf,
+    /// PID written into the lock file at acquire — the only identity that may
+    /// release this lock.
+    pid: u32,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
+        // Remove the lock only if we still own it: a lock this process was
+        // reaped from and another reclaimed must survive its original holder's
+        // Drop (see `store_lock::remove_lock_file_if_owned` for the race).
+        crate::store_lock::remove_lock_file_if_owned(&self.lock_path, self.pid);
     }
 }
 
@@ -553,7 +559,10 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
                 let _ = f.write_all(content.as_bytes());
                 let _ = f.flush();
                 drop(f);
-                return Ok(Reservation { lock_path });
+                return Ok(Reservation {
+                    lock_path,
+                    pid: std::process::id(),
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
@@ -587,11 +596,17 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
 #[derive(Debug)]
 pub struct SessionLock {
     lock_path: PathBuf,
+    /// PID written into the lock file at acquire — the only identity that may
+    /// release this lock.
+    pid: u32,
 }
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
+        // Remove the lock only if we still own it: a lock this process was
+        // reaped from and another reclaimed must survive its original holder's
+        // Drop (see `store_lock::remove_lock_file_if_owned` for the race).
+        crate::store_lock::remove_lock_file_if_owned(&self.lock_path, self.pid);
     }
 }
 
@@ -652,7 +667,10 @@ pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBus
                 let _ = f.write_all(content.as_bytes());
                 let _ = f.flush();
                 drop(f);
-                return Ok(SessionLock { lock_path });
+                return Ok(SessionLock {
+                    lock_path,
+                    pid: std::process::id(),
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
@@ -664,7 +682,12 @@ pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBus
             }
             // Not a contention error — degrade to an un-backed guard rather than
             // refusing the owner access to their own session.
-            Err(_) => return Ok(SessionLock { lock_path }),
+            Err(_) => {
+                return Ok(SessionLock {
+                    lock_path,
+                    pid: std::process::id(),
+                });
+            }
         }
     }
 }
@@ -1209,7 +1232,13 @@ pub fn unique_session_id(cwd: &str, name: &str) -> (String, Reservation) {
         }
     }
     let lock_path = dir.join(format!(".{fallback}.lock"));
-    (fallback, Reservation { lock_path })
+    (
+        fallback,
+        Reservation {
+            lock_path,
+            pid: std::process::id(),
+        },
+    )
 }
 
 /// In-process cache of each session file's [`SessionMeta`], keyed by its
@@ -2643,6 +2672,30 @@ mod tests {
         });
     }
 
+    /// A reservation whose lock was reaped as stale and re-claimed by a
+    /// different pid must survive its original holder's `Drop` — the
+    /// reap/reclaim race the pid-ownership check exists for (Windows has no
+    /// liveness probe, so every pid reads as dead past the staleness age).
+    #[test]
+    fn reservation_drop_leaves_a_reclaimed_lock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".reclaimed.lock");
+        let _res = try_reserve(dir.path(), "reclaimed").expect("a fresh id reserves");
+        // A concurrent process reaped our lock as stale and re-claimed the path
+        // with its own pid.
+        let other_pid = std::process::id().wrapping_add(1);
+        std::fs::write(
+            &lock_path,
+            format!("{other_pid} {}", hrdr_tools::unix_now()),
+        )
+        .unwrap();
+        drop(_res);
+        assert!(
+            lock_path.exists(),
+            "the old owner's Drop must not delete the new owner's lock"
+        );
+    }
+
     /// Two concurrent reservations for the same name get different ids.
     #[test]
     fn concurrent_unique_session_ids_are_different() {
@@ -2693,6 +2746,48 @@ mod tests {
             // _lock dropped here
         }
         assert!(!path.exists(), "Drop removes the lock file");
+    }
+
+    /// An open-lock reaped as stale and re-claimed by a different pid must
+    /// survive its original holder's `Drop` — the same reap/reclaim race the
+    /// reservation test above guards.
+    #[test]
+    fn open_lock_drop_leaves_a_reclaimed_lock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".chat.open.lock");
+        let _lock = acquire_open_lock(dir.path(), "chat").expect("fresh id acquires");
+        // A concurrent process reaped our lock as stale and re-claimed the path
+        // with its own pid.
+        let other_pid = std::process::id().wrapping_add(1);
+        std::fs::write(
+            &lock_path,
+            format!("{other_pid} {}", hrdr_tools::unix_now()),
+        )
+        .unwrap();
+        drop(_lock);
+        assert!(
+            lock_path.exists(),
+            "the old owner's Drop must not delete the new owner's lock"
+        );
+    }
+
+    /// The degraded un-backed guard — an acquire whose create failed for a
+    /// reason other than contention, so no lock file was ever created — drops
+    /// cleanly: the ownership read of an absent file fails and nothing is
+    /// removed (or created).
+    #[test]
+    fn unbacked_guard_drop_is_benign() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".never-created.open.lock");
+        let guard = SessionLock {
+            lock_path: lock_path.clone(),
+            pid: std::process::id(),
+        };
+        drop(guard);
+        assert!(
+            !lock_path.exists(),
+            "an un-backed guard leaves no lock file behind"
+        );
     }
 
     /// A second acquire while the first guard is alive is refused with the live

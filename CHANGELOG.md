@@ -67,6 +67,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bound, so a corrupt or runaway file meant unbounded memory on every resume.
   The read is now capped at the same 100 MiB the session file itself is — a
   pathological transcript folds only its first 100 MiB.
+- **A session lock reaped as stale is no longer deleted by its original holder's
+  `Drop`.** On Windows — which has no process-liveness probe, so every pid reads
+  as dead past the 60 s staleness age — a live lock can be reaped and re-claimed
+  by a second instance, and the first instance's `Drop` then deleted the new
+  holder's lock mid-write: the two-window lost-update the lock exists to
+  prevent. All three lock guards (the session open-lock, the id reservation, and
+  the store lock) now remove their file only while it still names their own PID.
 
 ### Performance
 
