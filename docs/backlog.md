@@ -2603,9 +2603,9 @@ test-side duplication.
 `:perf` over the whole tree (working tree clean at the time), split across two
 sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
 hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced at its cited
-lines by the sweep lead. **Status: 4 shipped 2026-08-14 — the TUI idle redraw +
-completion memo, tool-args parse-once, ToolEnd move, and the grep newline
-offsets. 3 open (deferred, reasons inline).**
+lines by the sweep lead. **Status: 5 shipped 2026-08-14/15 — the TUI idle
+redraw + completion memo, tool-args parse-once, ToolEnd move, grep newline
+offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
 
 1. **The whole message history is deep-cloned per committed round — O(history)
    per round, O(N²) across a session.** `crates/hrdr-agent/src/delegation.rs` —
@@ -2628,19 +2628,7 @@ offsets. 3 open (deferred, reasons inline).**
    bigger than the win for sub-agent snapshots; the live autosave copies are in
    `hrdr-tui` (app.rs History handler, session.rs), the payoff sites if the TUI
    gets a dedicated pass.**
-2. **Every attachment is re-SHA-256'd on every save.** `AttachmentRef::of`
-   (`hrdr-agent/src/attachment_store.rs`) digests the full bytes of every
-   attachment; called from `attachment_refs` on every per-round save
-   (`session.rs`). The blob write is skipped when the file exists, but the hash
-   is recomputed regardless; the `Attachment` instance is stable across saves,
-   so its digest is stable. Fix: memoize the digest on the `Attachment` at
-   attach time; or cache the ref per message index. Only materializes for
-   sessions that carry attachments, but for one it is a full read of every
-   attached byte per round. **Deferred 2026-08-14: the clean fix (a digest field
-   on `Attachment`, computed once at `Attachment::new`) needs `sha2` in
-   `hrdr-llm`, which does not depend on it — adding a dependency is the user's
-   call.**
-3. **Per-turn lowercase copies of every memory body**
+2. **Per-turn lowercase copies of every memory body**
    (`hrdr-tools/src/ memory.rs`): `relevance_score` lowercases
    name/description/body per needle (per recall token), and the mtime-cache hit
    `cloned()`s the whole memory before the mtime filter. Runs once per opening

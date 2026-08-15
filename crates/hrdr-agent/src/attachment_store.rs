@@ -85,13 +85,13 @@ pub struct AttachmentRef {
 }
 
 impl AttachmentRef {
-    /// Describe `a` for storage, hashing its bytes.
+    /// Describe `a` for storage, reusing its construction-time digest.
     pub fn of(a: &Attachment) -> Self {
         Self {
             filename: a.filename().to_string(),
             media_type: a.media_type().mime().to_string(),
             len: a.bytes().len() as u64,
-            sha256: digest_hex(a.bytes()),
+            sha256: a.sha256().to_string(),
         }
     }
 }
@@ -394,6 +394,17 @@ mod tests {
         let mut m = Message::user("look");
         m.attachments = attachments;
         m
+    }
+
+    /// The reference's digest is the bytes' own SHA-256 — the same value the
+    /// store has always derived by hashing them, now served from the
+    /// attachment's construction-time digest.
+    #[test]
+    fn ref_digest_is_the_bytes_sha256() {
+        let a = attachment(16, "shot.png");
+        let r = AttachmentRef::of(&a);
+        assert_eq!(r.sha256, digest_hex(a.bytes()));
+        assert_eq!(r.sha256, a.sha256());
     }
 
     /// A blob's name is the SHA-256 of its own bytes, so identical bytes land on

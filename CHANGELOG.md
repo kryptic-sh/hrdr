@@ -70,6 +70,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Performance
 
+- **Attachment-heavy sessions no longer re-hash every attachment on every
+  save.** The session store derives a blob's name from a SHA-256 of its bytes,
+  and it recomputed that digest on each per-round save — a full re-read of every
+  attached byte per round, for data whose bytes never change. The `Attachment`
+  now computes its digest once at construction and the store reuses it, so saves
+  cost nothing per attachment beyond a 64-char read.
 - **An idle TUI no longer redraws ~8.3×/sec.** The run loop drew the full frame
   on a fixed 120 ms ticker whether or not anything was happening, so a
   completely idle session burned the frame build (transcript walk, status bar,

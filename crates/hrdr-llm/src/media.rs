@@ -30,6 +30,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::types::{ChatMessage, Role};
 
@@ -647,6 +648,15 @@ pub struct Attachment {
     /// What reading the payload settled about its cost, read once at
     /// construction — see [`Cost`] for why it is this rather than a token count.
     cost: Cost,
+    /// Lowercase-hex SHA-256 of the bytes — the blob-store identity the session
+    /// store keys a blob by ([`AttachmentRef::sha256`] in hrdr-agent).
+    ///
+    /// A pure function of the bytes, so it is computed once at construction and
+    /// held for the object's lifetime rather than re-hashed on every use: the
+    /// same [`Attachment`] sits in the message history across per-round session
+    /// saves, and a per-save re-hash would re-read every attached byte each
+    /// round.
+    sha256: Arc<str>,
 }
 
 /// Prints the shape, never the payload: [`ChatMessage`] derives `Debug` and is
@@ -692,11 +702,20 @@ impl Attachment {
             });
         }
         let cost = cost_of(media_type, &bytes);
+        // The digest is a pure function of the bytes (immutable after this
+        // point), so it is hashed once here and reused for the object's
+        // lifetime — see the field docs.
+        let sha256: Arc<str> = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .into();
         Ok(Self {
             bytes,
             media_type,
             filename,
             cost,
+            sha256,
         })
     }
 
@@ -744,10 +763,17 @@ impl Attachment {
     ///
     /// For persistence: a session stores these beside its file, content-addressed
     /// by their digest, rather than inlining them (see `hrdr_agent::session`).
-    /// Hashing happens there, not here — this crate has no digest dependency, and
-    /// an attachment is a wire concern.
+    /// The digest itself is [`Self::sha256`], computed once at construction so a
+    /// per-save content-addressing pass never re-reads these bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Lowercase-hex SHA-256 of the payload — the identity the session store
+    /// addresses a blob by, so the digest is stable for the object's lifetime
+    /// and asking for it never re-reads the bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
     }
 
     /// How many bytes this becomes once base64-encoded: 4 bytes per 3-byte
@@ -1218,6 +1244,33 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The digest is the lowercase hex SHA-256 of the bytes, computed once at
+    /// construction: identical bytes hash identically, and a clone of the
+    /// object carries the same digest.
+    #[test]
+    fn sha256_is_the_lowercase_hex_digest_computed_once() {
+        let bytes = png(16);
+        let a = Attachment::new(bytes.clone(), MediaType::Png, "a.png").unwrap();
+        let expected: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            a.sha256(),
+            expected,
+            "lowercase hex of the payload's SHA-256"
+        );
+        assert_eq!(a.sha256().len(), 64);
+
+        // Same bytes, fresh object: the digest is a pure function of the bytes.
+        let b = Attachment::new(bytes, MediaType::Png, "b.png").unwrap();
+        assert_eq!(a.sha256(), b.sha256());
+        assert_eq!(b.sha256(), expected);
+
+        // Clone shares the same value.
+        assert_eq!(a.clone().sha256(), expected);
     }
 
     /// The encoded length is base64's 4-per-3-bytes with padding — the number
