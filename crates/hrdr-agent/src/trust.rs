@@ -212,13 +212,15 @@ mod tests {
 
     /// A path containing a line break would split its own entry in the
     /// newline-delimited store and never match again, so trusting it is refused
-    /// up front rather than silently corrupting the store.
+    /// up front rather than silently corrupting the store. The path is NOT
+    /// created: such a name is legal on Unix (POSIX allows `\n` in a file name —
+    /// the premise of the guard) but illegal on Windows, and the guard fires on
+    /// the path string before any filesystem access either way.
     #[test]
     fn trusting_a_path_with_a_newline_is_refused() {
         let (_store, _lock) = private_store();
         let parent = tempfile::tempdir().unwrap();
         let weird = parent.path().join("bad\nname");
-        std::fs::create_dir(&weird).unwrap();
 
         let err = trust(&weird).unwrap_err();
         assert!(
