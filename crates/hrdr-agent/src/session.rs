@@ -590,9 +590,9 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
 /// [`acquire_open_lock`]).
 ///
 /// This is a **distinct** file from the brief `.{id}.lock` id-reservation that
-/// [`unique_session_id`] takes and [`Session::save`] deletes: save's cleanup
-/// removes only `.{id}.lock`, so it never disturbs a live open-lock, and the two
-/// mechanisms don't interfere.
+/// [`unique_session_id`] takes and the [`Reservation`] guard releases: the
+/// reservation's cleanup removes only `.{id}.lock`, so it never disturbs a live
+/// open-lock, and the two mechanisms don't interfere.
 #[derive(Debug)]
 pub struct SessionLock {
     lock_path: PathBuf,
@@ -861,10 +861,13 @@ impl Session {
         if compressed.exists() {
             let _ = std::fs::remove_file(&compressed);
         }
-        // Clean up the reservation lock left by `unique_session_id`, if any.
-        // A save that was NOT preceded by a reservation (e.g. an autosave of an
-        // already-assigned id) has no lock to clean up; `remove_file` is benign.
-        let _ = std::fs::remove_file(dir.join(format!(".{}.lock", sanitize_name(id))));
+        // The reservation lock (`.{id}.lock`) is NOT released here — that is
+        // [`Reservation::drop`]'s job, and it is pid-guarded. Removing it here
+        // by path would defeat the guard: on Windows a live lock past
+        // `STALE_LOCK_AGE_SECS` is reapable, and a reclaimed lock deleted by
+        // this unconditional `remove_file` would let two instances overwrite one
+        // another — the two-window lost-update the reservation exists to
+        // prevent.
         // Two writes can land within the filesystem's mtime granularity
         // (Windows timestamps tick coarsely), and `meta_cache` trusts an
         // unchanged mtime — so a listing right after e.g. a rename could
@@ -1618,12 +1621,12 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
     // (this is the once-per-session first-save path, not the per-round one), so
     // clone here.
     Session::new(state.clone().persisted()).save(&outcome.id)?;
-    // The reservation is dropped here. If `save` failed above, the drop
-    // removes the lock file that `unique_session_id` created — no stale
-    // lock is left behind. If `save` succeeded, `save()` already removed
-    // the reservation lock (`.{id}.lock`, distinct from the open-lock); the
-    // second `remove_file` in `Reservation::drop` is benign. `open_lock` is
-    // NOT dropped — it is handed to the caller to hold.
+    // The reservation is dropped here, and its Drop is the SOLE release of the
+    // reservation lock (`.{id}.lock`, distinct from the open-lock): it removes
+    // the lock only while the file still names this process's pid. That
+    // pid-guard is what keeps a lock reclaimed by a second instance alive past
+    // the original holder's Drop — `Session::save` must NOT also delete it by
+    // path. `open_lock` is NOT dropped — it is handed to the caller to hold.
     Ok(Some(SaveOutcome {
         reservation: None,
         ..outcome
@@ -2116,10 +2119,11 @@ mod tests {
         });
     }
 
-    /// The lock file created by `unique_session_id` is cleaned up after a
-    /// successful `Session::save`.
+    /// The lock file created by `unique_session_id` is released by the
+    /// [`Reservation`] guard's drop, not by `Session::save`: a save that deletes
+    /// the lock by path would delete a lock a second instance had reclaimed.
     #[test]
-    fn unique_session_id_lock_is_cleaned_up_after_save() {
+    fn reservation_lock_survives_save_and_cleans_up_on_drop() {
         with_test_env(|_tmp| {
             let cwd = std::env::current_dir()
                 .unwrap()
@@ -2128,14 +2132,16 @@ mod tests {
             let dir = session_dir(&cwd);
             let _ = std::fs::create_dir_all(&dir);
 
-            let (id, _res) = unique_session_id(&cwd, "cleanup test");
+            let (id, reservation) = unique_session_id(&cwd, "cleanup test");
             assert_eq!(id, "cleanup-test");
             let lock = dir.join(".cleanup-test.lock");
             assert!(lock.exists(), "lock file exists after reservation");
 
-            // Save removes the lock.
+            // Save leaves the lock in place; the guard releases it.
             Session::new(state("cleanup", &cwd)).save(&id).unwrap();
-            assert!(!lock.exists(), "lock file removed after save");
+            assert!(lock.exists(), "save must not remove the reservation lock");
+            drop(reservation);
+            assert!(!lock.exists(), "the reservation drop removed the lock");
         });
     }
 
@@ -2175,12 +2181,16 @@ mod tests {
             // id…
             let (second, _res2) = unique_session_id(&cwd, "chat");
             assert_eq!(second, "chat-2");
-            // …and the write, once it lands, removes the reservation lock.
+            // …and the write leaves the reservation lock in place — releasing it
+            // is the Reservation guard's pid-guarded Drop, not `save`'s job
+            // (a save that deleted the lock by path would delete a lock a second
+            // instance had reclaimed).
             Session::new(st.persisted()).save(&outcome.id).unwrap();
-            assert!(!lock.exists(), "save removed the reservation lock");
-            // Dropping the outcome (with its reservation) is then benign.
+            assert!(lock.exists(), "save must not remove the reservation lock");
+            // Dropping the outcome (with its reservation) releases it, and only
+            // because the lock still names this process's pid.
             drop(outcome);
-            assert!(!lock.exists(), "no lock to clean after a successful save");
+            assert!(!lock.exists(), "the reservation drop removed the lock");
         });
     }
 
@@ -2885,7 +2895,9 @@ mod tests {
             // Simulate a stray reservation lock next to the open-lock.
             std::fs::write(&reservation, format!("{} 0", std::process::id())).unwrap();
 
-            // A save deletes only the reservation; the open-lock must survive.
+            // A save must not remove either lock: both are released by their own
+            // pid-guarded Drops (`SessionLock`/`Reservation`), never by `save`
+            // deleting by path.
             Session::new(state("My Chat", &cwd))
                 .save("my-chat")
                 .unwrap();
@@ -2893,7 +2905,10 @@ mod tests {
                 open_lock.exists(),
                 "save must not remove the live open-lock"
             );
-            assert!(!reservation.exists(), "save removes the reservation lock");
+            assert!(
+                reservation.exists(),
+                "save must not remove the reservation lock"
+            );
         });
     }
 
