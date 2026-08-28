@@ -2666,3 +2666,117 @@ formatting. Dropped as noise: per-chunk `Reasoning`/`Text` event clones
 per-round `auth.json` read (small file, ChatGPT-identity only); `find_hits`
 re-lowering per `/next`/`/prev` (command-frequency, not per-keystroke). GAP:
 `hrdr-tui/src/app/e2e.rs` is test-only, skipped.
+
+## Correctness review 2026-08-28
+
+`:review` (low depth) over the whole tree (working tree clean at the time),
+split across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
+hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
+candidate was re-traced at its cited lines by the sweep lead before recording.
+**Status: 3 findings (1 medium, 2 low) — all actionable, none yet shipped.**
+
+1. **Medium — `Session::save` still removes the reservation lock by path,
+   defeating the pid-guard added in `2823fc2`.** `hrdr-agent/src/session.rs:867`
+   unconditionally `remove_file`s `.{id}.lock`, while the guard the fix added to
+   `Reservation::drop` (`session.rs:540`) and `SessionLock::drop` (`:609`) is
+   `remove_lock_file_if_owned` (`store_lock.rs:284`). That leaves a second,
+   unguarded release path for the same lock. On Windows `process_alive` answers
+   `false` for every pid (`store_lock.rs:326-329`), so a live lock older than
+   `STALE_LOCK_AGE_SECS = 60` (`session.rs:26`) is reapable; a first save whose
+   blob-write phase exceeds 60 s lets a second instance reap and reclaim the
+   reservation, then the first instance's `:867` deletes the _second_ instance's
+   lock — the two-window lost-update the locks exist to prevent. The
+   `Reservation` guard is held across every save (`save_session` `:1620`;
+   `hrdr-tui` `spawn_save` `:378`), so removing `:867` and letting the
+   pid-guarded Drop be the sole release is the fix. Repro:
+
+   ```
+   // Windows, two hrdr instances, same cwd + session name.
+   // A's first save spends >60s writing blob attachments (slow/network FS).
+   // B starts a same-named session during that window.
+   Expect: B mints a distinct id; A never deletes B's lock.
+   Actual: both hold `slug`; A's `:867` deletes B's reclaimed `.{slug}.lock`,
+           and the two sessions silently overwrite one another.
+   ```
+
+2. **Low — completion memoization serves stale sub-agent names after a turn
+   ends.** `hrdr-tui/src/app/completion.rs:26-33` memoizes `active_completions`
+   on `(editor content, completion_generation)`, but `compute_completions` reads
+   the sub-agent list through `agent_names`
+   (`hrdr-app/src/commands/helpers.rs:397-402`), which is `[]` whenever the turn
+   task holds the agent lock (`try_lock` fails). No site bumps
+   `completion_generation` when a turn ends, so a popup computed with the lock
+   held is served again with the lock free. Before `ff2c949` this recomputed
+   every frame and self-corrected within one. Fix:
+   `bump_completion_generation()` in the `TurnMsg::Done` handler
+   (`app.rs:3027`). Repro:
+
+   ```
+   state: sub-agent profile configured; main turn running (lock held)
+   input: type `@`, let the turn finish (content stays `@`)
+   Expect: once the turn ends the `@` popup lists sub-agent names
+   Actual: the popup keeps showing no names until the next keystroke
+   ```
+
+3. **Low — `/cwd` rediscovers commands but not skills.** `TuiHost::cwd_changed`
+   (`hrdr-tui/src/app/commands.rs:417-424`) refreshes `self.app.commands` for
+   the new directory but leaves `self.app.skills` as the previous directory's
+   set; `apply_cwd` (`app.rs:2570-2571`) and `reload_cmd` (`commands.rs:186`)
+   refresh both, so this is an asymmetric pre-existing path. A skill that exists
+   only in the old directory is still offered as a `:name` completion after the
+   switch. Fix: `cwd_changed` should also set
+   `self.app.skills = hrdr_app::discover_skills(new, self.app.project_instructions)`.
+   Repro:
+
+   ```
+   state: project A has .agents/skills/foo/SKILL.md; project B (trusted) does not
+   input: start in A, `/cwd /path/to/B`, then type `:foo`
+   Expect: no `:foo` suggestion (B has no such skill)
+   Actual: `:foo` still offered from A's stale `self.skills`
+   ```
+
+**Cleared (suspected, traced, safe — do not re-investigate):** attachment digest
+memoization (`00989fd` — `Attachment.bytes` is a private `Arc<[u8]>` with no
+mutation path, so the construction-time `sha256` cannot drift; `read_blob`
+re-hashes loaded bytes for verification, so the memo cannot weaken the
+corruption check); `AttachmentRef::of`/`write_blobs` zip pairing (both derive
+from the same `self.state.messages` snapshot with no interleaved mutation);
+trust.rs newline guard + test change (`key` preserves a literal `\n` through
+canonicalize and fallback arms, so the refusal fires whether or not the
+directory exists); PlainEngine cursor math; history-writer coalescing
+(capacity-1 `try_send` under the pending lock cannot lose the newest snapshot —
+the wakeup sees the stored snapshot); completion `items.len() - 1` underflow
+(`compute_completions` only returns `Some` when `items` is non-empty);
+`spinner_live()` coverage (every animated source is covered; only the wall-clock
+header logo is intentionally frozen); `Agent::agent_names` static profile list
+(built once, cannot drift mid-session — the only dynamic part is the
+lock-held-empty case, which is finding 2).
+
+**Hardening (correct today, fragile):**
+
+- `remove_lock_file_if_owned` is read-then-delete, not atomic
+  (`store_lock.rs:284-298`) — a concurrent reap+reclaim between the read and the
+  `remove_file` can still delete the new holder's lock. Same class as the
+  documented write-path TOCTOU; pre-dates `2823fc2`.
+- The completion cache key omits `suppress_completions` — safe today because the
+  suppressed path returns `None` before the cache and every unsuppress path
+  accompanies a content change; a future unsuppress without a content change
+  would serve a stale entry.
+- `agent_names`/`agent_cwd` are "best-effort under lock" (`helpers.rs:386-402`);
+  the memoization turned their transient wrong answer into a persistent one
+  (finding 2). The `/cwd`-during-a-running-turn overlap leaves the file index
+  built from the fallback process cwd, not the agent's new cwd.
+
+**Coverage:** reviewed in depth — the three post-sweep commits and every file
+they touch (`session.rs` lock/reserve/save paths, `store_lock.rs`,
+`attachment_store.rs`, `media.rs`, `trust.rs`), `hrdr-tui` `completion.rs` /
+`commands.rs` `cwd_changed` / `session.rs` save flow / `util.rs`,
+`hrdr-app/src/commands/helpers.rs`, `hrdr-test-support`,
+`apps/hrdr/src/main.rs`. GAP: not re-reviewed line-by-line — the bulk of
+`hrdr-agent` (`lib.rs`, `prompt.rs`, `compaction.rs`, `delegation.rs`,
+`turn_loop.rs`, `config.rs`, `commands/dispatch.rs`, `login.rs`), `hrdr-llm`
+(`client.rs`/`anthropic.rs`/
+`codex.rs`/`sse.rs`/`types.rs`/`catalog.rs`/`pdf.rs`), `hrdr-tools` (`lib.rs`,
+`sandbox.rs`, most `tools/*`, `mcp/*`), `hrdr-tui` (`ui.rs`, most of `app.rs`,
+`e2e.rs`, selectors, theme), and all integration-test dirs. These were covered
+by the 2026-08-14 passes; their cleared items were not re-derived.
