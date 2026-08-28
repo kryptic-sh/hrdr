@@ -257,6 +257,14 @@ fn read_blob(dir: &Path, r: &AttachmentRef) -> Result<Attachment, AttachmentLoss
     let Some(media_type) = MediaType::from_mime(&r.media_type) else {
         return Err(AttachmentLossReason::Invalid);
     };
+    // The blob's file name is its digest: anything that is not 64 lowercase hex
+    // cannot name a blob. Reject it before it is joined to `dir` — the sweep
+    // side applies the same `is_blob_name` gate, and joining an untrusted
+    // deserialized string here is what would turn a crafted session file into an
+    // arbitrary-read / existence oracle.
+    if !is_blob_name(&r.sha256) {
+        return Err(AttachmentLossReason::Corrupt);
+    }
     let path = dir.join(&r.sha256);
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
@@ -462,6 +470,27 @@ mod tests {
         let mut restored = vec![Message::user("look")];
         let losses = resolve_attachments(dir.path(), &refs, &mut restored);
         assert_eq!(losses[0].reason, AttachmentLossReason::Corrupt);
+    }
+
+    /// A `sha256` that is not 64 lowercase hex cannot name a blob, so the read
+    /// path refuses it before touching the filesystem — otherwise a crafted
+    /// session file could stat/read an arbitrary path (and tell existence apart
+    /// by the Missing-vs-Corrupt reason).
+    #[test]
+    fn read_blob_refuses_a_non_blob_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = AttachmentRef {
+            filename: "x".into(),
+            media_type: "image/png".into(),
+            len: 0,
+            sha256: "../does-not-exist".into(),
+        };
+        // Pre-fix, `dir.join("../does-not-exist")` stats as Missing; the fix
+        // returns Corrupt before any filesystem access.
+        assert_eq!(
+            read_blob(dir.path(), &reference),
+            Err(AttachmentLossReason::Corrupt)
+        );
     }
 
     /// The sweep deletes only what the mark set omits, only for blob-shaped
