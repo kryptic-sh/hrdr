@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use hrdr_llm::media::{Attachment, MediaType};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::Message;
 
@@ -143,10 +142,7 @@ impl std::fmt::Display for AttachmentLoss {
 
 /// Lowercase-hex SHA-256, the form a blob is named by.
 pub(crate) fn digest_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hrdr_llm::sha256_hex(bytes)
 }
 
 /// Whether `name` is a blob file name — exactly 64 lowercase hex digits.

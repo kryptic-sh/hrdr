@@ -659,6 +659,17 @@ pub struct Attachment {
     sha256: Arc<str>,
 }
 
+/// Lowercase-hex SHA-256 — the shared spelling both the blob store
+/// (`hrdr-agent`'s `digest_hex`) and [`Attachment`]'s construction-time digest
+/// use, so a blob's file name and its recorded digest stay byte-identical by
+/// construction rather than by two copies agreeing today.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Prints the shape, never the payload: [`ChatMessage`] derives `Debug` and is
 /// logged whole in places, and a derived impl would spill megabytes of image
 /// bytes into a log line.
@@ -705,11 +716,7 @@ impl Attachment {
         // The digest is a pure function of the bytes (immutable after this
         // point), so it is hashed once here and reused for the object's
         // lifetime — see the field docs.
-        let sha256: Arc<str> = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            .into();
+        let sha256: Arc<str> = sha256_hex(&bytes).into();
         Ok(Self {
             bytes,
             media_type,
