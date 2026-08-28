@@ -36,6 +36,13 @@ impl super::App {
         }
     }
 
+    /// The agent's TODO list, copied under its lock for a session write. Two
+    /// save paths (mid-turn persist and the turn-end autosave) need the same
+    /// snapshot; a poisoned lock degrades to empty rather than erroring a save.
+    fn todos_snapshot(&self) -> Vec<hrdr_agent::Todo> {
+        self.todos.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
     /// Point the shared sub-agent transcript cell at the current session's dir,
     /// and attach the MAIN agent's own durable transcript writer at its sibling
     /// `<id>.jsonl`. Called after the session id is assigned; anything spawned or
@@ -163,7 +170,7 @@ impl super::App {
     /// move to a spawned task once the session has an id (the mint — id +
     /// open-lock — is synchronous and only ever runs here on the UI thread).
     pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
-        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        let todos = self.todos_snapshot();
         // `state.cwd` is only synced by the turn-end autosave; on the very
         // first turn it is still empty, which would file the session under the
         // wrong cwd slug.
@@ -300,7 +307,7 @@ impl super::App {
         else {
             return;
         };
-        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        let todos = self.todos_snapshot();
         self.state_mut().sync_from(msgs, todos, cwd);
 
         if self.state().id.is_some() {
@@ -309,8 +316,9 @@ impl super::App {
             // mint deferred over at the same point as always — here, turn end —
             // so it lands once the first save of the session succeeds.
             if std::mem::take(&mut self.session_notice_pending) {
-                let id = self.state().id.clone().unwrap_or_default();
-                self.system(hrdr_app::session_saved_notice(&id));
+                let notice =
+                    hrdr_app::session_saved_notice(self.state().id.as_deref().unwrap_or_default());
+                self.system(notice);
             }
             self.enqueue_save();
             return;

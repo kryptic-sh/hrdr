@@ -209,13 +209,7 @@ fn report_failure(
         " The rest of the gate was NOT run — fix this, then call `verify` again. Do not report \
          the work finished, and do not describe the checks that did not run as passing.",
     );
-    if let Some(asked) = raised_from {
-        s.push('\n');
-        s.push_str(&crate::timeout_floor_note(
-            asked,
-            DEFAULT_VERIFY_TIMEOUT_SECS,
-        ));
-    }
+    append_timeout_note(&mut s, raised_from);
     s
 }
 
@@ -226,6 +220,13 @@ fn report_pass(passed: &[String], origin: &str, raised_from: Option<u64>) -> Str
         passed.len(),
         quoted(passed),
     );
+    append_timeout_note(&mut s, raised_from);
+    s
+}
+
+/// Append the timeout-floor explanation when a `verify` caller asked for a
+/// timeout below the floor and it was raised.
+fn append_timeout_note(s: &mut String, raised_from: Option<u64>) {
     if let Some(asked) = raised_from {
         s.push('\n');
         s.push_str(&crate::timeout_floor_note(
@@ -233,7 +234,6 @@ fn report_pass(passed: &[String], origin: &str, raised_from: Option<u64>) -> Str
             DEFAULT_VERIFY_TIMEOUT_SECS,
         ));
     }
-    s
 }
 
 fn quoted(commands: &[String]) -> String {
