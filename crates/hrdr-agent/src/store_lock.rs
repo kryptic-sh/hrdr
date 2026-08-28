@@ -420,7 +420,6 @@ mod tests {
         // Backdate its mtime past the staleness window so it ages out.
         let old =
             std::time::SystemTime::now() - Duration::from_secs(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
-        let old = filetime_from(old);
         set_mtime(&lock, old);
         let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
         assert!(lock.exists());
@@ -715,11 +714,6 @@ mod tests {
     // Small mtime helper (no external crate): backdate a file's mtime by
     // shelling out to `touch`. Unix-only — the sole caller
     // (`unparseable_old_lock_is_reaped_by_mtime`) is `#[cfg(unix)]` too.
-    #[cfg(unix)]
-    fn filetime_from(t: std::time::SystemTime) -> std::time::SystemTime {
-        t
-    }
-
     #[cfg(unix)]
     fn set_mtime(path: &Path, when: std::time::SystemTime) {
         // `touch -t [[CC]YY]MMDDhhmm[.SS]` is portable across GNU and BSD

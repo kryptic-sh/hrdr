@@ -765,29 +765,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Whether `query`'s chars appear in order within the space-joined, lowercased
-/// `parts` — the fuzzy match shared by the picker filters. An empty query
-/// matches everything.
-pub fn fuzzy_match(query: &str, parts: &[&str]) -> bool {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
-        return true;
-    }
-    fuzzy_match_q(&q, parts)
-}
-
-/// Case-insensitive subsequence test over the space-joined parts, against an
-/// already-normalized query — the per-row core of [`fuzzy_match`], split out so
-/// a caller filtering many rows normalizes the query once.
-fn fuzzy_match_q(q: &[char], parts: &[&str]) -> bool {
-    fuzzy_match_hay(q, &parts.join(" ").to_lowercase())
-}
-
-/// The per-row core of [`fuzzy_match_q`] against an already-joined,
-/// already-lowercased haystack — what the pickers pay for when a choice's
-/// haystack is precomputed once per picker open instead of per keystroke.
-/// Shared with the app-crate picker filters, which precompute their own
-/// haystacks (see the `*_haystack` builders in `hrdr-app`).
+/// The per-row subsequence test against an already-joined, already-lowercased
+/// haystack — what the pickers pay for when a choice's haystack is precomputed
+/// once per picker open instead of per keystroke. Shared with the app-crate
+/// picker filters, which precompute their own haystacks (see the `*_haystack`
+/// builders in `hrdr-app`).
 pub fn fuzzy_match_hay(q: &[char], haystack: &str) -> bool {
     let mut it = haystack.chars();
     q.iter().all(|&c| it.any(|h| h == c))
