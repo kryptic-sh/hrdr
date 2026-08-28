@@ -2780,3 +2780,107 @@ they touch (`session.rs` lock/reserve/save paths, `store_lock.rs`,
 `sandbox.rs`, most `tools/*`, `mcp/*`), `hrdr-tui` (`ui.rs`, most of `app.rs`,
 `e2e.rs`, selectors, theme), and all integration-test dirs. These were covered
 by the 2026-08-14 passes; their cleared items were not re-derived.
+
+## Security audit 2026-08-28
+
+`:audit` (low depth) over the whole tree (working tree clean at the time), split
+across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
+hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
+candidate was re-traced at its cited lines by the sweep lead before recording.
+**Status: 1 finding (low) — actionable; 1 new hardening note; the rest
+cleared.**
+
+1. **Low — `read_blob` joins an untrusted `sha256` without the 64-hex check, so
+   a crafted session file reads arbitrary paths (existence/size oracle, not
+   exfiltration).** `hrdr-agent/src/attachment_store.rs:260` builds
+   `dir.join(&r.sha256)` from the deserialized on-disk `AttachmentRef.sha256`
+   (`#[derive(Deserialize)]`; the on-disk `Raw.attachments` → `attachment_refs`
+   at `session.rs:219,275`) with no `is_blob_name` guard, while the deletion
+   side `sweep_blobs` (`:363`) does gate on `is_blob_name` (`:157`, exactly 64
+   lowercase hex). `r.sha256 = "../…"` or an absolute path reaches
+   `std::fs::metadata` then `std::fs::read` (`:261,:273`); the read is bounded
+   by `r.len == meta.len()` (`:270`) and the bytes are discarded because the
+   digest check (`:277`) can never match a non-64-hex name — so content never
+   reaches the model, but the `Missing`/`Unreadable`/`Corrupt` category plus the
+   attacker-controlled `filename` are surfaced in the resume notice
+   (`resolve_attachments` `:314-320`), giving a file-existence/size oracle on
+   paths the attacker can guess. Fix: reject `r.sha256` unless
+   `is_blob_name(&r.sha256)` in `read_blob`, returning `Corrupt`. Repro:
+
+   ```
+   state: a session file whose attachments[0].files[0] = {
+            "sha256": "../../../etc/passwd", "len": <target size>,
+            "media_type": "image/png", "filename": "x" }
+   input: resume that session
+   Expect: no filesystem read outside the blob dir; the attachment is Corrupt
+   Actual: the guessed path is stat'd and read; existence is distinguishable
+           via the resume notice's Missing/Unreadable/Corrupt category
+   ```
+
+**Cleared (suspected, traced, safe — do not re-investigate):** SSRF in
+`fetch`/`search` (connect-time `SsrfGuardResolver`, `is_blocked_ip` covers
+loopback/private/link-local/CGNAT/unspecified plus IPv4-mapped v6, redirects
+re-checked); `catalog` fetch has no SSRF guard but `HRDR_MODELS_URL` is
+operator-set env, not attacker-influenceable; MCP `endpoint` event SSRF (host
+matched against the operator-configured base before POST, fail-closed); shell
+command injection (the command string is the tool's stated payload; guardrails +
+sandbox first); hook injection via `{path}` (`Shell::quote` single-quotes, so an
+embedded `'; rm …; '` stays one inert argument); terminal escape injection
+(ratatui drops control-char graphemes on every render path; the only unfiltered
+sinks were the headless ones, closed 2026-08-14); completion memoization
+(correctness-only — the correctness finding #2); attachment digest memo
+(`Attachment.bytes` private immutable `Arc<[u8]>`; `read_blob` re-hashes on
+load); SSE/JSON overflow caps; `gate.rs` CI YAML recursion (bounded by
+`serde_yaml_ng`'s 128-level limit plus byte/file caps); OAuth CSRF/state
+(constant-time compare), PKCE (CSPRNG), HTML-escaped error pages, loopback-only
+listener, bind-before-browser; token leakage (sanitized errors never echo the
+body); credential store (0600 atomic, StoreLock RMW, refuses to clobber
+malformed); trust store (canonicalize, exact-match, refuses `\n`/`\r` before
+write); session id/path traversal (`sanitize_name` + `id != sanitize_name(&id)`
+guard); `attachments_arg` (model `task` attachments) routed through
+`resolve_read` + `check_attachments`; `resolve_subagent_cwd` containment; OAuth
+single-flight coordinator (cancel-safe `RefresherGuard`).
+
+**Hardening (correct today, fragile — not vulnerabilities):**
+
+- **`open_system_handler` Windows `cmd /C start` escaping is partial**
+  (`hrdr-app/src/commands/dispatch.rs:574-610`): only `&` is caret-escaped, so
+  other cmd metacharacters (`|`, `<`, `>`, `%`, `^`) in a path would still be
+  interpreted. Inert today: `open_browser` passes a fixed OAuth URL and
+  `open_editor` has no in-tree caller (the TUI overrides the trait default);
+  platform-gated, so not compiled locally. Worth fixing only if a real user-path
+  caller appears.
+
+The pre-existing `session.rs:867` lost-update, `remove_lock_file_if_owned`
+TOCTOU, and the `is_blocked_ip` v6-encoding / write-path-TOCTOU / MCP
+`Box::leak` / `untrusted_nonce` `DefaultHasher` notes are already recorded and
+were re-confirmed, not re-filed.
+
+**Coverage:** walked line-by-line — hrdr-agent `trust.rs`, `auth.rs`,
+`auth_store.rs`, `oauth.rs`, `session.rs` lock/reserve/save/load/sweep core,
+`attachment_store.rs`, `resolve.rs`, `paths.rs`, `hooks.rs`, `transcript_log.rs`
+read side, `delegation.rs` attachments/`cwd`/`resolve_subagent_cwd`,
+`skills.rs`/ `commands.rs`/`config.rs` (targeted); hrdr-app `login.rs`,
+`dispatch.rs` `open_system_handler`, `host.rs`; hrdr-tools `web.rs`,
+`tools/shell.rs`, `gate.rs`, `proc.rs`, `hooks.rs`, `mcp/transport.rs`,
+`mcp/client.rs`, `lib.rs` resolve/identity/secret/truncate; hrdr-llm `sse.rs`,
+`capped_read.rs`, `catalog.rs`, `fs.rs`, `media.rs`, `lib.rs`; hrdr-tui
+`completion.rs` plus the ff2c949 diff; `hrdr-test-support`;
+`apps/hrdr/src/main.rs` (trust gate + sandbox-exec wrapper). GAP: not re-audited
+line-by-line — `hrdr-editor` (`plain.rs`/`host.rs`/`lib.rs`); the bulk of
+`hrdr-agent` (`lib.rs`, `prompt.rs`, `compaction.rs`, `turn_loop.rs`,
+`registry.rs`, `transcript.rs`, `transcript_log.rs` write side,
+`chatgpt_models.rs`, `provider_catalog.rs`, `models.rs`, `budget.rs`); hrdr-app
+`config.rs`, `sessions.rs`, `history.rs`, `util.rs`, `completion.rs`,
+`subagents.rs`; hrdr-llm `client.rs`/`anthropic.rs`/
+`codex.rs`/`types.rs`/`pdf.rs`; hrdr-tools `sandbox.rs`, `memory.rs`, `lsp.rs`,
+`guardrails.rs`, and the remaining tool impls; hrdr-tui `ui.rs`, `app.rs` input
+handlers, selectors, theme; `hrdr-tui/src/app/e2e.rs` (test-only). These were
+covered by the 2026-08-14 audit; their cleared items were not re-derived.
+
+**Summary:** 1 low, 0 critical/high/medium. Overall risk unchanged and low — the
+surfaces that would carry a real bug (SSRF, command/hook injection, file-tool
+traversal/TOCTOU, SSE/JSON caps, secret exfiltration, terminal injection) were
+re-verified as guarded. Fix first: the `read_blob` `is_blob_name` check (this
+finding), then the already-recorded `session.rs:867` reservation-lock
+lost-update (the correctness medium).
