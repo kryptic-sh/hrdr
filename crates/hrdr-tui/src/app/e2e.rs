@@ -9562,6 +9562,21 @@ async fn up_after_recalling_a_slash_command_keeps_walking_history() {
     );
 }
 
+/// A completed turn frees the agent lock, so the completion popup computed while
+/// the turn held it — `agent_names` reads as empty under `try_lock` — must not be
+/// served stale. The turn-end handler invalidates the cache by bumping the
+/// completion generation.
+#[tokio::test]
+async fn completing_a_turn_bumps_the_completion_generation() {
+    let mut h = Harness::new(vec![MockReply::Text("answer".to_string())]).await;
+    let before = h.app.completion_generation;
+    h.submit("hi").await;
+    assert!(
+        h.app.completion_generation > before,
+        "a completed turn invalidates the completion cache"
+    );
+}
+
 /// `@file` completion sees files that appear *after* its index was built. A
 /// recursive watcher on the cwd invalidates the cache on create/rename/remove,
 /// so a file added by a `git pull`, another shell, or the agent's own write

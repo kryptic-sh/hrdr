@@ -3032,6 +3032,11 @@ impl App {
                     return;
                 }
                 self.registry.end_turn(hrdr_agent::MAIN_KEY);
+                // The agent lock is free again: the sub-agent list (and cwd) that
+                // `agent_names`/`agent_cwd` read under `try_lock` is now the real
+                // one, so the completion popup cached while the turn held the lock
+                // (empty sub-agent names) must be recomputed, not served stale.
+                self.bump_completion_generation();
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
                 if let Some(e) = err {
