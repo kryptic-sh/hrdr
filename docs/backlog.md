@@ -2973,3 +2973,86 @@ recent commits. GAP: not line-by-line — the bulk of `hrdr-tools/src/tools/*` a
 `hrdr-tui/src/app/e2e.rs` (test-only), and the large `hrdr-agent` modules
 (`lib.rs` body, `prompt.rs`, `session.rs` beyond the lock sections,
 `delegation.rs`, `compaction.rs`, `config.rs`).
+
+## Performance review 2026-08-28
+
+`:perf` over the whole tree (working tree clean at the time), split across two
+read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
+hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced
+at its cited lines by the sweep lead. **Status: 5 actionable (1 per-keystroke
+selection, 2 medium, 1 small, 1 micro) + 1 deliberate-tradeoff revisit; none yet
+applied.**
+
+1. **`rank_file_matches` sorts the whole 20k-file index per keystroke, then
+   keeps 8.** `hrdr-app/src/completion.rs:178-201` builds a `Vec` of up to
+   `WALK_MAX_FILES` (20_000) tuples, runs a full `sort_by`, then `.take(8)` —
+   O(F log F) comparisons + O(F) allocation per keystroke; the empty-query case
+   (`@` alone) scores every entry. Called on every `@` keystroke via
+   `file_completion_items` (`hrdr-tui/src/app/completion.rs:184`), one recompute
+   per keystroke (the memo keys on content). Fix: bounded top-8 selection —
+   `select_nth_unstable_by(7, …)` then sort only the 8, or a fixed-size 8-slot
+   best-list during the `filter_map` pass. O(F), same ordering for the kept 8.
+
+2. **`HighlightCache::highlight` deep-clones the whole accumulated block on
+   every call.** `hrdr-app/src/highlight.rs:140` does
+   `let mut out = block.lines.clone()` — the entire `Vec<HlLine>` (every
+   committed line and every span string) — even though only the newly appended
+   lines were parsed. Runs per frame for a _streaming_ code block, which grows
+   each chunk and so misses the render cache (`hrdr-tui/src/ui.rs:2118-2121`):
+   O(block bytes) deep clone per redraw for the whole stream. Fix: hand out
+   `Arc<Vec<HlLine>>` (clone the `Arc`), or return a shared slice so the stable
+   committed prefix is not re-copied.
+
+3. **`PlainEngine` is O(n²) on paste and Ctrl+W.** `hrdr-editor/src/plain.rs` —
+   `insert`/`backspace` are per-char `Vec::insert`/`remove` (`:53-57`,
+   `:59-65`), and `paste` loops `insert` per char (`:233-239`) while
+   `delete_word` loops `backspace` per char (`:140-147`). A pasted code block or
+   a long-word Ctrl+W is O(n²) memmoves. Fix: `paste` → one
+   `chars.splice(cursor..cursor, text.chars().filter(|&c| c != '\r'))` + one
+   cursor bump; `delete_word` → compute the range then `drain` once (exactly
+   what `kill_to_line_start` already does at `:149-153`). A gap-buffer/rope is
+   the larger fix if mid-buffer typing ever matters.
+
+4. **Loop-invariant spinner-frame clock read per chunk per frame.**
+   `hrdr-tui/src/ui.rs:2890-2891` computes `frame_idx`/`frame` from
+   `app.header_anchor.elapsed()` _inside_ the
+   `for (i, entry) in transcript.iter().enumerate()` loop (`:2880`) — a real
+   clock read plus index math per top-level chunk, ~8.3 Hz while
+   `spinner_live()` keeps the ticker alive, over an unboundedly growing
+   transcript. They depend only on wall time, not `i`. Fix: hoist both lines
+   above the loop (the comment at `:2864` already says "one clock read for the
+   whole frame").
+
+5. **SSE decoder drops its line-buffer capacity on every line.**
+   `hrdr-llm/src/sse.rs:141` does `std::mem::take(&mut self.line_buf)`, leaving
+   a zero-capacity `Vec` that the next line grows byte-by-byte (1→2→4→…) — once
+   per SSE line (≈ per token) on every streamed response. Fix: preserve capacity
+   — decode with a scoped `from_utf8_lossy` borrow, then hand the buffer back
+   with `raw.clear(); self.line_buf = raw;`. Micro; low priority.
+
+**Deliberate tradeoff, not changed (revisit):** attachment base64 is re-encoded
+every round (`hrdr-llm/src/media.rs:788-790`, `STANDARD.encode(&self.bytes)` per
+attachment per request build). The doc comment at `:639-642` records the choice
+— caching the encoding keeps a second resident copy (4/3 the bytes). The
+`00989fd` digest memo set a precedent (hash once at construction), but that
+string is fixed-size while base64 scales with the payload, so the memory
+tradeoff is different. Worth a deliberate re-decision with a real image/PDF
+session benchmark; the cheaper middle ground is to serialize requests by
+borrowing the cached encoding rather than building a `serde_json::Value` tree
+per round (the already-tracked "request serialization per round" gap).
+
+**Coverage:** traced end-to-end — hrdr-tui `ui.rs` (transcript_chunks/flush/
+cache, status bar, selectors), `app.rs` on_key, `completion.rs`, `selector.rs`;
+hrdr-llm `sse.rs`, `client.rs` request/stream, `anthropic.rs`/`codex.rs` body +
+decode, `media.rs`, `catalog.rs`; hrdr-tools `read.rs`/`replace.rs`/`edit.rs`/
+`find.rs`/`tree.rs`/`lib.rs`; hrdr-agent `turn_loop`, `budget`, `prompt`,
+`transcript`, `delegation`, `session`/`attachment_store`, `trust`, `commands`/
+`skills`/`agents_dir`, `pane`; hrdr-app `completion`, `util`, `format`,
+`highlight`, `history`, `sessions`, `status`, `transcript`, `helpers`;
+hrdr-editor `lib`/`plain`/`host`. Not settled without profiling: the full
+per-frame transcript render walk in `hrdr-tui` (already the tracked gap) and the
+absolute weight of the base64 re-encode vs its memory tradeoff. GAP: not traced
+line-by-line — `hrdr-tools/src/sandbox.rs`, `lsp.rs`, `shell.rs`, `watch.rs`,
+`mcp/*`, `hooks.rs`, `guardrails.rs`, `verification.rs`, `proc.rs`, `web.rs`
+(mostly per-tool-call frequency); `apps/hrdr/src/main.rs` (startup only);
+`hrdr-test-support` (test-only).
