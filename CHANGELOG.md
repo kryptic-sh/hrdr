@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-29
+
+### Breaking
+
+- **Five dead public functions are removed from crates.io-published crates.**
+  The 2026-08-14 tidy pass deleted `hrdr_app::save_agent_session` and
+  `hrdr_app::latest_session_for_cwd` (the TUI uses the locked
+  `open_latest_session_for_cwd`), `hrdr_tools::ToolContext::mark_read_partial`
+  (`record_read`/`mark_read` cover the bookkeeping), and
+  `hrdr_agent::await_oauth_code` (unused after the bind-first login fix). A
+  later pass removed `hrdr_agent::fuzzy_match` and its private `fuzzy_match_q`,
+  orphaned by the `fuzzy_filter` refactor — the picker filters all delegate to
+  `fuzzy_filter`/`fuzzy_match_hay` now. Below 1.0 these public removals are a
+  breaking change.
+
+### Added
+
+- **`hrdr_llm::Client::try_new`** — a fallible client constructor. `Client::new`
+  still panics on TLS-backend init failure exactly as before; `try_new` returns
+  the error so a caller that builds a client fallibly (as the web tool does) no
+  longer aborts the process.
+
 ### Fixed
 
 - **The retention sweep can no longer wipe a whole cwd's sessions.** The purge
@@ -74,6 +96,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   holder's lock mid-write: the two-window lost-update the lock exists to
   prevent. All three lock guards (the session open-lock, the id reservation, and
   the store lock) now remove their file only while it still names their own PID.
+- **The id-reservation lock is released only by its pid-guarded guard.**
+  `Session::save` still removed `.{id}.lock` by path — a fourth, unguarded
+  release the guard fix above missed — so a slow first save (over 60 s of blob
+  writes) on Windows let a second instance reap and reclaim the reservation, and
+  the first instance's save then deleted the second's lock: the same two-window
+  lost-update. `Reservation::drop` is now the sole release; `save` touches
+  neither lock.
+- **A crafted session file can no longer read or stat arbitrary paths.** The
+  attachment-restore path joined a deserialized `sha256` field to the blob
+  directory without checking it was a 64-hex blob name, so a crafted session
+  file could read an arbitrary file and infer its existence and size from the
+  `Missing`/`Unreadable`/`Corrupt` reason surfaced on resume. The read side now
+  applies the same `is_blob_name` gate the sweep side already had, before any
+  filesystem access.
+- **A directory whose path contains a line break can no longer be trusted.**
+  `trust()` wrote the canonical path verbatim into a newline-delimited store, so
+  a `\n` in the name (legal on Linux) split the entry and left the directory
+  untrusted forever. Such paths are refused up front — the directory stays
+  untrusted and the user is re-asked, without corrupting the store.
+- **A misconfigured server can no longer inflate the compaction threshold.** A
+  hostile or broken local endpoint could advertise a context window up to
+  `u32::MAX`, blowing up the auto-compaction trigger; the advertised window is
+  now clamped at a 4M-token sanity ceiling.
+- **The `@`-mention popup no longer shows stale sub-agent names after a turn.**
+  The completion memoization cached the popup on editor content + a generation
+  counter, but nothing bumped the counter when a turn ended — so a popup
+  computed while the turn held the agent lock (sub-agent names read as empty)
+  was served again with the lock free. Turn end now invalidates the cache.
+- **`/cwd` rediscovers skills, not just commands.** `cwd_changed` refreshed the
+  project's `:command` list but left the skill list as the previous directory's,
+  so a skill that only the old directory had was still offered as a `:name`
+  completion after the switch. Both are now rediscovered together.
 
 ### Performance
 
@@ -104,6 +158,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   streamed token while it is in view. The frame now copies one screenful: the
   same block measures ~0.23ms, and the cost no longer depends on how big the
   thing on screen is.
+- **Tool-call arguments parse once, and multiline grep is no longer quadratic.**
+  Tool args were parsed twice per call (once to record, once inside the spawned
+  task) and cloned into the future; they now parse once, the recorded form and
+  the repeat-refusal borrow the result, and the task consumes it. Multiline grep
+  rescanned the file from byte 0 per match to count newlines; a once-per-file
+  offset vector plus a binary search makes it O(n + k log n) instead of O(k·n).
+- **`@file` completion no longer sorts the whole index per keystroke.** Ranking
+  sorted up to 20,000 paths on every `@` keystroke and kept 8; it now selects
+  the top 8 in O(F) and orders just those, on top of the memoization above.
+- **Pasting and Ctrl+W in the non-vim editor are no longer quadratic.** The
+  plain input engine inserted/deleted one character at a time, so a pasted block
+  or a long-word delete was O(n²) memmoves; both are now one batch splice/drain.
 
 ## [0.13.0] - 2026-08-13
 
@@ -7240,7 +7306,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/kryptic-sh/hrdr/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/kryptic-sh/hrdr/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kryptic-sh/hrdr/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/hrdr/compare/v0.11.0...v0.11.1
