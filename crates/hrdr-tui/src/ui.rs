@@ -2877,6 +2877,14 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     // after them merges into the same group instead of opening a new one.
     // `group_members_end` is one past the group when one is in progress.
     let mut group_members_end: Option<usize> = None;
+    // The current spinner frame is loop-invariant — it depends only on wall
+    // time. Compute it once per frame, not once per transcript chunk: the
+    // comment on `now` above already promises one clock read for the whole
+    // frame. It is mixed into unfinished tool entries' cache hash so the
+    // block invalidates on each tick, animating the marker; the tool-group
+    // summary header uses the same frame.
+    let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
+    let frame = SPINNER[frame_idx as usize % SPINNER.len()];
     for (i, entry) in transcript.iter().enumerate() {
         if group_members_end.is_some_and(|end| i >= end) {
             group_members_end = None;
@@ -2884,11 +2892,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         if group_members_end.is_some_and(|end| i < end) {
             continue;
         }
-        // For unfinished tool entries the current spinner frame is mixed into the
-        // hash so the cached block invalidates on each tick, animating the
-        // marker — and the tool-group summary header uses the same frame.
-        let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
-        let frame = SPINNER[frame_idx as usize % SPINNER.len()];
         // Tool groups: collapsible calls — everything but `edit`/`replace`,
         // which always render and never group — collapse behind one
         // `{mark} ran 2 commands · read 1 file` summary line, even for a group
