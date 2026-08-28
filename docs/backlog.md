@@ -2884,3 +2884,92 @@ traversal/TOCTOU, SSE/JSON caps, secret exfiltration, terminal injection) were
 re-verified as guarded. Fix first: the `read_blob` `is_blob_name` check (this
 finding), then the already-recorded `session.rs:867` reservation-lock
 lost-update (the correctness medium).
+
+## Tidy review 2026-08-28
+
+`:tidy` over the whole tree (working tree clean at the time), split across two
+read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
+hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read
+at its cited lines by the sweep lead; behavior-preserving only. **Status: 7
+cleanups — 1 dead code (high value), 6 low-value duplications; none yet
+applied.**
+
+1. **Delete dead `fuzzy_match` + `fuzzy_match_q`.**
+   `hrdr-agent/src/models.rs:771` and `:782` are orphaned by the 2026-08-14
+   `fuzzy_filter` refactor — the only references are `fuzzy_match` →
+   `fuzzy_match_q` → `fuzzy_match_hay`, and `fuzzy_match` itself has zero
+   callers repo-wide (the six picker filters all delegate to `fuzzy_filter` →
+   `fuzzy_match_hay`, `:809`). Action: delete both, and drop `fuzzy_match` from
+   the re-export at `hrdr-agent/src/lib.rs:183` (keep
+   `fuzzy_filter`/`fuzzy_match_hay`, which stay used).
+
+2. **Delete the identity no-op `filetime_from`.**
+   `hrdr-agent/src/store_lock.rs:719` is literally
+   `fn filetime_from(t: SystemTime) -> SystemTime { t }`; its sole caller `:423`
+   is a no-op rebind, and the comment above it describes `set_mtime`, not this
+   fn. Test-only (`#[cfg(unix)]`). Action: delete the fn and the
+   `let old = filetime_from(old);` line (use `old` directly).
+
+3. **Needless `Option<String>` clone in the session-saved notice.**
+   `hrdr-tui/src/app/session.rs:312-313` clones `state().id` to dodge the
+   `&mut self` borrow on `self.system`. Action: materialize the notice first —
+   `let notice = hrdr_app::session_saved_notice(self.state().id.as_deref().unwrap_or_default());`
+   then `self.system(notice)`. Same class as the shipped `--model` fix.
+
+4. **Duplicated lowercase-hex SHA-256 (new from `00989fd`).**
+   `hrdr-llm/src/media.rs:708-712` is byte-for-byte the same derivation as
+   `hrdr-agent/src/attachment_store.rs:145-150` (`digest_hex`). Action: add
+   `pub fn sha256_hex(bytes: &[u8]) -> String` in hrdr-llm (beside
+   `Attachment`), use it at `media.rs:708`, and make
+   `attachment_store::digest_hex` a one-line delegate. hrdr-agent already
+   depends on hrdr-llm (`Cargo.toml:11`); both pin `sha2`, so no new dependency.
+
+5. **Duplicated discovery-refresh block — resolves with correctness finding
+   #3.** `hrdr-tui/src/app.rs:2570-2572` (`apply_cwd`) and
+   `hrdr-tui/src/app/commands.rs:185-187` (`reload_cmd`) are identical (discover
+   commands + discover skills + bump). Action: extract one private
+   `fn rediscover(&mut self, cwd: &Path)` and call it from both — and from
+   `cwd_changed` (`commands.rs:417`), which today does the commands half only;
+   folding it in also fixes correctness finding #3 (stale `:skill` completion).
+
+6. **Duplicated timeout-floor-note append.**
+   `hrdr-tools/src/tools/verify.rs:212-218` and `:229-235` are the same
+   `if let Some(asked) = raised_from { … }` block. Action: extract
+   `fn append_timeout_note(s: &mut String, raised_from: Option<u64>)` and call
+   it from `report_failure`/`report_pass`.
+
+7. **Duplicated todos snapshot under lock.** `hrdr-tui/src/app/session.rs:166`
+   and `:303` both do
+   `self.todos.lock().map(|t| t.clone()).unwrap_or_default()`. Action: extract
+   `fn todos_snapshot(&self) -> Vec<TodoItem>`; the two mutation sites stay.
+
+**Dropped as not-tidy:** `confirm_identity_with`/`Entitlements` re-export
+(deliberate DI seam, same shape as `ask_to_trust`); `split_fence`/
+`discover_agent_profiles` `pub`→`pub(crate)` (marginal, lib.rs is the intended
+surface); `account_digest` thin wrapper (names a domain concept, ~15 call sites
+— DRY not indirection); O_EXCL lock-create loop duplication across
+`try_reserve`/`acquire_open_lock`/`StoreLock::acquire` (already declined —
+different contention/error policies); `digest_hex` (hrdr-agent) vs
+`Attachment::sha256` (hrdr-llm) (different crates — now candidate 4);
+`active_completions` cloning `Completions` (callers need owned;
+`Option<&Completions>` conflicts with the `&mut app` writes in scope);
+`editor.content()` allocating per cache hit (perf/API question, out of tidy
+scope); `spinner_live` vs `in_flight`/`running` (genuinely different
+predicates); platform-gated twin fns (deliberate `#[cfg]` splits, project
+idiom); `chrome_line` vs `chrome_fragment` (differ: newline vs flush);
+`replace_model_choices` inline re-filter (clearer than `refilter()`'s reset);
+retry.rs lowercase copies (one-liners across differing input types);
+`sha256: Arc<str>` field (deliberate O(1)-clone choice).
+
+**Coverage:** hrdr-editor read in full; hrdr-app `lib.rs`/`sessions.rs`/
+`themes.rs`/`effort.rs`/`palette.rs`/`pane.rs`/`transcript.rs`/`subagents.rs`/
+`helpers.rs`; hrdr-agent `auth.rs`/`paths.rs`/`hooks.rs`/`usage.rs`/
+`turn_state.rs`/`store_lock.rs`/`attachment_store.rs`/`validate.rs`/`models.rs`;
+hrdr-tui `completion.rs`/`selector.rs`/`util.rs`/`session.rs`; hrdr-tools
+`verify.rs`; `hrdr-test-support`; `apps/hrdr/src/main.rs`; plus the diffs of the
+recent commits. GAP: not line-by-line — the bulk of `hrdr-tools/src/tools/*` and
+`mcp/*`, `hrdr-llm` `client.rs`/`anthropic.rs`/`codex.rs`/`sse.rs`/`pdf.rs`/
+`fs.rs`, `hrdr-tui` `app.rs`/`ui.rs`/`theme.rs`/`trust_prompt.rs`,
+`hrdr-tui/src/app/e2e.rs` (test-only), and the large `hrdr-agent` modules
+(`lib.rs` body, `prompt.rs`, `session.rs` beyond the lock sections,
+`delegation.rs`, `compaction.rs`, `config.rs`).
