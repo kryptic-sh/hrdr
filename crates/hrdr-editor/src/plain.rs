@@ -138,12 +138,16 @@ impl PlainEngine {
     }
 
     fn delete_word(&mut self) {
-        while self.cursor > 0 && self.chars[self.cursor - 1].is_whitespace() {
-            self.backspace();
+        let mut start = self.cursor;
+        while start > 0 && self.chars[start - 1].is_whitespace() {
+            start -= 1;
         }
-        while self.cursor > 0 && !self.chars[self.cursor - 1].is_whitespace() {
-            self.backspace();
+        while start > 0 && !self.chars[start - 1].is_whitespace() {
+            start -= 1;
         }
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+        self.invalidate_layout();
     }
 
     fn kill_to_line_start(&mut self) {
@@ -231,11 +235,13 @@ impl EditorEngine for PlainEngine {
     }
 
     fn paste(&mut self, text: &str) {
-        for c in text.chars() {
-            if c != '\r' {
-                self.insert(c);
-            }
-        }
+        // One splice instead of a per-char `Vec::insert`: a pasted block is
+        // O(n) memmoves total rather than O(n²).
+        let chars: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
+        let n = chars.len();
+        self.chars.splice(self.cursor..self.cursor, chars);
+        self.cursor += n;
+        self.invalidate_layout();
     }
 }
 
@@ -351,6 +357,19 @@ mod tests {
         type_str(&mut e, "foo bar");
         e.feed_key(ctrl('w'));
         assert_eq!(e.content(), "foo ");
+    }
+
+    /// A paste inserts at the cursor in one batch and drops `\r` (Windows line
+    /// endings) while keeping `\n` — the same contract the per-char path had.
+    #[test]
+    fn paste_inserts_at_the_cursor_and_drops_carriage_returns() {
+        let mut e = PlainEngine::new();
+        type_str(&mut e, "ab");
+        e.left();
+        e.paste("XY");
+        assert_eq!(e.content(), "aXYb");
+        e.paste("\r\n");
+        assert_eq!(e.content(), "aXY\nb");
     }
 
     /// Wide (CJK) glyphs are 2 display columns each: wrapping and cursor
