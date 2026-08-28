@@ -193,10 +193,22 @@ pub fn rank_file_matches(files: &[(String, String)], query: &str) -> Vec<String>
             }
         })
         .collect();
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+    // Only the top 8 are ever returned, but the index can hold tens of
+    // thousands of entries, so sorting all of them on every `@` keystroke is
+    // O(F log F). Select the 8 smallest in O(F), then order just those — the
+    // comparator is a strict total order (tier, then length, then path), so the
+    // selected set matches the full sort's prefix exactly.
+    let order = |a: &(u8, usize, &String), b: &(u8, usize, &String)| {
+        a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2))
+    };
+    let keep = scored.len().min(8);
+    if keep < scored.len() {
+        scored.select_nth_unstable_by(keep - 1, &order);
+    }
+    scored[..keep].sort_by(&order);
     scored
         .into_iter()
-        .take(8)
+        .take(keep)
         .map(|(_, _, p)| p.clone())
         .collect()
 }
@@ -499,6 +511,25 @@ mod tests {
                 .first()
                 .map(String::as_str),
             Some("docs/README")
+        );
+    }
+
+    /// Over an index larger than the returned cap, the top-8 selection must
+    /// produce exactly the prefix the full sort would — same entries, same
+    /// order. The per-keystroke path is now O(F) selection rather than a full
+    /// O(F log F) sort, so this pins that the two agree.
+    #[test]
+    fn rank_file_matches_caps_at_eight_in_sorted_order() {
+        // 12 equal-length names, all matching the empty query: the tie-break is
+        // lexicographic, so the first 8 of the sorted list win.
+        let files: Vec<(String, String)> = (0..12)
+            .map(|i| format!("f{i:02}.txt"))
+            .map(|p| (p.clone(), p.clone()))
+            .collect();
+        let out = rank_file_matches(&files, "");
+        assert_eq!(
+            out,
+            (0..8).map(|i| format!("f{i:02}.txt")).collect::<Vec<_>>()
         );
     }
 
