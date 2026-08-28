@@ -2211,6 +2211,17 @@ impl App {
         self.completion_generation += 1;
     }
 
+    /// Re-discover the project's commands and skills for `cwd` and invalidate the
+    /// completion cache. Every site that moves the agent to a new directory (or
+    /// reloads discovery) goes through this, so `:command` and `:skill`
+    /// completion never serves a stale set — the callers are `cwd_changed`,
+    /// `apply_cwd` and `reload_cmd`.
+    fn rediscover(&mut self, cwd: &std::path::Path) {
+        self.commands = hrdr_app::discover_commands(cwd, self.project_instructions);
+        self.skills = hrdr_app::discover_skills(cwd, self.project_instructions);
+        self.bump_completion_generation();
+    }
+
     /// Interrupt whatever [`Self::in_flight`] reports, and say whether there was
     /// anything to interrupt. The one cancel path behind both Esc and Ctrl+C.
     fn cancel_in_flight(&mut self) -> bool {
@@ -2567,9 +2578,7 @@ impl App {
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
         self.arm_file_watcher(&new);
-        self.commands = hrdr_app::discover_commands(&new, self.project_instructions);
-        self.skills = hrdr_app::discover_skills(&new, self.project_instructions);
-        self.bump_completion_generation();
+        self.rediscover(&new);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does

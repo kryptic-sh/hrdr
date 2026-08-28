@@ -9577,6 +9577,41 @@ async fn completing_a_turn_bumps_the_completion_generation() {
     );
 }
 
+/// `/cwd` into a trusted directory rediscovers BOTH commands and skills: a skill
+/// that only the old directory had is no longer offered as a `:name` completion.
+/// (Regression: `TuiHost::cwd_changed` refreshed commands but left `skills` as
+/// the previous directory's set.)
+#[tokio::test]
+async fn cwd_changes_rediscover_skills_for_the_new_directory() {
+    let mut h = Harness::new(vec![]).await;
+    let old = std::path::PathBuf::from(h.app.current_cwd());
+    // A skill that exists only in the starting directory.
+    let bundle = old.join(".hrdr/skills/foo");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: foo\ndescription: only the old dir has this skill\n---\nbody",
+    )
+    .unwrap();
+    // Refresh through the real command so the shipped discovery path runs.
+    h.submit("/reload").await;
+    assert!(
+        h.app.skills.skills.iter().any(|s| s.name == "foo"),
+        "sanity: the old directory's skill is discovered"
+    );
+
+    // A fresh, trusted directory with no such skill.
+    let new = tempfile::tempdir().unwrap();
+    let new_path = new.path().canonicalize().unwrap();
+    hrdr_agent::trust::trust(&new_path).expect("record the trust answer");
+    h.submit(&format!("/cwd {}", new_path.display())).await;
+
+    assert!(
+        !h.app.skills.skills.iter().any(|s| s.name == "foo"),
+        "the old directory's skill must not survive /cwd"
+    );
+}
+
 /// `@file` completion sees files that appear *after* its index was built. A
 /// recursive watcher on the cwd invalidates the cache on create/rename/remove,
 /// so a file added by a `git pull`, another shell, or the agent's own write
