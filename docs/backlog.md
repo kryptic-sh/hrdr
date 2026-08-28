@@ -2673,7 +2673,9 @@ re-lowering per `/next`/`/prev` (command-frequency, not per-keystroke). GAP:
 split across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate was re-traced at its cited lines by the sweep lead before recording.
-**Status: 3 findings (1 medium, 2 low) — all actionable, none yet shipped.**
+**Status: all 3 shipped 2026-08-28 — `40bdb6f` (session-lock release via the
+pid-guard), `94090bf` (completion-cache bump on turn end), `d541dde` (skills on
+`/cwd`).**
 
 1. **Medium — `Session::save` still removes the reservation lock by path,
    defeating the pid-guard added in `2823fc2`.** `hrdr-agent/src/session.rs:867`
@@ -2787,8 +2789,8 @@ by the 2026-08-14 passes; their cleared items were not re-derived.
 across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate was re-traced at its cited lines by the sweep lead before recording.
-**Status: 1 finding (low) — actionable; 1 new hardening note; the rest
-cleared.**
+**Status: the finding shipped 2026-08-28 (`d8e181d`); 1 new hardening note; the
+rest cleared.**
 
 1. **Low — `read_blob` joins an untrusted `sha256` without the 64-hex check, so
    a crafted session file reads arbitrary paths (existence/size oracle, not
@@ -2890,9 +2892,9 @@ lost-update (the correctness medium).
 `:tidy` over the whole tree (working tree clean at the time), split across two
 read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read
-at its cited lines by the sweep lead; behavior-preserving only. **Status: 7
-cleanups — 1 dead code (high value), 6 low-value duplications; none yet
-applied.**
+at its cited lines by the sweep lead; behavior-preserving only. **Status: all 7
+applied 2026-08-28 — `d541dde` (rediscover), `be89e1a` (dead code), `c10a38f`
+(sha256_hex), `9302af8` (three extractions).**
 
 1. **Delete dead `fuzzy_match` + `fuzzy_match_q`.**
    `hrdr-agent/src/models.rs:771` and `:782` are orphaned by the 2026-08-14
@@ -2979,9 +2981,10 @@ recent commits. GAP: not line-by-line — the bulk of `hrdr-tools/src/tools/*` a
 `:perf` over the whole tree (working tree clean at the time), split across two
 read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced
-at its cited lines by the sweep lead. **Status: 5 actionable (1 per-keystroke
-selection, 2 medium, 1 small, 1 micro) + 1 deliberate-tradeoff revisit; none yet
-applied.**
+at its cited lines by the sweep lead. **Status: 3 shipped 2026-08-28 (`5e3516b`
+file ranking, `77c7b80` editor batch, `3619655` clock hoist), 1 declined, 1
+micro left, 1 deliberate-tradeoff revisit — see the note after the coverage
+section.**
 
 1. **`rank_file_matches` sorts the whole 20k-file index per keystroke, then
    keeps 8.** `hrdr-app/src/completion.rs:178-201` builds a `Vec` of up to
@@ -3056,3 +3059,14 @@ line-by-line — `hrdr-tools/src/sandbox.rs`, `lsp.rs`, `shell.rs`, `watch.rs`,
 `mcp/*`, `hooks.rs`, `guardrails.rs`, `verification.rs`, `proc.rs`, `web.rs`
 (mostly per-tool-call frequency); `apps/hrdr/src/main.rs` (startup only);
 `hrdr-test-support` (test-only).
+
+**Disposition (2026-08-28):** findings 1, 3 and 4 shipped. Finding 2
+(`HighlightCache`) was investigated and declined: the renderer
+(`highlight_lines` in `hrdr-tui/src/ui.rs`) has to emit owned `Span<'static>`s,
+so the committed prefix's `String`s are cloned on every render regardless — the
+proposed `Arc<Vec<HlLine>>` return only saves the inner-`Vec` allocations, and
+the dominant cost is the per-frame full re-render, which is the already-tracked
+transcript-render-walk gap. Finding 5 (SSE line-buffer capacity) is left
+unapplied: self-labelled micro, and preserving the buffer means a method
+extraction on the correctness-critical decoder for a win dwarfed by the round
+trip.
