@@ -811,8 +811,7 @@ impl<'a> Document<'a> {
         }
 
         let mut pos = 0usize;
-        for pair in index.chunks_exact(2) {
-            let [first, count] = pair else { return None };
+        for [first, count] in index.as_chunks::<2>().0 {
             let start = u32::try_from(*first).ok()?;
             let count = u32::try_from(*count).ok()?;
             for i in 0..count {
