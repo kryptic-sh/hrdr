@@ -777,6 +777,14 @@ impl Client {
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
+                // Never follow a redirect: a 307/308 replay carries the auth
+                // headers (`x-api-key`/`api-key`/Bearer) verbatim to the new
+                // host — reqwest's `remove_sensitive_headers` strips only
+                // Authorization/Cookie on a cross-host hop, so the others
+                // would leak to a host the user never authorized (including an
+                // https→http downgrade). POST chat endpoints never
+                // legitimately redirect.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("building the HTTP client")?,
             base_url,
@@ -925,6 +933,9 @@ impl Client {
         let mut builder = reqwest::Client::builder();
         let dur = timeout.unwrap_or(std::time::Duration::from_secs(300));
         builder = builder.connect_timeout(dur).read_timeout(dur);
+        // Same redirect policy as `try_new`: auth headers must never ride a
+        // 307/308 to a host the user didn't configure.
+        builder = builder.redirect(reqwest::redirect::Policy::none());
         if let Ok(http) = builder.build() {
             self.http = http;
         }
@@ -1950,6 +1961,59 @@ mod tests {
     #[test]
     fn try_new_succeeds_with_a_normal_base_url() {
         assert!(Client::try_new("https://api.openai.com/v1", None, "gpt-5.6").is_ok());
+    }
+
+    /// A `307` pointing at another host must NOT be followed: the replay would
+    /// carry the `x-api-key`/`api-key`/Bearer headers verbatim to a host the
+    /// user never authorized (reqwest strips only Authorization/Cookie on a
+    /// cross-host hop). The client returns the redirect as an error and the
+    /// second listener never sees a request.
+    #[tokio::test]
+    async fn client_does_not_follow_a_redirect_to_another_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // The target the redirect would point at; records whether it was hit.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit_clone = hit.clone();
+        tokio::spawn(async move {
+            if target.accept().await.is_ok() {
+                hit_clone.store(true, std::sync::atomic::Ordering::SeqCst)
+            }
+        });
+
+        // The origin: answers every request with 307 → target.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = origin.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target_addr}/v1/models\r\ncontent-length: 0\r\n\r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+
+        let client = Client::try_new(
+            format!("http://{origin_addr}/v1"),
+            Some("sekrit-key".into()),
+            "m",
+        )
+        .expect("client");
+        let err = client.list_models().await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("redirect"),
+            "the redirect surfaces as an error, not a silent follow: {err}"
+        );
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::SeqCst),
+            "the 307 target must never receive the key-bearing request"
+        );
     }
 
     /// A message with attachments has its string `content` rewritten into a
