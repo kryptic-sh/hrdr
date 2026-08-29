@@ -413,11 +413,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         });
     }
     fn cwd_changed(&mut self, new: &std::path::Path) {
-        self.app.dir = hrdr_app::display_dir(new);
-        self.app.branch = hrdr_app::git_branch(new);
-        self.app.file_index_cwd = None; // rebuild @-completion for the new dir
-        self.app.arm_file_watcher(new);
-        self.app.rediscover(new);
+        self.app.apply_cwd_view(new);
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl

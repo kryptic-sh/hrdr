@@ -2616,11 +2616,18 @@ impl App {
     /// Switch the tools' working directory: update the agent and the status bar.
     fn apply_cwd(&mut self, new: std::path::PathBuf) {
         self.with_agent(|a| a.set_cwd(new.clone()));
-        self.dir = display_dir(&new);
-        self.branch = git_branch(&new);
+        self.apply_cwd_view(&new);
+    }
+
+    /// The status-bar half of a cwd change — what every directory switch has in
+    /// common, whether the agent's cwd was set here or the agent itself reported
+    /// a change (see [`TuiHost::cwd_changed`](crate::app::commands::TuiHost)).
+    fn apply_cwd_view(&mut self, new: &std::path::Path) {
+        self.dir = display_dir(new);
+        self.branch = git_branch(new);
         self.file_index_cwd = None; // force a rebuild for the new directory
-        self.arm_file_watcher(&new);
-        self.rediscover(&new);
+        self.arm_file_watcher(new);
+        self.rediscover(new);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does
