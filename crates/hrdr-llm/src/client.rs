@@ -7,11 +7,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use serde::Deserialize;
 
 use crate::capped_read::{MAX_DIAGNOSTIC_BYTES, MAX_LOG_FILE_BYTES, MAX_STRUCTURED_JSON_BYTES};
-use crate::sse::{SseDecoder, SseOverflow};
+use crate::sse::SseDecoder;
 use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, Role, ToolDef};
 
 /// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
@@ -1485,51 +1485,8 @@ impl Client {
             // buffered whole and decoded only when its line is complete.
             let mut decoder = SseDecoder::new();
             loop {
-                // On EOF, `finish()` flushes a final `data:` line that had no
-                // blank-line terminator (lenient servers end with `data: [DONE]\n`
-                // rather than a spec `\n\n`), so the sentinel isn't lost.
-                let (events, at_eof) = match bytes.next().await {
-                    Some(chunk) => {
-                        // A transport error mid-body (connection reset, WiFi blip)
-                        // is safe to retry — the reply was partial. Type it as
-                        // Transient so the agent retry loop catches it; an untyped
-                        // anyhow error would print only "reading stream chunk" and
-                        // slip past the classifier.
-                        let bytes = chunk.map_err(|e| ChatError {
-                            status: None,
-                            retry_after,
-                            kind: ChatErrorKind::Transient,
-                            message: format!(
-                                "incomplete stream: transport error mid-response \
-                                 ({e}) (partial response, safe to retry)"
-                            ),
-                        })?;
-                        if decoder.push(&bytes).is_err() {
-                            let _ = decoder.drain(); // discard truncated events
-                            Err(ChatError {
-                                status: None,
-                                retry_after,
-                                kind: ChatErrorKind::Other,
-                                message: SseOverflow.to_string(),
-                            })?;
-                        }
-                        (decoder.drain(), false)
-                    }
-                    None => {
-                        // If overflow was flagged during the stream, the final
-                        // events may be truncated — never parse them.
-                        let events = match decoder.finish() {
-                            Ok(events) => events,
-                            Err(_) => Err(ChatError {
-                                status: None,
-                                retry_after,
-                                kind: ChatErrorKind::Other,
-                                message: SseOverflow.to_string(),
-                            })?,
-                        };
-                        (events, true)
-                    }
-                };
+                let (events, at_eof) =
+                    crate::sse::next_sse_events(&mut decoder, &mut bytes, retry_after).await?;
                 for ev in events {
                     let data = ev.data.trim();
                     if data.is_empty() {
@@ -1946,6 +1903,7 @@ pub(crate) async fn serve_once(body: &'static str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use serde_json::json;
 
     /// The chat-completions body for `messages`, through the same path a real

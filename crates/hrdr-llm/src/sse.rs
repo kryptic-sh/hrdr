@@ -263,6 +263,69 @@ impl Default for SseDecoder {
     }
 }
 
+/// One step of the per-chunk SSE drain shared by every backend's `chat_stream`
+/// loop: pull the next byte chunk (or EOF) off `bytes`, feed it to `decoder`,
+/// and return the complete events plus whether the stream ended. Errors are
+/// typed the same way in all three backends — a mid-body transport error is
+/// `Transient` (the reply was partial, safe to retry; an untyped error would
+/// slip past the agent's retry classifier), and overflow is `Other` — so the
+/// retry loop classifies them identically no matter which backend produced
+/// them.
+///
+/// On EOF, `finish()` flushes a final `data:` line that had no blank-line
+/// terminator (lenient servers end with `data: [DONE]\n` rather than a spec
+/// `\n\n`), so a trailing event isn't lost — and if overflow was flagged
+/// during the stream, the final events may be truncated, so they're never
+/// parsed.
+pub(crate) async fn next_sse_events<B, E>(
+    decoder: &mut SseDecoder,
+    bytes: &mut (impl futures_util::Stream<Item = Result<B, E>> + Unpin),
+    retry_after: Option<std::time::Duration>,
+) -> Result<(Vec<SseEvent>, bool), crate::client::ChatError>
+where
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures_util::StreamExt;
+    match bytes.next().await {
+        Some(chunk) => {
+            let chunk = chunk.map_err(|e| crate::client::ChatError {
+                status: None,
+                retry_after,
+                kind: crate::client::ChatErrorKind::Transient,
+                message: format!(
+                    "incomplete stream: transport error mid-response ({e}) \
+                     (partial response, safe to retry)"
+                ),
+            })?;
+            if decoder.push(chunk.as_ref()).is_err() {
+                let _ = decoder.drain(); // discard truncated events
+                return Err(crate::client::ChatError {
+                    status: None,
+                    retry_after,
+                    kind: crate::client::ChatErrorKind::Other,
+                    message: SseOverflow.to_string(),
+                });
+            }
+            Ok((decoder.drain(), false))
+        }
+        None => {
+            let events = match decoder.finish() {
+                Ok(events) => events,
+                Err(_) => {
+                    return Err(crate::client::ChatError {
+                        status: None,
+                        retry_after,
+                        kind: crate::client::ChatErrorKind::Other,
+                        message: SseOverflow.to_string(),
+                    });
+                }
+            };
+            Ok((events, true))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

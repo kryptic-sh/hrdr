@@ -3224,40 +3224,35 @@ checked arithmetic in `parse_imf_fixdate` (review finding 3, dup here).
 `:tidy` over the whole tree (clean), split across three sub-agents; every
 candidate verified at its cited lines (top items by the sweep lead; clippy
 `--workspace --all-targets --all-features -D warnings` is clean in all crates —
-compiler-verified dead code is none anywhere). **Status: seven items shipped
+compiler-verified dead code is none anywhere). **Status: eight items shipped
 2026-08-30 (capture_overflow_error hoisted to types.rs; url_host doc fixed;
 Gate::matched → is_whole; join_roots/join_paths merged; four whitespace-collapse
 copies → collapse_whitespace; apply_cwd/cwd_changed share apply_cwd_view; the
-five doc-rot sites rewritten — including the dead `[forbidden_flag]` link); six
-items open — recorded, not applied.** Findings 1–2 of wave 1 and 1–4 of wave 3
-are safe, behavior-preserving dedups; nothing behavior-changing proposed.
+five doc-rot sites rewritten — including the dead `[forbidden_flag]` link; the
+triplicated SSE drain is one `sse::next_sse_events`); five items open —
+recorded, not applied.** Findings 1–2 of wave 1 and 1–4 of wave 3 are safe,
+behavior-preserving dedups; nothing behavior-changing proposed.
 
-1. **Triplicated per-chunk SSE drain/error block across all three backends** —
-   `client.rs`, `anthropic.rs`, `codex.rs`: each `chat_stream` loop builds the
-   same three `ChatError`s (mid-body Transient, push-overflow, finish-overflow).
-   Extract one async helper in `sse.rs` (which owns the decoder +
-   `SseOverflow`); the per-backend "ended without X" message stays at each call
-   site. Verified identical across all three.
-2. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
+1. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
    — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
    the two tail arms differ only in marker wording. Route all arms through
    shared helpers.
-3. **`cached_body`/`cached_block` same cache helper, different maps** —
+2. **`cached_body`/`cached_block` same cache helper, different maps** —
    `hrdr-tui/src/ui.rs`: identical lookup-filter-else-render-insert shape. One
    generic `cached<C,K>`; `cached_block` a thin wrapper.
-4. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
+3. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
    reimplements `common::drain_pty` line-for-line (verified identical);
    isolated-child env table copied 5× across headless/headless_tty/trust_pty/
    tui_pty — one `common::isolated_env` helper; `chrome_line`/ `chrome_fragment`
    one function with two flag settings (`apps/hrdr/src/main.rs`);
    `run_hrdr_inner` a pure middleman — delete, point callers at
    `run_hrdr_inner_with_home`.
-5. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
+4. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
    `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
    arms): extract a private `place()` helper; the hard-break arm is a genuine
    variant — leave it. (The related `PlainEngine::layout` String→Vec<char>
    round-trip is low value — flagged, not proposed.)
-6. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
+5. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
    (`verification.rs`) are the identical Format…Test mapping in two private fns,
    but the maintainer's comment at `gate.rs` documents keeping them apart
    ("three different questions"). Merging is behavior-identical today but

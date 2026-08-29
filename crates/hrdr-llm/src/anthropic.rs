@@ -20,10 +20,9 @@
 //! [`Accumulator`]: crate::Accumulator
 
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::sse::{SseDecoder, SseOverflow};
+use crate::sse::SseDecoder;
 
 use crate::types::{
     CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, Role, TokenDetails, ToolDef, Usage,
@@ -668,49 +667,8 @@ pub(crate) async fn chat_stream(
         // ignored (ev.event is unused). Splitting on 0x0A is safe for UTF-8.
         let mut decoder = SseDecoder::new();
         loop {
-            // On EOF, `finish()` flushes a final `data:` line that arrived
-            // without a blank-line terminator, so a trailing `message_stop`
-            // event isn't lost (which would falsely look like a cut stream).
-            let (events, at_eof) = match bytes.next().await {
-                Some(chunk) => {
-                    // Type a mid-body transport error as Transient (safe to
-                    // retry); an untyped error would slip past the agent's
-                    // retry classifier.
-                    let chunk = chunk.map_err(|e| crate::client::ChatError {
-                        status: None,
-                        retry_after,
-                        kind: crate::client::ChatErrorKind::Transient,
-                        message: format!(
-                            "incomplete stream: transport error mid-response \
-                             ({e}) (partial response, safe to retry)"
-                        ),
-                    })?;
-                    if decoder.push(&chunk).is_err() {
-                        let _ = decoder.drain(); // discard truncated events
-                        Err(crate::client::ChatError {
-                            status: None,
-                            retry_after,
-                            kind: crate::client::ChatErrorKind::Other,
-                            message: SseOverflow.to_string(),
-                        })?;
-                    }
-                    (decoder.drain(), false)
-                }
-                None => {
-                    // If overflow was flagged during the stream, the final
-                    // events may be truncated — never parse them.
-                    let events = match decoder.finish() {
-                        Ok(events) => events,
-                        Err(_) => Err(crate::client::ChatError {
-                            status: None,
-                            retry_after,
-                            kind: crate::client::ChatErrorKind::Other,
-                            message: SseOverflow.to_string(),
-                        })?,
-                    };
-                    (events, true)
-                }
-            };
+            let (events, at_eof) =
+                crate::sse::next_sse_events(&mut decoder, &mut bytes, retry_after).await?;
             for sse_ev in events {
                 let data = &sse_ev.data;
                 if data.is_empty() { continue; }
@@ -1131,6 +1089,7 @@ fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
 mod tests {
     use super::*;
     use crate::types::{FunctionCall, MessageOrigin, ToolCall};
+    use futures_util::StreamExt;
 
     fn sys(t: &str) -> ChatMessage {
         ChatMessage::system(t)
