@@ -608,12 +608,20 @@ impl ToolContext {
 /// an implementation detail.
 pub struct TrackedSigs(Vec<(FileSig, PathBuf)>);
 
+/// Collapse every run of whitespace to a single space and trim the ends — the
+/// one spelling of "flatten to a single-spaced line", shared by the four places
+/// that need it (web query collapsing, memory frontmatter flattening, command
+/// shortening, edit near-match detection) so a fix lands once.
+pub(crate) fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// A shell command shortened for an error message: whitespace collapsed (a
 /// heredoc or line-continuation must not spray across the message) and cut to
 /// `MAX` characters. The model only needs to recognize *which* command ran.
 fn shorten_command(command: &str) -> String {
     const MAX: usize = 80;
-    let flat = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = collapse_whitespace(command);
     if flat.chars().count() <= MAX {
         return flat;
     }

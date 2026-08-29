@@ -392,9 +392,10 @@ impl Tool for EditTool {
             } else {
                 // The #1 retry cause: right text, wrong whitespace. Detect it
                 // and say so instead of the generic error.
-                let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
-                let normalized_old = norm(&a.old_string);
-                if !normalized_old.is_empty() && norm(&text).contains(&normalized_old) {
+                let normalized_old = crate::collapse_whitespace(&a.old_string);
+                if !normalized_old.is_empty()
+                    && crate::collapse_whitespace(&text).contains(&normalized_old)
+                {
                     bail!(
                         "old_string not found in {}, but a near-match differing only in \
                          whitespace/indentation exists — copy the exact text from read \

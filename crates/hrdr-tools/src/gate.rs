@@ -170,7 +170,7 @@ impl Gate {
             let want = normalized_tokens(&check.command);
             !want.is_empty() && run.iter().any(|got| want.iter().all(|t| got.contains(t)))
         })?;
-        let run_whole = classify(command).is_some_and(|(_, s)| s == Scope::Whole);
+        let run_whole = is_whole(command);
         let scope = if run_whole || !is_whole(&check.command) {
             Scope::Whole
         } else {

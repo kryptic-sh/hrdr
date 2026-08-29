@@ -801,9 +801,10 @@ fn attr_value(tag: &str, attr: &str) -> Option<String> {
     }
 }
 
-/// Collapse all runs of whitespace to single spaces and trim.
+/// Collapse all runs of whitespace to single spaces and trim — see
+/// [`crate::collapse_whitespace`].
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::collapse_whitespace(s)
 }
 
 /// Percent-encode a query string (RFC 3986 unreserved kept; space → `%20`).

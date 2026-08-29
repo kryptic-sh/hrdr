@@ -303,7 +303,7 @@ impl SandboxPolicy {
                  You may write only under: {}{}. Keep work inside your working directory; \
                  use the scratch dir for throwaway files.",
                 shown.display(),
-                join_paths(&self.project_writable_roots()),
+                join_paths(self.project_writable_roots()),
                 self.cache_roots_clause()
             )
         }
@@ -322,7 +322,7 @@ impl SandboxPolicy {
             "sandbox: refusing to read {} — this agent is strictly confined and may read only \
              under: {}.",
             shown.display(),
-            join_roots(&self.readable_roots)
+            join_paths(&self.readable_roots)
         )
     }
 }
@@ -348,21 +348,16 @@ fn is_under_any(canon: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| canon.starts_with(root))
 }
 
-/// The roots as the refusal messages list them.
-fn join_roots(roots: &[PathBuf]) -> String {
-    roots
-        .iter()
-        .map(|r| r.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// [`join_roots`] for a borrowed set — what
-/// [`SandboxPolicy::project_writable_roots`] returns.
-fn join_paths(paths: &[&Path]) -> String {
+/// The paths as the refusal messages list them — one helper for owned roots
+/// and borrowed sets alike.
+fn join_paths<I, P>(paths: I) -> String
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
     paths
-        .iter()
-        .map(|r| r.display().to_string())
+        .into_iter()
+        .map(|r| r.as_ref().display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1015,7 +1010,7 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
     } else {
         format!(
             "writable here: {}{}",
-            join_paths(&policy.project_writable_roots()),
+            join_paths(policy.project_writable_roots()),
             policy.cache_roots_clause(),
         )
     };

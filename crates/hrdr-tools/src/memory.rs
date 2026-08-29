@@ -936,9 +936,8 @@ fn load_memories(root: &Path) -> Store {
     store
 }
 
-/// Collapse a frontmatter value to a single line of single-spaced text, for the
-/// renderers that put one memory on one line (the `MEMORY.md` pointer index,
-/// `search` hits, the recall header).
+/// Collapse a frontmatter value to a single line of single-spaced text — see
+/// [`crate::collapse_whitespace`] for the shared helper.
 ///
 /// A `description` may legitimately contain newlines, and a raw one would split
 /// a pointer across two lines — corrupting the index the way the truncating
@@ -946,7 +945,7 @@ fn load_memories(root: &Path) -> Store {
 /// the render, never at parse time: the stored value keeps its newlines, so
 /// nothing is lost on the way back to disk.
 fn flatten_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::collapse_whitespace(s)
 }
 
 /// Rebuild `MEMORY.md` from the memory files: pointers grouped by type (user,
