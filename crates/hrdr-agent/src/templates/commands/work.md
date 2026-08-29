@@ -43,7 +43,14 @@ commit.
      before moving on.
 
 6. **Keep the backlog honest as you go.** When an item is done, DELETE it from
-   `docs/backlog.md` (`git log` is the record of completed work); leave
-   guidance-needed items in place, and add anything this session raised but left
-   unfinished. Finish by reporting what was worked, what was left and why, and
-   what still needs the user.
+   `docs/backlog.md` — a closed item has no place in the one-file work list.
+   Finished work is tracked in `git log` and, when the project keeps a
+   changelog, in `CHANGELOG.md`: add the completed item under the matching
+   Keep-a-Changelog section of `CHANGELOG.md` (Added / Changed / Fixed /
+   Removed / Deprecated / Security, under `## [Unreleased]`) in the SAME change,
+   naming the API, file or behavior that changed rather than restating the
+   backlog entry. The backlog says what is still open; the changelog + git log
+   say what shipped — an item that left the backlog without a changelog entry
+   is work that shipped without a record. Leave guidance-needed items in place,
+   and add anything this session raised but left unfinished. Finish by reporting
+   what was worked, what was left and why, and what still needs the user.

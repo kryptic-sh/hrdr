@@ -24,5 +24,6 @@
   Otherwise the only record is a conversation nobody reopens, and the next
   session rediscovers it from nothing. Name symbols and files rather than line
   numbers — line numbers rot — and when an entry is finally done, DELETE it
-  rather than annotating it as finished; `git log` is the history, and a backlog
-  full of closed items is one nobody reads.
+  rather than annotating it as finished; its record moves to the changelog
+  (an entry under `## [Unreleased]` in the same commit as the work, per the
+  changelog rule above), and a backlog full of closed items is one nobody reads.
