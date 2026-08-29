@@ -2843,7 +2843,7 @@ mod attachment_tests {
             queued.sent
         );
         assert!(
-            queued.sent.contains("Image 1: shot.png"),
+            queued.sent.contains("Image 1: `shot.png`"),
             "and the image is named, since every dialect renders it before the text: {:?}",
             queued.sent
         );
@@ -2984,7 +2984,7 @@ mod attachment_tests {
             crate::Steer::plain("brief")
                 .with_labelled_attachments(mine)
                 .sent,
-            "brief\n\n--- Attached files ---\nImage 1: shot.png\n",
+            "brief\n\n--- Attached files ---\nImage 1: `shot.png`\n",
             "and labelled in the form the user's path uses"
         );
     }

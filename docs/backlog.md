@@ -3121,8 +3121,9 @@ test-support full except the Windows-only wrapper (read, not run).
 
 `:audit` over the whole tree (clean), split across four sub-agents by crate;
 every finding re-verified at its cited lines. **1 medium, 5 low; 0 high. Overall
-risk low-to-moderate; safe to ship as-is.** **Status: findings 2 and 5 shipped
-2026-08-30 (MCP parse error truncated to 500 bytes; `Policy::none()` on both
+risk low-to-moderate; safe to ship as-is.** **Status: findings 2, 3 and 5
+shipped 2026-08-30 (MCP parse error truncated to 500 bytes; attachment filenames
+escaped and backtick-quoted in sub-agent prompts; `Policy::none()` on both
 client builders so auth headers never ride a cross-host 307/308 — each with a
 regression test that failed before the fix); the rest open.**
 

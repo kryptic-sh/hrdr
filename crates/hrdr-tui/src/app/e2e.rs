@@ -10434,7 +10434,7 @@ async fn an_at_mentioned_image_is_sent_as_an_attachment() {
             .unwrap_or_default()
     };
     assert!(
-        labelled.contains("Image 1: shot.png"),
+        labelled.contains("Image 1: `shot.png`"),
         "the label block travels with the bytes: {labelled}"
     );
 }
@@ -10565,7 +10565,7 @@ async fn an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent() {
     );
     assert_eq!(queued.attachments[0].filename(), "shot.png");
     assert!(
-        queued.sent.contains("Image 1: shot.png"),
+        queued.sent.contains("Image 1: `shot.png`"),
         "labelled for the sub-agent's model too: {:?}",
         queued.sent
     );

@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!(
             steer.sent,
             "what is @shot.png and @report.pdf\n\n--- Attached files ---\n\
-             Image 1: shot.png\nDocument 1: report.pdf\n"
+             Image 1: `shot.png`\nDocument 1: `report.pdf`\n"
         );
         assert_eq!(steer.attachments.len(), 2);
     }
@@ -1532,7 +1532,7 @@ mod tests {
         // The label block trails the delegation directive it belongs to.
         let sent = out.into_steer("@explore what is @shot.png").sent;
         assert!(
-            sent.ends_with("--- Attached files ---\nImage 1: shot.png\n"),
+            sent.ends_with("--- Attached files ---\nImage 1: `shot.png`\n"),
             "{sent}"
         );
     }
@@ -1555,9 +1555,9 @@ mod tests {
 
         let steer = out.into_steer("compare @shot.png with this");
         assert!(
-            steer
-                .sent
-                .ends_with("--- Attached files ---\nImage 1: shot.png\nImage 2: pasted-1.png\n"),
+            steer.sent.ends_with(
+                "--- Attached files ---\nImage 1: `shot.png`\nImage 2: `pasted-1.png`\n"
+            ),
             "{}",
             steer.sent
         );
@@ -1640,7 +1640,7 @@ mod tests {
         let steer = out.into_steer("what is this");
         assert_eq!(
             steer.sent,
-            "what is this\n\n--- Attached files ---\nImage 1: pasted-1.png\n"
+            "what is this\n\n--- Attached files ---\nImage 1: `pasted-1.png`\n"
         );
     }
 }
