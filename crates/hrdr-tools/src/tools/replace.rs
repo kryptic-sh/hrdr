@@ -335,6 +335,17 @@ fn collect_files(
             continue;
         }
         let path = entry.into_path();
+        // `.git` is never a rewrite (or diff-disclosure) target: the walker's
+        // `hidden(false)` descends into it, and the deny-list has no `.git` arm,
+        // so without this the sweep could rewrite `refs/heads/main` (a 40-hex
+        // SHA matches a broad literal like `a` with near-certainty), `config`
+        // (remote URLs), `packed-refs` or the hooks — corrupting the repo and
+        // diffing its metadata into the transcript. `find`/`grep`/`tree` stay
+        // out by skipping dotfiles entirely; `replace` must keep walking
+        // dotfiles (a sweep may target `.github/`), so it skips `.git` alone.
+        if path.components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
         // Never a rewrite (or diff-disclosure) target: mirrors the `read`/
         // `grep` deny-list so a broad `replace` can't touch a `.env` etc.
         if crate::secret_file_reason(&crate::canonicalize_nearest(&path)).is_some() {
@@ -427,6 +438,44 @@ mod tests {
 
     async fn read(path: &std::path::Path) -> String {
         tokio::fs::read_to_string(path).await.unwrap()
+    }
+
+    /// `.git` metadata is never a rewrite target: the walker's `hidden(false)`
+    /// descends into it, and without the `.git`-component skip a broad literal
+    /// like `a` matches the 40-hex SHA in `refs/heads/main` (p ≈ 92%) and
+    /// corrupts the repo. The sweep must leave `.git` files byte-identical
+    /// while still walking dotfiles (a `.github/` file below is rewritten).
+    #[tokio::test]
+    async fn replace_never_rewrites_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        // A real-ish repo head ref, containing `a` many times.
+        let head = dir.path().join(".git/refs/heads/main");
+        write(&head, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n").await;
+        // A dotfile outside `.git` that the sweep SHOULD rewrite.
+        write(&dir.path().join(".github/workflows/ci.yml"), "on: a\n").await;
+
+        let out = ReplaceTool
+            .execute(
+                json!({"pattern": "a", "replace": "b", "literal": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains(".github"),
+            "dotfiles outside .git still swept:\n{out}"
+        );
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("--- a/.git/") || l.starts_with("+++ b/.git/")),
+            "no .git file appears in the diff:\n{out}"
+        );
+        assert_eq!(
+            read(&head).await,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "the branch ref must survive a sweeping `a`→`b` replace"
+        );
     }
 
     #[tokio::test]

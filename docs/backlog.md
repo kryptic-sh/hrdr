@@ -3079,26 +3079,10 @@ trip.
 five sub-agents by crate area; every finding re-verified at its cited lines by
 the sweep lead before recording (the `replace`→`.git` one empirically, with the
 pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
-(no defects — five hardening items, top two spot-checked). **Status: all open —
+(no defects — five hardening items, top two spot-checked). **Status: item 1
+shipped 2026-08-30 (`.git`-component skip + regression test); items 2-6 open —
 recorded, not fixed.**
 
-1. **`replace` walks and rewrites `.git` metadata — HIGH.** `collect_files`
-   (`hrdr-tools/src/tools/replace.rs`) is the only walker in the crate that
-   builds `ignore::WalkBuilder::new(root).hidden(false)`; the shared
-   `ignore_walker` used by `grep`/`find`/`tree` skips dotfiles. Empirically
-   confirmed with the same builder args: the walk yields `.git/config`,
-   `.git/refs/heads/main`, `.git/HEAD`, hooks, packed-refs etc. Nothing
-   downstream refuses them — `secret_file_reason` has no `.git` arm,
-   `resolve_write` passes (`.git` is under the cwd writable root), and the diff
-   is written via `apply_file_change`/`atomic_write`. Repro: repo with one
-   commit; `replace` `{"pattern": "a", "replace": "b", "literal": true}` — the
-   40-hex SHA in `.git/refs/heads/main` contains `a` with p≈92%, so the branch
-   ref is rewritten to a bogus object and `git log`/`git status` fail with "bad
-   object"; `.git/config` (remote URLs), `packed-refs`, `description` equally in
-   scope, and their contents are diffed into the transcript. Fix: reuse the
-   shared `ignore_walker` (skip dotfiles by default) or skip any component named
-   `.git`. Expect: only project files change. Actual: `.git` internals
-   rewritten.
 2. **`memory write` for a name the loader skips reports success and silently
    loses the memory — MEDIUM.** `safe_stem` (`hrdr-tools/src/memory.rs`) has no
    reserved-stem check, but `load_memories` deliberately skips exactly
