@@ -3079,22 +3079,11 @@ trip.
 five sub-agents by crate area; every finding re-verified at its cited lines by
 the sweep lead before recording (the `replace`→`.git` one empirically, with the
 pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
-(no defects — five hardening items, top two spot-checked). **Status: item 1
-shipped 2026-08-30 (`.git`-component skip + regression test); items 2-6 open —
-recorded, not fixed.**
+(no defects — five hardening items, top two spot-checked). **Status: items 1-2
+shipped 2026-08-30 (`.git`-component skip + reserved-stem refusal, each with a
+regression test that failed before the fix); items 3-6 open — recorded, not
+fixed.**
 
-2. **`memory write` for a name the loader skips reports success and silently
-   loses the memory — MEDIUM.** `safe_stem` (`hrdr-tools/src/memory.rs`) has no
-   reserved-stem check, but `load_memories` deliberately skips exactly
-   `MEMORY.md` and `index.md`. Repro: `memory write name=index …` — writes
-   `index.md`, rebuilds `MEMORY.md` (which lists nothing), and the memory is
-   invisible to the pointer index, `search`, `recall` forever (`view` still
-   reads it). On a case-insensitive filesystem a name slugging to `memory`
-   resolves to the same file as the generated `MEMORY.md`: the write stomps the
-   index and `rebuild_index` rewrites the index over the memory. Expect: the
-   memory lists and recalls like any other. Actual: written but uncountable.
-   Fix: refuse the reserved stems `index`/`memory` (case-insensitively) in
-   `safe_stem`, like the Windows device-name refusal already there.
 3. **Pre-1970 `Retry-After` IMF-fixdate overflows — debug panic, release 60 s
    wait — LOW.** `parse_imf_fixdate` (`hrdr-llm/src/client.rs`) contract says
    "None on … past dates"; for pre-1970 dates `days_from_civil` is negative (my

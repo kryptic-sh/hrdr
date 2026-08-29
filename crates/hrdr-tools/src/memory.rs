@@ -402,6 +402,19 @@ fn safe_stem(name: &str) -> Result<String> {
              (with any extension) — pick another name"
         );
     }
+    // The two exact names the loader skips (`load_memories` — `MEMORY.md` is the
+    // generated pointer index, `index.md` its sibling) — slugified, so the case
+    // is already folded. Writing one of these would report success and then be
+    // invisible to the index, `search` and `recall` forever; and on a
+    // case-insensitive filesystem a `memory` slug resolves to the same file as
+    // the generated `MEMORY.md`, so the write stomps the index and `rebuild_index`
+    // stomps the memory. Refuse, as loudly as the device names.
+    if matches!(slug.as_str(), "index" | "memory") {
+        bail!(
+            "memory name '{name}' slugs to '{slug}', which is reserved for the generated \
+             pointer index (MEMORY.md) — pick another name"
+        );
+    }
     Ok(slug)
 }
 
@@ -1637,6 +1650,47 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("'{name}' is not a device name: {e}"));
+        }
+    }
+
+    /// `index` and `memory` are the two exact stems the loader skips (`index.md`
+    /// and the generated `MEMORY.md` pointer index). A `write` with either must
+    /// refuse loudly — the alternative is a memory that reports "saved" and then
+    /// never lists in the index, `search` or `recall` (or, on a case-insensitive
+    /// filesystem, stomps the generated `MEMORY.md` itself). Case is folded by
+    /// slugification, so every spelling of the stem is caught.
+    #[tokio::test]
+    async fn reserved_index_and_memory_stems_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        for name in ["index", "INDEX", "Index", "memory", "MEMORY", "Memory"] {
+            let r = tool
+                .execute(
+                    json!({"action": "write", "name": name, "description": "d"}),
+                    &ctx,
+                )
+                .await;
+            let err = match r {
+                Err(e) => format!("{e}"),
+                Ok(ok) => panic!("'{name}' must be refused, got: {ok}"),
+            };
+            assert!(
+                err.contains("reserved for the generated"),
+                "'{name}': {err}"
+            );
+        }
+
+        // Close spellings are not reserved — only the exact stems the loader
+        // skips.
+        for name in ["indexed", "memory-map", "memories"] {
+            tool.execute(
+                json!({"action": "write", "name": name, "description": "d"}),
+                &ctx,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("'{name}' is not a reserved stem: {e}"));
         }
     }
 
