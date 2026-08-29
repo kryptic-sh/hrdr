@@ -3262,18 +3262,26 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
 /// before the text ever becomes a `Span`.
 const TAB_WIDTH: usize = 4;
 
-/// Tabs expanded, for any raw text on its way into a [`Span`].
+/// Tabs expanded, and terminal control characters neutralized, for any raw
+/// text on its way into a [`Span`].
 ///
 /// Every path that turns bytes we did not write into block-body lines goes
 /// through here: tool results, shell command bodies, code previews, plain text.
 /// Miss one and that pane alone renders `\t`-indented output clumped against
 /// the margin — which is exactly how this was found, in `read` and `!command`
 /// output, after only [`text_lines`] had been fixed.
+///
+/// The same single point is where a hostile ESC lands and is defused: a file's
+/// contents or a `!command`'s output can carry any byte, and a raw ESC written
+/// to the terminal hides the cursor, clears the screen, or spoofs a prompt.
+/// [`sanitize_for_terminal`](hrdr_editor::sanitize_for_terminal) replaces
+/// every control char with a visible cell before the text becomes a `Span`.
 pub(crate) fn expand_tabs(raw: &str) -> String {
-    if !raw.contains('\t') {
-        return raw.to_string();
+    let sanitized = hrdr_editor::sanitize_for_terminal(raw);
+    if !sanitized.contains('\t') {
+        return sanitized;
     }
-    raw.replace('\t', &" ".repeat(TAB_WIDTH))
+    sanitized.replace('\t', &" ".repeat(TAB_WIDTH))
 }
 
 /// Split plain text into styled block-body lines (no padding — [`render_block`]
@@ -3294,9 +3302,15 @@ fn markdown_lines(
     bg: Color,
     width: u16,
 ) -> Vec<Line<'static>> {
+    // Prose and code pass through hjkl's renderers, not through
+    // [`expand_tabs`] — so the ESC-neutralizing sanitizer has to run here,
+    // on the raw markdown, before either path paints a cell. The model's own
+    // reply is the surface a prompt injection would ride; a raw ESC in it
+    // must not reach the terminal.
+    let text = hrdr_editor::sanitize_for_terminal(text);
     let mut buf = Vec::new();
     let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
-    for ev in hjkl_markdown::parse(text) {
+    for ev in hjkl_markdown::parse(&text) {
         if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
             if !ev_buf.is_empty() {
                 buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));

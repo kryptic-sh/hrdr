@@ -134,6 +134,50 @@ pub(crate) fn char_width(c: char) -> usize {
     c.width().unwrap_or(0)
 }
 
+/// The single-cell glyph that replaces a control character on its way to the
+/// terminal.
+///
+/// One cell, deliberately: the editor's wrap layout and cursor `positions`
+/// are computed over the *original* buffer chars, so a replacement that
+/// rendered as several cells (an escaped `\x1b` spelling) would drift every
+/// cursor and wrap measurement after it. A width-1 glyph keeps every
+/// measurement exact while still making the hidden control visible.
+const CONTROL_REPLACEMENT: char = '·';
+
+/// Replace terminal control characters (C0: `0x00`–`0x1F`, `0x7F`) with a
+/// single visible cell, so hostile text — a file's contents read through a
+/// tool, a `!command`'s output, a pasted blob, a directory name on the trust
+/// screen — cannot inject ESC sequences into the user's terminal (hide the
+/// cursor, clear the screen, spoof a prompt).
+///
+/// The two layout controls are kept: `\t` (the TUI expands it before
+/// rendering, and the editor measures it) and `\n` (the line structure).
+/// Everything else a terminal would act on — ESC first among them — becomes
+/// `·`. The underlying data is untouched; only the painted form is sanitized.
+///
+/// Returns `raw` unchanged (a fresh `String`) when there is nothing to
+/// replace, so the hot per-frame render path pays nothing when the text is
+/// clean.
+pub fn sanitize_for_terminal(raw: &str) -> String {
+    // Fast path on CHARS, not bytes: C1 controls (U+0080–U+009F) are two-byte
+    // in UTF-8, so a byte scan misses them and would return them unchanged.
+    if !raw
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n'))
+    {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\t' | '\n' => out.push(c),
+            c if c.is_control() => out.push(CONTROL_REPLACEMENT),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Word-wrapping layout — shared by the sizing and rendering halves of
 // [`plain::PlainEngine`] so both count and visual lines agree.
@@ -630,5 +674,37 @@ mod wrap_tests {
     fn only_newlines() {
         assert_eq!(rows("\n", 10), 2);
         assert_eq!(rows("\n\n", 10), 3);
+    }
+
+    // ── sanitize_for_terminal ──────────────────────────────────────────────
+
+    /// Control characters (ESC above all) are replaced with a single visible
+    /// cell, so a hostile file/tool/`!command` output can never reach the
+    /// terminal as a live escape sequence. Layout controls survive; clean text
+    /// is returned as a fresh String unchanged.
+    #[test]
+    fn control_chars_are_replaced_with_a_single_cell() {
+        // ESC + a screen-clearing CSI sequence: the whole attack. Only the ESC
+        // bytes are controls; the `[2J`/`[H` bodies are printable and stay as
+        // readable (inert) text.
+        assert_eq!(
+            sanitize_for_terminal("\x1b[2J\x1b[H"),
+            "·[2J·[H",
+            "every ESC becomes one visible cell, the rest stays readable"
+        );
+        // Bell, tab (kept — the TUI expands it), newline (kept), DEL.
+        assert_eq!(sanitize_for_terminal("a\x07b"), "a·b");
+        assert_eq!(sanitize_for_terminal("a\tb"), "a\tb");
+        assert_eq!(sanitize_for_terminal("a\nb"), "a\nb");
+        assert_eq!(sanitize_for_terminal("a\x7fb"), "a·b");
+        // C1 controls too (0x80–0x9F as UTF-8), not just C0.
+        assert_eq!(sanitize_for_terminal("a\u{0085}b"), "a·b");
+        // Clean text passes through byte-for-byte.
+        assert_eq!(sanitize_for_terminal("plain text"), "plain text");
+        // Every replacement is exactly one cell wide, so the editor's cursor
+        // and wrap math (computed over the original chars) stay exact.
+        for c in sanitize_for_terminal("\x1b\x07\x00").chars() {
+            assert_eq!(char_width(c), 1, "{c:?} must render as one cell");
+        }
     }
 }

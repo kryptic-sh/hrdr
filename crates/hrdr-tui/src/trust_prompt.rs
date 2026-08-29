@@ -121,7 +121,10 @@ fn run_menus(
             ),
             Line::raw(""),
             Line::styled(
-                format!("  {}", cwd.display()),
+                format!(
+                    "  {}",
+                    hrdr_editor::sanitize_for_terminal(&cwd.display().to_string())
+                ),
                 Style::default().fg(theme.accent),
             ),
             Line::raw(""),

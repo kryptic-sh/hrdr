@@ -8153,6 +8153,55 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     );
 }
 
+/// A `!command` printing raw ESC sequences must not reach the terminal as a
+/// live escape — the render sanitizer replaces control bytes with a visible
+/// cell before they become buffer symbols. Without it, `\x1b[2J` (clear
+/// screen) or `\x1b[?25l` (hide cursor) would be written straight through.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hostile_shell_outputs_esc_never_reaches_the_terminal_buffer() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    // `printf` is a bash builtin, so no external binary is needed.
+    h.type_str(r"!printf 'esc:\x1b[2J\x1b[?25l done'");
+    h.press(KeyCode::Enter);
+
+    // Drain the shell's events until the block closes.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv()).await {
+            Ok(Some(msg)) => h.app.on_turn_msg(msg),
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+    h.app.verbose = true;
+    let screen = h.render();
+    assert!(screen.contains("esc:"), "the output is on screen: {screen}");
+    assert!(
+        screen.contains("done"),
+        "the output after the escape is on screen: {screen}"
+    );
+    assert!(
+        !screen.contains('\x1b'),
+        "no raw ESC byte reaches the rendered buffer: {screen:?}"
+    );
+    // The escape is defused, not deleted: the CSI body stays readable as text.
+    assert!(
+        screen.contains("·[2J") || screen.contains("·[?25l"),
+        "the ESC is replaced by a visible cell: {screen:?}"
+    );
+}
+
 /// `:!command` is the `!` shell escape under the ex-style prefix — vim
 /// muscle memory types `:!git status` and means the shell, not a command
 /// named `!`. It takes the exact `!` path: no model turn spawns, the
