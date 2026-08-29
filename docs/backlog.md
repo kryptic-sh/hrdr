@@ -3500,7 +3500,57 @@ O(n²) _shape_ is certain), and whether hrdr-app's `PaneSet::sync` drains every
 agent's events deque per tick (a pane nobody renders would retain every delta);
 tui/app/editor — draw path, event loop, ticker, spinner-live, both engines,
 highlight cache, todo panel traced; `hjkl_markdown`/syntect internals assumed
-linear (not measured); absolute per-frame times need a profile. hrdr-llm — its
-perf pass was still running when this section was written; its findings get
-appended here when it lands (the crate was fully walked by this sweep's review
-and audit passes regardless).
+linear (not measured); absolute per-frame times need a profile. hrdr-llm —
+findings below were appended after the section was written.
+
+### hrdr-llm (appended 2026-08-30)
+
+18. **HIGH — per-token String clone in `Accumulator::push`** —
+    `hrdr-llm/src/types.rs` `push`: `choice.delta.content.clone()` (a heap alloc
+    - memcpy per streamed token) is only returned so the caller can render the
+      delta; the chunk is owned and dropped right after (`hrdr-agent`
+      `turn_loop` `drain_stream`). The matching reasoning clone lives in the
+      caller (`turn_loop.rs` `on_event(AgentEvent::Reasoning(r.clone()))` per
+      thinking token; `types.rs` then `push_str`s the same text again). ~2
+      removable allocations per token on the hottest loop in the crate; a
+      10K-token turn is 10–20K fewer allocs. Fix: `push(chunk: ChatChunk) ->
+      Result<Option<String>, …
+      > ` taking the delta by value (`std::mem::take`), caller moves the chunk in; the reasoning case extracts `reasoning_content.take()`before push.`push`is`pub`,
+      > but the only production caller is that one site.
+19. **MEDIUM — catalog cross-provider re-scan every request** —
+    `hrdr-llm/src/catalog.rs`: every `chat_stream` runs
+    `input_modalities_cached(None, …)` and often `max_output_cached(None, …)`;
+    `provider=None` skips the keyed branch and falls into the full
+    cross-provider scan (measured: 207 providers, 7,483 model entries), plus a
+    `std::fs::metadata` syscall + global-Mutex lock per lookup (`cached_read`).
+    For local/llama.cpp sessions the model id never matches, so every request
+    pays the whole scan (tens of µs). Fix: memoize lookup results per
+    `(catalog mtime, provider, model)` in a static map, mirroring the existing
+    mtime-keyed `CATALOG_LOAD_CACHE`.
+20. **LOW — SSE decoder scans byte-at-a-time** — `hrdr-llm/src/sse.rs` `push`:
+    one branch + len check per streamed byte (~1–2 MB for a 10K-token turn ≈
+    1–2M iterations). Fix: find line ends with `memchr` and split chunks into
+    lines in one pass. (`flush_line`'s `from_utf8_lossy` is a borrow-only `Cow`
+    on valid UTF-8 — no per-line alloc on the hot path; confirmed.)
+21. **LOW — per-event `data.contains("\"error\"")` pre-scan** —
+    `hrdr-llm/src/client.rs`: a full O(len) scan of every SSE event just to pick
+    a parse branch, immediately before an O(len) `serde_json::from_str` —
+    doubles the scan per token. Fix: parse directly and fall back to the
+    error-path only when the result is an all-defaults chunk carrying `error`.
+22. **LOW — per-fragment alloc in Codex arg streaming** —
+    `hrdr-llm/src/codex.rs`: `state.args_streamed.insert(fc_id.to_string())` per
+    `function_call_arguments.delta` fragment. Fix: insert only on the first
+    fragment (`if !contains`), or key the set by `u64` hash. Hot only during
+    tool-calling rounds.
+
+**Checked, not problems (hrdr-llm):** full-history re-serialization per request
+is inherent (each backend needs the whole history; OpenAI fast path already
+skips the `Value` tree when no grafts apply; wire log off by default); per-event
+JSON parse is the wire itself; accumulator `String` growth is amortized
+geometric; tool-slot `resize_with` amortized and capped; `resolved_model` lock
+never held across `.await`; pdf/image parse runs once at attach then cached as
+`Cost`; `pdf_page_count`'s `windows().position()` is not O(n²) (cursor only
+moves forward); catalog `cached_read` cold read happens once per mtime. Not
+settled without profiling: how much of per-token CPU the JSON parse dominates;
+true per-request catalog-scan µs; per-attachment base64 wall time. The
+deliberate per-request base64 tradeoff is recorded above.
