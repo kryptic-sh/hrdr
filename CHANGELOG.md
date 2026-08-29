@@ -6,6 +6,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`replace` no longer rewrites `.git` metadata.** The sweep's file walker
+  skips any path under `.git` — previously a broad literal like `a` matched the
+  40-hex SHA in `refs/heads/main` with near-certainty and rewrote it, corrupting
+  the repo (`git log`/`git status` fail with "bad object") and diffing its
+  internals into the transcript. Dotfiles outside `.git` (`.github/`) are still
+  swept.
+- **`memory write` refuses the reserved names `index` and `memory`.** These slug
+  to `index.md`/`MEMORY.md`, which the loader skips — a write reported success
+  and then never listed in the index, `search` or `recall` (and on a
+  case-insensitive filesystem could stomp the generated index itself). The
+  refusal names the reserved stem, like the Windows device-name check.
+- **`Retry-After` IMF-fixdate parsing is bounded against overflow.** A pre-1970
+  date (negative day count) or an absurd field previously panicked debug builds
+  (`attempt to multiply with overflow`) on a server-supplied header, or stalled
+  release builds for 60 s. RFC 7231 bounds (4-digit year, hour 00-23, min/sec
+  00-59) and a sign check make such values a parse failure — `None`, as the
+  contract documents.
+- **Cancelling a `!command` no longer double-finishes when its own `ToolEnd` is
+  already queued.** The abort races the task's final send; the drained event
+  used to re-run the end-of-shell plumbing — a second history note, a duplicate
+  autosave, and a turn launch right after the user asked to stop — and a stale
+  `ToolEnd` draining after a newer `!command` started could null the newer
+  shell's tracking. The aborted shell's id is marked so its late `ToolEnd` is a
+  no-op, and any event not belonging to the tracked shell is dropped.
+- **`--auto-compact` with an unparseable value warns instead of being silently
+  ignored.** A mistyped toggle (e.g. `--auto-compact falze`) kept compaction on
+  with no error; it now prints a warning naming the flag and the kept value,
+  like the `--sandbox` arm and the `$HRDR_AUTO_COMPACT` env warning.
+- **MCP parse errors truncate the response body to 500 bytes.** A non-JSON
+  response up to the 10 MiB cap was interpolated whole into the tool error,
+  which reaches the model unwrapped — a per-call context blow-up and an
+  instruction-injection channel through the harness's own error channel. The
+  error now names the truncated body, matching the non-success arm.
+- **LLM clients never follow HTTP redirects.** A 307/308 replayed the
+  `x-api-key`/`api-key`/Bearer headers verbatim to a host the user never
+  configured (reqwest strips only Authorization/Cookie on a cross-host hop, and
+  only when redirects are followed). `Policy::none()` turns the redirect into an
+  error instead.
+- **Attachment filenames are escaped and quoted in sub-agent prompts.** The
+  basename of an attached file — attacker-controlled on a cloned or audited
+  checkout, and newline is legal in POSIX filenames — was rendered verbatim into
+  the sub-agent's opening message, framing hostile text as a fact. Control
+  characters now become visible `\n`-style spellings (no real newline survives
+  to open a turn boundary) and backticks are doubled so the name cannot break
+  out of its quote.
+- **A jailed sub-agent's workspace map is built from its own `cwd`.** A
+  `prisoner` scoped to `vendor/sketchy` was briefed with the whole parent's
+  layout — context it cannot read and must not trust. The map is now walked from
+  the resolved sub-agent scope; write/read agents are unchanged (their resolved
+  cwd is the parent's).
+- **Terminal control characters are neutralized at the render entry points.** A
+  file read through a tool, a `!command`'s output, a pasted blob or a hostile
+  directory name could carry raw ESC bytes into the terminal — clearing the
+  screen, hiding the cursor, or spoofing a prompt. A single sanitizer
+  (`hrdr_editor::sanitize_for_terminal`) replaces every control char (C0 and C1,
+  ESC first) with a single visible cell at the block-body choke point, the
+  markdown renderers, the editor pane and the trust-prompt cwd line.
+
 ## [0.14.0] - 2026-08-29
 
 ### Breaking
