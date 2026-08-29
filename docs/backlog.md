@@ -3229,70 +3229,53 @@ checked arithmetic in `parse_imf_fixdate` (review finding 3, dup here).
 `:tidy` over the whole tree (clean), split across three sub-agents; every
 candidate verified at its cited lines (top items by the sweep lead; clippy
 `--workspace --all-targets --all-features -D warnings` is clean in all crates —
-compiler-verified dead code is none anywhere). **Status: all open — recorded,
-not applied.** Findings 1–2 of wave 1 and 1–4 of wave 3 are safe,
-behavior-preserving dedups; nothing behavior-changing proposed.
+compiler-verified dead code is none anywhere). **Status: items 1 and 3-6 shipped
+2026-08-30 (capture_overflow_error hoisted to types.rs; url_host doc fixed;
+Gate::matched → is_whole; join_roots/join_paths merged; four whitespace-collapse
+copies → collapse_whitespace); items 2 and 7-13 open — recorded, not applied.**
+Findings 1–2 of wave 1 and 1–4 of wave 3 are safe, behavior-preserving dedups;
+nothing behavior-changing proposed.
 
-1. **Byte-identical `capture_overflow_error` duplicated** — `anthropic.rs` and
-   `codex.rs` (both `hrdr-llm/src/`): same name, body, doc. Hoist one
-   `pub(crate)` copy beside `stream_overflow_error` (`types.rs`) and call from
-   both. Verified byte-identical.
 2. **Triplicated per-chunk SSE drain/error block across all three backends** —
    `client.rs`, `anthropic.rs`, `codex.rs`: each `chat_stream` loop builds the
    same three `ChatError`s (mid-body Transient, push-overflow, finish-overflow).
    Extract one async helper in `sse.rs` (which owns the decoder +
    `SseOverflow`); the per-backend "ended without X" message stays at each call
    site. Verified identical across all three.
-3. **Stale doc comment** — `client.rs` `url_host` still says "duplicated in
-   hrdr-agent… keep both in sync", but hrdr-agent now imports it (`config.rs`
-   `use hrdr_llm::{…, url_host}`). Drop the sentence.
-4. **`Gate::matched` re-derives what `is_whole` already is** —
-   `hrdr-tools/src/gate.rs`:
-   `classify(command).is_some_and(|(_, s)| s == Scope::Whole)` duplicated
-   between the call site and the file's own `is_whole` helper (which has no
-   other caller). Call `is_whole(command)`.
-5. **`join_roots`/`join_paths` same function over different slice types** —
-   `hrdr-tools/src/sandbox.rs`: identical bodies (`&[PathBuf]` vs `&[&Path]`).
-   Merge into one generic over `AsRef<Path>`.
-6. **Whitespace collapse implemented four times in one crate** — `web.rs`
-   `collapse_ws`, `memory.rs` `flatten_line`, `lib.rs` `shorten_command`'s
-   `flat`, `tools/edit.rs` `norm` closure: all
-   `split_whitespace().collect::<Vec<_>>().join(" ")`. Promote one `pub(crate)`
-   helper; three callers switch.
-7. **`apply_cwd` and `TuiHost::cwd_changed` duplicate their view-update tail** —
+3. **`apply_cwd` and `TuiHost::cwd_changed` duplicate their view-update tail** —
    `hrdr-tui/src/app.rs` vs `app/commands.rs`: both do `display_dir` +
    `git_branch` + `file_index_cwd = None` + `arm_file_watcher` + `rediscover`
    with identical comments. Extract `apply_cwd_view(&mut self, new)`.
-8. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
+4. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
    — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
    the two tail arms differ only in marker wording. Route all arms through
    shared helpers.
-9. **`cached_body`/`cached_block` same cache helper, different maps** —
+5. **`cached_body`/`cached_block` same cache helper, different maps** —
    `hrdr-tui/src/ui.rs`: identical lookup-filter-else-render-insert shape. One
    generic `cached<C,K>`; `cached_block` a thin wrapper.
-10. **Doc-comment rot — 5 sites** — orphaned/merged comment blocks in
-    `hrdr-tools/src/guardrails.rs`, `lsp.rs`, `tools/secret_diff.rs` (incl. a
-    dead intra-doc link `[forbidden_flag]`), `sandbox.rs` (`seatbelt_args` doc
-    attached to the wrong constant), and `hrdr-tui/src/app.rs` test `transcript`
-    doc.
-11. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
-    reimplements `common::drain_pty` line-for-line (verified identical);
-    isolated-child env table copied 5× across headless/headless_tty/trust_pty/
-    tui_pty — one `common::isolated_env` helper; `chrome_line`/
-    `chrome_fragment` one function with two flag settings
-    (`apps/hrdr/src/main.rs`); `run_hrdr_inner` a pure middleman — delete, point
-    callers at `run_hrdr_inner_with_home`.
-12. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
-    `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
-    arms): extract a private `place()` helper; the hard-break arm is a genuine
-    variant — leave it. (The related `PlainEngine::layout` String→Vec<char>
-    round-trip is low value — flagged, not proposed.)
-13. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
-    (`verification.rs`) are the identical Format…Test mapping in two private
-    fns, but the maintainer's comment at `gate.rs` documents keeping them apart
-    ("three different questions"). Merging is behavior-identical today but
-    overturns a stated decision — left alone unless the duplication is wanted on
-    principle.
+6. **Doc-comment rot — 5 sites** — orphaned/merged comment blocks in
+   `hrdr-tools/src/guardrails.rs`, `lsp.rs`, `tools/secret_diff.rs` (incl. a
+   dead intra-doc link `[forbidden_flag]`), `sandbox.rs` (`seatbelt_args` doc
+   attached to the wrong constant), and `hrdr-tui/src/app.rs` test `transcript`
+   doc.
+7. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
+   reimplements `common::drain_pty` line-for-line (verified identical);
+   isolated-child env table copied 5× across headless/headless_tty/trust_pty/
+   tui_pty — one `common::isolated_env` helper; `chrome_line`/ `chrome_fragment`
+   one function with two flag settings (`apps/hrdr/src/main.rs`);
+   `run_hrdr_inner` a pure middleman — delete, point callers at
+   `run_hrdr_inner_with_home`.
+8. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
+   `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
+   arms): extract a private `place()` helper; the hard-break arm is a genuine
+   variant — leave it. (The related `PlainEngine::layout` String→Vec<char>
+   round-trip is low value — flagged, not proposed.)
+9. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
+   (`verification.rs`) are the identical Format…Test mapping in two private fns,
+   but the maintainer's comment at `gate.rs` documents keeping them apart
+   ("three different questions"). Merging is behavior-identical today but
+   overturns a stated decision — left alone unless the duplication is wanted on
+   principle.
 
 **Dropped (would change behavior):** `is_env_assignment` in guardrails vs
 verification accept _different_ syntax; `split_shell_words` deliberately
