@@ -384,8 +384,22 @@ fn parse_imf_fixdate(raw: &str) -> Option<std::time::Duration> {
     let min: u64 = parts.next()?.parse().ok()?;
     let sec: u64 = parts.next()?.parse().ok()?;
 
+    // RFC 7231 §7.1.1.1 bounds: year is 4 digits (0000-9999), hour 00-23,
+    // minute and second 00-59. Enforcing them keeps the arithmetic below
+    // overflow-free: a hostile `Retry-After` — a pre-1970 date, a `year` that
+    // is `i32::MIN` (where `days_from_civil` would overflow on `year - 1`), an
+    // absurd hour — must parse as a failure, never panic a debug build.
+    if !(0..=9999).contains(&year) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
     let days = days_from_civil(year, month, day)?;
-    let total_secs = days as u64 * 86400 + hour * 3600 + min * 60 + sec;
+    // `days` is negative for pre-1970 dates. Cast to `u64` would wrap to
+    // ~2^64 and overflow the ×86400 below — a debug panic on a server-supplied
+    // header, or a 2^64-saturated wait otherwise. A past date is `None` per the
+    // contract above, so refuse it before the multiply.
+    let days = u64::try_from(days).ok()?;
+    let total_secs = days * 86400 + hour * 3600 + min * 60 + sec;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4176,6 +4190,24 @@ mod tests {
                 retry_after_from_headers(&retry_after_header(junk)),
                 None,
                 "{junk:?} must not parse as a delay"
+            );
+        }
+
+        // A hostile server's date-shaped values must be parse failures, not
+        // arithmetic panics: a pre-1970 date (negative `days` — casting to u64
+        // wraps to ~2^64 and the ×86400 overflows), a year at `i32::MIN` (where
+        // `days_from_civil`'s `year - 1` overflows), and a field past its RFC
+        // bound (`hour * 3600` would overflow a debug build).
+        for hostile in [
+            "Wed, 01 Jan 1958 00:00:00 GMT",
+            "Tue, 31 Dec 1969 23:59:59 GMT",
+            "Xyz, 01 Jan -2147483648 00:00:00 GMT",
+            "Xyz, 01 Jan 9999 24:00:00 GMT",
+        ] {
+            assert_eq!(
+                retry_after_from_headers(&retry_after_header(hostile)),
+                None,
+                "{hostile:?} must not parse as a delay (and must not panic)"
             );
         }
     }

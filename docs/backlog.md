@@ -3079,22 +3079,11 @@ trip.
 five sub-agents by crate area; every finding re-verified at its cited lines by
 the sweep lead before recording (the `replace`→`.git` one empirically, with the
 pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
-(no defects — five hardening items, top two spot-checked). **Status: items 1-2
-shipped 2026-08-30 (`.git`-component skip + reserved-stem refusal, each with a
-regression test that failed before the fix); items 3-6 open — recorded, not
-fixed.**
+(no defects — five hardening items, top two spot-checked). **Status: items 1-3
+shipped 2026-08-30 (`.git`-component skip, reserved-stem refusal, and RFC-7231
+bounds in `parse_imf_fixdate` — each with a regression test that failed before
+the fix); items 4-6 open — recorded, not fixed.**
 
-3. **Pre-1970 `Retry-After` IMF-fixdate overflows — debug panic, release 60 s
-   wait — LOW.** `parse_imf_fixdate` (`hrdr-llm/src/client.rs`) contract says
-   "None on … past dates"; for pre-1970 dates `days_from_civil` is negative (my
-   recompute of `days_from_civil(1958, 1, 1)` = −4383) and `days as u64 * 86400`
-   at the day-count multiply overflows. Repro:
-   `Retry-After: Wed, 01 Jan 1958 00:00:00 GMT` on any response (incl. a 200 SSE
-   stream) — debug builds panic `attempt to multiply with overflow`; release
-   wraps ≈2⁶⁴ and clamps to `MAX_BACKOFF` → a 60 s stall for a date 68 years in
-   the past. Expect: `None`. Actual: panic / 60 s wait. Fix: sign-check before
-   the multiply (`u64::try_from(days).ok()?`), and `checked_mul` for the hour
-   term. Cross-listed under audit (flagged by both passes).
 4. **`cancel_user_shell` races the shell's already-delivered `ToolEnd` — LOW.**
    (`hrdr-tui/src/app.rs`): between the final `ToolEnd` channel send completing
    and the task being marked finished, the cancel path records `(cancelled)` and
@@ -3213,14 +3202,14 @@ no `Command::new` on untrusted input anywhere, hooks' `{path}` POSIX-quoted;
 path traversal in sandbox/memory/diff headers; unbounded allocation / fd
 exhaustion — every seam capped (shell lines 8 KiB, fetch/web bodies byte-capped,
 MCP 10 MiB/60 s, LSP 16 MiB, `replace` projected-output caps 64 MiB); integer
-overflow — saturating arithmetic throughout (except the Retry-After case, which
-is review-finding 3 and this pass's finding 5 dup); TOCTOU on reads open-first
-guard-second; secret/token leakage — `secret_file_reason` structural, wire-log
-records URL+body never headers, auth-header names filtered from config headers;
-`ChatError` never interpolates keys; TLS rustls, no cert bypass; OAuth CSRF/
-state/PKCE; blob traversal; session/transcript 100 MiB caps; untrusted-content
-envelope nonce forgery — `wrap_untrusted` verifies the nonce absent from the
-body.
+overflow — saturating arithmetic throughout (the Retry-After case is fixed
+2026-08-30 — RFC-7231 bounds + `u64::try_from(days)` in `parse_imf_fixdate`);
+TOCTOU on reads open-first guard-second; secret/token leakage —
+`secret_file_reason` structural, wire-log records URL+body never headers,
+auth-header names filtered from config headers; `ChatError` never interpolates
+keys; TLS rustls, no cert bypass; OAuth CSRF/ state/PKCE; blob traversal;
+session/transcript 100 MiB caps; untrusted-content envelope nonce forgery —
+`wrap_untrusted` verifies the nonce absent from the body.
 
 **Hardening (correct today, fragile):** intermediate dangling-symlink
 canonicalization in `canonicalize_nearest` widens the documented write-TOCTOU on
