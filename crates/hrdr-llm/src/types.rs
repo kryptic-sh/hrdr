@@ -813,6 +813,22 @@ fn stream_overflow_error() -> ChatError {
     }
 }
 
+/// The overflow error for capture-for-replay state exceeding a cap — mirrors
+/// [`stream_overflow_error`]'s wording, since both are the same flooding-endpoint
+/// guard on the same data. One copy, shared by every backend's replay path.
+pub(crate) fn capture_overflow_error() -> ChatError {
+    ChatError {
+        status: None,
+        retry_after: None,
+        kind: ChatErrorKind::Other,
+        message: format!(
+            "stream overflow: captured-for-replay data exceeding {} MiB limit; \
+             broken or hostile server",
+            MAX_ACCUMULATED_BYTES / (1024 * 1024)
+        ),
+    }
+}
+
 impl Accumulator {
     pub fn new() -> Self {
         Self {

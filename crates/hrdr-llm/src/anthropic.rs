@@ -802,22 +802,6 @@ fn beta_headers(
     betas
 }
 
-/// The overflow error for capture-for-replay state exceeding a cap — mirrors
-/// the [`crate::Accumulator`] byte-budget error's wording, since both are the
-/// same flooding-endpoint guard on the same data.
-fn capture_overflow_error() -> crate::client::ChatError {
-    crate::client::ChatError {
-        status: None,
-        retry_after: None,
-        kind: crate::client::ChatErrorKind::Other,
-        message: format!(
-            "stream overflow: captured-for-replay data exceeding {} MiB limit; \
-             broken or hostile server",
-            crate::types::MAX_ACCUMULATED_BYTES / (1024 * 1024)
-        ),
-    }
-}
-
 /// Translate one Anthropic stream event into a [`ChatChunk`] (or `None` for
 /// events with nothing for the accumulator: `ping`, `content_block_stop`, …).
 ///
@@ -852,7 +836,7 @@ fn map_event(
             let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
             if block_type == Some("tool_use") {
                 if tool_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
-                    return Err(anyhow::Error::new(capture_overflow_error()));
+                    return Err(anyhow::Error::new(crate::types::capture_overflow_error()));
                 }
                 let slot = *next_tool;
                 tool_slot.insert(idx, slot);
@@ -870,7 +854,7 @@ fn map_event(
                 Ok(Some(tool_call_chunk(slot, Some(id), Some(name), None)))
             } else if block_type == Some("thinking") {
                 if thinking_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
-                    return Err(anyhow::Error::new(capture_overflow_error()));
+                    return Err(anyhow::Error::new(crate::types::capture_overflow_error()));
                 }
                 thinking_slot.insert(idx, (String::new(), String::new()));
                 Ok(None)
@@ -884,7 +868,7 @@ fn map_event(
                 if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES
                     || redacted_order.len() >= crate::types::MAX_CAPTURED_ENTRIES
                 {
-                    return Err(anyhow::Error::new(capture_overflow_error()));
+                    return Err(anyhow::Error::new(crate::types::capture_overflow_error()));
                 }
                 redacted_order.push((idx, json!({"type": "redacted_thinking", "data": data})));
                 Ok(None)
@@ -907,7 +891,7 @@ fn map_event(
                         .unwrap_or("");
                     *captured_bytes = captured_bytes.saturating_add(t.len());
                     if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES {
-                        return Err(anyhow::Error::new(capture_overflow_error()));
+                        return Err(anyhow::Error::new(crate::types::capture_overflow_error()));
                     }
                     // An unknown block index (no matching `content_block_start`
                     // recorded it) must not silently default to thinking slot 0 —
@@ -926,7 +910,7 @@ fn map_event(
                         .unwrap_or("");
                     *captured_bytes = captured_bytes.saturating_add(sig.len());
                     if *captured_bytes > crate::types::MAX_ACCUMULATED_BYTES {
-                        return Err(anyhow::Error::new(capture_overflow_error()));
+                        return Err(anyhow::Error::new(crate::types::capture_overflow_error()));
                     }
                     if let Some(entry) = thinking_slot.get_mut(&idx) {
                         entry.1.push_str(sig);

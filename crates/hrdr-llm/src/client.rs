@@ -582,9 +582,8 @@ fn uses_max_completion_tokens(model: &str) -> bool {
 ///
 /// Handles bracketed IPv6 literals (`http://[::1]:8080/v1` → `::1`): a naive
 /// `rsplit_once(':')` would chop an IPv6 address's internal colons instead of
-/// just the trailing port, mangling the host. This helper is duplicated in
-/// hrdr-agent's `resolve_cache_mode` helpers — keep both in sync (or, better,
-/// have hrdr-agent call this one).
+/// just the trailing port, mangling the host. hrdr-agent imports this rather
+/// than keeping a second copy.
 pub fn url_host(base_url: &str) -> &str {
     let authority = base_url
         .split("://")

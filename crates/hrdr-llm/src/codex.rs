@@ -641,22 +641,6 @@ fn map_event(
     }
 }
 
-/// The overflow error for capture-for-replay state exceeding a cap — mirrors
-/// the [`crate::Accumulator`] byte-budget error's wording, since both are the
-/// same flooding-endpoint guard on the same data.
-fn capture_overflow_error() -> crate::client::ChatError {
-    crate::client::ChatError {
-        status: None,
-        retry_after: None,
-        kind: crate::client::ChatErrorKind::Other,
-        message: format!(
-            "stream overflow: captured-for-replay data exceeding {} MiB limit; \
-             broken or hostile server",
-            crate::types::MAX_ACCUMULATED_BYTES / (1024 * 1024)
-        ),
-    }
-}
-
 /// Stash a completed `{"type":"reasoning", …}` output item for replay in the
 /// next request's `input[]`, preserving stream order.
 ///
@@ -693,7 +677,7 @@ fn capture_reasoning_item(
     if state.captured_bytes > crate::types::MAX_ACCUMULATED_BYTES
         || state.reasoning_items.len() >= crate::types::MAX_CAPTURED_ENTRIES
     {
-        return Err(capture_overflow_error());
+        return Err(crate::types::capture_overflow_error());
     }
     state.reasoning_items.push(item.clone());
     Ok(())
@@ -709,7 +693,7 @@ impl StreamState {
             return Ok(slot);
         }
         if self.tool_slot.len() >= crate::types::MAX_CAPTURED_ENTRIES {
-            return Err(capture_overflow_error());
+            return Err(crate::types::capture_overflow_error());
         }
         let slot = self.next_tool;
         self.tool_slot.insert(fc_id.to_string(), slot);
