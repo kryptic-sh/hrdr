@@ -3079,20 +3079,12 @@ trip.
 five sub-agents by crate area; every finding re-verified at its cited lines by
 the sweep lead before recording (the `replace`→`.git` one empirically, with the
 pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
-(no defects — five hardening items, top two spot-checked). **Status: items 1-4
+(no defects — five hardening items, top two spot-checked). **Status: items 1-5
 shipped 2026-08-30 (`.git`-component skip, reserved-stem refusal, RFC-7231
-bounds in `parse_imf_fixdate`, and the cancelled-shell id-marker in the
-`UserShell` handler — each with a regression test that failed before the fix);
-items 5-6 open — recorded, not fixed.**
+bounds in `parse_imf_fixdate`, the cancelled-shell id-marker in the `UserShell`
+handler, and the `--auto-compact` parse warning — each with a regression test
+that failed before the fix); item 6 open — recorded, not fixed.**
 
-5. **`--auto-compact` with an unparseable value is silently ignored — LOW.**
-   (`apps/hrdr/src/main.rs`): `cli.auto_compact…and_then(parse_toggle_or_num)`
-   turns a parse failure into a no-op — no error, no warning, default kept
-   (compaction stays on). The sibling `--sandbox` arm warns loudly, and
-   `$HRDR_AUTO_COMPACT` goes through `env_warning`. Repro:
-   `hrdr --auto-compact falze run "hi"` — expect an error/warning, actual exit 0
-   with default behaviour and no stderr line. Fix: `Result`-parse and warn like
-   the sandbox arm, or clap-time validation.
 6. **Session-name blowup candidates** — the sub-agent review surfaced five
    hardening items, none a live defect (generation-invalidated `RunGuard` leak
    one abort-site away from real; unjoined live-stream forwarders can drop the

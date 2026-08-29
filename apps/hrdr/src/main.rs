@@ -670,12 +670,19 @@ async fn main() -> Result<()> {
             })?;
         config = hrdr_agent::config_for_agent_profile(&config, profile)?;
     }
-    if let Some(b) = cli
-        .auto_compact
-        .as_deref()
-        .and_then(hrdr_agent::parse_toggle_or_num)
-    {
-        config.auto_compact = b;
+    if let Some(b) = cli.auto_compact.as_deref() {
+        match hrdr_agent::parse_toggle_or_num(b) {
+            Some(b) => config.auto_compact = b,
+            // A mistyped `--auto-compact` is never dropped silently — the
+            // failure mode is compaction left ON for a user who meant to
+            // disable it. The `$HRDR_AUTO_COMPACT` env path warns through
+            // `env_warning`; the flag mirrors the `--sandbox` arm below.
+            None => eprintln!(
+                "warning: --auto-compact: {:?} is not a boolean or a number (> 0 = on) — \
+                 keeping {}",
+                b, config.auto_compact
+            ),
+        }
     }
     if let Some(n) = cli.compaction_reserved {
         config.compaction_reserved = n;

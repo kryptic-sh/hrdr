@@ -410,6 +410,25 @@ fn run_rejects_a_negative_max_cost() {
     );
 }
 
+/// A mistyped `--auto-compact` is warned about, never dropped silently: the
+/// failure mode of an `and_then`-swallowed parse is compaction left ON for a
+/// user who meant to disable it. The run proceeds (exit 0) but names the flag
+/// on stderr, like the `--sandbox` arm.
+#[test]
+fn run_warns_on_a_mistyped_auto_compact() {
+    let server = MockServer::start(vec![text_turn("unused")]);
+    let out = run_hrdr(&server, &["run", "--auto-compact", "falze", "hi"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a mistyped toggle is a warning, not a usage error: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("auto-compact"),
+        "stderr names the flag: {stderr:?}"
+    );
+}
+
 // ── 6. a rejected optional parameter ─────────────────────────────────────────
 
 /// REGRESSION, process level: a provider that refuses an optional parameter used
