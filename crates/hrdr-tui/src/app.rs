@@ -581,6 +581,14 @@ pub(crate) struct App {
     pub(crate) browser_login_task: Option<tokio::task::JoinHandle<()>>,
     /// The running user `!command`, if any — Esc cancels it.
     pub(crate) user_shell: Option<UserShell>,
+    /// The id of a `!command` this frontend already aborted, whose real
+    /// `ToolEnd` may still be draining from the channel (the abort raced the
+    /// task's own final send). Drop that ToolEnd when it arrives — the cancel
+    /// already closed the block as `(cancelled)` and wrote its history note,
+    /// so re-finishing would double-note, autosave twice and launch a turn
+    /// the user cancelled. Ids are monotonic per process, so a marker that
+    /// never meets its ToolEnd (abort beat the send) is harmless.
+    pub(crate) cancelled_user_shell: Option<String>,
     /// Discovered `:command` prompt templates for the current cwd, for the
     /// completion popup (refreshed on cwd change and `/reload`; the send path
     /// re-discovers on its own, so a stale list only affects completion).
@@ -925,6 +933,7 @@ impl App {
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
+            cancelled_user_shell: None,
             commands: hrdr_app::discover_commands(&cwd_for_commands, project_instructions),
             skills: hrdr_app::discover_skills(&cwd_for_commands, project_instructions),
             completion_cache: None,
@@ -1671,6 +1680,11 @@ impl App {
             return; // it completed; the ToolEnd event already closed the block
         }
         shell.handle.abort();
+        // Remember which shell was aborted: its final `ToolEnd` may already be
+        // in the channel (the abort raced the task's own send), and when it
+        // drains the handler must drop it rather than re-finish the cancel —
+        // see the `TurnMsg::UserShell` arm.
+        self.cancelled_user_shell = Some(shell.id.clone());
         self.record_local(AgentEvent::ToolEnd {
             id: shell.id,
             name: shell.name,
@@ -3010,6 +3024,34 @@ impl App {
             TurnMsg::UserShell(ev, note) => {
                 let ended = matches!(ev, AgentEvent::ToolEnd { .. });
                 if ended {
+                    // A ToolEnd that does not belong to the currently tracked
+                    // `!command` is either the shell this frontend already
+                    // aborted (the cancel raced the task's own final send, so
+                    // the real event is still draining) or a stale event
+                    // draining after a newer `!command` took the slot. In
+                    // both cases the end-of-shell plumbing must NOT run again
+                    // — the cancel already closed the block as `(cancelled)`
+                    // and wrote its history note, so re-finishing would push a
+                    // second note, autosave twice and launch a turn the user
+                    // cancelled; and finishing a stale event would null the
+                    // newer shell's tracking. The event is still recorded (it
+                    // closes the block in the transcript; a no-op against an
+                    // already-closed one). The one ToolEnd that may finish is
+                    // the live shell's own — or, with no shell tracked, a
+                    // finished one the cancel's `is_finished` early return
+                    // left for the queue to close.
+                    let stale = match &ev {
+                        AgentEvent::ToolEnd { id, .. } => {
+                            self.cancelled_user_shell.as_deref() == Some(id.as_str())
+                                || self.user_shell.as_ref().is_some_and(|s| s.id != *id)
+                        }
+                        _ => false,
+                    };
+                    if stale {
+                        self.cancelled_user_shell = None;
+                        self.record_local(ev);
+                        return;
+                    }
                     self.user_shell = None;
                 }
                 self.record_local(ev);

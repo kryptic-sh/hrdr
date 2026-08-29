@@ -8514,6 +8514,115 @@ async fn esc_cancels_a_running_user_shell_command() {
     assert!(h.app.user_shell.is_some(), "a new command is accepted");
 }
 
+/// The abort in [`App::cancel_user_shell`] can race the shell task's own final
+/// `ToolEnd`: the send completes a moment before the task is marked finished,
+/// so the real `ToolEnd` is still in the channel when the cancel runs — and
+/// when it drains, the `UserShell` handler must not re-run the end-of-shell
+/// plumbing. Re-finishing would push a second (success) history note after the
+/// cancel note, autosave twice, and launch a turn the user just cancelled.
+/// The cancel's id-marker (`cancelled_user_shell`) must make that drained
+/// `ToolEnd` a no-op.
+#[tokio::test]
+async fn a_raced_tool_end_after_cancel_does_not_double_finish() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("!sleep 30");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "the shell task is tracked");
+
+    // Simulate the race: the task sent its `ToolEnd` to the channel, but the
+    // cancel runs before the handler drains it.
+    let id = h.app.user_shell.as_ref().expect("shell tracked").id.clone();
+    h.app.cancel_user_shell();
+    assert!(
+        h.app.user_shell.is_none(),
+        "the cancel took the slot as if the abort won"
+    );
+    h.app.on_turn_msg(TurnMsg::UserShell(
+        hrdr_agent::AgentEvent::ToolEnd {
+            id: id.clone(),
+            name: "shell".to_string(),
+            result: "real output that must not re-finish the block".to_string(),
+            ok: true,
+        },
+        Some("I ran `sleep 30` in the shell (exit 0)…".to_string()),
+    ));
+
+    let noted = h.app.agent.try_lock().is_ok_and(|a| {
+        a.messages_owned().iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("cancelled"))
+        })
+    });
+    assert!(noted, "the cancellation note is in the agent history");
+    let success_note_absent = h.app.agent.try_lock().is_ok_and(|a| {
+        a.messages_owned().iter().all(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| !c.contains("(exit 0)"))
+        })
+    });
+    assert!(
+        success_note_absent,
+        "the raced success ToolEnd must not push its note after the cancel"
+    );
+    assert!(
+        !h.app.running(),
+        "no turn is launched by the raced ToolEnd after a cancel"
+    );
+}
+
+/// A stale `ToolEnd` drained after a *newer* `!command` took the slot must not
+/// null the newer shell's tracking (`user_shell = None` in the handler would
+/// make the newer command uncancellable and stop its spinner). The id-marker
+/// check covers the cancelled-first shape; a ToolEnd for a shell that is no
+/// longer the tracked one is dropped regardless of how it ended.
+#[tokio::test]
+async fn a_stale_tool_end_does_not_null_a_newer_shell() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("!sleep 30");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "the first shell is tracked");
+
+    // First shell races its own ToolEnd; cancel marks it.
+    let first = h.app.user_shell.as_ref().expect("shell tracked").id.clone();
+    h.app.cancel_user_shell();
+    assert!(
+        h.app.user_shell.is_none(),
+        "the cancel released the first slot"
+    );
+
+    // A second command starts before the first's ToolEnd drains.
+    h.type_str("!echo newer");
+    h.press(KeyCode::Enter);
+    assert!(h.app.user_shell.is_some(), "the second shell is tracked");
+    let second = h.app.user_shell.as_ref().expect("shell tracked").id.clone();
+    assert_ne!(first, second, "each command mints its own tool id");
+
+    // Now the first shell's already-sent ToolEnd drains.
+    h.app.on_turn_msg(TurnMsg::UserShell(
+        hrdr_agent::AgentEvent::ToolEnd {
+            id: first,
+            name: "shell".to_string(),
+            result: "stale output".to_string(),
+            ok: true,
+        },
+        Some("I ran `sleep 30` in the shell (exit 0)…".to_string()),
+    ));
+
+    assert!(
+        h.app.user_shell.is_some(),
+        "the stale ToolEnd must not clear the newer shell's slot"
+    );
+    assert_eq!(
+        h.app.user_shell.as_ref().map(|s| &s.id),
+        Some(&second),
+        "the newer shell's tracking survives the stale ToolEnd"
+    );
+}
+
 /// Esc-Esc cancels a turn whose *model-driven* tool is mid-flight: the batch
 /// guard aborts the spawned tool task (a dropped `JoinHandle` alone would just
 /// detach it), the shell tool's future drops, and `kill_on_drop` kills the

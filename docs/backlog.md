@@ -3079,26 +3079,12 @@ trip.
 five sub-agents by crate area; every finding re-verified at its cited lines by
 the sweep lead before recording (the `replace`→`.git` one empirically, with the
 pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
-(no defects — five hardening items, top two spot-checked). **Status: items 1-3
-shipped 2026-08-30 (`.git`-component skip, reserved-stem refusal, and RFC-7231
-bounds in `parse_imf_fixdate` — each with a regression test that failed before
-the fix); items 4-6 open — recorded, not fixed.**
+(no defects — five hardening items, top two spot-checked). **Status: items 1-4
+shipped 2026-08-30 (`.git`-component skip, reserved-stem refusal, RFC-7231
+bounds in `parse_imf_fixdate`, and the cancelled-shell id-marker in the
+`UserShell` handler — each with a regression test that failed before the fix);
+items 5-6 open — recorded, not fixed.**
 
-4. **`cancel_user_shell` races the shell's already-delivered `ToolEnd` — LOW.**
-   (`hrdr-tui/src/app.rs`): between the final `ToolEnd` channel send completing
-   and the task being marked finished, the cancel path records `(cancelled)` and
-   calls `finish_user_shell(note, false)`; when the queued real `ToolEnd`
-   drains, the arm at the `UserShell` handler sets `user_shell = None` and calls
-   `finish_user_shell(note, true)` again — pushing the success note after the
-   cancel note (two history entries), autosaving twice, and (nothing running)
-   `launch_turn()` sending the shell output to the model after the user asked to
-   stop. If a new `!command` started meanwhile, the stale `user_shell = None`
-   drops the new shell's tracking. The reducer drops the duplicate `ToolEnd`
-   only as a no-op (`open_tool` matches `done: false`). Repro:
-   `!sleep 0.1 && echo done`, press Esc Esc in the same instant the command
-   finishes. Fix: match `ToolEnd.id` against the current shell's id before
-   acting, or mark the id cancelled so the late `ToolEnd` skips
-   `finish_user_shell`.
 5. **`--auto-compact` with an unparseable value is silently ignored — LOW.**
    (`apps/hrdr/src/main.rs`): `cli.auto_compact…and_then(parse_toggle_or_num)`
    turns a parse failure into a no-op — no error, no warning, default kept
