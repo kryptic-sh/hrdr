@@ -3121,7 +3121,9 @@ test-support full except the Windows-only wrapper (read, not run).
 
 `:audit` over the whole tree (clean), split across four sub-agents by crate;
 every finding re-verified at its cited lines. **1 medium, 5 low; 0 high. Overall
-risk low-to-moderate; safe to ship as-is.**
+risk low-to-moderate; safe to ship as-is.** **Status: finding 2 shipped
+2026-08-30 (MCP parse error truncated to 500 bytes, like the non-success arm,
+with a regression test that failed before the fix); the rest open.**
 
 1. **MEDIUM — terminal escape-sequence injection via displayed text.**
    (`hrdr-tui/src/ui.rs` render path; also `hrdr-editor/src/plain.rs`,
