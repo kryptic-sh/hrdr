@@ -13479,6 +13479,83 @@ mod tests {
             );
         }
 
+        /// **A jailed sub-agent's workspace map is built from its own `cwd`** —
+        /// the resolved scope, not the parent's tree. `prisoner cwd=vendor/sketchy`
+        /// is told about `vendor/sketchy`'s layout; the parent's crates and any
+        /// sibling directories are context it cannot read and must not trust, so
+        /// they must not ride in the brief.
+        #[tokio::test]
+        async fn a_jailed_subagents_prompt_maps_only_its_own_cwd() {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "ok"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let root = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            // The parent's tree: a crate and a sibling directory the jailed agent
+            // may not read.
+            std::fs::create_dir_all(root.path().join("crates/hjkl-keymap/src")).unwrap();
+            std::fs::create_dir_all(root.path().join("secret")).unwrap();
+            // The scoped agent's own world.
+            std::fs::create_dir_all(root.path().join("vendor/sketchy/src")).unwrap();
+            std::fs::create_dir_all(root.path().join("vendor/sketchy/docs")).unwrap();
+
+            let cell: ChildDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                ts_dir.path().to_path_buf(),
+            ))));
+            let mut cfg = test_cfg(server.base_url(), root.path());
+            cfg.read_only = true;
+            cfg.sandbox = hrdr_tools::SandboxMode::Jail;
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            let tool = SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                cell,
+                super::super::AgentRegistry::new(),
+            );
+            let ctx = hrdr_tools::ToolContext::new(root.path());
+
+            tool.execute(
+                json!({"prompt": "audit this", "cwd": "vendor/sketchy", "description": "probe"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            await_background(&tool, &ctx).await;
+
+            let (_, events) = read_events(ts_dir.path());
+            let transcript_log::Record::Start { prompt, .. } = &events[0] else {
+                panic!("first event is a Start: {:?}", events[0]);
+            };
+            assert!(
+                prompt.contains("Workspace layout (verified"),
+                "the layout section is appended: {prompt}"
+            );
+            assert!(
+                prompt.contains("src") && prompt.contains("docs"),
+                "the scoped cwd's own layout is mapped: {prompt}"
+            );
+            assert!(
+                !prompt.contains("hjkl-keymap"),
+                "the parent's crate tree must not leak into a jailed brief: {prompt}"
+            );
+            assert!(
+                !prompt.contains("secret"),
+                "sibling directories of the scope must not leak: {prompt}"
+            );
+        }
+
         /// **A delegated sub-agent SEES the image it was handed.** The whole
         /// point of the model-facing `attachments` argument: the file the parent
         /// named is read, put on the sub-agent's opening user message as bytes

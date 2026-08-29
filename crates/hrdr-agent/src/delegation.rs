@@ -1564,7 +1564,14 @@ impl hrdr_tools::Tool for SubagentTool {
         // run on the blocking pool — a big repo should not stall a tokio worker
         // for the whole walk. The closure owns the cloned cwd, so nothing borrows
         // `ctx` across the `spawn_blocking` boundary.
-        let cwd = ctx.cwd.clone();
+        //
+        // The map is built from the RESOLVED sub-agent `cwd`, not the parent's:
+        // a jailed agent scoped to `vendor/sketchy` is told about
+        // `vendor/sketchy`'s layout — its cwd is its whole world, and the rest
+        // of the parent's tree is context it cannot read and must not trust.
+        // For a write/read agent the resolved cwd is the parent's, so the map
+        // is unchanged from before.
+        let cwd = cfg.cwd.clone();
         let map = tokio::task::spawn_blocking(move || workspace_map(&cwd)).await?;
         if let Some(map) = map {
             prompt.push_str("\n\n");
