@@ -334,13 +334,47 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}
         let tail_marker = "SECRETS-END-MARKER";
         let bad_body = format!("{bad_body}{tail_marker}");
         tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut stream, _) = listener.accept().await.expect("accept");
+            // Drain the request (headers + content-length body) BEFORE
+            // responding: closing the write side while the client is still
+            // sending aborts the client's send on Windows (os error 10053),
+            // which would fail the test for the wrong reason.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let headers_end = loop {
+                match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                    }
+                }
+            };
+            if let Some(headers_end) = headers_end {
+                let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
+                let content_len: usize = hdrs
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < headers_end + content_len {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 bad_body.len(),
                 bad_body
             );
-            use tokio::io::AsyncWriteExt;
             let _ = stream.write_all(response.as_bytes()).await;
         });
 
