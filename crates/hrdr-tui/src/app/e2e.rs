@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::{App, Entry, EntryKind, StatusBarMode, TurnMsg};
+use super::{App, Entry, EntryKind, LoginModal, StatusBarMode, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
@@ -3490,6 +3490,57 @@ async fn a_toast_paints_over_the_screen() {
             .iter()
             .any(|e| format!("{:?}", e.kind).contains("copied 2 lines")),
         "and stays out of the transcript"
+    );
+}
+
+/// A poisoned clipboard — a multi-MB blob, which a web page can put there — is
+/// capped at `MAX_PASTE_CHARS`: the editor buffer must not grow to a
+/// multi-MB-per-frame re-wrap cost, and the login key field must not accept an
+/// oversized paste that later lands in the auth file. The truncation is
+/// warned, not silent.
+#[tokio::test]
+async fn an_oversized_paste_is_capped_and_warned() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let huge = "x".repeat(super::MAX_PASTE_CHARS + 10_000);
+    h.app.on_paste(&huge);
+
+    let buf = h.app.editor.content();
+    assert_eq!(
+        buf.chars().count(),
+        super::MAX_PASTE_CHARS,
+        "the buffer holds exactly the cap, not the full blob"
+    );
+    assert!(
+        h.app
+            .toasts
+            .last_body()
+            .is_some_and(|b| b.contains("paste too large")),
+        "a truncation warning toast is showing"
+    );
+}
+
+/// The login key field gets the same cap as the composer — an oversized paste
+/// must not land in the auth file through a second, uncapped door.
+#[tokio::test]
+async fn an_oversized_login_paste_is_capped_too() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.login_modal = Some(super::LoginModal::Key {
+        name: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        warning: String::new(),
+        input: String::new(),
+    });
+    let huge = "k".repeat(super::MAX_PASTE_CHARS + 10_000);
+    h.app.on_paste(&huge);
+    let LoginModal::Key { input, .. } = h.app.login_modal.as_ref().expect("modal open") else {
+        panic!("login modal open");
+    };
+    assert!(
+        input.chars().count() <= super::MAX_PASTE_CHARS,
+        "the login field is capped too: {} chars",
+        input.chars().count()
     );
 }
 

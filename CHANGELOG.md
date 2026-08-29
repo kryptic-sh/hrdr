@@ -65,6 +65,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`hrdr_editor::sanitize_for_terminal`) replaces every control char (C0 and C1,
   ESC first) with a single visible cell at the block-body choke point, the
   markdown renderers, the editor pane and the trust-prompt cwd line.
+- **Pastes are capped at 256K chars with a warning.** A clipboard a web page
+  poisoned with a multi-MB blob used to splice into the composer buffer
+  unconstrained (a per-frame re-wrap cost afterwards) and into the login key
+  field, where it later landed in the auth file. `on_paste` now truncates to
+  `MAX_PASTE_CHARS` and toasts the truncation; the login field gets the same
+  cap.
 
 ## [0.14.0] - 2026-08-29
 

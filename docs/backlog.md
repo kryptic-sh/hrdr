@@ -3121,14 +3121,14 @@ test-support full except the Windows-only wrapper (read, not run).
 
 `:audit` over the whole tree (clean), split across four sub-agents by crate;
 every finding re-verified at its cited lines. **1 medium, 5 low; 0 high. Overall
-risk low-to-moderate; safe to ship as-is.** **Status: findings 1-5 shipped
+risk low-to-moderate; safe to ship as-is.** **Status: findings 1-6 shipped
 2026-08-30 (terminal control-char sanitizer at the render entry points — block
 bodies, markdown, editor pane, trust-prompt cwd; MCP parse error truncated to
 500 bytes; attachment filenames escaped and backtick-quoted in sub-agent
 prompts; the workspace map built from the jailed sub-agent's resolved `cwd`;
 `Policy::none()` on both client builders so auth headers never ride a cross-host
-307/308 — each with a regression test that failed before the fix); finding 6
-open.**
+307/308; `MAX_PASTE_CHARS` paste cap — each with a regression test that failed
+before the fix).**
 
 1. **MEDIUM — terminal escape-sequence injection via displayed text.**
    (`hrdr-tui/src/ui.rs` render path; also `hrdr-editor/src/plain.rs`,
@@ -3175,11 +3175,6 @@ open.**
    already received the key, so the marginal leak is a host the user never
    authorized. Fix: `redirect(Policy::none())` on both builders (POST endpoints
    never legitimately redirect).
-6. **LOW — no size cap on pasted text.** (`hrdr-tui/src/app.rs` `on_paste` →
-   `hrdr-editor/src/plain.rs` paste splice; login key field too): a clipboard
-   poisoned with a multi-MB blob splices into the buffer unconstrained and is
-   re-wrapped per frame; the login-field paste later lands in the auth file.
-   Fix: cap paste (a few MB) with a toast; mirror in the login key field.
 
 **Cleared (top of list):** SSRF — connect-time `SsrfGuardResolver`, redirects
 re-checked per hop, SearXNG operator-env-only (justified); command injection —

@@ -28,6 +28,12 @@ const MOUSE_SCROLL_LINES: usize = 3;
 /// process outliving the session.
 const USER_SHELL_TIMEOUT_SECS: u64 = 60 * 60 * 24;
 
+/// The most characters a single paste may insert — editor buffer or login key
+/// field. A poisoned clipboard (a web page can set it) must not grow the buffer
+/// into a multi-MB re-wrap-per-frame cost, and a pasted API key is small by
+/// construction, so the cap never binds a real paste.
+const MAX_PASTE_CHARS: usize = 256 * 1024;
+
 use crate::theme::Theme;
 
 mod commands;
@@ -1742,11 +1748,26 @@ impl App {
     /// ([`Self::paste_clipboard`]), which reads the clipboard's *file* flavour.
     pub(crate) fn on_paste(&mut self, text: &str) {
         self.disarm();
+        // A clipboard or terminal paste can be poisoned with a multi-MB blob (a
+        // web page can set the text clipboard). The editor buffer is re-wrapped
+        // per frame, so an unbounded paste is an allocation + O(n) wrap cost per
+        // keypress afterwards — and the login-field paste later lands in the
+        // auth file. Cap at a generous message size and say so.
+        let chars = text.chars().count();
+        let capped: String = if chars > MAX_PASTE_CHARS {
+            self.toasts.warn(format!(
+                "paste too large — kept the first {} of {chars} chars",
+                MAX_PASTE_CHARS
+            ));
+            text.chars().take(MAX_PASTE_CHARS).collect()
+        } else {
+            text.to_string()
+        };
         if let Some(LoginModal::Key { input, .. }) = &mut self.login_modal {
-            input.push_str(text.trim());
+            input.push_str(capped.trim());
             return;
         }
-        self.editor.paste(text);
+        self.editor.paste(&capped);
     }
 
     /// Ctrl+] — paste what is on the system clipboard, whatever it turns out to
@@ -1774,8 +1795,15 @@ impl App {
             }
             hrdr_app::ClipboardPaste::Text(text) => {
                 let chars = text.chars().count();
+                let pasted = text.chars().take(MAX_PASTE_CHARS).count();
                 self.on_paste(&text);
-                self.toasts.info(format!("pasted {chars} chars"));
+                if pasted < chars {
+                    self.toasts.warn(format!(
+                        "paste too large — kept the first {pasted} of {chars} chars"
+                    ));
+                } else {
+                    self.toasts.info(format!("pasted {chars} chars"));
+                }
             }
             hrdr_app::ClipboardPaste::Empty => {
                 self.toasts.warn("clipboard is empty");
