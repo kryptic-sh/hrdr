@@ -2170,8 +2170,6 @@ impl App {
     /// Like [`Self::with_agent`], but emits the standard "busy" system line when
     /// the agent is locked, so callers can `let Some(x) = …_or_busy(…) else {
     /// return; }`.
-    /// Append a transcript entry. Each entry carries its own timestamp, set when
-    /// it was constructed.
     /// The main agent's transcript — the session's conversation, and the very one
     /// its state persists. (Tests reach for this; the app goes through `panes`.)
     #[cfg(test)]

@@ -21,13 +21,9 @@
 /// space, a double quote, a backslash, or a non-ASCII byte —
 /// `diff --git "a/my dir/.env" "b/my dir/.env"` — so this can't just scan for
 /// literal `" b/"`; it tokenizes the two (possibly quoted) paths and unquotes
-/// whichever one is quoted. [`forbidden_flag`] separately refuses
-/// What replaces a withheld hunk. Shared with `shell`'s streaming redaction so
-/// the two paths cannot describe the same thing differently.
-pub(crate) const REDACTED_DIFF_MARKER: &str =
-    "[redacted: this file is a credential/secret store — its diff is withheld]";
-
-/// `--no-prefix`/`--src-prefix`/`--dst-prefix`, which would otherwise strip the
+/// whichever one is quoted.
+///
+/// `--no-prefix`/`--src-prefix`/`--dst-prefix` would otherwise strip the
 /// `a/`/`b/` markers this still relies on to tell the two tokens apart.
 pub(crate) fn diff_section_path(line: &str) -> Option<String> {
     if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -55,6 +51,11 @@ pub(crate) fn diff_section_path(line: &str) -> Option<String> {
     }
     None
 }
+
+/// What replaces a withheld hunk. Shared with `shell`'s streaming redaction so
+/// the two paths cannot describe the same thing differently.
+pub(crate) const REDACTED_DIFF_MARKER: &str =
+    "[redacted: this file is a credential/secret store — its diff is withheld]";
 
 /// Consume one whitespace-delimited `diff --git` header token from the start
 /// of `s`, which may be a bare path (`a/foo`) or a C-style-quoted one

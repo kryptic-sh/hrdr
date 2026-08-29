@@ -1682,8 +1682,6 @@ mod tests {
         assert!(apply_lsp_edits("abcdefgh", &overlap).is_err());
     }
 
-    /// The navigation tools end-to-end against the scripted server:
-    /// definition + references resolve `symbol` on a 1-based line, and rename
     /// A server that initializes fine but then stops draining its stdin must
     /// not hang the edit: the bounded write times out, diagnostics degrade to
     /// `None` (the edit still succeeds), and the server is retired so later

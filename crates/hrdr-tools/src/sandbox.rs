@@ -1241,13 +1241,6 @@ fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SEATBELT_PROGRAM: &str = "/usr/bin/sandbox-exec";
 
-/// The full `sandbox-exec` argv (everything after `argv[0]`): the generated
-/// profile, then the shell invocation it applies to.
-///
-/// There is no `--chdir` to pass — Seatbelt only filters syscalls, so the child
-/// inherits the cwd the caller sets on the `Command`, and stdio, exit status,
-/// timeouts and group-kill are untouched.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The hidden argv[1] that puts hrdr into its own confinement wrapper.
 ///
 /// Windows has no `pre_exec`, and a `tokio::process::Command` cannot carry a
@@ -1347,6 +1340,12 @@ pub fn lower_current_process_to_low_integrity() -> std::io::Result<()> {
     }
 }
 
+/// The full `sandbox-exec` argv (everything after `argv[0]`): the generated
+/// profile, then the shell invocation it applies to.
+///
+/// There is no `--chdir` to pass — Seatbelt only filters syscalls, so the child
+/// inherits the cwd the caller sets on the `Command`, and stdio, exit status,
+/// timeouts and group-kill are untouched.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn seatbelt_args(
     policy: &SandboxPolicy,

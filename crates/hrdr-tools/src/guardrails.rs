@@ -373,8 +373,9 @@ pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a
 /// before the guardrails recursion stops. This bounds work without an arbitrary
 /// depth limit that 5+ levels of `sh -c` nesting would defeat.
 const MAX_NESTED_PAYLOAD_BYTES: usize = 64 * 1024;
-/// never run them — a model that shells one out is (wrongly) trying to poll a
-/// background task, which just errors in a loop.
+
+/// Tools that must never be run by shelling out — a model that shells one out
+/// is (wrongly) trying to poll a background task, which just errors in a loop.
 /// Kept as the FULL historical set, not just the tools that exist. A model
 /// trained on an older hrdr (or on another harness) reaches for `task_output` or
 /// `task_list` by name, and shelling out a tool that no longer exists produces
