@@ -13,6 +13,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still pending, the harness nudges the model to keep working or cancel each one
   explicitly — the same one-nudge-per-turn backstop the TODO list has. Goals
   persist with the session and are restored on resume.
+- **`cron` tool** — the model sets recurring reminders (`cron create` with a
+  5-field cron schedule + reminder content, `cron cancel` / `cron list`). A
+  per-cron scheduler task delivers the reminder into the conversation each time
+  it fires — waking an idle app exactly like a finished background task — and
+  the reminder ends by telling the model it can cancel the cron once its goal is
+  achieved. Crons persist with the session and their schedulers re-arm on
+  resume.
 
 ### Fixed
 

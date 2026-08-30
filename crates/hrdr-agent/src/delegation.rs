@@ -1953,10 +1953,13 @@ impl hrdr_tools::Tool for TaskCancelTool {
                 Some(t) => {
                     t.cancelled = true;
                     t.done = true;
-                    if t.kind == hrdr_tools::BackgroundKind::Watch {
-                        "watch"
-                    } else {
-                        "background task"
+                    match t.kind {
+                        hrdr_tools::BackgroundKind::Watch => "watch",
+                        hrdr_tools::BackgroundKind::Cron => {
+                            "cron reminder — cancels this one delivery; the cron itself \
+                             keeps firing (cancel it with `cron cancel`)"
+                        }
+                        hrdr_tools::BackgroundKind::Task => "background task",
                     }
                 }
                 None if !aborted => anyhow::bail!(

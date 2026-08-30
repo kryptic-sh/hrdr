@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+chrono.workspace = true
 glob.workspace = true
 ignore.workspace = true
 regex = "1"

@@ -50,6 +50,12 @@ impl super::App {
         self.goals.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// The agent's recurring-reminder list, copied under its lock for a session
+    /// write — the crons persist so a resume can re-arm their schedulers.
+    fn crons_snapshot(&self) -> Vec<hrdr_agent::Cron> {
+        self.crons.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
     /// Point the shared sub-agent transcript cell at the current session's dir,
     /// and attach the MAIN agent's own durable transcript writer at its sibling
     /// `<id>.jsonl`. Called after the session id is assigned; anything spawned or
@@ -179,6 +185,7 @@ impl super::App {
     pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
         let todos = self.todos_snapshot();
         let goals = self.goals_snapshot();
+        let crons = self.crons_snapshot();
         // `state.cwd` is only synced by the turn-end autosave; on the very
         // first turn it is still empty, which would file the session under the
         // wrong cwd slug.
@@ -187,6 +194,7 @@ impl super::App {
         state.messages = messages;
         state.todos = todos;
         state.goals = goals;
+        state.crons = crons;
         state.cwd = cwd;
         if self.state().id.is_some() {
             // The id (and its open-lock) was minted synchronously — at turn
@@ -318,7 +326,8 @@ impl super::App {
         };
         let todos = self.todos_snapshot();
         let goals = self.goals_snapshot();
-        self.state_mut().sync_from(msgs, todos, goals, cwd);
+        let crons = self.crons_snapshot();
+        self.state_mut().sync_from(msgs, todos, goals, crons, cwd);
 
         if self.state().id.is_some() {
             // The mint happened synchronously (at turn start, or on the very
@@ -554,12 +563,13 @@ impl super::App {
         // The resumed session's spend is seeded into the agent's own counter, so it
         // counts on from there — rather than the frontend keeping a second tally and
         // adding it to the agent's on the way to the screen.
-        let (messages, todos, goals, spent) = {
+        let (messages, todos, goals, crons, spent) = {
             let s = self.state();
             (
                 s.messages.clone(),
                 s.todos.clone(),
                 s.goals.clone(),
+                s.crons.clone(),
                 s.usage.cost_usd,
             )
         };
@@ -627,6 +637,13 @@ impl super::App {
         if let Ok(mut g) = self.goals.lock() {
             *g = goals;
         }
+        if let Ok(mut c) = self.crons.lock() {
+            *c = crons;
+        }
+        // A resumed session's crons must keep firing: the scheduler tasks die
+        // with the old process, so re-arm every restored cron. Idempotent — a
+        // cron whose scheduler is already live is skipped.
+        self.with_agent(|a| a.arm_crons());
         // A resumed session is a different transcript — every index-based view
         // state (opened thoughts) from the session we left is meaningless here.
         self.thinking_open.clear();

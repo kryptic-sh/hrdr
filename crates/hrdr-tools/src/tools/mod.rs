@@ -1,5 +1,6 @@
 //! The built-in tool set (read, write, edit, shell, grep, find, ls, todo, fetch, search).
 
+pub(crate) mod cron;
 pub(crate) mod edit;
 pub(crate) mod find;
 pub(crate) mod goal;

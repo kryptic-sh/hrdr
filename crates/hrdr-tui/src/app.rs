@@ -672,6 +672,9 @@ pub(crate) struct App {
     /// Shared goal list updated live by the `goal` tool (persisted with the
     /// session so a resume keeps the standing intentions).
     pub(crate) goals: Arc<Mutex<Vec<hrdr_agent::Goal>>>,
+    /// Shared recurring-reminder list updated live by the `cron` tool
+    /// (persisted with the session; schedulers re-armed on resume).
+    pub(crate) crons: Arc<Mutex<Vec<hrdr_agent::Cron>>>,
     /// Count of completed turns, used to age out finished TODO items.
     todo_turn: u64,
     /// Turn (in `todo_turn` units) each completed TODO was first seen finished,
@@ -833,6 +836,7 @@ impl App {
         let agent = Agent::new(config)?;
         let todos = agent.todos();
         let goals = agent.goals();
+        let crons = agent.crons();
         let registry = agent.registry();
         let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
@@ -963,6 +967,7 @@ impl App {
             max_scroll: 0,
             todos,
             goals,
+            crons,
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
             todo_ttl,

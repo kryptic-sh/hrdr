@@ -2812,6 +2812,19 @@ impl Agent {
         self.ctx.goals.clone()
     }
 
+    /// Shared recurring-reminder list, mutated by the `cron` tool.
+    pub fn crons(&self) -> Arc<Mutex<Vec<hrdr_tools::CronItem>>> {
+        self.ctx.crons.clone()
+    }
+
+    /// Spawn a scheduler task for every cron in the shared list (idempotent: a
+    /// cron whose scheduler already runs is skipped). Called on session resume
+    /// so restored crons keep firing, and after a `/clear` that wiped the list
+    /// there is nothing to arm.
+    pub fn arm_crons(&self) {
+        hrdr_tools::arm_crons(&self.ctx);
+    }
+
     /// Shared registry of detached background sub-agents (for the frontend's
     /// live panel). Mutated by the `task` tool's `background` mode.
     pub fn background_tasks(&self) -> Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>> {
@@ -2882,6 +2895,7 @@ pub use hrdr_llm::catalog;
 /// (`minimal`/`low`/`medium`/`high`) rather than a display-only label.
 pub use hrdr_llm::normalize_effort;
 pub use hrdr_llm::{CompactionReason, MessageOrigin};
+pub use hrdr_tools::CronItem as Cron;
 pub use hrdr_tools::GoalItem as Goal;
 pub use hrdr_tools::TodoItem as Todo;
 
@@ -6481,13 +6495,16 @@ mod tests {
         // this agent's own `ToolContext` and touches nothing on disk, and the
         // turn-end goal nudge (which reads that same list) applies to a
         // read-only agent as much as a write-capable one.
+        // `cron` is in on the same terms too: it mutates a list held in this
+        // agent's own `ToolContext` and delivers reminders as `BackgroundTask`s
+        // into its own conversation — nothing on disk, no subprocesses.
         // Short, and deliberately so. `grep`/`find`/`ls`/`tree` are NOT here: they
         // are jail-only now, because every other mode has `shell` — which does all
         // four in one call and better. `definition`/`references` are gone outright
         // (available and ignored: 2 calls in 9,350).
         // Sorted, because `tools` sorts.
         let readers = [
-            "command", "fetch", "goal", "models", "read", "search",
+            "command", "cron", "fetch", "goal", "models", "read", "search",
             // A shell, sandbox-confined to reads — `git log`/`diff`/`blame`, a
             // linter, a test all run here.
             "shell",

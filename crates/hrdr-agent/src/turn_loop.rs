@@ -509,6 +509,10 @@ impl Agent {
         for notice in self.take_pending_notices() {
             on_event(AgentEvent::Notice(notice));
         }
+        // Crons restored from a resumed session must keep firing even if the
+        // resume's re-arm raced a locked agent — arming is idempotent, so a
+        // cron whose scheduler is already live is simply skipped.
+        hrdr_tools::arm_crons(&self.ctx);
         // A previous turn interrupted mid tool-call can leave the history ending
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.

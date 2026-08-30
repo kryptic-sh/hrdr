@@ -53,6 +53,7 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
+pub use tools::cron::{CronTool, arm_crons};
 pub use tools::{
     CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS,
     DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool, FindTool, GoalTool,
@@ -134,15 +135,34 @@ pub struct GoalItem {
     pub status: String,
 }
 
+/// A single recurring reminder tracked by `cron` — a schedule (5-field cron
+/// expression) plus the reminder content delivered to the model each time it
+/// fires. The per-cron scheduler task is spawned by the tool (and re-armed on
+/// session resume) and delivers each fire as a finished `BackgroundTask`, the
+/// same path `watch` uses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CronItem {
+    /// Stable per-cron id, minted by the `cron` tool and shown to the model as
+    /// `#N` so it can cancel a specific cron.
+    pub id: u64,
+    /// The 5-field cron expression (`minute hour dom month dow`), as the model
+    /// passed it. Kept verbatim so a resume can re-parse and re-arm.
+    pub schedule: String,
+    /// The reminder content delivered to the model at each fire.
+    pub content: String,
+}
+
 /// Which producer a [`BackgroundTask`] entry belongs to. One variant per kind
 /// of background work in the shared registry (`task` sub-agents, `watch`
-/// pollers); `task_cancel` reads it to say what cancelling means for that kind
-/// — a sub-agent may have edited the working directory, a watch wrote nothing.
+/// pollers, `cron` reminders); `task_cancel` reads it to say what cancelling
+/// means for that kind — a sub-agent may have edited the working directory, a
+/// watch wrote nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackgroundKind {
     #[default]
     Task,
     Watch,
+    Cron,
 }
 
 /// A detached background sub-agent (every `task` runs detached): it runs
@@ -228,6 +248,15 @@ pub struct ToolContext {
     /// that would end with pending goals gets reminded of them, mirroring the
     /// TODO nudge).
     pub goals: Arc<Mutex<Vec<GoalItem>>>,
+    /// Shared recurring-reminder list, mutated by `cron`; the per-cron
+    /// scheduler task reads it each cycle (to know the schedule and whether
+    /// the cron still exists) and delivers each fire as a `BackgroundTask`.
+    pub crons: Arc<Mutex<Vec<CronItem>>>,
+    /// Ids of crons whose scheduler task is currently armed — set by
+    /// [`arm_crons`], cleared when a cron's task exits (cancel/teardown). Makes
+    /// re-arming (create, resume) idempotent: a cron already being scheduled is
+    /// not double-spawned.
+    pub(crate) cron_armed: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
     /// Per-call output line cap, applied alongside [`max_output`](Self::max_output)
@@ -336,6 +365,8 @@ impl ToolContext {
             cwd: cwd.into(),
             todos: Arc::new(Mutex::new(Vec::new())),
             goals: Arc::new(Mutex::new(Vec::new())),
+            crons: Arc::new(Mutex::new(Vec::new())),
+            cron_armed: Arc::new(Mutex::new(std::collections::HashSet::new())),
             max_output: DEFAULT_MAX_OUTPUT,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             stream: None,
@@ -1745,6 +1776,7 @@ impl ToolRegistry {
         r.register(Arc::new(TreeTool));
         r.register(Arc::new(TodoTool));
         r.register(Arc::new(GoalTool));
+        r.register(Arc::new(CronTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r

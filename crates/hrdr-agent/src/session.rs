@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use crate::Entry;
 use crate::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use anyhow::{Context, Result};
-use hrdr_tools::{GoalItem, TodoItem};
+use hrdr_tools::{CronItem, GoalItem, TodoItem};
 use serde::{Deserialize, Serialize};
 
 /// How long (in seconds) a reservation lock must exist before it may be
@@ -113,6 +113,10 @@ pub struct SessionState {
     /// restored on resume so the turn-end nudge keeps its standing intentions.
     #[serde(default)]
     pub goals: Vec<GoalItem>,
+    /// Recurring reminders from the `cron` tool (the shared list is its runtime
+    /// owner) — restored on resume so each cron's scheduler can be re-armed.
+    #[serde(default)]
+    pub crons: Vec<CronItem>,
     /// The display transcript: every entry the user saw, each with its own
     /// timestamp. This — not `messages` — is what a resume renders.
     ///
@@ -166,6 +170,7 @@ impl Default for SessionState {
             messages: Vec::new(),
             todos: Vec::new(),
             goals: Vec::new(),
+            crons: Vec::new(),
             transcript: Vec::new(),
             usage: SessionUsage::default(),
             attachment_refs: Vec::new(),
@@ -215,6 +220,8 @@ impl<'de> Deserialize<'de> for SessionState {
             todos: Vec<TodoItem>,
             #[serde(default)]
             goals: Vec<GoalItem>,
+            #[serde(default)]
+            crons: Vec<CronItem>,
             #[serde(default)]
             transcript: Vec<Entry>,
             #[serde(default)]
@@ -278,6 +285,7 @@ impl<'de> Deserialize<'de> for SessionState {
             messages: raw.messages,
             todos: raw.todos,
             goals: raw.goals,
+            crons: raw.crons,
             transcript: raw.transcript,
             usage: raw.usage,
             attachment_refs: raw.attachments,
@@ -364,11 +372,13 @@ impl SessionState {
         messages: Vec<Message>,
         todos: Vec<TodoItem>,
         goals: Vec<GoalItem>,
+        crons: Vec<CronItem>,
         cwd: String,
     ) {
         self.messages = messages;
         self.todos = todos;
         self.goals = goals;
+        self.crons = crons;
         self.cwd = cwd;
         if self.name.is_empty() {
             self.name = crate::session_name_from(&self.messages)
@@ -2096,6 +2106,7 @@ mod tests {
             vec![Message::user("first line")],
             vec![],
             vec![],
+            vec![],
             "/tmp/p".into(),
         );
         assert_eq!(st.cwd, "/tmp/p");
@@ -2111,13 +2122,14 @@ mod tests {
             vec![Message::user("other")],
             vec![],
             vec![],
+            vec![],
             "/tmp/p".into(),
         );
         assert_eq!(st.name, "Kept");
 
         // No conversation-derived name → the default is the cwd's basename.
         st.name = String::new();
-        st.sync_from(vec![], vec![], vec![], "/tmp/my-proj".into());
+        st.sync_from(vec![], vec![], vec![], vec![], "/tmp/my-proj".into());
         assert_eq!(st.name, "my-proj", "default name is the cwd basename");
     }
 
@@ -3244,6 +3256,7 @@ mod tests {
                 vec![
                     "base_url",
                     "created",
+                    "crons",
                     "cwd",
                     "goals",
                     "messages",
@@ -3629,6 +3642,11 @@ mod roundtrip_audit {
                 id: 1,
                 status: "pending".into(),
             }],
+            crons: vec![hrdr_tools::CronItem {
+                id: 1,
+                schedule: "*/30 * * * *".into(),
+                content: "check the CI".into(),
+            }],
             transcript: vec![
                 Entry::at(EntryKind::Header, t),
                 Entry::at(EntryKind::User("hi".into()), t),
@@ -3685,6 +3703,9 @@ mod roundtrip_audit {
         assert_eq!(back.goals.len(), 1);
         assert_eq!(back.goals[0].content, "a goal");
         assert_eq!(back.goals[0].status, "pending");
+        assert_eq!(back.crons.len(), 1);
+        assert_eq!(back.crons[0].schedule, "*/30 * * * *");
+        assert_eq!(back.crons[0].content, "check the CI");
         assert_eq!(back.messages.len(), 2);
         // The transcript is deliberately NOT in the `.json` any more — it is
         // written to the sibling jsonl and rebuilt on load. A bare `from_str`
