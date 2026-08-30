@@ -24,26 +24,6 @@ Conventions:
 
 ---
 
-## hrdr-agent/src/lib.rs is a 15k-line monolith — split into modules 2026-08-30
-
-`crates/hrdr-agent/src/lib.rs` is ~15,000 lines: the `Agent` impl, delegation
-runtime, session/oauth/auth/trust wiring, `AgentEvent`, the `mock_server` test
-harness, and ~7k lines of tests all in one file. Every change to any of them
-forces a reader to load the whole file, and concurrent edits collide in it. The
-seams already exist (delegation.rs, session.rs, turn_loop.rs, pane.rs, oauth/,
-auth/, trust.rs are separate); what remains is the `Agent` impl core
-(`impl Agent` blocks: ~2,500 lines), `AgentEvent` + the event plumbing, the
-`mock_server` test module (~1,000 lines), and the giant `tests::mock_server`
-test block. Split along those seams: move the `impl Agent` blocks to an
-`agent_impl.rs`, `AgentEvent` + `MessageOrigin` consumers to an `events.rs`, and
-the mock-server test harness + its tests into a `tests/` integration module —
-preserving the public surface (re-export from the old path) so callers don't
-churn. Do it as move-only commits (no behavior change), one seam per commit,
-each gate-green. Tracked as a tidy/perf cross-cutting debt item; not blocking
-any current work.
-
----
-
 ## Frame cost measured 2026-08-13 — one fix shipped, one left open
 
 Prompted by "lag as the context gets bigger". Measured with a throwaway probe
@@ -2342,6 +2322,13 @@ Promoted here when the effort that taught them was deleted:
   a constant or trait import that had moved between `windows-sys` releases,
   never the token or SID logic. Spell a fixed ABI value out locally instead of
   importing it and the class disappears.
+- **The hrdr-agent `mock_server` tests stay in-crate** (`src/mock_server.rs`,
+  extracted from the lib.rs monolith 2026-08-30). They call private modules
+  (`transcript`, `turn_loop`, `compaction`, `oauth`) and
+  `#[cfg(test)] pub(crate)` re-exports, so a `tests/` integration module — which
+  sees only the public API — is not a pure move; reaching it needs a deliberate
+  pub-surface decision. The shared helper `assistant_with_calls` lives there as
+  `pub(crate)` and is imported back into `mod tests`.
 
 ## Correctness review 2026-08-14
 
