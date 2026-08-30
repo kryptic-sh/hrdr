@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`goal` tool** — the model tracks long-horizon goals it sets for itself
+  (`goal add` / `goal cancel` / `goal list`). When a turn would end with goals
+  still pending, the harness nudges the model to keep working or cancel each one
+  explicitly — the same one-nudge-per-turn backstop the TODO list has. Goals
+  persist with the session and are restored on resume.
+
 ### Fixed
 
 - **`replace` no longer rewrites `.git` metadata.** The sweep's file walker

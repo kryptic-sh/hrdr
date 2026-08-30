@@ -200,7 +200,7 @@ use futures_util::StreamExt;
 use hrdr_llm::{
     Accumulator, ChatMessage, ChatStream, Client, RetryAttempt, RetryBudget, Role, ToolDef,
 };
-use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
+use hrdr_tools::{GoalItem, TodoItem, ToolContext, ToolRegistry};
 
 #[derive(Clone)]
 struct PublicModelRuntime {
@@ -2806,6 +2806,12 @@ impl Agent {
         self.ctx.todos.clone()
     }
 
+    /// Shared goal list, mutated by the `goal` tool, read by the turn-end
+    /// nudge.
+    pub fn goals(&self) -> Arc<Mutex<Vec<GoalItem>>> {
+        self.ctx.goals.clone()
+    }
+
     /// Shared registry of detached background sub-agents (for the frontend's
     /// live panel). Mutated by the `task` tool's `background` mode.
     pub fn background_tasks(&self) -> Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>> {
@@ -2876,6 +2882,7 @@ pub use hrdr_llm::catalog;
 /// (`minimal`/`low`/`medium`/`high`) rather than a display-only label.
 pub use hrdr_llm::normalize_effort;
 pub use hrdr_llm::{CompactionReason, MessageOrigin};
+pub use hrdr_tools::GoalItem as Goal;
 pub use hrdr_tools::TodoItem as Todo;
 
 /// Downgrade `messages` out of the tool-call protocol entirely — no
@@ -6470,13 +6477,17 @@ mod tests {
         // how a prompt sends a model after something it cannot call, and
         // `the_unconditional_prompt_names_only_tools_a_read_only_agent_has`
         // (in `prompt.rs`) now fails if the two ever drift apart again.
+        // `goal` is in on the same terms as `todo`: it mutates a list held in
+        // this agent's own `ToolContext` and touches nothing on disk, and the
+        // turn-end goal nudge (which reads that same list) applies to a
+        // read-only agent as much as a write-capable one.
         // Short, and deliberately so. `grep`/`find`/`ls`/`tree` are NOT here: they
         // are jail-only now, because every other mode has `shell` — which does all
         // four in one call and better. `definition`/`references` are gone outright
         // (available and ignored: 2 calls in 9,350).
         // Sorted, because `tools` sorts.
         let readers = [
-            "command", "fetch", "models", "read", "search",
+            "command", "fetch", "goal", "models", "read", "search",
             // A shell, sandbox-confined to reads — `git log`/`diff`/`blame`, a
             // linter, a test all run here.
             "shell",
@@ -9001,7 +9012,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         use super::super::{
-            Agent, AgentConfig, AgentEvent, ChatMessage, MessageOrigin, Role, TodoItem,
+            Agent, AgentConfig, AgentEvent, ChatMessage, GoalItem, MessageOrigin, Role, TodoItem,
             steering_queue,
         };
 
@@ -10032,6 +10043,131 @@ mod tests {
                 .collect();
             assert!(texts.iter().any(|t| t.contains("implement")), "{texts:?}");
             assert!(texts.iter().any(|t| t.contains("deferring")), "{texts:?}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// No pending TODOs (empty list, or every item already `completed`) means
+        /// nothing to nudge about — the turn ends on the first text-only reply,
+        /// same as before this defense existed. The mock server has only one
+        /// response queued, so a second round (were one wrongly triggered) would
+        /// hang the request and fail the `.unwrap()` below.
+        #[tokio::test]
+        async fn agent_run_nudges_once_then_ends_on_pending_goals() {
+            let server = MockServer::start(vec![
+                // Round 1: text-only, no tool calls, goals still pending.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "I've done what I can for now."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 2 (post-nudge): still text-only — a genuinely blocked or
+                // deferring model must be able to stop after its one nudge.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Still blocked, deferring."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.goals().lock().unwrap() = vec![
+                GoalItem {
+                    content: "ship the release".to_string(),
+                    id: 1,
+                    status: "pending".to_string(),
+                },
+                GoalItem {
+                    content: "fix the CI".to_string(),
+                    id: 2,
+                    status: "pending".to_string(),
+                },
+            ];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("do the thing", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // Exactly one nudge message, naming both pending goals and carrying
+            // the cancel instruction.
+            let nudges: Vec<&ChatMessage> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.origin == MessageOrigin::Nudge)
+                .collect();
+            assert_eq!(nudges.len(), 1, "exactly one nudge injected: {nudges:?}");
+            let body = nudges[0].content.as_deref().unwrap();
+            assert!(body.contains("ship the release"), "{body}");
+            assert!(body.contains("fix the CI"), "{body}");
+            assert!(
+                body.contains("not yet achieved"),
+                "states the turn was about to end early: {body}"
+            );
+            assert!(
+                body.contains("goal cancel <id>"),
+                "tells the model how to cancel: {body}"
+            );
+            assert_ne!(nudges[0].origin, MessageOrigin::User);
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("pending goals"))),
+                "a Notice explains the nudge: {events:?}"
+            );
+
+            // Both rounds actually ran, and the turn ended normally afterward.
+            let texts: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.iter().any(|t| t.contains("done what I can")),
+                "{texts:?}"
+            );
+            assert!(texts.iter().any(|t| t.contains("deferring")), "{texts:?}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// A cancelled goal is a resolved goal — the nudge stays silent, exactly
+        /// as a completed/cancelled TODO does. One mock response queued, so a
+        /// wrongly-triggered second round would hang the `.unwrap()`.
+        #[tokio::test]
+        async fn agent_run_no_nudge_when_goals_all_cancelled() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "All goals resolved."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.goals().lock().unwrap() = vec![GoalItem {
+                content: "was the goal".to_string(),
+                id: 1,
+                status: "cancelled".to_string(),
+            }];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("do the thing", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.origin == MessageOrigin::Nudge),
+                "a cancelled goal must not nudge"
+            );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }
 

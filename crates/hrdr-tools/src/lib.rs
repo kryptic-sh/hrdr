@@ -55,9 +55,9 @@ pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
     CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS,
-    DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool, FindTool, GrepTool, LsTool,
-    ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool, WatchTool, WriteTool,
-    available_shell_tools, redact_secret_diffs, run_user_command,
+    DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool, FindTool, GoalTool,
+    GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool,
+    WatchTool, WriteTool, available_shell_tools, redact_secret_diffs, run_user_command,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -111,6 +111,27 @@ pub struct TodoItem {
 
 fn default_status() -> String {
     "pending".to_string()
+}
+
+/// A single goal tracked by `goal` — a longer-horizon objective the model set
+/// for itself and is nudged about when it tries to end a turn without having
+/// resolved it. Distinct from a TODO: a TODO is the current task list
+/// (replace-whole-list, statuses including `in_progress`); a goal is a
+/// standing intention (`pending` until cancelled) the harness reminds it of at
+/// turn end, mirroring the TODO nudge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GoalItem {
+    pub content: String,
+    /// Stable per-goal reference id, minted by the `goal` tool and shown to the
+    /// model as `#N` so it can cancel a specific goal. `0` = unassigned
+    /// (legacy items saved before this field existed).
+    #[serde(default)]
+    pub id: u64,
+    /// `pending` | `cancelled`. A goal is never `completed` by the tool — the
+    /// model cancels one it considers achieved or abandoned, and the cancel is
+    /// what the turn-end nudge asks for ("cancel goals already met").
+    #[serde(default = "default_status")]
+    pub status: String,
 }
 
 /// Which producer a [`BackgroundTask`] entry belongs to. One variant per kind
@@ -203,6 +224,10 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// Shared TODO list, mutated by `todo`, surfaced to the UI.
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
+    /// Shared goal list, mutated by `goal`, read by the turn-end nudge (a turn
+    /// that would end with pending goals gets reminded of them, mirroring the
+    /// TODO nudge).
+    pub goals: Arc<Mutex<Vec<GoalItem>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
     /// Per-call output line cap, applied alongside [`max_output`](Self::max_output)
@@ -310,6 +335,7 @@ impl ToolContext {
         Self {
             cwd: cwd.into(),
             todos: Arc::new(Mutex::new(Vec::new())),
+            goals: Arc::new(Mutex::new(Vec::new())),
             max_output: DEFAULT_MAX_OUTPUT,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             stream: None,
@@ -1718,6 +1744,7 @@ impl ToolRegistry {
         r.register(Arc::new(LsTool));
         r.register(Arc::new(TreeTool));
         r.register(Arc::new(TodoTool));
+        r.register(Arc::new(GoalTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r

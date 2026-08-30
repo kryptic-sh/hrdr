@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use crate::Entry;
 use crate::{DEFAULT_MODEL_REF, Message, ModelRef, ModelSpec, cwd_slug};
 use anyhow::{Context, Result};
-use hrdr_tools::TodoItem;
+use hrdr_tools::{GoalItem, TodoItem};
 use serde::{Deserialize, Serialize};
 
 /// How long (in seconds) a reservation lock must exist before it may be
@@ -109,6 +109,10 @@ pub struct SessionState {
     /// TODO items from the `todo` tool (the shared list is its runtime owner).
     #[serde(default)]
     pub todos: Vec<TodoItem>,
+    /// Goals from the `goal` tool (the shared list is its runtime owner) —
+    /// restored on resume so the turn-end nudge keeps its standing intentions.
+    #[serde(default)]
+    pub goals: Vec<GoalItem>,
     /// The display transcript: every entry the user saw, each with its own
     /// timestamp. This — not `messages` — is what a resume renders.
     ///
@@ -161,6 +165,7 @@ impl Default for SessionState {
             cwd: String::new(),
             messages: Vec::new(),
             todos: Vec::new(),
+            goals: Vec::new(),
             transcript: Vec::new(),
             usage: SessionUsage::default(),
             attachment_refs: Vec::new(),
@@ -208,6 +213,8 @@ impl<'de> Deserialize<'de> for SessionState {
             messages: Vec<Message>,
             #[serde(default)]
             todos: Vec<TodoItem>,
+            #[serde(default)]
+            goals: Vec<GoalItem>,
             #[serde(default)]
             transcript: Vec<Entry>,
             #[serde(default)]
@@ -270,6 +277,7 @@ impl<'de> Deserialize<'de> for SessionState {
             cwd: raw.cwd,
             messages: raw.messages,
             todos: raw.todos,
+            goals: raw.goals,
             transcript: raw.transcript,
             usage: raw.usage,
             attachment_refs: raw.attachments,
@@ -351,9 +359,16 @@ mod persisted_messages {
 impl SessionState {
     /// Refresh the fields whose runtime owners live elsewhere, immediately
     /// before a save.
-    pub fn sync_from(&mut self, messages: Vec<Message>, todos: Vec<TodoItem>, cwd: String) {
+    pub fn sync_from(
+        &mut self,
+        messages: Vec<Message>,
+        todos: Vec<TodoItem>,
+        goals: Vec<GoalItem>,
+        cwd: String,
+    ) {
         self.messages = messages;
         self.todos = todos;
+        self.goals = goals;
         self.cwd = cwd;
         if self.name.is_empty() {
             self.name = crate::session_name_from(&self.messages)
@@ -2077,7 +2092,12 @@ mod tests {
     #[test]
     fn sync_from_refreshes_the_agent_owned_mirrors() {
         let mut st = SessionState::default();
-        st.sync_from(vec![Message::user("first line")], vec![], "/tmp/p".into());
+        st.sync_from(
+            vec![Message::user("first line")],
+            vec![],
+            vec![],
+            "/tmp/p".into(),
+        );
         assert_eq!(st.cwd, "/tmp/p");
         assert_eq!(st.messages.len(), 1);
         assert_eq!(
@@ -2087,12 +2107,17 @@ mod tests {
 
         // An existing name is never overwritten (a `/rename` must stick).
         st.name = "Kept".into();
-        st.sync_from(vec![Message::user("other")], vec![], "/tmp/p".into());
+        st.sync_from(
+            vec![Message::user("other")],
+            vec![],
+            vec![],
+            "/tmp/p".into(),
+        );
         assert_eq!(st.name, "Kept");
 
         // No conversation-derived name → the default is the cwd's basename.
         st.name = String::new();
-        st.sync_from(vec![], vec![], "/tmp/my-proj".into());
+        st.sync_from(vec![], vec![], vec![], "/tmp/my-proj".into());
         assert_eq!(st.name, "my-proj", "default name is the cwd basename");
     }
 
@@ -3220,6 +3245,7 @@ mod tests {
                     "base_url",
                     "created",
                     "cwd",
+                    "goals",
                     "messages",
                     "model",
                     "name",
@@ -3598,6 +3624,11 @@ mod roundtrip_audit {
                 status: "completed".into(),
                 evidence: None,
             }],
+            goals: vec![hrdr_tools::GoalItem {
+                content: "a goal".into(),
+                id: 1,
+                status: "pending".into(),
+            }],
             transcript: vec![
                 Entry::at(EntryKind::Header, t),
                 Entry::at(EntryKind::User("hi".into()), t),
@@ -3651,6 +3682,9 @@ mod roundtrip_audit {
         assert_eq!(back.usage, state.usage);
         assert_eq!(back.todos.len(), 1);
         assert_eq!(back.todos[0].content, "task");
+        assert_eq!(back.goals.len(), 1);
+        assert_eq!(back.goals[0].content, "a goal");
+        assert_eq!(back.goals[0].status, "pending");
         assert_eq!(back.messages.len(), 2);
         // The transcript is deliberately NOT in the `.json` any more — it is
         // written to the sibling jsonl and rebuilt on load. A bare `from_str`

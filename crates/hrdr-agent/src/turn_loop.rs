@@ -390,6 +390,17 @@ pub(crate) fn render_unfinished_todos(todos: &[TodoItem]) -> String {
         .join("\n")
 }
 
+/// Render the not-yet-`cancelled` goals as `○ content` lines, one per goal —
+/// the goal counterpart of [`render_unfinished_todos`], for the turn-end nudge.
+pub(crate) fn render_pending_goals(goals: &[GoalItem]) -> String {
+    goals
+        .iter()
+        .filter(|g| g.status.as_str() != "cancelled")
+        .map(|g| format!("○ {}", g.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Guard against an assistant turn carrying neither text nor a tool call.
 ///
 /// `Accumulator::into_message` leaves both `content` and `tool_calls` unset
@@ -686,6 +697,42 @@ impl Agent {
                                  replace, collapse, or drop items to make the list look \
                                  finished; a shorter list is not a resolved list.]",
                                 render_unfinished_todos(&unfinished)
+                            ),
+                            MessageOrigin::Nudge,
+                        );
+                        continue;
+                    }
+                }
+                // The same backstop for standing goals: a model that ends its
+                // turn with goals still pending either keeps working toward them
+                // or cancels each one explicitly (achieved or abandoned — the
+                // goal tool's cancel is the only way out of the nudge).
+                if !nudged_this_turn && self.bg_handle_count() == 0 {
+                    let pending: Vec<GoalItem> = self
+                        .ctx
+                        .goals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .filter(|g| g.status.as_str() != "cancelled")
+                        .cloned()
+                        .collect();
+                    if !pending.is_empty() {
+                        nudged_this_turn = true;
+                        on_event(AgentEvent::Notice(format!(
+                            "turn ended with {} pending goals — nudging the model to \
+                             continue or cancel them explicitly",
+                            pending.len()
+                        )));
+                        self.push_user_message(
+                            format!(
+                                "[Your turn was about to end, but these goals are not yet \
+                                 achieved:\n{}\nEither continue working toward them, or cancel \
+                                 each one you consider already achieved or abandoned with the \
+                                 goal tool (`goal cancel <id>`), saying plainly why. A \
+                                 cancelled goal is a resolved goal — do not just drop it from \
+                                 the list.]",
+                                render_pending_goals(&pending)
                             ),
                             MessageOrigin::Nudge,
                         );

@@ -43,6 +43,13 @@ impl super::App {
         self.todos.lock().map(|t| t.clone()).unwrap_or_default()
     }
 
+    /// The agent's goal list, copied under its lock for a session write — the
+    /// goals persist so a resume keeps the standing intentions the turn-end
+    /// nudge reads back.
+    fn goals_snapshot(&self) -> Vec<hrdr_agent::Goal> {
+        self.goals.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
     /// Point the shared sub-agent transcript cell at the current session's dir,
     /// and attach the MAIN agent's own durable transcript writer at its sibling
     /// `<id>.jsonl`. Called after the session id is assigned; anything spawned or
@@ -171,6 +178,7 @@ impl super::App {
     /// open-lock — is synchronous and only ever runs here on the UI thread).
     pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
         let todos = self.todos_snapshot();
+        let goals = self.goals_snapshot();
         // `state.cwd` is only synced by the turn-end autosave; on the very
         // first turn it is still empty, which would file the session under the
         // wrong cwd slug.
@@ -178,6 +186,7 @@ impl super::App {
         let state = self.state_mut();
         state.messages = messages;
         state.todos = todos;
+        state.goals = goals;
         state.cwd = cwd;
         if self.state().id.is_some() {
             // The id (and its open-lock) was minted synchronously — at turn
@@ -308,7 +317,8 @@ impl super::App {
             return;
         };
         let todos = self.todos_snapshot();
-        self.state_mut().sync_from(msgs, todos, cwd);
+        let goals = self.goals_snapshot();
+        self.state_mut().sync_from(msgs, todos, goals, cwd);
 
         if self.state().id.is_some() {
             // The mint happened synchronously (at turn start, or on the very
@@ -544,9 +554,14 @@ impl super::App {
         // The resumed session's spend is seeded into the agent's own counter, so it
         // counts on from there — rather than the frontend keeping a second tally and
         // adding it to the agent's on the way to the screen.
-        let (messages, todos, spent) = {
+        let (messages, todos, goals, spent) = {
             let s = self.state();
-            (s.messages.clone(), s.todos.clone(), s.usage.cost_usd)
+            (
+                s.messages.clone(),
+                s.todos.clone(),
+                s.goals.clone(),
+                s.usage.cost_usd,
+            )
         };
         self.with_agent(|a| {
             a.set_messages(messages);
@@ -608,6 +623,9 @@ impl super::App {
 
         if let Ok(mut t) = self.todos.lock() {
             *t = todos;
+        }
+        if let Ok(mut g) = self.goals.lock() {
+            *g = goals;
         }
         // A resumed session is a different transcript — every index-based view
         // state (opened thoughts) from the session we left is meaningless here.

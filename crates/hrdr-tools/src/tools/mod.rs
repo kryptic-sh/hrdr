@@ -2,6 +2,7 @@
 
 pub(crate) mod edit;
 pub(crate) mod find;
+pub(crate) mod goal;
 pub(crate) mod grep;
 pub(crate) mod ls;
 pub(crate) mod mutation;
@@ -124,6 +125,7 @@ pub(crate) fn rel_display<'a>(
 
 pub use edit::EditTool;
 pub use find::FindTool;
+pub use goal::GoalTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
