@@ -2817,6 +2817,17 @@ impl Agent {
         self.ctx.crons.clone()
     }
 
+    /// The ids of crons whose scheduler tasks are armed — test-only observable
+    /// for the resume/re-arm path (the field is `pub(crate)` in hrdr-tools).
+    #[cfg(test)]
+    pub fn cron_armed_for_test(&self) -> std::collections::HashSet<u64> {
+        self.ctx
+            .cron_armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Spawn a scheduler task for every cron in the shared list (idempotent: a
     /// cron whose scheduler already runs is skipped). Called on session resume
     /// so restored crons keep firing, and after a `/clear` that wiped the list
@@ -10184,6 +10195,284 @@ mod tests {
                     .iter()
                     .any(|m| m.origin == MessageOrigin::Nudge),
                 "a cancelled goal must not nudge"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// The `goal` tool works through the model's own tool call: the model
+        /// adds a goal, and when it then tries to end the turn text-only, the
+        /// turn-end nudge names the goal it just set. Three rounds: the tool
+        /// call, the text-only "done" that triggers the nudge, and the reply
+        /// after the nudge.
+        #[tokio::test]
+        async fn agent_run_goal_tool_call_then_turn_end_nudges_with_the_new_goal() {
+            let add_args = serde_json::to_string(&json!({
+                "op": "add",
+                "content": "ship the release",
+            }))
+            .unwrap();
+            let server = MockServer::start(vec![
+                // Round 1: the model calls `goal add`.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_goal", "goal"),
+                    tool_args_chunk("c1", &add_args),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 2: text-only end attempt — must trigger the goal nudge.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "I've done what I can."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 3 (post-nudge): still text-only, the turn may end.
+                MockResp::Sse(vec![
+                    text_chunk("c3", "Understood."),
+                    stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("plan the work", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // The tool call ran and stored the goal.
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::ToolEnd { name, ok: true, .. } if name == "goal")
+                ),
+                "goal tool must have run ok: {events:?}"
+            );
+            let binding = agent.goals();
+            let goals = binding.lock().unwrap();
+            assert_eq!(goals.len(), 1, "the goal is stored: {goals:?}");
+            assert_eq!(goals[0].content, "ship the release");
+            assert_eq!(goals[0].status, "pending");
+            drop(goals);
+            drop(binding);
+
+            // The turn-end nudge names the goal the model itself just set.
+            let nudges: Vec<&ChatMessage> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.origin == MessageOrigin::Nudge)
+                .collect();
+            assert_eq!(nudges.len(), 1, "exactly one nudge: {nudges:?}");
+            let body = nudges[0].content.as_deref().unwrap();
+            assert!(body.contains("ship the release"), "{body}");
+            assert!(body.contains("goal cancel <id>"), "{body}");
+        }
+
+        /// The `cron` tool works through the model's own tool call: `create`
+        /// stores the cron and returns an ack naming the cancel path; a
+        /// subsequent `cancel` removes it. Two turns, each a tool call
+        /// followed by a text-only end (a cron does not itself nudge at turn
+        /// end).
+        #[tokio::test]
+        async fn agent_run_cron_tool_call_creates_and_cancels() {
+            let create_args = serde_json::to_string(&json!({
+                "op": "create",
+                "schedule": "0 9 * * 1-5",
+                "content": "check the release CI",
+            }))
+            .unwrap();
+            let cancel_args = serde_json::to_string(&json!({
+                "op": "cancel",
+                "id": 1,
+            }))
+            .unwrap();
+            let server = MockServer::start(vec![
+                // Turn 1, round 1: the model calls `cron create`.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_create", "cron"),
+                    tool_args_chunk("c1", &create_args),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 1, round 2: text-only end.
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Scheduled."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 2, round 1: the model cancels the cron it just made.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c3", "call_cancel", "cron"),
+                    tool_args_chunk("c3", &cancel_args),
+                    tool_calls_stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+                // Turn 2, round 2: final text-only end.
+                MockResp::Sse(vec![
+                    text_chunk("c4", "Done."),
+                    stop_chunk("c4"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("set up the reminder", |ev| events.push(ev))
+                .await
+                .unwrap();
+            agent
+                .run_input("cancel it now", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // The create ran, stored the cron, and the ack named the cancel.
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::ToolEnd { name, ok: true, .. } if name == "cron"
+                )),
+                "cron tool must have run ok: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(e, AgentEvent::ToolEnd {
+                    name: n, ok: true, result, ..
+                } if n == "cron" && result.contains("cron cancel 1"))),
+                "the create ack names the cancel path"
+            );
+
+            // The cancel removed the cron.
+            let binding = agent.crons();
+            let crons = binding.lock().unwrap();
+            assert!(
+                crons.is_empty(),
+                "the cron was cancelled and removed: {crons:?}"
+            );
+            drop(crons);
+            drop(binding);
+        }
+
+        /// A fired cron delivers its reminder into the conversation exactly like
+        /// a finished background task: a done `BackgroundKind::Cron` entry in
+        /// the registry is drained into a user message carrying the reminder
+        /// content and the cancel-if-done hint. This is the delivery half of
+        /// the cron lifecycle — the fire itself is the scheduler sleeping to
+        /// `next_fire` (unit-tested in hrdr-tools); here the entry is seeded
+        /// done, as the scheduler leaves it.
+        #[tokio::test]
+        async fn agent_run_a_fired_cron_delivers_its_reminder_with_the_cancel_hint() {
+            let server = MockServer::start(vec![
+                // Round 1: the turn opens with nothing to deliver; the fired
+                // cron's done entry is drained before the request, so this
+                // reply is the model reacting to the reminder.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "I'll check the CI now."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // Seed the fired reminder exactly as `cron`'s scheduler leaves it:
+            // done, kind Cron, with the reminder text.
+            agent
+                .background_tasks()
+                .lock()
+                .unwrap()
+                .push(hrdr_tools::BackgroundTask {
+                    id: hrdr_tools::BackgroundTask::next_id(),
+                    kind: hrdr_tools::BackgroundKind::Cron,
+                    tool_id: None,
+                    label: "cron #1: check the release CI".to_string(),
+                    log: String::new(),
+                    done: true,
+                    result: Some(
+                        "[Cron reminder #1] check the release CI\n\nIf the goal behind this \
+                         reminder is already achieved, cancel this cron with `cron cancel 1` — \
+                         say plainly why."
+                            .to_string(),
+                    ),
+                    delivered: false,
+                    cancelled: false,
+                });
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            // Opener-less turn: nothing to deliver, so `run` proceeds straight
+            // to the loop, which drains the background entry before the request.
+            agent
+                .run(steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // The reminder landed as a user message with the content + hint.
+            let delivered: Vec<&ChatMessage> = agent
+                .messages()
+                .iter()
+                .filter(|m| {
+                    m.origin == MessageOrigin::Tool
+                        && m.content
+                            .as_deref()
+                            .is_some_and(|c| c.contains("check the release CI"))
+                })
+                .collect();
+            assert_eq!(delivered.len(), 1, "the reminder was delivered once");
+            let body = delivered[0].content.as_deref().unwrap();
+            assert!(
+                body.contains("cron cancel 1"),
+                "the cancel-if-done hint rides the delivered reminder: {body}"
+            );
+            // And the registry entry was pruned after delivery.
+            let remaining = agent
+                .background_tasks()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.kind == hrdr_tools::BackgroundKind::Cron)
+                .count();
+            assert_eq!(remaining, 0, "the delivered entry is pruned");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// A resumed session re-arms its restored crons: `Agent::run` starts by
+        /// arming every cron in the shared list, so a cron persisted to the
+        /// session file and loaded back keeps firing. The armed-mark set is the
+        /// observable (the scheduler task itself is the unit-tested half in
+        /// hrdr-tools; here we prove the resume path calls the arm).
+        #[tokio::test]
+        async fn agent_run_resume_re_arms_restored_crons() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "Resumed."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // What a resume restores into the shared list: the persisted crons.
+            let binding = agent.crons();
+            binding.lock().unwrap().push(hrdr_tools::CronItem {
+                id: 7,
+                schedule: "0 9 * * 1-5".to_string(),
+                content: "morning standup".to_string(),
+            });
+            drop(binding);
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("resume the session", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            // The turn start armed the restored cron.
+            assert!(
+                agent.cron_armed_for_test().contains(&7),
+                "the resumed cron's scheduler was re-armed"
             );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }

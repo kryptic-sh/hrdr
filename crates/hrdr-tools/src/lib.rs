@@ -255,8 +255,8 @@ pub struct ToolContext {
     /// Ids of crons whose scheduler task is currently armed — set by
     /// [`arm_crons`], cleared when a cron's task exits (cancel/teardown). Makes
     /// re-arming (create, resume) idempotent: a cron already being scheduled is
-    /// not double-spawned.
-    pub(crate) cron_armed: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// not double-spawned. `pub` so the agent's test-only accessor can read it.
+    pub cron_armed: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
     /// Per-call output line cap, applied alongside [`max_output`](Self::max_output)

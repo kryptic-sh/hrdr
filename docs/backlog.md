@@ -24,6 +24,26 @@ Conventions:
 
 ---
 
+## hrdr-agent/src/lib.rs is a 15k-line monolith — split into modules 2026-08-30
+
+`crates/hrdr-agent/src/lib.rs` is ~15,000 lines: the `Agent` impl, delegation
+runtime, session/oauth/auth/trust wiring, `AgentEvent`, the `mock_server` test
+harness, and ~7k lines of tests all in one file. Every change to any of them
+forces a reader to load the whole file, and concurrent edits collide in it. The
+seams already exist (delegation.rs, session.rs, turn_loop.rs, pane.rs, oauth/,
+auth/, trust.rs are separate); what remains is the `Agent` impl core
+(`impl Agent` blocks: ~2,500 lines), `AgentEvent` + the event plumbing, the
+`mock_server` test module (~1,000 lines), and the giant `tests::mock_server`
+test block. Split along those seams: move the `impl Agent` blocks to an
+`agent_impl.rs`, `AgentEvent` + `MessageOrigin` consumers to an `events.rs`, and
+the mock-server test harness + its tests into a `tests/` integration module —
+preserving the public surface (re-export from the old path) so callers don't
+churn. Do it as move-only commits (no behavior change), one seam per commit,
+each gate-green. Tracked as a tidy/perf cross-cutting debt item; not blocking
+any current work.
+
+---
+
 ## Frame cost measured 2026-08-13 — one fix shipped, one left open
 
 Prompted by "lag as the context gets bigger". Measured with a throwaway probe
