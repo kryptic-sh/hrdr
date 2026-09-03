@@ -3570,6 +3570,46 @@ async fn first_compaction_request_injects_chatgpt_oauth() {
     }
 }
 
+// ── the OpenCode session id follows the conversation ──────────────────
+
+/// The `x-opencode-session` value is conversation-scoped: minted per agent,
+/// replaced by the durable id a frontend assigns on reserve/resume, and
+/// re-minted when the conversation is cleared — never reused across two
+/// unrelated conversations (which would make the gateway group them).
+#[tokio::test]
+async fn opencode_session_id_is_minted_cleared_and_resettable() {
+    let dir = tempfile::tempdir().unwrap();
+    // No server: this test makes no request, and `Agent::new` is network-free.
+    let mut agent = Agent::new(test_cfg("http://127.0.0.1:1/v1".to_string(), dir.path())).unwrap();
+    let minted = agent.session_id().to_string();
+    assert!(
+        !minted.is_empty(),
+        "every agent has a session id from birth"
+    );
+    assert_eq!(
+        agent.client.session_id(),
+        Some(minted.as_str()),
+        "the client carries the minted id from construction"
+    );
+
+    // `/clear` starts a NEW conversation: a fresh id, so the gateway never
+    // groups the cleared conversation's requests with the new one's.
+    agent.clear();
+    let cleared = agent.session_id().to_string();
+    assert_ne!(cleared, minted, "clearing the conversation re-mints the id");
+    assert_eq!(
+        agent.client.session_id(),
+        Some(cleared.as_str()),
+        "the re-mint reaches the client"
+    );
+
+    // A resume (or a new session's first reserve) hands the durable on-disk
+    // id to the agent, overriding whatever was minted — in both stores.
+    agent.set_session_id("fix-login".to_string());
+    assert_eq!(agent.session_id(), "fix-login");
+    assert_eq!(agent.client.session_id(), Some("fix-login"));
+}
+
 // ── compaction retries a transient error on the summarization call ────
 
 /// `Agent::compact`'s summarization request hits a transient 429 first;

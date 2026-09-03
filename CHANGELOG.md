@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Requests to OpenCode Zen/Go now carry `x-opencode-session`.** The gateway
+  (`opencode.ai`) requires the header — one stable id per conversation — to
+  route a conversation's requests together for session affinity and prompt
+  caching, and errors on requests missing it since 2026-09-06. The value is the
+  durable session id (stable across resumes), or a per-agent minted id for
+  headless/delegated agents; it is sent only to `opencode.ai` endpoints and
+  never duplicates a provider-configured header.
+
 ## [0.15.1] - 2026-08-30
 
 ## [0.15.0] - 2026-08-30

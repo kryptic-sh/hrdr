@@ -76,6 +76,17 @@ impl super::App {
             let jsonl = hrdr_app::session_transcript_path(&cwd, id);
             self.registry
                 .attach_transcript(hrdr_agent::MAIN_KEY, &jsonl);
+            // Hand the conversation's id to the main agent so its requests to
+            // the OpenCode gateway carry it as `x-opencode-session` — the
+            // gateway requires the header and groups a conversation by it for
+            // session affinity and caching. Pushed here, the one point every
+            // id assignment funnels through (first reserve, resume, first
+            // save), so a new session, a `/resume` and a `/clear` each land on
+            // the right id without every mint site remembering to push.
+            // Skipped while a turn holds the agent lock — a running turn's
+            // requests already carry whatever id was in force when it started.
+            let id = id.clone();
+            self.with_agent(|a| a.set_session_id(id));
         }
     }
 

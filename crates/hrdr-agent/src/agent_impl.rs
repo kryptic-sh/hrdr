@@ -418,6 +418,14 @@ impl Agent {
         // on here, and gating would just be another way to forget it.
         let prompt_cache_key = new_prompt_cache_key();
         client.set_prompt_cache_key(Some(prompt_cache_key.clone()));
+        // One OpenCode session id per conversation, mirroring the prompt-cache
+        // key just above: minted here so every agent — headless or delegated,
+        // or a main agent before its frontend has reserved a durable session —
+        // still sends the `x-opencode-session` header the OpenCode gateway
+        // requires. The frontend overwrites it with the durable id once one is
+        // reserved (see `Agent::set_session_id`).
+        let session_id = new_prompt_cache_key();
+        client.set_session_id(Some(session_id.clone()));
         client.set_api_version(resolved.api_version().map(str::to_string));
         client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
         client.set_timeout(
@@ -493,6 +501,7 @@ impl Agent {
         Ok(Self {
             client,
             prompt_cache_key,
+            session_id,
             resolved,
             providers: config.providers,
             pending_notices,
@@ -683,6 +692,11 @@ impl Agent {
         // whatever made the summarizer fail belonged to the old history (or was
         // transient), not to this agent for the rest of the session.
         self.self_compact_failed_at = None;
+        // A cleared conversation is a NEW conversation: it must not keep the
+        // previous one's OpenCode session id, or the gateway would group two
+        // unrelated conversations together.
+        self.session_id = new_prompt_cache_key();
+        self.client.set_session_id(Some(self.session_id.clone()));
     }
 
     /// Forget which files the model has "seen": once the transcript no longer
@@ -965,6 +979,24 @@ impl Agent {
         Ok(())
     }
 
+    /// Set this agent's OpenCode conversation id — the value its requests send
+    /// as `x-opencode-session` to the OpenCode gateway. A frontend calls this
+    /// with its durable on-disk session id once a session is reserved (and
+    /// again on resume), so the id is stable across restarts; until then the
+    /// id minted at construction stands (see the field docs).
+    pub fn set_session_id(&mut self, id: String) {
+        self.session_id = id;
+        self.client.set_session_id(Some(self.session_id.clone()));
+    }
+
+    /// The OpenCode conversation id currently in force — the value sent as
+    /// `x-opencode-session`. Exposed so a caller that mints or replaces it
+    /// (or a test driving [`Self::clear`]) can assert what the agent and its
+    /// client actually carry.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Would `reference` be a real identity on this agent's providers? — the
     /// network-free pass that runs BEFORE [`set_model_ref`](Self::set_model_ref)
     /// moves anything.
@@ -1016,6 +1048,10 @@ impl Agent {
         // absent key means the cache stops matching, and nothing errors.
         self.client
             .set_prompt_cache_key(Some(self.prompt_cache_key.clone()));
+        // Same for the OpenCode session id, for the same reason: the
+        // conversation did not change, only what it runs on, and the requests
+        // after the switch must still identify it to the gateway.
+        self.client.set_session_id(Some(self.session_id.clone()));
         self.client
             .set_api_version(resolved.api_version().map(str::to_string));
         self.client.model = resolved.reference().model().to_string();

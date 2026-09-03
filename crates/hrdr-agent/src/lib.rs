@@ -866,6 +866,20 @@ pub struct Agent {
     /// and cwd, and a shared key would ask OpenAI to route two different prefixes
     /// to one cache slot.
     prompt_cache_key: String,
+    /// This agent's OpenCode conversation id, sent as the `x-opencode-session`
+    /// header on requests to the OpenCode gateway (`opencode.ai` — Zen and
+    /// Go), which requires it since 2026-09-06 and groups a conversation's
+    /// requests by it for session affinity and prompt caching.
+    ///
+    /// Held here, not just on the client, so the single writer of the identity
+    /// ([`Agent::adopt_resolved`]) can re-assert it after a `/model` switch,
+    /// mirroring [`prompt_cache_key`](Self::prompt_cache_key). Minted per
+    /// `Agent` at construction (like that key) so a headless or delegated
+    /// agent — one no frontend ever assigns a durable session to — still sends
+    /// *some* stable id per conversation; the frontend overwrites it with the
+    /// durable on-disk session id once one is reserved, so the value survives
+    /// resumes. Re-minted by [`Agent::clear`], which starts a new conversation.
+    session_id: String,
     /// **What this agent is running on**: the identity (provider AND model) and
     /// everything derived from it — endpoint, key, api-version, headers, trust
     /// kind, window. One value, moved as one by [`Agent::set_model_ref`], so the

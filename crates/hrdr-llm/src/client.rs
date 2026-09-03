@@ -541,6 +541,13 @@ pub struct Client {
     /// the native Anthropic Messages API has no such field and would 400 on it.
     /// See [`Client::set_prompt_cache_key`] for why it must be set.
     prompt_cache_key: Option<String>,
+    /// The conversation id, sent as `x-opencode-session` on requests to the
+    /// OpenCode gateway (`opencode.ai` — OpenCode Zen and Go). The gateway
+    /// groups a conversation's requests by it for session affinity and prompt
+    /// caching, and errors on requests missing it since 2026-09-06. `None` =
+    /// no header (a client never told its conversation id must not invent
+    /// one). Installed via [`Client::set_session_id`].
+    session_id: Option<String>,
     system_cache_split: Option<usize>,
     /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
     /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
@@ -640,6 +647,16 @@ fn replays_reasoning_content(base_url: &str, model: &str) -> bool {
 fn is_openrouter(base_url: &str) -> bool {
     let host = url_host(base_url);
     host == "openrouter.ai" || host.ends_with(".openrouter.ai")
+}
+
+/// Whether `base_url` is the OpenCode gateway (`opencode.ai`) — OpenCode Zen
+/// (`/zen/v1`) and Go (`/zen/go/v1`), the endpoints that want an
+/// `x-opencode-session` header on every request. Host-matched like
+/// [`is_openrouter`]: a different site on a lookalike host must not receive
+/// the conversation id.
+fn is_opencode(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
 }
 
 /// The `plugins` array an OpenRouter request carrying a PDF needs, or `None`
@@ -795,6 +812,7 @@ impl Client {
             effort: None,
             params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
+            session_id: None,
             prompt_cache_key: None,
             system_cache_split: None,
             api_version: None,
@@ -943,6 +961,21 @@ impl Client {
     /// Set the provider-configured extra headers sent with every request.
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
         self.extra_headers = headers;
+    }
+
+    /// Set the conversation id this client sends as `x-opencode-session` to
+    /// OpenCode endpoints (`opencode.ai`), or `None` to send none. See the
+    /// field docs for what the header is for and when it goes on the wire.
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
+    }
+
+    /// The session id currently installed ([`Client::set_session_id`]) — so a
+    /// caller that mints or replaces the id can assert the client actually
+    /// carries the new value (a dropped install is invisible until a request
+    /// to the OpenCode gateway goes out without the header it requires).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Whether an extra header with `name` (case-insensitive) is currently set.
@@ -1195,6 +1228,19 @@ impl Client {
                 // this only covers the best-effort `/models` + `/props` GETs.
                 Backend::OpenAi | Backend::Codex => req.bearer_auth(key),
             };
+        }
+        // The OpenCode gateway (Zen and Go) wants the conversation's id on
+        // every request: it routes a conversation's requests together for
+        // session affinity and prompt caching, and errors on requests missing
+        // `x-opencode-session` since 2026-09-06. Only `opencode.ai` gets it,
+        // and only when the provider config did not already set its own header
+        // — an operator-set `x-opencode-session` is deliberate, and two
+        // same-named headers would be ambiguous.
+        if let Some(sid) = &self.session_id
+            && is_opencode(&self.base_url)
+            && !self.extra_headers_contains("x-opencode-session")
+        {
+            req = req.header("x-opencode-session", sid);
         }
         req
     }
@@ -2898,6 +2944,84 @@ mod tests {
                 .unwrap(),
             "acct-1"
         );
+    }
+
+    #[test]
+    fn opencode_requests_carry_the_session_id_header() {
+        // The OpenCode gateway (Zen and Go, both on opencode.ai) requires
+        // `x-opencode-session` on every request since 2026-09-06 — without it
+        // requests may error, and the gateway cannot group a conversation for
+        // session affinity and prompt caching.
+        let mut client = Client::new(
+            "https://opencode.ai/zen/go/v1",
+            Some("sk-oc".to_string()),
+            "deepseek-v4-flash",
+        );
+        // No session id installed → no header: a client that was never told
+        // its conversation id must not invent one on the wire.
+        let req = client
+            .auth(client.http.post(client.url("chat/completions")))
+            .build()
+            .expect("request builds");
+        assert!(
+            req.headers().get("x-opencode-session").is_none(),
+            "no session id set, no header sent"
+        );
+
+        client.set_session_id(Some("fix-login".to_string()));
+        // Both OpenCode hosts carry it; a non-OpenCode endpoint never does.
+        for base in [
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/go/v1",
+        ] {
+            client.set_base_url(base.to_string());
+            let req = client
+                .auth(client.http.post(client.url("chat/completions")))
+                .build()
+                .expect("request builds");
+            assert_eq!(
+                req.headers()
+                    .get("x-opencode-session")
+                    .expect("session header present")
+                    .to_str()
+                    .unwrap(),
+                "fix-login",
+                "x-opencode-session on {base}"
+            );
+        }
+        client.set_base_url("https://api.openai.com/v1".to_string());
+        let req = client
+            .auth(client.http.post(client.url("chat/completions")))
+            .build()
+            .expect("request builds");
+        assert!(
+            req.headers().get("x-opencode-session").is_none(),
+            "a non-OpenCode endpoint must not receive the conversation id"
+        );
+    }
+
+    #[test]
+    fn a_configured_session_header_wins_over_the_clients() {
+        // An operator-set `x-opencode-session` (provider config) is deliberate;
+        // appending the client's own alongside it would be ambiguous — two
+        // same-named headers and no way to know which a server honours.
+        let mut client = Client::new(
+            "https://opencode.ai/zen/v1",
+            Some("sk-oc".to_string()),
+            "grok-code",
+        );
+        client.set_headers(vec![(
+            "x-opencode-session".to_string(),
+            "operator".to_string(),
+        )]);
+        client.set_session_id(Some("client".to_string()));
+        let req = client
+            .auth(client.http.post(client.url("chat/completions")))
+            .build()
+            .expect("request builds");
+        let got: Vec<_> = req.headers().get_all("x-opencode-session").iter().collect();
+        assert_eq!(got.len(), 1, "exactly one x-opencode-session header");
+        assert_eq!(got[0].to_str().unwrap(), "operator");
     }
 
     #[test]
