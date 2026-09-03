@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cron cancel` can no longer race a fire into a stray reminder.** The
+  scheduler's delivery now re-checks the cron's existence and pushes the
+  `BackgroundTask` under the same crons → background_tasks lock order the
+  `cancel` arm holds, so a cancel either leaves no cron for the fire to find or
+  marks the in-flight delivery cancelled before it reaches the conversation
+  (`crates/hrdr-tools`).
+
 ## [0.15.2] - 2026-09-04
 
 ### Fixed

@@ -3485,34 +3485,9 @@ mock_server.rs), the TUI paste cap, the gate/sandbox/whitespace dedup, and the
 highest-density areas (stream loops, session serialization, tool batch
 execution, background task lifecycle, shell/watch delivery).
 
-**Findings: 1 new (Low, race); plus one previously-recorded open item
-re-confirmed against the current code. Rest cleared.** No code was changed.
-
-1. **LOW — `cron cancel` vs a fire landing in the scheduler's final window
-   delivers one reminder after the cancel.**
-   (`crates/hrdr-tools/src/tools/cron.rs` `run_scheduler` 392-407, `cancel` arm
-   135-158, `deliver` 425-451.) The scheduler re-checks the cron list before
-   delivering, but between that check and `deliver`'s own push nothing is held:
-   the `cancel` tool can run fully in between — `crons.retain` removes the
-   entry, `cancel_pending_deliveries` marks every _existing_ not-yet-delivered
-   entry cancelled — and then `deliver` pushes a **new** `BackgroundTask` with
-   `cancelled: false`. `drain_background` (hrdr-agent/src/turn_state.rs 99-151)
-   delivers any `done && !delivered && !cancelled` entry, so the model receives
-   `[Cron reminder #N]` after the user cancelled it.
-
-   ```
-   Repro: cron created with schedule `*/30 * * * *`; at the fire instant when the
-   scheduler has passed its re-check but not yet called deliver(),
-   `cron cancel 1` runs to completion.
-   Expect: no further delivery after the cancel returns.
-   Actual: one live (cancelled: false) BackgroundKind::Cron entry for #1 in
-   ctx.background_tasks; delivered at the next drain — remote reminder for a
-   cancelled cron.
-   ```
-
-   One stray message, no state corruption. Fix direction: have `deliver`
-   re-check the cron's presence under the `background_tasks` lock (or mark the
-   delivery cancelled-race-free by re-reading the list inside deliver).
+**Findings: 1 new (Low, race) — fixed and closed 2026-09-04 (see CHANGELOG
+`## [Unreleased]`); plus one previously-recorded open item re-confirmed. Rest
+cleared.**
 
 2. **Re-confirmed (open hardening item from 2026-08-30) — `task_cancel` vs the
    background-spawn window: "Cancelled" while the run continues.** On the
@@ -3629,8 +3604,10 @@ OpenCode-gateway flow, the hrdr-agent split (events.rs / agent_impl.rs), the TUI
 paste cap, the gate/sandbox/whitespace dedup — plus the standing high-risk paths
 (shell/sandbox/lsp/mcp, credential handling, session deserialization). Every
 candidate was re-traced at its cited lines against the current code. **Status: 2
-new findings (both Low); 2 previously-recorded findings re-confirmed; the rest
-cleared.** No code changed.
+new findings (both Low); 1 previously-recorded finding re-confirmed; the
+`cron cancel` race from the 09-04 review was fixed and closed the same day (see
+CHANGELOG `## [Unreleased]`); the rest cleared.** No code changed by the audit
+itself.
 
 1. **LOW — stream decode/parse errors embed up to 32 MiB of provider-controlled
    text in hrdr's error channel, unwrapped and untruncated, on all three
@@ -3674,15 +3651,7 @@ cleared.** No code changed.
    "SSE/JSON overflow caps" entries covered the stream and accumulator paths,
    not this one. Fix: route `get_json` through `read_capped_json`
    (`MAX_STRUCTURED_JSON_BYTES`) like `list_models` does.
-3. **Re-confirmed (recorded 2026-09-04 correctness review #1, still open) —
-   `cron cancel` vs a fire landing in the scheduler's final window delivers one
-   reminder after the cancel.** `cron.rs` `run_scheduler` 392-406 + `deliver`
-   425-451: the re-check and the `background_tasks` push are not atomic, and
-   `cancel`'s `cancel_pending_deliveries` marks only deliveries that already
-   exist. One stray (model-visible, recorded as a user-role message by
-   `drain_background`, `turn_state.rs:99-151`) message, no state corruption.
-   Re-verified against the current code; not re-derived.
-4. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
+3. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
    open) — `task_cancel` vs the background-spawn window: "Cancelled" while the
    run continues.** `delegation.rs` registers the entry before the worker spawns
    and pushes the `JoinHandle` after, so a cancel in that window never aborts
@@ -3691,11 +3660,10 @@ cleared.** No code changed.
 
 **Cleared (suspected, traced, safe — do not re-investigate):**
 
-- **cron scheduler concurrency / deadlock.** Every `ctx` lock is taken alone and
-  dropped before the next is acquired — `run_scheduler` and `cancel` each hold
-  `crons` then release before touching `background_tasks`; no lock is ever
-  nested, so there is no lock-order inversion. `deliver` holds only
-  `background_tasks`; `arm_cron` holds `cron_armed` alone.
+- **cron scheduler concurrency / deadlock.** `deliver` and `cancel` share one
+  lock order — `crons` first, then `background_tasks` (nested) — so the
+  existence check and the push are atomic with respect to a cancel and there is
+  no lock-order inversion. `arm_cron` holds `cron_armed` alone.
 - **Double-arm across create/resume (`/clear`-then-recreate).** `cron_armed` is
   inserted before the spawn; `arm_crons` is idempotent; a second arm is a no-op,
   so two schedulers cannot race to deliver one fire.
@@ -3781,16 +3749,17 @@ Platform-gated backends (Windows LowIntegrity, macOS Seatbelt) were read only �
 never compiled or run on this Linux host. GAP: those areas ride prior-sweep
 verification; new findings there remain possible.
 
-**Summary:** 2 low, 0 medium/high/critical, plus 2 previously-recorded open
-items re-confirmed. Overall risk unchanged and low — the surfaces that would
-carry a real bug (redirect/auth-header leak, terminal injection, sandbox escape,
-SSRF, secret exfiltration, session-file traversal) were re-verified as guarded,
-and the new cron/goal/session-id machinery is sound apart from the two recorded
-races. Fix first: 1) truncate the five stream-error `format!`s to a bounded,
-char-boundary-safe size (mirror the MCP 500-byte fix); 2) cap `get_json` probe
-reads with `read_capped_json` like `list_models`; 3) then the already-recorded
-cron cancel-vs-deliver race (re-check under the `background_tasks` lock in
-`deliver`).
+**Summary:** 2 low, 0 medium/high/critical, plus 1 previously-recorded open item
+re-confirmed (the `cron cancel` race recorded by the 09-04 review was fixed and
+closed the same day — see CHANGELOG `## [Unreleased]`). Overall risk unchanged
+and low — the surfaces that would carry a real bug (redirect/auth-header leak,
+terminal injection, sandbox escape, SSRF, secret exfiltration, session-file
+traversal) were re-verified as guarded, and the new cron/goal/session-id
+machinery is sound apart from the still-open spawn-window race. Fix first: 1)
+truncate the five stream-error `format!`s to a bounded, char-boundary-safe size
+(mirror the MCP 500-byte fix); 2) cap `get_json` probe reads with
+`read_capped_json` like `list_models`; the stale `cron cancel` fix-first is done
+and deleted.
 
 ## Tidy review 2026-09-04
 

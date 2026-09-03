@@ -387,23 +387,15 @@ async fn run_scheduler(ctx: ToolContext, id: u64) {
         };
         let wait = (next - Local::now()).to_std().unwrap_or(Duration::ZERO);
         tokio::time::sleep(wait).await;
-        // Re-check the cron still exists before delivering — a cancel that
-        // landed during the sleep must not be followed by one last reminder.
-        let content = {
-            let crons = ctx
-                .crons
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match crons.iter().find(|c| c.id == id) {
-                Some(c) => c.content.clone(),
-                None => {
-                    drop(crons);
-                    mark_unarmed(&ctx, id);
-                    return;
-                }
-            }
-        };
-        deliver(&ctx, id, content);
+        // Deliver the fire atomically with respect to `cron cancel`: the
+        // existence check and the push share `deliver`'s crons →
+        // background_tasks lock order, so a cancel that landed during the sleep
+        // either left no cron to find (deliver returns false) or marks the
+        // just-pushed delivery cancelled before it can be delivered.
+        if !deliver(&ctx, id) {
+            mark_unarmed(&ctx, id);
+            return;
+        }
     }
 }
 
@@ -418,20 +410,35 @@ fn mark_unarmed(ctx: &ToolContext, id: u64) {
     armed.remove(&id);
 }
 
-/// Deliver one fire as a finished `BackgroundTask`: `drain_background`
+/// Deliver one fire as a finished `BackgroundTask` — `drain_background`
 /// (mid-turn) or the frontend's idle wake delivers it into the conversation
 /// like a finished watch. The message ends with the cancel hint — the model's
 /// reminder to stop the cron once its goal is achieved.
-fn deliver(ctx: &ToolContext, cron_id: u64, content: String) {
+///
+/// Returns false when the cron no longer exists (cancelled or cleared while
+/// the scheduler slept): nothing is pushed, and the caller clears the armed
+/// mark and exits. The existence check and the push run under the crons lock
+/// (then the background_tasks lock — the same order `cancel` holds them), so
+/// they are atomic with respect to a `cron cancel`: one that runs before
+/// leaves no cron to find, one that runs after marks this delivery cancelled.
+fn deliver(ctx: &ToolContext, cron_id: u64) -> bool {
+    let crons = ctx
+        .crons
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(content) = crons.iter().find(|c| c.id == cron_id) else {
+        return false;
+    };
     let id = BackgroundTask::next_id();
     let label = format!(
         "cron #{cron_id}: {}",
-        crate::truncate(&content, 60).replace(['\n', '\r'], " ")
+        crate::truncate(&content.content, 60).replace(['\n', '\r'], " ")
     );
     let result = format!(
-        "[Cron reminder #{cron_id}] {content}\n\n\
+        "[Cron reminder #{cron_id}] {}\n\n\
          If the goal behind this reminder is already achieved, cancel this cron with \
          `cron cancel {cron_id}` — say plainly why.",
+        content.content
     );
     let mut v = ctx
         .background_tasks
@@ -448,6 +455,7 @@ fn deliver(ctx: &ToolContext, cron_id: u64, content: String) {
         delivered: false,
         cancelled: false,
     });
+    true
 }
 
 /// Mark any not-yet-delivered `BackgroundKind::Cron` delivery for this cron as
@@ -618,7 +626,7 @@ mod tests {
             .await
             .unwrap();
         // Simulate a fire that landed but has not been delivered yet.
-        deliver(&ctx, 1, "a".to_string());
+        assert!(deliver(&ctx, 1), "cron #1 exists, so the fire delivers");
         {
             let v = ctx.background_tasks.lock().unwrap();
             assert_eq!(v.len(), 1);
@@ -653,7 +661,12 @@ mod tests {
     async fn deliver_carries_the_reminder_and_the_cancel_hint() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path());
-        deliver(&ctx, 3, "review the release notes".to_string());
+        *ctx.crons.lock().unwrap() = vec![CronItem {
+            id: 3,
+            schedule: "0 9 * * *".to_string(),
+            content: "review the release notes".to_string(),
+        }];
+        assert!(deliver(&ctx, 3), "cron #3 exists, so the fire delivers");
         let v = ctx.background_tasks.lock().unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, BackgroundKind::Cron);
@@ -664,6 +677,21 @@ mod tests {
         assert!(
             result.contains("already achieved"),
             "the cancel-if-done hint rides the reminder: {result}"
+        );
+    }
+
+    /// A fire whose cron was cancelled (or cleared) while the scheduler slept
+    /// must not land after the cancel: `deliver` re-checks existence under the
+    /// crons lock and pushes nothing, returning false — the half of the
+    /// cancel-vs-fire race that used to slip a `cancelled: false` task in.
+    #[tokio::test]
+    async fn deliver_skips_when_the_cron_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        assert!(!deliver(&ctx, 1), "no cron #1 to deliver");
+        assert!(
+            ctx.background_tasks.lock().unwrap().is_empty(),
+            "no stray reminder is pushed"
         );
     }
 
