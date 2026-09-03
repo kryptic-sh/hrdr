@@ -3825,9 +3825,10 @@ scheduler), the shared per-chunk SSE drain, the hrdr-agent split
 (events.rs/agent_impl.rs), the TUI paste cap, the gate/sandbox/whitespace dedup
 — plus a status pass on every open 08-30 perf finding, re-verified at its
 current line (the agent split and SSE refactor moved/handled several).
-**Findings: 1 new (LOW). All 22 recorded 08-30 findings remain open —
-re-confirmed, not re-derived; each one line + current file:line instead of a
-full writeup.** No code changed.
+**Findings: 1 new (LOW) — fixed and closed 2026-09-04 (`cron` `next_fire`
+fast-forward, below). All 22 recorded 08-30 findings remain open — re-confirmed,
+not re-derived; each one line + current file:line instead of a full writeup.**
+No code changed by the perf pass itself.
 
 Ranked by impact, biggest first:
 
@@ -3883,25 +3884,9 @@ Ranked by impact, biggest first:
 11. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
     request.** `catalog.rs:219,257,318-324`; caller sites unchanged
     (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-12. **LOW (NEW) — `cron` re-derives the next fire by a minute-by-minute scan out
-    to a 4-year horizon.** `crates/hrdr-tools/src/tools/cron.rs:291-302`:
-    `next_fire` steps `cand` forward one minute at a time (each iteration
-    `matches` → up to ~10 linear `Vec::contains` + chrono field reads) until the
-    schedule matches or the horizon (`NEXT_FIRE_HORIZON_DAYS` = 4×366 days ≈
-    2.1M minutes) runs out. Reached from the `create` tool path (`cron.rs:106`,
-    the schedule-validation `next_fire(...).is_none()`) and from the scheduler
-    loop once per fire (`cron.rs:383`) — which runs once per persisted cron on
-    every resume via `arm_crons` → per-cron `run_scheduler`. Frequency is cold
-    (once per fire) but the cost scales with rarity: a yearly cron re-scans ~526
-    K minutes (single-digit to tens of ms of CPU) per recompute, and the
-    pathological Feb-29 case scans ~2.1 M minutes on the create path, where it
-    blocks the tool result the model is waiting on. Fix: when a coarse field
-    fails, jump the candidate to the next value that could match it (next
-    matching hour / day / month) instead of `+1 minute` — O(1)-ish for every
-    real schedule, same horizon bound. Pure CPU win, no memory tradeoff.
-13. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+12. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
     page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-14. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+13. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
     acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
     `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
     in the transcript projection (`transcript_log.rs:114-115`); runs per
@@ -3910,15 +3895,15 @@ Ranked by impact, biggest first:
     `to_write` feeds both the deque and the transcript write, so
     `Record::from_event` would need to borrow the payload from the deque entry.
     Still available; open.
-15. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+14. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-16. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
+15. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
     pre-scan.** `client.rs:1557`, immediately before the same O(len) parse.
     Open.
-17. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
+16. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
     insert into `args_streamed`.** `codex.rs:450`. Open.
-18. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+17. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `memory.rs`
     (#13 recall lowercasing per token), `budget.rs` (#16 no-usage re-estimate —
     held open by decision) or the hrdr-tools dispatch (#17 args clone). Presumed

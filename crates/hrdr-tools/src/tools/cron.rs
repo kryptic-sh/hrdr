@@ -284,42 +284,128 @@ fn parse_field(field: &str, lo: u32, hi: u32) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// Whether `t`'s day satisfies the Vixie day rule: with both day-of-month and
+/// day-of-week restricted, either may match; with either side a wildcard, only
+/// the restricted side decides.
+fn day_hit(sched: &Schedule, t: &chrono::DateTime<Local>) -> bool {
+    let dom_hit = sched.dom.contains(&t.day());
+    let dow_hit = sched.dow.contains(&t.weekday().num_days_from_sunday());
+    if sched.dom_restricted && sched.dow_restricted {
+        dom_hit || dow_hit
+    } else {
+        dom_hit && dow_hit
+    }
+}
+
+fn matches(sched: &Schedule, t: &chrono::DateTime<Local>) -> bool {
+    sched.month.contains(&t.month())
+        && day_hit(sched, t)
+        && sched.hour.contains(&t.hour())
+        && sched.minute.contains(&t.minute())
+}
+
 /// The next fire strictly after `from`, or `None` when the schedule never
-/// fires within [`NEXT_FIRE_HORIZON_DAYS`]. Scans minute by minute — simple,
-/// and fast in practice because the first matching minute is usually close;
-/// the horizon caps the pathological (Feb-29) case.
+/// fires within [`NEXT_FIRE_HORIZON_DAYS`]. Fast-forwards by the coarsest
+/// failing unit instead of stepping minute by minute — a failing month rules
+/// out the whole month, a failing day the whole day — so a yearly schedule
+/// costs ~526 K iterations of the old walk and a Feb-29 one ~2.1 M. Every jump
+/// lands on an instant that could still match (a skipped hour, say a DST
+/// spring-forward gap, is stepped over, not leapt near), so the earliest match
+/// is identical to the minute walk; the horizon still caps the never-fires
+/// case.
 fn next_fire(expr: &str, from: chrono::DateTime<Local>) -> Option<chrono::DateTime<Local>> {
     let sched = parse_schedule(expr).ok()?;
     let horizon = from + chrono::Duration::days(NEXT_FIRE_HORIZON_DAYS);
     let mut cand = from + chrono::Duration::minutes(1);
-    while cand <= horizon {
+    loop {
+        if cand > horizon {
+            return None;
+        }
         if matches(&sched, &cand) {
             return Some(cand);
         }
-        cand += chrono::Duration::minutes(1);
+        if !sched.month.contains(&cand.month()) {
+            cand = next_month_start(&sched, cand);
+        } else if !day_hit(&sched, &cand) {
+            cand = next_local_midnight(cand);
+        } else if !sched.hour.contains(&cand.hour()) {
+            match next_hour_start(&sched, cand) {
+                Some(t) => cand = t,
+                None => cand = next_local_midnight(cand),
+            }
+        } else {
+            // The hour matches but the minute does not: step to the next
+            // matching minute, or escalate past the hour when exhausted.
+            let Some(&m) = sched.minute.iter().find(|&&m| m > cand.minute()) else {
+                match next_hour_start(&sched, cand) {
+                    Some(t) => cand = t,
+                    None => cand = next_local_midnight(cand),
+                }
+                continue;
+            };
+            // m comes from a 0..=59 field, so with_minute cannot fail; the
+            // fallback only exists to keep the loop total.
+            cand = cand
+                .with_minute(m)
+                .unwrap_or(cand + chrono::Duration::minutes(1));
+        }
     }
-    None
 }
 
-fn matches(sched: &Schedule, t: &chrono::DateTime<Local>) -> bool {
-    if !sched.month.contains(&t.month()) {
-        return false;
+/// The first day of the next month whose number is in `sched.month` (wrapping
+/// into the next year), at local midnight — or, when that midnight does not
+/// exist (a whole-day zone skip, practically never), the instant 24 h after
+/// `from`: the loop then walks days inside the target month rather than
+/// leaping past its matching days.
+fn next_month_start(sched: &Schedule, from: chrono::DateTime<Local>) -> chrono::DateTime<Local> {
+    let (mut year, mut month) = (from.year(), from.month());
+    loop {
+        month += 1;
+        if month > 12 {
+            month = 1;
+            year += 1;
+        }
+        if sched.month.contains(&month) {
+            break;
+        }
     }
-    // Day-of-month vs day-of-week: the Vixie OR rule.
-    let dom_hit = sched.dom.contains(&t.day());
-    let dow_hit = sched.dow.contains(&t.weekday().num_days_from_sunday());
-    let day_hit = if sched.dom_restricted && sched.dow_restricted {
-        dom_hit || dow_hit
-    } else {
-        dom_hit && dow_hit
-    };
-    if !day_hit {
-        return false;
-    }
-    if !sched.hour.contains(&t.hour()) {
-        return false;
-    }
-    sched.minute.contains(&t.minute())
+    to_local_datetime(year, month, 1, 0, 0, 0).unwrap_or(from + chrono::Duration::days(1))
+}
+
+/// The next matching hour after `from`'s hour on the same day, at minute 0 —
+/// `None` when the hour list is exhausted (the caller moves to the next day).
+/// An hour swallowed by a DST gap is stepped over, not returned as `None`.
+fn next_hour_start(
+    sched: &Schedule,
+    from: chrono::DateTime<Local>,
+) -> Option<chrono::DateTime<Local>> {
+    sched
+        .hour
+        .iter()
+        .filter(|&&h| h > from.hour())
+        .find_map(|&h| to_local_datetime(from.year(), from.month(), from.day(), h, 0, 0))
+}
+
+/// The instant of the next day's local midnight. Falls back to `from + 24 h`
+/// when midnight does not exist as a local time — the loop re-evaluates and
+/// jumps again.
+fn next_local_midnight(from: chrono::DateTime<Local>) -> chrono::DateTime<Local> {
+    let next = from + chrono::Duration::days(1);
+    to_local_datetime(next.year(), next.month(), next.day(), 0, 0, 0).unwrap_or(next)
+}
+
+/// `with_ymd_and_hms` against the local zone, choosing the earliest instant
+/// when a fall-back makes the wall time ambiguous; `None` when it does not
+/// exist (a spring-forward gap).
+fn to_local_datetime(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<chrono::DateTime<Local>> {
+    chrono::TimeZone::with_ymd_and_hms(&Local, year, month, day, hour, minute, second).earliest()
 }
 
 // ---- the per-cron scheduler task ----
@@ -562,6 +648,114 @@ mod tests {
         let from = Local.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
         // Feb 30 does not exist — the horizon is 4 years, and no Feb has 30 days.
         assert!(next_fire("0 0 30 2 *", from).is_none());
+    }
+
+    /// The month-jump + day-scan fast-forward must reproduce the minute walk's
+    /// earliest-match result for a far-away yearly schedule, including the
+    /// year wrap.
+    #[test]
+    fn next_fire_fast_forwards_across_months_to_the_yearly_fire() {
+        let from = Local.with_ymd_and_hms(2026, 1, 3, 14, 12, 0).unwrap();
+        let next = next_fire("30 9 13 6 *", from).unwrap();
+        assert_eq!(
+            (
+                next.year(),
+                next.month(),
+                next.day(),
+                next.hour(),
+                next.minute()
+            ),
+            (2026, 6, 13, 9, 30),
+            "{next}"
+        );
+        // The only fire within ~a year is after the year boundary: the month
+        // list wraps to January of the next year.
+        let from = Local.with_ymd_and_hms(2026, 11, 20, 23, 59, 0).unwrap();
+        let next = next_fire("0 0 1 1 *", from).unwrap();
+        assert_eq!(
+            (next.year(), next.month(), next.day()),
+            (2027, 1, 1),
+            "{next}"
+        );
+    }
+
+    /// A minutes list exhausted within the current hour escalates to the next
+    /// matching hour, not to the next day.
+    #[test]
+    fn next_fire_escalates_minutes_to_the_next_hour() {
+        let from = Local.with_ymd_and_hms(2026, 8, 30, 10, 50, 0).unwrap();
+        let next = next_fire("45 * * * *", from).unwrap();
+        assert_eq!((next.hour(), next.minute()), (11, 45), "{next}");
+    }
+
+    /// Differential oracle: the fast-forward must land on the same matching
+    /// minute as the minute walk across a spread of schedules and start times,
+    /// and never later than it. (The walk preserves `from`'s seconds — from
+    /// 10:50:01 it returns 11:00:01 — while the fast-forward returns the
+    /// match's `:00` boundary, so the two are compared per-minute; the exact
+    /// second is immaterial to the scheduler, which just sleeps until the
+    /// returned instant and the schedule is minute-granular.) The schedules
+    /// chosen all fire within a year, so the brute-force walk stays bounded.
+    #[test]
+    fn next_fire_agrees_with_a_minute_walk() {
+        let schedules = [
+            "* * * * *",
+            "*/30 * * * *",
+            "0 9 * * *",
+            "45 * * * *",
+            "30 10 13 * 1",
+            "0 9 * * 1-5",
+            "5 0 1,15 * *",
+            "0 12 * 6,12 *",
+        ];
+        let starts = [
+            (2026, 1, 3, 14, 12, 0),
+            (2026, 6, 13, 9, 29, 30),
+            (2026, 8, 29, 10, 50, 1),
+            (2026, 11, 20, 23, 59, 0),
+        ];
+        let mut checked = 0;
+        for expr in schedules {
+            let sched = parse_schedule(expr).unwrap();
+            for (y, mo, d, h, mi, se) in starts {
+                let from = Local.with_ymd_and_hms(y, mo, d, h, mi, se).unwrap();
+                let horizon = from + chrono::Duration::days(366);
+                // The reference: one minute at a time, exactly the old walk.
+                let mut walk = from + chrono::Duration::minutes(1);
+                let expected = loop {
+                    if walk > horizon {
+                        break None;
+                    }
+                    if matches(&sched, &walk) {
+                        break Some(walk);
+                    }
+                    walk += chrono::Duration::minutes(1);
+                };
+                let got = next_fire(expr, from);
+                match (got, expected) {
+                    (None, None) => {}
+                    (Some(g), Some(e)) => {
+                        assert_eq!(
+                            (g.year(), g.month(), g.day(), g.hour(), g.minute()),
+                            (e.year(), e.month(), e.day(), e.hour(), e.minute()),
+                            "fast-forward landed on a different minute than the walk \
+                             for `{expr}` from {from}"
+                        );
+                        assert!(
+                            g <= e,
+                            "fast-forward must not return a later instant than the walk \
+                             for `{expr}` from {from}: {g} vs {e}"
+                        );
+                    }
+                    _ => panic!(
+                        "fast-forward diverged from the minute walk for `{expr}` from {from}: \
+                         {got:?} vs {expected:?}"
+                    ),
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, schedules.len() * starts.len(), "all combos ran");
     }
 
     #[tokio::test]
