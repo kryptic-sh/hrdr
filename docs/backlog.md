@@ -3603,30 +3603,13 @@ delivery), the shared per-chunk SSE drain, the `x-opencode-session` /
 OpenCode-gateway flow, the hrdr-agent split (events.rs / agent_impl.rs), the TUI
 paste cap, the gate/sandbox/whitespace dedup — plus the standing high-risk paths
 (shell/sandbox/lsp/mcp, credential handling, session deserialization). Every
-candidate was re-traced at its cited lines against the current code. **Status: 1
-new finding, fixed and closed 2026-09-04 (the stream-error truncation — see
-CHANGELOG `## [Unreleased]`); 1 new finding still open (the `get_json` probe
-cap); 1 previously-recorded finding re-confirmed; the `cron cancel` race from
-the 09-04 review was fixed and closed the same day; the rest cleared.** No code
-changed by the audit itself.
+candidate was re-traced at its cited lines against the current code. **Status: 2
+new findings, both fixed and closed 2026-09-04 (stream-error truncation and the
+`get_json` probe cap — see CHANGELOG `## [Unreleased]`); 1 previously-recorded
+finding re-confirmed; the `cron cancel` race from the 09-04 review was fixed and
+closed the same day; the rest cleared.** No code changed by the audit itself.
 
-1. **LOW — the context-window probe reads `/v1/models` and `/props` with no byte
-   cap.** `crates/hrdr-llm/src/client.rs:1732-1738` — `get_json` does
-   `resp.json::<serde_json::Value>()`, reading the whole body into memory with
-   no cap, while the sibling `list_models` caps the same endpoint family with
-   `read_capped_json` (`client.rs:1641-1644`). Live reach: `context_window` →
-   `context_from_models` / `context_from_props` (same file), invoked at startup
-   (`apps/hrdr/src/main.rs:959`, wrapped in a 3 s timeout that bounds wall time,
-   **not** memory), by `/model` switch probing
-   (`hrdr-app/src/commands/model.rs:150`) and the TUI context probe
-   (`hrdr-tui/src/app.rs:1100`). Traced flow: a hostile or misconfigured
-   endpoint (a compromised provider, or a local server the user pointed hrdr at
-   — the same trust boundary the SSE/accumulator caps defend) serves a multi-GB
-   `/v1/models` or `/props` body → unbounded allocation → OOM. The cleared
-   "SSE/JSON overflow caps" entries covered the stream and accumulator paths,
-   not this one. Fix: route `get_json` through `read_capped_json`
-   (`MAX_STRUCTURED_JSON_BYTES`) like `list_models` does.
-2. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
+1. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
    open) — `task_cancel` vs the background-spawn window: "Cancelled" while the
    run continues.** `delegation.rs` registers the entry before the worker spawns
    and pushes the `JoinHandle` after, so a cancel in that window never aborts
@@ -3724,17 +3707,15 @@ Platform-gated backends (Windows LowIntegrity, macOS Seatbelt) were read only �
 never compiled or run on this Linux host. GAP: those areas ride prior-sweep
 verification; new findings there remain possible.
 
-**Summary:** 2 low, 0 medium/high/critical, plus 1 previously-recorded open item
-re-confirmed (the `cron cancel` race recorded by the 09-04 review was fixed and
-closed the same day — see CHANGELOG `## [Unreleased]`). Overall risk unchanged
-and low — the surfaces that would carry a real bug (redirect/auth-header leak,
-terminal injection, sandbox escape, SSRF, secret exfiltration, session-file
-traversal) were re-verified as guarded, and the new cron/goal/session-id
-machinery is sound apart from the still-open spawn-window race. Fix first: 1)
-truncate the five stream-error `format!`s to a bounded, char-boundary-safe size
-(mirror the MCP 500-byte fix); 2) cap `get_json` probe reads with
-`read_capped_json` like `list_models`; the stale `cron cancel` fix-first is done
-and deleted.
+**Summary:** 2 low, 0 medium/high/critical, all fixed and closed 2026-09-04
+(stream-error truncation, `get_json` probe cap — see CHANGELOG
+`## [Unreleased]`), plus 1 previously-recorded item re-confirmed (the
+`cron cancel` race recorded by the 09-04 review was also fixed and closed the
+same day). Overall risk unchanged and low — the surfaces that would carry a real
+bug (redirect/auth-header leak, terminal injection, sandbox escape, SSRF, secret
+exfiltration, session-file traversal) were re-verified as guarded, and the new
+cron/goal/session-id machinery is sound apart from the still-open spawn-window
+race.
 
 ## Tidy review 2026-09-04
 

@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   payload.** A `data:` event that fails to parse (up to 32 MiB by the decoder
   cap) is truncated to 500 bytes — char-boundary-safe, with the omission marked
   — before it rides the error text on all three backends (`crates/hrdr-llm`).
+- **The context-window probe caps its response bodies at 1 MiB.**
+  `GET /v1/models` and `GET /props` reads go through the same structured-JSON
+  cap as the models list, so a hostile or misconfigured endpoint cannot make the
+  probe buffer an unbounded body (`crates/hrdr-llm`).
 
 ## [0.15.2] - 2026-09-04
 

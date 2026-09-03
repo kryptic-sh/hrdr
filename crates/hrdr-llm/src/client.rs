@@ -1744,14 +1744,19 @@ impl Client {
     }
 
     /// GET `url` with the backend's auth and decode JSON; `None` on any error
-    /// (unreachable endpoint, non-2xx, or unparseable body) — detection is
-    /// best-effort and never fails the caller.
+    /// (unreachable endpoint, non-2xx, unparseable body, or one over the
+    /// structured cap) — detection is best-effort and never fails the caller.
+    /// The body is bounded by the same [`MAX_STRUCTURED_JSON_BYTES`] cap the
+    /// models list uses, so a hostile endpoint cannot make the probe buffer an
+    /// unbounded body.
     async fn get_json(&self, url: &str) -> Option<serde_json::Value> {
         let resp = self.auth(self.http.get(url)).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        resp.json::<serde_json::Value>().await.ok()
+        crate::capped_read::read_capped_json(resp, MAX_STRUCTURED_JSON_BYTES)
+            .await
+            .ok()
     }
 }
 
@@ -3250,6 +3255,28 @@ mod tests {
             msg.len() < 600,
             "the error stays bounded: {} bytes",
             msg.len()
+        );
+    }
+
+    /// The context-window probe (`get_json`) must not buffer an oversized body
+    /// whole: anything past the 1 MiB structured cap comes back as `None`
+    /// (best-effort), never an unbounded allocation.
+    #[tokio::test]
+    async fn oversized_probe_body_is_dropped_not_buffered() {
+        let payload = format!(
+            "{{\"a\":\"{}\"}}",
+            "x".repeat(MAX_STRUCTURED_JSON_BYTES + 64 * 1024)
+        );
+        let body = Box::leak(payload.into_boxed_str());
+        let base_url = serve_once(body).await;
+
+        let client = Client::new(&base_url, None, "test-model");
+        assert!(
+            client
+                .get_json(&format!("{base_url}/props"))
+                .await
+                .is_none(),
+            "an oversized probe body must read as None, not a buffered Value"
         );
     }
 
