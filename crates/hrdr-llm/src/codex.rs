@@ -323,7 +323,7 @@ pub(crate) async fn chat_stream(
                 // The Responses stream has no `[DONE]` sentinel — it terminates
                 // with `response.completed`/`.incomplete`/`.failed`.
                 let ev: Value = serde_json::from_str(data)
-                    .with_context(|| format!("decoding stream event: {data}"))?;
+                    .with_context(|| format!("decoding stream event: {}", crate::client::truncate_error_text(data)))?;
                 if let Some(out) = map_event(&mut state, &ev, retry_after)? {
                     yield out;
                 }

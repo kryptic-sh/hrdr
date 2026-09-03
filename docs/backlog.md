@@ -3603,39 +3603,14 @@ delivery), the shared per-chunk SSE drain, the `x-opencode-session` /
 OpenCode-gateway flow, the hrdr-agent split (events.rs / agent_impl.rs), the TUI
 paste cap, the gate/sandbox/whitespace dedup — plus the standing high-risk paths
 (shell/sandbox/lsp/mcp, credential handling, session deserialization). Every
-candidate was re-traced at its cited lines against the current code. **Status: 2
-new findings (both Low); 1 previously-recorded finding re-confirmed; the
-`cron cancel` race from the 09-04 review was fixed and closed the same day (see
-CHANGELOG `## [Unreleased]`); the rest cleared.** No code changed by the audit
-itself.
+candidate was re-traced at its cited lines against the current code. **Status: 1
+new finding, fixed and closed 2026-09-04 (the stream-error truncation — see
+CHANGELOG `## [Unreleased]`); 1 new finding still open (the `get_json` probe
+cap); 1 previously-recorded finding re-confirmed; the `cron cancel` race from
+the 09-04 review was fixed and closed the same day; the rest cleared.** No code
+changed by the audit itself.
 
-1. **LOW — stream decode/parse errors embed up to 32 MiB of provider-controlled
-   text in hrdr's error channel, unwrapped and untruncated, on all three
-   backends.** `crates/hrdr-llm/src/client.rs:1559,1604,1608`,
-   `anthropic.rs:679`, `codex.rs:326` — a `data:` event that fails
-   `serde_json::from_str` (or carries an `{"error":{"message":…}}` object) is
-   interpolated whole into the error text
-   (`format!("decoding stream event: {data}")` /
-   `format!("mid-stream error: {msg}")`), and `SseDecoder` lets a line/event
-   grow to `MAX_BUFFER_BYTES` = 32 MiB (`sse.rs:25`) before it errors. Traced
-   flow: a provider streams `data: <not-json>` (or a valid JSON error with an
-   oversized `message`) → the typed `ChatError` fails to downcast for the parse
-   case, so `is_transient` (`retry.rs:233-261`) and the overflow scan fall back
-   to **keyword-matching the server's own text** — a payload containing
-   `incomplete stream`, `overloaded`, `returned 429`, … forces retries (each
-   re-requesting, up to the fixed retry budget), and a payload containing a
-   context-overflow phrase drives `recover_context_overflow`
-   (`turn_loop.rs:1414`) into a **spurious compaction**; when the budget
-   exhausts, the full text becomes the turn error → error popup / headless
-   stderr, and it is not wrapped in the `<untrusted-content>` envelope (tool
-   `Err`s bypass it — `lib.rs` `execute`). Same class as the 2026-08-30 MCP
-   finding #2, which the fix capped at 500 bytes at the transport — the LLM
-   backends never got the equivalent. Impact: unwrapped instruction surface +
-   mis-steered retry/compaction + a per-turn ~MiB-scale error dump (display side
-   is ESC-sanitized by the 08-30 renderer fix, so no terminal injection). Fix:
-   truncate the event text inside the error formats (~500–2000 bytes,
-   char-boundary-guarded) at all five sites, matching the MCP fix.
-2. **LOW — the context-window probe reads `/v1/models` and `/props` with no byte
+1. **LOW — the context-window probe reads `/v1/models` and `/props` with no byte
    cap.** `crates/hrdr-llm/src/client.rs:1732-1738` — `get_json` does
    `resp.json::<serde_json::Value>()`, reading the whole body into memory with
    no cap, while the sibling `list_models` caps the same endpoint family with
@@ -3651,7 +3626,7 @@ itself.
    "SSE/JSON overflow caps" entries covered the stream and accumulator paths,
    not this one. Fix: route `get_json` through `read_capped_json`
    (`MAX_STRUCTURED_JSON_BYTES`) like `list_models` does.
-3. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
+2. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
    open) — `task_cancel` vs the background-spawn window: "Cancelled" while the
    run continues.** `delegation.rs` registers the entry before the worker spawns
    and pushes the `JoinHandle` after, so a cancel in that window never aborts

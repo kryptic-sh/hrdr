@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cancel` arm holds, so a cancel either leaves no cron for the fire to find or
   marks the in-flight delivery cancelled before it reaches the conversation
   (`crates/hrdr-tools`).
+- **Stream decode errors only carry a bounded slice of the offending SSE
+  payload.** A `data:` event that fails to parse (up to 32 MiB by the decoder
+  cap) is truncated to 500 bytes — char-boundary-safe, with the omission marked
+  — before it rides the error text on all three backends (`crates/hrdr-llm`).
 
 ## [0.15.2] - 2026-09-04
 

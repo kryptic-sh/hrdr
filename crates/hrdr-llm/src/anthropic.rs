@@ -676,7 +676,7 @@ pub(crate) async fn chat_stream(
                 // one worth having in the log.
                 crate::client::log_wire("sse", || json!({"data": data}));
                 let ev: Value = serde_json::from_str(data)
-                    .with_context(|| format!("decoding stream event: {data}"))?;
+                    .with_context(|| format!("decoding stream event: {}", crate::client::truncate_error_text(data)))?;
                 if let Some(out) = map_event(
                     &ev,
                     &mut tool_slot,

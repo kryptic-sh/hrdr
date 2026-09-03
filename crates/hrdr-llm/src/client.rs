@@ -168,6 +168,20 @@ pub(crate) fn set_client_warning(msg: String) {
     }
 }
 
+/// Bound an SSE payload for hrdr's error channel: a `data:` event embedded in
+/// a decode error can be up to `MAX_BUFFER_BYTES` (32 MiB, `sse.rs`) of
+/// provider-controlled text, and the whole thing must not ride the error text
+/// (memory, logs, and retry's keyword scans over `message`). Char-boundary-safe
+/// head truncation to the same 500-byte bound MCP's transport uses.
+pub(crate) fn truncate_error_text(text: &str) -> String {
+    const MAX_ERROR_TEXT_BYTES: usize = 500;
+    if text.len() <= MAX_ERROR_TEXT_BYTES {
+        return text.to_string();
+    }
+    let end = text.floor_char_boundary(MAX_ERROR_TEXT_BYTES);
+    format!("{}… [{} bytes omitted]", &text[..end], text.len() - end)
+}
+
 /// Append one `{"ts":…,"kind":…,…}` line to the wire log (no-op when off).
 ///
 /// `pub(crate)` because the wire log is a promise about *every* backend, and the
@@ -1556,7 +1570,7 @@ impl Client {
                     // the common case parses `data` straight into `ChatChunk`.
                     if data.contains("\"error\"") {
                         let value: serde_json::Value = serde_json::from_str(data)
-                            .with_context(|| format!("decoding stream event: {data}"))?;
+                            .with_context(|| format!("decoding stream event: {}", truncate_error_text(data)))?;
                         if let Some(err_obj) = value.get("error").filter(|e| !e.is_null()) {
                             let msg = err_obj
                                 .get("message")
@@ -1597,15 +1611,18 @@ impl Client {
                                 status: None,
                                 retry_after,
                                 kind,
-                                message: format!("mid-stream error: {msg}"),
+                                message: format!(
+                                    "mid-stream error: {}",
+                                    crate::client::truncate_error_text(msg)
+                                ),
                             })?;
                         }
                         let parsed: ChatChunk = serde_json::from_value(value)
-                            .with_context(|| format!("decoding stream event: {data}"))?;
+                            .with_context(|| format!("decoding stream event: {}", truncate_error_text(data)))?;
                         yield parsed;
                     } else {
                         let parsed: ChatChunk = serde_json::from_str(data)
-                            .with_context(|| format!("decoding stream event: {data}"))?;
+                            .with_context(|| format!("decoding stream event: {}", truncate_error_text(data)))?;
                         yield parsed;
                     }
                 }
@@ -3177,6 +3194,63 @@ mod tests {
             .expect("stream must yield the content chunk")
             .expect("null error field must not be treated as an error");
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn truncate_error_text_bounds_at_a_char_boundary() {
+        assert_eq!(truncate_error_text("short"), "short");
+        // Exactly at the bound: unchanged.
+        let exact = "x".repeat(500);
+        assert_eq!(truncate_error_text(&exact), exact);
+        // One over: cut to the bound with an omitted marker.
+        let over = "x".repeat(501);
+        let cut = truncate_error_text(&over);
+        assert_eq!(cut, format!("{}… [1 bytes omitted]", "x".repeat(500)));
+        assert_eq!(cut.len(), 500 + "… [1 bytes omitted]".len());
+        // A multibyte char straddling the bound is not split mid-codepoint.
+        let wide = format!("{}é {}", "x".repeat(499), "y".repeat(100));
+        let cut = truncate_error_text(&wide);
+        assert!(
+            cut.contains("… [") && cut.contains("bytes omitted]"),
+            "marker present, cut at a boundary: {cut}"
+        );
+        assert!(
+            !cut.contains('é'),
+            "the straddling char is cut whole: {cut}"
+        );
+        assert!(cut.is_char_boundary(cut.len()));
+    }
+
+    /// A hostile `data:` payload that fails to decode (up to 32 MiB by the SSE
+    /// cap) must not ride the error text whole: it is bounded to the same
+    /// 500-byte head truncation MCP's transport uses, tail omitted.
+    #[tokio::test]
+    async fn stream_decode_error_truncates_a_hostile_payload() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATAIL_SENTINEL_PAYLOAD_END";
+        let body = Box::leak(format!("{payload}\n\n").into_boxed_str());
+        let base_url = serve_once(body).await;
+
+        let client = Client::new(base_url, None, "test-model");
+        let mut stream = client.chat_stream(&[], &[]).await.unwrap();
+        let err = stream
+            .next()
+            .await
+            .expect("stream must yield the error")
+            .expect_err("the unterminated delta must fail to decode");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("… [") && msg.contains("bytes omitted]"),
+            "the error names the omission: {msg}"
+        );
+        assert!(
+            !msg.contains("TAIL_SENTINEL_PAYLOAD_END"),
+            "the payload's tail must be cut out of the error: {msg}"
+        );
+        assert!(
+            msg.len() < 600,
+            "the error stays bounded: {} bytes",
+            msg.len()
+        );
     }
 
     /// The `Retry-After` every [`stream_error`] mock answers with, in the two
