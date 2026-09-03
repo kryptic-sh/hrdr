@@ -1806,12 +1806,10 @@ impl App {
             hrdr_app::ClipboardPaste::Text(text) => {
                 let chars = text.chars().count();
                 let pasted = text.chars().take(MAX_PASTE_CHARS).count();
+                // on_paste caps and toasts the truncation itself; only the
+                // success toast is this arm's own.
                 self.on_paste(&text);
-                if pasted < chars {
-                    self.toasts.warn(format!(
-                        "paste too large — kept the first {pasted} of {chars} chars"
-                    ));
-                } else {
+                if pasted == chars {
                     self.toasts.info(format!("pasted {chars} chars"));
                 }
             }

@@ -3732,19 +3732,10 @@ OpenCode session-id fix. clippy
 `--workspace --all-targets --all-features -D warnings` is clean, so
 compiler-visible dead code is none; findings are duplication/indirection only.
 **Three new items; four 08-30 items still open (re-confirmed); one open by
-stated decision.**
+stated decision.** (Item 1 — the double paste warning — fixed and closed
+2026-09-04.)
 
-1. **An oversized paste warns twice on the Ctrl+] path** —
-   `crates/hrdr-tui/src/app.rs:1806-1817`: `on_paste` (1767-1775) already caps
-   at `MAX_PASTE_CHARS` and toasts "paste too large — kept the first … of …
-   chars"; `paste_clipboard`'s `ClipboardPaste::Text` arm then re-counts,
-   re-checks `pasted < chars`, and toasts the **identical** message a second
-   time. A bracketed terminal paste (tui.rs:143, the other entry point) warns
-   exactly once today. Action: drop the redundant warn from the Text arm — keep
-   the count, and emit only the `pasted N chars` info toast when nothing was
-   truncated (`on_paste` owns the truncation warning, so the two flanks cannot
-   drift).
-2. **`goal` re-implements the crate's shared args-parser** —
+1. **`goal` re-implements the crate's shared args-parser** —
    `crates/hrdr-tools/src/tools/goal.rs:133-135`: the local `parse_args` is a
    bare `serde_json::from_value` wrapper around `crate::tool_args`
    (`lib.rs:2012`), which the sibling `cron` tool added in the same commit uses
@@ -3752,7 +3743,7 @@ stated decision.**
    `crate::tool_args::<GoalArgs>("goal", args)?` — root-level errors produce
    byte-identical messages; **caveat**: a field-level error gains a `path:`
    prefix, which the shared helper adds by design.
-3. **goal and cron mint ids with the same max+1 expression** —
+2. **goal and cron mint ids with the same max+1 expression** —
    `goals.iter().map(|g| g.id).max().unwrap_or(0) + 1` (goal.rs:82) and
    `crons.iter().map(|c| c.id).max().unwrap_or(0) + 1` (cron.rs:117) are the
    identical list-backed id mint, introduced together. Action: one tiny
