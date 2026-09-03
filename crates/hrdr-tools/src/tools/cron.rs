@@ -114,7 +114,7 @@ impl Tool for CronTool {
                     .crons
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let id = crons.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+                let id = crate::next_id(crons.iter().map(|c| c.id));
                 crons.push(CronItem {
                     id,
                     schedule: schedule.trim().to_string(),

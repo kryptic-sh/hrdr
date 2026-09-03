@@ -79,7 +79,7 @@ impl Tool for GoalTool {
                     .goals
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let id = goals.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+                let id = crate::next_id(goals.iter().map(|g| g.id));
                 goals.push(GoalItem {
                     content: content.trim().to_string(),
                     id,

@@ -3732,16 +3732,8 @@ OpenCode session-id fix. clippy
 `--workspace --all-targets --all-features -D warnings` is clean, so
 compiler-visible dead code is none; findings are duplication/indirection only.
 **Three new items; four 08-30 items still open (re-confirmed); one open by
-stated decision.** (Items 1–2 — the double paste warning and the goal args
-wrapper — fixed and closed 2026-09-04.)
-
-1. **goal and cron mint ids with the same max+1 expression** —
-   `goals.iter().map(|g| g.id).max().unwrap_or(0) + 1` (goal.rs:82) and
-   `crons.iter().map(|c| c.id).max().unwrap_or(0) + 1` (cron.rs:117) are the
-   identical list-backed id mint, introduced together. Action: one tiny
-   `next_id(ids: impl Iterator<Item = u64>)` helper in `hrdr-tools/src/lib.rs`
-   serving both (todo's `assign_ids` has different rules — 0-filter + `max`
-   floor — and stays as is). Minor.
+stated decision.** (All three new items — the double paste warning, the goal
+args wrapper, and the shared id mint — fixed and closed 2026-09-04.)
 
 **Re-confirmed open from 2026-08-30:**
 

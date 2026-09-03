@@ -2003,6 +2003,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The next id for a list-backed registry: max existing + 1, so ids start at 1
+/// and never collide while entries are only appended or removed wholesale.
+pub fn next_id(ids: impl Iterator<Item = u64>) -> u64 {
+    ids.max().unwrap_or(0) + 1
+}
+
 /// Deserialize a tool's arguments, naming the offending field when it fails.
 ///
 /// `serde_json::from_value` reports *what* was wrong ("invalid type: integer
