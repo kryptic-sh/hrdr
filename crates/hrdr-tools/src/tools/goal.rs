@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -68,7 +68,7 @@ impl Tool for GoalTool {
         false
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a = parse_args(args).context("invalid goal args")?;
+        let a: GoalArgs = crate::tool_args("goal", args)?;
         match a.op.as_str() {
             "add" => {
                 let content = a
@@ -128,10 +128,6 @@ struct GoalArgs {
     content: Option<String>,
     #[serde(default)]
     id: Option<u64>,
-}
-
-fn parse_args(args: serde_json::Value) -> Result<GoalArgs> {
-    serde_json::from_value(args).map_err(|e| anyhow!(e.to_string()))
 }
 
 /// Render the goal list the way `todo` renders its list — `#N` + status mark +
