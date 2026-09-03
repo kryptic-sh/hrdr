@@ -3618,3 +3618,177 @@ read, not run); the bulk of the e2e/mock_server suites. Those areas rode the
 previous sweep's verification and this pass's broader read; new findings there
 remain possible. Platform-gated backends (Windows LowIntegrity, macOS Seatbelt)
 were read only — never compiled or run on this Linux host.
+
+## Security audit 2026-09-04
+
+`:audit` over the whole tree (working tree clean at the start), run single-agent.
+Scope = entire codebase; focus on what landed since the 2026-08-30 sweep — the
+`goal` and `cron` tools (persistence, scheduler concurrency, delivery), the
+shared per-chunk SSE drain, the `x-opencode-session` / OpenCode-gateway flow,
+the hrdr-agent split (events.rs / agent_impl.rs), the TUI paste cap, the
+gate/sandbox/whitespace dedup — plus the standing high-risk paths
+(shell/sandbox/lsp/mcp, credential handling, session deserialization). Every
+candidate was re-traced at its cited lines against the current code. **Status:
+2 new findings (both Low); 2 previously-recorded findings re-confirmed; the
+rest cleared.** No code changed.
+
+1. **LOW — stream decode/parse errors embed up to 32 MiB of provider-controlled
+   text in hrdr's error channel, unwrapped and untruncated, on all three
+   backends.** `crates/hrdr-llm/src/client.rs:1559,1604,1608`,
+   `anthropic.rs:679`, `codex.rs:326` — a `data:` event that fails
+   `serde_json::from_str` (or carries an `{"error":{"message":…}}` object) is
+   interpolated whole into the error text (`format!("decoding stream event:
+   {data}")` / `format!("mid-stream error: {msg}")`), and `SseDecoder` lets a
+   line/event grow to `MAX_BUFFER_BYTES` = 32 MiB (`sse.rs:25`) before it
+   errors. Traced flow: a provider streams `data: <not-json>` (or a valid JSON
+   error with an oversized `message`) → the typed `ChatError` fails to
+   downcast for the parse case, so `is_transient` (`retry.rs:233-261`) and the
+   overflow scan fall back to **keyword-matching the server's own text** — a
+   payload containing `incomplete stream`, `overloaded`, `returned 429`, …
+   forces retries (each re-requesting, up to the fixed retry budget), and a
+   payload containing a context-overflow phrase drives `recover_context_overflow`
+   (`turn_loop.rs:1414`) into a **spurious compaction**; when the budget
+   exhausts, the full text becomes the turn error → error popup / headless
+   stderr, and it is not wrapped in the `<untrusted-content>` envelope (tool
+   `Err`s bypass it — `lib.rs` `execute`). Same class as the 2026-08-30 MCP
+   finding #2, which the fix capped at 500 bytes at the transport — the LLM
+   backends never got the equivalent. Impact: unwrapped instruction surface +
+   mis-steered retry/compaction + a per-turn ~MiB-scale error dump (display
+   side is ESC-sanitized by the 08-30 renderer fix, so no terminal injection).
+   Fix: truncate the event text inside the error formats (~500–2000 bytes,
+   char-boundary-guarded) at all five sites, matching the MCP fix.
+2. **LOW — the context-window probe reads `/v1/models` and `/props` with no
+   byte cap.** `crates/hrdr-llm/src/client.rs:1732-1738` — `get_json` does
+   `resp.json::<serde_json::Value>()`, reading the whole body into memory with
+   no cap, while the sibling `list_models` caps the same endpoint family with
+   `read_capped_json` (`client.rs:1641-1644`). Live reach: `context_window` →
+   `context_from_models` / `context_from_props` (same file), invoked at
+   startup (`apps/hrdr/src/main.rs:959`, wrapped in a 3 s timeout that bounds
+   wall time, **not** memory), by `/model` switch probing
+   (`hrdr-app/src/commands/model.rs:150`) and the TUI context probe
+   (`hrdr-tui/src/app.rs:1100`). Traced flow: a hostile or misconfigured
+   endpoint (a compromised provider, or a local server the user pointed hrdr
+   at — the same trust boundary the SSE/accumulator caps defend) serves a
+   multi-GB `/v1/models` or `/props` body → unbounded allocation → OOM. The
+   cleared "SSE/JSON overflow caps" entries covered the stream and accumulator
+   paths, not this one. Fix: route `get_json` through `read_capped_json`
+   (`MAX_STRUCTURED_JSON_BYTES`) like `list_models` does.
+3. **Re-confirmed (recorded 2026-09-04 correctness review #1, still open) —
+   `cron cancel` vs a fire landing in the scheduler's final window delivers
+   one reminder after the cancel.** `cron.rs` `run_scheduler` 392-406 +
+   `deliver` 425-451: the re-check and the `background_tasks` push are not
+   atomic, and `cancel`'s `cancel_pending_deliveries` marks only deliveries
+   that already exist. One stray (model-visible, recorded as a user-role
+   message by `drain_background`, `turn_state.rs:99-151`) message, no state
+   corruption. Re-verified against the current code; not re-derived.
+4. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
+   open) — `task_cancel` vs the background-spawn window: "Cancelled" while the
+   run continues.** `delegation.rs` registers the entry before the worker
+   spawns and pushes the `JoinHandle` after, so a cancel in that window never
+   aborts and the write-capable sub-agent's edits still land. Not a new
+   finding; listed so the routing step records it.
+
+**Cleared (suspected, traced, safe — do not re-investigate):**
+
+- **cron scheduler concurrency / deadlock.** Every `ctx` lock is taken alone
+  and dropped before the next is acquired — `run_scheduler` and `cancel` each
+  hold `crons` then release before touching `background_tasks`; no lock is
+  ever nested, so there is no lock-order inversion. `deliver` holds only
+  `background_tasks`; `arm_cron` holds `cron_armed` alone.
+- **Double-arm across create/resume (`/clear`-then-recreate).** `cron_armed`
+  is inserted before the spawn; `arm_crons` is idempotent; a second arm is a
+  no-op, so two schedulers cannot race to deliver one fire.
+- **cron schedule arithmetic.** `parse_field` bounds-checks every range
+  (`start`/`end` inside `lo..=hi`, `start <= end`, `step != 0`), `step_by`
+  cannot overflow, the Feb-29 case is bounded by
+  `NEXT_FIRE_HORIZON_DAYS`, and the unreachable-schedule refusal happens at
+  create time. The one recorded DST mistiming has no security content.
+- **`cron`/`goal` in jail.** `JAIL_TOOLS` is the fixed 5-tool set
+  (`lib.rs:1712`) — read/grep/find/ls/tree — so neither tool reaches a jailed
+  agent.
+- **`x-opencode-session` / OpenCode gateway.** The id is CSPRNG-minted
+  (`new_prompt_cache_key`, `lib.rs:837-848`, 16 random bytes); the header is
+  host-gated (`is_opencode`, exact host or `.opencode.ai` suffix,
+  `client.rs:657-660`), never duplicates an operator-set header
+  (`client.rs:1239-1244`), rides `auth()` on every request including the
+  `/models` GETs, and is re-asserted/re-minted on the paths the review traced.
+  The 08-30 cross-host redirect fix (`Policy::none`, `client.rs:803` and
+  `:955`, and the same client object is what both native backends send on) is
+  present, so the new header — and the old `x-api-key`/Bearer — cannot ride a
+  redirect.
+- **SSE drain extraction.** Caps and overflow semantics preserved (32 MiB
+  line/event, overflow → error never a truncated event, char-boundary-safe
+  cuts), `[DONE]` handled before `finish()`, `finish()` re-checks overflow;
+  behavior-preserving per the 09-04 review diff.
+- **codex/anthropic map_event paths.** No indexing into untrusted arrays
+  (`tool_slot.get`, `.copied()`, `Option`-chained); `assign_slot` and
+  `capture_reasoning_item` are capped by `MAX_CAPTURED_ENTRIES` /
+  `MAX_ACCUMULATED_BYTES`; unknown event types ignored; error objects
+  classified by `code`/`type` first, message text only as a fallback.
+- **Background-delivery gating.** `drain_background` delivers only
+  `done && !delivered && !cancelled`; a cancelled task's result is discarded,
+  and the delivered result rides the arrival-reminder framing ("a report to
+  read", not an instruction).
+- **Agent split commits (78d329e, f2e2f7e, ea34689).** Move-only (four methods
+  widened private → `pub(crate)`); nothing security-relevant changed in the
+  move.
+- **Paste cap and gate/sandbox/whitespace dedup.** `take(MAX_PASTE_CHARS)`
+  (also bounds memory from a poisoned clipboard); `join_paths`/`is_whole`/
+  `collapse_whitespace` verified byte-equivalent to the originals.
+
+**Hardening (correct today, fragile — explicitly not vulnerabilities):**
+
+- **A resume of a session whose stored cron schedule no longer parses (or
+  never fires) exits the scheduler without clearing the armed mark.**
+  `cron.rs:383-387` (`let Some(next) = next_fire(...) else { return; }`) — the
+  two cancel exits call `mark_unarmed`, this one does not. Reachable only via
+  an edited/crafted session file (create-time validation refuses these
+  schedules). Effect today: a HashSet entry and a zombie `cron list` entry
+  that cannot be re-armed; ids are minted `max+1`, so the stale mark blocks
+  nothing. Fold into the recorded "session-file trusted at resume" item: add
+  `mark_unarmed` before the `return`.
+- **Cron/goal `content` is validated by `trim()` only (`cron.rs:121`,
+  `goal.rs:84`), so ESC/control bytes survive into the delivered user-role
+  message and the persisted session file.** Author is the model (or the local
+  session file), and the render-path sanitizer strips display-side, so this
+  is not a finding; stripping controls at `create` (as the delivery label
+  does, `cron.rs:429`) would close the file-resume corner.
+- **`crons`/`goals` are adopted from the session file with no validation
+  (`session.rs:287-288`)** — the 2026-08-30 hardening
+  ("session-file `cwd`/`read_only`/identity trusted at resume") now covers
+  two more fields whose content re-enters the conversation (a crafted file can
+  plant a cron reminder of up to file-cap size). Same trust class as the
+  transcript; re-validate at adopt if the promise is ever tightened.
+
+**Coverage:** walked in full this pass — `hrdr-tools` cron.rs, goal.rs,
+ToolContext + registration + `JAIL_TOOLS`, lib.rs secret/identity/resolve
+surface around the tools; `hrdr-agent` turn_loop.rs (run loop, nudge/goal
+backstops, connect_stream/connect_and_drain, retry + overflow recovery,
+drain_background), turn_state.rs, session.rs (crons/goals serialize/load/adopt,
+persisted_messages), agent_impl.rs session-id mint + adopt, delegation.rs
+cancel window (re-read for re-confirmation), events.rs; `hrdr-llm` sse.rs,
+client.rs (auth/redirect/session header/get_json/SSE loop), anthropic.rs
+(request build + stream loop + error paths), codex.rs (map_event, slot/reasoning
+caps), retry.rs classification, types.rs; split-commit diffs (78d329e/f2e2f7e)
+read as diffs. NOT re-audited line-by-line (no new code since 08-30; covered by
+the previous audits, whose cleared items were not re-derived): lsp.rs, mcp/*,
+memory.rs, guardrails.rs, verification.rs, web.rs, shell.rs internals,
+sandbox.rs policy build, compaction.rs, oauth/*, auth_store.rs,
+attachment_store.rs, trust.rs, history/transcript write side, `hrdr-tui`
+ui.rs/app.rs render + input detail + selectors, `hrdr-editor`, `hrdr-app`
+dispatch internals, `apps/hrdr/src/main.rs` beyond the probe, and the bulk of
+the mock_server/e2e test suites. Platform-gated backends (Windows LowIntegrity,
+macOS Seatbelt) were read only — never compiled or run on this Linux host.
+GAP: those areas ride prior-sweep verification; new findings there remain
+possible.
+
+**Summary:** 2 low, 0 medium/high/critical, plus 2 previously-recorded open
+items re-confirmed. Overall risk unchanged and low — the surfaces that would
+carry a real bug (redirect/auth-header leak, terminal injection, sandbox
+escape, SSRF, secret exfiltration, session-file traversal) were re-verified as
+guarded, and the new cron/goal/session-id machinery is sound apart from the two
+recorded races. Fix first: 1) truncate the five stream-error `format!`s to a
+bounded, char-boundary-safe size (mirror the MCP 500-byte fix); 2) cap
+`get_json` probe reads with `read_capped_json` like `list_models`; 3) then the
+already-recorded cron cancel-vs-deliver race (re-check under the
+`background_tasks` lock in `deliver`).
