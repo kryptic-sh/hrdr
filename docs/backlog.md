@@ -3473,3 +3473,148 @@ moves forward); catalog `cached_read` cold read happens once per mtime. Not
 settled without profiling: how much of per-token CPU the JSON parse dominates;
 true per-request catalog-scan µs; per-attachment base64 wall time. The
 deliberate per-request base64 tradeoff is recorded above.
+
+## Correctness review 2026-09-04
+
+`:review` over the whole tree (clean at the time; scope = entire codebase per
+the procedure), run single-agent. Focus on the code landed since the 2026-08-30
+sweep — the shared per-chunk SSE drain (`hrdr-llm/src/sse.rs`), the `goal` and
+`cron` tools, the hrdr-agent lib.rs split (events.rs / agent_impl.rs /
+mock_server.rs), the TUI paste cap, the gate/sandbox/whitespace dedup, and the
+`x-opencode-session` header work — plus a correctness walk of the
+highest-density areas (stream loops, session serialization, tool batch
+execution, background task lifecycle, shell/watch delivery).
+
+**Findings: 1 new (Low, race); plus one previously-recorded open item
+re-confirmed against the current code. Rest cleared.** No code was changed.
+
+1. **LOW — `cron cancel` vs a fire landing in the scheduler's final window
+   delivers one reminder after the cancel.**
+   (`crates/hrdr-tools/src/tools/cron.rs` `run_scheduler` 392-407, `cancel` arm
+   135-158, `deliver` 425-451.) The scheduler re-checks the cron list before
+   delivering, but between that check and `deliver`'s own push nothing is held:
+   the `cancel` tool can run fully in between — `crons.retain` removes the
+   entry, `cancel_pending_deliveries` marks every _existing_ not-yet-delivered
+   entry cancelled — and then `deliver` pushes a **new** `BackgroundTask` with
+   `cancelled: false`. `drain_background` (hrdr-agent/src/turn_state.rs 99-151)
+   delivers any `done && !delivered && !cancelled` entry, so the model receives
+   `[Cron reminder #N]` after the user cancelled it.
+
+   ```
+   Repro: cron created with schedule `*/30 * * * *`; at the fire instant when the
+   scheduler has passed its re-check but not yet called deliver(),
+   `cron cancel 1` runs to completion.
+   Expect: no further delivery after the cancel returns.
+   Actual: one live (cancelled: false) BackgroundKind::Cron entry for #1 in
+   ctx.background_tasks; delivered at the next drain — remote reminder for a
+   cancelled cron.
+   ```
+
+   One stray message, no state corruption. Fix direction: have `deliver`
+   re-check the cron's presence under the `background_tasks` lock (or mark the
+   delivery cancelled-race-free by re-reading the list inside deliver).
+
+2. **Re-confirmed (open hardening item from 2026-08-30) — `task_cancel` vs the
+   background-spawn window: "Cancelled" while the run continues.** On the
+   current code the entry is registered before the worker is spawned
+   (delegation.rs:439-451), but the `JoinHandle` is pushed to `bg_handles` only
+   after the spawn (delegation.rs:462 spawn, 670-678 push). A `task_cancel`
+   landing in that window finds the entry (marks it `cancelled`), finds no
+   handle (`aborted = false`), never aborts — and the worker keeps running to
+   completion. Its `done`/`result` writes land (delegation.rs:655-660) but the
+   entry stays `cancelled`, so `drain_background` discards the result: the model
+   was told "Cancelled", a write-capable sub-agent's edits still land in the
+   tree afterwards, and its report is silently dropped. The new 10 s awaited
+   abort (delegation.rs:1937-1939) closed the post-abort half of the race but
+   not this pre-registration half. Observable: `task_cancel` called immediately
+   after the `task` call returns "Started background task #N" reports
+   "Cancelled" while the task's transcript keeps recording events.
+
+**Cleared (suspected, traced, safe):**
+
+- **SSE drain extraction is behavior-preserving.** Diffed each backend's
+  pre-refactor loop against `next_sse_events`: error texts byte-identical (the
+  `\`-continued string folds to the same single space), overflow and EOF
+  handling match, and `finish()`'s post-flush overflow recheck is present in all
+  three callers' semantics.
+- **gate/sandbox/whitespace dedup.** `is_whole` is literally
+  `classify(...) == Scope::Whole`; `collapse_whitespace` is the same
+  `split_whitespace().join(" ")` as all four old copies; the `join_paths`
+  generic iterates `&&Path`/`&PathBuf` identically under `AsRef<Path>`.
+- **`x-opencode-session`.** Host-gated (`is_opencode`, host == opencode.ai
+  exactly, mirroring `is_openrouter`); never duplicates an operator-set header
+  (`extra_headers_contains`); re-asserted on `/model` switch, re-minted on
+  `clear()`, TUI pushes the durable id at the single funnel (`session.rs`
+  `refresh_subagent_dir` — first reserve, resume, first save), and the first
+  reserve runs at turn start while the agent lock is free, so the durable id
+  normally lands before the first request.
+- **Paste cap.** `take(MAX_PASTE_CHARS)` in `on_paste` and the toast's counted
+  `pasted` agree; both composer and login field capped.
+- **Accumulator usage merge.** `max` + don't-clobber-Some preserves Anthropic's
+  two-phase usage; `cache_creation_input_tokens` survives `message_delta`
+  (tested both orders).
+- **`system_cache_split`.** Both consumers (`mark_system_cache` in
+  `types.rs:499`, `split_system_for_cache` in `anthropic.rs:430`) guard
+  `is_char_boundary` and fall back to the single-block shape; the offset is a
+  byte sum of sections (`prefix_len_before`, `prompt.rs:331`), safe to compute.
+- **cron vs `/clear` and resume.** `/clear` never wipes `ctx.crons` (only the
+  TUI's todo list is cleared in `clear_all`), so there is no id-reuse-with-a-
+  still-armed-scheduler collision and no silently-unarmed recreate; schedulers
+  surviving `/clear` is deliberate (crons persist to the session file and are
+  re-armed on resume; `cron_armed` + idempotent `arm_crons` make resume
+  double-arm impossible).
+- **cron scheduling arithmetic.** `next_fire` scans minute-by-minute from
+  from+1, `wait` computed from the same `now`; unreachable-schedule refusal at
+  create time; `id = max + 1` monotonic.
+- **Watch lifecycle.** Entry pushed before the poller spawns, so `task_cancel`
+  can always address a fresh watch; poller self-terminates on cancel/absence;
+  `finish` never clears `cancelled`, so a cancelled-then-finished watch cannot
+  deliver.
+- **`expect("array")` in the models tool** (`hrdr-agent/src/lib.rs:392,402,417`)
+  is structurally safe — `value` is built with `"warnings": <vec>`.
+- **`read_line_capped`** indexing safe (`take >= 1` whenever the buffer is
+  non-empty); shell overflow spool seeding + per-line append consistent
+  (regression test present); display re-trim to the real budget present.
+- **`ToolContext::resolve/write/read` gate + signature bookkeeping** — no new
+  gaps found in the read-before-edit or stale-modifier paths.
+
+**Hardening (correct today, fragile):**
+
+- **Session-id push can silently skip while a turn holds the agent lock**
+  (`session.rs:79-90` via `app.rs:2176-2178` `with_agent` try_lock). If
+  `refresh_subagent_dir` runs mid-turn (first save landing during the first
+  turn), the agent keeps its construction-minted id for the rest of the process
+  — the durable on-disk id only surfaces after a resume. Effect is limited to
+  OpenCode session affinity/prompt-caching grouping; self-heals on resume.
+  Consider re-asserting the id from `state.id` at turn end.
+- **`watch` accepts `timeout_secs: 0`** (`watch.rs:173-179`; schema has a
+  maximum but no minimum): the first iteration's `elapsed >= 0` check fires
+  immediately and returns "timed out after 0s — the check never exited 0"
+  without ever running the check. A model passing 0 gets a confusing instant
+  failure. Add a minimum (1) or run the first poll before the timeout check.
+- **Cron fire across a DST transition** (`cron.rs:383-389`): `wait` is a
+  wall-clock difference computed before the sleep; a transition between
+  computation and fire shifts one delivery by an hour. The loop recomputes
+  `next_fire` from `Local::now()` after every delivery, so later fires
+  self-correct; no missed fire, at most one mistimed.
+
+**Coverage:** full codebase scope (working tree clean at review start). Read in
+full: `hrdr-llm` sse.rs + the three backends' stream loops and map_event,
+types.rs (Accumulator, usage merge, cache breakpoints), retry.rs classifiers;
+`hrdr-tools` shell.rs (run_streamed_command, caps, spool), watch.rs, cron.rs,
+goal.rs, gate.rs, sandbox.rs join paths, agents_dir.rs; `hrdr-agent`
+turn_loop.rs (run loop, nudge/goal backstops, tool batch + cancellation guards),
+turn_state.rs, session.rs serialization + persisted_messages, delegation.rs
+(background spawn/reap, task_cancel), prompt.rs SystemPrompt, usage.rs;
+`hrdr-tui` tui.rs run loop, app.rs paste cap + idle wake + with_agent,
+app/session.rs reserve/adopt/autosave, app/commands.rs clear_all, app/e2e.rs
+cited tests. NOT line-read this pass (covered by the 2026-08-30 sweep;
+skimmed/fn-mapped only): hrdr-llm pdf.rs, media.rs, fs.rs, capped_read.rs,
+catalog.rs internals and test tails; hrdr-agent compaction.rs, oauth/, trust.rs,
+auth_store.rs internals, chatgpt_models.rs, provider_catalog.rs; hrdr-tools
+lsp.rs, mcp/, memory.rs (tails), guardrails.rs, verification.rs internals;
+hrdr-app dispatch/engine internals; hrdr-editor; apps/hrdr (Windows-only wrapper
+read, not run); the bulk of the e2e/mock_server suites. Those areas rode the
+previous sweep's verification and this pass's broader read; new findings there
+remain possible. Platform-gated backends (Windows LowIntegrity, macOS Seatbelt)
+were read only — never compiled or run on this Linux host.
