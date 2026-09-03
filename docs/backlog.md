@@ -3762,7 +3762,7 @@ cleared.** No code changed.
 
 **Coverage:** walked in full this pass — `hrdr-tools` cron.rs, goal.rs,
 ToolContext + registration + `JAIL_TOOLS`, lib.rs secret/identity/resolve
-surface around the tools; `hrdr-agent` turn_loop.rs (run loop, nudge/goal
+surface around the tools; `hrdr-agent` `turn_loop.rs` (run loop, nudge/goal
 backstops, connect_stream/connect_and_drain, retry + overflow recovery,
 drain_background), turn_state.rs, session.rs (crons/goals serialize/load/adopt,
 persisted_messages), agent_impl.rs session-id mint + adopt, delegation.rs cancel
@@ -3771,9 +3771,9 @@ window (re-read for re-confirmation), events.rs; `hrdr-llm` sse.rs, client.rs
 stream loop + error paths), codex.rs (map_event, slot/reasoning caps), retry.rs
 classification, types.rs; split-commit diffs (78d329e/f2e2f7e) read as diffs.
 NOT re-audited line-by-line (no new code since 08-30; covered by the previous
-audits, whose cleared items were not re-derived): lsp.rs, mcp/_, memory.rs,
+audits, whose cleared items were not re-derived): lsp.rs, `mcp/`, memory.rs,
 guardrails.rs, verification.rs, web.rs, shell.rs internals, sandbox.rs policy
-build, compaction.rs, oauth/_, auth_store.rs, attachment_store.rs, trust.rs,
+build, compaction.rs, `oauth/`, auth_store.rs, attachment_store.rs, trust.rs,
 history/transcript write side, `hrdr-tui` ui.rs/app.rs render + input detail +
 selectors, `hrdr-editor`, `hrdr-app` dispatch internals, `apps/hrdr/src/main.rs`
 beyond the probe, and the bulk of the mock_server/e2e test suites.
@@ -3891,3 +3891,147 @@ chat_stream loops; hrdr-app + apps/hrdr tests (env tables in all three PTY
 files, common/mod.rs) and main.rs (grep for chrome/run_hrdr_inner). Remainder
 (sandbox policy internals, memory/lsp/mcp, ui.rs blocks beyond the cached
 regions, the mock_server/e2e suites) carries prior-sweep coverage.
+
+## Performance review 2026-09-04
+
+`:perf` over the whole tree (clean at start). Focus per the sweep brief: the
+code landed since 2026-08-30 — the `goal`/`cron` tools (cron's per-cron tokio
+scheduler), the shared per-chunk SSE drain, the hrdr-agent split
+(events.rs/agent_impl.rs), the TUI paste cap, the gate/sandbox/whitespace dedup
+— plus a status pass on every open 08-30 perf finding, re-verified at its
+current line (the agent split and SSE refactor moved/handled several).
+**Findings: 1 new (LOW). All 22 recorded 08-30 findings remain open —
+re-confirmed, not re-derived; each one line + current file:line instead of a
+full writeup.** No code changed.
+
+Ranked by impact, biggest first:
+
+1. **HIGH (re-confirmed, 08-30 #1) — per-round deep clone + snapshot save with 2
+   fsyncs on every delegated tool round.** `(**messages).clone()` on every
+   `AgentEvent::History` from a background sub-agent, `delegation.rs:509-510`,
+   then `RunSnapshot::save` → whole-body serialize → `save_to_path` →
+   `write_atomic`. O(history) per round, O(n²) over a run. Fix as recorded
+   (serialize from the `Arc<Vec<ChatMessage>>` the event carries; move the write
+   off the turn future). Open.
+2. **HIGH (re-confirmed, 08-30 #2) — main-session `.json` fully rewritten every
+   tool round.** Design stated at `session.rs:512` ("a session file is rewritten
+   on every tool round"); save still whole-body `write_atomic`
+   (`session.rs:880`). TUI coalesces; each landed save is still O(history). Open
+   — the delta-journal fix from 08-30 stands.
+3. **HIGH (re-confirmed, 08-30 #18) — per-token String clones on the
+   streamed-delta path.** `Accumulator::push(&chunk)` still clones
+   `choice.delta.content` at `crates/hrdr-llm/src/types.rs:961` (returned only
+   so `drain_stream` can render it), and the caller re-clones the reasoning
+   delta per thinking token (`crates/hrdr-agent/src/turn_loop.rs:225`). ~2
+   removable allocations per token on the hottest loop in the crate. Open.
+4. **MEDIUM-HIGH (re-confirmed, 08-30 #3/#4) — TUI body cache keys miss on every
+   frame for running/streaming blocks.** Running tools keyed on `frame_idx + 1`
+   (`crates/hrdr-tui/src/ui.rs:3008`), streaming entries on the precomputed
+   `content_hash` (`ui.rs:3002`, changes per delta) — a running/streaming block
+   re-parses, re-highlights and re-wraps every frame the ticker draws. Idle
+   ticks are gated on `spinner_live()` (`crates/hrdr-tui/src/tui.rs:159-160`),
+   so the cost is paid exactly while an agent streams. Open.
+5. **MEDIUM-HIGH (re-confirmed, 08-30 #5) — full-transcript walk per frame.**
+   `draw_chunks` (`ui.rs:1002`) iterates every transcript entry per frame
+   (thread-local cache lookups + `Rc` clones + the `cum`/hit-map rebuilds),
+   unbounded by pane size; same caveat as #4 (paid only while a spinner is live,
+   which is the streaming turn). Open — fix shape unchanged (`ChunkRows::Lazy`
+   - per-pane assembled-layout cache invalidated from the first changed entry).
+6. **MEDIUM (re-confirmed, 08-30 #6) — todo panel clones and sorts the whole
+   list every frame.** `todo_lines` `ui.rs:1247-1261` (`todos.clone()` +
+   `sort_by_key` per frame; `spinner_live` also locks the todos mutex). Open.
+7. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
+   line per call.** `crates/hrdr-app/src/highlight.rs:140` `block.lines.clone()`
+   per streaming frame of a growing code block. Open.
+8. **MEDIUM (re-confirmed, 08-30 #9) — shell overflow spool, one unbuffered
+   `write(2)` per line past the cap.**
+   `crates/hrdr-tools/src/tools/shell.rs:650` (the seed writes at 637-639 are
+   fine; 650 is the steady-state per-line one). 100 KLOC build wall ≈ 100 K
+   syscalls. Fix: `BufWriter`, flush on drop. Open.
+9. **MEDIUM (re-confirmed, 08-30 #10) — per-file `canonicalize_nearest` in the
+   grep/replace walkers.** `grep.rs:233,339` / `replace.rs:351` — every walked
+   file pays an lstat + full realpath for the deny-list check. Fix as recorded
+   (raw-path `secret_file_reason` first). Open.
+10. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
+    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
+    matches only after the whole read. Open.
+11. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
+    request.** `catalog.rs:219,257,318-324`; caller sites unchanged
+    (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
+12. **LOW (NEW) — `cron` re-derives the next fire by a minute-by-minute scan out
+    to a 4-year horizon.** `crates/hrdr-tools/src/tools/cron.rs:291-302`:
+    `next_fire` steps `cand` forward one minute at a time (each iteration
+    `matches` → up to ~10 linear `Vec::contains` + chrono field reads) until the
+    schedule matches or the horizon (`NEXT_FIRE_HORIZON_DAYS` = 4×366 days ≈
+    2.1M minutes) runs out. Reached from the `create` tool path (`cron.rs:106`,
+    the schedule-validation `next_fire(...).is_none()`) and from the scheduler
+    loop once per fire (`cron.rs:383`) — which runs once per persisted cron on
+    every resume via `arm_crons` → per-cron `run_scheduler`. Frequency is cold
+    (once per fire) but the cost scales with rarity: a yearly cron re-scans ~526
+    K minutes (single-digit to tens of ms of CPU) per recompute, and the
+    pathological Feb-29 case scans ~2.1 M minutes on the create path, where it
+    blocks the tool result the model is waiting on. Fix: when a coarse field
+    fails, jump the candidate to the next value that could match it (next
+    matching hour / day / month) instead of `+1 minute` — O(1)-ish for every
+    real schedule, same horizon bound. Pure CPU win, no memory tradeoff.
+13. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+    page.** `WindowScanner::new` (`read.rs:240,573`). Open.
+14. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+    acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
+    `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
+    in the transcript projection (`transcript_log.rs:114-115`); runs per
+    streamed token on every agent, the main one included. The suggested merge
+    ("move into the deque exactly once") is now slightly harder than on 08-30:
+    `to_write` feeds both the deque and the transcript write, so
+    `Record::from_event` would need to borrow the payload from the deque entry.
+    Still available; open.
+15. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+    `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
+    unchanged. Open.
+16. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
+    pre-scan.** `client.rs:1557`, immediately before the same O(len) parse.
+    Open.
+17. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
+    insert into `args_streamed`.** `codex.rs:450`. Open.
+18. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+    commit since 08-30 touches `replace.rs` (#12 double-match pass), `memory.rs`
+    (#13 recall lowercasing per token), `budget.rs` (#16 no-usage re-estimate —
+    held open by decision) or the hrdr-tools dispatch (#17 args clone). Presumed
+    open-by-construction.
+
+**Checked, not findings (new code since 08-30):**
+
+- SSE-drain refactor is cost-parity with the old loops: per-chunk `drain()`
+  Vec + per-event JSON parse are the wire itself; `trim()` and `from_utf8_lossy`
+  borrow on valid UTF-8. Verified all three loops (`client.rs:1533-1615`,
+  `anthropic.rs:669-694`, `codex.rs:314-332`).
+- **The 08-30 "not settled" event-retention question resolves as bounded.**
+  `PaneSet::sync` (`pane.rs:313-423`) drains AND compacts every live agent's
+  event deque per tick (`events_since` → replay → `compact`,
+  `registry.rs:730-749`), and a finished, delivered, unpinned sub-agent's pane +
+  deque are reaped by `prune` (`registry.rs:899-901`) — a pane nobody renders
+  does not retain deltas. Per-tick sync cost is O(agents + events-since-tick).
+- cron scheduler: one long-sleeping tokio task per cron, wait computed once per
+  fire; per-fire work is two small `crons.iter().find` scans + one
+  `background_tasks` push. `arm_crons` on resume is O(crons), once. Scheduler
+  never holds a lock across `sleep`/`await`.
+- `task_cancel` now AWAITS the aborted handle up to 10 s
+  (`delegation.rs:1937-1939`, the review hardening) — a deliberate
+  correctness-latency tradeoff on an occasional path (the cancel tool result
+  blocks until the worker is truly dropped). Recorded, not a finding.
+- goal tool, paste cap (`take(MAX_PASTE_CHARS)` once per paste, 256 KiB bound,
+  `app.rs:35,1767-1770`), `x-opencode-session` (one header String per request),
+  gate/sandbox/whitespace dedup (sub-millisecond, per-invocation-size inputs):
+  all bounded, per-invocation only.
+
+**Coverage:** read in full this pass — cron.rs (scheduler + `next_fire` +
+deliver), goal.rs, sse.rs + all three backend stream loops, types.rs
+`Accumulator::push`, registry.rs (`record`/`since`/`compact`/`prune`) + pane.rs
+`sync`, delegation.rs (snapshot save + task_cancel), session.rs save path,
+transcript_log.rs write side, events.rs; re-verified every re-confirmed item
+above at its cited line against the current tree. NOT re-traced (untouched since
+08-30; ride prior coverage): hrdr-editor internals, hrdr-app beyond the
+highlight cache, memory.rs/lsp/mcp, guardrails/verification, e2e/mock_server
+suites, apps/hrdr. Still needs profiling, as at 08-30: absolute per-frame draw
+times, per-token clone/lock cost vs network round-trip, catalog-scan µs,
+snapshot/session fsync wall time.
