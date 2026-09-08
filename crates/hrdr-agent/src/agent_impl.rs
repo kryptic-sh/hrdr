@@ -30,6 +30,22 @@ pub(crate) fn apply_chatgpt_model_capabilities_from(
     client.set_ultra_effort_override(metadata.and_then(|model| model.multi_agent_reasoning_effort));
 }
 
+fn preflight_unnamed_model(resolved: &ResolvedModel) -> Result<()> {
+    if resolved.reference().model() != UNNAMED_MODEL {
+        return Ok(());
+    }
+
+    let backend = match Client::backend_for(resolved.base_url()) {
+        Backend::Anthropic => "Anthropic Messages",
+        Backend::Codex => "ChatGPT/Codex Responses",
+        Backend::OpenAi => return Ok(()),
+    };
+    bail!(
+        "provider `{}` uses the native {backend} backend; choose an explicit model instead of `{UNNAMED_MODEL}`",
+        resolved.reference().provider()
+    );
+}
+
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
@@ -53,6 +69,7 @@ impl Agent {
         // client below is configured from this resolved value, not the raw config
         // fields, so it and `self.resolved` can never disagree.
         let resolved = oauth_derived(ResolvedModel::from_config(&config));
+        preflight_unnamed_model(&resolved)?;
         let delegation_runtime = new_delegation_runtime(&config, &resolved);
         let registry = AgentRegistry::new();
         tools.register(Arc::new(ModelsTool {
@@ -1007,6 +1024,7 @@ impl Agent {
     /// [`Self::switch_model_ref`] instead.
     pub fn set_model_ref(&mut self, reference: ModelRef) -> Result<()> {
         let resolved = oauth_derived(resolve_in(&self.providers, &reference, None)?);
+        preflight_unnamed_model(&resolved)?;
         self.adopt_resolved(resolved);
         Ok(())
     }
@@ -1026,6 +1044,7 @@ impl Agent {
         on_event: &mut F,
     ) -> Result<Option<CompactionReport>> {
         let resolved = oauth_derived(resolve_in(&self.providers, &reference, None)?);
+        preflight_unnamed_model(&resolved)?;
         let target_window = target_window.or_else(|| resolved.context_window());
 
         let mut candidate = self.client.clone();

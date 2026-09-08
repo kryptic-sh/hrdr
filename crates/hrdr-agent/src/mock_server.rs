@@ -6792,6 +6792,39 @@ fn enrich_switch_history(agent: &mut Agent) -> usize {
 }
 
 #[tokio::test]
+async fn unnamed_native_interactive_switch_preserves_history_without_requesting() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
+    let server = MockServer::start_with_hook(Vec::new(), move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    cfg.providers.insert(
+        "native".to_string(),
+        switch_candidate("https://chatgpt.com/backend-api/codex"),
+    );
+    let mut agent = Agent::new(cfg).unwrap();
+    fill_switch_history(&mut agent);
+    let identity_before = agent.model_ref().clone();
+    let history_before = Arc::clone(&agent.messages);
+
+    let error = agent
+        .switch_model_ref("native://default".parse().unwrap(), Some(1), &mut |_| {})
+        .await
+        .expect_err("the native backend requires an explicit model");
+    assert!(error.to_string().contains("explicit model"), "{error:#}");
+    assert_eq!(agent.model_ref(), &identity_before);
+    assert!(Arc::ptr_eq(&agent.messages, &history_before));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the rejected switch must not compact or send a request"
+    );
+}
+
+#[tokio::test]
 async fn model_switch_compacts_only_on_the_outgoing_identity_before_adoption() {
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = Arc::clone(&bodies);

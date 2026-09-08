@@ -500,13 +500,9 @@ const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 /// The one server that tolerates it is single-model llama.cpp, which ignores
 /// `model` entirely. So the OpenAI-shaped request builder omits the field
 /// instead — vLLM's own `model` is nullable and falls back to the served model,
-/// which is the same thing the sentinel was trying to say. The two native
-/// builders are the other side of the same decision: neither has a nullable
-/// `model`, so `chat_stream` hands them the sentinel before `wire_model`
-/// resolves it and they put the literal string on the wire — a provider entry
-/// left at `default` pointed at Anthropic or Codex sends `"model": "default"`
-/// and gets that provider's own "unknown model" error (pinned by
-/// `the_unnamed_model_sentinel_reaches_the_wire_on_the_native_backends`).
+/// which is the same thing the sentinel was trying to say. Native backends
+/// require a model; agent configuration rejects this sentinel before reaching
+/// them.
 ///
 /// Defined here rather than in hrdr-agent (whose `DEFAULT_MODEL` is the same
 /// string) because this crate is what decides whether the field goes on the
@@ -730,13 +726,18 @@ fn detect_backend(base_url: &str) -> Backend {
     }
 }
 
+impl Client {
+    /// Detect the request backend an endpoint uses without constructing a client.
+    pub fn backend_for(base_url: &str) -> Backend {
+        detect_backend(base_url)
+    }
+}
+
 /// Whether hrdr will speak the **native Anthropic Messages API** at `base_url`.
 ///
-/// The predicate form of [`detect_backend`] for callers outside this crate, which
-/// cannot see the private [`Backend`]. It exists so a caller that needs the
-/// *decision* (does this endpoint consume `cache_control`?) asks for the decision
-/// instead of string-comparing `wire_protocol`'s display name — that name is for
-/// showing a human, and a rename there must not silently flip a behaviour.
+/// The predicate form of [`Client::backend_for`] for callers that only need the
+/// Anthropic decision (does this endpoint consume `cache_control`?) rather than
+/// branching over every backend.
 pub fn is_anthropic_backend(base_url: &str) -> bool {
     detect_backend(base_url) == Backend::Anthropic
 }
@@ -2819,67 +2820,6 @@ mod tests {
         let named = Client::new("http://gpu-box.lan:8000/v1", None, "qwen3-coder");
         let body = named.body_json(&named.request(Some("qwen3-coder".to_string()), &[], &[], true));
         assert_eq!(body["model"], "qwen3-coder");
-    }
-
-    /// **Known limitation, pinned deliberately** — this test documents current
-    /// behaviour, it does not endorse it.
-    ///
-    /// The sentinel is handled on the OpenAI path only. [`Client::chat_stream`]
-    /// returns into [`crate::anthropic`] / [`crate::codex`] with `&self.model`
-    /// *before* it reaches `wire_model()`, and both native builders write
-    /// `"model": model` unconditionally — so a provider entry left at `default`
-    /// and pointed at either endpoint puts the literal string on the wire, and
-    /// the only diagnosis is that provider's own "unknown model" error.
-    ///
-    /// It is not resolved there because there is nothing to resolve it *to*:
-    /// [`Client::wire_model`] adopts a `/v1/models` listing only when it holds
-    /// exactly one entry, which a hosted multi-model provider's never does. So
-    /// the honest choices are today's pass-through or an up-front error — not
-    /// asking the endpoint.
-    #[test]
-    fn the_unnamed_model_sentinel_reaches_the_wire_on_the_native_backends() {
-        let anthropic = crate::anthropic::build_body(
-            UNNAMED_MODEL,
-            8192,
-            None,
-            None,
-            None,
-            &[],
-            CacheMode::Off,
-            false,
-            None,
-            &[ChatMessage::user("hi")],
-            &[],
-        );
-        assert_eq!(
-            anthropic["model"], UNNAMED_MODEL,
-            "pinned: the Messages API body carries the sentinel verbatim"
-        );
-
-        let codex = crate::codex::build_body(
-            UNNAMED_MODEL,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[ChatMessage::user("hi")],
-            &[],
-        );
-        assert_eq!(
-            codex["model"], UNNAMED_MODEL,
-            "pinned: the Responses API body carries the sentinel verbatim"
-        );
-
-        // The divergence is the finding, so assert both halves in one place:
-        // handed the same sentinel (already resolved to nothing), the OpenAI
-        // builder omits the field entirely instead of sending `"default"`.
-        let openai = Client::new("http://gpu-box.lan:8000/v1", None, UNNAMED_MODEL);
-        let body = openai.body_json(&openai.request(None, &[], &[], true));
-        assert!(
-            body.get("model").is_none(),
-            "the OpenAI path still omits it: {body}"
-        );
     }
 
     /// `prompt_cache_key` goes only to the endpoints that read it. The gate is

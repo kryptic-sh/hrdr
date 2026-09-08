@@ -201,7 +201,8 @@ use anyhow::{Result, bail};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use hrdr_llm::{
-    Accumulator, ChatMessage, ChatStream, Client, RetryAttempt, RetryBudget, Role, ToolDef,
+    Accumulator, Backend, ChatMessage, ChatStream, Client, RetryAttempt, RetryBudget, Role,
+    ToolDef, UNNAMED_MODEL,
 };
 use hrdr_tools::{GoalItem, TodoItem, ToolContext, ToolRegistry};
 
@@ -2760,6 +2761,76 @@ mod tests {
         assert_eq!(e.headers(), cfg.headers.as_slice());
         assert_eq!(e.kind(), super::ResolvedProviderKind::BuiltIn);
         assert_eq!(runtime.endpoint.effort, Some("low".to_string()));
+    }
+
+    #[test]
+    fn unnamed_model_rejects_native_backends_but_not_openai_compatible_ones() {
+        for (provider, expected_provider, base_url, backend) in [
+            (
+                "anthropic",
+                "claude",
+                "https://api.anthropic.com/v1",
+                "Anthropic Messages",
+            ),
+            (
+                "chatgpt",
+                "openai",
+                "https://chatgpt.com/backend-api/codex",
+                "ChatGPT/Codex Responses",
+            ),
+        ] {
+            let error = Agent::new(AgentConfig {
+                model: r(&format!("{provider}://default")),
+                base_url: base_url.to_string(),
+                ..Default::default()
+            })
+            .err()
+            .expect("native backends require a model");
+            let message = error.to_string();
+            assert!(message.contains(expected_provider), "{message}");
+            assert!(message.contains(backend), "{message}");
+            assert!(message.contains("explicit model"), "{message}");
+        }
+
+        Agent::new(AgentConfig {
+            model: r("local://default"),
+            base_url: "http://gpu-box.lan:8000/v1".to_string(),
+            ..Default::default()
+        })
+        .expect("OpenAI-compatible endpoints retain unnamed-model support");
+    }
+
+    #[test]
+    fn set_model_ref_rejects_unnamed_native_identity_without_mutating() {
+        let mut cfg = AgentConfig {
+            model: r("local://old"),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "native".to_string(),
+            ProviderConfig {
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(true),
+                context_window: None,
+                headers: HashMap::new(),
+                api_version: None,
+            },
+        );
+        let mut agent = Agent::new(cfg).unwrap();
+        let before = agent.model_ref().clone();
+        let endpoint_before = agent.endpoint_base_url();
+        let history_before = Arc::clone(&agent.messages);
+
+        let error = agent
+            .set_model_ref(r("native://default"))
+            .expect_err("the native backend requires an explicit model");
+        assert!(error.to_string().contains("explicit model"), "{error:#}");
+        assert_eq!(agent.model_ref(), &before);
+        assert_eq!(agent.endpoint_base_url(), endpoint_before);
+        assert!(Arc::ptr_eq(&agent.messages, &history_before));
     }
 
     /// THE ONE MUTATOR: a switch moves the identity AND everything derived from it

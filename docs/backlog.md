@@ -1355,11 +1355,6 @@ decision, not work — except the last, which is a missing feature.
   any error message that happens to follow a matching phrase), so it wants a
   real provider message to justify each spelling added rather than a guess at
   the set. Nobody has collected those messages.
-- **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
-  because `wire_model` runs after their early returns. Pinned as a known
-  limitation. Erroring early is worth doing, but at provider-selection time in
-  hrdr-agent — not in `chat_stream`, where it would fire once per turn and where
-  a wrong error kind would make the retry loop spin on a permanent config error.
 - **An unrecognized Anthropic `stop_reason` still reports
   `truncated() == false`.** Deliberate: it now raises a notice naming the value
   (`1871631`), and guessing a direction is wrong either way — folding to `stop`

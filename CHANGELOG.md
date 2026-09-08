@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Native Anthropic and ChatGPT/Codex backends reject `default` models before a
+  request.** Agent construction and model switches now require an explicit model
+  for these native APIs while OpenAI-compatible/local endpoints retain their
+  omitted-model behavior (`crates/hrdr-agent`).
+
 - **`task_cancel` never reports a background task cancelled while its worker can
   continue.** A task row is now registered and paired with its worker handle
   under the same lifecycle lock order used by cancellation, so cancellation
