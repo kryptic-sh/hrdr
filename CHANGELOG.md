@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-09-09
+
 ### Added
 
 - **ChatGPT OAuth sessions can discover and run GPT-6 Astra.** The account
@@ -14,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Astra through Responses Lite with encrypted reasoning replay and namespaced
   direct function tools. hrdr reports that it does not provide Codex's separate
   code-mode interpreter when a model requests `code_mode_only`.
+
+### Changed
+
+- **Sparse cron schedules compute their next fire without minute-by-minute
+  scanning.** The scheduler now jumps to the next eligible month, day, hour, or
+  minute while preserving the earliest matching instant (`crates/hrdr-tools`).
 
 ### Fixed
 
@@ -7448,7 +7456,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.15.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.15.3...HEAD
+[0.15.3]: https://github.com/kryptic-sh/hrdr/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/kryptic-sh/hrdr/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/kryptic-sh/hrdr/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/kryptic-sh/hrdr/compare/v0.14.0...v0.15.0
