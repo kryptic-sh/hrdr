@@ -555,6 +555,15 @@ pub struct Client {
     /// the native Anthropic Messages API has no such field and would 400 on it.
     /// See [`Client::set_prompt_cache_key`] for why it must be set.
     prompt_cache_key: Option<String>,
+    /// Whether Codex requests use the Responses Lite framing advertised by the
+    /// authenticated ChatGPT model catalog.
+    responses_lite: bool,
+    /// Catalog-authoritative modalities for the current authenticated ChatGPT
+    /// model. `None` falls back to models.dev/unknown-model behavior.
+    input_modalities: Option<Vec<String>>,
+    /// Wire effort substituted when the configured/display effort is `ultra`.
+    /// Catalog-driven and cleared whenever the model/provider changes.
+    ultra_effort_override: Option<String>,
     /// The conversation id, sent as `x-opencode-session` on requests to the
     /// OpenCode gateway (`opencode.ai` — OpenCode Zen and Go). The gateway
     /// groups a conversation's requests by it for session affinity and prompt
@@ -584,7 +593,7 @@ pub struct Client {
 }
 
 /// Whether `model` is an OpenAI reasoning model that wants `max_completion_tokens`
-/// instead of `max_tokens` (o-series, gpt-5). Handles a provider prefix like
+/// instead of `max_tokens` (o-series, gpt-5, gpt-6). Handles a provider prefix like
 /// `openai/o3-mini`. Non-OpenAI models are unaffected (they use `max_tokens`).
 fn uses_max_completion_tokens(model: &str) -> bool {
     let m = model
@@ -597,6 +606,7 @@ fn uses_max_completion_tokens(model: &str) -> bool {
         || m.starts_with("o4")
         || m.starts_with("o5")
         || m.starts_with("gpt-5")
+        || m.starts_with("gpt-6")
 }
 
 /// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
@@ -828,6 +838,9 @@ impl Client {
             extra_headers: Vec::new(),
             session_id: None,
             prompt_cache_key: None,
+            responses_lite: false,
+            input_modalities: None,
+            ultra_effort_override: None,
             system_cache_split: None,
             api_version: None,
             max_attachment_bytes: None,
@@ -906,6 +919,46 @@ impl Client {
     /// (a dropped key is a silent, invisible cache miss, not an error).
     pub fn prompt_cache_key(&self) -> Option<&str> {
         self.prompt_cache_key.as_deref()
+    }
+
+    /// Enable or disable Codex Responses Lite framing for this model.
+    pub fn set_responses_lite(&mut self, enabled: bool) {
+        self.responses_lite = enabled;
+    }
+
+    /// Whether Codex Responses Lite framing is currently enabled.
+    pub fn responses_lite(&self) -> bool {
+        self.responses_lite
+    }
+
+    /// Install authenticated ChatGPT catalog modalities for attachment checks.
+    pub fn set_input_modalities(&mut self, modalities: Option<Vec<String>>) {
+        self.input_modalities = modalities;
+    }
+
+    /// Catalog-authoritative modalities currently installed for this model.
+    pub fn input_modalities(&self) -> Option<&[String]> {
+        self.input_modalities.as_deref()
+    }
+
+    /// Install the catalog's wire mapping for the display-only `ultra` effort.
+    /// `None` clears model-specific state on a model/provider switch.
+    pub fn set_ultra_effort_override(&mut self, effort: Option<String>) {
+        self.ultra_effort_override = effort.and_then(|value| crate::normalize_effort(&value));
+    }
+
+    /// Current model-specific `ultra` wire mapping.
+    pub fn ultra_effort_override(&self) -> Option<&str> {
+        self.ultra_effort_override.as_deref()
+    }
+
+    fn wire_effort(&self) -> Option<&str> {
+        match self.effort.as_deref() {
+            Some(effort) if effort.trim().eq_ignore_ascii_case("ultra") => {
+                self.ultra_effort_override.as_deref()
+            }
+            effort => effort,
+        }
     }
 
     /// Set the reasoning-effort label; only recognized levels
@@ -1194,7 +1247,7 @@ impl Client {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             temperature: self.temperature,
-            reasoning_effort: self.effort.as_deref().and_then(crate::normalize_effort),
+            reasoning_effort: self.wire_effort().and_then(crate::normalize_effort),
             max_tokens,
             max_completion_tokens,
             top_p: self.params.top_p,
@@ -1401,7 +1454,10 @@ impl Client {
         // live turn, where an out-of-band catalog fetch would interleave with
         // the stream about to open. `None` (no catalog, or no entry) is the
         // allow case.
-        let accepts = crate::catalog::input_modalities_cached(None, &self.model);
+        let accepts = self
+            .input_modalities
+            .clone()
+            .or_else(|| crate::catalog::input_modalities_cached(None, &self.model));
         crate::media::check_attachments(
             &self.model,
             accepts.as_deref(),
@@ -1471,7 +1527,7 @@ impl Client {
                 &self.base_url,
                 self.api_key.as_deref(),
                 &self.model,
-                self.effort.as_deref(),
+                self.wire_effort(),
                 self.temperature,
                 self.params.top_p,
                 self.params.max_tokens,
@@ -1479,6 +1535,7 @@ impl Client {
                 // chat-completions, at the top level — see
                 // `Client::set_prompt_cache_key`.
                 self.prompt_cache_key.as_deref(),
+                self.responses_lite,
                 // `ChatGPT-Account-Id` rides here (set via `set_headers`);
                 // `originator: hrdr` + `Authorization: Bearer` are added inside.
                 &self.extra_headers,
@@ -2352,10 +2409,23 @@ mod tests {
         let high = client.request(Some(client.model.clone()), &[], &[], false);
         assert_eq!(high.reasoning_effort.as_deref(), Some("high"));
 
+        client.set_effort(Some("ultra".to_string()));
+        client.set_ultra_effort_override(Some("xhigh".to_string()));
+        assert_eq!(client.effort(), Some("ultra"));
+        assert_eq!(client.ultra_effort_override(), Some("xhigh"));
+        let ultra = client.request(Some(client.model.clone()), &[], &[], false);
+        assert_eq!(ultra.reasoning_effort.as_deref(), Some("xhigh"));
+
+        client.set_ultra_effort_override(None);
+        assert_eq!(client.effort(), Some("ultra"));
+        assert_eq!(client.ultra_effort_override(), None);
+        let cleared = client.request(Some(client.model.clone()), &[], &[], false);
+        assert!(
+            cleared.reasoning_effort.is_none(),
+            "raw ultra must never serialize"
+        );
+
         client.set_effort(None);
-        assert_eq!(client.effort(), None);
-        let none = client.request(Some(client.model.clone()), &[], &[], false);
-        assert!(none.reasoning_effort.is_none());
     }
 
     /// The chat-completions body grows a top-level `prompt_cache_key` when one
@@ -2685,6 +2755,8 @@ mod tests {
     fn max_tokens_routes_to_completion_field_for_reasoning_models() {
         assert!(uses_max_completion_tokens("o3-mini"));
         assert!(uses_max_completion_tokens("openai/gpt-5"));
+        assert!(uses_max_completion_tokens("gpt-6-astra"));
+        assert!(uses_max_completion_tokens("openai/gpt-6-astra"));
         assert!(uses_max_completion_tokens("o1"));
         assert!(!uses_max_completion_tokens("gpt-4o"));
         assert!(!uses_max_completion_tokens("claude-opus-4-8"));
@@ -3584,6 +3656,78 @@ mod tests {
             (body, headers)
         });
         (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    #[test]
+    fn authenticated_astra_modalities_accept_images_but_reject_pdf() {
+        use crate::media::tests::{pdf_attachment, png_attachment};
+
+        let mut client = Client::new("https://chatgpt.com/backend-api/codex", None, "gpt-6-astra");
+        client.set_input_modalities(Some(vec!["text".to_string(), "image".to_string()]));
+        let mut image = ChatMessage::user("inspect");
+        image.attachments.push(png_attachment("image.png"));
+        assert!(client.check_attachments(&[image]).is_ok());
+
+        let mut pdf = ChatMessage::user("inspect");
+        pdf.attachments.push(pdf_attachment("document.pdf"));
+        let error = client.check_attachments(&[pdf]).unwrap_err().to_string();
+        assert!(
+            error.contains("does not accept application/pdf input"),
+            "{error}"
+        );
+    }
+
+    const MINIMAL_CODEX_STREAM: &str = "event: response.completed\n\
+         data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+
+    #[tokio::test]
+    async fn responses_lite_flag_sets_codex_header_and_wire_framing() {
+        let (url, request) = serve_once_capturing(MINIMAL_CODEX_STREAM).await;
+        let mut client = Client::new(url, Some("token".to_string()), "gpt-6-astra");
+        client.set_backend_for_test(Backend::Codex);
+        client.set_responses_lite(true);
+        client.set_effort(Some("ultra".to_string()));
+        client.set_ultra_effort_override(Some("xhigh".to_string()));
+        client.set_params(crate::RequestParams {
+            max_tokens: Some(4096),
+            ..Default::default()
+        });
+        client.set_prompt_cache_key(Some("cache-key".to_string()));
+        let tools = [ToolDef::function(
+            "read",
+            "read a file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut stream = client
+            .chat_stream(
+                &[ChatMessage::system("base"), ChatMessage::user("go")],
+                &tools,
+            )
+            .await
+            .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+
+        let (body, headers) = request.await.expect("the server captured the request");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-openai-internal-codex-responses-lite: true\r\n")
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert!(!body.to_string().contains("ultra"), "{body}");
+        assert_eq!(client.effort(), Some("ultra"));
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["max_output_tokens"], 4096);
+        assert_eq!(body["prompt_cache_key"], "cache-key");
     }
 
     /// The shortest Anthropic stream that ends cleanly — the two tests below

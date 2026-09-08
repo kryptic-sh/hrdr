@@ -8063,6 +8063,7 @@ async fn model_catalog_stale_generation_is_dropped() {
             slug: "gpt-5.5".to_string(),
             label: "GPT-5.5".to_string(),
             context_window: Some(400_000),
+            ..Default::default()
         }],
         hrdr_agent::CatalogSource::Fresh,
         None,
@@ -8091,6 +8092,7 @@ async fn model_catalog_matching_generation_merges_rows() {
             slug: "gpt-5.5".to_string(),
             label: "GPT-5.5".to_string(),
             context_window: Some(400_000),
+            ..Default::default()
         }],
         hrdr_agent::CatalogSource::Fresh,
         None,

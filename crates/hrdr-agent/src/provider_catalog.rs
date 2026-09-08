@@ -136,12 +136,32 @@ pub async fn refresh_all(config: AgentConfig) {
     }
 }
 
+/// Whether the generic provider-list cache may suppress this refresh. Codex
+/// OAuth has its own five-minute account catalog, so its day-long generic cache
+/// must never prevent reaching that catalog's freshness decision.
+fn should_refresh_provider_cache(generic_cache_fresh: bool, uses_account_catalog: bool) -> bool {
+    uses_account_catalog || !generic_cache_fresh
+}
+
+fn uses_account_catalog(config: &AgentConfig, provider: &str) -> bool {
+    let Ok(placeholder) =
+        ModelRef::new(crate::ProviderName::new(provider), crate::PLACEHOLDER_MODEL)
+    else {
+        return false;
+    };
+    crate::resolve(&placeholder, config, None)
+        .ok()
+        .map(crate::oauth_derived)
+        .is_some_and(|resolved| resolved.is_codex_oauth())
+}
+
 /// Refresh one provider, unless its cache is still fresh.
 async fn refresh_one(config: &AgentConfig, provider: &str) {
     let Some(path) = cache_path(provider) else {
         return;
     };
-    if hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL) {
+    let generic_cache_fresh = hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL);
+    if !should_refresh_provider_cache(generic_cache_fresh, uses_account_catalog(config, provider)) {
         return;
     }
     let Some(ids) = list_models(config, provider).await else {
@@ -151,6 +171,14 @@ async fn refresh_one(config: &AgentConfig, provider: &str) {
         return; // an empty answer is not evidence; keep whatever is cached.
     }
     write_cache(&path, &ids);
+}
+
+fn visible_chatgpt_ids(models: Vec<crate::ChatGptModel>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|model| model.picker_visible)
+        .map(|model| model.slug)
+        .collect()
 }
 
 /// The ids `provider` serves, from the network. `None` on any failure.
@@ -173,7 +201,7 @@ async fn list_models(config: &AgentConfig, provider: &str) -> Option<Vec<String>
             .await
             .ok()?;
         let catalog = crate::chatgpt_model_catalog(&access, false).await;
-        let mut ids: Vec<String> = catalog.models.into_iter().map(|m| m.slug).collect();
+        let mut ids = visible_chatgpt_ids(catalog.models);
         ids.sort();
         return Some(ids);
     }
@@ -262,6 +290,31 @@ mod tests {
         );
         write_cache(&path, &["m".to_string()]);
         assert!(hrdr_llm::catalog::is_fresh(&path, PROVIDER_MODELS_TTL));
+    }
+
+    #[test]
+    fn hidden_chatgpt_rows_are_absent_from_provider_listings() {
+        let ids = visible_chatgpt_ids(vec![
+            crate::ChatGptModel {
+                slug: "listed".to_string(),
+                ..Default::default()
+            },
+            crate::ChatGptModel {
+                slug: "hidden-astra".to_string(),
+                use_responses_lite: true,
+                picker_visible: false,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(ids, ["listed"]);
+    }
+
+    #[test]
+    fn fresh_generic_cache_never_suppresses_account_catalog_refresh() {
+        assert!(should_refresh_provider_cache(true, true));
+        assert!(!should_refresh_provider_cache(true, false));
+        assert!(should_refresh_provider_cache(false, true));
+        assert!(should_refresh_provider_cache(false, false));
     }
 
     /// The refresh covers every provider the machine could switch to, not the

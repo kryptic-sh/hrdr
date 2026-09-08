@@ -2352,7 +2352,12 @@ pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
     if resolved.is_codex_oauth() {
         let access = coordinated_oauth_access(resolved.kind(), resolved.base_url()).await?;
         let catalog = chatgpt_model_catalog(&access, false).await;
-        let mut ids: Vec<String> = catalog.models.into_iter().map(|m| m.slug).collect();
+        let mut ids: Vec<String> = catalog
+            .models
+            .into_iter()
+            .filter(|model| model.picker_visible)
+            .map(|model| model.slug)
+            .collect();
         ids.sort();
         return Ok(ids);
     }

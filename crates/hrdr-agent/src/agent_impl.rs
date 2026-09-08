@@ -1,5 +1,35 @@
 use super::*;
 
+fn apply_chatgpt_model_capabilities(client: &mut Client, resolved: &ResolvedModel) {
+    let metadata = resolved
+        .is_codex_oauth()
+        .then(|| chatgpt_models::cached_model(resolved.reference().model()))
+        .flatten();
+    apply_chatgpt_model_capabilities_from(client, resolved, metadata);
+}
+
+pub(crate) fn apply_chatgpt_model_capabilities_from(
+    client: &mut Client,
+    resolved: &ResolvedModel,
+    metadata: Option<ChatGptModel>,
+) {
+    let metadata = resolved.is_codex_oauth().then(|| {
+        metadata.or_else(|| chatgpt_models::builtin_protocol_metadata(resolved.reference().model()))
+    });
+    let metadata = metadata.flatten();
+    client.set_responses_lite(
+        metadata
+            .as_ref()
+            .is_some_and(|model| model.use_responses_lite),
+    );
+    client.set_input_modalities(
+        metadata
+            .as_ref()
+            .map(|model| model.input_modalities.clone()),
+    );
+    client.set_ultra_effort_override(metadata.and_then(|model| model.multi_agent_reasoning_effort));
+}
+
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
@@ -407,6 +437,7 @@ impl Agent {
             include_usage: config.stream_usage,
         });
         client.set_headers(resolved.headers().to_vec());
+        apply_chatgpt_model_capabilities(&mut client, &resolved);
         client.set_system_cache_split(system_cache_split);
         // The per-attachment ceiling belongs to the user, not to the identity:
         // it stays put across a `/model` switch (unlike the endpoint, key and
@@ -1039,6 +1070,7 @@ impl Agent {
             .set_api_key(resolved.api_key().map(str::to_string));
         self.client.set_cache(cache);
         self.client.set_headers(resolved.headers().to_vec());
+        apply_chatgpt_model_capabilities(&mut self.client, &resolved);
         // Re-assert the prompt-cache key here, in the single writer, with the
         // SAME value: the conversation did not change, only what it runs on, and
         // the requests after the switch still share their prefix with the ones

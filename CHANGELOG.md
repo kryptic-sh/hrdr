@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **ChatGPT OAuth sessions can discover and run GPT-6 Astra.** The account
+  catalog now declares Codex compatibility `0.153.4`, preserves each model's
+  transport, visibility, reasoning, context, and input capabilities, and sends
+  Astra through Responses Lite with encrypted reasoning replay and namespaced
+  direct function tools. hrdr reports that it does not provide Codex's separate
+  code-mode interpreter when a model requests `code_mode_only`.
+
 ### Fixed
 
 - **`cron cancel` can no longer race a fire into a stray reminder.** The

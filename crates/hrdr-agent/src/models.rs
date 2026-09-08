@@ -247,6 +247,7 @@ fn sort_choices(out: &mut [ModelChoice], usage: &HashMap<String, u64>) {
 pub fn chatgpt_model_choices(models: &[crate::ChatGptModel]) -> Vec<ModelChoice> {
     models
         .iter()
+        .filter(|m| m.picker_visible)
         .map(|m| ModelChoice {
             provider: ProviderName::new("chatgpt").as_str().to_string(),
             model: m.slug.clone(),
@@ -1020,11 +1021,13 @@ mod tests {
                 slug: "z-model".into(),
                 label: "z".into(),
                 context_window: Some(400_000),
+                ..ChatGptModel::default()
             },
             ChatGptModel {
                 slug: "a-model".into(),
                 label: "a".into(),
                 context_window: Some(272_000),
+                ..ChatGptModel::default()
             },
         ];
         let mut choices = chatgpt_model_choices(&cg);
@@ -1051,6 +1054,32 @@ mod tests {
     }
 
     #[test]
+    fn hidden_chatgpt_rows_are_not_picker_choices() {
+        use crate::ChatGptModel;
+        let models = vec![
+            ChatGptModel {
+                slug: "visible".into(),
+                label: "Visible".into(),
+                ..Default::default()
+            },
+            ChatGptModel {
+                slug: "hidden-astra".into(),
+                label: "Hidden Astra".into(),
+                use_responses_lite: true,
+                picker_visible: false,
+                ..Default::default()
+            },
+        ];
+        let choices = chatgpt_model_choices(&models);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].model, "visible");
+        assert!(
+            models[1].use_responses_lite,
+            "hidden metadata remains usable explicitly"
+        );
+    }
+
+    #[test]
     fn chatgpt_equal_label_ties_keep_upstream_server_order() {
         use crate::ChatGptModel;
         // Two rows sharing a label: the stable sort must preserve their inserted
@@ -1060,11 +1089,13 @@ mod tests {
                 slug: "server-first".into(),
                 label: "dup".into(),
                 context_window: None,
+                ..ChatGptModel::default()
             },
             ChatGptModel {
                 slug: "server-second".into(),
                 label: "dup".into(),
                 context_window: None,
+                ..ChatGptModel::default()
             },
         ];
         let mut choices = chatgpt_model_choices(&cg);
@@ -1096,6 +1127,7 @@ mod tests {
             slug: "fresh".into(),
             label: "fresh".into(),
             context_window: Some(1),
+            ..ChatGptModel::default()
         }];
         let out = merge_chatgpt_choices(base, &cg, &HashMap::new());
         let chatgpt: Vec<&str> = out
@@ -1147,6 +1179,7 @@ mod tests {
                 slug: "fresh".into(),
                 label: "fresh".into(),
                 context_window: Some(400_000),
+                ..ChatGptModel::default()
             }];
             let out = merge_chatgpt_choices(base, &cg, &HashMap::new());
             assert_eq!(

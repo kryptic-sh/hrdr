@@ -31,11 +31,11 @@ use crate::{
 /// compatibility pin (protocol declaration), not a model allowlist — compatible
 /// new models arrive dynamically. Bump only after validating the client
 /// protocol at the new version. Tracker: `kryptic-sh/hrdr#2`.
-pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.144.3";
+pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.153.4";
 
 /// On-disk cache schema. Bump on any incompatible layout change (invalidates
 /// older entries, which are then treated as absent).
-const CATALOG_CACHE_SCHEMA: u32 = 1;
+const CATALOG_CACHE_SCHEMA: u32 = 2;
 
 /// Fresh-cache window: 5 minutes.
 const CATALOG_TTL_MS: u64 = 5 * 60 * 1000;
@@ -70,6 +70,51 @@ pub struct ChatGptModel {
     pub label: String,
     /// Advertised context window, when the endpoint reports one.
     pub context_window: Option<u32>,
+    /// Whether this model requires Codex's Responses Lite request framing.
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    /// Catalog tool exposure mode (`direct`, `code_mode`, or `code_mode_only`).
+    /// hrdr transports its existing direct functions through AdditionalTools;
+    /// this metadata does not imply Codex's code-mode interpreter is present.
+    #[serde(default)]
+    pub tool_mode: Option<String>,
+    /// Catalog wire effort used for Astra's multi-agent `ultra` display level.
+    #[serde(default)]
+    pub multi_agent_reasoning_effort: Option<String>,
+    /// Reasoning effort values advertised by this model, in catalog order.
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<String>,
+    /// Input modalities accepted by the authenticated ChatGPT model.
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<String>,
+    /// Whether this row should appear in model pickers and listings. Hidden rows
+    /// remain cached so an explicit selection can use their protocol metadata.
+    #[serde(default = "default_picker_visible")]
+    pub picker_visible: bool,
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".to_string(), "image".to_string()]
+}
+
+fn default_picker_visible() -> bool {
+    true
+}
+
+impl Default for ChatGptModel {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            label: String::new(),
+            context_window: None,
+            use_responses_lite: false,
+            tool_mode: None,
+            multi_agent_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            input_modalities: default_input_modalities(),
+            picker_visible: true,
+        }
+    }
 }
 
 /// The catalog plus provenance and an optional user-facing warning.
@@ -130,10 +175,11 @@ fn is_unsupported_feature(feature: &str) -> bool {
         .any(|f| f.eq_ignore_ascii_case(feature))
 }
 
-/// Parse a Codex `/models` success payload into list-visible models, in upstream
+/// Parse a Codex `/models` success payload into usable models, in upstream
 /// order. Tolerant: unknown fields are ignored and missing optional fields
-/// defaulted. Rows that are not list-visible, have an empty slug, or require a
-/// feature hrdr cannot serve ([`UNSUPPORTED_FEATURES`]) are dropped.
+/// defaulted. Hidden rows remain available for explicit selection and capability
+/// lookup; picker/list callers filter `picker_visible`. Rows with an empty slug or
+/// a feature hrdr cannot serve ([`UNSUPPORTED_FEATURES`]) are dropped.
 ///
 /// Errors only on a structurally malformed payload (no models array at all), so
 /// the caller can distinguish "parsed, possibly empty" from "not a catalog".
@@ -146,15 +192,17 @@ pub fn parse_catalog(v: &Value) -> Result<Vec<ChatGptModel>> {
 
     let mut out = Vec::with_capacity(arr.len());
     for m in arr {
-        // Default list-visible to true when the field is absent (tolerant), but
-        // honour an explicit false.
-        if !m
-            .get("list_visible")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
-            continue;
-        }
+        // Current catalogs use `visibility: "list"`. When it is explicit, only
+        // that value is picker-visible; legacy payloads retain `list_visible`.
+        let visibility = m.get("visibility").and_then(Value::as_str);
+        let picker_visible = visibility.map_or_else(
+            || {
+                m.get("list_visible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            },
+            |value| value.eq_ignore_ascii_case("list"),
+        );
         let slug = m
             .get("slug")
             .or_else(|| m.get("id"))
@@ -193,10 +241,53 @@ pub fn parse_catalog(v: &Value) -> Result<Vec<ChatGptModel>> {
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
             .filter(|w| *w > 0);
+        let supported_reasoning_efforts = m
+            .get("supported_reasoning_levels")
+            .or_else(|| m.get("supported_reasoning_efforts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("effort").and_then(Value::as_str))
+            })
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_string)
+            .collect();
+        let input_modalities = m
+            .get("input_modalities")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|modality| !modality.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(default_input_modalities);
         out.push(ChatGptModel {
             slug: slug.to_string(),
             label,
             context_window,
+            use_responses_lite: m
+                .get("use_responses_lite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            tool_mode: m
+                .get("tool_mode")
+                .and_then(Value::as_str)
+                .filter(|mode| !mode.is_empty())
+                .map(str::to_string),
+            multi_agent_reasoning_effort: m
+                .get("multi_agent_reasoning_effort")
+                .and_then(Value::as_str)
+                .filter(|effort| !effort.is_empty())
+                .map(str::to_string),
+            supported_reasoning_efforts,
+            input_modalities,
+            picker_visible,
         });
     }
     Ok(out)
@@ -214,7 +305,33 @@ fn builtin_fallback() -> Vec<ChatGptModel> {
         slug: CHATGPT_DEFAULT_MODEL.to_string(),
         label: CHATGPT_DEFAULT_MODEL.to_string(),
         context_window: Some(CHATGPT_DEFAULT_CONTEXT_WINDOW),
+        input_modalities: default_input_modalities(),
+        picker_visible: true,
+        ..ChatGptModel::default()
     }]
+}
+
+/// Validated protocol metadata for explicit models that must work before the
+/// account catalog cache can be read or written. The caller must additionally
+/// gate this on the trusted Codex OAuth endpoint; catalog metadata wins whenever
+/// a row is present.
+pub fn builtin_protocol_metadata(slug: &str) -> Option<ChatGptModel> {
+    (slug == "gpt-6-astra").then(|| ChatGptModel {
+        slug: slug.to_string(),
+        label: "GPT-6 Astra".to_string(),
+        context_window: Some(272_000),
+        use_responses_lite: true,
+        tool_mode: Some("code_mode_only".to_string()),
+        multi_agent_reasoning_effort: Some("xhigh".to_string()),
+        supported_reasoning_efforts: [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        input_modalities: default_input_modalities(),
+        picker_visible: false,
+    })
 }
 
 // ── Cache I/O (path-injectable cores) ───────────────────────────────────────
@@ -237,15 +354,6 @@ fn write_cache_at(path: &Path, entry: &CacheFile) -> std::io::Result<()> {
     write_atomic(path, &json)
 }
 
-/// Pure slug→window lookup over a model list, so the resolution rule is testable
-/// without a cache file.
-fn context_window_in(models: &[ChatGptModel], slug: &str) -> Option<u32> {
-    models
-        .iter()
-        .find(|m| m.slug == slug)
-        .and_then(|m| m.context_window)
-}
-
 /// The advertised context window for `slug` in the catalog cache file at `path`,
 /// network-free. Path-injectable so it is testable without the real XDG cache.
 ///
@@ -255,12 +363,24 @@ fn context_window_in(models: &[ChatGptModel], slug: &str) -> Option<u32> {
 /// match is authoritative regardless of which account wrote the cache or how old
 /// it is — unlike *entitlement* (which rows exist), which those checks guard on
 /// the serve path.
-fn cached_context_window_at(path: &Path, slug: &str) -> Option<u32> {
+fn cached_model_at(path: &Path, slug: &str) -> Option<ChatGptModel> {
     let cache = load_cache_at(path)?;
     if cache.schema != CATALOG_CACHE_SCHEMA {
         return None;
     }
-    context_window_in(&cache.models, slug)
+    cache.models.into_iter().find(|model| model.slug == slug)
+}
+
+#[cfg(test)]
+fn cached_context_window_at(path: &Path, slug: &str) -> Option<u32> {
+    cached_model_at(path, slug).and_then(|model| model.context_window)
+}
+
+/// The cached metadata for a ChatGPT subscription model, network-free. The
+/// schema gate ensures transport and capability fields have their current
+/// meaning; account and age do not affect model-level protocol metadata.
+pub fn cached_model(slug: &str) -> Option<ChatGptModel> {
+    cached_model_at(&cache_path()?, slug)
 }
 
 /// The context window for ChatGPT model `slug` from the on-disk account catalog
@@ -270,7 +390,7 @@ fn cached_context_window_at(path: &Path, slug: &str) -> Option<u32> {
 /// models. `None` when there is no cache, the slug is absent, or the row
 /// advertised no window.
 pub fn cached_context_window(slug: &str) -> Option<u32> {
-    cached_context_window_at(&cache_path()?, slug)
+    cached_model(slug).and_then(|model| model.context_window)
 }
 
 /// The account's ENTITLED models, from the on-disk cache, network-free — the
@@ -582,6 +702,68 @@ mod tests {
     // ── Parser ───────────────────────────────────────────────────────────────
 
     #[test]
+    fn parse_preserves_gpt_6_astra_transport_and_capabilities() {
+        let v = payload(serde_json::json!([
+            {
+                "slug": "gpt-6-astra",
+                "display_name": "GPT-6 Astra",
+                "visibility": "list",
+                "context_window": 272000,
+                "input_modalities": ["text", "image"],
+                "use_responses_lite": true,
+                "tool_mode": "code_mode_only",
+                "multi_agent_reasoning_effort": "xhigh",
+                "supported_reasoning_levels": [
+                    {"effort": "none", "description": ""},
+                    {"effort": "minimal", "description": ""},
+                    {"effort": "low", "description": ""},
+                    {"effort": "medium", "description": ""},
+                    {"effort": "high", "description": ""},
+                    {"effort": "xhigh", "description": ""},
+                    {"effort": "max", "description": ""},
+                    {"effort": "ultra", "description": "display-only"}
+                ]
+            },
+            {"slug": "hidden", "visibility": "hide", "list_visible": true},
+            {"slug": "not-listed", "visibility": "none", "list_visible": true},
+            {"slug": "legacy-visible", "list_visible": true},
+            {"slug": "legacy-hidden", "list_visible": false}
+        ]));
+
+        let out = parse_catalog(&v).unwrap();
+        assert_eq!(
+            out.iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "gpt-6-astra",
+                "hidden",
+                "not-listed",
+                "legacy-visible",
+                "legacy-hidden"
+            ]
+        );
+        let astra = &out[0];
+        assert_eq!(astra.context_window, Some(272_000));
+        assert_eq!(astra.input_modalities, ["text", "image"]);
+        assert!(astra.use_responses_lite);
+        assert_eq!(astra.tool_mode.as_deref(), Some("code_mode_only"));
+        assert_eq!(astra.multi_agent_reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            astra.supported_reasoning_efforts,
+            [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+            ]
+        );
+        assert!(astra.picker_visible);
+        assert!(!out[1].picker_visible);
+        assert!(!out[2].picker_visible);
+        assert!(out[3].picker_visible);
+        assert!(!out[4].picker_visible);
+        assert!(!astra.input_modalities.iter().any(|value| value == "pdf"));
+    }
+
+    #[test]
     fn parse_keeps_list_visible_in_upstream_order_ignoring_unknown_fields() {
         let v = payload(serde_json::json!([
             { "slug": "gpt-5.5", "display_name": "GPT-5.5", "context_window": 400000, "surprise": 1 },
@@ -599,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drops_non_visible_empty_slug_and_unsupported_rows() {
+    fn parse_keeps_hidden_rows_but_drops_empty_slug_and_unsupported_rows() {
         let v = payload(serde_json::json!([
             { "slug": "shown" },
             { "slug": "hidden", "list_visible": false },
@@ -610,8 +792,10 @@ mod tests {
         let out = parse_catalog(&v).unwrap();
         assert_eq!(
             out.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(),
-            ["shown"]
+            ["shown", "hidden"]
         );
+        assert!(out[0].picker_visible);
+        assert!(!out[1].picker_visible);
     }
 
     #[test]
@@ -619,6 +803,17 @@ mod tests {
         let out = parse_catalog(&payload(serde_json::json!([{ "slug": "m" }]))).unwrap();
         assert_eq!(out[0].context_window, None);
         assert_eq!(out[0].label, "m");
+    }
+
+    #[test]
+    fn parse_preserves_explicit_empty_input_modalities() {
+        let out = parse_catalog(&payload(serde_json::json!([
+            { "slug": "explicit-empty", "input_modalities": [] },
+            { "slug": "absent" }
+        ])))
+        .unwrap();
+        assert!(out[0].input_modalities.is_empty());
+        assert_eq!(out[1].input_modalities, ["text", "image"]);
     }
 
     #[test]
@@ -702,6 +897,7 @@ mod tests {
                 slug: "cached".to_string(),
                 label: "Cached".to_string(),
                 context_window: Some(100),
+                ..ChatGptModel::default()
             }],
         }
     }
@@ -743,26 +939,47 @@ mod tests {
         let mut e = entry(&account_digest("acct"), 0);
         e.models = vec![
             ChatGptModel {
-                slug: "gpt-5.5".to_string(),
-                label: "GPT-5.5".to_string(),
+                slug: "gpt-6-astra".to_string(),
+                label: "GPT-6 Astra".to_string(),
                 context_window: Some(272_000),
+                use_responses_lite: true,
+                tool_mode: Some("code_mode_only".to_string()),
+                multi_agent_reasoning_effort: Some("xhigh".to_string()),
+                supported_reasoning_efforts: [
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                picker_visible: true,
             },
             ChatGptModel {
                 slug: "gpt-5.3-codex-spark".to_string(),
                 label: "Spark".to_string(),
                 context_window: Some(128_000),
+                ..ChatGptModel::default()
             },
             ChatGptModel {
                 slug: "no-window".to_string(),
                 label: "x".to_string(),
                 context_window: None,
+                ..ChatGptModel::default()
             },
         ];
         write_cache_at(&path, &e).unwrap();
 
         // Each entitled model resolves to its OWN advertised window — not a
         // single provider-wide constant.
-        assert_eq!(cached_context_window_at(&path, "gpt-5.5"), Some(272_000));
+        assert_eq!(
+            cached_context_window_at(&path, "gpt-6-astra"),
+            Some(272_000)
+        );
+        let astra = cached_model_at(&path, "gpt-6-astra").unwrap();
+        assert!(astra.use_responses_lite);
+        assert_eq!(astra.tool_mode.as_deref(), Some("code_mode_only"));
+        assert_eq!(astra.input_modalities, ["text", "image"]);
+        assert_eq!(astra.supported_reasoning_efforts.last().unwrap(), "ultra");
         assert_eq!(
             cached_context_window_at(&path, "gpt-5.3-codex-spark"),
             Some(128_000)
@@ -841,6 +1058,7 @@ mod tests {
             slug: "fresh".to_string(),
             label: "Fresh".to_string(),
             context_window: Some(1),
+            ..ChatGptModel::default()
         }]
     }
 

@@ -345,6 +345,7 @@ mod tests {
                 slug: (*s).to_string(),
                 label: (*s).to_string(),
                 context_window: Some(272_000),
+                ..ChatGptModel::default()
             })
             .collect()
     }
@@ -399,7 +400,8 @@ mod tests {
         // A STALE list — the cache carries no freshness signal here, and does not need
         // to: an entitlement list only grows, so a model that was entitled an hour ago
         // is entitled now.
-        let rows = entitlements(&["gpt-5.5", "gpt-5.5-codex", "gpt-5.3-codex-spark"]);
+        let mut rows = entitlements(&["gpt-5.5", "gpt-5.5-codex", "gpt-5.3-codex-spark"]);
+        rows[1].picker_visible = false;
         let v = validate_identity_with(&cfg.providers, &m, Some(&rows), Some(&catalog()));
         assert_eq!(v, Identity::Known(Vec::new()));
 

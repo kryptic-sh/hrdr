@@ -474,12 +474,18 @@ impl ModelsTool {
                     // match the `provider` field in this payload (a row the model
                     // reads back must name a provider that resolves).
                     available.retain(|m| m.provider != active_provider);
-                    available.extend(catalog.models.into_iter().map(|m| AvailableModel {
-                        provider: active_provider.to_string(),
-                        model: m.slug,
-                        label: m.label,
-                        source: ModelSource::AccountCatalog,
-                    }));
+                    available.extend(
+                        catalog
+                            .models
+                            .into_iter()
+                            .filter(|model| model.picker_visible)
+                            .map(|m| AvailableModel {
+                                provider: active_provider.to_string(),
+                                model: m.slug,
+                                label: m.label,
+                                source: ModelSource::AccountCatalog,
+                            }),
+                    );
                     match catalog.source {
                         CatalogSource::Fresh => {}
                         CatalogSource::Stale => warnings.push(serde_json::json!({
@@ -1357,10 +1363,27 @@ fn preflight_notices(
     providers: &HashMap<String, ProviderConfig>,
     resolved: &ResolvedModel,
 ) -> Vec<String> {
-    match validate::validate_identity_in(providers, resolved) {
+    let mut notices = match validate::validate_identity_in(providers, resolved) {
         validate::Identity::Known(warnings) => warnings,
         validate::Identity::Unconfirmed(_) => Vec::new(),
+    };
+    if resolved.is_codex_oauth() {
+        let metadata = chatgpt_models::cached_model(resolved.reference().model())
+            .or_else(|| chatgpt_models::builtin_protocol_metadata(resolved.reference().model()));
+        if metadata
+            .as_ref()
+            .and_then(|model| model.tool_mode.as_deref())
+            == Some("code_mode_only")
+        {
+            notices.push(
+                "This model is catalogued as `code_mode_only`. hrdr keeps basic Responses Lite \
+                 text/tool transport enabled through its direct function tools, but does not \
+                 provide Codex's code-mode interpreter."
+                    .to_string(),
+            );
+        }
     }
+    notices
 }
 
 /// The initial delegation-runtime projection for `config`. The single place the
@@ -2789,6 +2812,82 @@ mod tests {
         assert!(agent.set_model_ref(r("nosuchprovider://m")).is_err());
         assert_eq!(agent.model_ref(), &r("next://new"));
         assert_eq!(agent.client.base_url(), "https://next.example/v1");
+    }
+
+    #[test]
+    fn chatgpt_model_capabilities_enable_astra_and_clear_on_switch() {
+        use crate::ChatGptModel;
+        use hrdr_llm::Client;
+
+        let cfg = AgentConfig {
+            model: r("openai://gpt-6-astra"),
+            ..Default::default()
+        };
+        let astra_resolved = super::resolve::oauth_derived_with(
+            super::resolve(&cfg.model, &cfg, None).unwrap(),
+            true,
+        );
+        let astra = ChatGptModel {
+            slug: "gpt-6-astra".to_string(),
+            use_responses_lite: true,
+            multi_agent_reasoning_effort: Some("xhigh".to_string()),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            ..Default::default()
+        };
+        let mut client = Client::new(
+            astra_resolved.base_url(),
+            None,
+            astra_resolved.reference().model(),
+        );
+        crate::agent_impl::apply_chatgpt_model_capabilities_from(
+            &mut client,
+            &astra_resolved,
+            None,
+        );
+        assert!(
+            client.responses_lite(),
+            "built-in fallback must protect a cold cache"
+        );
+        assert_eq!(client.input_modalities().unwrap(), ["text", "image"]);
+        assert_eq!(client.ultra_effort_override(), Some("xhigh"));
+        let notices = super::preflight_notices(&cfg.providers, &astra_resolved);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("does not provide Codex's code-mode interpreter")),
+            "{notices:?}"
+        );
+
+        crate::agent_impl::apply_chatgpt_model_capabilities_from(
+            &mut client,
+            &astra_resolved,
+            Some(ChatGptModel {
+                slug: "gpt-6-astra".to_string(),
+                input_modalities: Vec::new(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            !client.responses_lite(),
+            "present catalog metadata is authoritative"
+        );
+        assert!(client.input_modalities().unwrap().is_empty());
+        assert_eq!(client.ultra_effort_override(), None);
+
+        crate::agent_impl::apply_chatgpt_model_capabilities_from(
+            &mut client,
+            &astra_resolved,
+            Some(astra),
+        );
+        assert!(client.responses_lite());
+        assert_eq!(client.input_modalities().unwrap(), ["text", "image"]);
+        assert_eq!(client.ultra_effort_override(), Some("xhigh"));
+
+        let local = super::resolve(&r("local://other"), &cfg, None).unwrap();
+        crate::agent_impl::apply_chatgpt_model_capabilities_from(&mut client, &local, None);
+        assert!(!client.responses_lite());
+        assert_eq!(client.input_modalities(), None);
+        assert_eq!(client.ultra_effort_override(), None);
     }
 
     /// **THE ENDPOINT BELONGS TO THE PROVIDER.** A `/model` switch always lands on

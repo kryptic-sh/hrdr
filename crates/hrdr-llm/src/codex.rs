@@ -97,6 +97,7 @@ use crate::types::{
 ///
 /// [`ChatMessage::responses_reasoning_items`]: crate::ChatMessage::responses_reasoning_items
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_body(
     model: &str,
     effort: Option<&str>,
@@ -107,21 +108,105 @@ pub(crate) fn build_body(
     messages: &[ChatMessage],
     tools: &[ToolDef],
 ) -> Value {
-    let (instructions, input) = split_instructions_and_input(messages);
+    build_body_with_mode(
+        model,
+        effort,
+        temperature,
+        top_p,
+        max_tokens,
+        prompt_cache_key,
+        messages,
+        tools,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_body_with_mode(
+    model: &str,
+    effort: Option<&str>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+    prompt_cache_key: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    responses_lite: bool,
+) -> Value {
+    let (instructions, mut input) = split_instructions_and_input(messages);
+
+    if responses_lite {
+        strip_responses_lite_image_detail(&mut input);
+        let functions = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                })
+            })
+            .collect::<Vec<_>>();
+        // Responses Lite returns ordinary function calls with the default
+        // `functions` namespace. hrdr's tool-call abstraction is intentionally
+        // flat, so restore that protocol-only namespace when replaying history.
+        for item in &mut input {
+            if item.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(object) = item.as_object_mut()
+            {
+                object.insert("namespace".to_string(), json!("functions"));
+            }
+        }
+        let additional_tools = if functions.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": functions,
+            })]
+        };
+        input.insert(
+            0,
+            json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": additional_tools,
+            }),
+        );
+        if !instructions.is_empty() {
+            input.insert(
+                1,
+                json!({
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": instructions }],
+                }),
+            );
+        }
+    }
 
     let mut body = json!({
         "model": model,
         "input": input,
+        "include": ["reasoning.encrypted_content"],
         "stream": true,
         "store": false,
     });
 
-    if !instructions.is_empty() {
+    if !responses_lite && !instructions.is_empty() {
         body["instructions"] = json!(instructions);
     }
 
     if let Some(level) = effort.and_then(crate::normalize_effort) {
-        body["reasoning"] = json!({ "effort": level });
+        body["reasoning"] = if responses_lite {
+            json!({ "effort": level, "context": "all_turns" })
+        } else {
+            json!({ "effort": level })
+        };
+    } else if responses_lite {
+        body["reasoning"] = json!({ "context": "all_turns" });
     }
     if let Some(n) = max_tokens {
         body["max_output_tokens"] = json!(n);
@@ -136,7 +221,9 @@ pub(crate) fn build_body(
         body["prompt_cache_key"] = json!(key);
     }
 
-    if !tools.is_empty() {
+    if responses_lite {
+        body["parallel_tool_calls"] = json!(false);
+    } else if !tools.is_empty() {
         let defs: Vec<Value> = tools
             .iter()
             .map(|t| {
@@ -152,6 +239,34 @@ pub(crate) fn build_body(
     }
 
     body
+}
+
+/// Responses Lite rejects the normal Responses `detail` sibling on every
+/// `input_image`. Walk the whole input tree so resumed/history content and fresh
+/// attachments receive the same 0.153.4 framing.
+fn strip_responses_lite_image_detail(values: &mut [Value]) {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if object.get("type").and_then(Value::as_str) == Some("input_image") {
+                    object.remove("detail");
+                }
+                for value in object.values_mut() {
+                    strip(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    strip(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for value in values {
+        strip(value);
+    }
 }
 
 /// Split hrdr history into the top-level `instructions` string (all system
@@ -255,11 +370,12 @@ pub(crate) async fn chat_stream(
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     prompt_cache_key: Option<&str>,
+    responses_lite: bool,
     extra_headers: &[(String, String)],
     messages: &[ChatMessage],
     tools: &[ToolDef],
 ) -> Result<crate::ChatStream> {
-    let body = build_body(
+    let body = build_body_with_mode(
         model,
         effort,
         temperature,
@@ -268,6 +384,7 @@ pub(crate) async fn chat_stream(
         prompt_cache_key,
         messages,
         tools,
+        responses_lite,
     );
     let url = format!("{base_url}/responses");
     let mut req = http
@@ -275,6 +392,9 @@ pub(crate) async fn chat_stream(
         // Codex identifies the client via `originator`; the endpoint expects it.
         .header("originator", "hrdr")
         .json(&body);
+    if responses_lite {
+        req = req.header("x-openai-internal-codex-responses-lite", "true");
+    }
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
@@ -782,6 +902,105 @@ mod tests {
         ChatMessage::user(t)
     }
 
+    #[test]
+    fn namespaced_responses_lite_function_call_maps_to_existing_tool_call() {
+        let mut state = StreamState::default();
+        let chunk = map_event(
+            &mut state,
+            &json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "namespace": "functions",
+                    "name": "read"
+                }
+            }),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let call = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id.as_deref(), Some("call_1"));
+        assert_eq!(
+            call.function
+                .as_ref()
+                .and_then(|function| function.name.as_deref()),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn responses_lite_frames_astra_tools_and_instructions_in_input() {
+        let tools = [ToolDef::function(
+            "read",
+            "read a file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )];
+        let body = build_body_with_mode(
+            "gpt-6-astra",
+            Some("max"),
+            None,
+            None,
+            Some(8192),
+            Some("conversation-key"),
+            &[sys("base instructions"), user("go")],
+            &tools,
+            true,
+        );
+
+        assert!(body.get("instructions").is_none(), "{body}");
+        assert!(body.get("tools").is_none(), "{body}");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "max", "context": "all_turns"})
+        );
+        assert_eq!(body["max_output_tokens"], 8192);
+        assert_eq!(body["prompt_cache_key"], "conversation-key");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(body["input"][0]["tools"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["input"][0]["tools"][0]["tools"][0]["name"], "read");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "base instructions");
+        assert_eq!(body["input"][2]["role"], "user");
+
+        let mut image_history = ChatMessage::user("inspect");
+        image_history.attachments = vec![crate::media::tests::png_attachment("history.png")];
+        let image_body = build_body_with_mode(
+            "gpt-6-astra",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[image_history],
+            &[],
+            true,
+        );
+        let image = &image_body["input"][1]["content"][0];
+        assert_eq!(image["type"], "input_image");
+        assert!(image.get("detail").is_none(), "{image_body}");
+
+        let ultra = build_body_with_mode(
+            "gpt-6-astra",
+            Some("ultra"),
+            None,
+            None,
+            None,
+            None,
+            &[user("go")],
+            &[],
+            true,
+        );
+        assert_eq!(ultra["reasoning"], json!({"context": "all_turns"}));
+    }
+
     /// `build_body` with everything optional left off.
     fn body_of(messages: &[ChatMessage]) -> Value {
         build_body("gpt-5.5", None, None, None, None, None, messages, &[])
@@ -899,6 +1118,7 @@ mod tests {
         // Streaming + stateless.
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["model"], "gpt-5.5");
 
         let input = body["input"].as_array().unwrap();
@@ -1630,10 +1850,10 @@ mod tests {
         assert_eq!(input[5]["type"], "function_call_output");
     }
 
-    /// No-regression guard: a history with no stored reasoning items must build
-    /// byte-identical to what it built before replay existed.
+    /// No-regression guard: a history with no stored reasoning items does not
+    /// acquire any replay items; the required encrypted-content request remains.
     #[test]
-    fn messages_without_reasoning_items_build_an_unchanged_body() {
+    fn messages_without_reasoning_items_only_request_encrypted_content() {
         let assistant = ChatMessage {
             role: Role::Assistant,
             content: Some("done".into()),
@@ -1662,6 +1882,7 @@ mod tests {
                 "model": "gpt-5.5",
                 "stream": true,
                 "store": false,
+                "include": ["reasoning.encrypted_content"],
                 "instructions": "you are hrdr",
                 "input": [
                     {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
