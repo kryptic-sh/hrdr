@@ -22,6 +22,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   history are estimated with the current tool schemas and combined with the
   server's last prompt count, so they can trigger compaction before an oversized
   ordinary request is rejected (`crates/hrdr-agent`).
+- **Compaction avoids requests that cannot reclaim useful context.** Proactive
+  passes now account for the complete summary instruction and projected
+  replacement history before spending a model call, while manual and overflow
+  recovery remain available. Sizing follows each client's native token target
+  and compaction continues through the ordinary OpenAI-compatible, Anthropic
+  Messages, and ChatGPT/Codex Responses request paths (`crates/hrdr-agent`).
 - **`cron cancel` can no longer race a fire into a stray reminder.** The
   scheduler's delivery now re-checks the cron's existence and pushes the
   `BackgroundTask` under the same crons → background_tasks lock order the

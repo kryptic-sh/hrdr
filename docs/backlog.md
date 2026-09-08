@@ -279,49 +279,8 @@ shipped silently.
 
 The plan (`docs/compaction-rewrite-plan.md`) is archived into this section — its
 open items are below, and the binding decisions it left are listed at the end of
-this section. Items 4 and 5 are both blocked on a decision rather than on
+this section. Item 5 is blocked on an architectural decision rather than on
 effort; the one audit gap still open is under _Audit items needing a decision_.
-
-### Item 4 — trigger on the body, not the total (BLOCKED, needs a decision)
-
-The plan says hrdr measures total prompt tokens against the window while the
-prefix (system prompt, `tools[]`, memory) is exactly what compaction cannot
-reclaim, and cites codex's
-`AutoCompactTokenLimitScope::{Total, BodyAfterPrefix}` as the shape to copy.
-
-**Not built, because the arithmetic does not transfer.** hrdr's trigger is
-DERIVED (`compaction_trigger` = `window − min(reserved, window/4)`), not
-configured. Restating it against the body — fire when
-`total − prefix ≥ window − reserved − prefix` — is the identical inequality, so
-a literal port changes nothing. Codex's knob only means something because its
-limit is a configured absolute number that the user sets against one scope or
-the other.
-
-The real defect the item is pointing at is narrower and worth fixing on its own
-terms: **on a small window a compaction can reclaim nothing and still fire every
-round.** Worked example — a 32k window with the reserve clamped to `window/4`
-gives a 24k trigger; a 15k prefix leaves a 9k body, and `preserve_recent_tokens`
-alone can exceed that, so `compact()` replaces the history with a summary plus a
-tail that is no smaller, the trigger is still met on the next round, and each
-round buys another summarization call. `compact()` only no-ops on the STRUCTURE
-of the history (`before == after`), never on how many tokens a compaction would
-actually free.
-
-Options, needing the owner's call:
-
-- **Gate on the reclaim.** Before summarizing, estimate
-  `body − (tail + a summary allowance)` and no-op when it is below some floor.
-  Cheap, local to `compact()`, and does not touch the trigger. Risk: an agent
-  that genuinely cannot fit its next request now no-ops instead of trying, so
-  overflow recovery has to be the thing that reports it clearly.
-- **Subtract the prefix from the trigger's meaning** and expose the scope as
-  config, closest to codex. Costs a config key, and the key is hard to explain
-  precisely because the limit it scopes is derived.
-- **Leave it.** The churn case needs a small window AND a large prefix; hrdr's
-  prefix is large, so this is really a "small local model" defect.
-
-Not measured on a real session — the example above is arithmetic from the
-constants, not an observed run.
 
 ### Item 5 — compact with the outgoing model on a model switch (BLOCKED on shape)
 

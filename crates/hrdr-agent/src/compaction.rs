@@ -79,7 +79,7 @@ impl Drop for CompactingGuard {
 pub(crate) const COMPACT_TOOL_CALL_ATTEMPTS: usize = 2;
 
 /// User-turn instruction that triggers the structured summary.
-const COMPACT_TRIGGER: &str = "\
+pub(crate) const COMPACT_TRIGGER: &str = "\
 Summarize the conversation so far. Write the summary as your reply: return prose only, \
 and do not call a tool — a tool call cannot be a summary and will not be run. \
 The summary REPLACES the full history, so it must \
@@ -350,10 +350,10 @@ impl ShrinkStage {
 /// sizing estimate — nothing caps the response at this.
 const COMPACT_ASSUMED_OUTPUT_TOKENS: u32 = 32_768;
 
-/// Slack held back on top of the output allowance when sizing the summarization
-/// request: the trigger message, and the estimator's own error. The system
-/// prompt and `tools[]` are charged separately — see
-/// [`Agent::first_viable_compact_stage`]'s `prefix_tokens`.
+/// Fixed estimator-error slack held back when sizing the summarization request.
+/// The system prompt, `tools[]`, and complete trigger message are charged
+/// separately — see [`Agent::first_viable_compact_stage`]'s
+/// `fixed_request_tokens`.
 const COMPACT_INPUT_SLACK: u32 = 8_192;
 
 /// Token estimate for the history a shrink stage would send, without building
@@ -739,7 +739,7 @@ impl Agent {
         // was *before* this call. Clearing it here (rather than in one caller) stops
         // a frontend-driven `/compact` from leaving a stale, over-the-trigger figure
         // that makes the agent immediately compact the history it just compacted.
-        self.last_prompt_tokens = None;
+        let prior_prompt_tokens = self.last_prompt_tokens.take();
         let before = self.messages.len();
         if before <= 2 {
             return Ok(CompactionReport::nothing_to_do(reason, before));
@@ -828,6 +828,38 @@ impl Agent {
         // wrong: the summary covers the session and the tail follows it in
         // full.
         let defs = self.tools.defs();
+        // Proactive compaction is optional optimization, so do not spend a model
+        // call when the best conservative outcome cannot buy even the same
+        // window/16 headroom required before retrying a failed proactive pass.
+        // The unknown summary is charged at the session's full output allowance;
+        // manual and overflow-triggered compactions still attempt the request so
+        // the explicit user action or provider error gets a definitive result.
+        if reason == CompactionReason::ContextFilling && self.context_window.is_some() {
+            let target = self.client.token_target();
+            let tool_tokens = estimate_tokens_in_tools(&defs);
+            let current_prompt_tokens = prior_prompt_tokens.unwrap_or_default().max(
+                estimate_tokens_in_messages(&self.messages, target).saturating_add(tool_tokens),
+            );
+            let continuation = ChatMessage::user(continuation_framing(
+                reason,
+                tail_start < self.messages.len(),
+            ));
+            let projected_prompt_tokens = estimate_tokens_in_messages(&self.messages[..1], target)
+                .saturating_add(estimate_tokens_in_messages(
+                    std::slice::from_ref(&continuation),
+                    target,
+                ))
+                .saturating_add(estimate_tokens_in_messages(
+                    &self.messages[tail_start..],
+                    target,
+                ))
+                .saturating_add(tool_tokens)
+                .saturating_add(self.compact_output_allowance());
+            let projected_gain = current_prompt_tokens.saturating_sub(projected_prompt_tokens);
+            if projected_gain < self.self_compact_retry_growth() {
+                return Ok(CompactionReport::nothing_to_do(reason, before));
+            }
+        }
         // When compaction is overflow-triggered, the summarization request is
         // itself over the limit. If it overflows, shrink what the summarizer
         // sees and retry: first elide bulky tool results, then keep only the
@@ -848,12 +880,18 @@ impl Agent {
         // under-counts (~4 bytes/token, and code is denser than that), so a
         // wrong guess errs toward starting too early, which the escalation
         // below still handles: this only skips stages that plainly cannot fit.
-        // The prefix rides on every stage and cannot be shrunk by any of them,
-        // so it comes off the budget rather than being sized against it.
-        let prefix_tokens =
+        // The request fields that ride on every stage cannot be shrunk, so they
+        // come off the budget rather than being sized against it. Charge the
+        // complete trigger message explicitly: optional instructions can be much
+        // larger than the base trigger and must move the starting rung too.
+        let fixed_request_tokens =
             estimate_tokens_in_messages(&self.messages[..1], self.client.token_target())
-                .saturating_add(estimate_tokens_in_tools(&defs));
-        let mut stage = self.first_viable_compact_stage(&full, &mut elided, prefix_tokens);
+                .saturating_add(estimate_tokens_in_tools(&defs))
+                .saturating_add(estimate_tokens_in_messages(
+                    std::slice::from_ref(&ChatMessage::user(trigger.clone())),
+                    self.client.token_target(),
+                ));
+        let mut stage = self.first_viable_compact_stage(&full, &mut elided, fixed_request_tokens);
         // Bounded retry (with the same backoff the main turn loop uses) for a
         // transient 429/503 hitting the summarization request itself — without
         // this, compaction (often triggered *because* the model is under
@@ -1003,6 +1041,13 @@ impl Agent {
         })
     }
 
+    fn compact_output_allowance(&self) -> u32 {
+        self.client
+            .params()
+            .max_tokens
+            .unwrap_or(COMPACT_ASSUMED_OUTPUT_TOKENS)
+    }
+
     /// The first shrink stage whose request plausibly fits the context window,
     /// so the doomed attempts before it are never uploaded.
     ///
@@ -1010,10 +1055,10 @@ impl Agent {
     /// means there is nothing to size against: start at 0 and let the escalation
     /// discover the limit the slow way, exactly as before.
     ///
-    /// `prefix_tokens` is what the request carries no matter which stage it
-    /// sends — the session's system prompt and its `tools[]`. No stage can
-    /// shrink either, so they come off the budget rather than being sized
-    /// against it.
+    /// `fixed_request_tokens` is what the request carries no matter which stage
+    /// it sends — the session's system prompt, its `tools[]`, and the complete
+    /// trigger message. No stage can shrink them, so they come off the budget
+    /// rather than being sized against it.
     ///
     /// The output allowance comes off it too, and is the session's own
     /// `max_tokens` because [`Agent::plain_completion`] no longer overrides it.
@@ -1024,20 +1069,17 @@ impl Agent {
         &self,
         full: &[ChatMessage],
         elided: &mut Option<Vec<ChatMessage>>,
-        prefix_tokens: u32,
+        fixed_request_tokens: u32,
     ) -> ShrinkStage {
         let Some(window) = self.context_window else {
             return ShrinkStage::Full;
         };
         let headroom = self
-            .client
-            .params()
-            .max_tokens
-            .unwrap_or(COMPACT_ASSUMED_OUTPUT_TOKENS)
+            .compact_output_allowance()
             .saturating_add(COMPACT_INPUT_SLACK);
         let budget = window
             .saturating_sub(headroom)
-            .saturating_sub(prefix_tokens);
+            .saturating_sub(fixed_request_tokens);
         if budget == 0 {
             // A window smaller than the headroom: nothing can be sized, and
             // guessing the smallest stage would throw away the history for a

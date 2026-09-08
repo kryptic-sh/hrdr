@@ -46,6 +46,8 @@ pub(crate) fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
 enum MockResp {
     /// An SSE stream: each string is emitted as `data: <s>\n\n`.
     Sse(Vec<String>),
+    /// An SSE stream with its framing already encoded.
+    RawSse(String),
     /// A plain HTTP error status (no body).
     HttpError(u16),
     /// An HTTP error with a provider error body.
@@ -73,6 +75,14 @@ impl MockResp {
                 )
                 .into_bytes()
             }
+            MockResp::RawSse(body) => format!(
+                "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/event-stream\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {body}"
+            )
+            .into_bytes(),
             MockResp::HttpError(status) => format!(
                 "HTTP/1.1 {status} Error\r\n\
                          Content-Length: 0\r\n\
@@ -242,6 +252,33 @@ fn stop_chunk(id: &str) -> String {
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }))
     .unwrap()
+}
+
+/// A minimal successful summary stream in each backend's native framing.
+fn native_summary_response(backend: hrdr_llm::Backend) -> MockResp {
+    match backend {
+        hrdr_llm::Backend::OpenAi => MockResp::Sse(vec![
+            text_chunk("summary", "Native summary."),
+            stop_chunk("summary"),
+            "[DONE]".to_string(),
+        ]),
+        hrdr_llm::Backend::Anthropic => MockResp::RawSse(
+            "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Native summary.\"}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+             event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n"
+                .to_string(),
+        ),
+        hrdr_llm::Backend::Codex => MockResp::RawSse(
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"Native summary.\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n"
+                .to_string(),
+        ),
+    }
 }
 
 /// Build a tool-call start chunk: creates a tool call slot.
@@ -3839,6 +3876,467 @@ async fn the_compaction_request_keeps_the_live_prefix_byte_for_byte() {
     );
 }
 
+/// Manual compaction uses the session client's native request path rather than
+/// constructing an OpenAI-shaped summarizer request beside it.
+#[tokio::test]
+async fn manual_compaction_uses_each_backends_ordinary_native_request_shape() {
+    for backend in [
+        hrdr_llm::Backend::OpenAi,
+        hrdr_llm::Backend::Anthropic,
+        hrdr_llm::Backend::Codex,
+    ] {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = bodies.clone();
+        let server = MockServer::start_with_body_hook(
+            vec![native_summary_response(backend)],
+            move |_, body| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+            },
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+        agent.client.set_backend_for_test(backend);
+        agent.client.model = "claude-3-haiku".to_string();
+        agent.set_temperature(Some(0.7));
+        agent
+            .client
+            .set_prompt_cache_key(Some("session-key".into()));
+        agent.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(1_234),
+            top_p: Some(0.8),
+            ..Default::default()
+        });
+        agent.compaction_tail_turns = 1;
+        agent.preserve_recent_tokens = 0;
+        for i in 0..8 {
+            Arc::make_mut(&mut agent.messages)
+                .push(ChatMessage::user(format!("native-history-user-{i}")));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
+                "native-history-assistant-{i}"
+            )));
+        }
+        let system = agent.messages[0].content.clone().unwrap();
+        let tool_names: Vec<String> = agent
+            .tools
+            .defs()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect();
+
+        let report = agent
+            .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
+            .await
+            .unwrap_or_else(|error| panic!("{backend:?} compaction failed: {error:#}"));
+        assert!(report.shrank(), "{backend:?} must replace old history");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "{backend:?} issued one request");
+        let body = &bodies[0];
+        let encoded = body.to_string();
+        assert!(
+            encoded.contains("native-history-user-0")
+                && encoded.contains("native-history-assistant-7"),
+            "{backend:?} retained the live history: {body}"
+        );
+        assert!(
+            encoded.contains("Summarize the conversation so far"),
+            "{backend:?} appended the compaction instruction: {body}"
+        );
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+                || body["input"].as_array().is_some_and(|input| {
+                    input.iter().any(|item| item["type"] == "additional_tools")
+                }),
+            "{backend:?} retained the session tools: {body}"
+        );
+        assert!(
+            tool_names.iter().all(|name| encoded.contains(name)),
+            "{backend:?} retained every session tool: {body}"
+        );
+        assert!(
+            (body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6,
+            "{backend:?} retained temperature: {body}"
+        );
+        assert!(
+            (body["top_p"].as_f64().unwrap() - 0.8).abs() < 1e-6,
+            "{backend:?} retained top_p: {body}"
+        );
+        assert_eq!(body["stream"], true);
+
+        match backend {
+            hrdr_llm::Backend::OpenAi => {
+                assert!(body["messages"].is_array(), "OpenAI uses messages: {body}");
+                assert_eq!(body["messages"][0]["role"], "system");
+                assert_eq!(body["messages"][0]["content"], system);
+                assert!(body.get("input").is_none());
+                assert!(body.get("instructions").is_none());
+                assert_eq!(body["max_tokens"], 1_234);
+                assert_eq!(body["tools"][0]["type"], "function");
+                assert!(body["tools"][0]["function"]["parameters"].is_object());
+            }
+            hrdr_llm::Backend::Anthropic => {
+                assert!(body["system"].is_array(), "Anthropic hoists system: {body}");
+                let sent_system: String = body["system"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect();
+                assert_eq!(sent_system, system);
+                assert!(body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().all(|message| message["role"] != "system")
+                }));
+                assert_eq!(body["max_tokens"], 1_234);
+                assert!(body["tools"][0]["name"].is_string());
+                assert!(body["tools"][0]["input_schema"].is_object());
+                assert!(
+                    body.get("prompt_cache_key").is_none(),
+                    "Anthropic must never receive OpenAI's prompt_cache_key: {body}"
+                );
+                assert!(body.get("stream_options").is_none());
+            }
+            hrdr_llm::Backend::Codex => {
+                assert!(
+                    body["instructions"].is_string(),
+                    "Codex hoists system: {body}"
+                );
+                assert_eq!(body["instructions"], system);
+                assert!(
+                    body["input"].is_array(),
+                    "Codex uses Responses input: {body}"
+                );
+                assert!(body.get("messages").is_none());
+                assert_eq!(body["max_output_tokens"], 1_234);
+                assert_eq!(body["prompt_cache_key"], "session-key");
+                assert_eq!(body["store"], false);
+            }
+        }
+    }
+}
+
+/// The preflight shrink rung prices image history for the pinned backend. The
+/// boundary admits OpenAI's full history but only Anthropic's recent half.
+#[tokio::test]
+async fn compaction_presizing_uses_the_clients_provider_specific_token_target() {
+    fn sized_png(width: u32, height: u32) -> hrdr_llm::media::Attachment {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        hrdr_llm::media::Attachment::new(bytes, hrdr_llm::media::MediaType::Png, "sizing.png")
+            .unwrap()
+    }
+
+    let image = sized_png(1_024, 1_024);
+    let mut history = Vec::new();
+    for i in 0..8 {
+        let mut user = ChatMessage::user(format!("image-turn-{i}"));
+        user.attachments.push(image.clone());
+        history.push(user);
+        history.push(ChatMessage::assistant(format!("image-reply-{i}")));
+    }
+    let openai_full =
+        crate::compaction::estimate_tokens_in_messages(&history, hrdr_llm::TokenTarget::OpenAi);
+    let anthropic_full =
+        crate::compaction::estimate_tokens_in_messages(&history, hrdr_llm::TokenTarget::Anthropic);
+    let anthropic_half_history = crate::compaction::tail_window(&history, 2);
+    let anthropic_half = crate::compaction::estimate_tokens_in_messages(
+        &anthropic_half_history,
+        hrdr_llm::TokenTarget::Anthropic,
+    );
+    let history_budget = openai_full.max(anthropic_half);
+    assert!(
+        history_budget < anthropic_full,
+        "the selected boundary must distinguish the providers: OpenAI full {openai_full}, Anthropic half {anthropic_half}, Anthropic full {anthropic_full}"
+    );
+
+    for (backend, expected_stage) in [
+        (hrdr_llm::Backend::OpenAi, crate::ShrinkStage::Full),
+        (hrdr_llm::Backend::Anthropic, crate::ShrinkStage::Half),
+    ] {
+        let server = MockServer::start(vec![native_summary_response(backend)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+        agent.client.set_backend_for_test(backend);
+        agent.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(1_024),
+            ..Default::default()
+        });
+        agent.compaction_tail_turns = 1;
+        agent.preserve_recent_tokens = 0;
+        Arc::make_mut(&mut agent.messages).extend(history.clone());
+        let target = agent.client.token_target();
+        let fixed = crate::compaction::estimate_tokens_in_messages(&agent.messages[..1], target)
+            .saturating_add(crate::compaction::estimate_tokens_in_tools(
+                &agent.tools.defs(),
+            ))
+            .saturating_add(crate::compaction::estimate_tokens_in_messages(
+                std::slice::from_ref(&ChatMessage::user(crate::compaction::COMPACT_TRIGGER)),
+                target,
+            ));
+        agent.set_context_window(Some(
+            fixed
+                .saturating_add(1_024)
+                .saturating_add(8_192)
+                .saturating_add(history_budget),
+        ));
+
+        let report = agent
+            .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
+            .await
+            .unwrap_or_else(|error| panic!("{backend:?} compaction failed: {error:#}"));
+        assert_eq!(report.stage, expected_stage, "{backend:?} token pricing");
+        assert_eq!(report.attempts, 1);
+    }
+}
+
+/// Long optional instructions are part of the fixed compaction request, so they
+/// can make a full-history request nonviable before anything is uploaded.
+#[tokio::test]
+async fn compaction_presizing_charges_the_complete_trigger_before_the_first_request() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = bodies.clone();
+    let server = MockServer::start_with_body_hook(
+        vec![MockResp::Sse(vec![
+            text_chunk("s1", "A summary."),
+            stop_chunk("s1"),
+            "[DONE]".to_string(),
+        ])],
+        move |_, body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+        },
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    agent.client.set_params(hrdr_llm::RequestParams {
+        max_tokens: Some(1_024),
+        ..Default::default()
+    });
+    for i in 0..12 {
+        Arc::make_mut(&mut agent.messages)
+            .push(ChatMessage::user(format!("turn-{i} {}", "u".repeat(5_000))));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
+            "reply-{i} {}",
+            "a".repeat(5_000)
+        )));
+    }
+    let target = agent.client.token_target();
+    let full_tokens = crate::compaction::estimate_tokens_in_messages(&agent.messages[1..], target);
+    let fixed_without_trigger =
+        crate::compaction::estimate_tokens_in_messages(&agent.messages[..1], target)
+            .saturating_add(crate::compaction::estimate_tokens_in_tools(
+                &agent.tools.defs(),
+            ));
+    // Without charging the trigger, this window fits Full exactly after the
+    // output allowance and fixed estimator slack. The long extra instructions
+    // make Full and Elided nonviable while Half still fits.
+    agent.set_context_window(Some(
+        fixed_without_trigger
+            .saturating_add(1_024)
+            .saturating_add(8_192)
+            .saturating_add(full_tokens),
+    ));
+    let instructions = "focus".repeat(6_667);
+
+    let report = agent
+        .compact(
+            crate::CompactionReason::UserRequested,
+            Some(&instructions),
+            &mut |_| {},
+        )
+        .await
+        .expect("the first viable request succeeds");
+
+    assert_eq!(report.attempts, 1, "no avoidable overflow attempt was sent");
+    assert_eq!(report.stage, crate::ShrinkStage::Half);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let messages = bodies[0]["messages"].as_array().unwrap();
+    assert!(
+        !messages.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("turn-0 "))),
+        "the first request must already use the half-history stage: {}",
+        bodies[0]
+    );
+    assert!(
+        messages.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("turn-6 "))),
+        "the viable half-history tail must be retained: {}",
+        bodies[0]
+    );
+}
+
+/// Proactive compaction is a no-op when its conservative replacement estimate
+/// cannot buy the retry-growth headroom; no summarizer request is spent.
+#[tokio::test]
+async fn proactive_compaction_skips_a_no_benefit_large_tail() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let server = MockServer::start_with_hook(
+        vec![MockResp::Sse(vec![
+            text_chunk("s1", "must not be requested"),
+            stop_chunk("s1"),
+            "[DONE]".to_string(),
+        ])],
+        move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    let window = 16_000;
+    agent.set_context_window(Some(window));
+    agent.client.set_params(hrdr_llm::RequestParams {
+        max_tokens: Some(8_000),
+        ..Default::default()
+    });
+    agent.compaction_tail_turns = 7;
+    agent.preserve_recent_tokens = u32::MAX;
+    agent.last_prompt_tokens = Some(window);
+    for i in 0..8 {
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!("reply {i}")));
+    }
+    assert!(crate::compaction::should_auto_compact(
+        agent.last_prompt_tokens,
+        agent.context_window,
+        agent.compaction_reserved,
+        true,
+    ));
+    let before: Vec<(Role, Option<String>)> = agent
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.clone()))
+        .collect();
+
+    let report = agent
+        .compact(crate::CompactionReason::ContextFilling, None, &mut |_| {})
+        .await
+        .expect("a no-benefit proactive pass is a clean no-op");
+
+    assert!(!report.shrank());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let after: Vec<(Role, Option<String>)> = agent
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.clone()))
+        .collect();
+    assert_eq!(after, before, "a no-op must preserve the original history");
+}
+
+/// A proactive pass with substantial old history still summarizes, while the
+/// no-benefit gate never suppresses manual or overflow recovery attempts.
+#[tokio::test]
+async fn compaction_no_benefit_gate_is_proactive_only() {
+    for reason in [
+        crate::CompactionReason::ContextFilling,
+        crate::CompactionReason::UserRequested,
+        crate::CompactionReason::ContextOverflow,
+    ] {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let server = MockServer::start_with_hook(
+            vec![MockResp::Sse(vec![
+                text_chunk("s1", "A summary."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])],
+            move |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+        agent.set_context_window(Some(30_000));
+        agent.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(1_024),
+            ..Default::default()
+        });
+        agent.compaction_tail_turns = 1;
+        agent.preserve_recent_tokens = 0;
+        for i in 0..8 {
+            Arc::make_mut(&mut agent.messages)
+                .push(ChatMessage::user(format!("turn {i} {}", "x".repeat(8_000))));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
+                "reply {i} {}",
+                "y".repeat(8_000)
+            )));
+        }
+
+        let report = agent
+            .compact(reason, None, &mut |_| {})
+            .await
+            .expect("meaningful reclaim must still compact");
+        assert!(report.shrank(), "{reason:?} must not be suppressed");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{reason:?} must issue one summarizer request"
+        );
+    }
+
+    for reason in [
+        crate::CompactionReason::UserRequested,
+        crate::CompactionReason::ContextOverflow,
+    ] {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let server = MockServer::start_with_hook(
+            vec![MockResp::Sse(vec![
+                text_chunk("s1", "A summary."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])],
+            move |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+        agent.set_context_window(Some(16_000));
+        agent.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(8_000),
+            ..Default::default()
+        });
+        agent.compaction_tail_turns = 7;
+        agent.preserve_recent_tokens = u32::MAX;
+        for i in 0..8 {
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!("reply {i}")));
+        }
+
+        agent
+            .compact(reason, None, &mut |_| {})
+            .await
+            .expect("explicit compaction reasons must attempt the model request");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{reason:?} must bypass the proactive-only gate"
+        );
+    }
+}
+
 /// A tool round the user cancelled mid-flight is repaired BEFORE the
 /// tail is chosen, not after.
 ///
@@ -4681,6 +5179,10 @@ async fn assert_proactive_compaction_precedes_request(last_prompt_tokens: Option
 
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    agent.client.set_params(hrdr_llm::RequestParams {
+        max_tokens: Some(1_024),
+        ..Default::default()
+    });
     agent.context_window = Some(30_000);
     agent.context_window_probed = true;
     agent.compaction_reserved = 1_000;
