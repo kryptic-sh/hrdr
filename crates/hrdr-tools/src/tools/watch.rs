@@ -38,6 +38,9 @@ pub const MIN_WATCH_INTERVAL_SECS: u64 = 15;
 /// 12–19 minutes — a 10-minute default would time the flagship flow out
 /// mid-run and force a re-watch with an explicit ceiling.
 pub const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 1800;
+/// The floor on `timeout_secs`: a whole-watch duration must leave enough time
+/// for the immediate first poll to observe the check.
+pub const MIN_WATCH_TIMEOUT_SECS: u64 = 1;
 /// The ceiling on `timeout_secs`: any longer and the watch holds its registry
 /// entry — and the poller's clone of the call's stream channel — past any
 /// sensible turn.
@@ -137,11 +140,12 @@ impl Tool for WatchTool {
                 "timeout_secs": {
                     "type": "integer",
                     "default": DEFAULT_WATCH_TIMEOUT_SECS,
+                    "minimum": MIN_WATCH_TIMEOUT_SECS,
                     "maximum": MAX_WATCH_TIMEOUT_SECS,
                     "description": format!(
                         "Whole-watch ceiling, in seconds (default {DEFAULT_WATCH_TIMEOUT_SECS}, \
-                         maximum {MAX_WATCH_TIMEOUT_SECS}). The watch ends with a timeout result \
-                         if the check never exits 0."
+                         minimum {MIN_WATCH_TIMEOUT_SECS}, maximum {MAX_WATCH_TIMEOUT_SECS}). The \
+                         watch ends with a timeout result if the check never exits 0."
                     ),
                 }
             },
@@ -171,6 +175,11 @@ impl Tool for WatchTool {
             );
         }
         let timeout = a.timeout_secs.unwrap_or(DEFAULT_WATCH_TIMEOUT_SECS);
+        if timeout < MIN_WATCH_TIMEOUT_SECS {
+            bail!(
+                "timeout_secs={timeout} is outside the accepted range {MIN_WATCH_TIMEOUT_SECS}s..={MAX_WATCH_TIMEOUT_SECS}s"
+            );
+        }
         if timeout > MAX_WATCH_TIMEOUT_SECS {
             bail!(
                 "timeout_secs={timeout} exceeds the {MAX_WATCH_TIMEOUT_SECS}s ceiling — the watch \
@@ -270,9 +279,8 @@ async fn poll_watch(
             return;
         }
         // Whole-watch ceiling, checked before each round so a check never runs
-        // past it. First iteration (elapsed ≈ 0) falls through unless the model
-        // asked for a sub-second timeout, which times out immediately with the
-        // "never ran" fallback.
+        // past it. The first iteration (elapsed ≈ 0) falls through for every
+        // accepted timeout, so it gets a polling opportunity.
         if started.elapsed() >= Duration::from_secs(timeout) {
             let output = last_output.as_deref().unwrap_or("(no check output yet)");
             let result = format!(
@@ -787,6 +795,66 @@ mod tests {
             props["timeout_secs"]["default"],
             json!(DEFAULT_WATCH_TIMEOUT_SECS)
         );
+        assert_eq!(
+            props["timeout_secs"]["minimum"],
+            json!(MIN_WATCH_TIMEOUT_SECS)
+        );
         assert_eq!(schema["required"], json!(["check"]));
+    }
+
+    /// A direct `Tool::execute` call bypasses JSON Schema validation, so the
+    /// timeout floor must reject zero before the poller can run its check.
+    #[tokio::test]
+    async fn watch_rejects_zero_timeout_before_running_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let err = tool()
+            .execute(
+                serde_json::json!({
+                    "check": flip_check(dir.path(), 1),
+                    "timeout_secs": 0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "timeout_secs=0 is outside the accepted range {MIN_WATCH_TIMEOUT_SECS}s..={MAX_WATCH_TIMEOUT_SECS}s"
+            )
+        );
+        assert_eq!(
+            counter_value(dir.path()),
+            0,
+            "the rejected check produced its observable marker"
+        );
+    }
+
+    /// One second is the smallest valid whole-watch duration and still lets the
+    /// immediate first poll observe a condition that is already met.
+    #[tokio::test]
+    async fn watch_one_second_timeout_gets_a_polling_opportunity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.enforce_timeout_floor = false;
+        let ack = tool()
+            .execute(
+                serde_json::json!({
+                    "check": flip_check(dir.path(), 1),
+                    "interval_secs": 1,
+                    "timeout_secs": MIN_WATCH_TIMEOUT_SECS,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let entry = wait_done(&ctx, ack_id(&ack), Duration::from_secs(10)).await;
+        assert!(
+            entry.result.unwrap().contains("exited 0"),
+            "the first poll did not observe the passing check"
+        );
+        assert_eq!(counter_value(dir.path()), 1, "the check ran once");
     }
 }

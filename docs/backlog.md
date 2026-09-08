@@ -3472,11 +3472,6 @@ remained open at that review and was fixed 2026-09-09. Rest cleared.**
   — the durable on-disk id only surfaces after a resume. Effect is limited to
   OpenCode session affinity/prompt-caching grouping; self-heals on resume.
   Consider re-asserting the id from `state.id` at turn end.
-- **`watch` accepts `timeout_secs: 0`** (`watch.rs:173-179`; schema has a
-  maximum but no minimum): the first iteration's `elapsed >= 0` check fires
-  immediately and returns "timed out after 0s — the check never exited 0"
-  without ever running the check. A model passing 0 gets a confusing instant
-  failure. Add a minimum (1) or run the first poll before the timeout check.
 - **Cron fire across a DST transition** (`cron.rs:383-389`): `wait` is a
   wall-clock difference computed before the sleep; a transition between
   computation and fire shifts one delivery by an hour. The loop recomputes

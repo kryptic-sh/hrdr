@@ -17,6 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for these native APIs while OpenAI-compatible/local endpoints retain their
   omitted-model behavior (`crates/hrdr-agent`).
 
+- **`watch` rejects a zero-second whole-watch timeout before it spawns a
+  check.** Its schema and direct-call validation now accept only 1–3600 seconds,
+  so an invalid `timeout_secs: 0` cannot report an instant timeout without
+  polling (`crates/hrdr-tools`).
 - **`task_cancel` never reports a background task cancelled while its worker can
   continue.** A task row is now registered and paired with its worker handle
   under the same lifecycle lock order used by cancellation, so cancellation
