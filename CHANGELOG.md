@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **OpenAI-compatible streams no longer drop `delta.reasoning`.** Both
+  `delta.reasoning_content` and `delta.reasoning` normalize into the existing
+  reasoning accumulation and render path; if a provider emits both, the
+  established `reasoning_content` value wins (`crates/hrdr-llm`).
 - **Native Anthropic and ChatGPT/Codex backends reject `default` models before a
   request.** Agent construction and model switches now require an explicit model
   for these native APIs while OpenAI-compatible/local endpoints retain their

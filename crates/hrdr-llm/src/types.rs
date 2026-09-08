@@ -665,14 +665,37 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Delta {
-    #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
     pub reasoning_content: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+impl<'de> Deserialize<'de> for Delta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawDelta {
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            reasoning_content: Option<String>,
+            #[serde(default)]
+            reasoning: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ToolCallDelta>>,
+        }
+
+        let raw = RawDelta::deserialize(deserializer)?;
+        Ok(Self {
+            content: raw.content,
+            // `reasoning_content` is the established spelling. Keep its value
+            // when both keys are present so a gateway cannot double-count a
+            // delta by emitting aliases together.
+            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1104,6 +1127,64 @@ mod tests {
         assert_eq!(c2.choices.len(), 1);
         assert!(c2.choices[0].delta.content.is_none());
         assert_eq!(c2.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn chat_chunk_normalizes_reasoning_spellings() {
+        let cases = [
+            (
+                r#"{"choices":[{"delta":{"reasoning_content":"canonical"}}]}"#,
+                "canonical",
+            ),
+            (
+                r#"{"choices":[{"delta":{"reasoning":"alternate"}}]}"#,
+                "alternate",
+            ),
+            (
+                r#"{"choices":[{"delta":{"reasoning_content":"canonical","reasoning":"alternate"}}]}"#,
+                "canonical",
+            ),
+        ];
+
+        for (json, expected_reasoning) in cases {
+            let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                chunk.choices[0].delta.reasoning_content.as_deref(),
+                Some(expected_reasoning),
+                "{json}"
+            );
+        }
+
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"answer","reasoning":"thought","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.content.as_deref(), Some("answer"));
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thought"));
+        assert_eq!(
+            delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn accumulator_normalizes_reasoning_spelling() {
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"think","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let mut acc = Accumulator::new();
+        assert_eq!(acc.push(&chunk).unwrap().as_deref(), Some("answer"));
+        assert_eq!(
+            acc.into_message().reasoning_content.as_deref(),
+            Some("think")
+        );
     }
 
     #[test]

@@ -1360,10 +1360,6 @@ decision, not work — except the last, which is a missing feature.
   (`1871631`), and guessing a direction is wrong either way — folding to `stop`
   hides a truncation, folding to `length` calls a refusal truncated. Revisit
   only if a real reason turns up that wants a fourth answer.
-- **`Delta` deserializes only `reasoning_content`**, so providers streaming
-  `delta.reasoning` (several OpenAI-compatible gateways) have their reasoning
-  silently dropped. A missing feature, not a missing test — do not re-derive it
-  as a coverage gap.
 
 ---
 

@@ -1688,6 +1688,36 @@ mod tests {
         assert_eq!(drained.decode, std::time::Duration::ZERO);
     }
 
+    #[tokio::test]
+    async fn alternate_reasoning_spelling_reaches_reasoning_events() {
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"thought","content":"answer"}}]}"#,
+        )
+        .unwrap();
+
+        let (events, acc) = events_for(vec![chunk]).await;
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, ["thought"]);
+        assert_eq!(text, ["answer"]);
+        assert_eq!(
+            acc.into_message().reasoning_content.as_deref(),
+            Some("thought")
+        );
+    }
+
     /// An empty delta is dropped rather than forwarded — in both directions.
     ///
     /// Regression: a Qwen3-style backend keeps emitting `reasoning_content: ""`
