@@ -266,7 +266,7 @@ jobs:
           key: ${{ matrix.target }}
       - name: Setup zig
         if: matrix.zig == 'true'
-        uses: mlugg/setup-zig@v2
+        uses: step-security/setup-zig@1e9fbd457bcc3587b58845344a267f12f151709c # v2.2.2
         with:
           version: '0.15.1'
       - name: Install cargo-zigbuild
@@ -352,7 +352,7 @@ jobs:
           RPM_FILE=$(ls target/${{ matrix.target }}/generate-rpm/hrdr-*.rpm | head -1)
           cp "$RPM_FILE" .
           sha256sum "$(basename "$RPM_FILE")" > "$(basename "$RPM_FILE").sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hrdr-${{ matrix.target }}
           path: |

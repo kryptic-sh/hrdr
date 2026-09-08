@@ -24,6 +24,16 @@ Conventions:
 
 ---
 
+## GitHub Actions setup-zig cache verification
+
+`step-security/setup-zig` v2.2.2 was adopted for its Node.js 24 runtime after a
+confined source audit. Fresh Zig archives are verified with Zig's minisign key,
+but archives restored from GitHub Actions cache are extracted and executed
+without re-verification. The current workflow limits that residual risk to a
+public repository on GitHub-hosted runners with a literal Zig version and pins
+the action to its audited commit. Revisit this dependency when `mlugg/setup-zig`
+ships a Node.js 24 release or the replacement verifies cache hits.
+
 ## Frame cost measured 2026-08-13 — one fix shipped, one left open
 
 Prompted by "lag as the context gets bigger". Measured with a throwaway probe
