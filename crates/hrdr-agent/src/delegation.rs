@@ -84,6 +84,88 @@ pub(crate) fn bg_handles() -> BgHandles {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+#[cfg(test)]
+struct TaskCancelHandleLockAttempt {
+    id: u64,
+    contended: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[cfg(test)]
+static TASK_CANCEL_HANDLE_LOCK_ATTEMPT: std::sync::OnceLock<
+    Mutex<Option<TaskCancelHandleLockAttempt>>,
+> = std::sync::OnceLock::new();
+
+fn lock_task_handles(
+    handles: &BgHandles,
+    id: u64,
+) -> std::sync::MutexGuard<'_, Vec<(u64, tokio::task::JoinHandle<()>)>> {
+    #[cfg(not(test))]
+    let _ = id;
+    #[cfg(test)]
+    {
+        let hook = TASK_CANCEL_HANDLE_LOCK_ATTEMPT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|hook| hook.id == id);
+        if let Some(hook) = hook {
+            match handles.try_lock() {
+                Ok(guard) => {
+                    let _ = hook.contended.send(false);
+                    return guard;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let _ = hook.contended.send(true);
+                }
+                Err(std::sync::TryLockError::Poisoned(err)) => {
+                    let _ = hook.contended.send(false);
+                    return err.into_inner();
+                }
+            }
+        }
+    }
+    handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Holds the handle registry lock while a visible background-task row is paired
+/// with its worker. `task_cancel` takes this lock before reading the row, so it
+/// cannot report cancellation until there is a handle to abort and await.
+struct BackgroundPublication<'a> {
+    handles: std::sync::MutexGuard<'a, Vec<(u64, tokio::task::JoinHandle<()>)>>,
+}
+
+fn register_background_task<'a>(
+    registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
+    handles: &'a BgHandles,
+    task: hrdr_tools::BackgroundTask,
+) -> BackgroundPublication<'a> {
+    // `task_cancel` takes `handles` before `background_tasks`; keep that order
+    // here. The guard remains held through `tokio::spawn` and publication, so a
+    // cancellation that observes this row waits until it can take the worker.
+    let handles = handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut tasks) = registry.lock() {
+        tasks.push(task);
+    }
+    BackgroundPublication { handles }
+}
+
+impl BackgroundPublication<'_> {
+    fn publish(mut self, id: u64, handle: tokio::task::JoinHandle<()>) {
+        // Best-effort reaping: drop handles for tasks that have already
+        // finished. A finished task's result is already recorded in the
+        // registry, so dropping the JoinHandle is safe. This keeps the Vec
+        // bounded over a long session without requiring an explicit drain.
+        // Note: this is best-effort — a panicked task is also considered
+        // finished (is_finished returns true) and is reaped here.
+        self.handles.retain(|(_, h)| !h.is_finished());
+        self.handles.push((id, handle));
+    }
+}
+
 /// Spawn `cfg`'s sub-agent detached: it streams into the shared background
 /// registry and, on completion, records its result there for the run loop to
 /// deliver. Returns immediately with an acknowledgement for the model.
@@ -436,8 +518,10 @@ async fn spawn_background(
             prompt: opening.sent.clone(),
         });
     }
-    if let Ok(mut v) = registry.lock() {
-        v.push(hrdr_tools::BackgroundTask {
+    let publication = register_background_task(
+        registry,
+        handles,
+        hrdr_tools::BackgroundTask {
             id,
             kind: hrdr_tools::BackgroundKind::Task,
             tool_id,
@@ -447,8 +531,8 @@ async fn spawn_background(
             result: None,
             delivered: false,
             cancelled: false,
-        });
-    }
+        },
+    );
     let ts_inner = transcript.clone();
     let ts_outer = transcript;
     let reg = registry.clone();
@@ -667,16 +751,7 @@ async fn spawn_background(
             e.done = true;
         });
     });
-    if let Ok(mut v) = handles.lock() {
-        // Best-effort reaping: drop handles for tasks that have already
-        // finished. A finished task's result is already recorded in the
-        // registry, so dropping the JoinHandle is safe. This keeps the Vec
-        // bounded over a long session without requiring an explicit drain.
-        // Note: this is best-effort — a panicked task is also considered
-        // finished (is_finished returns true) and is reaped here.
-        v.retain(|(_, h)| !h.is_finished());
-        v.push((id, handle));
-    }
+    publication.publish(id, handle);
     let isolation = if cfg_read_only {
         ""
     } else {
@@ -1924,10 +1999,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
         // wedged task can't hang the cancel; abort resolves promptly for the
         // I/O-bound sub-agent in the common case.
         let handle = {
-            let mut handles = self
-                .bg_handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut handles = lock_task_handles(&self.bg_handles, id);
             handles
                 .iter()
                 .position(|(hid, _)| *hid == id)
@@ -2420,6 +2492,125 @@ impl Agent {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod background_publication_tests {
+    use super::*;
+    use hrdr_tools::Tool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    /// A cancel that sees a background row while its worker is being published
+    /// must wait for that handle, then abort it before reporting success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_waits_for_worker_publication_before_returning() {
+        let _test_lock = TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let ctx = hrdr_tools::ToolContext::new(tempfile::tempdir().unwrap().path());
+        let registry = Arc::clone(&ctx.background_tasks);
+        let handles = bg_handles();
+        let id = 4242;
+        let publication = register_background_task(
+            &registry,
+            &handles,
+            hrdr_tools::BackgroundTask {
+                id,
+                kind: hrdr_tools::BackgroundKind::Task,
+                tool_id: None,
+                label: "publication-race".to_string(),
+                log: String::new(),
+                done: false,
+                result: None,
+                delivered: false,
+                cancelled: false,
+            },
+        );
+        assert!(
+            registry.lock().unwrap().iter().any(|task| task.id == id),
+            "the task row is visible before cancellation starts"
+        );
+
+        let may_mutate = Arc::new(tokio::sync::Notify::new());
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let (ready, ready_wait) = tokio::sync::oneshot::channel();
+        let (mutated, mutation_wait) = tokio::sync::oneshot::channel();
+        let worker = {
+            let may_mutate = Arc::clone(&may_mutate);
+            let mutations = Arc::clone(&mutations);
+            tokio::spawn(async move {
+                let _ = ready.send(());
+                may_mutate.notified().await;
+                mutations.fetch_add(1, Ordering::SeqCst);
+                let _ = mutated.send(());
+            })
+        };
+        ready_wait.await.expect("worker is waiting to mutate");
+        let cancel_tool = TaskCancelTool {
+            bg_handles: Arc::clone(&handles),
+            live: AgentRegistry::new(),
+        };
+        let (handle_lock_contended, handle_lock_contended_wait) = tokio::sync::oneshot::channel();
+        *TASK_CANCEL_HANDLE_LOCK_ATTEMPT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(TaskCancelHandleLockAttempt {
+                id,
+                contended: handle_lock_contended,
+            });
+        let cancel_ctx = ctx.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_tool
+                .execute(serde_json::json!({"id": id}), &cancel_ctx)
+                .await
+        });
+
+        assert!(
+            handle_lock_contended_wait
+                .await
+                .expect("cancellation measured handle-lock contention"),
+            "cancellation did not contend with handle publication"
+        );
+        assert!(
+            !cancel.is_finished(),
+            "cancel returned while publication still held the handle lock"
+        );
+
+        publication.publish(id, worker);
+        let result = cancel
+            .await
+            .expect("cancel task completes")
+            .expect("cancel succeeds");
+        assert!(
+            result.contains("Cancelled background task #4242"),
+            "{result}"
+        );
+        assert!(
+            handles.lock().unwrap().is_empty(),
+            "cancellation removes the published worker handle"
+        );
+        let task = registry
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|task| task.id == id)
+            .cloned()
+            .expect("the cancelled row remains visible");
+        assert!(task.cancelled && task.done, "{task:?}");
+
+        // Cancellation awaited the abort before returning, so releasing this
+        // signal cannot let the dropped worker mutate observable state.
+        may_mutate.notify_one();
+        assert!(
+            mutation_wait.await.is_err(),
+            "the worker mutated after cancellation returned"
+        );
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
     }
 }
 

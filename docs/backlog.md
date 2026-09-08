@@ -3420,25 +3420,9 @@ mock_server.rs), the TUI paste cap, the gate/sandbox/whitespace dedup, and the
 highest-density areas (stream loops, session serialization, tool batch
 execution, background task lifecycle, shell/watch delivery).
 
-**Findings: 1 new (Low, race) — fixed and closed 2026-09-04 (see CHANGELOG
-`## [Unreleased]`); plus one previously-recorded open item re-confirmed. Rest
-cleared.**
-
-2. **Re-confirmed (open hardening item from 2026-08-30) — `task_cancel` vs the
-   background-spawn window: "Cancelled" while the run continues.** On the
-   current code the entry is registered before the worker is spawned
-   (delegation.rs:439-451), but the `JoinHandle` is pushed to `bg_handles` only
-   after the spawn (delegation.rs:462 spawn, 670-678 push). A `task_cancel`
-   landing in that window finds the entry (marks it `cancelled`), finds no
-   handle (`aborted = false`), never aborts — and the worker keeps running to
-   completion. Its `done`/`result` writes land (delegation.rs:655-660) but the
-   entry stays `cancelled`, so `drain_background` discards the result: the model
-   was told "Cancelled", a write-capable sub-agent's edits still land in the
-   tree afterwards, and its report is silently dropped. The new 10 s awaited
-   abort (delegation.rs:1937-1939) closed the post-abort half of the race but
-   not this pre-registration half. Observable: `task_cancel` called immediately
-   after the `task` call returns "Started background task #N" reports
-   "Cancelled" while the task's transcript keeps recording events.
+**Original finding: 1 new (Low, race) — fixed and closed 2026-09-04 (see
+CHANGELOG `## [Unreleased]`). A re-confirmed `task_cancel` publication item
+remained open at that review and was fixed 2026-09-09. Rest cleared.**
 
 **Cleared (suspected, traced, safe):**
 
@@ -3540,16 +3524,9 @@ paste cap, the gate/sandbox/whitespace dedup — plus the standing high-risk pat
 (shell/sandbox/lsp/mcp, credential handling, session deserialization). Every
 candidate was re-traced at its cited lines against the current code. **Status: 2
 new findings, both fixed and closed 2026-09-04 (stream-error truncation and the
-`get_json` probe cap — see CHANGELOG `## [Unreleased]`); 1 previously-recorded
-finding re-confirmed; the `cron cancel` race from the 09-04 review was fixed and
-closed the same day; the rest cleared.** No code changed by the audit itself.
-
-1. **Re-confirmed (recorded 2026-08-30 hardening + 2026-09-04 review #2, still
-   open) — `task_cancel` vs the background-spawn window: "Cancelled" while the
-   run continues.** `delegation.rs` registers the entry before the worker spawns
-   and pushes the `JoinHandle` after, so a cancel in that window never aborts
-   and the write-capable sub-agent's edits still land. Not a new finding; listed
-   so the routing step records it.
+`get_json` probe cap — see CHANGELOG `## [Unreleased]`); the `cron cancel` race
+from the 09-04 review was fixed and closed the same day; the rest cleared.** No
+code changed by the audit itself.
 
 **Cleared (suspected, traced, safe — do not re-investigate):**
 
@@ -3644,13 +3621,13 @@ verification; new findings there remain possible.
 
 **Summary:** 2 low, 0 medium/high/critical, all fixed and closed 2026-09-04
 (stream-error truncation, `get_json` probe cap — see CHANGELOG
-`## [Unreleased]`), plus 1 previously-recorded item re-confirmed (the
-`cron cancel` race recorded by the 09-04 review was also fixed and closed the
-same day). Overall risk unchanged and low — the surfaces that would carry a real
-bug (redirect/auth-header leak, terminal injection, sandbox escape, SSRF, secret
+`## [Unreleased]`), plus the `cron cancel` race recorded by the 09-04 review,
+also fixed and closed the same day. The re-confirmed `task_cancel` publication
+item remained open at this audit and was fixed 2026-09-09. Overall risk
+unchanged and low — the surfaces that would carry a real bug
+(redirect/auth-header leak, terminal injection, sandbox escape, SSRF, secret
 exfiltration, session-file traversal) were re-verified as guarded, and the new
-cron/goal/session-id machinery is sound apart from the still-open spawn-window
-race.
+cron/goal/session-id machinery is sound.
 
 ## Tidy review 2026-09-04
 
@@ -3835,10 +3812,6 @@ Ranked by impact, biggest first:
   fire; per-fire work is two small `crons.iter().find` scans + one
   `background_tasks` push. `arm_crons` on resume is O(crons), once. Scheduler
   never holds a lock across `sleep`/`await`.
-- `task_cancel` now AWAITS the aborted handle up to 10 s
-  (`delegation.rs:1937-1939`, the review hardening) — a deliberate
-  correctness-latency tradeoff on an occasional path (the cancel tool result
-  blocks until the worker is truly dropped). Recorded, not a finding.
 - goal tool, paste cap (`take(MAX_PASTE_CHARS)` once per paste, 256 KiB bound,
   `app.rs:35,1767-1770`), `x-opencode-session` (one header String per request),
   gate/sandbox/whitespace dedup (sub-millisecond, per-invocation-size inputs):

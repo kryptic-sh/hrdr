@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`task_cancel` never reports a background task cancelled while its worker can
+  continue.** A task row is now registered and paired with its worker handle
+  under the same lifecycle lock order used by cancellation, so cancellation
+  waits for publication, aborts the worker, and drops its future before
+  returning (`crates/hrdr-agent`).
+
 ## [0.15.3] - 2026-09-09
 
 ### Added
