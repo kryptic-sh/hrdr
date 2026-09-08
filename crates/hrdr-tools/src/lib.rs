@@ -114,6 +114,18 @@ fn default_status() -> String {
     "pending".to_string()
 }
 
+/// Normalize persisted cron and goal content at creation and session adoption.
+/// Newlines and tabs remain meaningful content; every other control character is
+/// discarded before trimming outer whitespace.
+pub fn normalize_cron_goal_content(content: &str) -> String {
+    content
+        .chars()
+        .filter(|&c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// A single goal tracked by `goal` — a longer-horizon objective the model set
 /// for itself and is nudged about when it tries to end a turn without having
 /// resolved it. Distinct from a TODO: a TODO is the current task list
@@ -2506,6 +2518,15 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn normalizes_cron_and_goal_content() {
+        assert_eq!(
+            normalize_cron_goal_content(" \u{1b}review\r\n\t日本語\u{7f}\u{85}\u{1}\u{9f} "),
+            "review\n\t日本語"
+        );
+        assert_eq!(normalize_cron_goal_content("\u{1b}\r\u{1}\u{85}\u{9f}"), "");
+    }
 
     // ---- every tool call has a deadline ----
 

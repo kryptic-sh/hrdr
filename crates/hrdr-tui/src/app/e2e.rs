@@ -3279,6 +3279,63 @@ async fn resumed_different_unknown_identity_clears_the_outgoing_context_window()
 }
 
 #[tokio::test]
+async fn resumed_session_normalizes_goals_and_crons_before_adoption() {
+    let mut h = Harness::new(vec![]).await;
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        messages: vec![hrdr_agent::Message::system("saved system")],
+        goals: vec![
+            hrdr_agent::Goal {
+                id: 7,
+                status: "cancelled".to_string(),
+                content: " \u{1b}finish\r\n\tthe 日本語 audit\u{85} ".to_string(),
+            },
+            hrdr_agent::Goal {
+                id: 8,
+                status: "pending".to_string(),
+                content: "\u{1b}\r\u{1}\u{85}\u{9f}".to_string(),
+            },
+        ],
+        crons: vec![
+            hrdr_agent::Cron {
+                id: 9,
+                schedule: "not a cron".to_string(),
+                content: " \u{1b}review\r\n\tthe 日本語 release\u{85} ".to_string(),
+            },
+            hrdr_agent::Cron {
+                id: 10,
+                schedule: "0 0 1 1 *".to_string(),
+                content: "\u{1b}\r\u{1}\u{85}\u{9f}".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+
+    h.app
+        .auto_resume_state(saved, "normalized-content".to_string());
+
+    {
+        let state = h.app.state();
+        assert_eq!(state.goals.len(), 1);
+        assert_eq!(state.goals[0].id, 7);
+        assert_eq!(state.goals[0].status, "cancelled");
+        assert_eq!(state.goals[0].content, "finish\n\tthe 日本語 audit");
+        assert_eq!(state.crons.len(), 1);
+        assert_eq!(state.crons[0].id, 9);
+        assert_eq!(state.crons[0].schedule, "not a cron");
+        assert_eq!(state.crons[0].content, "review\n\tthe 日本語 release");
+    }
+
+    let goals = h.app.goals.lock().unwrap();
+    assert_eq!(goals.len(), 1, "only normalized goals are shared");
+    assert_eq!(goals[0].content, "finish\n\tthe 日本語 audit");
+    drop(goals);
+    let crons = h.app.crons.lock().unwrap();
+    assert_eq!(crons.len(), 1, "only normalized crons are armed/shared");
+    assert_eq!(crons[0].content, "review\n\tthe 日本語 release");
+}
+
+#[tokio::test]
 async fn resumed_different_identity_uses_its_saved_context_window() {
     let mut h = Harness::new(vec![]).await;
     h.app.state_mut().usage.context_window = Some(1_000_000);

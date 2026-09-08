@@ -95,9 +95,13 @@ impl Tool for CronTool {
                 let schedule = a.schedule.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                     anyhow!("`cron` with `op: create` needs a non-empty `schedule`")
                 })?;
-                let content = a.content.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-                    anyhow!("`cron` with `op: create` needs a non-empty `content`")
-                })?;
+                let content = a
+                    .content
+                    .map(|content| crate::normalize_cron_goal_content(&content))
+                    .filter(|content| !content.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("`cron` with `op: create` needs a non-empty `content`")
+                    })?;
                 // Validate before minting: a schedule that never fires within
                 // the horizon is a mistake the model should hear about now, not
                 // a scheduler that silently does nothing.
@@ -118,7 +122,7 @@ impl Tool for CronTool {
                 crons.push(CronItem {
                     id,
                     schedule: schedule.trim().to_string(),
-                    content: content.trim().to_string(),
+                    content,
                 });
                 // Spawn the scheduler AFTER the entry exists, so the task's
                 // first lock finds itself addressable.
@@ -776,6 +780,52 @@ mod tests {
         assert_eq!(crons.len(), 1);
         assert_eq!(crons[0].id, 1);
         assert_eq!(crons[0].schedule, "*/30 * * * *");
+    }
+
+    #[tokio::test]
+    async fn create_normalizes_content_and_refuses_control_only_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = CronTool
+            .execute(
+                json!({"op": "create", "schedule": "0 0 1 1 *", "content": " \u{1b}review\r\n\t日本語\u{85} "}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("review\n\t日本語"), "{out}");
+        assert!(
+            !out.chars()
+                .filter(|&c| !matches!(c, '\n' | '\t'))
+                .any(char::is_control),
+            "{out:?}"
+        );
+        assert_eq!(ctx.crons.lock().unwrap()[0].content, "review\n\t日本語");
+
+        assert!(deliver(&ctx, 1), "the created cron delivers");
+        let delivery = ctx.background_tasks.lock().unwrap()[0]
+            .result
+            .as_deref()
+            .unwrap()
+            .to_string();
+        assert!(delivery.contains("review\n\t日本語"), "{delivery}");
+        assert!(
+            !delivery
+                .chars()
+                .filter(|&c| !matches!(c, '\n' | '\t'))
+                .any(char::is_control),
+            "{delivery:?}"
+        );
+
+        let err = CronTool
+            .execute(
+                json!({"op": "create", "schedule": "0 0 1 1 *", "content": "\u{1b}\r\u{1}\u{85}\u{9f}"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-empty `content`"), "{err}");
     }
 
     #[tokio::test]

@@ -549,7 +549,24 @@ impl super::App {
 
         // The state *is* the main pane's — transcript, counters and all — so
         // adopting a session is one assignment. There is nothing left to hand back.
-        *self.state_mut() = state.restored();
+        let mut state = state.restored();
+        state.goals = state
+            .goals
+            .into_iter()
+            .filter_map(|mut goal| {
+                goal.content = hrdr_tools::normalize_cron_goal_content(&goal.content);
+                (!goal.content.is_empty()).then_some(goal)
+            })
+            .collect();
+        state.crons = state
+            .crons
+            .into_iter()
+            .filter_map(|mut cron| {
+                cron.content = hrdr_tools::normalize_cron_goal_content(&cron.content);
+                (!cron.content.is_empty()).then_some(cron)
+            })
+            .collect();
+        *self.state_mut() = state;
         // A first-save reservation pending for the session we just left is
         // stale: `promote_pending_save`'s id guard drops that snapshot, so its
         // `.id.lock` must go too (dropping the reservation removes it).

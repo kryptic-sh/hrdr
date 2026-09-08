@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cron and goal content now drops unsafe control characters at creation and
+  session adoption.** Newlines and tabs remain intact, while other Unicode
+  controls are removed before storage, delivery, rendering, and cron re-arming;
+  empty normalized entries are rejected or dropped (`crates/hrdr-tools`,
+  `crates/hrdr-tui`).
+
 - **Completed TUI turns reassert their durable OpenCode session id before a
   queued steer can launch.** A refresh skipped while the agent mutex is held is
   retried after `end_turn`, preserving OpenCode session affinity and

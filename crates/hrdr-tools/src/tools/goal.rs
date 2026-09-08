@@ -73,7 +73,8 @@ impl Tool for GoalTool {
             "add" => {
                 let content = a
                     .content
-                    .filter(|s| !s.trim().is_empty())
+                    .map(|content| crate::normalize_cron_goal_content(&content))
+                    .filter(|content| !content.is_empty())
                     .ok_or_else(|| anyhow!("`goal` with `op: add` needs a non-empty `content`"))?;
                 let mut goals = ctx
                     .goals
@@ -81,7 +82,7 @@ impl Tool for GoalTool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let id = crate::next_id(goals.iter().map(|g| g.id));
                 goals.push(GoalItem {
-                    content: content.trim().to_string(),
+                    content,
                     id,
                     status: "pending".to_string(),
                 });
@@ -187,6 +188,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("content"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn add_normalizes_content_and_refuses_control_only_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = tool()
+            .execute(
+                json!({"op": "add", "content": " \u{1b}ship\r\n\tthe 日本語 release\u{85} "}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("ship\n\tthe 日本語 release"), "{out}");
+        assert!(
+            !out.chars()
+                .filter(|&c| !matches!(c, '\n' | '\t'))
+                .any(char::is_control),
+            "{out:?}"
+        );
+        assert_eq!(
+            ctx.goals.lock().unwrap()[0].content,
+            "ship\n\tthe 日本語 release"
+        );
+
+        let err = tool()
+            .execute(
+                json!({"op": "add", "content": "\u{1b}\r\u{1}\u{85}\u{9f}"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-empty `content`"), "{err}");
     }
 
     #[tokio::test]

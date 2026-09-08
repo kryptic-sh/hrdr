@@ -3555,19 +3555,6 @@ code changed by the audit itself.
 
 **Hardening (correct today, fragile — explicitly not vulnerabilities):**
 
-- **Cron/goal `content` is validated by `trim()` only (`cron.rs:121`,
-  `goal.rs:84`), so ESC/control bytes survive into the delivered user-role
-  message and the persisted session file.** Author is the model (or the local
-  session file), and the render-path sanitizer strips display-side, so this is
-  not a finding; stripping controls at `create` (as the delivery label does,
-  `cron.rs:429`) would close the file-resume corner.
-- **`crons`/`goals` are adopted from the session file with no validation
-  (`session.rs:287-288`)** — the 2026-08-30 hardening ("session-file
-  `cwd`/`read_only`/identity trusted at resume") now covers two more fields
-  whose content re-enters the conversation (a crafted file can plant a cron
-  reminder of up to file-cap size). Same trust class as the transcript;
-  re-validate at adopt if the promise is ever tightened.
-
 **Coverage:** walked in full this pass — `hrdr-tools` cron.rs, goal.rs,
 ToolContext + registration + `JAIL_TOOLS`, lib.rs secret/identity/resolve
 surface around the tools; `hrdr-agent` `turn_loop.rs` (run loop, nudge/goal
