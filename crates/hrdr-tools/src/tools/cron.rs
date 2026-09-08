@@ -469,6 +469,7 @@ async fn run_scheduler(ctx: ToolContext, id: u64) {
         let Some(next) = next_fire(&schedule, Local::now()) else {
             // Unreachable after create-time validation, but a schedule edited on
             // disk between resume and arm must not spin: stop quietly.
+            mark_unarmed(&ctx, id);
             return;
         };
         let wait = (next - Local::now()).to_std().unwrap_or(Duration::ZERO);
@@ -887,6 +888,45 @@ mod tests {
             ctx.background_tasks.lock().unwrap().is_empty(),
             "no stray reminder is pushed"
         );
+    }
+
+    /// A resume may adopt a crafted persisted schedule that create-time validation
+    /// would reject. Its scheduler must tear down the armed mark so the cron id
+    /// is not left permanently blocked from being armed again.
+    #[tokio::test]
+    async fn arm_crons_clears_mark_for_an_unreachable_adopted_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        const ID: u64 = 7;
+        *ctx.crons.lock().unwrap() = vec![CronItem {
+            id: ID,
+            schedule: "0 0 30 2 *".to_string(),
+            content: "never".to_string(),
+        }];
+
+        arm_crons(&ctx);
+        for _ in 0..100 {
+            if ctx.cron_armed.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ctx.cron_armed.lock().unwrap().is_empty(),
+            "an unreachable adopted schedule clears its armed mark"
+        );
+        assert!(
+            ctx.background_tasks.lock().unwrap().is_empty(),
+            "an unreachable schedule creates no delivery"
+        );
+
+        ctx.crons.lock().unwrap()[0].schedule = "0 0 1 1 *".to_string();
+        arm_crons(&ctx);
+        assert!(
+            ctx.cron_armed.lock().unwrap().contains(&ID),
+            "the id can be armed again after the unreachable scheduler exits"
+        );
+        mark_unarmed(&ctx, ID);
     }
 
     /// `arm_crons` spawns a scheduler per cron exactly once — a second call

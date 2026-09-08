@@ -3555,15 +3555,6 @@ code changed by the audit itself.
 
 **Hardening (correct today, fragile — explicitly not vulnerabilities):**
 
-- **A resume of a session whose stored cron schedule no longer parses (or never
-  fires) exits the scheduler without clearing the armed mark.**
-  `cron.rs:383-387` (`let Some(next) = next_fire(...) else { return; }`) — the
-  two cancel exits call `mark_unarmed`, this one does not. Reachable only via an
-  edited/crafted session file (create-time validation refuses these schedules).
-  Effect today: a HashSet entry and a zombie `cron list` entry that cannot be
-  re-armed; ids are minted `max+1`, so the stale mark blocks nothing. Fold into
-  the recorded "session-file trusted at resume" item: add `mark_unarmed` before
-  the `return`.
 - **Cron/goal `content` is validated by `trim()` only (`cron.rs:121`,
   `goal.rs:84`), so ESC/control bytes survive into the delivered user-role
   message and the persisted session file.** Author is the model (or the local
