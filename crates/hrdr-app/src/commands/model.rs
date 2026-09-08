@@ -60,7 +60,7 @@ pub fn apply_provider(
             message: format!("{e:#}"),
         }
     })?;
-    apply_reference(host, reference.clone(), p.context_window, true);
+    apply_reference(host, reference.clone(), p.context_window, true, true);
     // Hand the resolved `provider://model` identity back so callers persist it as
     // the default in that single form — never a separate, now-defunct `provider`
     // key (config rejects the old split provider/model layout).
@@ -90,25 +90,25 @@ pub fn apply_provider_or_pick(
 /// `window` is a window already known for the target (a picker row's, or the
 /// provider's configured one), which wins over a probe; `remember` records the
 /// identity as last-used (a deliberate choice — a session resume does not).
+/// `protect_context` compacts the outgoing conversation before an interactive
+/// switch; administrative resume restoration disables it because the resumed
+/// messages already belong to the incoming provider.
 fn apply_reference(
     host: &mut dyn CommandHost,
     reference: ModelRef,
     window: Option<u32>,
     remember: bool,
+    protect_context: bool,
 ) {
     // A change of PROVIDER moves the endpoint; a change of model on the provider you
     // are already on does not — the endpoint is a property of the provider, so it
     // cannot have moved. Same rule as the agent's.
     let moving_provider = host.model_ref().provider() != reference.provider();
-    let endpoint = moving_provider
-        .then(|| host.resolve_provider(reference.provider().as_str()))
-        .flatten()
-        .map(|p| p.base_url);
 
     let agent = host.agent();
     let show = host.identity_poster();
-    let post = host.context_window_poster();
-    let probe_after = window.is_none();
+    let post_event = host.agent_event_poster();
+    let post_completion = host.switch_completion_poster();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
         // Is this identity even REAL? The cached pass is network-free; settling it may
@@ -121,17 +121,64 @@ fn apply_reference(
         // keystroke: the display must never run ahead of the agent.
         let verdict = match a.validate_ref(&reference) {
             Ok(v) => v,
-            Err(e) => return format!("{e:#}"),
+            Err(e) => {
+                drop(a);
+                post_completion(super::host::SwitchCompletion::default());
+                return format!("{e:#}");
+            }
         };
         let mut warnings = match hrdr_agent::confirm_identity(verdict).await {
             Ok(w) => w,
-            Err(e) => return format!("{e:#}"),
+            Err(e) => {
+                drop(a);
+                post_completion(super::host::SwitchCompletion::default());
+                return format!("{e:#}");
+            }
         };
-        // ONE call: endpoint, key, api-version, headers, trust kind and model move
-        // together, under the same lock, so a probe can never see a half-switch.
-        if let Err(e) = a.set_model_ref(reference.clone()) {
-            return format!("{e:#}");
+        // ONE transaction: interactive changes compact against the outgoing
+        // provider before adoption. Resume restoration is administrative: its
+        // messages already came from the incoming provider and must never be sent
+        // back to the launch provider as a compaction request.
+        let mut usage_emitted = false;
+        let mut on_event = |event| {
+            usage_emitted |= matches!(event, hrdr_agent::AgentEvent::Usage { .. });
+            post_event(event);
+        };
+        let report = if protect_context {
+            match a
+                .switch_model_ref(reference.clone(), window, &mut on_event)
+                .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    drop(a);
+                    post_completion(super::host::SwitchCompletion {
+                        succeeded: false,
+                        usage_emitted,
+                        history_changed: false,
+                    });
+                    return format!("{e:#}");
+                }
+            }
+        } else {
+            if let Err(e) = a.set_model_ref(reference.clone()) {
+                drop(a);
+                post_completion(super::host::SwitchCompletion::default());
+                return format!("{e:#}");
+            }
+            a.set_context_window(window);
+            None
+        };
+        let adopted_endpoint = moving_provider.then(|| a.client().base_url().to_string());
+        // Probe after adoption while the identity transaction still owns the agent.
+        // Capture the result now, then release the mutex before posting Identity:
+        // handling Identity may autosave through try_lock and must see this history.
+        if a.context_window().is_none()
+            && let Some(probed) = a.probe_context_window().await
+        {
+            a.set_context_window(Some(probed));
         }
+        let adopted_window = a.context_window();
         // The agent pre-flights every identity it adopts and queues what it found for
         // the next turn. Drain that here: the switch just happened, so this is where
         // the answer belongs — and taking it now is also what keeps the next turn from
@@ -141,14 +188,18 @@ fn apply_reference(
                 warnings.push(notice);
             }
         }
-        show(reference.clone(), endpoint, window);
+        let history_changed = report.is_some();
+        drop(a);
+        show(reference.clone(), adopted_endpoint, adopted_window, report);
+        post_completion(super::host::SwitchCompletion {
+            succeeded: true,
+            usage_emitted,
+            history_changed,
+        });
         if remember {
             // Remembered per provider, so a later `/login <provider>` (which names no
             // model) can come back to the model you were actually using there.
             hrdr_agent::record_last_model(&reference);
-        }
-        if probe_after && let Some(w) = a.probe_context_window().await {
-            post(w);
         }
         // What merely LOOKS wrong (models.dev has never heard of this id; we could not
         // reach the entitlement catalog to check) is said, not enforced.
@@ -178,7 +229,7 @@ pub fn restore_session_provider(
     model: String,
     saved_window: Option<u32>,
 ) -> Result<(), String> {
-    repoint(host, provider_name, model, saved_window, false)
+    repoint(host, provider_name, model, saved_window, false, false)
 }
 
 /// Switch to a specific `(provider, model)` pair chosen in the `/model`
@@ -193,7 +244,14 @@ pub fn apply_choice(
     model: String,
     choice_context_window: Option<u32>,
 ) -> Result<(), String> {
-    repoint(host, provider_name, model, choice_context_window, true)
+    repoint(
+        host,
+        provider_name,
+        model,
+        choice_context_window,
+        true,
+        true,
+    )
 }
 
 /// Apply a `(provider, model)` pair from a two-key source (a picker row, a saved
@@ -206,6 +264,7 @@ fn repoint(
     model: String,
     choice_context_window: Option<u32>,
     remember: bool,
+    protect_context: bool,
 ) -> Result<(), String> {
     let Some(p) = host.resolve_provider(provider_name) else {
         return Err(format!("unknown provider '{provider_name}'"));
@@ -218,7 +277,7 @@ fn repoint(
     // Prefer the chosen model's own context window (e.g. an entitled ChatGPT
     // row) over the provider's; probe the endpoint only when neither is known.
     let window = choice_context_window.or(p.context_window);
-    apply_reference(host, reference, window, remember);
+    apply_reference(host, reference, window, remember, protect_context);
     Ok(())
 }
 

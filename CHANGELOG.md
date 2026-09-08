@@ -28,6 +28,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recovery remain available. Sizing follows each client's native token target
   and compaction continues through the ordinary OpenAI-compatible, Anthropic
   Messages, and ChatGPT/Codex Responses request paths (`crates/hrdr-agent`).
+- **Interactive model switches protect smaller incoming context windows.** When
+  needed, hrdr now compacts with the unchanged outgoing model and provider
+  before atomically adopting the target, prices attachments for the incoming
+  backend, and refuses unsafe switches without losing conversation state. Switch
+  compaction usage, context gauges, and session history remain synchronized;
+  session resume switches administratively so saved provider history is never
+  uploaded to the launch provider (`crates/hrdr-agent`, `crates/hrdr-app`,
+  `crates/hrdr-tui`).
 - **`cron cancel` can no longer race a fire into a stray reminder.** The
   scheduler's delivery now re-checks the cron's existence and pushes the
   `BackgroundTask` under the same crons → background_tasks lock order the

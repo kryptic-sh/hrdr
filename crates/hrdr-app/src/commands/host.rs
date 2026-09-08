@@ -10,8 +10,25 @@ use super::types::{ExpandMode, LineFuture, LineKind};
 
 /// The sink [`CommandHost::identity_poster`] hands to a switch task: the identity the
 /// agent actually adopted, plus the endpoint and window that moved with it (each
-/// `None` when it did not).
-pub type IdentityPoster = Box<dyn Fn(hrdr_agent::ModelRef, Option<String>, Option<u32>) + Send>;
+/// `None` when it did not), and any compaction performed before adoption.
+pub type IdentityPoster = Box<
+    dyn Fn(hrdr_agent::ModelRef, Option<String>, Option<u32>, Option<hrdr_agent::CompactionReport>)
+        + Send,
+>;
+
+/// Event sink for model calls made by an out-of-turn switch compaction.
+pub type AgentEventPoster = Box<dyn Fn(hrdr_agent::AgentEvent) + Send + Sync>;
+
+/// State the UI needs once switch preparation has released the agent lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwitchCompletion {
+    pub succeeded: bool,
+    pub usage_emitted: bool,
+    pub history_changed: bool,
+}
+
+/// Completion sink for switch preparation, successful or failed.
+pub type SwitchCompletionPoster = Box<dyn Fn(SwitchCompletion) + Send + Sync>;
 
 /// The capabilities a frontend exposes so the shared commands can drive it.
 pub trait CommandHost {
@@ -294,7 +311,20 @@ pub trait CommandHost {
     /// [`set_base_url`](Self::set_base_url) + [`set_context_window`](Self::set_context_window),
     /// the way [`context_window_poster`](Self::context_window_poster) is of the last.
     fn identity_poster(&self) -> IdentityPoster {
-        Box::new(|_, _, _| {})
+        Box::new(|_, _, _, _| {})
+    }
+
+    /// Record events emitted by compaction inside an interactive switch. The
+    /// default is a no-op for frontends that do not track per-pane usage.
+    fn agent_event_poster(&self) -> AgentEventPoster {
+        Box::new(|_| {})
+    }
+
+    /// Report that switch preparation finished after its agent lock was released.
+    /// The completion carries whether compaction emitted billable usage and whether
+    /// successful preparation replaced the conversation history.
+    fn switch_completion_poster(&self) -> SwitchCompletionPoster {
+        Box::new(|_| {})
     }
 
     /// Begin the `/login` wizard. A frontend that supports it stashes

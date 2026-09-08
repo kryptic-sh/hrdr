@@ -269,14 +269,35 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn identity_poster(
         &self,
-    ) -> Box<dyn Fn(hrdr_agent::ModelRef, Option<String>, Option<u32>) + Send> {
+    ) -> Box<
+        dyn Fn(
+                hrdr_agent::ModelRef,
+                Option<String>,
+                Option<u32>,
+                Option<hrdr_agent::CompactionReport>,
+            ) + Send,
+    > {
         let tx = self.app.tx.clone();
         // Bind the pane *now*, as `context_window_poster` does: the switch lands
         // later, and the identity belongs to the agent that was switched, not to
         // whatever the reader happens to be looking at when it arrives.
         let id = self.app.panes.active();
-        Box::new(move |reference, base_url, window| {
-            let _ = tx.try_send(TurnMsg::Identity(id, reference, base_url, window));
+        Box::new(move |reference, base_url, window, report| {
+            let _ = tx.try_send(TurnMsg::Identity(id, reference, base_url, window, report));
+        })
+    }
+    fn agent_event_poster(&self) -> Box<dyn Fn(hrdr_agent::AgentEvent) + Send + Sync> {
+        let tx = self.app.tx.clone();
+        let id = self.app.panes.active();
+        Box::new(move |event| {
+            let _ = tx.try_send(TurnMsg::SwitchEvent(id, event));
+        })
+    }
+    fn switch_completion_poster(&self) -> Box<dyn Fn(hrdr_app::SwitchCompletion) + Send + Sync> {
+        let tx = self.app.tx.clone();
+        let id = self.app.panes.active();
+        Box::new(move |completion| {
+            let _ = tx.try_send(TurnMsg::SwitchComplete(id, completion));
         })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {

@@ -217,6 +217,11 @@ pub(crate) use hrdr_app::{Entry, EntryKind};
 /// Messages from the background agent task back to the UI loop.
 pub(crate) enum TurnMsg {
     Event(AgentEvent),
+    /// An event emitted by model-switch compaction outside a turn, bound to the
+    /// pane whose agent incurred it.
+    SwitchEvent(hrdr_app::PaneId, AgentEvent),
+    /// Switch preparation finished after releasing the pane's agent mutex.
+    SwitchComplete(hrdr_app::PaneId, hrdr_app::SwitchCompletion),
     /// A user-initiated `!command` shell event. Separate from [`TurnMsg::Event`]
     /// so it bypasses the "ignore buffered events after cancellation" guard —
     /// these aren't turn events and arrive while no turn is running. The
@@ -258,6 +263,7 @@ pub(crate) enum TurnMsg {
         hrdr_agent::ModelRef,
         Option<String>,
         Option<u32>,
+        Option<hrdr_agent::CompactionReport>,
     ),
     /// A browser OAuth login's exchange/save step finished. Carries the typed
     /// outcome (with its originating `login_id`) so the loop can reject a stale
@@ -3062,6 +3068,17 @@ impl App {
                     self.apply_event(ev);
                 }
             }
+            TurnMsg::SwitchEvent(pane, ev) => {
+                self.registry.record(pane.key(), &ev);
+                self.sync_panes();
+            }
+            TurnMsg::SwitchComplete(pane, completion) => {
+                if pane == hrdr_app::PaneId::MAIN
+                    && (completion.usage_emitted || completion.history_changed)
+                {
+                    self.autosave();
+                }
+            }
             TurnMsg::UserShell(ev, note) => {
                 let ended = matches!(ev, AgentEvent::ToolEnd { .. });
                 if ended {
@@ -3192,14 +3209,15 @@ impl App {
             }
             TurnMsg::FileIndexDirty => self.on_file_index_dirty(),
             TurnMsg::SaveDone(result) => self.on_save_done(result),
-            TurnMsg::Identity(id, reference, base_url, window) => {
+            TurnMsg::Identity(id, reference, base_url, window, report) => {
                 // The agent has taken it; the chrome may now say so.
                 self.update_chrome(id, |s| s.model = reference);
                 if let Some(url) = base_url {
                     self.update_chrome(id, |s| s.base_url = url);
                 }
-                if let Some(w) = window {
-                    self.set_pane_context_window(id, Some(w));
+                self.set_pane_context_window(id, window);
+                if let Some(report) = report {
+                    self.update_chrome(id, |s| s.usage.set_last(Some((report.context_after, 0))));
                 }
             }
             TurnMsg::ContextWindow(id, tokens) => {
@@ -3582,6 +3600,121 @@ mod tests {
             usage_last(&live, key),
             Some((42, 0)),
             "a nothing-to-do pass keeps the existing reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_events_and_report_stay_with_the_originating_pane() {
+        let (mut app, key, _tmp) = app_viewing_a_sub_agent();
+        app.registry
+            .update(MAIN_KEY, |entry| entry.usage.set_last(Some((100, 5))));
+        app.on_turn_msg(TurnMsg::SwitchEvent(
+            PaneId(key),
+            AgentEvent::Usage {
+                prompt_tokens: 30,
+                completion_tokens: 7,
+                decode_ms: 10,
+                cached_prompt_tokens: Some(4),
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
+                session_cost_usd: None,
+                cost_partial: false,
+            },
+        ));
+        assert_eq!(usage_last(&app.registry, key), Some((30, 7)));
+        assert_eq!(usage_last(&app.registry, MAIN_KEY), Some((100, 5)));
+
+        app.on_turn_msg(TurnMsg::Identity(
+            PaneId(key),
+            "local://after-switch".parse().unwrap(),
+            None,
+            Some(1_000),
+            Some(hrdr_agent::CompactionReport {
+                reason: hrdr_agent::CompactionReason::ModelSwitch,
+                before: 10,
+                after: 2,
+                context_after: 44,
+                prompt_tokens: 30,
+                cached_prompt_tokens: Some(4),
+                output_tokens: 7,
+                cost_usd: None,
+                stage: hrdr_agent::ShrinkStage::Full,
+                attempts: 1,
+            }),
+        ));
+        assert_eq!(usage_last(&app.registry, key), Some((44, 0)));
+        assert_eq!(usage_last(&app.registry, MAIN_KEY), Some((100, 5)));
+        assert_eq!(
+            app.panes.pane_for(key).unwrap().state.model,
+            "local://after-switch".parse().unwrap()
+        );
+
+        app.set_pane_context_window(PaneId(key), Some(9_999));
+        app.on_turn_msg(TurnMsg::Identity(
+            PaneId(key),
+            "local://unknown-window".parse().unwrap(),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            app.registry.usage(key).unwrap().context_window,
+            None,
+            "an unknown incoming window clears stale pane and registry chrome"
+        );
+        assert_eq!(
+            app.panes.pane_for(key).unwrap().state.usage.context_window,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_compaction_autosave_reads_the_authoritative_agent_history() {
+        let (mut app, _key, _tmp) = app_viewing_a_sub_agent();
+        let compacted = {
+            let mut agent = app.agent.lock().await;
+            let mut compacted = agent.messages_owned();
+            let mut summary = compacted[0].clone();
+            summary.content = Some("compacted history".to_string());
+            summary.origin =
+                hrdr_agent::MessageOrigin::Summary(hrdr_agent::CompactionReason::ModelSwitch);
+            compacted.push(summary);
+            agent.set_messages(compacted.clone());
+            compacted
+        };
+        assert_ne!(app.state().messages.len(), compacted.len());
+
+        app.on_turn_msg(TurnMsg::Identity(
+            PaneId::MAIN,
+            "local://after-switch".parse().unwrap(),
+            None,
+            Some(1_000),
+            Some(hrdr_agent::CompactionReport {
+                reason: hrdr_agent::CompactionReason::ModelSwitch,
+                before: 10,
+                after: 2,
+                context_after: 44,
+                prompt_tokens: 30,
+                cached_prompt_tokens: None,
+                output_tokens: 7,
+                cost_usd: None,
+                stage: hrdr_agent::ShrinkStage::Full,
+                attempts: 1,
+            }),
+        ));
+        app.on_turn_msg(TurnMsg::SwitchComplete(
+            PaneId::MAIN,
+            hrdr_app::SwitchCompletion {
+                succeeded: true,
+                usage_emitted: false,
+                history_changed: true,
+            },
+        ));
+        assert_eq!(app.state().messages.len(), compacted.len());
+        assert_eq!(
+            app.state().messages[1].content.as_deref(),
+            Some("compacted history")
         );
     }
 

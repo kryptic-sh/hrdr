@@ -6739,3 +6739,375 @@ async fn a_failed_write_task_still_carries_the_review_note() {
         "a half-finished write task still leaves a tree to review: {result}"
     );
 }
+
+fn switch_candidate(base_url: &str) -> crate::ProviderConfig {
+    crate::ProviderConfig {
+        base_url: base_url.to_string(),
+        remote: Some(false),
+        ..Default::default()
+    }
+}
+
+fn fill_switch_history(agent: &mut Agent) {
+    agent.compaction_tail_turns = 0;
+    agent.preserve_recent_tokens = 0;
+    for i in 0..12 {
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!(
+            "switch-history-user-{i}-{}",
+            "u".repeat(2_000)
+        )));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
+            "switch-history-assistant-{i}-{}",
+            "a".repeat(2_000)
+        )));
+    }
+}
+
+fn enrich_switch_history(agent: &mut Agent) -> usize {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    let attachment =
+        hrdr_llm::media::Attachment::new(png, hrdr_llm::media::MediaType::Png, "rollback.png")
+            .unwrap();
+    let index = 1;
+    let message = &mut Arc::make_mut(&mut agent.messages)[index];
+    message.reasoning_content = Some("private reasoning".to_string());
+    message.anthropic_thinking_blocks = vec![json!({
+        "type": "thinking",
+        "thinking": "anthropic thought",
+        "signature": "signed"
+    })];
+    message.responses_reasoning_items = vec![json!({
+        "type": "reasoning",
+        "id": "reasoning-item",
+        "encrypted_content": "opaque"
+    })];
+    message.attachments = vec![attachment];
+    message.origin = MessageOrigin::Tool;
+    index
+}
+
+#[tokio::test]
+async fn model_switch_compacts_only_on_the_outgoing_identity_before_adoption() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&bodies);
+    let server = MockServer::start_with_body_hook(
+        vec![MockResp::Sse(vec![
+            text_chunk("switch-summary", "The compacted switch summary."),
+            stop_chunk("switch-summary"),
+            "[DONE]".to_string(),
+        ])],
+        move |_, body| captured.lock().unwrap().push(body.to_string()),
+    )
+    .await;
+    let incoming_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let incoming_seen = Arc::clone(&incoming_requests);
+    let incoming_server = MockServer::start_with_hook(vec![MockResp::HttpError(418)], move |_| {
+        incoming_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    let incoming_url = incoming_server.base_url();
+    cfg.providers
+        .insert("incoming".to_string(), switch_candidate(&incoming_url));
+    let mut agent = Agent::new(cfg).unwrap();
+    agent.client.set_params(hrdr_llm::RequestParams {
+        max_tokens: Some(2_048),
+        top_p: Some(0.7),
+        ..Default::default()
+    });
+    fill_switch_history(&mut agent);
+    let incoming: crate::ModelRef = "incoming://small".parse().unwrap();
+    let before = agent.estimated_context_for(hrdr_llm::TokenTarget::OpenAi);
+    let report = agent
+        .switch_model_ref(incoming.clone(), Some(before), &mut |_| {})
+        .await
+        .expect("switch compaction succeeds")
+        .expect("the smaller target requires compaction");
+
+    assert!(report.shrank());
+    assert_eq!(report.reason, crate::CompactionReason::ModelSwitch);
+    assert_eq!(
+        agent.model_ref(),
+        &incoming,
+        "adoption happens after summary"
+    );
+    assert_eq!(agent.context_window(), Some(before));
+    assert_eq!(agent.client.base_url(), incoming_url);
+    assert_eq!(
+        incoming_requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "compaction must not touch the incoming endpoint"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "the incoming endpoint receives no request");
+    let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(body["model"], "test-model", "summary names outgoing model");
+    assert_eq!(body["max_tokens"], 2_048);
+    assert_eq!(body["top_p"], 0.7);
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn model_switch_accepts_equal_message_count_when_incoming_tokens_fit() {
+    let server = MockServer::start(vec![MockResp::Sse(vec![
+        text_chunk("mega-summary", "The oversized user request was summarized."),
+        stop_chunk("mega-summary"),
+        "[DONE]".to_string(),
+    ])])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    cfg.providers.insert(
+        "incoming".to_string(),
+        switch_candidate("https://incoming.example/v1"),
+    );
+    let mut agent = Agent::new(cfg).unwrap();
+    agent.preserve_recent_tokens = 0;
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!(
+        "mega-message-{}",
+        "x".repeat(200_000)
+    )));
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant("short reply"));
+    let before_count = agent.messages.len();
+    let before = agent.estimated_context_for(hrdr_llm::TokenTarget::OpenAi);
+
+    let report = agent
+        .switch_model_ref(
+            "incoming://small".parse().unwrap(),
+            Some(before),
+            &mut |_| {},
+        )
+        .await
+        .expect("the compacted token estimate fits")
+        .expect("the oversized message requires compaction");
+
+    assert_eq!(report.before, before_count);
+    assert_eq!(
+        report.after, before_count,
+        "summary plus tail keeps the count"
+    );
+    assert!(report.context_after < before);
+    assert_eq!(agent.model_ref().to_string(), "incoming://small");
+}
+
+#[tokio::test]
+async fn failed_switch_compaction_keeps_the_outgoing_identity_and_runtime() {
+    let server = MockServer::start(vec![MockResp::HttpError(401)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    cfg.providers.insert(
+        "incoming".to_string(),
+        switch_candidate("https://incoming.example/v1"),
+    );
+    let mut agent = Agent::new(cfg).unwrap();
+    fill_switch_history(&mut agent);
+    let rich_message = enrich_switch_history(&mut agent);
+    let read_file = dir.path().join("switch-read.txt");
+    std::fs::write(&read_file, "read before switching").unwrap();
+    agent.mark_files_read(std::slice::from_ref(&read_file));
+    agent.last_prompt_tokens = Some(77_777);
+    agent.self_compact_failed_at = Some(66_666);
+    agent.client.set_system_cache_split(Some(17));
+    let messages_before = Arc::clone(&agent.messages);
+    let cache_split_before = agent.client.system_cache_split();
+    let read_before = agent.ctx.read_state(&read_file);
+    let outgoing = agent.model_ref().clone();
+    let outgoing_endpoint = agent.client.base_url().to_string();
+    let runtime_before = agent
+        .delegation_runtime
+        .lock()
+        .unwrap()
+        .public
+        .reference
+        .clone();
+    let before = agent.estimated_context_for(hrdr_llm::TokenTarget::OpenAi);
+
+    let error = agent
+        .switch_model_ref(
+            "incoming://small".parse().unwrap(),
+            Some(before),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("a failed outgoing summary refuses adoption");
+    assert!(error.to_string().contains("401"), "{error:#}");
+    assert_eq!(agent.model_ref(), &outgoing);
+    assert_eq!(agent.client.model, outgoing.model());
+    assert_eq!(agent.client.base_url(), outgoing_endpoint);
+    assert!(Arc::ptr_eq(&agent.messages, &messages_before));
+    let retained = &agent.messages[rich_message];
+    assert_eq!(
+        retained.reasoning_content.as_deref(),
+        Some("private reasoning")
+    );
+    assert_eq!(retained.anthropic_thinking_blocks[0]["signature"], "signed");
+    assert_eq!(
+        retained.responses_reasoning_items[0]["id"],
+        "reasoning-item"
+    );
+    assert_eq!(retained.attachments.len(), 1);
+    assert_eq!(retained.origin, MessageOrigin::Tool);
+    assert_eq!(agent.client.system_cache_split(), cache_split_before);
+    assert_eq!(agent.ctx.read_state(&read_file), read_before);
+    assert_eq!(agent.last_prompt_tokens, Some(77_777));
+    assert_eq!(agent.self_compact_failed_at, Some(66_666));
+    assert_eq!(
+        agent.delegation_runtime.lock().unwrap().public.reference,
+        runtime_before
+    );
+}
+
+#[tokio::test]
+async fn model_switch_skips_compaction_when_it_is_not_required_or_disabled() {
+    for (window, enabled) in [(Some(u32::MAX), true), (None, true), (Some(1), false)] {
+        let server = MockServer::start(Vec::new()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(server.base_url(), dir.path());
+        cfg.auto_compact = enabled;
+        cfg.providers.insert(
+            "incoming".to_string(),
+            switch_candidate("https://incoming.example/v1"),
+        );
+        let mut agent = Agent::new(cfg).unwrap();
+        fill_switch_history(&mut agent);
+        let incoming: crate::ModelRef = "incoming://next".parse().unwrap();
+        let report = agent
+            .switch_model_ref(incoming.clone(), window, &mut |_| {})
+            .await
+            .expect("immediate switch succeeds");
+        assert!(report.is_none());
+        assert_eq!(agent.model_ref(), &incoming);
+    }
+}
+
+#[tokio::test]
+async fn switch_refuses_adoption_when_the_compacted_history_still_does_not_fit() {
+    let server = MockServer::start(vec![MockResp::Sse(vec![
+        text_chunk("large-summary", &"summary".repeat(10_000)),
+        stop_chunk("large-summary"),
+        "[DONE]".to_string(),
+    ])])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    cfg.memory = true;
+    cfg.providers.insert(
+        "incoming".to_string(),
+        switch_candidate("https://incoming.example/v1"),
+    );
+    let mut agent = Agent::new(cfg).unwrap();
+    fill_switch_history(&mut agent);
+    let rich_message = enrich_switch_history(&mut agent);
+    let read_file = dir.path().join("oversized-switch-read.txt");
+    std::fs::write(&read_file, "stable read record").unwrap();
+    agent.mark_files_read(std::slice::from_ref(&read_file));
+    agent.last_prompt_tokens = Some(55_555);
+    agent.self_compact_failed_at = Some(44_444);
+    agent.client.set_system_cache_split(Some(23));
+    let outgoing = agent.model_ref().clone();
+    let before_messages = Arc::clone(&agent.messages);
+    let cache_split_before = agent.client.system_cache_split();
+    let read_before = agent.ctx.read_state(&read_file);
+    let before = agent.estimated_context_for(hrdr_llm::TokenTarget::OpenAi);
+
+    let error = agent
+        .switch_model_ref(
+            "incoming://tiny".parse().unwrap(),
+            Some(before),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("an oversized rebuilt history refuses adoption");
+    assert!(error.to_string().contains("still"), "{error:#}");
+    assert_eq!(agent.model_ref(), &outgoing);
+    assert!(Arc::ptr_eq(&agent.messages, &before_messages));
+    let retained = &agent.messages[rich_message];
+    assert_eq!(
+        retained.reasoning_content.as_deref(),
+        Some("private reasoning")
+    );
+    assert_eq!(
+        retained.anthropic_thinking_blocks[0]["thinking"],
+        "anthropic thought"
+    );
+    assert_eq!(
+        retained.responses_reasoning_items[0]["encrypted_content"],
+        "opaque"
+    );
+    assert_eq!(retained.attachments.len(), 1);
+    assert_eq!(retained.origin, MessageOrigin::Tool);
+    assert_eq!(agent.client.system_cache_split(), cache_split_before);
+    assert_eq!(agent.ctx.read_state(&read_file), read_before);
+    assert_eq!(agent.last_prompt_tokens, Some(55_555));
+    assert_eq!(agent.self_compact_failed_at, Some(44_444));
+    assert!(agent.messages.iter().all(|message| !matches!(
+        message.origin,
+        MessageOrigin::Summary(crate::CompactionReason::ModelSwitch)
+    )));
+}
+
+#[tokio::test]
+async fn switch_threshold_prices_attachments_for_the_incoming_backend() {
+    let server = MockServer::start(vec![MockResp::Sse(vec![
+        text_chunk(
+            "image-summary",
+            "Images and their conclusions were summarized.",
+        ),
+        stop_chunk("image-summary"),
+        "[DONE]".to_string(),
+    ])])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    fill_switch_history(&mut agent);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&1_000u32.to_be_bytes());
+    png.extend_from_slice(&1_000u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    let image =
+        hrdr_llm::media::Attachment::new(png, hrdr_llm::media::MediaType::Png, "switch.png")
+            .unwrap();
+    Arc::make_mut(&mut agent.messages)
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .unwrap()
+        .attachments = vec![image; 32];
+    let openai = agent.estimated_context_for(hrdr_llm::TokenTarget::OpenAi);
+    let anthropic = agent.estimated_context_for(hrdr_llm::TokenTarget::Anthropic);
+    assert!(openai < anthropic);
+    let trigger = openai + (anthropic - openai) / 2;
+    let reserved = crate::DEFAULT_COMPACTION_RESERVED;
+    let window = if trigger >= reserved.saturating_mul(3) {
+        trigger.saturating_add(reserved)
+    } else {
+        trigger.saturating_mul(4).div_ceil(3)
+    };
+    assert!(openai < crate::compaction::compaction_trigger(window, reserved));
+    assert!(anthropic >= crate::compaction::compaction_trigger(window, reserved));
+
+    let report = agent
+        .switch_model_ref(
+            "claude://claude-sonnet-4-5".parse().unwrap(),
+            Some(window),
+            &mut |_| {},
+        )
+        .await
+        .expect("Anthropic-priced switch succeeds");
+    assert!(
+        report.is_some(),
+        "incoming Anthropic pricing triggers compaction"
+    );
+}

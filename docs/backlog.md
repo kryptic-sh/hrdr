@@ -277,43 +277,9 @@ shipped silently.
 
 ## Compaction rewrite
 
-The plan (`docs/compaction-rewrite-plan.md`) is archived into this section — its
-open items are below, and the binding decisions it left are listed at the end of
-this section. Item 5 is blocked on an architectural decision rather than on
-effort; the one audit gap still open is under _Audit items needing a decision_.
-
-### Item 5 — compact with the outgoing model on a model switch (BLOCKED on shape)
-
-Verified as described in the plan: `set_model_ref` → `adopt_resolved`
-invalidates the cached window and the next `maybe_self_compact` fires against
-the new, smaller trigger. So a downshift IS handled — but the summarizing is
-then done by the INCOMING model, on a history that may not fit its window, with
-a cold cache.
-
-**The blocker is architectural, not conceptual.** `Agent::set_model_ref` and
-`adopt_resolved` are synchronous, and compacting is an `async` model call. Doing
-this properly means either making the switch path async (it is called from the
-`/model` command flow in `hrdr-app` and `hrdr-tui`, so the change is not local)
-or adding an explicit "compact before switching" step ahead of the switch in
-those callers, which leaves the agent's own API able to perform an unsafe
-switch. Neither is a detail to pick while implementing.
-
-The plan's second half is separable and worth doing regardless: codex's
-`should_retry_with_current_model` taxonomy (`InvalidRequest`,
-`UnexpectedStatus`, `ContextWindowExceeded`, `UsageLimitReached`,
-`ServerOverloaded`, `InternalServerError`, `RetryLimit`) separates
-"model-specific, a different model might work" from "transient, retry the same
-request". hrdr's `is_transient` only has the second class, so several
-permanently-failing cases are retried. **Shipped `12fb89c`** (2026-08-05): the
-one permanent class hrdr actually retried was the spent-quota 429 — typed
-`Transient` on status alone and retried through the whole ~6-minute backoff. The
-new `ChatErrorKind::UsageLimit` (codex's `UsageLimitReached`) is terminal,
-decided by the body where it is available (`error_from_response` plus the
-Anthropic/Codex/OpenAI mid-stream error objects); `is_transient` and
-`is_context_overflow` treat it as terminal, and the four-class taxonomy is
-documented on `ChatErrorKind` against codex's model. The model-switch half (a
-different model might work) still has no machinery here — all four classes
-surface rather than switch.
+The plan (`docs/compaction-rewrite-plan.md`) is archived into this section. The
+binding decisions it left are listed below; the one audit gap still open is
+under _Audit items needing a decision_.
 
 ### Standing constraint: compaction overrides NO request parameter
 

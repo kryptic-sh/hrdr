@@ -75,6 +75,9 @@ pub enum CompactionReason {
     /// A request was rejected for exceeding the context window, and compaction
     /// is the rescue.
     ContextOverflow,
+    /// The conversation is being moved to a different model whose context window
+    /// cannot hold the outgoing model's history.
+    ModelSwitch,
 }
 
 impl CompactionReason {
@@ -84,6 +87,7 @@ impl CompactionReason {
             Self::UserRequested => "compacted on request",
             Self::ContextFilling => "context was filling up — compacted",
             Self::ContextOverflow => "context window exceeded — compacted",
+            Self::ModelSwitch => "compacted before switching models",
         }
     }
 }
@@ -2154,6 +2158,16 @@ mod tests {
         let bare: ChatMessage =
             serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
         assert!(bare.responses_reasoning_items.is_empty());
+    }
+
+    #[test]
+    fn model_switch_compaction_reason_round_trips() {
+        let json = serde_json::to_string(&CompactionReason::ModelSwitch).unwrap();
+        assert_eq!(json, r#""ModelSwitch""#);
+        assert_eq!(
+            serde_json::from_str::<CompactionReason>(&json).unwrap(),
+            CompactionReason::ModelSwitch
+        );
     }
 
     #[test]

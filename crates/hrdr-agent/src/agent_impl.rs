@@ -975,11 +975,7 @@ impl Agent {
             e.effort = effort;
             e.auto_compact = auto_compact;
             e.compaction_reserved = reserved;
-            // A model switch invalidates the window until it is re-learned; keep
-            // showing the last known figure rather than blanking the gauge.
-            if window.is_some() {
-                e.usage.context_window = window;
-            }
+            e.usage.context_window = window;
         });
     }
 
@@ -1004,10 +1000,111 @@ impl Agent {
     /// The endpoint always comes back from [`resolve_in`] — the provider's own, and
     /// there is no other kind. Nothing carried over from the endpoint in force can
     /// survive a switch, because nothing but a provider definition ever named it.
+    /// Switch what this agent is running on immediately, without compacting.
+    ///
+    /// This is the administrative/programmatic switch primitive. Interactive
+    /// callers that must protect a smaller incoming context window use
+    /// [`Self::switch_model_ref`] instead.
     pub fn set_model_ref(&mut self, reference: ModelRef) -> Result<()> {
-        let resolved = resolve_in(&self.providers, &reference, None)?;
+        let resolved = oauth_derived(resolve_in(&self.providers, &reference, None)?);
         self.adopt_resolved(resolved);
         Ok(())
+    }
+
+    /// Switch interactively, compacting with the outgoing provider when the
+    /// incoming model cannot hold the current request.
+    ///
+    /// `target_window` is a caller-known window and takes precedence over the
+    /// candidate identity's derived window. The candidate is fully resolved,
+    /// including OAuth-derived routing, before its token target is used for the
+    /// estimate, but neither it nor its client settings are adopted until any
+    /// required outgoing-model compaction succeeds and fits the target.
+    pub async fn switch_model_ref<F: FnMut(AgentEvent)>(
+        &mut self,
+        reference: ModelRef,
+        target_window: Option<u32>,
+        on_event: &mut F,
+    ) -> Result<Option<CompactionReport>> {
+        let resolved = oauth_derived(resolve_in(&self.providers, &reference, None)?);
+        let target_window = target_window.or_else(|| resolved.context_window());
+
+        let mut candidate = self.client.clone();
+        candidate.set_base_url(resolved.base_url().to_string());
+        candidate.set_api_key(resolved.api_key().map(str::to_string));
+        candidate.set_headers(resolved.headers().to_vec());
+        candidate.set_api_version(resolved.api_version().map(str::to_string));
+        candidate.model = resolved.reference().model().to_string();
+        apply_chatgpt_model_capabilities(&mut candidate, &resolved);
+        let target = candidate.token_target();
+
+        let mut report = None;
+        if self.auto_compact
+            && resolved.reference() != self.resolved.reference()
+            && let Some(window) = target_window
+        {
+            let trigger = compaction::compaction_trigger(window, self.compaction_reserved);
+            let before = self.estimated_context_for(target);
+            if before >= trigger {
+                // Preparing an interactive switch is transactional conversation state.
+                // Compaction may repair dangling tool calls before its request and, on
+                // success, replaces history and clears read/prompt state. Keep the Arc
+                // itself: every mutation goes through COW, so this snapshot remains
+                // byte-for-byte the outgoing conversation without cloning its payload.
+                let messages_before = Arc::clone(&self.messages);
+                let read_files_before = self
+                    .ctx
+                    .read_files
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let last_prompt_tokens_before = self.last_prompt_tokens;
+                let self_compact_failed_at_before = self.self_compact_failed_at;
+                let system_cache_split_before = self.client.system_cache_split();
+                let compacted = match self
+                    .compact(CompactionReason::ModelSwitch, None, on_event)
+                    .await
+                {
+                    Ok(compacted) => compacted,
+                    Err(error) => {
+                        self.messages = Arc::clone(&messages_before);
+                        *self
+                            .ctx
+                            .read_files
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            read_files_before.clone();
+                        self.last_prompt_tokens = last_prompt_tokens_before;
+                        self.self_compact_failed_at = self_compact_failed_at_before;
+                        self.client
+                            .set_system_cache_split(system_cache_split_before);
+                        return Err(error);
+                    }
+                };
+                let after = self.estimated_context_for(target);
+                if after >= trigger {
+                    self.messages = messages_before;
+                    *self
+                        .ctx
+                        .read_files
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = read_files_before;
+                    self.last_prompt_tokens = last_prompt_tokens_before;
+                    self.self_compact_failed_at = self_compact_failed_at_before;
+                    self.client
+                        .set_system_cache_split(system_cache_split_before);
+                    bail!(
+                        "cannot switch to {reference}: compacted context is still {after} tokens, at or above the {trigger}-token trigger"
+                    );
+                }
+                let mut compacted = compacted;
+                compacted.context_after = after;
+                report = Some(compacted);
+            }
+        }
+
+        self.adopt_resolved(resolved);
+        self.set_context_window(target_window);
+        Ok(report)
     }
 
     /// Set this agent's OpenCode conversation id — the value its requests send
@@ -1046,15 +1143,9 @@ impl Agent {
         Ok(validate::validate_identity_in(&self.providers, &resolved))
     }
 
-    /// Apply a resolved identity to the client and the runtime, atomically. The
-    /// single writer of `self.resolved`.
-    ///
-    /// The auth-derived endpoint switch is applied here — the single writer — so a
-    /// `/model` switch to a keyless built-in `openai` with a stored OpenAI OAuth
-    /// credential lands on the ChatGPT/Codex endpoint, exactly as construction
-    /// does. [`resolve_in`] stays pure; this is where the OAuth store is read.
+    /// Apply an already OAuth-derived identity to the client and runtime,
+    /// atomically. The single writer of `self.resolved`.
     fn adopt_resolved(&mut self, resolved: ResolvedModel) {
-        let resolved = oauth_derived(resolved);
         // Pre-flight the identity actually being adopted (post auth-switch), here in
         // the single writer — so every path that changes what this agent runs on gets
         // the check, not just the ones that remembered to ask for it. Deduped: bouncing

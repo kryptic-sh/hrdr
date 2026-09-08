@@ -535,6 +535,7 @@ impl super::App {
         // drop the user is not told about leaves them (and the model) reading a
         // label for something that is not there. Every resume path lands here.
         let losses = state.attachment_losses.clone();
+        let saved_window = state.usage.context_window;
         let probed_window = self.state().usage.context_window;
         let base_url = std::mem::take(&mut self.state_mut().base_url);
         // The identity in force right now — the provider an OLD session file (one
@@ -551,13 +552,25 @@ impl super::App {
         let state = self.state_mut();
         state.id = id;
         state.base_url = base_url;
-        state.usage.context_window = probed_window.or(state.usage.context_window);
+        // A probe belongs to the identity it measured. It survives a resume only
+        // when that identity survives; otherwise the incoming session's own saved
+        // window is the best known value until its target is resolved or probed.
+        state.usage.context_window = if state.model == in_force {
+            probed_window.or(saved_window)
+        } else {
+            saved_window
+        };
         // A pre-`provider://model` session file: its model, on the provider we are on.
         if state.provider_unset {
             state.model = hrdr_agent::ModelSpec::ModelOnly(state.model.model().to_string())
                 .apply(&in_force)
                 .expect("a bare model id always resolves");
             state.provider_unset = false;
+            state.usage.context_window = if state.model == in_force {
+                probed_window.or(saved_window)
+            } else {
+                saved_window
+            };
         }
         // Drop the outgoing session's transcript writer before pointing the dirs
         // at the incoming one: `refresh_subagent_dir` then re-attaches against the

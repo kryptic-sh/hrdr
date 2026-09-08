@@ -260,6 +260,9 @@ fn continuation_framing(reason: CompactionReason, has_tail: bool) -> String {
         CompactionReason::ContextOverflow => {
             "This conversation was compacted because it exceeded the context window."
         }
+        CompactionReason::ModelSwitch => {
+            "This conversation was compacted so it could move to a model with a smaller context window."
+        }
     };
     let tail = if has_tail {
         " The most recent messages follow it verbatim: where they and the summary describe the \
@@ -695,6 +698,13 @@ pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage], target: Toke
 }
 
 impl Agent {
+    /// Estimate the next request's prompt against a specific provider token
+    /// target, including the tool schemas and provider-priced attachments.
+    pub(crate) fn estimated_context_for(&self, target: TokenTarget) -> u32 {
+        estimate_tokens_in_messages(&self.messages, target)
+            .saturating_add(estimate_tokens_in_tools(&self.tools.defs()))
+    }
+
     /// Whether this agent compacts itself when its context fills, and the buffer it
     /// keeps below its window — which is also the threshold its context gauge turns
     /// red at.
@@ -1635,6 +1645,13 @@ pub(crate) mod tests {
         assert!(
             continuation_framing(CompactionReason::ContextFilling, true)
                 .contains("filling the context window")
+        );
+        let switching = continuation_framing(CompactionReason::ModelSwitch, true);
+        assert!(switching.contains("move to a model"), "{switching}");
+        assert!(
+            CompactionReason::ModelSwitch
+                .as_str()
+                .contains("switching models")
         );
     }
 

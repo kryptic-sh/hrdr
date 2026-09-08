@@ -55,6 +55,7 @@ enum MockReply {
 /// once the queue drains). Runs until dropped.
 struct MockServer {
     base_url: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
     _handle: tokio::task::JoinHandle<()>,
 }
 
@@ -64,6 +65,8 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}/v1");
         let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -71,7 +74,9 @@ impl MockServer {
                     break;
                 };
                 let queue = queue.clone();
+                let requests = Arc::clone(&request_count);
                 tokio::spawn(async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let head = read_request_head(&mut sock).await;
                     let path = head
                         .lines()
@@ -103,8 +108,13 @@ impl MockServer {
 
         Self {
             base_url,
+            requests,
             _handle: handle,
         }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -375,8 +385,8 @@ impl Harness {
         self.pump().await;
     }
 
-    /// Let a `/model` switch LAND: drain until the switch task posts the identity the
-    /// agent actually adopted.
+    /// Let a `/model` switch LAND: drain until switch preparation completes after
+    /// releasing the agent lock.
     ///
     /// The chrome is deliberately not written on the keystroke any more. Settling a
     /// switch can need a network round-trip (confirming a ChatGPT entitlement the
@@ -385,12 +395,18 @@ impl Harness {
     /// the agent, one message later. The real event loop drains that message; a test
     /// that switches has to as well.
     async fn settle_switch(&mut self) {
+        let mut failed = false;
         while let Some(msg) = self.rx.recv().await {
-            let landed = matches!(msg, TurnMsg::Identity(..));
+            let completion = match &msg {
+                TurnMsg::SwitchComplete(_, completion) => Some(*completion),
+                _ => None,
+            };
+            let error = failed && matches!(msg, TurnMsg::System(_));
             self.app.on_turn_msg(msg);
-            if landed {
+            if completion.is_some_and(|completion| completion.succeeded) || error {
                 return;
             }
+            failed |= completion.is_some_and(|completion| !completion.succeeded);
         }
     }
 
@@ -2319,9 +2335,11 @@ async fn a_saved_context_window_never_clobbers_the_probed_one() {
     assert!(probed.is_some(), "the harness config sets a context window");
 
     let cwd = h.app.current_cwd();
+    let model = h.app.state().model.clone();
     let session = |window: Option<u32>| {
         hrdr_app::Session::new(hrdr_app::SessionState {
             cwd: cwd.clone(),
+            model: model.clone(),
             messages: vec![hrdr_agent::Message::system("sys")],
             usage: hrdr_app::SessionUsage {
                 context_window: window,
@@ -2838,11 +2856,16 @@ async fn the_header_persists_and_shows_live_details() {
     assert_eq!(back.time.timestamp(), entry.time.timestamp());
 
     let mut h = Harness::new(vec![]).await;
+    h.app.state_mut().usage.context_window = Some(u32::MAX);
     let state = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
         model: "local://restored-model".parse().unwrap(),
         messages: vec![hrdr_agent::Message::system("sys")],
         transcript: vec![Entry::header()],
+        usage: hrdr_app::SessionUsage {
+            context_window: Some(u32::MAX),
+            ..Default::default()
+        },
         ..Default::default()
     };
     h.app
@@ -2896,6 +2919,7 @@ async fn a_narrow_viewport_drops_the_header_details() {
 async fn a_resumed_session_keeps_its_own_model_over_a_launch_flag() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
+        h.app.state_mut().usage.context_window = Some(u32::MAX);
         // As if `hrdr --model chatgpt://gpt-5.5` (or `$HRDR_MODEL`).
         h.app.state_mut().model = "chatgpt://gpt-5.5".parse().unwrap();
 
@@ -2905,6 +2929,10 @@ async fn a_resumed_session_keeps_its_own_model_over_a_launch_flag() {
             base_url: "https://saved.example/v1".into(),
             messages: vec![hrdr_agent::Message::system("sys")],
             transcript: vec![Entry::user("earlier")],
+            usage: hrdr_app::SessionUsage {
+                context_window: Some(u32::MAX),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if explicit_resume {
@@ -3089,11 +3117,16 @@ async fn a_legacy_session_lands_its_model_on_the_provider_in_force() {
 #[tokio::test]
 async fn resuming_a_session_repoints_the_agent_to_its_provider() {
     let mut h = Harness::new(vec![]).await;
+    h.app.state_mut().usage.context_window = Some(u32::MAX);
 
     let saved = hrdr_app::SessionState {
         cwd: h.app.current_cwd(),
         model: "zen://deepseek-v4-flash".parse().unwrap(),
         messages: vec![hrdr_agent::Message::system("sys")],
+        usage: hrdr_app::SessionUsage {
+            context_window: Some(u32::MAX),
+            ..Default::default()
+        },
         ..Default::default()
     };
     h.app.auto_resume_state(saved, "old".to_string());
@@ -3137,6 +3170,137 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
         "zen://deepseek-v4-flash",
         "the bar names the identity the agent is actually talking to"
     );
+}
+
+#[tokio::test]
+async fn resumed_history_is_never_compacted_by_the_launch_provider() {
+    let mut h = Harness::new(vec![MockReply::Text("must not be requested".into())]).await;
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "zen://pro".parse().unwrap(),
+        messages: vec![
+            hrdr_agent::Message::system("saved system"),
+            hrdr_agent::Message::user("b".repeat(200_000)),
+            hrdr_agent::Message::assistant("resumed provider B answer"),
+        ],
+        usage: hrdr_app::SessionUsage {
+            context_window: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    h.app.auto_resume_state(saved, "provider-b".to_string());
+    h.settle_switch().await;
+
+    assert_eq!(h._mock.request_count(), 0, "provider A received no request");
+    assert_eq!(
+        h.app.agent.lock().await.model_ref().to_string(),
+        "zen://pro"
+    );
+}
+
+#[tokio::test]
+async fn resumed_different_unknown_identity_clears_the_outgoing_context_window() {
+    let mock = MockServer::start(vec![]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = AgentConfig {
+        base_url: mock.base_url.clone(),
+        model: "local://test-model".parse().unwrap(),
+        cwd: tmp.path().to_path_buf(),
+        context_window: Some(1_000_000),
+        sandbox: hrdr_tools::SandboxMode::None,
+        ..Default::default()
+    };
+    config.providers.insert(
+        "unknown-window".to_string(),
+        hrdr_agent::ProviderConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            remote: Some(false),
+            ..Default::default()
+        },
+    );
+    let ui = hrdr_app::UiConfig {
+        auto_resume: false,
+        ..Default::default()
+    };
+    let mut app = App::new(config, ui, TEST_LOGO).unwrap();
+    let rx = app.rx.take().expect("fresh app has its receiver");
+    let mut h = Harness {
+        app,
+        rx,
+        _mock: mock,
+        _tmp: tmp,
+    };
+    assert_eq!(
+        h.app
+            .registry
+            .usage(hrdr_agent::MAIN_KEY)
+            .unwrap()
+            .context_window,
+        Some(1_000_000)
+    );
+    h.app.agent.lock().await.set_context_window(None);
+    assert_eq!(
+        h.app
+            .registry
+            .usage(hrdr_agent::MAIN_KEY)
+            .unwrap()
+            .context_window,
+        None,
+        "the agent clears its live registry projection"
+    );
+    h.app.agent.lock().await.set_context_window(Some(1_000_000));
+
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "unknown-window://never-catalogued-model".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::system("saved system")],
+        usage: hrdr_app::SessionUsage {
+            context_window: None,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    h.app.auto_resume_state(saved, "unknown-window".to_string());
+    h.settle_switch().await;
+    h.app.sync_panes();
+
+    assert_eq!(h.app.agent.lock().await.context_window(), None);
+    assert_eq!(
+        h.app
+            .registry
+            .usage(hrdr_agent::MAIN_KEY)
+            .unwrap()
+            .context_window,
+        None
+    );
+    assert_eq!(h.app.state().usage.context_window, None);
+}
+
+#[tokio::test]
+async fn resumed_different_identity_uses_its_saved_context_window() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.state_mut().usage.context_window = Some(1_000_000);
+    h.app.agent.lock().await.set_context_window(Some(1_000_000));
+    let saved = hrdr_app::SessionState {
+        cwd: h.app.current_cwd(),
+        model: "zen://pro".parse().unwrap(),
+        messages: vec![hrdr_agent::Message::system("saved system")],
+        usage: hrdr_app::SessionUsage {
+            context_window: Some(4_096),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    h.app
+        .auto_resume_state(saved, "small-provider-b".to_string());
+    h.settle_switch().await;
+    h.app.sync_panes();
+
+    assert_eq!(h.app.state().usage.context_window, Some(4_096));
+    assert_eq!(h.app.agent.lock().await.context_window(), Some(4_096));
 }
 
 /// The same rule with the launch identity coming from the config file (or a provider
@@ -9570,6 +9734,140 @@ async fn effort_picker_lists_levels_default_first_and_applies() {
     assert_eq!(effort_of(&h), None, "Default clears the override");
 }
 
+/// Switch completion reaches the real event loop only after the agent lock is
+/// released, so its autosave can copy the compacted authoritative history.
+#[tokio::test]
+async fn switched_identity_reaches_autosave_after_agent_unlock() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::Text("compact summary".into())]).await;
+    let outgoing_messages = {
+        let mut agent = h.app.agent.lock().await;
+        agent.push_user_note(format!(
+            "oversized outgoing history {}",
+            "x".repeat(200_000)
+        ));
+        agent.push_user_note("short tail");
+        agent.messages_owned()
+    };
+    h.app.state_mut().messages = outgoing_messages;
+    let pre_switch = h.app.state().messages.clone();
+    h.app
+        .apply_model_choice_for_test("deepseek", "test-model", Some(40_000));
+
+    loop {
+        let msg = h.rx.recv().await.expect("switch task posts completion");
+        let completed = matches!(msg, TurnMsg::SwitchComplete(..));
+        if completed {
+            assert!(
+                h.app.agent.try_lock().is_ok(),
+                "completion must not be posted while the agent lock is held"
+            );
+        }
+        h.app.on_turn_msg(msg);
+        if completed {
+            break;
+        }
+    }
+
+    let compacted = h.app.agent.lock().await.messages_owned();
+    let compacted_json = serde_json::to_value(&compacted).unwrap();
+    assert_ne!(
+        compacted_json,
+        serde_json::to_value(&pre_switch).unwrap(),
+        "the switch prepared a compacted history"
+    );
+    assert_eq!(
+        serde_json::to_value(&h.app.state().messages).unwrap(),
+        compacted_json,
+        "Identity autosave copied the post-compaction history"
+    );
+}
+
+/// A rejected switch still persists the compaction call's billed usage. Completion
+/// arrives after the usage event and after the agent rollback released its lock, so
+/// autosave sees the accumulated counters and the original history together.
+#[tokio::test]
+async fn failed_model_switch_autosaves_billed_usage_with_rolled_back_history() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::Text("summary".repeat(30_000))]).await;
+    let original = {
+        let mut agent = h.app.agent.lock().await;
+        agent.push_user_note(format!(
+            "oversized outgoing history {}",
+            "x".repeat(200_000)
+        ));
+        agent.push_user_note("original short tail");
+        agent.messages_owned()
+    };
+    h.app.state_mut().messages = original.clone();
+    h.app.state_mut().usage = hrdr_app::SessionUsage {
+        tokens_in: 100,
+        tokens_out: 50,
+        context_window: Some(1_000),
+        ..Default::default()
+    };
+    h.app.publish_main_agent();
+    h.app.autosave();
+    h.save_drain().await;
+    let id = h.app.state().id.clone().expect("seed session saved");
+    let outgoing = h.app.state().model.clone();
+
+    h.app
+        .apply_model_choice_for_test("deepseek", "test-model", Some(40_000));
+    h.settle_switch().await;
+    h.save_drain().await;
+
+    assert_eq!(h.app.state().model, outgoing);
+    assert_eq!(h.app.agent.lock().await.model_ref(), &outgoing);
+    assert_eq!(h.app.state().usage.tokens_in, 110);
+    assert_eq!(h.app.state().usage.tokens_out, 55);
+    assert_eq!(h.app.state().messages.len(), original.len());
+    assert_eq!(
+        h.app
+            .state()
+            .messages
+            .last()
+            .and_then(|message| message.content.as_deref()),
+        Some("original short tail")
+    );
+
+    let saved = hrdr_app::Session::load(&h.app.current_cwd(), &id).unwrap();
+    assert_eq!(saved.state.model, outgoing);
+    assert_eq!(saved.state.usage.tokens_in, 110);
+    assert_eq!(saved.state.usage.tokens_out, 55);
+    assert_eq!(saved.state.messages.len(), original.len());
+    assert_eq!(
+        saved
+            .state
+            .messages
+            .last()
+            .and_then(|message| message.content.as_deref()),
+        Some("original short tail")
+    );
+}
+
+/// A switch whose outgoing compaction cannot buy any room reports failure without
+/// letting the pane chrome run ahead of the unchanged agent identity.
+#[tokio::test]
+async fn failed_model_switch_keeps_the_outgoing_identity_chrome() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let outgoing = h.app.state().model.clone();
+    h.app
+        .apply_model_choice_for_test("deepseek", "test-model", Some(1));
+    h.settle_switch().await;
+    h.app.sync_panes();
+
+    assert_eq!(h.app.state().model, outgoing);
+    assert_eq!(h.app.agent.lock().await.model_ref(), &outgoing);
+    assert!(
+        h.app
+            .toasts
+            .history()
+            .any(|toast| { toast.body.contains("compacted context is still") })
+    );
+}
+
 /// The status bar names the effort in force. With no override — "Default" from
 /// the `/effort` picker — it shows the provider's documented default instead of
 /// dropping the effort section: a deepseek agent reads `high` even though
@@ -9591,7 +9889,7 @@ async fn status_bar_shows_the_providers_default_effort_when_unset() {
     // Move the agent onto deepseek (its documented default is "high") and let
     // the identity land — the chrome follows the agent, one message later.
     h.app
-        .apply_model_choice_for_test("deepseek", "test-model", Some(1000));
+        .apply_model_choice_for_test("deepseek", "test-model", Some(u32::MAX));
     h.settle_switch().await;
     h.app.sync_panes();
     let screen = h.render();
