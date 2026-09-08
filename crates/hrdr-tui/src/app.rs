@@ -3141,6 +3141,10 @@ impl App {
                     return;
                 }
                 self.registry.end_turn(hrdr_agent::MAIN_KEY);
+                // `refresh_subagent_dir` may have skipped this while the completed
+                // turn held the mutex. Retry now, before saving or launching queued
+                // steering, so every following request carries the durable id.
+                self.reassert_session_id();
                 // The agent lock is free again: the sub-agent list (and cwd) that
                 // `agent_names`/`agent_cwd` read under `try_lock` is now the real
                 // one, so the completion popup cached while the turn held the lock

@@ -79,14 +79,19 @@ impl super::App {
             // Hand the conversation's id to the main agent so its requests to
             // the OpenCode gateway carry it as `x-opencode-session` — the
             // gateway requires the header and groups a conversation by it for
-            // session affinity and caching. Pushed here, the one point every
-            // id assignment funnels through (first reserve, resume, first
-            // save), so a new session, a `/resume` and a `/clear` each land on
-            // the right id without every mint site remembering to push.
-            // Skipped while a turn holds the agent lock — a running turn's
-            // requests already carry whatever id was in force when it started.
-            let id = id.clone();
-            self.with_agent(|a| a.set_session_id(id));
+            // session affinity and caching.
+            self.reassert_session_id();
+        }
+    }
+
+    /// Reassert the durable session id on the main agent when it is idle.
+    ///
+    /// This deliberately only updates the live agent: it neither persists state
+    /// nor attaches transcripts, and skips rather than waiting while a turn owns
+    /// the mutex. The turn-end path retries after that lock is released.
+    pub(super) fn reassert_session_id(&self) {
+        if let Some(id) = self.state().id.clone() {
+            self.with_agent(|agent| agent.set_session_id(id));
         }
     }
 

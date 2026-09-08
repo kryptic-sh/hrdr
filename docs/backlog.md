@@ -3465,13 +3465,6 @@ remained open at that review and was fixed 2026-09-09. Rest cleared.**
 
 **Hardening (correct today, fragile):**
 
-- **Session-id push can silently skip while a turn holds the agent lock**
-  (`session.rs:79-90` via `app.rs:2176-2178` `with_agent` try_lock). If
-  `refresh_subagent_dir` runs mid-turn (first save landing during the first
-  turn), the agent keeps its construction-minted id for the rest of the process
-  — the durable on-disk id only surfaces after a resume. Effect is limited to
-  OpenCode session affinity/prompt-caching grouping; self-heals on resume.
-  Consider re-asserting the id from `state.id` at turn end.
 - **Cron fire across a DST transition** (`cron.rs:383-389`): `wait` is a
   wall-clock difference computed before the sleep; a transition between
   computation and fire shifts one delivery by an hour. The loop recomputes

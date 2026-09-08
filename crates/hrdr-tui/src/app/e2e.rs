@@ -6646,6 +6646,44 @@ async fn reserve_session_id_defers_the_first_write_off_thread() {
     );
 }
 
+#[tokio::test]
+async fn done_reasserts_the_durable_session_id_after_a_busy_refresh() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+
+    // The reservation refreshes the durable id while a turn owns the agent mutex,
+    // so `with_agent` must skip it rather than waiting on the running turn.
+    let agent = h.app.agent.clone();
+    let guard = agent.lock().await;
+    h.app.reserve_session_id("keep this conversation together");
+    let id = h
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("reservation assigned a durable session id");
+    assert_ne!(
+        guard.session_id(),
+        id,
+        "the busy refresh leaves the agent on its construction id"
+    );
+    drop(guard);
+
+    // A queued steer can launch another turn immediately from `Done`; its request
+    // must see the durable id rather than the stale construction id.
+    h.app
+        .registry
+        .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::plain("continue"));
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.on_turn_msg(TurnMsg::Done(None));
+
+    assert_eq!(
+        h.app.agent.lock().await.session_id(),
+        id,
+        "Done repairs the skipped refresh before launching queued steering"
+    );
+}
+
 /// A detached sub-agent that finishes while nothing is running wakes the model:
 /// an empty turn spawns, and `Agent::run` folds the result into the conversation
 /// before its first request. The user never has to type to collect it.

@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Completed TUI turns reassert their durable OpenCode session id before a
+  queued steer can launch.** A refresh skipped while the agent mutex is held is
+  retried after `end_turn`, preserving OpenCode session affinity and
+  prompt-cache grouping for the process (`crates/hrdr-tui`).
 - **OpenAI-compatible streams no longer drop `delta.reasoning`.** Both
   `delta.reasoning_content` and `delta.reasoning` normalize into the existing
   reasoning accumulation and render path; if a provider emits both, the
