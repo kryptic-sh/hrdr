@@ -4793,6 +4793,306 @@ async fn compaction_gives_up_on_a_model_that_only_ever_calls_tools() {
     );
 }
 
+/// A compaction request that still overflows walks every shrink rung in order,
+/// and installs only the summary from the first rung that fits.
+#[tokio::test]
+async fn compaction_escalates_through_every_shrink_rung_before_rebuilding_history() {
+    let overflow = || {
+        MockResp::HttpErrorBody(
+            400,
+            json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "context_length_exceeded"
+                }
+            })
+            .to_string(),
+        )
+    };
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = bodies.clone();
+    let server = MockServer::start_with_body_hook(
+        vec![
+            overflow(),
+            overflow(),
+            overflow(),
+            overflow(),
+            MockResp::Sse(vec![
+                text_chunk("s5", "Summary after the eighth-history request."),
+                stop_chunk("s5"),
+                "[DONE]".to_string(),
+            ]),
+        ],
+        move |_, body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+        },
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    // An unknown window forces pre-sizing to begin at Full. Sixteen complete
+    // tool rounds make the later suffix windows land exactly on round markers.
+    agent.set_context_window(None);
+    agent.compaction_tail_turns = 1;
+    agent.preserve_recent_tokens = 0;
+    for i in 0..16 {
+        let call_id = format!("ladder-call-{i}");
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("LADDER_USER_{i}")));
+        Arc::make_mut(&mut agent.messages).push(assistant_with_calls(&[&call_id]));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::tool_result(
+            &call_id,
+            format!(
+                "LADDER_TOOL_{i}_START:{}:LADDER_TOOL_{i}_END",
+                "x".repeat(1_000)
+            ),
+        ));
+    }
+    let expected_tail = agent.messages[agent.messages.len() - 3..].to_vec();
+
+    let report = agent
+        .compact(crate::CompactionReason::ContextOverflow, None, &mut |_| {})
+        .await
+        .expect("the eighth-history request succeeds");
+
+    assert_eq!(report.attempts, 5);
+    assert_eq!(report.stage, crate::ShrinkStage::Eighth);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 5, "one captured request per ladder rung");
+    let histories: Vec<&[serde_json::Value]> = bodies
+        .iter()
+        .map(|body| {
+            let messages = body["messages"].as_array().unwrap();
+            // Exclude the system prompt and transient compaction trigger.
+            &messages[1..messages.len() - 1]
+        })
+        .collect();
+    assert_eq!(
+        histories
+            .iter()
+            .map(|history| history.len())
+            .collect::<Vec<_>>(),
+        vec![48, 48, 24, 12, 6],
+        "Full, Elided, Half, Quarter, Eighth must be attempted in order"
+    );
+    let has = |history: &[serde_json::Value], marker: &str| {
+        history.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(marker))
+        })
+    };
+    assert!(has(histories[0], "LADDER_USER_0"));
+    assert!(has(histories[0], "LADDER_TOOL_0_END"));
+    assert!(!has(histories[0], "tool output elided for compaction"));
+    assert!(has(histories[1], "LADDER_USER_0"));
+    assert!(!has(histories[1], "LADDER_TOOL_0_END"));
+    assert!(has(histories[1], "tool output elided for compaction"));
+    for (history, first_retained, first_dropped) in [
+        (histories[2], "LADDER_USER_8", "LADDER_USER_7"),
+        (histories[3], "LADDER_USER_12", "LADDER_USER_11"),
+        (histories[4], "LADDER_USER_14", "LADDER_USER_13"),
+    ] {
+        assert!(has(history, first_retained), "missing {first_retained}");
+        assert!(!has(history, first_dropped), "retained {first_dropped}");
+        assert!(has(history, "tool output elided for compaction"));
+    }
+
+    assert_eq!(agent.messages.len(), 2 + expected_tail.len());
+    assert_eq!(
+        agent.messages[1].origin,
+        MessageOrigin::Summary(crate::CompactionReason::ContextOverflow)
+    );
+    for (actual, expected) in agent.messages[2..].iter().zip(&expected_tail) {
+        assert_eq!(actual.role, expected.role);
+        assert_eq!(actual.content, expected.content);
+        assert_eq!(actual.tool_call_id, expected.tool_call_id);
+        assert_eq!(
+            serde_json::to_value(&actual.tool_calls).unwrap(),
+            serde_json::to_value(&expected.tool_calls).unwrap()
+        );
+    }
+    assert_ne!(agent.messages[2].role, Role::Tool);
+    assert_eq!(agent.messages[2].content.as_deref(), Some("LADDER_USER_15"));
+}
+
+/// A rejected summary must leave the complete session untouched, including
+/// state that is not represented by message text.
+#[tokio::test]
+async fn failed_summaries_preserve_rich_history_and_non_usage_state() {
+    for (label, response, diagnostic) in [
+        (
+            "empty",
+            MockResp::Sse(vec![stop_chunk("empty"), "[DONE]".to_string()]),
+            "compaction produced an empty summary",
+        ),
+        (
+            "truncated",
+            MockResp::Sse(vec![
+                text_chunk("truncated", "A partial summary that must not be installed."),
+                length_stop_chunk("truncated"),
+                "[DONE]".to_string(),
+            ]),
+            "the summary was cut off at the output limit (77 tokens)",
+        ),
+    ] {
+        let server = MockServer::start(vec![response]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let read_file = dir.path().join("already-read.txt");
+        std::fs::write(&read_file, "stable bytes").unwrap();
+        let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+        agent.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(77),
+            ..Default::default()
+        });
+        agent.auto_compact = false;
+        agent.compaction_reserved = 12_345;
+        agent.set_context_window(Some(123_456));
+        agent.compaction_tail_turns = 3;
+        agent.preserve_recent_tokens = 6_789;
+        agent.self_compact_failed_at = Some(54_321);
+        agent.last_prompt_tokens = Some(111_111);
+        agent.mark_files_read(std::slice::from_ref(&read_file));
+
+        let mut rich_user = ChatMessage::user("RICH_USER_CONTENT");
+        rich_user.origin = MessageOrigin::Tool;
+        rich_user.attachments.push(
+            hrdr_llm::media::Attachment::new(
+                b"\x89PNG\r\n\x1a\n\0\0\0\0".to_vec(),
+                hrdr_llm::media::MediaType::Png,
+                "state.png",
+            )
+            .unwrap(),
+        );
+        Arc::make_mut(&mut agent.messages).push(rich_user);
+        let mut rich_assistant = assistant_with_calls(&["rich-call"]);
+        rich_assistant.content = Some("RICH_ASSISTANT_CONTENT".to_string());
+        rich_assistant.reasoning_content = Some("private reasoning".to_string());
+        rich_assistant.anthropic_thinking_blocks =
+            vec![json!({"type": "thinking", "thinking": "native", "signature": "sig"})];
+        rich_assistant.responses_reasoning_items =
+            vec![json!({"type": "reasoning", "id": "reasoning-item"})];
+        rich_assistant.tool_calls.as_mut().unwrap()[0]
+            .function
+            .parsed_arguments = Some(json!({"parsed": true}));
+        Arc::make_mut(&mut agent.messages).push(rich_assistant);
+        Arc::make_mut(&mut agent.messages)
+            .push(ChatMessage::tool_result("rich-call", "RICH_TOOL_RESULT"));
+        for i in 0..8 {
+            Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+            let mut reply = ChatMessage::assistant(format!("reply {i}"));
+            if i == 2 {
+                reply.origin = MessageOrigin::Nudge;
+                reply.name = Some("named-message".to_string());
+            }
+            Arc::make_mut(&mut agent.messages).push(reply);
+        }
+
+        let before_messages = agent.messages.as_ref().clone();
+        let before_state = (
+            agent.auto_compact,
+            agent.compaction_reserved,
+            agent.context_window,
+            agent.context_window_probed,
+            agent.compaction_tail_turns,
+            agent.preserve_recent_tokens,
+            agent.self_compact_failed_at,
+            agent.ctx.read_state(&read_file),
+        );
+        let err = agent
+            .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
+            .await
+            .expect_err("an unusable summary must fail compaction");
+        assert!(
+            err.to_string().contains(diagnostic),
+            "{label} summary diagnostic was {err:#}"
+        );
+        assert_eq!(
+            agent.messages.len(),
+            before_messages.len(),
+            "{label}: no partial summary or rebuilt history may be installed"
+        );
+        for (index, (actual, expected)) in agent.messages.iter().zip(&before_messages).enumerate() {
+            assert_eq!(actual.role, expected.role, "{label}: role at {index}");
+            assert_eq!(
+                actual.content, expected.content,
+                "{label}: content at {index}"
+            );
+            assert_eq!(
+                actual.reasoning_content, expected.reasoning_content,
+                "{label}: reasoning at {index}"
+            );
+            assert_eq!(
+                actual.anthropic_thinking_blocks, expected.anthropic_thinking_blocks,
+                "{label}: Anthropic blocks at {index}"
+            );
+            assert_eq!(
+                actual.responses_reasoning_items, expected.responses_reasoning_items,
+                "{label}: Responses items at {index}"
+            );
+            assert_eq!(
+                actual.attachments, expected.attachments,
+                "{label}: attachments at {index}"
+            );
+            assert_eq!(actual.origin, expected.origin, "{label}: origin at {index}");
+            assert_eq!(
+                serde_json::to_value(&actual.tool_calls).unwrap(),
+                serde_json::to_value(&expected.tool_calls).unwrap(),
+                "{label}: tool calls at {index}"
+            );
+            let actual_parsed = actual.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| call.function.parsed_arguments.clone())
+                    .collect::<Vec<_>>()
+            });
+            let expected_parsed = expected.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| call.function.parsed_arguments.clone())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                actual_parsed, expected_parsed,
+                "{label}: parsed args at {index}"
+            );
+            assert_eq!(
+                actual.tool_call_id, expected.tool_call_id,
+                "{label}: tool result id at {index}"
+            );
+            assert_eq!(actual.name, expected.name, "{label}: name at {index}");
+        }
+        assert_eq!(
+            (
+                agent.auto_compact,
+                agent.compaction_reserved,
+                agent.context_window,
+                agent.context_window_probed,
+                agent.compaction_tail_turns,
+                agent.preserve_recent_tokens,
+                agent.self_compact_failed_at,
+                agent.ctx.read_state(&read_file),
+            ),
+            before_state,
+            "{label}: failed compaction must preserve non-usage state"
+        );
+        assert_eq!(
+            agent.last_prompt_tokens, None,
+            "{label}: compact deliberately consumes the stale prompt reading"
+        );
+        assert!(
+            agent.messages.iter().all(|message| !matches!(
+                message.origin,
+                MessageOrigin::Summary(crate::CompactionReason::UserRequested)
+            )),
+            "{label}: no failed summary may enter history"
+        );
+    }
+}
+
 // ── overflow recovery for a single oversized turn (Part A) ────────────
 
 /// REGRESSION: a sub-agent-shaped history — exactly one `role:"user"`
