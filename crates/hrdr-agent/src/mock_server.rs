@@ -4616,8 +4616,10 @@ async fn a_failed_self_compaction_is_re_probed_once_the_context_grows() {
     let growth = window / 16;
     let failed_at = window - 500;
 
+    let tool_tokens = crate::compaction::estimate_tokens_in_tools(&agent.tools.defs());
+
     agent.last_prompt_tokens = Some(failed_at);
-    agent.maybe_self_compact(&mut |_| {}).await;
+    agent.maybe_self_compact(tool_tokens, &mut |_| {}).await;
     assert_eq!(
         requests.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4631,7 +4633,7 @@ async fn a_failed_self_compaction_is_re_probed_once_the_context_grows() {
 
     // Still inside the growth window: no request, and no notice.
     agent.last_prompt_tokens = Some(failed_at + growth - 1);
-    agent.maybe_self_compact(&mut |_| {}).await;
+    agent.maybe_self_compact(tool_tokens, &mut |_| {}).await;
     assert_eq!(
         requests.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4640,7 +4642,7 @@ async fn a_failed_self_compaction_is_re_probed_once_the_context_grows() {
 
     // Grown past it: re-probed, and this time it works.
     agent.last_prompt_tokens = Some(failed_at + growth);
-    agent.maybe_self_compact(&mut |_| {}).await;
+    agent.maybe_self_compact(tool_tokens, &mut |_| {}).await;
     assert_eq!(
         requests.load(std::sync::atomic::Ordering::SeqCst),
         2,
@@ -4650,6 +4652,108 @@ async fn a_failed_self_compaction_is_re_probed_once_the_context_grows() {
         agent.self_compact_failed_at, None,
         "and the success clears the record"
     );
+}
+
+async fn assert_proactive_compaction_precedes_request(last_prompt_tokens: Option<u32>) {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = bodies.clone();
+    let server = MockServer::start_with_body_hook(
+        vec![
+            MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the conversation so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ]),
+            MockResp::Sse(vec![
+                text_chunk("c1", "Continued after proactive compaction."),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ]),
+        ],
+        move |_, body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+        },
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    agent.context_window = Some(30_000);
+    agent.context_window_probed = true;
+    agent.compaction_reserved = 1_000;
+    agent.compaction_tail_turns = 1;
+    agent.preserve_recent_tokens = 0;
+    agent.last_prompt_tokens = last_prompt_tokens;
+    // This history landed after the previous server reading, or was restored
+    // with the session. It alone is large enough to cross the next-request
+    // trigger and has enough old turns for compaction to shrink it.
+    for i in 0..8 {
+        Arc::make_mut(&mut agent.messages)
+            .push(ChatMessage::user(format!("turn {i} {}", "x".repeat(8_000))));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!(
+            "reply {i} {}",
+            "y".repeat(8_000)
+        )));
+    }
+
+    agent
+        .run(steering_queue(), |_| {})
+        .await
+        .expect("proactive compaction and the ordinary request succeed");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "one proactive summary must precede one ordinary request: {bodies:#?}"
+    );
+    let first_messages = bodies[0]["messages"].as_array().unwrap();
+    assert!(
+        first_messages
+            .last()
+            .is_some_and(|message| message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Summarize the conversation so far"))),
+        "the first request must be the proactive summary call: {}",
+        bodies[0]
+    );
+    let second_messages = bodies[1]["messages"].as_array().unwrap();
+    assert!(
+        second_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Summary of the conversation so far."))
+        }),
+        "the ordinary request must use the summary returned by request one: {}",
+        bodies[1]
+    );
+    assert!(
+        !second_messages.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Summarize the conversation so far"))),
+        "the transient compaction instruction must not enter ordinary history: {}",
+        bodies[1]
+    );
+}
+
+/// A server reading below the trigger describes only its preceding request.
+/// Large history appended afterwards must trigger compaction before the next
+/// ordinary model request, without waiting for that request to overflow.
+#[tokio::test]
+async fn newly_appended_history_drives_proactive_compaction() {
+    assert_proactive_compaction_precedes_request(Some(10_000)).await;
+}
+
+/// Resumed messages have no server usage reading in a fresh `Agent`, but they
+/// still form the first post-resume request and must be eligible for proactive
+/// compaction before it is sent.
+#[tokio::test]
+async fn restored_history_drives_first_request_proactive_compaction() {
+    assert_proactive_compaction_precedes_request(None).await;
 }
 
 // ── incomplete stream (truncated without [DONE]) ──────────────────────

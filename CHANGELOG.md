@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Proactive compaction now measures the request about to be sent.** Newly
+  appended tool output, steering, background-agent results, and restored session
+  history are estimated with the current tool schemas and combined with the
+  server's last prompt count, so they can trigger compaction before an oversized
+  ordinary request is rejected (`crates/hrdr-agent`).
 - **`cron cancel` can no longer race a fire into a stray reminder.** The
   scheduler's delivery now re-checks the cron's existence and pushes the
   `BackgroundTask` under the same crons → background_tasks lock order the

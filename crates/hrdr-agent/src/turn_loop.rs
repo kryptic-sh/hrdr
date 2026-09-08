@@ -574,7 +574,7 @@ impl Agent {
             // tool-output pruning used to get first shot at it and was removed,
             // because it invalidated the prompt cache each time it fired, could
             // fire repeatedly, and still ended here.
-            self.maybe_self_compact(&mut on_event).await;
+            self.maybe_self_compact(tool_tokens, &mut on_event).await;
             // Cost budget: stop before issuing another model call once the
             // session's estimated spend (incl. sub-agents) reaches the cap.
             if let Err(error) = self.budget_preflight().await {

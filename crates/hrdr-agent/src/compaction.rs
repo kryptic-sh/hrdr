@@ -1176,30 +1176,47 @@ impl Agent {
     ///
     /// Failure is non-fatal: if the summarising call fails, the turn proceeds and
     /// overflow recovery is still there to catch it.
-    pub(crate) async fn maybe_self_compact<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
-        if !self.auto_compact || self.last_prompt_tokens.is_none() {
+    pub(crate) async fn maybe_self_compact<F: FnMut(AgentEvent)>(
+        &mut self,
+        tool_tokens: u32,
+        on_event: &mut F,
+    ) {
+        if !self.auto_compact {
             return;
         }
+        // Judge the request that is about to be sent, not only the preceding
+        // server reading. History can grow substantially between rounds, and a
+        // resumed session has no reading at all. Keep a larger server count as
+        // the floor because it includes tokenizer and prefix overhead the rough
+        // local estimate cannot see.
+        let current_estimate =
+            estimate_tokens_in_messages(&self.messages, self.client.token_target())
+                .saturating_add(tool_tokens);
+        let effective_prompt_tokens = Some(
+            self.last_prompt_tokens
+                .unwrap_or_default()
+                .max(current_estimate),
+        );
         // Learn our own window before judging how full it is. Without this the
         // trigger is `None` for most agents and this whole path is dead code —
         // exactly for the small-context models it exists to protect.
         self.ensure_context_window();
         if !should_auto_compact(
-            self.last_prompt_tokens,
+            effective_prompt_tokens,
             self.context_window,
             self.compaction_reserved,
             self.auto_compact,
         ) {
             return;
         }
-        if self.self_compact_suppressed() {
+        if self.self_compact_suppressed(effective_prompt_tokens) {
             return;
         }
         // `compact` clears `last_prompt_tokens` on entry whatever the outcome, so
-        // the reading the failure happened at has to be captured before the call
-        // — read it afterwards and it is always `None`, the suppression never
-        // engages, and a failing summarizer is retried on every single round.
-        let attempted_at = self.last_prompt_tokens;
+        // the effective reading the failure happened at has to be captured before
+        // the call — read it afterwards and it is always `None`, the suppression
+        // never engages, and a failing summarizer is retried on every single round.
+        let attempted_at = effective_prompt_tokens;
         match self
             .compact(CompactionReason::ContextFilling, None, on_event)
             .await
@@ -1240,8 +1257,8 @@ impl Agent {
     /// for a passing reason gets another chance while the window is still
     /// filling, and one that is genuinely broken costs a bounded handful of
     /// calls rather than one per round.
-    fn self_compact_suppressed(&self) -> bool {
-        let (Some(failed_at), Some(now)) = (self.self_compact_failed_at, self.last_prompt_tokens)
+    fn self_compact_suppressed(&self, effective_prompt_tokens: Option<u32>) -> bool {
+        let (Some(failed_at), Some(now)) = (self.self_compact_failed_at, effective_prompt_tokens)
         else {
             return false;
         };
