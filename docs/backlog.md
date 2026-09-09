@@ -3669,10 +3669,10 @@ scheduler), the shared per-chunk SSE drain, the hrdr-agent split
 (events.rs/agent_impl.rs), the TUI paste cap, the gate/sandbox/whitespace dedup
 — plus a status pass on every open 08-30 perf finding, re-verified at its
 current line (the agent split and SSE refactor moved/handled several).
-**Findings: 1 new (LOW) — fixed and closed 2026-09-04 (`cron` `next_fire`
-fast-forward, below). All 22 recorded 08-30 findings remain open — re-confirmed,
-not re-derived; each one line + current file:line instead of a full writeup.**
-No code changed by the perf pass itself.
+**Findings: the new LOW `cron` fast-forward item was fixed and closed
+2026-09-04. Recorded 08-30 findings below remain open where stated; each is one
+line + current file:line instead of a full writeup.** No code changed by the
+perf pass itself.
 
 Ranked by impact, biggest first:
 
@@ -3694,19 +3694,19 @@ Ranked by impact, biggest first:
    so `drain_stream` can render it), and the caller re-clones the reasoning
    delta per thinking token (`crates/hrdr-agent/src/turn_loop.rs:225`). ~2
    removable allocations per token on the hottest loop in the crate. Open.
-4. **MEDIUM-HIGH (re-confirmed, 08-30 #3/#4) — TUI body cache keys miss on every
-   frame for running/streaming blocks.** Running tools keyed on `frame_idx + 1`
-   (`crates/hrdr-tui/src/ui.rs:3008`), streaming entries on the precomputed
-   `content_hash` (`ui.rs:3002`, changes per delta) — a running/streaming block
-   re-parses, re-highlights and re-wraps every frame the ticker draws. Idle
-   ticks are gated on `spinner_live()` (`crates/hrdr-tui/src/tui.rs:159-160`),
-   so the cost is paid exactly while an agent streams. Open.
+4. **MEDIUM-HIGH (partially fixed, 08-30 #3/#4) — streamed content re-renders
+   its body on every delta.** Streaming assistant, reasoning, and tool content
+   changes `content_hash` on each delta, so the TUI reparses and re-wraps the
+   growing body each time. Running tools now keep unchanged static rows across
+   spinner-only ticks, measured by `tool_lines` invocation count rather than
+   wall time; per-delta coalescing or incremental rendering remains open.
 5. **MEDIUM-HIGH (re-confirmed, 08-30 #5) — full-transcript walk per frame.**
    `draw_chunks` (`ui.rs:1002`) iterates every transcript entry per frame
    (thread-local cache lookups + `Rc` clones + the `cum`/hit-map rebuilds),
-   unbounded by pane size; same caveat as #4 (paid only while a spinner is live,
-   which is the streaming turn). Open — fix shape unchanged (`ChunkRows::Lazy`
-   - per-pane assembled-layout cache invalidated from the first changed entry).
+   unbounded by pane size and paid while a spinner is live. Painting an
+   unchanged running tool also still clones its cached rows and searches the
+   header marker each frame. Fix shape remains `ChunkRows::Lazy` plus a per-pane
+   assembled-layout cache invalidated from the first changed entry.
 6. **MEDIUM (re-confirmed, 08-30 #6) — todo panel clones and sorts the whole
    list every frame.** `todo_lines` `ui.rs:1247-1261` (`todos.clone()` +
    `sort_by_key` per frame; `spinner_live` also locks the todos mutex). Open.

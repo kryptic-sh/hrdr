@@ -1389,6 +1389,7 @@ fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hr
 /// around the ring of all eight dots — light (half lit), not the heavy
 /// 7-of-8 disk of the earlier frames.
 const SPINNER: [&str; 8] = ["⠹", "⢸", "⣰", "⣤", "⣆", "⡇", "⠏", "⠛"];
+const SPINNER_PADDED: [&str; 8] = ["⠹ ", "⢸ ", "⣰ ", "⣤ ", "⣆ ", "⡇ ", "⠏ ", "⠛ "];
 /// Spinner frame period in milliseconds. The redraw ticker in [`tui`] uses the
 /// same value so the animation and the draw loop stay in sync.
 pub(crate) const SPINNER_FRAME_MS: u64 = 120;
@@ -2111,6 +2112,21 @@ thread_local! {
     static LAZY_HEIGHTS: RefCell<HashMap<BlockKey, usize>> = RefCell::new(HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    static TOOL_LINES_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_tool_lines_renders() {
+    TOOL_LINES_RENDERS.with(|renders| renders.set(0));
+}
+
+#[cfg(test)]
+fn tool_lines_renders() -> usize {
+    TOOL_LINES_RENDERS.with(std::cell::Cell::get)
+}
+
 /// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
 /// `Line` per source line, no gutter and no width fill. Callers that want a
 /// solid code rectangle (fenced markdown blocks) pad it themselves; callers
@@ -2664,6 +2680,10 @@ pub(crate) enum RowHit {
 enum ChunkRows<'a> {
     /// Shared with the cache: an unchanged block is a refcount bump per frame.
     Ready(Rows),
+    /// A cached block whose static rows are reused while a running tool's spinner
+    /// changes. Painting clones only the already-laid-out rows to replace the
+    /// marker; it never re-highlights or re-wraps the body.
+    AnimatedChrome { rows: Rows, mark: &'static str },
     /// The session header, whose logo animates: it cannot be cached (the frame it
     /// would serve is the one before), and it paints a span per glyph, which is the
     /// single most expensive block in the transcript. In any session long enough to
@@ -2681,7 +2701,7 @@ impl ChunkRows<'_> {
     /// Screen rows this chunk occupies — never builds anything.
     fn height(&self) -> usize {
         match self {
-            ChunkRows::Ready(rows) => rows.len(),
+            ChunkRows::Ready(rows) | ChunkRows::AnimatedChrome { rows, .. } => rows.len(),
             ChunkRows::Lazy { height, .. } => *height,
         }
     }
@@ -2690,8 +2710,38 @@ impl ChunkRows<'_> {
     fn rows(&self) -> Rows {
         match self {
             ChunkRows::Ready(rows) => Rc::clone(rows),
+            ChunkRows::AnimatedChrome { rows, mark } => animated_tool_rows(rows, mark),
             ChunkRows::Lazy { build, .. } => build(),
         }
+    }
+}
+
+/// Replace the cached running-tool marker without touching its already-highlighted
+/// and wrapped static rows.
+fn animated_tool_rows(rows: &Rows, mark: &str) -> Rows {
+    let mut rows = (**rows).clone();
+    if let Some(header) = rows.get_mut(1)
+        && let Some(marker) = header.spans.iter_mut().find_map(|span| {
+            spinner_marker_has_space(span.content.as_ref()).map(|space| (span, space))
+        })
+        && let Some(index) = SPINNER.iter().position(|&spinner| spinner == mark)
+    {
+        marker.0.content = if marker.1 {
+            SPINNER_PADDED[index]
+        } else {
+            SPINNER[index]
+        }
+        .into();
+    }
+    Rc::new(rows)
+}
+
+/// Whether `marker` is exactly a spinner glyph, with an optional space suffix.
+fn spinner_marker_has_space(marker: &str) -> Option<bool> {
+    match marker {
+        "⠹" | "⢸" | "⣰" | "⣤" | "⣆" | "⡇" | "⠏" | "⠛" => Some(false),
+        "⠹ " | "⢸ " | "⣰ " | "⣤ " | "⣆ " | "⡇ " | "⠏ " | "⠛ " => Some(true),
+        _ => None,
     }
 }
 
@@ -2733,6 +2783,8 @@ struct PendingBlock<'a> {
 enum BodySource<'a> {
     /// Rendered and shared with [`BODY_CACHE`] — every entry but the header.
     Cached(Rows),
+    /// A running tool's cached static rows plus its per-frame spinner marker.
+    CachedAnimated { rows: Rows, mark: &'static str },
     /// Rebuilt on demand: the header, whose logo animates. Nothing about it can be
     /// cached, so it is only ever built when it is going to be seen.
     Animated(Box<dyn Fn() -> Vec<Line<'static>> + 'a>),
@@ -2771,6 +2823,10 @@ fn flush<'a>(
     let Some(block) = pending else { return };
     let (idx, msgs, tool_idx) = (block.idx, block.msgs, block.tool_idx);
     let animated = matches!(block.body, BodySource::Animated(_));
+    let animated_mark = match &block.body {
+        BodySource::CachedAnimated { mark, .. } => Some(*mark),
+        BodySource::Cached(_) | BodySource::Animated(_) => None,
+    };
     let bg = block.kind.bg(theme);
     let border = block.kind.border(theme);
     let untinted = bg == Color::Reset;
@@ -2790,7 +2846,9 @@ fn flush<'a>(
     let render = move || -> Rows {
         let mut body: Vec<Line<'static>> = Vec::with_capacity(8);
         match &block.body {
-            BodySource::Cached(rows) => body.extend(rows.iter().cloned()),
+            BodySource::Cached(rows) | BodySource::CachedAnimated { rows, .. } => {
+                body.extend(rows.iter().cloned())
+            }
             BodySource::Animated(build) => body.extend(build()),
         }
         for lent in &block.lent {
@@ -2806,12 +2864,10 @@ fn flush<'a>(
         Rc::new(rows)
     };
 
-    let rows = match animated {
-        // Every other block is laid out once and cached.
-        false => ChunkRows::Ready(cached_block(idx, key, render)),
+    let rows = if animated {
         // The header: its rows animate, its height does not. Once we know how tall
         // it is, a frame that doesn't show it doesn't build it.
-        true => match lazy_height(key) {
+        match lazy_height(key) {
             Some(height) => ChunkRows::Lazy {
                 height,
                 build: Box::new(render),
@@ -2821,7 +2877,13 @@ fn flush<'a>(
                 remember_lazy_height(key, rows.len());
                 ChunkRows::Ready(rows)
             }
-        },
+        }
+    } else {
+        let rows = cached_block(idx, key, render);
+        match animated_mark {
+            Some(mark) => ChunkRows::AnimatedChrome { rows, mark },
+            None => ChunkRows::Ready(rows),
+        }
     };
 
     for _ in 0..msgs {
@@ -2880,9 +2942,9 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     // The current spinner frame is loop-invariant — it depends only on wall
     // time. Compute it once per frame, not once per transcript chunk: the
     // comment on `now` above already promises one clock read for the whole
-    // frame. It is mixed into unfinished tool entries' cache hash so the
-    // block invalidates on each tick, animating the marker; the tool-group
-    // summary header uses the same frame.
+    // frame. Running-tool body keys deliberately exclude it: their static rows
+    // stay cached while [`ChunkRows::AnimatedChrome`] patches only the marker.
+    // The tool-group summary header uses the same frame directly.
     let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
     let frame = SPINNER[frame_idx as usize % SPINNER.len()];
     for (i, entry) in transcript.iter().enumerate() {
@@ -2963,7 +3025,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                     if summary_chunk.is_none() {
                         summary_chunk = Some(chunks.len().saturating_sub(1));
                     }
-                    pending = Some(tool_call_block(app, &transcript[j], j, w, frame, frame_idx));
+                    pending = Some(tool_call_block(app, &transcript[j], j, w, frame));
                 }
                 if summary_chunk.is_none() {
                     // No calls visible: flush the summary so the absorbed
@@ -3000,13 +3062,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         let base_hash = match entry.kind {
             EntryKind::Header => header_hash(app),
             _ => entry_content_hash(entry),
-        };
-        let base_hash = match &entry.kind {
-            // `+1` keeps a running body's key off the done body's (`^ 0`) even
-            // on the first frame — a tool that renders while running and then
-            // settles must not serve its stale spinner body from the cache.
-            EntryKind::Tool { done: false, .. } => base_hash ^ (frame_idx + 1),
-            _ => base_hash,
         };
         // A hidden thought the reader opened (`thinking_open`) renders its full
         // block — the same rows `/verbose on` shows — so its lazy-height slot
@@ -3137,11 +3192,19 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                             ok: *ok,
                             done: *done,
                             preview: false,
-                            frame,
+                            frame: if *done { frame } else { SPINNER[0] },
                         },
                     )
                 });
-                (BlockKind::Tool, BodySource::Cached(body))
+                let body = if *done {
+                    BodySource::Cached(body)
+                } else {
+                    BodySource::CachedAnimated {
+                        rows: body,
+                        mark: frame,
+                    }
+                };
+                (BlockKind::Tool, body)
             }
             // Slash-command output and status notices read like assistant output
             // — same markdown, same colors, no dimming — on their own background.
@@ -3640,7 +3703,6 @@ fn tool_call_block<'a>(
     idx: usize,
     w: usize,
     frame: &'static str,
-    frame_idx: u64,
 ) -> PendingBlock<'a> {
     let theme = &app.theme;
     let EntryKind::Tool {
@@ -3658,7 +3720,7 @@ fn tool_call_block<'a>(
     let small = *done && tool_fits_preview(name, args, result);
     let full = app.verbose || app.tool_open.contains(id) || small;
     let body_key = (
-        member.content_hash ^ if *done { 0 } else { frame_idx + 1 },
+        member.content_hash,
         w as u16,
         app.verbose,
         app.verbose,
@@ -3674,7 +3736,7 @@ fn tool_call_block<'a>(
                 ok: *ok,
                 done: *done,
                 preview: !full,
-                frame,
+                frame: if *done { frame } else { SPINNER[0] },
             },
         )
     });
@@ -3695,7 +3757,14 @@ fn tool_call_block<'a>(
     PendingBlock {
         idx,
         kind: BlockKind::Tool,
-        body: BodySource::Cached(body),
+        body: if *done {
+            BodySource::Cached(body)
+        } else {
+            BodySource::CachedAnimated {
+                rows: body,
+                mark: frame,
+            }
+        },
         lent: Vec::new(),
         body_key,
         tool_idx: None,
@@ -3761,6 +3830,9 @@ fn tool_lines(
     result: &str,
     st: ToolState,
 ) -> Vec<Line<'static>> {
+    #[cfg(test)]
+    TOOL_LINES_RENDERS.with(|renders| renders.set(renders.get() + 1));
+
     let bg = BlockKind::Tool.bg(theme);
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
     let mark = if !st.done {
@@ -4191,10 +4263,12 @@ mod subagent_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, Rc, cached_block, cached_body,
-        chrome_hash, entry_content_hash,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, Rc, SPINNER, SPINNER_FRAME_MS,
+        cached_block, cached_body, chrome_hash, entry_content_hash, reset_tool_lines_renders,
+        tool_lines_renders, transcript_chunks,
     };
-    use crate::app::Entry;
+    use crate::app::{App, Entry, EntryKind};
+    use hrdr_agent::AgentConfig;
     use ratatui::text::{Line, Span};
 
     // ── entry_content_hash ─────────────────────────────────────────────────────
@@ -4307,6 +4381,137 @@ mod cache_tests {
                 "an entry keeps one slot, however many times its content changes"
             );
         });
+    }
+
+    // ── animated tool cache seam ────────────────────────────────────────────────
+
+    /// The production dispatcher retains a running standalone tool's static rows
+    /// across spinner ticks, while its visible chrome advances. Content append and
+    /// completion each invalidate the static rows once; settled ticks reuse them.
+    #[test]
+    fn standalone_running_tool_dispatcher_caches_static_rows_and_animates_at_width_five() {
+        assert_running_tool_dispatcher_cache("edit", true, 5);
+    }
+
+    /// Group expansion routes a running groupable tool through `tool_call_block`.
+    /// It must use the same body-key semantics as a standalone tool.
+    #[test]
+    fn expanded_running_grouped_tool_dispatcher_caches_static_rows_and_animates() {
+        assert_running_tool_dispatcher_cache("shell", false, 80);
+    }
+
+    fn assert_running_tool_dispatcher_cache(name: &str, standalone: bool, width: u16) {
+        use std::time::{Duration, Instant};
+
+        BODY_CACHE.with(|c| c.borrow_mut().clear());
+        BLOCK_CACHE.with(|c| c.borrow_mut().clear());
+        reset_tool_lines_renders();
+        let tmp = tempfile::tempdir().expect("temporary cwd");
+        let mut app = App::new(
+            AgentConfig {
+                base_url: "http://127.0.0.1:1/v1".to_string(),
+                model: "local://test-model".parse().expect("test model"),
+                cwd: tmp.path().to_path_buf(),
+                sandbox: hrdr_tools::SandboxMode::None,
+                ..Default::default()
+            },
+            hrdr_app::UiConfig {
+                auto_resume: false,
+                ..Default::default()
+            },
+            "logo",
+        )
+        .expect("test app");
+        app.transcript_mut().clear();
+        let running = Entry::now(EntryKind::Tool {
+            id: "tool-1".into(),
+            name: name.into(),
+            args: "echo static".into(),
+            result: "first streamed row".into(),
+            ok: true,
+            done: false,
+        });
+        let append = Entry::now(EntryKind::Tool {
+            id: "tool-1".into(),
+            name: name.into(),
+            args: "echo static".into(),
+            result: "first streamed row\nsecond streamed row".into(),
+            ok: true,
+            done: false,
+        });
+        let settled = Entry::now(EntryKind::Tool {
+            id: "tool-1".into(),
+            name: name.into(),
+            args: "echo static".into(),
+            result: "first streamed row\nsecond streamed row".into(),
+            ok: true,
+            done: true,
+        });
+        app.transcript_mut().push(running);
+        if !standalone {
+            app.tool_groups.insert("tool-1".into());
+        }
+
+        let render = |app: &mut App, frame: u64| {
+            app.header_anchor = Instant::now() - Duration::from_millis(frame * SPINNER_FRAME_MS);
+            let (chunks, _, _) = transcript_chunks(app, width);
+            chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .rows
+                        .rows()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let first_rows = render(&mut app, 0);
+        let tick_rows = render(&mut app, 4);
+        let first_mark = SPINNER
+            .iter()
+            .find(|mark| first_rows.contains(**mark))
+            .expect("first running frame has a spinner");
+        let tick_mark = SPINNER
+            .iter()
+            .find(|mark| tick_rows.contains(**mark))
+            .expect("second running frame has a spinner");
+        assert_ne!(
+            first_mark, tick_mark,
+            "two dispatcher frames must show different spinner glyphs"
+        );
+        assert_eq!(
+            tool_lines_renders(),
+            1,
+            "two spinner frames render static tool rows only on the cold frame"
+        );
+
+        app.transcript_mut()[0] = append;
+        let append_rows = render(&mut app, 0);
+        assert_ne!(
+            first_rows, append_rows,
+            "content append changes rendered rows"
+        );
+        assert_eq!(
+            tool_lines_renders(),
+            2,
+            "content append rebuilds static tool rows once"
+        );
+
+        app.transcript_mut()[0] = settled;
+        let settled_rows = render(&mut app, 3);
+        let settled_tick_rows = render(&mut app, 6);
+        assert!(settled_rows.contains('✓'));
+        assert!(!settled_rows.contains(*first_mark));
+        assert_eq!(settled_rows, settled_tick_rows, "settled rows stay cached");
+        assert_eq!(
+            tool_lines_renders(),
+            3,
+            "completion rebuilds static tool rows once and settled ticks reuse them"
+        );
     }
 
     // ── cached_block ───────────────────────────────────────────────────────────
