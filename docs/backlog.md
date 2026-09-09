@@ -3700,12 +3700,12 @@ Ranked by impact, biggest first:
    growing body each time. Running tools now keep unchanged static rows across
    spinner-only ticks, measured by `tool_lines` invocation count rather than
    wall time; per-delta coalescing or incremental rendering remains open.
-5. **MEDIUM-HIGH — transcript mutations still rebuild the full assembly.**
-   Unchanged frames now reuse an app-scoped `Rc<TranscriptAssembly>` without
-   scanning source entries, but any transcript revision change rebuilds every
-   finalized descriptor. Retain the clean prefix using
-   `Pane::transcript_dirty_since` and segment dependency frontiers; tool groups
-   and lent stats can make a dirty entry invalidate an earlier block. Open.
+5. **MEDIUM — unchanged frames still materialize every assembled block.**
+   `materialize_transcript` walks all finalized blocks, clones each descriptor
+   and shared row pointer, and rebuilds chunks and message positions every
+   frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
+   static materialized prefix while resolving dynamic header, reasoning, and
+   tool-group bodies per frame. Open.
 6. **MEDIUM (re-confirmed, 08-30 #6) — todo panel clones and sorts the whole
    list every frame.** `todo_lines` `ui.rs:1247-1261` (`todos.clone()` +
    `sort_by_key` per frame; `spinner_live` also locks the todos mutex). Open.

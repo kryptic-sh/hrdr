@@ -9,10 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **Unchanged TUI frames now reuse their assembled transcript layout without
-  rescanning every entry.** Assembly descriptors and rendered rows are shared by
-  process-local app identity, while transcript, header, queue, width, and
-  per-pane expansion changes invalidate the cache without leaking state between
-  sessions (`crates/hrdr-tui`).
+  rescanning every entry, and tail mutations retain the unaffected finalized
+  prefix.** Assembly descriptors and rendered rows are shared by process-local
+  app identity, while transcript, header, queue, width, and per-pane expansion
+  changes invalidate only the required cache region without leaking state
+  between sessions (`crates/hrdr-tui`).
 - **`Pane` transcript mutations now flow through revision-tracked accessors.**
   The public `state` field is replaced by `state()` and conservatively
   invalidating `state_mut()`, while append, prune, clear, replacement, and event

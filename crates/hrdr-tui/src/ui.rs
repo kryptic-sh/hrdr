@@ -1002,13 +1002,16 @@ struct TranscriptFrame {
 /// on.
 fn draw_chunks(
     f: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     text_area: Rect,
     pending_goto: Option<usize>,
     pending_entry: Option<usize>,
 ) -> TranscriptFrame {
-    let (mut chunks, msg_at, panel_above) = transcript_chunks(app, text_area.width);
+    let queued = app.panes.active_pane().pending.clone();
+    let assembly = cached_assembly(app, text_area.width, !queued.is_empty());
+    let (mut chunks, msg_at, panel_above) =
+        transcript_chunks(&assembly, app, text_area.width, queued);
     // The live panels close the transcript, below the last block: they scroll
     // with it instead of holding rows of every frame for themselves.
     chunks.extend(live_panel_chunks(app, text_area.width, panel_above));
@@ -2109,7 +2112,7 @@ thread_local! {
     static BLOCK_CACHE: SlotCache<BlockKey> = RefCell::new(HashMap::new());
     // The complete entry scan, keyed by every state input that determines its
     // owned descriptors. Dynamic clock and spinner values materialize later.
-    static ASSEMBLY_CACHE: RefCell<Option<(AssemblyKey, Rc<TranscriptAssembly>)>> = const { RefCell::new(None) };
+    static ASSEMBLY_CACHE: RefCell<Option<CachedAssembly>> = const { RefCell::new(None) };
     // Heights of the blocks that are rebuilt rather than cached (the header). Keyed
     // by the same block key, so a header whose *shape* changed — a model with a
     // longer name, an effort row appearing — is measured again rather than trusted.
@@ -2894,13 +2897,20 @@ struct TranscriptAssembly {
     panel_above: Option<Color>,
 }
 
+struct CachedAssembly {
+    key: AssemblyKey,
+    observed_revision: u64,
+    assembly: Rc<TranscriptAssembly>,
+}
+
+type AssemblyPrefix = (usize, Vec<FinalizedBlock>, Vec<(usize, usize)>);
+
 /// Inputs that determine an assembled transcript before dynamic frame state is
 /// materialized. Theme changes clear the cache globally.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct AssemblyKey {
     render_cache_id: u64,
     pane_id: hrdr_app::PaneId,
-    transcript_revision: u64,
     transcript_view_revision: u64,
     header_hash: u64,
     tool_groups_len: usize,
@@ -3154,11 +3164,16 @@ fn separator<'a>() -> Chunk<'a> {
 /// whose entry has not changed come straight out of [`BLOCK_CACHE`] as an `Rc`,
 /// which is what keeps a frame's cost proportional to what *changed* rather than
 /// to the length of the session.
-fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembly {
+fn assemble_transcript(
+    app: &App,
+    width: u16,
+    queued: bool,
+    start: usize,
+    mut blocks: Vec<FinalizedBlock>,
+    mut leading_msgs: Vec<(usize, usize)>,
+) -> TranscriptAssembly {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
-    let mut blocks = Vec::new();
-    let mut leading_msgs = Vec::new();
     // Block width and the width its content is laid out at (minus padding).
     let w = width as usize;
     let inner = inner_width(w);
@@ -3172,7 +3187,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
     // after them merges into the same group instead of opening a new one.
     // `group_members_end` is one past the group when one is in progress.
     let mut group_members_end: Option<usize> = None;
-    for (i, entry) in transcript.iter().enumerate() {
+    for (i, entry) in transcript.iter().enumerate().skip(start) {
         #[cfg(test)]
         ASSEMBLY_ENTRY_VISITS.with(|visits| visits.set(visits.get() + 1));
         if group_members_end.is_some_and(|end| i >= end) {
@@ -3512,18 +3527,64 @@ fn materialize_transcript<'a>(
     (chunks, msg_at, assembly.panel_above)
 }
 
-fn cached_assembly(app: &App, width: u16, queued: bool) -> Rc<TranscriptAssembly> {
-    let pane = app.panes.active_pane();
+fn suffix_restart(
+    assembly: &TranscriptAssembly,
+    transcript: &[Entry],
+    dirty: usize,
+) -> Option<AssemblyPrefix> {
+    if dirty == 0 || dirty >= transcript.len() {
+        return None;
+    }
+
+    let mut boundary = dirty;
+    if group_absorbs(&transcript[dirty].kind) {
+        let mut group_start = dirty;
+        while group_start > 0 && group_absorbs(&transcript[group_start - 1].kind) {
+            group_start -= 1;
+        }
+        let mut group_end = dirty + 1;
+        while group_end < transcript.len() && group_absorbs(&transcript[group_end].kind) {
+            group_end += 1;
+        }
+        if let Some(head) =
+            (group_start..group_end).find(|&index| is_groupable_tool(&transcript[index].kind))
+        {
+            boundary = head;
+        }
+    }
+
+    let restart_block = assembly
+        .blocks
+        .iter()
+        .rposition(|finalized| finalized.block.idx < boundary)?;
+    if assembly
+        .leading_msgs
+        .iter()
+        .any(|&(block, _)| block >= restart_block)
+    {
+        return None;
+    }
+    Some((
+        assembly.blocks[restart_block].block.idx,
+        assembly.blocks[..restart_block].to_vec(),
+        assembly.leading_msgs.clone(),
+    ))
+}
+
+fn cached_assembly(app: &mut App, width: u16, queued: bool) -> Rc<TranscriptAssembly> {
     let tool_groups_len = app
         .active_tool_groups()
         .map_or(0, std::collections::HashSet::len);
     let tool_open_len = app
         .active_tool_open()
         .map_or(0, std::collections::HashSet::len);
+    let (pane_id, revision) = {
+        let pane = app.panes.active_pane();
+        (pane.id, pane.transcript_revision())
+    };
     let key = AssemblyKey {
         render_cache_id: app.render_cache_id,
-        pane_id: pane.id,
-        transcript_revision: pane.transcript_revision(),
+        pane_id,
         transcript_view_revision: app.transcript_view_revision,
         header_hash: header_hash(app),
         tool_groups_len,
@@ -3533,25 +3594,83 @@ fn cached_assembly(app: &App, width: u16, queued: bool) -> Rc<TranscriptAssembly
         verbose: app.verbose,
         queued,
     };
-    if let Some(assembly) = ASSEMBLY_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .as_ref()
-            .filter(|(cached_key, _)| *cached_key == key)
-            .map(|(_, assembly)| Rc::clone(assembly))
-    }) {
-        return assembly;
+    let cached = ASSEMBLY_CACHE.with(|cache| {
+        cache.borrow().as_ref().map(|cached| {
+            (
+                cached.key,
+                cached.observed_revision,
+                Rc::clone(&cached.assembly),
+            )
+        })
+    });
+    if let Some((cached_key, observed_revision, assembly)) = cached
+        && cached_key == key
+    {
+        if app
+            .panes
+            .active_pane()
+            .transcript_dirty_since(observed_revision)
+            .is_none()
+        {
+            return assembly;
+        }
+        if let Some((current_revision, dirty_from)) = app
+            .panes
+            .active_pane()
+            .transcript_dirty_since(observed_revision)
+            && let Some((start, blocks, leading_msgs)) =
+                suffix_restart(&assembly, app.panes.active_transcript(), dirty_from)
+        {
+            let assembly = Rc::new(assemble_transcript(
+                app,
+                width,
+                queued,
+                start,
+                blocks,
+                leading_msgs,
+            ));
+            ASSEMBLY_CACHE.with(|cache| {
+                *cache.borrow_mut() = Some(CachedAssembly {
+                    key,
+                    observed_revision: current_revision,
+                    assembly: Rc::clone(&assembly),
+                });
+            });
+            app.panes
+                .active_pane_mut()
+                .acknowledge_transcript_revision(current_revision);
+            return assembly;
+        }
     }
 
-    let assembly = Rc::new(assemble_transcript(app, width, queued));
-    ASSEMBLY_CACHE.with(|cache| *cache.borrow_mut() = Some((key, Rc::clone(&assembly))));
+    let assembly = Rc::new(assemble_transcript(
+        app,
+        width,
+        queued,
+        0,
+        Vec::new(),
+        Vec::new(),
+    ));
+    ASSEMBLY_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(CachedAssembly {
+            key,
+            observed_revision: revision,
+            assembly: Rc::clone(&assembly),
+        });
+    });
+    app.panes
+        .active_pane_mut()
+        .acknowledge_transcript_revision(revision);
     assembly
 }
 
-fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
-    let queued = app.panes.active_pane().pending.clone();
-    let assembly = cached_assembly(app, width, !queued.is_empty());
-    let (mut chunks, msg_at, panel_above) = materialize_transcript(&assembly, app, width);
+fn transcript_chunks<'a>(
+    assembly: &TranscriptAssembly,
+    app: &'a App,
+    width: u16,
+    queued: Vec<String>,
+) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
+    let (mut chunks, msg_at, panel_above) = materialize_transcript(assembly, app, width);
     if !queued.is_empty() {
         let theme = &app.theme;
         let bg = BlockKind::Queued.bg(theme);
@@ -4506,6 +4625,15 @@ mod cache_tests {
     use hrdr_agent::AgentConfig;
     use ratatui::text::{Line, Span};
 
+    macro_rules! test_transcript_chunks {
+        ($app:expr, $width:expr) => {{
+            let app = $app;
+            let queued = app.panes.active_pane().pending.clone();
+            let assembly = cached_assembly(app, $width, !queued.is_empty());
+            transcript_chunks(&assembly, app, $width, queued)
+        }};
+    }
+
     fn test_app() -> (tempfile::TempDir, App) {
         let tmp = tempfile::tempdir().expect("temporary cwd");
         let app = App::new(
@@ -4558,9 +4686,9 @@ mod cache_tests {
         app_a.transcript_mut().push(Entry::assistant("only app A"));
         app_b.transcript_mut().push(Entry::assistant("only app B"));
 
-        let (chunks, _, _) = transcript_chunks(&app_a, 80);
+        let (chunks, _, _) = test_transcript_chunks!(&mut app_a, 80);
         let first = chunk_snapshot(chunks);
-        let (chunks, _, _) = transcript_chunks(&app_b, 80);
+        let (chunks, _, _) = test_transcript_chunks!(&mut app_b, 80);
         let second = chunk_snapshot(chunks);
         let first_text = format!("{first:?}");
         let second_text = format!("{second:?}");
@@ -4581,12 +4709,12 @@ mod cache_tests {
         }
 
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(assembly_entry_visits(), ENTRY_COUNT);
         let first = (chunk_snapshot(chunks), msg_at, panel_above);
 
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         let second = (chunk_snapshot(chunks), msg_at, panel_above);
         assert_eq!(
             assembly_entry_visits(),
@@ -4604,12 +4732,150 @@ mod cache_tests {
         app.transcript_mut().push(Entry::assistant("static entry"));
 
         reset_assembly_entry_visits();
-        let first = cached_assembly(&app, 80, false);
+        let first = cached_assembly(&mut app, 80, false);
         assert_eq!(assembly_entry_visits(), 1);
         reset_assembly_entry_visits();
-        let second = cached_assembly(&app, 80, false);
+        let second = cached_assembly(&mut app, 80, false);
         assert!(Rc::ptr_eq(&first, &second));
         assert_eq!(assembly_entry_visits(), 0);
+    }
+
+    #[test]
+    fn tail_append_rebuilds_only_the_predecessor_and_tail() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        for index in 0..12 {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static entry {index}")));
+        }
+        let _ = test_transcript_chunks!(&mut app, 80);
+
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::assistant("tail append"));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        let warm = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(assembly_entry_visits(), 2);
+
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(warm, (chunk_snapshot(chunks), msg_at, panel_above));
+    }
+
+    #[test]
+    fn tail_streaming_mutation_rebuilds_only_the_predecessor_and_tail() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        for index in 0..12 {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static entry {index}")));
+        }
+        let _ = test_transcript_chunks!(&mut app, 80);
+
+        app.panes
+            .main_mut()
+            .apply(&hrdr_agent::AgentEvent::Text(" coalesced".to_string()));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        let warm = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(assembly_entry_visits(), 2);
+
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(warm, (chunk_snapshot(chunks), msg_at, panel_above));
+    }
+
+    #[test]
+    fn group_tail_growth_rebuilds_from_the_predecessor() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        let tool = |id: &str| {
+            Entry::now(EntryKind::Tool {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+                result: "done".to_string(),
+                ok: true,
+                done: true,
+            })
+        };
+        app.transcript_mut().clear();
+        for index in 0..9 {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static prefix {index}")));
+        }
+        app.transcript_mut().push(tool("first"));
+        app.transcript_mut().push(Entry::assistant(""));
+        app.active_tool_groups_mut().insert("first".to_string());
+        let _ = test_transcript_chunks!(&mut app, 80);
+
+        app.panes.main_mut().append_transcript(tool("second"));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        let warm = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(assembly_entry_visits(), 4);
+
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(warm, (chunk_snapshot(chunks), msg_at, panel_above));
+    }
+
+    #[test]
+    fn appended_stats_rebuilds_only_the_predecessor_and_tail() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        for index in 0..12 {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static entry {index}")));
+        }
+        let _ = test_transcript_chunks!(&mut app, 80);
+
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::now(EntryKind::Stats("stats".to_string())));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        let warm = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(assembly_entry_visits(), 2);
+        assert!(
+            warm.0
+                .last()
+                .expect("predecessor block")
+                .0
+                .iter()
+                .any(|row| row.contains("stats"))
+        );
+
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(warm, (chunk_snapshot(chunks), msg_at, panel_above));
+    }
+
+    #[test]
+    fn appended_empty_assistant_rebuilds_only_the_predecessor_and_tail() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        for index in 0..12 {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static entry {index}")));
+        }
+        let _ = test_transcript_chunks!(&mut app, 80);
+
+        app.panes.main_mut().append_transcript(Entry::assistant(""));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        let warm = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(assembly_entry_visits(), 2);
+        assert_eq!(warm.1.len(), 13);
+
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(warm, (chunk_snapshot(chunks), msg_at, panel_above));
     }
 
     #[test]
@@ -4617,11 +4883,11 @@ mod cache_tests {
         clear_transcript_cache();
         let (_tmp, mut app) = test_app();
         let width = 24;
-        let _ = transcript_chunks(&app, width);
+        let _ = test_transcript_chunks!(&mut app, width);
 
         app.dir = "/a/long/working/directory/that/wraps/the/session/header".to_string();
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, width);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, width);
         assert!(
             assembly_entry_visits() > 0,
             "cwd header change must rebuild assembly"
@@ -4629,25 +4895,25 @@ mod cache_tests {
         let warm = chunk_snapshot(chunks);
         assert_eq!(warm[0].1, warm[0].0.len());
         clear_transcript_cache();
-        let (chunks, cold_msg_at, cold_panel_above) = transcript_chunks(&app, width);
+        let (chunks, cold_msg_at, cold_panel_above) = test_transcript_chunks!(&mut app, width);
         assert_eq!(
             (warm, msg_at, panel_above),
             (chunk_snapshot(chunks), cold_msg_at, cold_panel_above)
         );
 
-        let _ = transcript_chunks(&app, width);
+        let _ = test_transcript_chunks!(&mut app, width);
         app.set_active_model_ref("local://a-much-longer-model-name".parse().expect("model"));
         reset_assembly_entry_visits();
-        let _ = transcript_chunks(&app, width);
+        let _ = test_transcript_chunks!(&mut app, width);
         assert!(
             assembly_entry_visits() > 0,
             "active pane model/provider header change must rebuild assembly"
         );
 
-        let _ = transcript_chunks(&app, width);
+        let _ = test_transcript_chunks!(&mut app, width);
         app.panes.active_pane_mut().effort = Some("high".to_string());
         reset_assembly_entry_visits();
-        let _ = transcript_chunks(&app, width);
+        let _ = test_transcript_chunks!(&mut app, width);
         assert!(
             assembly_entry_visits() > 0,
             "active pane effort header change must rebuild assembly"
@@ -4662,13 +4928,13 @@ mod cache_tests {
         app.panes
             .main_mut()
             .append_transcript(Entry::assistant("first static entry"));
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
 
         app.panes
             .main_mut()
             .append_transcript(Entry::assistant("tail append"));
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "tail append must rebuild assembly"
@@ -4682,41 +4948,41 @@ mod cache_tests {
                 .any(|line| line.contains("tail append"))
         );
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(appended, (chunk_snapshot(chunks), msg_at, panel_above));
 
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 48);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 48);
         assert!(
             assembly_entry_visits() > 0,
             "width change must rebuild assembly"
         );
         let narrow = (chunk_snapshot(chunks), msg_at, panel_above);
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 48);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 48);
         assert_eq!(narrow, (chunk_snapshot(chunks), msg_at, panel_above));
 
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
         app.panes
             .main_mut()
             .pending
             .push("queued message".to_string());
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "queued transition must rebuild final chrome"
         );
         let queued = (chunk_snapshot(chunks), msg_at, panel_above);
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(queued, (chunk_snapshot(chunks), msg_at, panel_above));
 
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
         clear_transcript_cache();
         reset_assembly_entry_visits();
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "global cache clear must rebuild assembly"
@@ -4741,45 +5007,45 @@ mod cache_tests {
             took_ms: Some(1),
         }));
         let reasoning_id = app.transcript_mut()[1].id();
-        let _ = transcript_chunks(&app, 80);
+        let _ = test_transcript_chunks!(&mut app, 80);
 
         app.active_tool_groups_mut().insert("tool-1".to_string());
         app.invalidate_transcript_view();
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "group expansion must rebuild assembly"
         );
         let group_open = (chunk_snapshot(chunks), msg_at, panel_above);
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(group_open, (chunk_snapshot(chunks), msg_at, panel_above));
 
         app.active_tool_open_mut().insert("tool-1".to_string());
         app.invalidate_transcript_view();
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "tool expansion must rebuild assembly"
         );
         let tool_open = (chunk_snapshot(chunks), msg_at, panel_above);
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(tool_open, (chunk_snapshot(chunks), msg_at, panel_above));
 
         app.thinking_open.insert(reasoning_id);
         app.invalidate_transcript_view();
         reset_assembly_entry_visits();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert!(
             assembly_entry_visits() > 0,
             "reasoning expansion must rebuild assembly"
         );
         let reasoning_open = (chunk_snapshot(chunks), msg_at, panel_above);
         clear_transcript_cache();
-        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(
             reasoning_open,
             (chunk_snapshot(chunks), msg_at, panel_above)
@@ -4794,13 +5060,13 @@ mod cache_tests {
         app.transcript_mut().push(Entry::assistant(""));
         app.transcript_mut().push(Entry::assistant(""));
 
-        let (chunks, msg_at, _) = transcript_chunks(&app, 80);
+        let (chunks, msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert!(chunks.is_empty());
         assert_eq!(msg_at, vec![0, 0]);
         drop(chunks);
 
         app.transcript_mut().push(Entry::user("visible"));
-        let (_, msg_at, _) = transcript_chunks(&app, 80);
+        let (_, msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(msg_at, vec![0, 0, 0]);
 
         let tool = |id: &str| {
@@ -4818,11 +5084,11 @@ mod cache_tests {
         app.transcript_mut().push(Entry::assistant(""));
         app.transcript_mut().push(tool("second"));
 
-        let (_, collapsed_msg_at, _) = transcript_chunks(&app, 80);
+        let (_, collapsed_msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(collapsed_msg_at, vec![0]);
         app.active_tool_groups_mut().insert("first".to_string());
         app.invalidate_transcript_view();
-        let (_, expanded_msg_at, _) = transcript_chunks(&app, 80);
+        let (_, expanded_msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(expanded_msg_at, vec![0]);
     }
 
@@ -4833,13 +5099,14 @@ mod cache_tests {
         app.transcript_mut().clear();
         app.transcript_mut().push(Entry::user("visible"));
 
-        let (plain_chunks, _, plain_panel) = transcript_chunks(&app, 80);
-        assert_eq!(plain_panel, Some(BlockKind::User.bg(&app.theme)));
+        let user_bg = BlockKind::User.bg(&app.theme);
+        let (plain_chunks, _, plain_panel) = test_transcript_chunks!(&mut app, 80);
+        assert_eq!(plain_panel, Some(user_bg));
         let plain_len = plain_chunks.len();
         drop(plain_chunks);
 
         app.panes.main_mut().pending.push("queued".to_string());
-        let (queued_chunks, _, queued_panel) = transcript_chunks(&app, 80);
+        let (queued_chunks, _, queued_panel) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(queued_panel, Some(ratatui::style::Color::Reset));
         assert_eq!(
             queued_chunks.len(),
@@ -4849,7 +5116,7 @@ mod cache_tests {
         drop(queued_chunks);
 
         app.transcript_mut().clear();
-        let (_, _, empty_queued_panel) = transcript_chunks(&app, 80);
+        let (_, _, empty_queued_panel) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(empty_queued_panel, Some(ratatui::style::Color::Reset));
     }
 
@@ -4933,13 +5200,13 @@ mod cache_tests {
             app.panes.main_mut().append_transcript(tool());
         }
 
-        let (chunks, _, _) = transcript_chunks(&app, 20);
+        let (chunks, _, _) = test_transcript_chunks!(&mut app, 20);
         let first = chunk_snapshot(chunks);
         assert_eq!(first[0].1, first[0].0.len());
 
         app.panes.main_mut().append_transcript(tool());
         app.panes.main_mut().append_transcript(tool());
-        let (chunks, _, _) = transcript_chunks(&app, 20);
+        let (chunks, _, _) = test_transcript_chunks!(&mut app, 20);
         let grown = chunk_snapshot(chunks);
         assert_ne!(first[0].0.len(), grown[0].0.len());
         assert_eq!(
@@ -5132,7 +5399,7 @@ mod cache_tests {
 
         let render = |app: &mut App, frame: u64| {
             app.header_anchor = Instant::now() - Duration::from_millis(frame * SPINNER_FRAME_MS);
-            let (chunks, _, _) = transcript_chunks(app, width);
+            let (chunks, _, _) = test_transcript_chunks!(app, width);
             chunks
                 .iter()
                 .flat_map(|chunk| {
