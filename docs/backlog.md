@@ -3700,13 +3700,12 @@ Ranked by impact, biggest first:
    growing body each time. Running tools now keep unchanged static rows across
    spinner-only ticks, measured by `tool_lines` invocation count rather than
    wall time; per-delta coalescing or incremental rendering remains open.
-5. **MEDIUM-HIGH (re-confirmed, 08-30 #5) — full-transcript walk per frame.**
-   `draw_chunks` (`ui.rs:1002`) iterates every transcript entry per frame
-   (thread-local cache lookups + `Rc` clones + the `cum`/hit-map rebuilds),
-   unbounded by pane size and paid while a spinner is live. Painting an
-   unchanged running tool also still clones its cached rows and searches the
-   header marker each frame. Fix shape remains `ChunkRows::Lazy` plus a per-pane
-   assembled-layout cache invalidated from the first changed entry.
+5. **MEDIUM-HIGH — transcript mutations still rebuild the full assembly.**
+   Unchanged frames now reuse an app-scoped `Rc<TranscriptAssembly>` without
+   scanning source entries, but any transcript revision change rebuilds every
+   finalized descriptor. Retain the clean prefix using
+   `Pane::transcript_dirty_since` and segment dependency frontiers; tool groups
+   and lent stats can make a dirty entry invalidate an earlier block. Open.
 6. **MEDIUM (re-confirmed, 08-30 #6) — todo panel clones and sorts the whole
    list every frame.** `todo_lines` `ui.rs:1247-1261` (`todos.clone()` +
    `sort_by_key` per frame; `spinner_live` also locks the todos mutex). Open.

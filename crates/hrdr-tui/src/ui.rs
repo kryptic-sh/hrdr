@@ -2091,7 +2091,7 @@ type Rows = Rc<Vec<Line<'static>>>;
 
 /// A render cache: one slot per transcript entry, holding the key it was rendered
 /// under and the rows it produced.
-type SlotCache<K> = RefCell<HashMap<usize, (K, Rows)>>;
+type SlotCache<K> = RefCell<HashMap<(u64, usize), (K, Rows)>>;
 
 thread_local! {
     // Incremental syntect state: a streaming block's content grows every token,
@@ -2107,15 +2107,22 @@ thread_local! {
     // drops both when the indices themselves move (prune, resume, /clear).
     static BODY_CACHE: SlotCache<BodyKey> = RefCell::new(HashMap::new());
     static BLOCK_CACHE: SlotCache<BlockKey> = RefCell::new(HashMap::new());
+    // The complete entry scan, keyed by every state input that determines its
+    // owned descriptors. Dynamic clock and spinner values materialize later.
+    static ASSEMBLY_CACHE: RefCell<Option<(AssemblyKey, Rc<TranscriptAssembly>)>> = const { RefCell::new(None) };
     // Heights of the blocks that are rebuilt rather than cached (the header). Keyed
     // by the same block key, so a header whose *shape* changed — a model with a
     // longer name, an effort row appearing — is measured again rather than trusted.
-    static LAZY_HEIGHTS: RefCell<HashMap<BlockKey, usize>> = RefCell::new(HashMap::new());
+    static LAZY_HEIGHTS: RefCell<HashMap<(u64, BlockKey), usize>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(test)]
 thread_local! {
     static TOOL_LINES_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Counts each source transcript entry reached by `assemble_transcript`'s outer
+    // scan, including entries it then skips because a recognized tool group owns
+    // them. It measures entry-scan work, not rendered blocks.
+    static ASSEMBLY_ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2126,6 +2133,16 @@ fn reset_tool_lines_renders() {
 #[cfg(test)]
 fn tool_lines_renders() -> usize {
     TOOL_LINES_RENDERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_assembly_entry_visits() {
+    ASSEMBLY_ENTRY_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn assembly_entry_visits() -> usize {
+    ASSEMBLY_ENTRY_VISITS.with(std::cell::Cell::get)
 }
 
 /// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
@@ -2533,6 +2550,7 @@ fn entry_content_hash(entry: &Entry) -> u64 {
 pub(crate) fn clear_transcript_cache() {
     BODY_CACHE.with(|c| c.borrow_mut().clear());
     BLOCK_CACHE.with(|c| c.borrow_mut().clear());
+    ASSEMBLY_CACHE.with(|c| *c.borrow_mut() = None);
     LAZY_HEIGHTS.with(|c| c.borrow_mut().clear());
 }
 
@@ -2554,39 +2572,41 @@ fn header_hash(app: &App) -> u64 {
 ///
 /// Shared by [`Rc`]: an unchanged entry costs a refcount bump per frame, not a
 /// copy of every [`Span`] in it.
-fn cached_body<F>(idx: usize, key: BodyKey, render: F) -> Rows
+fn cached_body<F>(cache_id: u64, idx: usize, key: BodyKey, render: F) -> Rows
 where
     F: FnOnce() -> Vec<Line<'static>>,
 {
+    let slot = (cache_id, idx);
     if let Some(hit) = BODY_CACHE.with(|c| {
         c.borrow()
-            .get(&idx)
+            .get(&slot)
             .filter(|(k, _)| *k == key)
             .map(|(_, rows)| Rc::clone(rows))
     }) {
         return hit;
     }
     let rows = Rc::new(render());
-    BODY_CACHE.with(|c| c.borrow_mut().insert(idx, (key, Rc::clone(&rows))));
+    BODY_CACHE.with(|c| c.borrow_mut().insert(slot, (key, Rc::clone(&rows))));
     rows
 }
 
 /// The finished rows of entry `idx`'s block, from [`BLOCK_CACHE`] when `key`
 /// still matches, otherwise from `render()`.
-fn cached_block<F>(idx: usize, key: BlockKey, render: F) -> Rows
+fn cached_block<F>(cache_id: u64, idx: usize, key: BlockKey, render: F) -> Rows
 where
     F: FnOnce() -> Rows,
 {
+    let slot = (cache_id, idx);
     if let Some(hit) = BLOCK_CACHE.with(|c| {
         c.borrow()
-            .get(&idx)
+            .get(&slot)
             .filter(|(k, _)| *k == key)
             .map(|(_, rows)| Rc::clone(rows))
     }) {
         return hit;
     }
     let rows = render();
-    BLOCK_CACHE.with(|c| c.borrow_mut().insert(idx, (key, Rc::clone(&rows))));
+    BLOCK_CACHE.with(|c| c.borrow_mut().insert(slot, (key, Rc::clone(&rows))));
     rows
 }
 
@@ -2594,12 +2614,12 @@ where
 /// blocks whose *rows* can't be cached but whose height doesn't change: the
 /// animated header. Knowing the height is enough to place the viewport, and a
 /// viewport that doesn't reach the block never builds it.
-fn lazy_height(key: BlockKey) -> Option<usize> {
-    LAZY_HEIGHTS.with(|c| c.borrow().get(&key).copied())
+fn lazy_height(cache_id: u64, key: BlockKey) -> Option<usize> {
+    LAZY_HEIGHTS.with(|c| c.borrow().get(&(cache_id, key)).copied())
 }
 
-fn remember_lazy_height(key: BlockKey, height: usize) {
-    LAZY_HEIGHTS.with(|c| c.borrow_mut().insert(key, height));
+fn remember_lazy_height(cache_id: u64, key: BlockKey, height: usize) {
+    LAZY_HEIGHTS.with(|c| c.borrow_mut().insert((cache_id, key), height));
 }
 
 /// The identity of the rows cached for entry `idx`, or `None` if it has no slot.
@@ -2608,10 +2628,10 @@ fn remember_lazy_height(key: BlockKey, height: usize) {
 /// `an_unchanged_block_is_reused_not_rerendered` to hold the invariant that keeps
 /// a long transcript's frame cost flat.
 #[cfg(test)]
-pub(crate) fn block_cache_ptr(idx: usize) -> Option<usize> {
+pub(crate) fn block_cache_ptr(cache_id: u64, idx: usize) -> Option<usize> {
     BLOCK_CACHE.with(|c| {
         c.borrow()
-            .get(&idx)
+            .get(&(cache_id, idx))
             .map(|(_, rows)| Rc::as_ptr(rows) as usize)
     })
 }
@@ -2758,6 +2778,7 @@ enum Lent {
 /// A block whose parts are gathered but which is not yet rendered. Held for one
 /// iteration so the block after it can say whether the two need a separator
 /// between them.
+#[derive(Clone)]
 struct PendingBlock {
     /// Transcript index — the cache slot this block owns.
     idx: usize,
@@ -2781,6 +2802,7 @@ struct PendingBlock {
 }
 
 /// A dynamic body resolved from the active transcript when the frame paints it.
+#[derive(Clone)]
 enum DynamicBody {
     Header {
         entry_idx: usize,
@@ -2794,7 +2816,7 @@ enum DynamicBody {
     ToolGroup {
         entry_idx: usize,
         entry_id: EntryId,
-        sections: Vec<String>,
+        sections: Rc<Vec<String>>,
         running: bool,
         all_ok: bool,
     },
@@ -2837,6 +2859,7 @@ impl DynamicBody {
 }
 
 /// Where a block's body comes from.
+#[derive(Clone)]
 enum BodySource {
     /// Rendered and shared with [`BODY_CACHE`] — every entry but the header.
     Cached(Rows),
@@ -2856,6 +2879,7 @@ impl PendingBlock {
 
 /// An owned block plus the already-decided relationship to its follower.
 /// Assembly never builds frame-borrowed chunks or lazy closures.
+#[derive(Clone)]
 struct FinalizedBlock {
     block: PendingBlock,
     next_bg: Option<Color>,
@@ -2868,6 +2892,23 @@ struct TranscriptAssembly {
     /// position before this finalized block.
     leading_msgs: Vec<(usize, usize)>,
     panel_above: Option<Color>,
+}
+
+/// Inputs that determine an assembled transcript before dynamic frame state is
+/// materialized. Theme changes clear the cache globally.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AssemblyKey {
+    render_cache_id: u64,
+    pane_id: hrdr_app::PaneId,
+    transcript_revision: u64,
+    transcript_view_revision: u64,
+    header_hash: u64,
+    tool_groups_len: usize,
+    tool_open_len: usize,
+    thinking_open_len: usize,
+    width: u16,
+    verbose: bool,
+    queued: bool,
 }
 
 fn finalize_block(
@@ -3051,6 +3092,7 @@ fn flush<'a>(
         Rc::new(rows)
     };
 
+    let cache_id = frame_context.app.map_or(0, |app| app.render_cache_id);
     let rows = if animated {
         // A stale descriptor cannot use the old measured height: its empty
         // fail-safe rows must remain consistent with the height reported to
@@ -3060,20 +3102,20 @@ fn flush<'a>(
         } else {
             // The header: its rows animate, its height does not. Once we know how
             // tall it is, a frame that doesn't show it doesn't build it.
-            match lazy_height(key) {
+            match lazy_height(cache_id, key) {
                 Some(height) => ChunkRows::Lazy {
                     height,
                     build: Box::new(render),
                 },
                 None => {
                     let rows = render();
-                    remember_lazy_height(key, rows.len());
+                    remember_lazy_height(cache_id, key, rows.len());
                     ChunkRows::Ready(rows)
                 }
             }
         }
     } else {
-        let rows = cached_block(idx, key, render);
+        let rows = cached_block(cache_id, idx, key, render);
         match animated_mark {
             Some(mark) => ChunkRows::AnimatedChrome { rows, mark },
             None => ChunkRows::Ready(rows),
@@ -3131,6 +3173,8 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
     // `group_members_end` is one past the group when one is in progress.
     let mut group_members_end: Option<usize> = None;
     for (i, entry) in transcript.iter().enumerate() {
+        #[cfg(test)]
+        ASSEMBLY_ENTRY_VISITS.with(|visits| visits.set(visits.get() + 1));
         if group_members_end.is_some_and(|end| i >= end) {
             group_members_end = None;
         }
@@ -3155,7 +3199,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             if head {
                 let end = tool_group_end(transcript, i);
                 let id = tool_call_id(&entry.kind).unwrap_or_default();
-                let expanded = app.verbose || app.tool_groups.contains(id);
+                let expanded = app.verbose || app.active_tool_group_is_open(id);
                 let tool_bg = BlockKind::Tool.bg(theme);
                 // Absorbed empty-assistant turns still count as messages (for
                 // `/find` jumps to them), landing on the summary block.
@@ -3277,7 +3321,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             // markdown, same colors. Only the block's background differs.
             EntryKind::User(text) => {
                 msg_here += 1;
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::User.bg(theme), inner)
                 });
                 (BlockKind::User, BodySource::Cached(body))
@@ -3287,7 +3331,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             // out and syntax-highlighted with syntect.
             EntryKind::Assistant(text) => {
                 msg_here += 1;
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Assistant.bg(theme), inner)
                 });
                 (BlockKind::Assistant, BodySource::Cached(body))
@@ -3315,7 +3359,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             EntryKind::Reasoning { text, .. } => {
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     markdown_lines(
                         text,
                         &theme.md_theme_dim(),
@@ -3333,7 +3377,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
                 done,
                 ..
             } => {
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     tool_lines(
                         theme,
                         name,
@@ -3357,7 +3401,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             // Slash-command output and status notices read like assistant output
             // — same markdown, same colors, no dimming — on their own background.
             EntryKind::System(text) | EntryKind::Notice(text) => {
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     markdown_lines(text, &md_theme, BlockKind::Command.bg(theme), inner)
                 });
                 (BlockKind::Command, BodySource::Cached(body))
@@ -3365,7 +3409,9 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             // The per-turn stats line belongs to the turn that just ended, so it
             // closes that turn's block rather than opening one of its own.
             EntryKind::Stats(text) => {
-                let body = cached_body(i, ck, || text_lines(text, Style::default().fg(theme.dim)));
+                let body = cached_body(app.render_cache_id, i, ck, || {
+                    text_lines(text, Style::default().fg(theme.dim))
+                });
                 match pending.as_mut() {
                     Some(block) => {
                         block.lend(Lent::Stats(ck, body));
@@ -3379,7 +3425,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
             // `/diff` is slash-command output too, but with diff coloring
             // instead of markdown.
             EntryKind::Diff(text) => {
-                let body = cached_body(i, ck, || {
+                let body = cached_body(app.render_cache_id, i, ck, || {
                     text.lines()
                         .map(|line| {
                             Line::from(Span::styled(
@@ -3427,7 +3473,7 @@ fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembl
 
 /// Turn an owned transcript assembly into frame-local chunks and lazy renderers.
 fn materialize_transcript<'a>(
-    assembly: TranscriptAssembly,
+    assembly: &TranscriptAssembly,
     app: &'a App,
     width: u16,
 ) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
@@ -3442,8 +3488,8 @@ fn materialize_transcript<'a>(
     };
     let mut chunks = Vec::new();
     let mut msg_at = Vec::new();
-    let mut leading = assembly.leading_msgs.into_iter().peekable();
-    for (block_idx, finalized) in assembly.blocks.into_iter().enumerate() {
+    let mut leading = assembly.leading_msgs.iter().copied().peekable();
+    for (block_idx, finalized) in assembly.blocks.iter().enumerate() {
         while let Some(&(at, count)) = leading.peek()
             && at == block_idx
         {
@@ -3453,7 +3499,7 @@ fn materialize_transcript<'a>(
         flush(
             &mut chunks,
             &mut msg_at,
-            Some(finalized.block),
+            Some(finalized.block.clone()),
             finalized.next_bg,
             width as usize,
             theme,
@@ -3466,10 +3512,46 @@ fn materialize_transcript<'a>(
     (chunks, msg_at, assembly.panel_above)
 }
 
+fn cached_assembly(app: &App, width: u16, queued: bool) -> Rc<TranscriptAssembly> {
+    let pane = app.panes.active_pane();
+    let tool_groups_len = app
+        .active_tool_groups()
+        .map_or(0, std::collections::HashSet::len);
+    let tool_open_len = app
+        .active_tool_open()
+        .map_or(0, std::collections::HashSet::len);
+    let key = AssemblyKey {
+        render_cache_id: app.render_cache_id,
+        pane_id: pane.id,
+        transcript_revision: pane.transcript_revision(),
+        transcript_view_revision: app.transcript_view_revision,
+        header_hash: header_hash(app),
+        tool_groups_len,
+        tool_open_len,
+        thinking_open_len: app.thinking_open.len(),
+        width,
+        verbose: app.verbose,
+        queued,
+    };
+    if let Some(assembly) = ASSEMBLY_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_key, _)| *cached_key == key)
+            .map(|(_, assembly)| Rc::clone(assembly))
+    }) {
+        return assembly;
+    }
+
+    let assembly = Rc::new(assemble_transcript(app, width, queued));
+    ASSEMBLY_CACHE.with(|cache| *cache.borrow_mut() = Some((key, Rc::clone(&assembly))));
+    assembly
+}
+
 fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
     let queued = app.panes.active_pane().pending.clone();
-    let assembly = assemble_transcript(app, width, !queued.is_empty());
-    let (mut chunks, msg_at, panel_above) = materialize_transcript(assembly, app, width);
+    let assembly = cached_assembly(app, width, !queued.is_empty());
+    let (mut chunks, msg_at, panel_above) = materialize_transcript(&assembly, app, width);
     if !queued.is_empty() {
         let theme = &app.theme;
         let bg = BlockKind::Queued.bg(theme);
@@ -3809,10 +3891,15 @@ fn tool_group_summary_block(
     w: usize,
 ) -> PendingBlock {
     let (sections, running, all_ok) = tool_group_summary(members);
-    // The hash is the members' aggregate, so a call joining or settling
-    // re-measures the (stable) height; the rows themselves are rebuilt every
-    // frame the block is visible.
-    let members_hash = members.iter().map(|e| e.content_hash).fold(0, |a, h| a ^ h);
+    // Hash the ordered member sequence so a call joining or settling re-measures
+    // the (stable) height; the rows themselves are rebuilt every frame the block
+    // is visible. The length keeps repeated equal hashes from cancelling out.
+    let mut hasher = DefaultHasher::new();
+    members.len().hash(&mut hasher);
+    for member in members {
+        member.content_hash.hash(&mut hasher);
+    }
+    let members_hash = hasher.finish();
     let body_key = (members_hash, w as u16, app.verbose, app.verbose, true);
     let body = BodySource::Dynamic(DynamicBody::ToolGroup {
         entry_idx: head_idx,
@@ -3820,7 +3907,7 @@ fn tool_group_summary_block(
             .first()
             .expect("a tool group always has a head")
             .id(),
-        sections,
+        sections: Rc::new(sections),
         running,
         all_ok,
     });
@@ -3867,7 +3954,7 @@ fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBl
         unreachable!("only tool members render as tool blocks");
     };
     let small = *done && tool_fits_preview(name, args, result);
-    let full = app.verbose || app.tool_open.contains(id) || small;
+    let full = app.verbose || app.active_tool_is_open(id) || small;
     let body_key = (
         member.content_hash,
         w as u16,
@@ -3875,7 +3962,7 @@ fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBl
         app.verbose,
         full,
     );
-    let body = cached_body(idx, body_key, || {
+    let body = cached_body(app.render_cache_id, idx, body_key, || {
         tool_lines(
             theme,
             name,
@@ -4409,9 +4496,10 @@ mod subagent_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        BLOCK_CACHE, BODY_CACHE, BlockKind, BodySource, ChunkRows, DynamicBody, DynamicFrame, Lent,
-        PendingBlock, Rc, SPINNER, SPINNER_FRAME_MS, cached_block, cached_body, chrome_hash,
-        clear_transcript_cache, entry_content_hash, flush, reset_tool_lines_renders,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, BodySource, Chunk, ChunkRows, DynamicBody,
+        DynamicFrame, Lent, PendingBlock, Rc, SPINNER, SPINNER_FRAME_MS, assembly_entry_visits,
+        cached_assembly, cached_block, cached_body, chrome_hash, clear_transcript_cache,
+        entry_content_hash, flush, reset_assembly_entry_visits, reset_tool_lines_renders,
         tool_lines_renders, transcript_chunks,
     };
     use crate::app::{App, Entry, EntryKind};
@@ -4436,6 +4524,266 @@ mod cache_tests {
         )
         .expect("test app");
         (tmp, app)
+    }
+
+    type ChunkSnapshot = (
+        Vec<String>,
+        usize,
+        Option<usize>,
+        Vec<(usize, super::RowHit)>,
+    );
+
+    fn chunk_snapshot(chunks: Vec<Chunk<'_>>) -> Vec<ChunkSnapshot> {
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                (
+                    chunk.rows.rows().iter().map(ToString::to_string).collect(),
+                    chunk.rows.height(),
+                    chunk.tool_idx,
+                    chunk.row_hits,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interleaved_apps_do_not_share_transcript_assemblies() {
+        clear_transcript_cache();
+        let (_tmp_a, mut app_a) = test_app();
+        let (_tmp_b, mut app_b) = test_app();
+        app_b.dir.clone_from(&app_a.dir);
+        app_a.transcript_mut().clear();
+        app_b.transcript_mut().clear();
+        app_a.transcript_mut().push(Entry::assistant("only app A"));
+        app_b.transcript_mut().push(Entry::assistant("only app B"));
+
+        let (chunks, _, _) = transcript_chunks(&app_a, 80);
+        let first = chunk_snapshot(chunks);
+        let (chunks, _, _) = transcript_chunks(&app_b, 80);
+        let second = chunk_snapshot(chunks);
+        let first_text = format!("{first:?}");
+        let second_text = format!("{second:?}");
+        assert!(first_text.contains("only app A"));
+        assert!(second_text.contains("only app B"));
+        assert!(!second_text.contains("only app A"));
+    }
+
+    #[test]
+    fn unchanged_assembly_skips_entry_scan_and_preserves_chunks() {
+        const ENTRY_COUNT: usize = 12;
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        for index in 0..ENTRY_COUNT {
+            app.transcript_mut()
+                .push(Entry::assistant(format!("static entry {index}")));
+        }
+
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(assembly_entry_visits(), ENTRY_COUNT);
+        let first = (chunk_snapshot(chunks), msg_at, panel_above);
+
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        let second = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert_eq!(
+            assembly_entry_visits(),
+            0,
+            "unchanged frame must not scan transcript entries"
+        );
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn cached_assembly_shares_allocation_on_unchanged_frames() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        app.transcript_mut().push(Entry::assistant("static entry"));
+
+        reset_assembly_entry_visits();
+        let first = cached_assembly(&app, 80, false);
+        assert_eq!(assembly_entry_visits(), 1);
+        reset_assembly_entry_visits();
+        let second = cached_assembly(&app, 80, false);
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(assembly_entry_visits(), 0);
+    }
+
+    #[test]
+    fn header_state_changes_rebuild_assembly_and_height() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        let width = 24;
+        let _ = transcript_chunks(&app, width);
+
+        app.dir = "/a/long/working/directory/that/wraps/the/session/header".to_string();
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, width);
+        assert!(
+            assembly_entry_visits() > 0,
+            "cwd header change must rebuild assembly"
+        );
+        let warm = chunk_snapshot(chunks);
+        assert_eq!(warm[0].1, warm[0].0.len());
+        clear_transcript_cache();
+        let (chunks, cold_msg_at, cold_panel_above) = transcript_chunks(&app, width);
+        assert_eq!(
+            (warm, msg_at, panel_above),
+            (chunk_snapshot(chunks), cold_msg_at, cold_panel_above)
+        );
+
+        let _ = transcript_chunks(&app, width);
+        app.set_active_model_ref("local://a-much-longer-model-name".parse().expect("model"));
+        reset_assembly_entry_visits();
+        let _ = transcript_chunks(&app, width);
+        assert!(
+            assembly_entry_visits() > 0,
+            "active pane model/provider header change must rebuild assembly"
+        );
+
+        let _ = transcript_chunks(&app, width);
+        app.panes.active_pane_mut().effort = Some("high".to_string());
+        reset_assembly_entry_visits();
+        let _ = transcript_chunks(&app, width);
+        assert!(
+            assembly_entry_visits() > 0,
+            "active pane effort header change must rebuild assembly"
+        );
+    }
+
+    #[test]
+    fn assembly_cache_rebuilds_for_transcript_width_queue_and_clear_changes() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::assistant("first static entry"));
+        let _ = transcript_chunks(&app, 80);
+
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::assistant("tail append"));
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "tail append must rebuild assembly"
+        );
+        let appended = (chunk_snapshot(chunks), msg_at, panel_above);
+        assert!(
+            appended
+                .0
+                .iter()
+                .flat_map(|(rows, _, _, _)| rows)
+                .any(|line| line.contains("tail append"))
+        );
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(appended, (chunk_snapshot(chunks), msg_at, panel_above));
+
+        let _ = transcript_chunks(&app, 80);
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 48);
+        assert!(
+            assembly_entry_visits() > 0,
+            "width change must rebuild assembly"
+        );
+        let narrow = (chunk_snapshot(chunks), msg_at, panel_above);
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 48);
+        assert_eq!(narrow, (chunk_snapshot(chunks), msg_at, panel_above));
+
+        let _ = transcript_chunks(&app, 80);
+        app.panes
+            .main_mut()
+            .pending
+            .push("queued message".to_string());
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "queued transition must rebuild final chrome"
+        );
+        let queued = (chunk_snapshot(chunks), msg_at, panel_above);
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(queued, (chunk_snapshot(chunks), msg_at, panel_above));
+
+        let _ = transcript_chunks(&app, 80);
+        clear_transcript_cache();
+        reset_assembly_entry_visits();
+        let _ = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "global cache clear must rebuild assembly"
+        );
+    }
+
+    #[test]
+    fn assembly_cache_rebuilds_for_expansion_view_state() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        app.transcript_mut().push(Entry::now(EntryKind::Tool {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+            result: "tool result".to_string(),
+            ok: true,
+            done: true,
+        }));
+        app.transcript_mut().push(Entry::now(EntryKind::Reasoning {
+            text: "reasoning detail".to_string(),
+            took_ms: Some(1),
+        }));
+        let reasoning_id = app.transcript_mut()[1].id();
+        let _ = transcript_chunks(&app, 80);
+
+        app.active_tool_groups_mut().insert("tool-1".to_string());
+        app.invalidate_transcript_view();
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "group expansion must rebuild assembly"
+        );
+        let group_open = (chunk_snapshot(chunks), msg_at, panel_above);
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(group_open, (chunk_snapshot(chunks), msg_at, panel_above));
+
+        app.active_tool_open_mut().insert("tool-1".to_string());
+        app.invalidate_transcript_view();
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "tool expansion must rebuild assembly"
+        );
+        let tool_open = (chunk_snapshot(chunks), msg_at, panel_above);
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(tool_open, (chunk_snapshot(chunks), msg_at, panel_above));
+
+        app.thinking_open.insert(reasoning_id);
+        app.invalidate_transcript_view();
+        reset_assembly_entry_visits();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert!(
+            assembly_entry_visits() > 0,
+            "reasoning expansion must rebuild assembly"
+        );
+        let reasoning_open = (chunk_snapshot(chunks), msg_at, panel_above);
+        clear_transcript_cache();
+        let (chunks, msg_at, panel_above) = transcript_chunks(&app, 80);
+        assert_eq!(
+            reasoning_open,
+            (chunk_snapshot(chunks), msg_at, panel_above)
+        );
     }
 
     #[test]
@@ -4472,7 +4820,8 @@ mod cache_tests {
 
         let (_, collapsed_msg_at, _) = transcript_chunks(&app, 80);
         assert_eq!(collapsed_msg_at, vec![0]);
-        app.tool_groups.insert("first".to_string());
+        app.active_tool_groups_mut().insert("first".to_string());
+        app.invalidate_transcript_view();
         let (_, expanded_msg_at, _) = transcript_chunks(&app, 80);
         assert_eq!(expanded_msg_at, vec![0]);
     }
@@ -4549,19 +4898,54 @@ mod cache_tests {
         let expected = vec![Line::from(Span::raw("cold render content"))];
 
         // Cold miss — closure must be invoked and its result stored.
-        let cold = cached_body(0, key, || expected.clone());
+        let cold = cached_body(0, 0, key, || expected.clone());
         assert_eq!(
             *cold, expected,
             "cold render must return what the closure produced"
         );
 
         // Warm hit — the cached value must be returned; closure panics if called.
-        let warm = cached_body(0, key, || {
+        let warm = cached_body(0, 0, key, || {
             panic!("closure must not be invoked on a warm cache hit")
         });
         assert_eq!(
             *warm, expected,
             "warm cache hit must return the same rows as the cold render"
+        );
+    }
+
+    #[test]
+    fn identical_tool_growth_remeasures_group_summary_height() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        let tool = || {
+            Entry::now(EntryKind::Tool {
+                id: "same-tool".to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+                result: String::new(),
+                ok: true,
+                done: true,
+            })
+        };
+        for _ in 0..9 {
+            app.panes.main_mut().append_transcript(tool());
+        }
+
+        let (chunks, _, _) = transcript_chunks(&app, 20);
+        let first = chunk_snapshot(chunks);
+        assert_eq!(first[0].1, first[0].0.len());
+
+        app.panes.main_mut().append_transcript(tool());
+        app.panes.main_mut().append_transcript(tool());
+        let (chunks, _, _) = transcript_chunks(&app, 20);
+        let grown = chunk_snapshot(chunks);
+        assert_ne!(first[0].0.len(), grown[0].0.len());
+        assert_eq!(
+            grown[0].1,
+            grown[0].0.len(),
+            "group growth must not reuse a colliding lazy height"
         );
     }
 
@@ -4652,8 +5036,8 @@ mod cache_tests {
         let lines_a = vec![Line::from(Span::raw("entry A — unique content"))];
         let lines_b = vec![Line::from(Span::raw("entry B — unique content"))];
 
-        let r_a = cached_body(10, key_a, || lines_a.clone());
-        let r_b = cached_body(11, key_b, || lines_b.clone());
+        let r_a = cached_body(0, 10, key_a, || lines_a.clone());
+        let r_b = cached_body(0, 11, key_b, || lines_b.clone());
 
         assert_eq!(*r_a, lines_a, "entry 10 must return its own rows");
         assert_eq!(*r_b, lines_b, "entry 11 must return its own rows");
@@ -4676,11 +5060,11 @@ mod cache_tests {
         let before = vec![Line::from(Span::raw("hello"))];
         let after = vec![Line::from(Span::raw("hello world"))];
 
-        let old = cached_body(3, (0x1111, 80, false, false, true), || before.clone());
+        let old = cached_body(0, 3, (0x1111, 80, false, false, true), || before.clone());
         assert_eq!(*old, before);
 
         // Same entry, new content → new key → the slot is re-rendered.
-        let new = cached_body(3, (0x2222, 80, false, false, true), || after.clone());
+        let new = cached_body(0, 3, (0x2222, 80, false, false, true), || after.clone());
         assert_eq!(*new, after, "a changed key must not serve the stale render");
 
         BODY_CACHE.with(|c| {
@@ -4743,7 +5127,7 @@ mod cache_tests {
         });
         app.transcript_mut().push(running.clone());
         if !standalone {
-            app.tool_groups.insert("tool-1".into());
+            app.active_tool_groups_mut().insert("tool-1".into());
         }
 
         let render = |app: &mut App, frame: u64| {
@@ -4855,9 +5239,9 @@ mod cache_tests {
 
         let stale = vec![Line::from(Span::raw("with 1m ago"))];
         let fresh = vec![Line::from(Span::raw("with 2m ago"))];
-        let first = cached_block(5, (body_key, h), || Rc::new(stale.clone()));
+        let first = cached_block(0, 5, (body_key, h), || Rc::new(stale.clone()));
         assert_eq!(*first, stale);
-        let second = cached_block(5, (body_key, h), || Rc::new(fresh.clone()));
+        let second = cached_block(0, 5, (body_key, h), || Rc::new(fresh.clone()));
         assert_eq!(
             *second, stale,
             "same body, same chrome → the block is reused"

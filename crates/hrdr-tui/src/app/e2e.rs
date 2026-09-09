@@ -4615,7 +4615,7 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
     // The group is expanded: the calls fan out and the transcript is tall.
-    h.app.tool_groups.insert("c1".to_string());
+    h.app.active_tool_groups_mut().insert("c1".to_string());
 
     let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4799,7 +4799,7 @@ async fn a_running_call_renders_only_its_summary_until_expanded() {
     );
 
     // Expanding reveals every call — the newest included — as a child item.
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
     let screen = h.render();
     assert!(
         screen.contains("✓ shell") && screen.contains("✓ read"),
@@ -4917,7 +4917,7 @@ async fn an_expanded_group_previews_calls_until_clicked() {
         ok: true,
         done: true,
     }));
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
 
     let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4965,7 +4965,7 @@ async fn clicking_a_call_preview_expands_just_that_call() {
         ok: true,
         done: true,
     }));
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4979,7 +4979,7 @@ async fn clicking_a_call_preview_expands_just_that_call() {
         "clicking the preview expands the full body:\n{screen}"
     );
     assert!(
-        h.app.tool_open.contains("a"),
+        h.app.active_tool_is_open("a"),
         "the clicked call is marked open"
     );
     assert!(
@@ -5026,7 +5026,7 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
         ok: true,
         done: true,
     }));
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
 
     let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5313,7 +5313,7 @@ async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
     );
 
     // Expanded: summary, one blank, then the first call's box.
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
     let row_of = |needle: &str| -> u16 {
@@ -5482,7 +5482,7 @@ async fn an_expanded_group_growing_keeps_the_scrolled_up_viewport() {
     h.app.push_entry(Entry::assistant("PIN-MARKER"));
     h.app.push_entry(tool("a", "shell"));
     h.app.push_entry(tool("b", "read"));
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
     for i in 0..12 {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
@@ -5982,7 +5982,7 @@ async fn toggle_tool_call_pins_the_group_summary_row_not_the_click_row() {
     h.app.push_entry(tool("a", long.clone()));
     h.app.push_entry(tool("b", long.clone()));
     // Expand the group so every call renders as its own block under the summary.
-    h.app.tool_groups.insert("a".to_string());
+    h.app.active_tool_groups_mut().insert("a".to_string());
     let mut term = Terminal::new(TestBackend::new(60, 50)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
@@ -6176,7 +6176,7 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
     }));
     // The lone call collapses behind its summary; fan it out so its box — the
     // surface these background assertions check — renders.
-    h.app.tool_groups.insert("c1".to_string());
+    h.app.active_tool_groups_mut().insert("c1".to_string());
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -9369,7 +9369,9 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
         h.app.push_entry(Entry::user(format!("message {i}")));
     }
     h.render();
-    let first: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    let first: Vec<Option<usize>> = (1..=50)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert!(
         first.iter().all(Option::is_some),
         "every entry should have been laid out once"
@@ -9377,7 +9379,9 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
 
     // A frame that changes nothing must not lay anything out again.
     h.render();
-    let second: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    let second: Vec<Option<usize>> = (1..=50)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert_eq!(first, second, "an idle frame must reuse every block");
 
     // Growing one entry — what streaming does, a token at a time — rebuilds that
@@ -9400,7 +9404,9 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
         .unwrap()
         .refresh_hash();
     h.render();
-    let third: Vec<Option<usize>> = (1..=50).map(crate::ui::block_cache_ptr).collect();
+    let third: Vec<Option<usize>> = (1..=50)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert_ne!(
         second[9], third[9],
         "the entry that changed must be laid out again"
@@ -9424,7 +9430,9 @@ async fn a_theme_switch_invalidates_transcript_cache() {
     // First render populates the block cache. Indices 2=user, 3=assistant
     // (0=header, 1=notice are the initial entries; the header is never cached).
     h.render();
-    let before: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    let before: Vec<Option<usize>> = (2..=3)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert!(
         before.iter().all(Option::is_some),
         "every entry should be cached after one render"
@@ -9435,7 +9443,9 @@ async fn a_theme_switch_invalidates_transcript_cache() {
     h.app.submit_input("/theme catppuccin-mocha".to_string());
 
     // Cache is now empty — old pointers should be gone.
-    let after_cmd: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    let after_cmd: Vec<Option<usize>> = (2..=3)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert!(
         after_cmd.iter().all(Option::is_none),
         "theme switch must clear the render cache: {after_cmd:?}"
@@ -9443,7 +9453,9 @@ async fn a_theme_switch_invalidates_transcript_cache() {
 
     // Re-render builds rows with the new theme.
     h.render();
-    let after_render: Vec<Option<usize>> = (2..=3).map(crate::ui::block_cache_ptr).collect();
+    let after_render: Vec<Option<usize>> = (2..=3)
+        .map(|idx| crate::ui::block_cache_ptr(h.app.render_cache_id, idx))
+        .collect();
     assert!(
         after_render.iter().all(Option::is_some),
         "re-render after theme switch must repopulate the cache"

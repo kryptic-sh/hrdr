@@ -1,7 +1,7 @@
 //! App state, the async event loop, and agent orchestration.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -33,6 +33,14 @@ const USER_SHELL_TIMEOUT_SECS: u64 = 60 * 60 * 24;
 /// into a multi-MB re-wrap-per-frame cost, and a pasted API key is small by
 /// construction, so the cap never binds a real paste.
 const MAX_PASTE_CHARS: usize = 256 * 1024;
+
+fn fresh_render_cache_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        next.checked_add(1)
+    })
+    .expect("TUI render cache ID exhausted")
+}
 
 use crate::theme::Theme;
 
@@ -716,18 +724,23 @@ pub(crate) struct App {
     /// thought's summary) toggles that entry. The group chunk's own calls and
     /// gaps are row-level targets, handled via [`Self::row_hits`].
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
-    /// Tool groups the reader opened (keyed by the head tool-call id). While a
+    /// Tool groups the reader opened (keyed by pane and head tool-call id). While a
     /// group is open its calls render as child items inside its summary; a
     /// click on the summary toggles it. Session-lifetime view state — never
     /// persisted.
-    pub(crate) tool_groups: std::collections::HashSet<String>,
+    pub(crate) tool_groups: HashMap<hrdr_app::PaneId, std::collections::HashSet<String>>,
     /// Individual calls inside an expanded group that the reader opened in
-    /// full (keyed by the tool-call id): every other call shows its preview
+    /// full (keyed by pane and tool-call id): every other call shows its preview
     /// (tail/head) until clicked. `verbose` shows every call in full at once.
-    pub(crate) tool_open: std::collections::HashSet<String>,
+    pub(crate) tool_open: HashMap<hrdr_app::PaneId, std::collections::HashSet<String>>,
     /// Thinking entries the reader opened while reasoning is hidden, keyed by
     /// stable entry identity so pruning cannot retarget an open thought.
     pub(crate) thinking_open: std::collections::HashSet<EntryId>,
+    /// Process-local namespace for this App's thread-local render-cache entries.
+    pub(crate) render_cache_id: u64,
+    /// Monotonic view-state generation for transcript assemblies. Expansion
+    /// toggles increment it instead of hashing their sets on every frame.
+    pub(crate) transcript_view_revision: u64,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
     /// Shared registry of *detached background* sub-agents (a clone of the
@@ -792,6 +805,9 @@ impl App {
         ui: hrdr_app::UiConfig,
         logo: &'static str,
     ) -> Result<Self> {
+        // A new app starts a distinct set of panes but shares this thread's render
+        // caches with the prior instance (notably in in-process test/preview hosts).
+        crate::ui::clear_transcript_cache();
         let identity = config.model.clone();
         // Compute the env-sourced-key warning while `config` is still whole
         // (it is consumed later building the agent); pushed into the transcript
@@ -978,9 +994,11 @@ impl App {
             popup: None,
             end_button: None,
             tool_hits: Vec::new(),
-            tool_groups: std::collections::HashSet::new(),
-            tool_open: std::collections::HashSet::new(),
+            tool_groups: HashMap::new(),
+            tool_open: HashMap::new(),
             thinking_open: std::collections::HashSet::new(),
+            render_cache_id: fresh_render_cache_id(),
+            transcript_view_revision: 0,
             transcript_rect: HitRect {
                 x: 0,
                 y: 0,
@@ -2048,6 +2066,7 @@ impl App {
             if !self.thinking_open.remove(&id) {
                 self.thinking_open.insert(id);
             }
+            self.invalidate_transcript_view();
             return;
         }
         // One expansion level: any click on a grouped tool — the summary
@@ -2060,10 +2079,24 @@ impl App {
             .get(head)
             .and_then(|e| crate::ui::tool_call_id(&e.kind))
             .map(str::to_owned);
-        if let Some(id) = id
-            && !self.tool_groups.remove(&id)
-        {
-            self.tool_groups.insert(id);
+        if let Some(id) = id {
+            let pane = self.panes.active();
+            let removed = self
+                .tool_groups
+                .get_mut(&pane)
+                .is_some_and(|groups| groups.remove(&id));
+            if removed {
+                if self
+                    .tool_groups
+                    .get(&pane)
+                    .is_some_and(|groups| groups.is_empty())
+                {
+                    self.tool_groups.remove(&pane);
+                }
+            } else {
+                self.tool_groups.entry(pane).or_default().insert(id);
+            }
+            self.invalidate_transcript_view();
         }
         // The group's height is about to change; the group chunk's top is the
         // same chunk the click landed on.
@@ -2099,9 +2132,23 @@ impl App {
             .map(|(r, _)| r.y);
         self.pending_scroll_entry = Some(head);
         self.pending_scroll_row = Some(summary_top.unwrap_or(row));
-        if !self.tool_open.remove(&id) {
-            self.tool_open.insert(id);
+        let pane = self.panes.active();
+        let removed = self
+            .tool_open
+            .get_mut(&pane)
+            .is_some_and(|open| open.remove(&id));
+        if removed {
+            if self
+                .tool_open
+                .get(&pane)
+                .is_some_and(|open| open.is_empty())
+            {
+                self.tool_open.remove(&pane);
+            }
+        } else {
+            self.tool_open.entry(pane).or_default().insert(id);
         }
+        self.invalidate_transcript_view();
     }
 
     /// The screen rect of the pane a mouse selection is anchored in — the band
@@ -2577,6 +2624,28 @@ impl App {
         // another pane's open thought must survive main scrollback pruning.
         for entry in &self.panes.main().transcript()[head..keep_start] {
             self.thinking_open.remove(&entry.id());
+            if let EntryKind::Tool { id, .. } = &entry.kind {
+                if let Some(open) = self.tool_open.get_mut(&hrdr_app::PaneId::MAIN) {
+                    open.remove(id);
+                }
+                if let Some(groups) = self.tool_groups.get_mut(&hrdr_app::PaneId::MAIN) {
+                    groups.remove(id);
+                }
+            }
+        }
+        if self
+            .tool_open
+            .get(&hrdr_app::PaneId::MAIN)
+            .is_some_and(|open| open.is_empty())
+        {
+            self.tool_open.remove(&hrdr_app::PaneId::MAIN);
+        }
+        if self
+            .tool_groups
+            .get(&hrdr_app::PaneId::MAIN)
+            .is_some_and(|groups| groups.is_empty())
+        {
+            self.tool_groups.remove(&hrdr_app::PaneId::MAIN);
         }
         self.panes.main_mut().prune_transcript(head..keep_start);
 
@@ -2586,10 +2655,51 @@ impl App {
         crate::ui::clear_transcript_cache();
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_tool_groups_mut(&mut self) -> &mut std::collections::HashSet<String> {
+        self.tool_groups.entry(self.panes.active()).or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_tool_open_mut(&mut self) -> &mut std::collections::HashSet<String> {
+        self.tool_open.entry(self.panes.active()).or_default()
+    }
+
+    pub(crate) fn active_tool_groups(&self) -> Option<&std::collections::HashSet<String>> {
+        self.tool_groups.get(&self.panes.active())
+    }
+
+    pub(crate) fn active_tool_open(&self) -> Option<&std::collections::HashSet<String>> {
+        self.tool_open.get(&self.panes.active())
+    }
+
+    pub(crate) fn active_tool_group_is_open(&self, id: &str) -> bool {
+        self.tool_groups
+            .get(&self.panes.active())
+            .is_some_and(|groups| groups.contains(id))
+    }
+
+    pub(crate) fn active_tool_is_open(&self, id: &str) -> bool {
+        self.tool_open
+            .get(&self.panes.active())
+            .is_some_and(|open| open.contains(id))
+    }
+
+    /// Invalidate assembled transcript views after an expansion state change.
+    pub(crate) fn invalidate_transcript_view(&mut self) {
+        self.transcript_view_revision = self
+            .transcript_view_revision
+            .checked_add(1)
+            .expect("transcript view revision overflow");
+        crate::ui::clear_transcript_cache();
+    }
+
     /// Clear the transcript.
     fn clear_transcript(&mut self) {
         self.panes.main_mut().clear_transcript();
         // A wholesale clear invalidates every index-based view state.
+        self.tool_groups.clear();
+        self.tool_open.clear();
         self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
     }
@@ -3440,7 +3550,7 @@ mod tests {
 
     // ---- /compact acts on the pane you are looking at ----
 
-    use super::App;
+    use super::{App, Entry, EntryKind};
     use hrdr_agent::{AgentConfig, AgentEntry, AgentRegistry, MAIN_KEY, PaneId};
 
     /// An app with one delegated sub-agent registered, whose pane is the one on
@@ -3504,6 +3614,73 @@ mod tests {
         // The cwd goes back with it: an app whose working directory has been
         // deleted saves and reads nothing like a real one.
         (app, key, tmp)
+    }
+
+    #[test]
+    fn pruning_main_does_not_clear_sub_agent_tool_expansion() {
+        let (mut app, _key, _tmp) = app_viewing_a_sub_agent();
+        let id = "shared-tool-id".to_string();
+        app.scrollback = 1;
+        app.active_tool_groups_mut().insert(id.clone());
+        app.active_tool_open_mut().insert(id.clone());
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::now(EntryKind::Tool {
+                id: id.clone(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+                result: String::new(),
+                ok: true,
+                done: true,
+            }));
+
+        app.prune_scrollback();
+
+        assert!(app.active_tool_group_is_open(&id));
+        assert!(app.active_tool_is_open(&id));
+    }
+
+    #[test]
+    fn prune_and_clear_remove_evicted_tool_expansion_state() {
+        let (mut app, _key, _tmp) = app_viewing_a_sub_agent();
+        let id = "evicted-tool".to_string();
+        app.scrollback = 1;
+        app.panes
+            .main_mut()
+            .append_transcript(Entry::now(EntryKind::Tool {
+                id: id.clone(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+                result: String::new(),
+                ok: true,
+                done: true,
+            }));
+        app.tool_groups
+            .entry(PaneId::MAIN)
+            .or_default()
+            .insert(id.clone());
+        app.tool_open
+            .entry(PaneId::MAIN)
+            .or_default()
+            .insert(id.clone());
+        app.prune_scrollback();
+        assert!(
+            !app.tool_groups
+                .get(&PaneId::MAIN)
+                .is_some_and(|groups| groups.contains(&id))
+        );
+        assert!(
+            !app.tool_open
+                .get(&PaneId::MAIN)
+                .is_some_and(|open| open.contains(&id))
+        );
+
+        app.active_tool_groups_mut().insert(id.clone());
+        app.active_tool_open_mut().insert(id);
+        app.clear_transcript();
+        assert!(app.tool_groups.is_empty());
+        assert!(app.tool_open.is_empty());
+        assert!(app.thinking_open.is_empty());
     }
 
     /// That agent's latest `(prompt, completion)` context reading.

@@ -693,7 +693,9 @@ impl super::App {
         // cron whose scheduler is already live is skipped.
         self.with_agent(|a| a.arm_crons());
         // A resumed session is a different transcript — every index-based view
-        // state (opened thoughts) from the session we left is meaningless here.
+        // state (opened thoughts and tools) from the session we left is meaningless here.
+        self.tool_groups.clear();
+        self.tool_open.clear();
         self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
 
