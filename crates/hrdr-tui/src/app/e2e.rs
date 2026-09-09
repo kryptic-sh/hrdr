@@ -5781,8 +5781,6 @@ async fn visible_entries_bound_a_tool_group() {
     // Open both thoughts so they render as visible entries — without
     // `/verbose`, which would also expand the tool group and push the summary
     // off a 40-row viewport.
-    h.app.thinking_open.insert(0);
-    h.app.thinking_open.insert(10);
     let tool = |id: &str, name: &str| {
         Entry::now(EntryKind::Tool {
             id: id.into(),
@@ -5802,6 +5800,8 @@ async fn visible_entries_bound_a_tool_group() {
     h.app.push_entry(tool("r2", "replace"));
     h.app.push_entry(Entry::reasoning("thinking again"));
     h.app.push_entry(Entry::assistant("the output"));
+    h.app.thinking_open.insert(h.app.transcript()[0].id());
+    h.app.thinking_open.insert(h.app.transcript()[10].id());
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5855,12 +5855,12 @@ async fn visible_entries_bound_a_tool_group() {
     );
 }
 
-/// An opened thought survives scrollback pruning, renumbered to its new index —
-/// not folded, and not leaving a stale index that a later Reasoning entry would
-/// inherit uninvited. (The 2026-08-06 correctness finding: `thinking_open` was
-/// keyed by transcript index while `prune_scrollback` shifted every index.)
+/// An opened thought survives scrollback pruning under its stable identity —
+/// not folded, and not leaving stale view state that a later Reasoning entry
+/// would inherit uninvited. (The 2026-08-06 correctness finding: `thinking_open`
+/// was keyed by transcript index while `prune_scrollback` shifted every index.)
 #[tokio::test]
-async fn opened_thought_survives_scrollback_pruning_renumbered() {
+async fn opened_thought_survives_scrollback_pruning() {
     let mut h = Harness::new(vec![]).await;
     h.app
         .transcript_mut()
@@ -5870,7 +5870,8 @@ async fn opened_thought_survives_scrollback_pruning_renumbered() {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
     h.app.push_entry(Entry::reasoning("the opened thought"));
-    h.app.thinking_open.insert(400);
+    let opened_id = h.app.transcript()[400].id();
+    h.app.thinking_open.insert(opened_id);
     // Grow past the 500-entry scrollback cap: each push past it evicts the
     // oldest entry, so 8 evictions land and every surviving index shifts down.
     for i in 0..107 {
@@ -5881,14 +5882,75 @@ async fn opened_thought_survives_scrollback_pruning_renumbered() {
         "the thought survived the pruning at its new index"
     );
     assert!(
-        h.app.thinking_open.contains(&392),
-        "the opened thought stays open, renumbered: {:?}",
+        h.app.thinking_open.contains(&opened_id),
+        "the opened thought stays open: {:?}",
         h.app.thinking_open
     );
     assert_eq!(
         h.app.thinking_open.len(),
         1,
         "no stale index left behind to open a different entry"
+    );
+}
+
+/// Pruning the main transcript must not discard expansion state owned by a
+/// different pane.
+#[tokio::test]
+async fn main_scrollback_pruning_preserves_an_open_subagent_thought() {
+    let mut h = Harness::new(vec![]).await;
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
+    h.app.registry.register(hrdr_agent::AgentEntry {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "review".to_string(),
+        model: "model".to_string(),
+        provider: None,
+        base_url: String::new(),
+        effort: None,
+        auto_compact: true,
+        compaction_reserved: 0,
+        sandbox: hrdr_tools::SandboxMode::None,
+        todos: Default::default(),
+        usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
+        reasoning_open: false,
+        pending_notices: Vec::new(),
+        turn: hrdr_agent::TurnStats::default(),
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: hrdr_agent::steering_queue(),
+        running: true,
+        compacting: false,
+        done: false,
+        delivered: false,
+        pinned: false,
+        transcript: None,
+    });
+    h.app.registry.record(
+        1,
+        &hrdr_agent::AgentEvent::Reasoning("sub-agent thought body".to_string()),
+    );
+    h.app.registry.record(1, &hrdr_agent::AgentEvent::TurnDone);
+    h.app.sync_panes();
+    let thought_id = h.app.panes.pane_for(1).unwrap().transcript()[0].id();
+    h.app.thinking_open.insert(thought_id);
+
+    for i in 0..=h.app.scrollback {
+        h.app
+            .push_entry(Entry::assistant(format!("main filler {i}")));
+    }
+
+    assert!(
+        h.app.thinking_open.contains(&thought_id),
+        "main pruning must not alter another pane's expansion state"
+    );
+    h.app.focus_pane(hrdr_app::PaneId(1));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|frame| ui::draw(frame, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("sub-agent thought body"),
+        "the opened thought remains expanded after main pruning:\n{screen}"
     );
 }
 

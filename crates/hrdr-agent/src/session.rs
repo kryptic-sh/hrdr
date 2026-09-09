@@ -2040,14 +2040,12 @@ mod tests {
             transcript: vec![
                 // As they arrive from serde: content present, hash zeroed.
                 Entry {
-                    kind: EntryKind::User("first".into()),
-                    time: t,
                     content_hash: 0,
+                    ..Entry::at(EntryKind::User("first".into()), t)
                 },
                 Entry {
-                    kind: EntryKind::User("second".into()),
-                    time: t,
                     content_hash: 0,
+                    ..Entry::at(EntryKind::User("second".into()), t)
                 },
             ],
             ..Default::default()

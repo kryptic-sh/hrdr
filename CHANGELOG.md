@@ -6,7 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`Pane` transcript mutations now flow through revision-tracked accessors.**
+  The public `state` field is replaced by `state()` and conservatively
+  invalidating `state_mut()`, while append, prune, clear, replacement, and event
+  reducers report the earliest dirty entry for incremental renderers
+  (`crates/hrdr-agent`).
+
 ### Fixed
+
+- **Cancelling a turn no longer leaves a cached running-tool spinner on
+  screen.** Settling an interrupted tool now refreshes its render identity, so
+  standalone `edit`/`replace` blocks and expanded tool groups redraw as failed
+  instead of reusing animated rows (`crates/hrdr-agent`, `crates/hrdr-tui`).
 
 - **Cron and goal content now drops unsafe control characters at creation and
   session adoption.** Newlines and tabs remain intact, while other Unicode

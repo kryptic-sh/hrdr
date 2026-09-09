@@ -318,7 +318,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     // switches *that* agent's model, and the status bar (which reads the active
     // pane) shows it, because they are the same piece of state.
     fn base_url(&self) -> String {
-        self.app.panes.active_pane().state.base_url.clone()
+        self.app.panes.active_pane().state().base_url.clone()
     }
     fn model_ref(&self) -> hrdr_agent::ModelRef {
         self.app.active_model_ref()
@@ -403,17 +403,17 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     // Usage reads the conversation on screen too: `/status` and `/cost` in a
     // sub-agent's view report what *that* agent has used and cost.
     fn context_usage(&self) -> Option<(u32, u32)> {
-        self.app.panes.active_pane().state.usage.last()
+        self.app.panes.active_pane().state().usage.last()
     }
     fn context_window(&self) -> Option<u32> {
-        self.app.panes.active_pane().state.usage.context_window
+        self.app.panes.active_pane().state().usage.context_window
     }
     fn session_tokens(&self) -> (usize, usize) {
-        let u = &self.app.panes.active_pane().state.usage;
+        let u = &self.app.panes.active_pane().state().usage;
         (u.tokens_in, u.tokens_out)
     }
     fn session_cache(&self) -> Option<(f64, usize, usize)> {
-        let u = &self.app.panes.active_pane().state.usage;
+        let u = &self.app.panes.active_pane().state().usage;
         Some((
             u.cache_hit_rate()?,
             u.cache_read_tokens,
@@ -421,10 +421,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         ))
     }
     fn session_cost(&self) -> f64 {
-        self.app.panes.active_pane().state.usage.cost_usd
+        self.app.panes.active_pane().state().usage.cost_usd
     }
     fn session_cost_partial(&self) -> bool {
-        self.app.panes.active_pane().state.usage.cost_partial
+        self.app.panes.active_pane().state().usage.cost_partial
     }
     fn set_effort(&mut self, label: Option<String>) {
         // Effort is the agent's; it publishes the change back into the chrome.

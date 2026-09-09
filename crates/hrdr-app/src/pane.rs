@@ -55,7 +55,7 @@ mod tests {
 
         // The row names the *agent*, not the session — naming it after the session
         // (which the status bar already shows) says nothing about which agent it is.
-        panes.main_mut().state.name = "my session".to_string();
+        panes.main_mut().state_mut().name = "my session".to_string();
         assert_eq!(pane_rows(&panes)[0].title, "main");
     }
 }

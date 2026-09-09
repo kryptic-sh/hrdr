@@ -1437,7 +1437,7 @@ fn loader_line(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
     let frame = spinner_frame(elapsed);
     let speed = turn.tok_per_sec();
 
-    let ctx = match pane.state.usage.last() {
+    let ctx = match pane.state().usage.last() {
         Some((prompt, completion)) => {
             let ratio = if completion > 0 {
                 prompt as f64 / completion as f64
@@ -1812,10 +1812,10 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
     let inputs = hrdr_app::StatusInputs {
         dir: &app.dir,
         branch: app.branch.as_deref(),
-        tokens_in: pane.state.usage.tokens_in,
-        tokens_out: pane.state.usage.tokens_out,
-        ctx_used: pane.state.usage.ctx_used(),
-        context_window: pane.state.usage.context_window,
+        tokens_in: pane.state().usage.tokens_in,
+        tokens_out: pane.state().usage.tokens_out,
+        ctx_used: pane.state().usage.ctx_used(),
+        context_window: pane.state().usage.context_window,
         // Both belong to the agent being shown: they set where *its* gauge turns
         // red, and a sub-agent on a 64k local model has its own threshold.
         auto_compact_enabled: pane.auto_compact,
@@ -3070,7 +3070,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // every block at once, `reasoning_open` one at a time.
         let reasoning_open = matches!(
             &entry.kind,
-            EntryKind::Reasoning { .. } if !app.verbose && app.thinking_open.contains(&i)
+            EntryKind::Reasoning { .. } if !app.verbose && app.thinking_open.contains(&entry.id())
         );
         // A hidden thought is always clickable — collapsed, clicking it opens
         // the block; open, clicking it folds it back.
@@ -4447,7 +4447,7 @@ mod cache_tests {
             ok: true,
             done: true,
         });
-        app.transcript_mut().push(running);
+        app.transcript_mut().push(running.clone());
         if !standalone {
             app.tool_groups.insert("tool-1".into());
         }
@@ -4511,6 +4511,25 @@ mod cache_tests {
             tool_lines_renders(),
             3,
             "completion rebuilds static tool rows once and settled ticks reuse them"
+        );
+
+        app.transcript_mut()[0] = running;
+        let cancelled_running_rows = render(&mut app, 0);
+        assert!(
+            SPINNER
+                .iter()
+                .any(|mark| cancelled_running_rows.contains(mark)),
+            "the warmed cancellation case starts with running chrome"
+        );
+        hrdr_agent::settle_restored_entries(app.transcript_mut());
+        let cancelled_rows = render(&mut app, 0);
+        assert!(
+            cancelled_rows.contains('✗'),
+            "settlement must invalidate the running body and render failure: {cancelled_rows}"
+        );
+        assert!(
+            !SPINNER.iter().any(|mark| cancelled_rows.contains(mark)),
+            "no running marker may survive settlement: {cancelled_rows}"
         );
     }
 

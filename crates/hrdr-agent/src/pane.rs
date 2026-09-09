@@ -14,7 +14,9 @@
 //! it, so every view is assembled by exactly the same rules: assistant text
 //! coalesces, reasoning coalesces, tool calls open and close.
 
-use crate::{AgentEntry, AgentEvent, AgentRegistry, Entry, SessionState, apply_event};
+use crate::{
+    AgentEntry, AgentEvent, AgentRegistry, Entry, SessionState, TranscriptMutation, apply_event,
+};
 
 /// Which conversation a pane is: the [`crate::AgentEntry::key`] of the agent it
 /// shows. The session's own agent is [`PaneId::MAIN`] and is a key like any
@@ -66,7 +68,7 @@ pub struct Pane {
     /// sub-agent has all of those things too. It is what makes the status bar able
     /// to describe *the agent you are looking at* rather than always describing the
     /// main one, and what a sub-agent's own state file will serialize.
-    pub state: SessionState,
+    state: SessionState,
     /// How many of this agent's recorded events have been folded into the
     /// transcript above. [`PaneSet::sync`] replays the rest.
     ///
@@ -75,6 +77,10 @@ pub struct Pane {
     /// transcript is rebuilt from the agent's own record rather than assembled from
     /// whatever the frontend happened to be listening for at the time.
     consumed: usize,
+    /// Monotonic generation of visible transcript changes.
+    transcript_revision: u64,
+    /// Earliest entry invalidated since the observer acknowledged this revision.
+    dirty_from: Option<usize>,
     /// The clock on this agent's current turn — what its loader shows: whether it
     /// is inferring, how long it has worked, its throughput, its time-to-first-token.
     ///
@@ -133,8 +139,82 @@ impl Pane {
     /// Fold one of this pane's agent events into its transcript *and* its
     /// counters — the two things an event says about the agent it came from.
     pub fn apply(&mut self, ev: &AgentEvent) {
-        apply_event(&mut self.state.transcript, ev);
+        let mutation = apply_event(&mut self.state.transcript, ev);
+        self.record_mutation(mutation);
         self.state.usage.record_event(ev);
+    }
+
+    fn record_mutation(&mut self, mutation: TranscriptMutation) {
+        let Some(index) = mutation.earliest_dirty else {
+            return;
+        };
+        self.transcript_revision = self
+            .transcript_revision
+            .checked_add(1)
+            .expect("transcript revision exhausted");
+        self.dirty_from = Some(self.dirty_from.map_or(index, |old| old.min(index)));
+    }
+
+    /// Current visible-transcript revision.
+    pub fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    /// Earliest invalidated entry since `observed_revision`, with the current
+    /// revision. A cache acknowledges the returned revision after consuming it.
+    pub fn transcript_dirty_since(&self, observed_revision: u64) -> Option<(u64, usize)> {
+        (observed_revision != self.transcript_revision)
+            .then_some((self.transcript_revision, self.dirty_from.unwrap_or(0)))
+    }
+
+    /// Acknowledge all invalidation through `revision`. Stale acknowledgements do
+    /// nothing, so a renderer cannot erase mutations it has not observed.
+    pub fn acknowledge_transcript_revision(&mut self, revision: u64) {
+        if revision == self.transcript_revision {
+            self.dirty_from = None;
+        }
+    }
+
+    /// Append one entry, invalidating only the new tail entry.
+    pub fn append_transcript(&mut self, entry: Entry) {
+        let index = self.state.transcript.len();
+        self.state.transcript.push(entry);
+        self.record_mutation(TranscriptMutation::changed(index));
+    }
+
+    /// Clear the transcript. Reordering/removing entries is full invalidation.
+    pub fn clear_transcript(&mut self) {
+        if !self.state.transcript.is_empty() {
+            self.state.transcript.clear();
+            self.record_mutation(TranscriptMutation::changed(0));
+        }
+    }
+
+    /// Remove a range of entries. Index shifts make this a full invalidation.
+    pub fn prune_transcript(&mut self, range: std::ops::Range<usize>) {
+        let end = range.end.min(self.state.transcript.len());
+        if range.start < end {
+            self.state.transcript.drain(range.start..end);
+            self.record_mutation(TranscriptMutation::changed(0));
+        }
+    }
+
+    /// Replace the transcript wholesale. Restores and reorderings are full invalidations.
+    pub fn replace_transcript(&mut self, entries: Vec<Entry>) {
+        self.state.transcript = entries;
+        self.record_mutation(TranscriptMutation::changed(0));
+    }
+
+    /// This pane's state.
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+
+    /// Mutable access to this pane's state. Because [`SessionState`] includes the
+    /// transcript, taking this escape hatch conservatively invalidates every row.
+    pub fn state_mut(&mut self) -> &mut SessionState {
+        self.record_mutation(TranscriptMutation::changed(0));
+        &mut self.state
     }
 
     /// This pane's live transcript.
@@ -143,6 +223,7 @@ impl Pane {
     }
 
     pub fn transcript_mut(&mut self) -> &mut Vec<Entry> {
+        self.record_mutation(TranscriptMutation::changed(0));
         &mut self.state.transcript
     }
 
@@ -211,6 +292,8 @@ impl Default for PaneSet {
                 tool_id: None,
                 delegation: None,
                 consumed: 0,
+                transcript_revision: 0,
+                dirty_from: None,
                 view: PaneView::default(),
             }],
             active: PaneId::MAIN,
@@ -372,6 +455,8 @@ impl PaneSet {
                         tool_id: None,
                         delegation: None,
                         consumed: 0,
+                        transcript_revision: 0,
+                        dirty_from: None,
                         view: PaneView::default(),
                     });
                     self.panes.last_mut().expect("just pushed")
@@ -414,7 +499,8 @@ impl PaneSet {
             let from = pane.consumed;
             if let Some((events, next)) = live.events_since(key, from) {
                 for ev in &events {
-                    apply_replayed(&mut pane.state.transcript, ev, &delegations);
+                    let mutation = apply_replayed(&mut pane.state.transcript, ev, &delegations);
+                    pane.record_mutation(mutation);
                 }
                 pane.consumed = next;
                 // Folded in — the agent may release them.
@@ -573,7 +659,11 @@ fn pane_holds(entry: &AgentEntry, pane: &Pane) -> bool {
 /// make the parent's transcript a second, flattened copy of a conversation that
 /// has a transcript of its own. The model still receives the real result; this is
 /// only what is *shown*.
-fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, delegations: &[(String, String)]) {
+fn apply_replayed(
+    transcript: &mut Vec<Entry>,
+    ev: &AgentEvent,
+    delegations: &[(String, String)],
+) -> TranscriptMutation {
     let delegated = |tid: &str| {
         delegations
             .iter()
@@ -581,18 +671,18 @@ fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, delegations: &[(
             .map(|(_, d)| d.clone())
     };
     match ev {
-        AgentEvent::ToolOutput { id, .. } if delegated(id).is_some() => {}
-        AgentEvent::ToolEnd { id, name, ok, .. } if delegated(id).is_some() => {
-            apply_event(
-                transcript,
-                &AgentEvent::ToolEnd {
-                    id: id.clone(),
-                    name: name.clone(),
-                    result: format!("↳ delegated to {}", delegated(id).unwrap_or_default()),
-                    ok: *ok,
-                },
-            );
-        }
+        AgentEvent::ToolOutput { id, .. } if delegated(id).is_some() => TranscriptMutation {
+            earliest_dirty: crate::transcript::finish_open_reasoning_at(transcript),
+        },
+        AgentEvent::ToolEnd { id, name, ok, .. } if delegated(id).is_some() => apply_event(
+            transcript,
+            &AgentEvent::ToolEnd {
+                id: id.clone(),
+                name: name.clone(),
+                result: format!("↳ delegated to {}", delegated(id).unwrap_or_default()),
+                ok: *ok,
+            },
+        ),
         _ => apply_event(transcript, ev),
     }
 }
@@ -678,6 +768,85 @@ mod tests {
         live.prune();
         panes.sync(&live);
         assert!(!panes.show_switcher());
+    }
+
+    #[test]
+    fn mutable_state_access_conservatively_invalidates_the_transcript() {
+        let mut panes = PaneSet::new();
+        let pane = panes.main_mut();
+        pane.state_mut()
+            .transcript
+            .push(Entry::assistant("through state"));
+
+        assert_eq!(pane.transcript_dirty_since(0), Some((1, 0)));
+    }
+
+    #[test]
+    fn replayed_delegated_output_still_settles_reasoning() {
+        let mut transcript = vec![Entry::reasoning("thought")];
+        let delegations = vec![("task-id".to_string(), "review · model".to_string())];
+
+        let mutation = apply_replayed(
+            &mut transcript,
+            &AgentEvent::ToolOutput {
+                id: "task-id".to_string(),
+                chunk: "suppressed output".to_string(),
+            },
+            &delegations,
+        );
+
+        assert_eq!(mutation.earliest_dirty, Some(0));
+        assert!(matches!(
+            transcript[0].kind,
+            EntryKind::Reasoning {
+                took_ms: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(transcript.len(), 1, "delegated output remains suppressed");
+    }
+
+    #[test]
+    fn prune_clamps_a_range_past_the_transcript_end() {
+        let mut panes = PaneSet::new();
+        let pane = panes.main_mut();
+        pane.append_transcript(Entry::assistant("zero"));
+        pane.append_transcript(Entry::assistant("one"));
+        pane.append_transcript(Entry::assistant("two"));
+
+        pane.prune_transcript(1..usize::MAX);
+
+        assert_eq!(pane.transcript().len(), 1);
+        assert!(matches!(
+            &pane.transcript()[0].kind,
+            EntryKind::Assistant(text) if text == "zero"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "transcript revision exhausted")]
+    fn transcript_revision_exhaustion_fails_loudly() {
+        let mut panes = PaneSet::new();
+        let pane = panes.main_mut();
+        pane.transcript_revision = u64::MAX;
+        pane.append_transcript(Entry::assistant("overflow"));
+    }
+
+    #[test]
+    fn pane_coalesces_dirty_boundaries_until_acknowledged() {
+        let mut pane = PaneSet::new();
+        let pane = pane.main_mut();
+        assert_eq!(pane.transcript_dirty_since(0), None);
+        pane.append_transcript(Entry::assistant("one"));
+        assert_eq!(pane.transcript_dirty_since(0), Some((1, 0)));
+        pane.apply(&AgentEvent::Text(" two".into()));
+        assert_eq!(pane.transcript_dirty_since(0), Some((2, 0)));
+        pane.acknowledge_transcript_revision(1);
+        assert_eq!(pane.transcript_dirty_since(0), Some((2, 0)));
+        pane.acknowledge_transcript_revision(2);
+        assert_eq!(pane.transcript_dirty_since(2), None);
+        let _ = pane.transcript_mut();
+        assert_eq!(pane.transcript_dirty_since(2), Some((3, 0)));
     }
 
     #[test]

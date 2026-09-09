@@ -13,6 +13,32 @@ use crate::AgentEvent;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Stable, process-local identity of one rendered transcript entry.
+///
+/// This is deliberately not persisted: restoring a session creates fresh entry
+/// identities, while cloning an entry preserves the identity of that logical row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EntryId(u64);
+
+impl EntryId {
+    fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("transcript entry ID exhausted");
+        Self(id)
+    }
+}
+
+impl Default for EntryId {
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
 
 /// One rendered item in the transcript, stamped with the local time it was
 /// added. Serializes as a flat object: `{"kind": "user", "data": "hi",
@@ -29,6 +55,9 @@ pub struct Entry {
     /// Computed on construction and refreshed on mutation. Never serialized.
     #[serde(skip, default)]
     pub content_hash: u64,
+    /// Stable process-local identity, regenerated when a persisted entry is restored.
+    #[serde(skip, default)]
+    pub(crate) id: EntryId,
 }
 
 impl PartialEq for Entry {
@@ -87,6 +116,7 @@ impl Entry {
             kind,
             time: Local::now(),
             content_hash,
+            id: EntryId::fresh(),
         }
     }
 
@@ -97,7 +127,13 @@ impl Entry {
             kind,
             time,
             content_hash,
+            id: EntryId::fresh(),
         }
+    }
+
+    /// This entry's stable process-local identity.
+    pub fn id(&self) -> EntryId {
+        self.id
     }
 
     /// The banner that opens a new session.
@@ -232,6 +268,7 @@ pub fn settle_restored_entries(entries: &mut [Entry]) {
             EntryKind::Tool { ok, done, .. } if !*done => {
                 *done = true;
                 *ok = false;
+                e.refresh_hash();
             }
             EntryKind::Reasoning {
                 took_ms: took @ None,
@@ -517,36 +554,62 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
 /// one `read` of a big file drowns the run around it.
 pub const TRANSCRIPT_TOOL_BODY_MAX: usize = 600;
 
+/// What a reducer application changed. `earliest_dirty` is `None` when the event
+/// caused no rendered transcript change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptMutation {
+    pub earliest_dirty: Option<usize>,
+}
+
+impl TranscriptMutation {
+    pub fn changed(index: usize) -> Self {
+        Self {
+            earliest_dirty: Some(index),
+        }
+    }
+
+    fn include(&mut self, index: Option<usize>) {
+        if let Some(index) = index {
+            self.earliest_dirty = Some(self.earliest_dirty.map_or(index, |old| old.min(index)));
+        }
+    }
+}
+
 /// Fold an agent event into a transcript. The shared reducer behind every pane —
 /// the main agent's stream and a sub-agent's stream are assembled by the same
 /// rules, so a sub-agent's view reads exactly like the main one.
 ///
-/// Only transcript-visible events do anything; `Usage`, `History` and `TurnDone`
-/// carry no transcript content and are ignored here (a frontend still handles
-/// them for its own bookkeeping).
-pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
-    // Close an open reasoning block as soon as anything else arrives, so its
-    // duration label stops streaming.
+/// Events without their own transcript row can still settle an open reasoning
+/// block. The returned boundary is the earliest entry whose rendering may have
+/// changed.
+pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) -> TranscriptMutation {
+    let mut mutation = TranscriptMutation::default();
     if !matches!(ev, AgentEvent::Reasoning(_)) {
-        finish_open_reasoning(transcript);
+        mutation.include(finish_open_reasoning_at(transcript));
     }
     match ev {
         AgentEvent::Text(t) => {
-            let mut mutated = false;
-            if let Some(last) = transcript.last_mut()
-                && let EntryKind::Assistant(s) = &mut last.kind
+            if !t.is_empty()
+                && let Some((index, last)) = transcript
+                    .iter_mut()
+                    .enumerate()
+                    .last()
+                    .filter(|(_, entry)| matches!(entry.kind, EntryKind::Assistant(_)))
             {
-                s.push_str(t);
-                last.fold_content_hash(t);
-                mutated = true;
-            }
-            if !mutated && !t.is_empty() {
+                if let EntryKind::Assistant(s) = &mut last.kind {
+                    s.push_str(t);
+                    last.fold_content_hash(t);
+                    mutation.include(Some(index));
+                }
+            } else if !t.is_empty() {
+                let index = transcript.len();
                 transcript.push(Entry::assistant(t.clone()));
+                mutation.include(Some(index));
             }
         }
         AgentEvent::Reasoning(t) => {
-            let mut mutated = false;
-            if let Some(last) = transcript.last_mut()
+            if !t.is_empty()
+                && let Some((index, last)) = transcript.iter_mut().enumerate().last()
                 && let EntryKind::Reasoning {
                     text,
                     took_ms: None,
@@ -554,21 +617,15 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
             {
                 text.push_str(t);
                 last.fold_content_hash(t);
-                mutated = true;
-            }
-            // Same `!is_empty` guard the `Text` arm above uses, and for a
-            // sharper reason: an empty reasoning entry renders as nothing, but
-            // it still lands at the tail of the transcript, and `Text` only
-            // coalesces when the last entry is `Assistant`. So an empty delta
-            // would silently split one streamed reply into a separate block per
-            // chunk. Servers do emit these — a Qwen3-style backend keeps sending
-            // `reasoning_content: ""` on every content chunk once it stops
-            // thinking, where other providers omit the field entirely.
-            if !mutated && !t.is_empty() {
+                mutation.include(Some(index));
+            } else if !t.is_empty() {
+                let index = transcript.len();
                 transcript.push(Entry::reasoning(t.clone()));
+                mutation.include(Some(index));
             }
         }
         AgentEvent::ToolStart { id, name, args } => {
+            let index = transcript.len();
             transcript.push(Entry::at(
                 EntryKind::Tool {
                     id: id.clone(),
@@ -580,13 +637,16 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 },
                 chrono::Local::now(),
             ));
+            mutation.include(Some(index));
         }
         AgentEvent::ToolOutput { id, chunk } => {
-            if let Some(entry) = open_tool(transcript, id)
+            if !chunk.is_empty()
+                && let Some((index, entry)) = open_tool(transcript, id)
                 && let EntryKind::Tool { result, .. } = &mut entry.kind
             {
                 result.push_str(chunk);
                 entry.fold_content_hash(chunk);
+                mutation.include(Some(index));
             }
         }
         AgentEvent::ToolEnd {
@@ -595,7 +655,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
             ok,
             name: _,
         } => {
-            if let Some(entry) = open_tool(transcript, id)
+            if let Some((index, entry)) = open_tool(transcript, id)
                 && let EntryKind::Tool {
                     result: r,
                     ok: o,
@@ -607,31 +667,36 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 *o = *ok;
                 *done = true;
                 entry.refresh_hash();
+                mutation.include(Some(index));
             }
         }
-        // An agent's notice (an error, an MCP warning, an exhausted step budget) is
-        // something the agent said about the run, so it is a system line and it
-        // persists — unlike frontend chrome (`Entry::notice`), which is stripped
-        // from a saved session.
-        AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
-        // A steered message is a real user turn in this conversation.
-        AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
+        AgentEvent::Notice(text) => {
+            let index = transcript.len();
+            transcript.push(Entry::system(text.clone()));
+            mutation.include(Some(index));
+        }
+        AgentEvent::Steered(sent) => {
+            let index = transcript.len();
+            transcript.push(Entry::user(sent.clone()));
+            mutation.include(Some(index));
+        }
         AgentEvent::Usage { .. }
         | AgentEvent::History(_)
         | AgentEvent::TurnDone
         | AgentEvent::TodoUpdated(_) => {}
     }
+    mutation
 }
 
 /// The still-open tool entry with `id`, searched from the end (a tool id is
 /// unique within a turn, and the newest match is the live one).
-fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
-    transcript.iter_mut().rev().find(|e| {
+fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<(usize, &'a mut Entry)> {
+    transcript.iter_mut().enumerate().rev().find(|(_, e)| {
         matches!(&e.kind, EntryKind::Tool {
-        id: tid,
-        done: false,
-        ..
-    } if tid == id)
+            id: tid,
+            done: false,
+            ..
+        } if tid == id)
     })
 }
 
@@ -649,9 +714,11 @@ fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry>
 /// would have closed it is never coming, but the entry is still the live one
 /// the stream built, so its `time` is a genuine open time.
 pub fn finish_open_reasoning(transcript: &mut [Entry]) {
-    let Some(entry) = transcript.last_mut() else {
-        return;
-    };
+    let _ = finish_open_reasoning_at(transcript);
+}
+
+pub(crate) fn finish_open_reasoning_at(transcript: &mut [Entry]) -> Option<usize> {
+    let (index, entry) = transcript.iter_mut().enumerate().last()?;
     // How long the block was open, from its own timestamp. The reducer stamps this
     // because the reducer is what closes the block: every agent's thinking time is
     // then measured the same way, wherever its events were folded. It used to be a
@@ -666,7 +733,9 @@ pub fn finish_open_reasoning(transcript: &mut [Entry]) {
     {
         let ms = (chrono::Local::now() - opened_at).num_milliseconds();
         *took = Some(ms.max(0) as u64);
+        return Some(index);
     }
+    None
 }
 
 #[cfg(test)]
@@ -702,6 +771,24 @@ mod tests {
         assert!(txt.contains("[welcome]"));
         assert!(!txt.contains("thinking")); // reasoning dropped
         assert!(!txt.ends_with('\n')); // trailing whitespace trimmed
+    }
+
+    #[test]
+    fn entry_identity_is_process_local_and_not_serialized() {
+        let entry = Entry::at(
+            EntryKind::Assistant("hello".into()),
+            time_from_unix(1_700_000_000, Local::now()),
+        );
+        let clone = entry.clone();
+        let other = Entry::assistant("hello");
+        assert_eq!(entry.id(), clone.id());
+        assert_ne!(entry.id(), other.id());
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("\"id\""));
+        let restored: Entry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, restored, "identity does not change entry equality");
+        assert_ne!(entry.id(), restored.id());
     }
 
     #[test]
@@ -936,6 +1023,142 @@ mod apply_event_tests {
             name: name.to_string(),
             args: "{}".to_string(),
         }
+    }
+
+    #[test]
+    fn invisible_events_settle_open_reasoning() {
+        let events = [
+            AgentEvent::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                decode_ms: 0,
+                cached_prompt_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
+                session_cost_usd: None,
+                cost_partial: false,
+            },
+            AgentEvent::History(std::sync::Arc::new(Vec::new())),
+            AgentEvent::TurnDone,
+            AgentEvent::TodoUpdated(Vec::new()),
+        ];
+
+        for event in events {
+            let mut transcript = vec![Entry::reasoning("thought")];
+            assert_eq!(
+                apply_event(&mut transcript, &event).earliest_dirty,
+                Some(0),
+                "{event:?} must invalidate the reasoning row it settles"
+            );
+            assert!(
+                matches!(
+                    transcript[0].kind,
+                    EntryKind::Reasoning {
+                        took_ms: Some(_),
+                        ..
+                    }
+                ),
+                "{event:?} must settle open reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_tool_output_does_not_dirty_an_open_tool() {
+        let mut transcript = Vec::new();
+        apply_event(&mut transcript, &tool_start("tool", "shell"));
+
+        assert_eq!(
+            apply_event(
+                &mut transcript,
+                &AgentEvent::ToolOutput {
+                    id: "tool".into(),
+                    chunk: String::new(),
+                },
+            )
+            .earliest_dirty,
+            None
+        );
+        assert_eq!(
+            apply_event(
+                &mut transcript,
+                &AgentEvent::ToolOutput {
+                    id: "missing".into(),
+                    chunk: String::new(),
+                },
+            )
+            .earliest_dirty,
+            None
+        );
+
+        let mut reasoning = vec![Entry::reasoning("thought")];
+        assert_eq!(
+            apply_event(
+                &mut reasoning,
+                &AgentEvent::ToolOutput {
+                    id: "missing".into(),
+                    chunk: String::new(),
+                },
+            )
+            .earliest_dirty,
+            Some(0),
+            "the empty chunk still settles open reasoning"
+        );
+    }
+
+    #[test]
+    fn reducer_reports_earliest_visible_change() {
+        let mut transcript = vec![Entry::reasoning("thought")];
+        assert_eq!(
+            apply_event(&mut transcript, &AgentEvent::Text("answer".into())).earliest_dirty,
+            Some(0),
+            "settling the thought precedes the appended answer"
+        );
+        assert_eq!(
+            apply_event(&mut transcript, &AgentEvent::Text(" more".into())).earliest_dirty,
+            Some(1)
+        );
+        assert_eq!(
+            apply_event(&mut transcript, &tool_start("tool", "shell")).earliest_dirty,
+            Some(2)
+        );
+        assert_eq!(
+            apply_event(
+                &mut transcript,
+                &AgentEvent::ToolOutput {
+                    id: "tool".into(),
+                    chunk: "out".into()
+                }
+            )
+            .earliest_dirty,
+            Some(2)
+        );
+        assert_eq!(
+            apply_event(
+                &mut transcript,
+                &AgentEvent::ToolEnd {
+                    id: "tool".into(),
+                    name: "shell".into(),
+                    result: "done".into(),
+                    ok: true,
+                }
+            )
+            .earliest_dirty,
+            Some(2)
+        );
+        assert_eq!(
+            apply_event(&mut transcript, &AgentEvent::Notice("notice".into())).earliest_dirty,
+            Some(3)
+        );
+        assert_eq!(
+            apply_event(&mut transcript, &AgentEvent::Steered("steer".into())).earliest_dirty,
+            Some(4)
+        );
+        assert_eq!(
+            apply_event(&mut transcript, &AgentEvent::TurnDone).earliest_dirty,
+            None
+        );
     }
 
     #[test]

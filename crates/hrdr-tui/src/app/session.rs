@@ -566,7 +566,9 @@ impl super::App {
                 (!cron.content.is_empty()).then_some(cron)
             })
             .collect();
+        let transcript = std::mem::take(&mut state.transcript);
         *self.state_mut() = state;
+        self.panes.main_mut().replace_transcript(transcript);
         // A first-save reservation pending for the session we just left is
         // stale: `promote_pending_save`'s id guard drops that snapshot, so its
         // `.id.lock` must go too (dropping the reservation removes it).

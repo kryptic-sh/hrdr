@@ -212,6 +212,7 @@ pub(crate) enum SelectionArea {
 
 // The transcript item model + its representation-independent queries
 // (search/count/export) live in the shared `hrdr-app` core.
+use hrdr_agent::EntryId;
 pub(crate) use hrdr_app::{Entry, EntryKind};
 
 /// Messages from the background agent task back to the UI loop.
@@ -724,14 +725,9 @@ pub(crate) struct App {
     /// full (keyed by the tool-call id): every other call shows its preview
     /// (tail/head) until clicked. `verbose` shows every call in full at once.
     pub(crate) tool_open: std::collections::HashSet<String>,
-    /// Thinking entries the reader opened while reasoning is hidden: a
-    /// collapsed `✓ Thought for 1m 32s · 2m ago` summary shows its full block
-    /// instead. Keyed by the entry's transcript index — not its content hash,
-    /// which changes as a streaming thought's text grows and would silently
-    /// fold the open thought back on the next token; indices are stable for a
-    /// session (nothing truncates the transcript). `verbose` (via `/verbose on`)
-    /// shows every thought at once.
-    pub(crate) thinking_open: std::collections::HashSet<usize>,
+    /// Thinking entries the reader opened while reasoning is hidden, keyed by
+    /// stable entry identity so pruning cannot retarget an open thought.
+    pub(crate) thinking_open: std::collections::HashSet<EntryId>,
     /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
     /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
     /// Shared registry of *detached background* sub-agents (a clone of the
@@ -906,7 +902,7 @@ impl App {
             registry,
             panes: {
                 let mut panes = hrdr_app::PaneSet::new();
-                panes.main_mut().state = state;
+                *panes.main_mut().state_mut() = state;
                 panes
             },
             session_notice_pending: false,
@@ -2048,8 +2044,9 @@ impl App {
         // entry's transcript index (its content hash moves as the text
         // streams, which would un-key an open thought mid-stream).
         if let EntryKind::Reasoning { .. } = &transcript[hit].kind {
-            if !self.thinking_open.remove(&hit) {
-                self.thinking_open.insert(hit);
+            let id = transcript[hit].id();
+            if !self.thinking_open.remove(&id) {
+                self.thinking_open.insert(id);
             }
             return;
         }
@@ -2308,11 +2305,11 @@ impl App {
     /// agent has one. The status bar reads whichever pane is active
     /// ([`hrdr_app::PaneSet::active_pane`]); this is simply the main one by name.
     pub(crate) fn state(&self) -> &hrdr_app::SessionState {
-        &self.panes.main().state
+        self.panes.main().state()
     }
 
     pub(crate) fn state_mut(&mut self) -> &mut hrdr_app::SessionState {
-        &mut self.panes.main_mut().state
+        self.panes.main_mut().state_mut()
     }
 
     /// Reconcile the pane list against the agent's live sub-agents, and refresh
@@ -2471,17 +2468,22 @@ impl App {
         // onto the entry. The registry is what the pane is rebuilt from every
         // frame, main agent included — a pane-only write would be undone at the
         // next draw.
-        let mut s = std::mem::take(&mut pane.state);
-        f(&mut s);
-        self.registry.update(key, |e| {
-            e.model = s.model.model().to_string();
-            e.provider = Some(s.model.provider().to_string());
-            e.base_url = s.base_url.clone();
-            e.usage = s.usage;
+        let (model, provider, base_url, usage) = {
+            let state = pane.state_mut();
+            f(state);
+            (
+                state.model.model().to_string(),
+                Some(state.model.provider().to_string()),
+                state.base_url.clone(),
+                state.usage,
+            )
+        };
+        self.registry.update(key, |entry| {
+            entry.model = model;
+            entry.provider = provider;
+            entry.base_url = base_url;
+            entry.usage = usage;
         });
-        if let Some(p) = self.panes.pane_mut(id) {
-            p.state = s;
-        }
     }
 
     fn update_active_chrome(&mut self, f: impl FnOnce(&mut hrdr_app::SessionState)) {
@@ -2529,7 +2531,7 @@ impl App {
     /// main pane's transcript. Notices no longer pass through here — they go to
     /// the toast stack ([`Self::system`]) or an Esc-dismissible popup.
     fn push_entry(&mut self, e: Entry) {
-        self.panes.main_mut().transcript_mut().push(e);
+        self.panes.main_mut().append_transcript(e);
         self.prune_scrollback();
     }
 
@@ -2538,7 +2540,7 @@ impl App {
     /// welcome/config/project-docs notices — see `App::new`) is always kept
     /// so the user never loses the intro banner.
     fn prune_scrollback(&mut self) {
-        if self.panes.main_mut().transcript_mut().len() <= self.scrollback {
+        if self.panes.main().transcript().len() <= self.scrollback {
             return;
         }
         // Count leading `Header`/`Notice` entries: they form the intro block
@@ -2562,44 +2564,22 @@ impl App {
             .len()
             .saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
-        let remove = excess.min(
-            self.panes
-                .main_mut()
-                .transcript_mut()
-                .len()
-                .saturating_sub(head),
-        );
+        let remove = excess.min(self.panes.main().transcript().len().saturating_sub(head));
         if remove == 0 {
             return;
         }
         // Drop the oldest non-head entries.
         let keep_start = head
             .saturating_add(remove)
-            .min(self.panes.main_mut().transcript_mut().len());
-        self.panes
-            .main_mut()
-            .transcript_mut()
-            .drain(head..keep_start);
-        // `thinking_open` is keyed by transcript index; the drain shifted every
-        // surviving entry's index down by `remove`. Renumber the open set so an
-        // opened thought stays open under its new index, and drop the entries
-        // that were themselves evicted (they are off the transcript for good).
-        // Without this an open thought folds back to its summary silently, or
-        // — worse — a later Reasoning entry landing on the stale index renders
-        // expanded without ever being clicked.
-        self.thinking_open = self
-            .thinking_open
-            .iter()
-            .filter_map(|&i| {
-                if (head..keep_start).contains(&i) {
-                    None
-                } else if i >= keep_start {
-                    Some(i - remove)
-                } else {
-                    Some(i)
-                }
-            })
-            .collect();
+            .min(self.panes.main().transcript().len());
+        // Stable IDs keep surviving thoughts associated with their own rows.
+        // Remove only expansion state for main-pane entries actually evicted;
+        // another pane's open thought must survive main scrollback pruning.
+        for entry in &self.panes.main().transcript()[head..keep_start] {
+            self.thinking_open.remove(&entry.id());
+        }
+        self.panes.main_mut().prune_transcript(head..keep_start);
+
         // Prune the render cache: any key with an entry_idx that has shifted
         // is stale.  Easiest way: clear the whole thread-local transcript cache
         // once (cheap — it rebuilds lazily on the next frame).
@@ -2608,7 +2588,7 @@ impl App {
 
     /// Clear the transcript.
     fn clear_transcript(&mut self) {
-        self.panes.main_mut().transcript_mut().clear();
+        self.panes.main_mut().clear_transcript();
         // A wholesale clear invalidates every index-based view state.
         self.thinking_open.clear();
         crate::ui::clear_transcript_cache();
@@ -2753,8 +2733,8 @@ impl App {
         // it does not reach — a tool call, or a thought some frontend-pushed
         // entry has pushed off the tail — is then settled below.
         self.sync_panes();
-        hrdr_agent::finish_open_reasoning(&mut self.panes.main_mut().state.transcript);
-        hrdr_agent::settle_restored_entries(&mut self.panes.main_mut().state.transcript);
+        hrdr_agent::finish_open_reasoning(self.panes.main_mut().transcript_mut());
+        hrdr_agent::settle_restored_entries(self.panes.main_mut().transcript_mut());
         // If the user typed while the turn was running, those messages are still
         // in the steering queue. They are neither dropped nor sent: they go back
         // into the composer, where the user can edit, resend or clear them.
@@ -3650,7 +3630,7 @@ mod tests {
         assert_eq!(usage_last(&app.registry, key), Some((44, 0)));
         assert_eq!(usage_last(&app.registry, MAIN_KEY), Some((100, 5)));
         assert_eq!(
-            app.panes.pane_for(key).unwrap().state.model,
+            app.panes.pane_for(key).unwrap().state().model,
             "local://after-switch".parse().unwrap()
         );
 
@@ -3668,7 +3648,12 @@ mod tests {
             "an unknown incoming window clears stale pane and registry chrome"
         );
         assert_eq!(
-            app.panes.pane_for(key).unwrap().state.usage.context_window,
+            app.panes
+                .pane_for(key)
+                .unwrap()
+                .state()
+                .usage
+                .context_window,
             None
         );
     }
