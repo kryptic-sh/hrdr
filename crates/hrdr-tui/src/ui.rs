@@ -2840,8 +2840,8 @@ impl DynamicBody {
 enum BodySource {
     /// Rendered and shared with [`BODY_CACHE`] — every entry but the header.
     Cached(Rows),
-    /// A running tool's cached static rows plus its per-frame spinner marker.
-    CachedAnimated { rows: Rows, mark: &'static str },
+    /// A running tool's cached static rows; materialization supplies its spinner.
+    CachedAnimated { rows: Rows },
     /// Rebuilt on demand from an owned descriptor. Nothing here borrows the app
     /// or transcript, so assembly can outlive this frame.
     Dynamic(DynamicBody),
@@ -2851,6 +2851,32 @@ impl PendingBlock {
     /// Take what a following entry lends.
     fn lend(&mut self, rows: Lent) {
         self.lent.push(rows);
+    }
+}
+
+/// An owned block plus the already-decided relationship to its follower.
+/// Assembly never builds frame-borrowed chunks or lazy closures.
+struct FinalizedBlock {
+    block: PendingBlock,
+    next_bg: Option<Color>,
+}
+
+/// The owned result of scanning transcript entries before frame-local rendering.
+struct TranscriptAssembly {
+    blocks: Vec<FinalizedBlock>,
+    /// Empty assistant messages that had no pending block attach to the chunk
+    /// position before this finalized block.
+    leading_msgs: Vec<(usize, usize)>,
+    panel_above: Option<Color>,
+}
+
+fn finalize_block(
+    blocks: &mut Vec<FinalizedBlock>,
+    pending: Option<PendingBlock>,
+    next_bg: Option<Color>,
+) {
+    if let Some(block) = pending {
+        blocks.push(FinalizedBlock { block, next_bg });
     }
 }
 
@@ -2974,7 +3000,7 @@ fn flush<'a>(
         (BodySource::Cached(_) | BodySource::CachedAnimated { .. }, _) => true,
     };
     let animated_mark = match &block.body {
-        BodySource::CachedAnimated { mark, .. } => Some(*mark),
+        BodySource::CachedAnimated { .. } => Some(frame_context.spinner),
         BodySource::Cached(_) | BodySource::Dynamic(_) => None,
     };
     let bg = block.kind.bg(theme);
@@ -3086,14 +3112,11 @@ fn separator<'a>() -> Chunk<'a> {
 /// whose entry has not changed come straight out of [`BLOCK_CACHE`] as an `Rc`,
 /// which is what keeps a frame's cost proportional to what *changed* rather than
 /// to the length of the session.
-fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
+fn assemble_transcript(app: &App, width: u16, queued: bool) -> TranscriptAssembly {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut msg_at: Vec<usize> = Vec::new();
-    // One clock read for the whole frame — the folded thinking summary's
-    // elapsed time and age read it.
-    let now = chrono::Local::now();
+    let mut blocks = Vec::new();
+    let mut leading_msgs = Vec::new();
     // Block width and the width its content is laid out at (minus padding).
     let w = width as usize;
     let inner = inner_width(w);
@@ -3107,14 +3130,6 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     // after them merges into the same group instead of opening a new one.
     // `group_members_end` is one past the group when one is in progress.
     let mut group_members_end: Option<usize> = None;
-    // The current spinner frame is loop-invariant — it depends only on wall
-    // time. Compute it once per frame, not once per transcript chunk: the
-    // comment on `now` above already promises one clock read for the whole
-    // frame. Running-tool body keys deliberately exclude it: their static rows
-    // stay cached while [`ChunkRows::AnimatedChrome`] patches only the marker.
-    // The tool-group summary header uses the same frame directly.
-    let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
-    let frame = SPINNER[frame_idx as usize % SPINNER.len()];
     for (i, entry) in transcript.iter().enumerate() {
         if group_members_end.is_some_and(|end| i >= end) {
             group_members_end = None;
@@ -3152,18 +3167,10 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         absorbed += 1;
                     }
                 }
-                flush(
-                    &mut chunks,
-                    &mut msg_at,
+                finalize_block(
+                    &mut blocks,
                     pending.take(),
                     Some(Color::Reset), // the summary reads on the page
-                    w,
-                    theme,
-                    DynamicFrame {
-                        app: Some(app),
-                        now,
-                        spinner: frame,
-                    },
                 );
                 // The summary block opens the group; the visible calls follow
                 // it as their own blocks.
@@ -3182,30 +3189,15 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 } else {
                     Vec::new()
                 };
-                // The summary chunk's index is where the group's absorbed turns
-                // jump to; it is the first chunk the visible calls' flushes
-                // emit, so capture it there, or force it out when none render.
-                let mut summary_chunk: Option<usize> = None;
-                for j in visible {
-                    flush(
-                        &mut chunks,
-                        &mut msg_at,
-                        pending.take(),
-                        Some(tool_bg),
-                        w,
-                        theme,
-                        DynamicFrame {
-                            app: Some(app),
-                            now,
-                            spinner: frame,
-                        },
-                    );
-                    if summary_chunk.is_none() {
-                        summary_chunk = Some(chunks.len().saturating_sub(1));
-                    }
-                    pending = Some(tool_call_block(app, &transcript[j], j, w, frame));
+                let no_visible = visible.is_empty();
+                if let Some(summary) = pending.as_mut() {
+                    summary.msgs = absorbed;
                 }
-                if summary_chunk.is_none() {
+                for j in visible {
+                    finalize_block(&mut blocks, pending.take(), Some(tool_bg));
+                    pending = Some(tool_call_block(app, &transcript[j], j, w));
+                }
+                if no_visible {
                     // No calls visible: flush the summary so the absorbed
                     // turns have a chunk to land on; its follower decides its
                     // bottom padding — asked the same way the renderer asks
@@ -3215,23 +3207,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                     let follower_bg = transcript
                         .get(end)
                         .map(|e| entry_block_kind(&e.kind).bg(theme));
-                    flush(
-                        &mut chunks,
-                        &mut msg_at,
-                        pending.take(),
-                        follower_bg,
-                        w,
-                        theme,
-                        DynamicFrame {
-                            app: Some(app),
-                            now,
-                            spinner: frame,
-                        },
-                    );
-                    summary_chunk = Some(chunks.len().saturating_sub(1));
-                }
-                for _ in 0..absorbed {
-                    msg_at.push(summary_chunk.unwrap());
+                    finalize_block(&mut blocks, pending.take(), follower_bg);
                 }
                 group_members_end = Some(end);
                 continue;
@@ -3291,7 +3267,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                 } else {
                     // Nothing to append to (it opens the transcript): the
                     // message keeps no jump point.
-                    msg_at.push(chunks.len());
+                    leading_msgs.push((blocks.len(), 1));
                 }
                 continue;
             }
@@ -3367,17 +3343,14 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                             ok: *ok,
                             done: *done,
                             preview: false,
-                            frame: if *done { frame } else { SPINNER[0] },
+                            frame: SPINNER[0],
                         },
                     )
                 });
                 let body = if *done {
                     BodySource::Cached(body)
                 } else {
-                    BodySource::CachedAnimated {
-                        rows: body,
-                        mark: frame,
-                    }
+                    BodySource::CachedAnimated { rows: body }
                 };
                 (BlockKind::Tool, body)
             }
@@ -3421,19 +3394,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         };
         // Flush the previous block, then hold this one: a text-less assistant
         // turn that follows appends its label to whatever is pending.
-        flush(
-            &mut chunks,
-            &mut msg_at,
-            pending.take(),
-            Some(kind.bg(theme)),
-            w,
-            theme,
-            DynamicFrame {
-                app: Some(app),
-                now,
-                spinner: frame,
-            },
-        );
+        finalize_block(&mut blocks, pending.take(), Some(kind.bg(theme)));
         pending = Some(PendingBlock {
             idx: i,
             kind,
@@ -3446,62 +3407,89 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             msgs: msg_here,
         });
     }
-    // Queued prompts follow the transcript, so the last block is separated from
-    // them exactly as it would be from any other tinted block.
-    // Each agent's own queue: what is waiting to reach *this* agent.
-    let queued = app.panes.active_pane().pending.clone();
-    let queued_bg = (!queued.is_empty()).then(|| BlockKind::Queued.bg(theme));
+    let queued_bg = queued.then(|| BlockKind::Queued.bg(theme));
     // The surface the live panels sit off: the trailing separator a queued
     // block leaves (Reset), else the last rendered block's background — or
     // nothing when the transcript rendered no blocks.
-    let panel_above = if !queued.is_empty() {
+    let panel_above = if queued {
         Some(Color::Reset)
     } else {
         pending.as_ref().map(|b| b.kind.bg(theme))
     };
-    flush(
-        &mut chunks,
-        &mut msg_at,
-        pending.take(),
-        queued_bg,
-        w,
-        theme,
-        DynamicFrame {
-            app: Some(app),
-            now,
-            spinner: frame,
-        },
-    );
+    finalize_block(&mut blocks, pending.take(), queued_bg);
 
-    // Pending queued messages render like user prompts, with a "Queued" badge
-    // as the block's last row — through the same block path as everything else,
-    // so they pick up the same padding and background. They are not transcript
-    // entries and have no cache slot: there are never more than a few, and each
-    // one is consumed the moment the agent is free.
+    TranscriptAssembly {
+        blocks,
+        leading_msgs,
+        panel_above,
+    }
+}
+
+/// Turn an owned transcript assembly into frame-local chunks and lazy renderers.
+fn materialize_transcript<'a>(
+    assembly: TranscriptAssembly,
+    app: &'a App,
+    width: u16,
+) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
+    let theme = &app.theme;
+    let now = chrono::Local::now();
+    let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
+    let frame = SPINNER[frame_idx as usize % SPINNER.len()];
+    let frame_context = DynamicFrame {
+        app: Some(app),
+        now,
+        spinner: frame,
+    };
+    let mut chunks = Vec::new();
+    let mut msg_at = Vec::new();
+    let mut leading = assembly.leading_msgs.into_iter().peekable();
+    for (block_idx, finalized) in assembly.blocks.into_iter().enumerate() {
+        while let Some(&(at, count)) = leading.peek()
+            && at == block_idx
+        {
+            msg_at.extend(std::iter::repeat_n(chunks.len(), count));
+            leading.next();
+        }
+        flush(
+            &mut chunks,
+            &mut msg_at,
+            Some(finalized.block),
+            finalized.next_bg,
+            width as usize,
+            theme,
+            frame_context,
+        );
+    }
+    for (_, count) in leading {
+        msg_at.extend(std::iter::repeat_n(chunks.len(), count));
+    }
+    (chunks, msg_at, assembly.panel_above)
+}
+
+fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize>, Option<Color>) {
+    let queued = app.panes.active_pane().pending.clone();
+    let assembly = assemble_transcript(app, width, !queued.is_empty());
+    let (mut chunks, msg_at, panel_above) = materialize_transcript(assembly, app, width);
     if !queued.is_empty() {
+        let theme = &app.theme;
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
         for msg in &queued {
-            let mut body = markdown_lines(msg, &md_theme, bg, inner);
-            // A blank row inside the block, so the badge doesn't sit flush
-            // against the message text above it.
+            let mut body = markdown_lines(msg, &theme.md_theme(), bg, inner_width(width as usize));
             body.push(Line::raw(""));
             body.push(Line::from(Span::styled(" Queued ", badge)));
             chunks.push(Chunk::plain(
                 ChunkRows::Ready(Rc::new(render_block(
                     body,
-                    w,
+                    width as usize,
                     bg,
                     BlockKind::Queued.border(theme),
                 ))),
                 None,
             ));
-            // Queued blocks are tinted: a blank row separates them from each
-            // other, and the last one from the input pane below.
             chunks.push(separator());
         }
     }
-
     (chunks, msg_at, panel_above)
 }
 
@@ -3864,13 +3852,7 @@ fn tool_fits_preview(name: &str, args: &str, result: &str) -> bool {
 /// the preview renders in full with nothing to toggle; a longer one renders as
 /// a preview (the tail, or the head for a mutation) and its body rows toggle it
 /// to the full output and back.
-fn tool_call_block(
-    app: &App,
-    member: &Entry,
-    idx: usize,
-    w: usize,
-    frame: &'static str,
-) -> PendingBlock {
+fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBlock {
     let theme = &app.theme;
     let EntryKind::Tool {
         id,
@@ -3903,7 +3885,7 @@ fn tool_call_block(
                 ok: *ok,
                 done: *done,
                 preview: !full,
-                frame: if *done { frame } else { SPINNER[0] },
+                frame: SPINNER[0],
             },
         )
     });
@@ -3927,10 +3909,7 @@ fn tool_call_block(
         body: if *done {
             BodySource::Cached(body)
         } else {
-            BodySource::CachedAnimated {
-                rows: body,
-                mark: frame,
-            }
+            BodySource::CachedAnimated { rows: body }
         },
         lent: Vec::new(),
         body_key,
@@ -4457,6 +4436,72 @@ mod cache_tests {
         )
         .expect("test app");
         (tmp, app)
+    }
+
+    #[test]
+    fn assembly_preserves_leading_and_group_absorbed_message_positions() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        app.transcript_mut().push(Entry::assistant(""));
+        app.transcript_mut().push(Entry::assistant(""));
+
+        let (chunks, msg_at, _) = transcript_chunks(&app, 80);
+        assert!(chunks.is_empty());
+        assert_eq!(msg_at, vec![0, 0]);
+        drop(chunks);
+
+        app.transcript_mut().push(Entry::user("visible"));
+        let (_, msg_at, _) = transcript_chunks(&app, 80);
+        assert_eq!(msg_at, vec![0, 0, 0]);
+
+        let tool = |id: &str| {
+            Entry::now(EntryKind::Tool {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+                result: "done".to_string(),
+                ok: true,
+                done: true,
+            })
+        };
+        app.transcript_mut().clear();
+        app.transcript_mut().push(tool("first"));
+        app.transcript_mut().push(Entry::assistant(""));
+        app.transcript_mut().push(tool("second"));
+
+        let (_, collapsed_msg_at, _) = transcript_chunks(&app, 80);
+        assert_eq!(collapsed_msg_at, vec![0]);
+        app.tool_groups.insert("first".to_string());
+        let (_, expanded_msg_at, _) = transcript_chunks(&app, 80);
+        assert_eq!(expanded_msg_at, vec![0]);
+    }
+
+    #[test]
+    fn queued_state_preserves_trailing_block_chrome_and_panel_background() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        app.transcript_mut().push(Entry::user("visible"));
+
+        let (plain_chunks, _, plain_panel) = transcript_chunks(&app, 80);
+        assert_eq!(plain_panel, Some(BlockKind::User.bg(&app.theme)));
+        let plain_len = plain_chunks.len();
+        drop(plain_chunks);
+
+        app.panes.main_mut().pending.push("queued".to_string());
+        let (queued_chunks, _, queued_panel) = transcript_chunks(&app, 80);
+        assert_eq!(queued_panel, Some(ratatui::style::Color::Reset));
+        assert_eq!(
+            queued_chunks.len(),
+            plain_len + 3,
+            "queued prompt adds the inter-block separator, prompt, and trailing separator"
+        );
+        drop(queued_chunks);
+
+        app.transcript_mut().clear();
+        let (_, _, empty_queued_panel) = transcript_chunks(&app, 80);
+        assert_eq!(empty_queued_panel, Some(ratatui::style::Color::Reset));
     }
 
     // ── entry_content_hash ─────────────────────────────────────────────────────
