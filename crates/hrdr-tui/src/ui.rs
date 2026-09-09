@@ -17,6 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Entry, EntryKind, HitRect, SelectionSpan, StatusBarMode};
 use crate::theme::Theme;
+use hrdr_agent::EntryId;
 use hrdr_app::relative_time;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
@@ -2757,12 +2758,12 @@ enum Lent {
 /// A block whose parts are gathered but which is not yet rendered. Held for one
 /// iteration so the block after it can say whether the two need a separator
 /// between them.
-struct PendingBlock<'a> {
+struct PendingBlock {
     /// Transcript index — the cache slot this block owns.
     idx: usize,
     kind: BlockKind,
     /// The entry's own content.
-    body: BodySource<'a>,
+    body: BodySource,
     /// What a following entry lent this block. Sits below the body.
     lent: Vec<Lent>,
     /// The body's cache key, extended with the chrome hash to key the block.
@@ -2779,22 +2780,165 @@ struct PendingBlock<'a> {
     msgs: usize,
 }
 
+/// A dynamic body resolved from the active transcript when the frame paints it.
+enum DynamicBody {
+    Header {
+        entry_idx: usize,
+        entry_id: EntryId,
+    },
+    Reasoning {
+        entry_idx: usize,
+        entry_id: EntryId,
+        open: bool,
+    },
+    ToolGroup {
+        entry_idx: usize,
+        entry_id: EntryId,
+        sections: Vec<String>,
+        running: bool,
+        all_ok: bool,
+    },
+}
+
+impl DynamicBody {
+    fn matches(&self, app: &App) -> bool {
+        let transcript = app.panes.active_transcript();
+        match self {
+            Self::Header {
+                entry_idx,
+                entry_id,
+            } => matches!(
+                transcript.get(*entry_idx),
+                Some(entry)
+                    if entry.id() == *entry_id && matches!(entry.kind, EntryKind::Header)
+            ),
+            Self::Reasoning {
+                entry_idx,
+                entry_id,
+                ..
+            } => matches!(
+                transcript.get(*entry_idx),
+                Some(entry)
+                    if entry.id() == *entry_id
+                        && matches!(entry.kind, EntryKind::Reasoning { .. })
+            ),
+            Self::ToolGroup {
+                entry_idx,
+                entry_id,
+                ..
+            } => matches!(
+                transcript.get(*entry_idx),
+                Some(entry)
+                    if entry.id() == *entry_id
+                        && matches!(entry.kind, EntryKind::Tool { .. })
+            ),
+        }
+    }
+}
+
 /// Where a block's body comes from.
-enum BodySource<'a> {
+enum BodySource {
     /// Rendered and shared with [`BODY_CACHE`] — every entry but the header.
     Cached(Rows),
     /// A running tool's cached static rows plus its per-frame spinner marker.
     CachedAnimated { rows: Rows, mark: &'static str },
-    /// Rebuilt on demand: the header, whose logo animates. Nothing about it can be
-    /// cached, so it is only ever built when it is going to be seen.
-    Animated(Box<dyn Fn() -> Vec<Line<'static>> + 'a>),
+    /// Rebuilt on demand from an owned descriptor. Nothing here borrows the app
+    /// or transcript, so assembly can outlive this frame.
+    Dynamic(DynamicBody),
 }
 
-impl PendingBlock<'_> {
+impl PendingBlock {
     /// Take what a following entry lends.
     fn lend(&mut self, rows: Lent) {
         self.lent.push(rows);
     }
+}
+
+/// Resolve an owned dynamic descriptor against the current transcript. An index
+/// reused for another entry must not paint that entry's content.
+fn materialize_dynamic_body(
+    body: &DynamicBody,
+    app: &App,
+    width: u16,
+    inner: u16,
+    now: chrono::DateTime<chrono::Local>,
+    frame: &'static str,
+) -> Vec<Line<'static>> {
+    if !body.matches(app) {
+        return Vec::new();
+    }
+    let transcript = app.panes.active_transcript();
+    match body {
+        DynamicBody::Header {
+            entry_idx,
+            entry_id,
+        } if matches!(transcript.get(*entry_idx), Some(entry) if entry.id() == *entry_id && matches!(entry.kind, EntryKind::Header)) => {
+            header_lines(app, app.header_anchor, width)
+        }
+        DynamicBody::Reasoning {
+            entry_idx,
+            entry_id,
+            open,
+        } => {
+            let Some(entry) = transcript.get(*entry_idx) else {
+                return Vec::new();
+            };
+            if entry.id() != *entry_id {
+                return Vec::new();
+            }
+            let EntryKind::Reasoning { text, took_ms } = &entry.kind else {
+                return Vec::new();
+            };
+            if *open {
+                markdown_lines(
+                    text,
+                    &app.theme.md_theme_dim(),
+                    BlockKind::Reasoning.bg(&app.theme),
+                    inner,
+                )
+            } else {
+                thinking_summary_lines(entry, *took_ms, now, frame, &app.theme, inner)
+            }
+        }
+        DynamicBody::ToolGroup {
+            entry_idx,
+            entry_id,
+            sections,
+            running,
+            all_ok,
+        } if matches!(transcript.get(*entry_idx), Some(entry) if entry.id() == *entry_id && matches!(entry.kind, EntryKind::Tool { .. })) =>
+        {
+            let (mark, color) = if *running {
+                (frame, app.theme.warn)
+            } else if *all_ok {
+                ("✓", app.theme.success)
+            } else {
+                ("✗", app.theme.error)
+            };
+            let dim = Style::default().fg(app.theme.dim);
+            pack_loader_segments(sections, usize::from(inner))
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut spans = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::styled(format!("{mark} "), Style::default().fg(color)));
+                    }
+                    spans.push(Span::styled(text, dim));
+                    Line::from(spans)
+                })
+                .collect()
+        }
+        DynamicBody::Header { .. } | DynamicBody::ToolGroup { .. } => Vec::new(),
+    }
+}
+
+/// Frame-local inputs needed to materialize an owned dynamic body.
+#[derive(Clone, Copy)]
+struct DynamicFrame<'a> {
+    app: Option<&'a App>,
+    now: chrono::DateTime<chrono::Local>,
+    spinner: &'static str,
 }
 
 /// Paint a held block, recording where its messages start and (for a tool call)
@@ -2815,17 +2959,23 @@ impl PendingBlock<'_> {
 fn flush<'a>(
     chunks: &mut Vec<Chunk<'a>>,
     msg_at: &mut Vec<usize>,
-    pending: Option<PendingBlock<'a>>,
+    pending: Option<PendingBlock>,
     next_bg: Option<Color>,
     width: usize,
     theme: &Theme,
+    frame_context: DynamicFrame<'a>,
 ) {
     let Some(block) = pending else { return };
     let (idx, msgs, tool_idx) = (block.idx, block.msgs, block.tool_idx);
-    let animated = matches!(block.body, BodySource::Animated(_));
+    let animated = matches!(block.body, BodySource::Dynamic(_));
+    let dynamic_valid = match (&block.body, frame_context.app) {
+        (BodySource::Dynamic(dynamic), Some(app)) => dynamic.matches(app),
+        (BodySource::Dynamic(_), None) => false,
+        (BodySource::Cached(_) | BodySource::CachedAnimated { .. }, _) => true,
+    };
     let animated_mark = match &block.body {
         BodySource::CachedAnimated { mark, .. } => Some(*mark),
-        BodySource::Cached(_) | BodySource::Animated(_) => None,
+        BodySource::Cached(_) | BodySource::Dynamic(_) => None,
     };
     let bg = block.kind.bg(theme);
     let border = block.kind.border(theme);
@@ -2849,7 +2999,18 @@ fn flush<'a>(
             BodySource::Cached(rows) | BodySource::CachedAnimated { rows, .. } => {
                 body.extend(rows.iter().cloned())
             }
-            BodySource::Animated(build) => body.extend(build()),
+            BodySource::Dynamic(dynamic) => {
+                if let Some(app) = frame_context.app {
+                    body.extend(materialize_dynamic_body(
+                        dynamic,
+                        app,
+                        width as u16,
+                        inner_width(width),
+                        frame_context.now,
+                        frame_context.spinner,
+                    ));
+                }
+            }
         }
         for lent in &block.lent {
             // The stats line sits a blank row below the turn it closes.
@@ -2865,17 +3026,24 @@ fn flush<'a>(
     };
 
     let rows = if animated {
-        // The header: its rows animate, its height does not. Once we know how tall
-        // it is, a frame that doesn't show it doesn't build it.
-        match lazy_height(key) {
-            Some(height) => ChunkRows::Lazy {
-                height,
-                build: Box::new(render),
-            },
-            None => {
-                let rows = render();
-                remember_lazy_height(key, rows.len());
-                ChunkRows::Ready(rows)
+        // A stale descriptor cannot use the old measured height: its empty
+        // fail-safe rows must remain consistent with the height reported to
+        // viewport and hit-test calculations.
+        if !dynamic_valid {
+            ChunkRows::Ready(render())
+        } else {
+            // The header: its rows animate, its height does not. Once we know how
+            // tall it is, a frame that doesn't show it doesn't build it.
+            match lazy_height(key) {
+                Some(height) => ChunkRows::Lazy {
+                    height,
+                    build: Box::new(render),
+                },
+                None => {
+                    let rows = render();
+                    remember_lazy_height(key, rows.len());
+                    ChunkRows::Ready(rows)
+                }
             }
         }
     } else {
@@ -2991,11 +3159,16 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                     Some(Color::Reset), // the summary reads on the page
                     w,
                     theme,
+                    DynamicFrame {
+                        app: Some(app),
+                        now,
+                        spinner: frame,
+                    },
                 );
                 // The summary block opens the group; the visible calls follow
                 // it as their own blocks.
                 let members = &transcript[i..end];
-                pending = Some(tool_group_summary_block(app, members, i, w, frame));
+                pending = Some(tool_group_summary_block(app, members, i, w));
                 // Which calls are visible: every call when expanded; otherwise
                 // none — a collapsed group renders only its summary, even while
                 // a call runs (no live preview outside `/verbose`).
@@ -3021,6 +3194,11 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         Some(tool_bg),
                         w,
                         theme,
+                        DynamicFrame {
+                            app: Some(app),
+                            now,
+                            spinner: frame,
+                        },
                     );
                     if summary_chunk.is_none() {
                         summary_chunk = Some(chunks.len().saturating_sub(1));
@@ -3044,6 +3222,11 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
                         follower_bg,
                         w,
                         theme,
+                        DynamicFrame {
+                            app: Some(app),
+                            now,
+                            spinner: frame,
+                        },
                     );
                     summary_chunk = Some(chunks.len().saturating_sub(1));
                 }
@@ -3095,9 +3278,10 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // frame that has scrolled past it doesn't build it at all.
             EntryKind::Header => (
                 BlockKind::Header,
-                BodySource::Animated(Box::new(move || {
-                    header_lines(app, app.header_anchor, width)
-                })),
+                BodySource::Dynamic(DynamicBody::Header {
+                    entry_idx: i,
+                    entry_id: entry.id(),
+                }),
             ),
             // An assistant turn that only called tools has no text, so it gets no
             // block of its own; it still counts as a message for `/find` jumps.
@@ -3140,23 +3324,14 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // Animated because the mark and the clock tick every frame, but
             // its height is stable at any width, so `lazy_height` still places
             // the viewport without building the block it can't see.
-            EntryKind::Reasoning { text, took_ms, .. } if !app.verbose => {
-                let body = BodySource::Animated(Box::new(move || {
-                    if reasoning_open {
-                        // The full thought: the same dimmed markdown a
-                        // `/verbose on` block renders.
-                        markdown_lines(
-                            text,
-                            &theme.md_theme_dim(),
-                            BlockKind::Reasoning.bg(theme),
-                            inner,
-                        )
-                    } else {
-                        thinking_summary_lines(entry, *took_ms, now, frame, theme, inner)
-                    }
-                }));
-                (BlockKind::Reasoning, body)
-            }
+            EntryKind::Reasoning { .. } if !app.verbose => (
+                BlockKind::Reasoning,
+                BodySource::Dynamic(DynamicBody::Reasoning {
+                    entry_idx: i,
+                    entry_id: entry.id(),
+                    open: reasoning_open,
+                }),
+            ),
             // No `⠹ Thinking` / `Thought: 1.2s` label: the dimmer text already
             // says it's the model thinking, and the loader above the input shows
             // that a turn is running. (`took_ms` is still recorded — it's the
@@ -3253,6 +3428,11 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             Some(kind.bg(theme)),
             w,
             theme,
+            DynamicFrame {
+                app: Some(app),
+                now,
+                spinner: frame,
+            },
         );
         pending = Some(PendingBlock {
             idx: i,
@@ -3286,6 +3466,11 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         queued_bg,
         w,
         theme,
+        DynamicFrame {
+            app: Some(app),
+            now,
+            spinner: frame,
+        },
     );
 
     // Pending queued messages render like user prompts, with a "Queued" badge
@@ -3627,48 +3812,30 @@ fn human_duration(ms: u64) -> String {
 /// 1 file` line(s) on the page background, like a thought or the model's
 /// output. Clicking it toggles the group — expanded, the calls render below it
 /// as ordinary tool blocks; collapsed, they fold away. Built through the same
-/// block path as every other entry; its body is Animated because the mark and
+/// block path as every other entry; its body is dynamic because the mark and
 /// the counts change every frame, but its height is stable at any width.
-fn tool_group_summary_block<'a>(
-    app: &'a App,
+fn tool_group_summary_block(
+    app: &App,
     members: &[Entry],
     head_idx: usize,
     w: usize,
-    frame: &'static str,
-) -> PendingBlock<'a> {
-    let theme = &app.theme;
-    let inner = usize::from(inner_width(w));
+) -> PendingBlock {
     let (sections, running, all_ok) = tool_group_summary(members);
-    let (mark, color) = if running {
-        (frame, theme.warn)
-    } else if all_ok {
-        ("✓", theme.success)
-    } else {
-        ("✗", theme.error)
-    };
-    let dim = Style::default().fg(theme.dim);
     // The hash is the members' aggregate, so a call joining or settling
     // re-measures the (stable) height; the rows themselves are rebuilt every
     // frame the block is visible.
     let members_hash = members.iter().map(|e| e.content_hash).fold(0, |a, h| a ^ h);
     let body_key = (members_hash, w as u16, app.verbose, app.verbose, true);
-    let body = BodySource::Animated(Box::new(move || {
-        pack_loader_segments(&sections, inner)
-            .into_iter()
-            .enumerate()
-            .map(|(i, text)| {
-                let mut spans = Vec::new();
-                if i == 0 {
-                    spans.push(Span::styled(
-                        format!("{} ", mark),
-                        Style::default().fg(color),
-                    ));
-                }
-                spans.push(Span::styled(text, dim));
-                Line::from(spans)
-            })
-            .collect()
-    }));
+    let body = BodySource::Dynamic(DynamicBody::ToolGroup {
+        entry_idx: head_idx,
+        entry_id: members
+            .first()
+            .expect("a tool group always has a head")
+            .id(),
+        sections,
+        running,
+        all_ok,
+    });
     PendingBlock {
         idx: head_idx,
         kind: BlockKind::Assistant,
@@ -3697,13 +3864,13 @@ fn tool_fits_preview(name: &str, args: &str, result: &str) -> bool {
 /// the preview renders in full with nothing to toggle; a longer one renders as
 /// a preview (the tail, or the head for a mutation) and its body rows toggle it
 /// to the full output and back.
-fn tool_call_block<'a>(
-    app: &'a App,
-    member: &'a Entry,
+fn tool_call_block(
+    app: &App,
+    member: &Entry,
     idx: usize,
     w: usize,
     frame: &'static str,
-) -> PendingBlock<'a> {
+) -> PendingBlock {
     let theme = &app.theme;
     let EntryKind::Tool {
         id,
@@ -4263,13 +4430,34 @@ mod subagent_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::{
-        BLOCK_CACHE, BODY_CACHE, BlockKind, ChunkRows, Lent, Rc, SPINNER, SPINNER_FRAME_MS,
-        cached_block, cached_body, chrome_hash, entry_content_hash, reset_tool_lines_renders,
+        BLOCK_CACHE, BODY_CACHE, BlockKind, BodySource, ChunkRows, DynamicBody, DynamicFrame, Lent,
+        PendingBlock, Rc, SPINNER, SPINNER_FRAME_MS, cached_block, cached_body, chrome_hash,
+        clear_transcript_cache, entry_content_hash, flush, reset_tool_lines_renders,
         tool_lines_renders, transcript_chunks,
     };
     use crate::app::{App, Entry, EntryKind};
     use hrdr_agent::AgentConfig;
     use ratatui::text::{Line, Span};
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().expect("temporary cwd");
+        let app = App::new(
+            AgentConfig {
+                base_url: "http://127.0.0.1:1/v1".to_string(),
+                model: "local://test-model".parse().expect("test model"),
+                cwd: tmp.path().to_path_buf(),
+                sandbox: hrdr_tools::SandboxMode::None,
+                ..Default::default()
+            },
+            hrdr_app::UiConfig {
+                auto_resume: false,
+                ..Default::default()
+            },
+            "logo",
+        )
+        .expect("test app");
+        (tmp, app)
+    }
 
     // ── entry_content_hash ─────────────────────────────────────────────────────
 
@@ -4330,6 +4518,82 @@ mod cache_tests {
             *warm, expected,
             "warm cache hit must return the same rows as the cold render"
         );
+    }
+
+    #[test]
+    fn stale_dynamic_descriptor_height_matches_materialized_rows() {
+        for preserve_id_with_wrong_kind in [false, true] {
+            clear_transcript_cache();
+            let (_tmp, mut app) = test_app();
+            app.transcript_mut().clear();
+            let header = Entry::header();
+            let header_id = header.id();
+            app.transcript_mut().push(header.clone());
+            let block = || PendingBlock {
+                idx: 0,
+                kind: BlockKind::Header,
+                body: BodySource::Dynamic(DynamicBody::Header {
+                    entry_idx: 0,
+                    entry_id: header_id,
+                }),
+                lent: Vec::new(),
+                body_key: (0xfeed, 80, false, false, true),
+                tool_idx: None,
+                row_hits: Vec::new(),
+                msgs: 0,
+            };
+            let frame = DynamicFrame {
+                app: Some(&app),
+                now: chrono::Local::now(),
+                spinner: SPINNER[0],
+            };
+            let mut chunks = Vec::new();
+            flush(
+                &mut chunks,
+                &mut Vec::new(),
+                Some(block()),
+                None,
+                80,
+                &app.theme,
+                frame,
+            );
+            assert_eq!(chunks[0].rows.height(), chunks[0].rows.rows().len());
+            drop(chunks);
+
+            let replacement = if preserve_id_with_wrong_kind {
+                let mut wrong_kind = header.clone();
+                wrong_kind.kind = EntryKind::Assistant("replacement".to_string());
+                wrong_kind
+            } else {
+                Entry::header()
+            };
+            app.transcript_mut()[0] = replacement;
+            let mut stale = Vec::new();
+            flush(
+                &mut stale,
+                &mut Vec::new(),
+                Some(block()),
+                None,
+                80,
+                &app.theme,
+                DynamicFrame {
+                    app: Some(&app),
+                    now: chrono::Local::now(),
+                    spinner: SPINNER[0],
+                },
+            );
+            let reported_height = stale[0].rows.height();
+            let rows = stale[0].rows.rows();
+            assert_eq!(
+                reported_height,
+                rows.len(),
+                "stale descriptor height must match the rows it paints"
+            );
+            assert!(
+                rows.iter().all(|row| !row.to_string().contains("logo")),
+                "a stale descriptor must not paint prior entry content"
+            );
+        }
     }
 
     /// Two entries must never cross-serve: looking up entry B after entry A is
@@ -4406,22 +4670,7 @@ mod cache_tests {
         BODY_CACHE.with(|c| c.borrow_mut().clear());
         BLOCK_CACHE.with(|c| c.borrow_mut().clear());
         reset_tool_lines_renders();
-        let tmp = tempfile::tempdir().expect("temporary cwd");
-        let mut app = App::new(
-            AgentConfig {
-                base_url: "http://127.0.0.1:1/v1".to_string(),
-                model: "local://test-model".parse().expect("test model"),
-                cwd: tmp.path().to_path_buf(),
-                sandbox: hrdr_tools::SandboxMode::None,
-                ..Default::default()
-            },
-            hrdr_app::UiConfig {
-                auto_resume: false,
-                ..Default::default()
-            },
-            "logo",
-        )
-        .expect("test app");
+        let (_tmp, mut app) = test_app();
         app.transcript_mut().clear();
         let running = Entry::now(EntryKind::Tool {
             id: "tool-1".into(),
@@ -4849,7 +5098,7 @@ mod block_tests {
 
     /// A one-content-row block of `kind`, rendered fresh (never cached, so these
     /// tests can't serve each other's rows out of the thread-local cache).
-    fn test_block<'a>(kind: BlockKind) -> PendingBlock<'a> {
+    fn test_block(kind: BlockKind) -> PendingBlock {
         PendingBlock {
             idx: 0,
             kind,
@@ -4899,6 +5148,11 @@ mod block_tests {
                 second.map(|k| k.bg(&theme)),
                 10,
                 &theme,
+                DynamicFrame {
+                    app: None,
+                    now: chrono::Local::now(),
+                    spinner: SPINNER[0],
+                },
             );
             let after_first: usize = chunks.iter().map(|c| c.rows.height()).sum();
             if let Some(second) = second {
@@ -4909,6 +5163,11 @@ mod block_tests {
                     None,
                     10,
                     &theme,
+                    DynamicFrame {
+                        app: None,
+                        now: chrono::Local::now(),
+                        spinner: SPINNER[0],
+                    },
                 );
             }
             let out = flatten(&chunks);
@@ -4956,6 +5215,11 @@ mod block_tests {
                 None,
                 10,
                 &theme,
+                DynamicFrame {
+                    app: None,
+                    now: chrono::Local::now(),
+                    spinner: SPINNER[0],
+                },
             );
             flatten(&chunks).len() - 2 // minus the content row and the top pad
         };
@@ -4974,7 +5238,19 @@ mod block_tests {
         let mut block = test_block(BlockKind::Tool);
         block.tool_idx = Some(7);
         block.msgs = 2; // a block carrying a borrowed assistant label
-        flush(&mut chunks, &mut starts, Some(block), None, 10, &theme);
+        flush(
+            &mut chunks,
+            &mut starts,
+            Some(block),
+            None,
+            10,
+            &theme,
+            DynamicFrame {
+                app: None,
+                now: chrono::Local::now(),
+                spinner: SPINNER[0],
+            },
+        );
         assert_eq!(starts, vec![1, 1], "both messages start at the block");
         let tools: Vec<_> = chunks
             .iter()
