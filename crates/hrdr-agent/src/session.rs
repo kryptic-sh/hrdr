@@ -1735,17 +1735,12 @@ mod tests {
         assert!(dir.starts_with(session_dir("/home/me/proj")));
     }
 
-    /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
+    /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`, under
+    /// this module's [`ENV_LOCK`] so the path-derivation tests above never see it
+    /// mid-swap.
     pub(super) fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
         let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
-        f(&tmp);
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
+        hrdr_test_support::with_test_env(f);
     }
 
     /// A saveable state: one user message, named, rooted at `cwd`.

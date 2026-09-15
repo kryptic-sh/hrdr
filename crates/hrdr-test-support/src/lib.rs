@@ -65,13 +65,19 @@ fn sandbox_user_state() {
     // created any thread. This is the one point in a test binary's life at which
     // `set_var` has no other thread to race.
     unsafe {
-        if let Some(real) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        // `USERPROFILE` is the home on Windows, where `HOME` is usually unset.
+        if let Some(real) = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .find_map(|var| std::env::var_os(var).filter(|h| !h.is_empty()))
+        {
             std::env::set_var(REAL_HOME_ENV, real);
         }
         std::env::set_var(SANDBOX_ENV, &root);
         std::env::set_var("HOME", &home);
-        // `dirs::home_dir()` reads this one on Windows; hrdr's own `home_dir()` falls
-        // back to it everywhere.
+        // hrdr's own `home_dir()` helpers fall back to this one where `HOME` is
+        // unset. `dirs::home_dir()` does NOT read it on Windows — it asks the shell
+        // API for the profile folder — so every user-state root below has to stay
+        // set: a path that falls back to `dirs` is the real profile there.
         std::env::set_var("USERPROFILE", &home);
         std::env::set_var("XDG_DATA_HOME", root.join("data"));
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
@@ -132,15 +138,24 @@ static DEFERRED_TEMP_DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::Te
 /// flaked (a sessions test's root appeared where the completion test's sessions
 /// should have been). `std::env::set_var` is `unsafe` in edition 2024; the lock
 /// is held for the whole call so no other env-swapping helper can race it.
+///
+/// Restored to what it was, never removed: the ctor's sandbox root is what every
+/// later test in the binary relies on, and with the variable unset the data dir
+/// falls back to `$HOME/.local/share` — which on Windows is the developer's real
+/// profile, because `dirs` ignores the sandboxed `HOME` there.
 pub fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _lock = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = std::env::var_os("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
     f(&tmp);
-    unsafe { std::env::remove_var("XDG_DATA_HOME") };
+    match previous {
+        Some(value) => unsafe { std::env::set_var("XDG_DATA_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+    }
 }
 
 /// Drop the deferred temp dirs at process exit: `TempDir::drop` removes the
@@ -243,10 +258,11 @@ pub fn user_state_dirs() -> (PathBuf, PathBuf, PathBuf) {
     (root.join("data"), root.join("config"), root.join("cache"))
 }
 
-/// `$HOME` as it was before the sandbox replaced it — the developer's real home.
+/// `$HOME` (`%USERPROFILE%` where `HOME` is unset) as it was before the sandbox replaced
+/// it — the developer's real home.
 ///
 /// For tests that assert a write did *not* land there. `None` when the environment had
-/// no `HOME` to begin with (a bare CI container).
+/// neither to begin with (a bare CI container).
 pub fn real_home() -> Option<PathBuf> {
     std::env::var_os(REAL_HOME_ENV)
         .filter(|h| !h.is_empty())
@@ -271,6 +287,55 @@ pub fn assert_sandboxed(path: &Path) {
             "{} is under the developer's real home {}",
             path.display(),
             real.display()
+        );
+    }
+}
+
+/// Whether a test should skip for want of a prerequisite (a shell, an
+/// interpreter, a sandbox backend) — **never in CI**.
+///
+/// Locally a missing prerequisite is an environment fact, and failing on it says
+/// nothing about the code. On a runner it is a broken environment, and the only
+/// useful thing a test can do is fail: a skip that cannot tell those apart turns
+/// an infrastructure failure into a green tick, which is worse than either. That
+/// is how whole families of tests once reported "passed" on a platform where they
+/// had exercised nothing.
+///
+/// Call it as `if skip_for_want_of("python", found) { return; }`.
+pub fn skip_for_want_of(what: &str, present: bool) -> bool {
+    if present {
+        return false;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{what} is missing on a CI runner — that is a broken environment, not a \
+         reason to report the test as passed"
+    );
+    eprintln!("skipping: {what} is not available on this machine");
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    /// The sandbox's data root survives a private swap: after `with_test_env` the
+    /// variable is the ctor's value again, not unset — unset sends the next test's
+    /// sessions to the fallback under the real profile on Windows.
+    #[test]
+    fn with_test_env_hands_the_sandbox_root_back() {
+        let sandboxed = super::user_state_dirs().0;
+        assert_eq!(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            Some(sandboxed.as_os_str())
+        );
+        super::with_test_env(|tmp| {
+            assert_eq!(
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+                Some(tmp.path().as_os_str())
+            );
+        });
+        assert_eq!(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            Some(sandboxed.as_os_str())
         );
     }
 }
