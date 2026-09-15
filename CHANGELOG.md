@@ -49,6 +49,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instance could steal it, while the temp-dir sweeps did nothing at all. The new
   `hrdr_tools::process_alive` asks `OpenProcess`/`WaitForSingleObject` on
   Windows and `kill(pid, 0)` on unix (`crates/hrdr-tools`, `crates/hrdr-agent`).
+- **A running `!command` stops growing its block at 256 KiB of live output
+  again.** The cap was lost when `!` moved onto the shell tool's streaming path;
+  the only bound left was the stream channel dropping what a busy TUI fell
+  behind on, so a TUI that kept up (as on Windows) buffered every byte of
+  `!cat huge.log` until the command exited. The settled result is unchanged
+  (`crates/hrdr-tui`).
 - **`rustls` 0.23.45 for RUSTSEC-2026-0285** (TLS 1.3 handshake messages
   accepted across encryption-level boundaries).
 

@@ -8787,11 +8787,46 @@ async fn a_bang_command_runs_unsandboxed() {
     );
 }
 
-/// A `!command` that dumps far more than the streaming cap (256 KiB) must not
+/// The live-output cap itself, with nothing racing it: twice the cap is already
+/// waiting in the stream and the consumer never falls behind, so every byte the
+/// forwarder lets through arrives. Without the cap all of it would.
+#[tokio::test]
+async fn live_bang_output_stops_growing_at_the_cap() {
+    let chunk = format!("{}\n", "x".repeat(1023));
+    let chunks = 2 * super::USER_SHELL_LIVE_OUTPUT_CAP / chunk.len();
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(chunks);
+    for _ in 0..chunks {
+        stream_tx.try_send(chunk.clone()).unwrap();
+    }
+    drop(stream_tx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(chunks);
+    super::forward_user_shell_output(stream_rx, tx, "bang".to_string()).await;
+
+    let mut forwarded = 0;
+    while let Ok(TurnMsg::UserShell(hrdr_agent::AgentEvent::ToolOutput { chunk, .. }, _)) =
+        rx.try_recv()
+    {
+        forwarded += chunk.len();
+    }
+    assert!(
+        forwarded >= super::USER_SHELL_LIVE_OUTPUT_CAP,
+        "everything up to the cap is shown live: {forwarded}"
+    );
+    assert!(
+        forwarded <= super::USER_SHELL_LIVE_OUTPUT_CAP + chunk.len(),
+        "nothing past the chunk that crossed the cap: {forwarded}"
+    );
+}
+
+/// A `!command` that dumps far more than `USER_SHELL_LIVE_OUTPUT_CAP` must not
 /// grow the in-memory buffer to match: the bytes actually forwarded over the
 /// channel for display stay bounded well below what the command wrote, and
 /// the process still runs to completion — the pipes are drained the whole
 /// time regardless of the cap, so nothing backs up and deadlocks.
+///
+/// On Linux the stream channel dropping what a slow consumer missed kept this
+/// green with no cap at all; the Windows runner, where the consumer keeps up,
+/// forwarded 700 KB and showed the cap was gone.
 #[tokio::test]
 async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
     if no_user_shell() {
@@ -8799,9 +8834,10 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
     }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
-    // ~2 MB of output — comfortably past the 256 KiB streaming cap and the
+    // ~2 MB of output — comfortably past the live-output cap and the
     // 50_000-char final display cap alike.
-    h.type_str("!yes 0123456789abcdef0123456789abcdef0123456789abcdef | head -c 2000000");
+    let line = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    h.type_str(&format!("!yes {line} | head -c 2000000"));
     h.press(KeyCode::Enter);
     assert!(h.app.user_shell.is_some(), "the shell task is tracked");
 
@@ -8832,7 +8868,8 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
     }
 
     assert!(
-        forwarded_bytes < 512 * 1024,
+        // The cap, plus the one line (and its newline) that crossed it.
+        forwarded_bytes <= super::USER_SHELL_LIVE_OUTPUT_CAP + line.len() + 1,
         "streaming forwarded {forwarded_bytes} bytes for a 2MB command — the \
          in-memory cap did not stop growth while the process was running"
     );

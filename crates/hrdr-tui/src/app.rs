@@ -28,6 +28,44 @@ const MOUSE_SCROLL_LINES: usize = 3;
 /// process outliving the session.
 const USER_SHELL_TIMEOUT_SECS: u64 = 60 * 60 * 24;
 
+/// How much of a running `!command`'s output is forwarded live into its block.
+///
+/// Everything past it still reaches the spool and the settled result, which
+/// replaces the live text on `ToolEnd`; this bounds only what accumulates in the
+/// transcript while the command runs, so `!cat huge.log` cannot grow the TUI
+/// without limit. The stream channel's own capacity is not that bound: it drops
+/// only what a busy consumer falls behind on, and a consumer that keeps up — as
+/// it did on the Windows runner — receives every byte.
+const USER_SHELL_LIVE_OUTPUT_CAP: usize = 256 * 1024;
+
+/// Forward a running `!command`'s live output into its block as `ToolOutput`
+/// events, up to [`USER_SHELL_LIVE_OUTPUT_CAP`], until the run closes the stream.
+///
+/// Past the cap it keeps draining: the run is still producing, and only the
+/// live view stops growing.
+async fn forward_user_shell_output(
+    mut stream_rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<TurnMsg>,
+    id: String,
+) {
+    let mut forwarded = 0usize;
+    while let Some(chunk) = stream_rx.recv().await {
+        if forwarded >= USER_SHELL_LIVE_OUTPUT_CAP {
+            continue;
+        }
+        forwarded += chunk.len();
+        let _ = tx
+            .send(TurnMsg::UserShell(
+                AgentEvent::ToolOutput {
+                    id: id.clone(),
+                    chunk,
+                },
+                None,
+            ))
+            .await;
+    }
+}
+
 /// The most characters a single paste may insert — editor buffer or login key
 /// field. A poisoned clipboard (a web page can set it) must not grow the buffer
 /// into a multi-MB re-wrap-per-frame cost, and a pasted API key is small by
@@ -1607,7 +1645,7 @@ impl App {
         });
         let task_id = id.clone();
         let cwd = hrdr_app::agent_cwd(&self.agent);
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<String>(256);
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<String>(256);
         let mut ctx = hrdr_tools::ToolContext::new(&cwd);
         ctx.stream = Some(stream_tx);
         ctx.max_output = 50_000;
@@ -1625,21 +1663,11 @@ impl App {
         let timeout = std::time::Duration::from_secs(USER_SHELL_TIMEOUT_SECS);
         let handle = tokio::spawn(async move {
             // Forward live output to the TUI as ToolOutput events.
-            let fwd_tx = tx.clone();
-            let fwd_id = task_id.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(chunk) = stream_rx.recv().await {
-                    let _ = fwd_tx
-                        .send(TurnMsg::UserShell(
-                            AgentEvent::ToolOutput {
-                                id: fwd_id.clone(),
-                                chunk,
-                            },
-                            None,
-                        ))
-                        .await;
-                }
-            });
+            let forwarder = tokio::spawn(forward_user_shell_output(
+                stream_rx,
+                tx.clone(),
+                task_id.clone(),
+            ));
             let finished =
                 hrdr_tools::run_user_command(shell, &task_command, timeout, true, &ctx).await;
             // Close the stream and let the forwarder drain before `ToolEnd`.
