@@ -42,6 +42,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Windows: an `@file` attachment is rejected if the path is swapped while it
   is validated.** The handle-identity check was compiled only on unix
   (`crates/hrdr-tools`).
+- **`rustls` 0.23.45 for RUSTSEC-2026-0285** (TLS 1.3 handshake messages
+  accepted across encryption-level boundaries).
 
 - **Cancelling a turn no longer leaves a cached running-tool spinner on
   screen.** Settling an interrupted tool now refreshes its render identity, so
