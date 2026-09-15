@@ -53,6 +53,7 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
+pub use proc::process_alive;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::cron::{CronTool, arm_crons};
@@ -3024,12 +3025,11 @@ mod tests {
     /// A dead session's spool is reaped, but not for a day — a resumed session is
     /// by definition one whose process is dead, and its restored context still
     /// points at "full output saved to <path>" inside that directory.
-    #[cfg(unix)]
     #[test]
     fn a_dead_sessions_spool_survives_long_enough_to_resume() {
         let base = tempfile::tempdir().unwrap();
-        let keep = base.path().join("s-1-keepme");
-        // pid 1 is always alive, so this stands in for a live sibling session.
+        // This process is alive, so its pid stands in for a live sibling session.
+        let keep = base.path().join(format!("s-{}-keepme", std::process::id()));
         std::fs::create_dir_all(&keep).unwrap();
         // A pid nothing can be using, whose directory was touched just now.
         let recent = base.path().join(format!("s-{}-recent", i32::MAX));

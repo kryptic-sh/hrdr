@@ -888,11 +888,10 @@ impl Session {
         }
         // The reservation lock (`.{id}.lock`) is NOT released here — that is
         // [`Reservation::drop`]'s job, and it is pid-guarded. Removing it here
-        // by path would defeat the guard: on Windows a live lock past
-        // `STALE_LOCK_AGE_SECS` is reapable, and a reclaimed lock deleted by
-        // this unconditional `remove_file` would let two instances overwrite one
-        // another — the two-window lost-update the reservation exists to
-        // prevent.
+        // by path would defeat the guard: a lock reaped as stale on a misjudged
+        // (recycled) pid and reclaimed, then deleted by this unconditional
+        // `remove_file`, would let two instances overwrite one another — the
+        // two-window lost-update the reservation exists to prevent.
         // Two writes can land within the filesystem's mtime granularity
         // (Windows timestamps tick coarsely), and `meta_cache` trusts an
         // unchanged mtime — so a listing right after e.g. a rename could
@@ -2714,8 +2713,8 @@ mod tests {
 
     /// A reservation whose lock was reaped as stale and re-claimed by a
     /// different pid must survive its original holder's `Drop` — the
-    /// reap/reclaim race the pid-ownership check exists for (Windows has no
-    /// liveness probe, so every pid reads as dead past the staleness age).
+    /// reap/reclaim race the pid-ownership check exists for (a recycled pid can
+    /// make a live holder's lock read as abandoned).
     #[test]
     fn reservation_drop_leaves_a_reclaimed_lock_alone() {
         let dir = tempfile::tempdir().unwrap();

@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use hrdr_tools::process_alive;
 
 /// [`StoreKind::SmallFileRewrite`]'s staleness age. A writer holds the lock for
 /// one read-modify-write of a tiny file, so a lock much older than this almost
@@ -103,14 +104,11 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// silence — which is exactly the defect this replaced: a save writing megabytes
 /// of attachments aged as if it were a credential file's read-modify-write.
 ///
-/// **The age only decides anything on a platform with no liveness probe.**
-/// Everywhere else [`process_alive`] answers first: a lock whose owner is still
-/// running is never reaped, whatever its age. Windows is that platform — no
-/// dependency-free probe, so every pid reads as dead — and there this age is the
-/// whole protection a live writer has. A real `OpenProcess` /
-/// `GetExitCodeProcess` probe would make both ages a formality again and is the
-/// better fix; it needs a Windows API dependency, which is the repo owner's call
-/// rather than this module's.
+/// **The age alone never reaps a live writer's lock.** [`process_alive`] answers
+/// after it, on every platform: a lock whose owner is still running stays,
+/// whatever its age. The age is what keeps a *recycled* pid — the dead owner's
+/// number reused by some unrelated process — from being consulted too early, and
+/// what bounds how long a crashed writer's lock blocks the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreKind {
     /// One read-modify-write of a small file — `auth.json`, `config.toml`: read
@@ -275,11 +273,10 @@ pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
 /// Remove the lock file at `lock_path` — but only if it still names `pid` as
 /// its owner.
 ///
-/// Deleting by path alone is the race: a holder that was reaped as stale
-/// (Windows has no liveness probe, so [`process_alive`] reports every pid dead
-/// past the staleness age) has its lock reclaimed by a second process, and the
-/// original holder's `Drop` then deletes the *new* holder's lock mid-write —
-/// the lost-update these locks exist to prevent. A lock we cannot parse to
+/// Deleting by path alone is the race: a holder that was reaped as stale (its
+/// pid misjudged — recycled, or unreadable) has its lock reclaimed by a second
+/// process, and the original holder's `Drop` then deletes the *new* holder's lock
+/// mid-write — the lost-update these locks exist to prevent. A lock we cannot parse to
 /// `pid`, or that no longer exists, needs no removal.
 pub(crate) fn remove_lock_file_if_owned(lock_path: &Path, pid: u32) {
     let owned = match std::fs::read_to_string(lock_path) {
@@ -295,38 +292,6 @@ pub(crate) fn remove_lock_file_if_owned(lock_path: &Path, pid: u32) {
     };
     if owned {
         let _ = std::fs::remove_file(lock_path);
-    }
-}
-
-/// Best-effort check for whether process `pid` is still alive, zero-dependency.
-/// Errs on the side of "alive" (returns `true` when it can't tell) so a live
-/// writer's lock is never stolen on a platform where the probe is unavailable.
-pub(crate) fn process_alive(pid: u32) -> bool {
-    // `/proc/<pid>` exists iff the process exists — no syscall crate needed.
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    // `kill -0` probes existence without sending a signal.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true)
-    }
-    // No cheap, dependency-free liveness probe on Windows. The caller only
-    // reaches here once the lock is already older than its `StoreKind`'s
-    // staleness age, so assume the owner is gone — a crashed writer's lock can
-    // still be reaped. That age is therefore the only thing keeping a live
-    // writer's lock safe here, which is why each kind states its own; a real
-    // `OpenProcess`/`GetExitCodeProcess` probe would be the better fix, at the
-    // cost of a Windows API dependency (see `StoreKind`).
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
     }
 }
 
@@ -404,12 +369,6 @@ mod tests {
         assert!(lock.exists(), "our fresh lock replaced the stale one");
     }
 
-    // Unix-only: exercising mtime-based reaping needs to backdate the lock's
-    // mtime, which we do with `touch` (see `set_mtime`). Windows has no
-    // dependency-free mtime setter here, so `set_mtime` is a no-op there and the
-    // lock would never age out — the reaping path itself is unix/Windows-agnostic
-    // and covered on unix CI.
-    #[cfg(unix)]
     #[test]
     fn unparseable_old_lock_is_reaped_by_mtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,7 +379,7 @@ mod tests {
         // Backdate its mtime past the staleness window so it ages out.
         let old =
             std::time::SystemTime::now() - Duration::from_secs(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
-        set_mtime(&lock, old);
+        filetime::set_file_mtime(&lock, filetime::FileTime::from_system_time(old)).unwrap();
         let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
         assert!(lock.exists());
     }
@@ -610,10 +569,7 @@ mod tests {
             child.pid(),
             "the lock on disk belongs to the other process"
         );
-        // Unix-only: `process_alive` has no probe on Windows and answers `false`
-        // for every pid, so there this would assert the opposite of the truth.
-        // It is the only place the probe meets a real, live, foreign process.
-        #[cfg(unix)]
+        // The only place the probe meets a real, live, foreign process.
         assert!(
             process_alive(child.pid()),
             "its owner is alive, so the lock is not stale however this test is timed"
@@ -644,11 +600,6 @@ mod tests {
     /// running. The child takes the lock and leaves through
     /// `std::process::exit`, which runs no destructors, so what it leaves behind
     /// is a real lock file naming a real pid that is really gone.
-    ///
-    /// Unix-only, deliberately: reaping turns on [`process_alive`], which on
-    /// Windows has no dependency-free probe and answers `false` for every pid —
-    /// so there this would pass without saying anything about a dead process.
-    #[cfg(unix)]
     #[test]
     fn a_dead_holders_lock_is_reaped_by_the_next_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -709,21 +660,5 @@ mod tests {
             "the parent released the child within its bound"
         );
         drop(guard);
-    }
-
-    // Small mtime helper (no external crate): backdate a file's mtime by
-    // shelling out to `touch`. Unix-only — the sole caller
-    // (`unparseable_old_lock_is_reaped_by_mtime`) is `#[cfg(unix)]` too.
-    #[cfg(unix)]
-    fn set_mtime(path: &Path, when: std::time::SystemTime) {
-        // `touch -t [[CC]YY]MMDDhhmm[.SS]` is portable across GNU and BSD
-        // `touch`; macOS's BSD `touch` rejects GNU's `-d @<epoch>` form (it
-        // silently no-ops, leaving the lock fresh and wedging the test). The
-        // `-t` argument is interpreted in local time, so format `when` locally.
-        let when: chrono::DateTime<chrono::Local> = when.into();
-        let stamp = when.format("%Y%m%d%H%M.%S").to_string();
-        let _ = std::process::Command::new("touch")
-            .args(["-t", &stamp, &path.to_string_lossy()])
-            .status();
     }
 }

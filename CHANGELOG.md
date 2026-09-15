@@ -42,6 +42,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Windows: an `@file` attachment is rejected if the path is swapped while it
   is validated.** The handle-identity check was compiled only on unix
   (`crates/hrdr-tools`).
+- **Windows: a running hrdr's session and store locks are no longer taken over
+  once they outlive their staleness window, and dead sessions' scratch and
+  tool-output directories are cleaned up.** Windows had no process-liveness
+  probe, so every lock owner read as dead once its lock aged out and a second
+  instance could steal it, while the temp-dir sweeps did nothing at all. The new
+  `hrdr_tools::process_alive` asks `OpenProcess`/`WaitForSingleObject` on
+  Windows and `kill(pid, 0)` on unix (`crates/hrdr-tools`, `crates/hrdr-agent`).
 - **`rustls` 0.23.45 for RUSTSEC-2026-0285** (TLS 1.3 handshake messages
   accepted across encryption-level boundaries).
 

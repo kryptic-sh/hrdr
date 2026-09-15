@@ -398,7 +398,6 @@ pub(crate) fn rand_hex8() -> String {
 /// Remove `hrdr-scratch-<pid>-*` directories in `temp` whose pid is gone,
 /// skipping `keep` (this process's own, freshly named). Best-effort: every
 /// error is ignored.
-#[cfg(unix)]
 fn sweep_stale_scratch(temp: &Path, keep: &Path) {
     for path in dead_pid_dirs(temp, "hrdr-scratch-", keep) {
         let _ = std::fs::remove_dir_all(&path);
@@ -417,7 +416,6 @@ fn sweep_stale_scratch(temp: &Path, keep: &Path) {
 ///
 /// Best-effort: every error is ignored, and an unreadable mtime counts as recent
 /// (keeping a directory is cheaper than deleting one somebody needs).
-#[cfg(unix)]
 pub(crate) fn sweep_stale_session_dirs(parent: &Path, prefix: &str, keep: &Path) {
     const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
     for path in dead_pid_dirs(parent, prefix, keep) {
@@ -431,17 +429,9 @@ pub(crate) fn sweep_stale_session_dirs(parent: &Path, prefix: &str, keep: &Path)
     }
 }
 
-/// Non-unix: no portable liveness probe, so leave stale dirs to the OS.
-#[cfg(not(unix))]
-pub(crate) fn sweep_stale_session_dirs(_parent: &Path, _prefix: &str, _keep: &Path) {}
-
 /// Directories in `parent` named `<prefix><pid>-…` whose pid is no longer alive,
-/// excluding `keep`.
-///
-/// Signal 0 probes for existence without delivering anything. Only `ESRCH` proves
-/// the process is gone — `EPERM` means it is alive and owned by somebody else, and
-/// that directory is not ours to reap.
-#[cfg(unix)]
+/// excluding `keep`. A pid [`crate::process_alive`] cannot rule out — another
+/// user's process, say — is not ours to reap.
 fn dead_pid_dirs(parent: &Path, prefix: &str, keep: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
@@ -457,21 +447,16 @@ fn dead_pid_dirs(parent: &Path, prefix: &str, keep: &Path) -> Vec<PathBuf> {
             .to_str()
             .and_then(|n| n.strip_prefix(prefix))
             .and_then(|rest| rest.split('-').next())
-            .and_then(|pid| pid.parse::<i32>().ok())
+            .and_then(|pid| pid.parse::<u32>().ok())
         else {
             continue;
         };
-        let rc = unsafe { libc::kill(pid, 0) };
-        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if !crate::process_alive(pid) {
             out.push(path);
         }
     }
     out
 }
-
-/// Non-unix: no portable liveness probe, so leave stale dirs to the OS.
-#[cfg(not(unix))]
-fn sweep_stale_scratch(_temp: &Path, _keep: &Path) {}
 
 /// Extra writable roots a linked git worktree needs to commit, and nothing
 /// more. Empty when `<cwd>/.git` is a directory (a normal checkout: `.git` is

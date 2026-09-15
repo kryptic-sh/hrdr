@@ -69,6 +69,61 @@ pub(crate) fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
         .map_or_else(|| program.into(), OsString::from)
 }
 
+/// Whether process `pid` is still running.
+///
+/// For telling an abandoned lock or per-process directory from one a live hrdr
+/// still owns, so every answer this cannot give is "alive": waiting out a lock or
+/// keeping a stale directory is recoverable, reaping a live process's is not.
+/// Verified on Linux locally; the Windows arm is exercised by the cross-process
+/// lock tests on the Windows CI runner.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill(0, 0)` would probe this process's own group and `-1` every
+        // process; no real pid is either.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 delivers nothing; the call only reports existence.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        // Only ESRCH proves it is gone. EPERM is a live process of another user.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+        // Fixed Win32 ABI values, spelled out: the names are what move between
+        // `windows-sys` releases.
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        const WAIT_OBJECT_0: u32 = 0;
+
+        // SAFETY: by-value arguments only; a non-null handle is closed exactly
+        // once, below.
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // No such pid is the one refusal that means gone; access denied is a
+            // live process hrdr may not open.
+            return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+        }
+        // A process handle is signalled once the process has exited — unlike its
+        // exit code, which a live process can never be told apart from one that
+        // exited with `STILL_ACTIVE`. A failed wait answers "alive".
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        unsafe { CloseHandle(handle) };
+        wait != WAIT_OBJECT_0
+    }
+}
+
 /// Put `cmd`'s future child in a position to have its whole process tree
 /// killed later, not just its own pid. Call this before `spawn()`, alongside
 /// the stdio/`kill_on_drop` setup every call site already does.
@@ -492,6 +547,28 @@ mod tests {
         assert_eq!(
             super::resolve_program("./bin/tool", path),
             OsStr::new("./bin/tool")
+        );
+    }
+
+    /// A running process reads as alive, and one that has exited and been reaped
+    /// reads as gone — on the platform's own probe, whichever that is.
+    #[test]
+    fn a_live_process_is_alive_and_a_reaped_one_is_not() {
+        assert!(super::process_alive(std::process::id()), "this process");
+
+        let exe = std::env::current_exe().unwrap();
+        // `--list` makes the test harness print its test names and exit, so the
+        // child runs nothing.
+        let mut child = std::process::Command::new(exe)
+            .args(["--list", "--exact", "no-such-test"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            !super::process_alive(pid),
+            "pid {pid} exited and was reaped"
         );
     }
 }
