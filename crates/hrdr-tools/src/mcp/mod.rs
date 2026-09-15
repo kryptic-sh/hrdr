@@ -564,6 +564,52 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         );
     }
 
+    /// A server configured by bare name is found on the `PATH` its own `env`
+    /// gives it, through a launcher script — the shape of `npx`/`uvx` reaching a
+    /// real server. On Windows the launcher is a `.cmd` shim, which a bare
+    /// `Command::new` never finds.
+    #[tokio::test]
+    async fn a_launcher_on_the_servers_own_path_starts_it() {
+        let Some(py) = crate::test_env::python() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mock_mcp.py");
+        std::fs::write(&script, MOCK_SERVER).unwrap();
+        #[cfg(windows)]
+        std::fs::write(
+            dir.path().join("hrdr-mock-mcp.cmd"),
+            format!("@{py} -u \"{}\" stdio\r\n", script.display()),
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        {
+            let launcher = dir.path().join("hrdr-mock-mcp");
+            std::fs::write(
+                &launcher,
+                format!("#!/bin/sh\nexec {py} -u '{}' stdio\n", script.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&inherited)),
+        )
+        .unwrap();
+        let env = vec![("PATH".to_string(), path.to_string_lossy().into_owned())];
+        let (_client, tools) = McpClient::connect_stdio("shim", "hrdr-mock-mcp", &[], &env)
+            .await
+            .expect("the launcher is found on the server's PATH and handshakes");
+        assert_eq!(tools.len(), 9);
+    }
+
     /// Test 6a — focused `tools/call` round-trip over stdio.
     ///
     /// The comprehensive `stdio_transport_tools_resources_prompts` test exercises

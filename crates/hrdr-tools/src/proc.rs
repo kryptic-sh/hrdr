@@ -36,7 +36,38 @@
 //! best-effort resource guard, not a security boundary. Unix has no such race —
 //! `process_group(0)` is applied pre-exec, atomically with the spawn.
 
+use std::ffi::{OsStr, OsString};
 use std::io;
+
+/// The program to hand `Command::new` for a configured program name: a bare name
+/// resolved through `PATH` (the child's own `PATH` when `path` overrides it) to the
+/// file that search actually finds, anything else unchanged.
+///
+/// `Command::new("name")` is not a `PATH` search on Windows. std looks in the
+/// application's directory and in System32 and the Windows directory *before*
+/// `PATH`, and tries a name without an extension only as `name.exe`. So `bash`
+/// meant System32's WSL launcher even with Git Bash first on `PATH`, and a Node
+/// shim — `npx.cmd`, `typescript-language-server.cmd` — could not be started at
+/// all. `which` walks `PATH` in order with `PATHEXT`, and std runs a resolved
+/// `.cmd`/`.bat` through `cmd.exe` with its own argument escaping.
+///
+/// On unix the result is the file `exec` would have found by the same search, so
+/// resolving there changes nothing but makes the lookup one code path everywhere.
+/// A path with a separator is left for the spawn to interpret (relative to the
+/// child's working directory, which `which` does not know), and a name nothing on
+/// `PATH` provides is passed through so the spawn error still names it.
+pub(crate) fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
+    if std::path::Path::new(program).components().count() != 1 {
+        return program.into();
+    }
+    let search = path
+        .map(OsStr::to_os_string)
+        .or_else(|| std::env::var_os("PATH"));
+    which::which_in_global(program, search)
+        .ok()
+        .and_then(|mut found| found.next())
+        .map_or_else(|| program.into(), OsString::from)
+}
 
 /// Put `cmd`'s future child in a position to have its whole process tree
 /// killed later, not just its own pid. Call this before `spawn()`, alongside
@@ -342,6 +373,7 @@ mod windows_job {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::time::Instant;
 
     use crate::test_env;
@@ -422,6 +454,44 @@ mod tests {
         assert!(
             !test_env::grandchild_finished(&marker, started).await,
             "the grandchild's sleep completed — dropping the guard did not reach it"
+        );
+    }
+
+    /// A bare name resolves to the file a `PATH` search finds — on Windows that
+    /// includes a `.cmd` shim, which `Command::new` alone never finds. The search
+    /// uses the `PATH` it is given, so a child whose `PATH` is overridden is
+    /// resolved against that one.
+    #[test]
+    fn a_bare_name_resolves_through_the_given_path() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let file = dir.path().join("hrdr-probe-tool.cmd");
+        #[cfg(not(windows))]
+        let file = dir.path().join("hrdr-probe-tool");
+        std::fs::write(&file, "exit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let resolved = super::resolve_program("hrdr-probe-tool", Some(dir.path().as_os_str()));
+        assert_eq!(std::path::Path::new(&resolved), file);
+    }
+
+    /// What no search can place is left alone: an unknown name reaches the spawn
+    /// as typed, so its error names it, and a path is the spawn's to interpret.
+    #[test]
+    fn an_unknown_name_or_a_path_passes_through() {
+        let empty = tempfile::tempdir().unwrap();
+        let path = Some(empty.path().as_os_str());
+        assert_eq!(
+            super::resolve_program("hrdr-no-such-tool", path),
+            OsStr::new("hrdr-no-such-tool")
+        );
+        assert_eq!(
+            super::resolve_program("./bin/tool", path),
+            OsStr::new("./bin/tool")
         );
     }
 }

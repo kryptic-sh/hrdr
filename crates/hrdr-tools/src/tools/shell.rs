@@ -60,10 +60,7 @@ impl Shell {
     /// probe must not print to the terminal a TUI owns — and any spawn error, any
     /// signal, any non-zero status all read the same: not usable.
     fn runs(self) -> bool {
-        if which::which(self.program()).is_err() {
-            return false;
-        }
-        std::process::Command::new(self.program())
+        std::process::Command::new(self.executable())
             .args(self.invoke_args())
             .arg("exit 0")
             .stdin(std::process::Stdio::null())
@@ -81,6 +78,19 @@ impl Shell {
         }
     }
 
+    /// The interpreter as spawned: [`Shell::program`] resolved through `PATH` once
+    /// per process (see [`crate::proc::resolve_program`] for why a bare name is
+    /// not good enough on Windows).
+    pub(crate) fn executable(self) -> &'static std::ffi::OsStr {
+        static BASH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+        static POSIX: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+        let resolved = match self {
+            Shell::Bash => &BASH,
+            Shell::Posix => &POSIX,
+        };
+        resolved.get_or_init(|| crate::proc::resolve_program(self.program(), None))
+    }
+
     /// The arguments that precede the command string. Separate from
     /// [`Shell::program`] because it is not universally `-c` — PowerShell would
     /// want `-NoProfile -Command`. Visible to the crate so the sandbox backends
@@ -94,7 +104,7 @@ impl Shell {
     /// A `Command` that runs `command` through this shell. Nothing else is
     /// configured — the caller owns cwd, stdio, timeouts and process groups.
     pub fn command(self, command: &str) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(self.program());
+        let mut cmd = tokio::process::Command::new(self.executable());
         cmd.args(self.invoke_args()).arg(command);
         cmd
     }
@@ -1056,7 +1066,7 @@ mod tests {
             shell.runs(),
             "{shell:?} was detected but cannot run `exit 0`"
         );
-        let out = std::process::Command::new(shell.program())
+        let out = std::process::Command::new(shell.executable())
             .args(shell.invoke_args())
             .arg("echo probe")
             .output()
@@ -1088,12 +1098,17 @@ mod tests {
 
             let cmd = shell.command("echo hi");
             let std_cmd = cmd.as_std();
-            assert!(
-                std_cmd
-                    .get_program()
-                    .to_string_lossy()
-                    .ends_with(shell.program()),
+            assert_eq!(
+                std_cmd.get_program(),
+                shell.executable(),
                 "{shell:?} spawns its own program"
+            );
+            assert!(
+                std::path::Path::new(shell.executable())
+                    .file_stem()
+                    .is_some_and(|stem| stem == shell.program()),
+                "{shell:?}'s executable is its program, wherever PATH found it: {:?}",
+                shell.executable()
             );
             let args: Vec<_> = std_cmd
                 .get_args()

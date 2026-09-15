@@ -1265,8 +1265,11 @@ pub const SANDBOX_EXEC_ARG: &str = "__sandbox-exec";
 /// no-OS-sandbox notice, exactly as it did before this backend existed.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn low_integrity_args(shell: crate::Shell, cmd_str: &str) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> =
-        vec![SANDBOX_EXEC_ARG.into(), "--".into(), shell.program().into()];
+    let mut args: Vec<std::ffi::OsString> = vec![
+        SANDBOX_EXEC_ARG.into(),
+        "--".into(),
+        shell.executable().into(),
+    ];
     args.extend(shell.invoke_args().iter().map(std::ffi::OsString::from));
     args.push(cmd_str.into());
     args
@@ -2505,13 +2508,16 @@ mod tests {
 
     /// The wrapper argv, checked on every platform so the shape cannot rot
     /// where it is not built: `__sandbox-exec -- <shell> -c <cmd>`, mirroring
-    /// Seatbelt's `-p <profile> -- <shell> -c <cmd>`.
+    /// Seatbelt's `-p <profile> -- <shell> -c <cmd>`. The shell is the resolved
+    /// executable, not the bare name: the wrapper's own spawn would otherwise
+    /// search System32 first and find WSL's `bash` on Windows.
     #[test]
     fn low_integrity_args_wrap_the_shell_invocation() {
         let args = argv(&low_integrity_args(crate::Shell::Bash, "echo hi"));
         assert_eq!(args[0], SANDBOX_EXEC_ARG);
         assert_eq!(args[1], "--");
-        assert_eq!(args[2..], ["bash", "-c", "echo hi"]);
+        assert_eq!(args[2], crate::Shell::Bash.executable().to_string_lossy());
+        assert_eq!(args[3..], ["-c", "echo hi"]);
     }
 
     /// A Low-integrity child can write nowhere the user owns, so the backend is

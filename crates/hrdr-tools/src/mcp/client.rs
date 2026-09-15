@@ -72,7 +72,20 @@ impl McpClient {
         args: &[String],
         env: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
-        let mut cmd = Command::new(command);
+        // The server is found on the `PATH` it will run with: an `env` entry
+        // overriding `PATH` is where its launcher lives.
+        let path = env
+            .iter()
+            .rev()
+            .find(|(k, _)| {
+                if cfg!(windows) {
+                    k.eq_ignore_ascii_case("PATH")
+                } else {
+                    k == "PATH"
+                }
+            })
+            .map(|(_, v)| std::ffi::OsStr::new(v));
+        let mut cmd = Command::new(crate::proc::resolve_program(command, path));
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

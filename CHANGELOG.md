@@ -28,6 +28,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving the alternate screen and releasing mouse capture, and the `?` on it
   ended the session. The push and pop are now best-effort on their own
   (`crates/hrdr-tui`).
+- **Windows: bare program names are found the way `PATH` says.** `Command::new`
+  searches System32 before `PATH` and tries only `<name>.exe`, so `bash` meant
+  WSL's launcher even with Git Bash first on `PATH`, and an MCP server launched
+  through `npx` or a language server installed as a `.cmd` shim
+  (`typescript-language-server`, `pyright-langserver`) never started. The shell,
+  MCP stdio servers (honouring an `env` `PATH` override), LSP servers and the
+  `read`-mode sandbox wrapper now spawn the file a `PATH` search resolves
+  (`crates/hrdr-tools`).
 - **Windows: the `read`-mode sandbox wrapper passes the command's exit code
   through.** Every failure used to come back as `exit status: 1`, so
   `cargo test`'s 101 and grep's no-match were indistinguishable (`apps/hrdr`).

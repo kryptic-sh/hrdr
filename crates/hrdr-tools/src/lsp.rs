@@ -453,7 +453,8 @@ fn initialize_params(root_uri: &str, initialization_options: Option<&Value>) -> 
 impl LspClient {
     /// Spawn + `initialize` + `initialized`.
     async fn start(config: &LspServerConfig, root: &Path, wait_secs: u64) -> Result<Arc<Self>> {
-        let mut cmd = tokio::process::Command::new(&config.command);
+        let mut cmd =
+            tokio::process::Command::new(crate::proc::resolve_program(&config.command, None));
         cmd.args(&config.args)
             .current_dir(root)
             .stdin(std::process::Stdio::piped())
