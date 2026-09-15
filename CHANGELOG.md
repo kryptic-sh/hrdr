@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-15
+
+### Breaking
+
+- **`hrdr_agent::Pane` transcript mutations now flow through revision-tracked
+  accessors.** The public `state` field is replaced by `state()` and
+  conservatively invalidating `state_mut()`, while append, prune, clear,
+  replacement, and event reducers report the earliest dirty entry for
+  incremental renderers (`crates/hrdr-agent`). Below 1.0 the removed public
+  `state` field is a breaking change.
+
+### Added
+
+- **`hrdr_tools::process_alive` and `hrdr_tools::resolve_program`** — the
+  process liveness probe (unix and Windows) and the `PATH` lookup that finds a
+  bare program name the way a shell would, including `.cmd` shims on Windows.
+
 ### Changed
 
 - **Unchanged TUI frames now reuse their assembled transcript layout without
@@ -14,11 +31,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   app identity, while transcript, header, queue, width, and per-pane expansion
   changes invalidate only the required cache region without leaking state
   between sessions (`crates/hrdr-tui`).
-- **`Pane` transcript mutations now flow through revision-tracked accessors.**
-  The public `state` field is replaced by `state()` and conservatively
-  invalidating `state_mut()`, while append, prune, clear, replacement, and event
-  reducers report the earliest dirty entry for incremental renderers
-  (`crates/hrdr-agent`).
 
 ### Fixed
 
@@ -7554,7 +7566,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.15.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/kryptic-sh/hrdr/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/kryptic-sh/hrdr/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/kryptic-sh/hrdr/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/kryptic-sh/hrdr/compare/v0.15.0...v0.15.1
