@@ -55,6 +55,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not have (it is now `notepad` there); and a draft saved with CRLF line endings
   came back with `\r` in the input box. A Ctrl+G editor that fails to launch now
   says so instead of doing nothing (`crates/hrdr-tui`).
+- **Windows: diagnostics from `typescript-language-server` and `pyright` reach
+  the edit that caused them.** Those servers publish `file:///c%3A/…` for a file
+  hrdr opened as `file:///C:/…`; diagnostics were stored and looked up by the
+  exact URI string, so every publish missed, and `uri_to_path` turned the
+  encoded form into `/c:/…` for definitions and references. Both now go through
+  the decoded path with the drive letter lowercased (`crates/hrdr-tools`).
 - **A running `!command` stops growing its block at 256 KiB of live output
   again.** The cap was lost when `!` moved onto the shell tool's streaming path;
   the only bound left was the stream channel dropping what a busy TUI fell

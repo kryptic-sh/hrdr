@@ -390,7 +390,8 @@ impl LspRegistry {
     }
 }
 
-/// The latest `publishDiagnostics` per URI: `(version, diagnostics)`.
+/// The latest `publishDiagnostics` per document, keyed by [`diagnostics_key`]:
+/// `(version, diagnostics)`.
 type DiagnosticsByUri = HashMap<String, (Option<i64>, Vec<Value>)>;
 
 /// One running language server: the JSON-RPC plumbing plus the diagnostics
@@ -575,7 +576,7 @@ impl LspClient {
                         .cloned()
                         .unwrap_or_default();
                     if let Ok(mut d) = client.diags.lock() {
-                        d.insert(uri, (version, list));
+                        d.insert(diagnostics_key(&uri), (version, list));
                     }
                     client.diag_notify.notify_waiters();
                 }
@@ -631,10 +632,11 @@ impl LspClient {
         wait: Duration,
     ) -> Vec<Value> {
         let uri = file_uri(path);
+        let key = diagnostics_key(&uri);
         // Forget the previous publish so an old result can't answer for this
         // edit (a same-version republish is indistinguishable otherwise).
         if let Ok(mut d) = self.diags.lock() {
-            d.remove(&uri);
+            d.remove(&key);
         }
         let Ok(version) = self.sync_file(&uri, ext, content).await else {
             return Vec::new();
@@ -648,7 +650,7 @@ impl LspClient {
         let mut settle_until: Option<tokio::time::Instant> = None;
         loop {
             let current = self.diags.lock().ok().and_then(|d| {
-                d.get(&uri)
+                d.get(&key)
                     .filter(|(v, _)| v.is_none() || *v == Some(version))
                     .map(|(_, list)| list.clone())
             });
@@ -796,12 +798,6 @@ pub struct LspFileEdits {
 /// contract.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    // Windows drive form `file:///C:/…` keeps the path after the third slash.
-    let rest = if rest.len() > 2 && rest.as_bytes()[0] == b'/' && rest.as_bytes()[2] == b':' {
-        &rest[1..]
-    } else {
-        rest
-    };
     let bytes = rest.as_bytes();
     let mut raw: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -817,7 +813,32 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
         raw.push(bytes[i]);
         i += 1;
     }
-    Some(PathBuf::from(String::from_utf8_lossy(&raw).into_owned()))
+    let decoded = String::from_utf8_lossy(&raw).into_owned();
+    // Windows drive form `file:///C:/…` keeps the path after the third slash.
+    // Checked after decoding: servers built on `vscode-uri` (typescript-language-
+    // server, pyright) encode the colon, `file:///c%3A/…`.
+    let d = decoded.as_bytes();
+    if d.len() > 2 && d[0] == b'/' && d[1].is_ascii_alphabetic() && d[2] == b':' {
+        return Some(PathBuf::from(&decoded[1..]));
+    }
+    Some(PathBuf::from(decoded))
+}
+
+/// The key a document's diagnostics are stored and looked up under: the path its
+/// URI names, with `/` separators and a Windows drive letter lowercased.
+///
+/// Not the URI string. [`file_uri`] sends `file:///C:/p/a.ts`; a server built on
+/// `vscode-uri` publishes the same file as `file:///c%3A/p/a.ts`, and an exact
+/// string match missed every one of its diagnostics on Windows.
+fn diagnostics_key(uri: &str) -> String {
+    let Some(path) = uri_to_path(uri) else {
+        return uri.to_string();
+    };
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    if key.as_bytes().get(1) == Some(&b':') {
+        key[..1].make_ascii_lowercase();
+    }
+    key
 }
 
 /// The byte offset of UTF-16 column `utf16_col` within `line` (clamped to the
@@ -1515,6 +1536,32 @@ mod tests {
     /// that per-byte loop came out as mojibake. `file_uri` also now
     /// percent-encodes non-ASCII bytes (RFC 3986 — a URI is ASCII-only), so
     /// this also pins that the encoded form contains no raw UTF-8 bytes.
+    /// A Windows path round-trips whichever way a server spells its drive: ours
+    /// (`file:///C:/…`) or `vscode-uri`'s (`file:///c%3A/…`, what
+    /// typescript-language-server and pyright publish) — and both spellings key
+    /// the same diagnostics.
+    #[test]
+    fn a_drive_letter_uri_resolves_however_the_server_spells_it() {
+        assert_eq!(
+            uri_to_path("file:///c%3A/proj/a.ts").unwrap(),
+            PathBuf::from("c:/proj/a.ts")
+        );
+        assert_eq!(
+            uri_to_path("file:///C:/proj/a.ts").unwrap(),
+            PathBuf::from("C:/proj/a.ts")
+        );
+        assert_eq!(
+            diagnostics_key("file:///c%3A/proj/a%20b.ts"),
+            diagnostics_key("file:///C:/proj/a%20b.ts")
+        );
+        // A unix path is untouched, and distinct files stay distinct.
+        assert_eq!(diagnostics_key("file:///proj/a.ts"), "/proj/a.ts");
+        assert_ne!(
+            diagnostics_key("file:///c%3A/proj/a.ts"),
+            diagnostics_key("file:///c%3A/proj/b.ts")
+        );
+    }
+
     #[test]
     fn non_ascii_filenames_round_trip_through_uris() {
         let p = Path::new("/proj/café.rs");
@@ -1734,7 +1781,7 @@ mod tests {
     /// version, exercising the stale-publish guard), and serves
     /// definition/references/rename for the word "boom" from the synced text.
     const FAKE_LSP_PY: &str = r#"
-import json, sys
+import json, re, sys
 
 texts = {}
 
@@ -1755,6 +1802,12 @@ def send(msg):
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
 
+def vscode_uri(uri):
+    # Publish a drive path the way vscode-uri based servers (typescript-language-
+    # server, pyright) spell it: lowercase drive, colon encoded. No drive, no change.
+    m = re.match(r"file:///([A-Za-z]):(.*)", uri)
+    return "file:///%s%%3A%s" % (m.group(1).lower(), m.group(2)) if m else uri
+
 def publish(uri, version, text):
     texts[uri] = text
     diags = []
@@ -1767,7 +1820,7 @@ def publish(uri, version, text):
                 "message": "found boom",
             })
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
-          "params": {"uri": uri, "version": version, "diagnostics": diags}})
+          "params": {"uri": vscode_uri(uri), "version": version, "diagnostics": diags}})
 
 def occurrences(uri):
     out = []
