@@ -21,25 +21,6 @@ extern crate hrdr_test_support;
 
 use std::process::Command;
 
-/// Whether to skip for want of the thing under test — **never in CI**.
-///
-/// Same shape and same reasoning as `skip_for_want_of_a_pty` in `tui_pty.rs` and
-/// `skip_for_want_of` in `hrdr-tools`: locally a missing prerequisite is an
-/// environment fact, on a runner it is a broken environment, and a skip that
-/// cannot tell them apart turns an infrastructure failure into a green tick.
-fn skip_for_want_of(what: &str, present: bool) -> bool {
-    if present {
-        return false;
-    }
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "{what} is missing on a CI runner — that is a broken environment, not a \
-         reason to report this backend as tested"
-    );
-    eprintln!("skipping: {what} is not available on this machine");
-    true
-}
-
 /// Run `hrdr __sandbox-exec -- cmd /c <command>` and hand back (success, stdout).
 ///
 /// `cmd.exe` rather than a shell hrdr detects: it is present on every Windows
@@ -60,7 +41,7 @@ fn under_low_integrity(command: &str) -> (bool, String) {
 /// which is the whole of what `SandboxMode::Read` promises.
 #[test]
 fn a_write_is_denied_under_the_low_integrity_wrapper() {
-    if skip_for_want_of(
+    if hrdr_test_support::skip_for_want_of(
         "cmd.exe",
         std::path::Path::new(r"C:\Windows\System32\cmd.exe").exists(),
     ) {
@@ -84,7 +65,7 @@ fn a_write_is_denied_under_the_low_integrity_wrapper() {
 /// backend that blocked reads too would be enforcing `jail`, not `read`.
 #[test]
 fn a_read_still_succeeds_under_the_low_integrity_wrapper() {
-    if skip_for_want_of(
+    if hrdr_test_support::skip_for_want_of(
         "cmd.exe",
         std::path::Path::new(r"C:\Windows\System32\cmd.exe").exists(),
     ) {
@@ -101,6 +82,24 @@ fn a_read_still_succeeds_under_the_low_integrity_wrapper() {
         stdout.contains("visible"),
         "the file's contents did not come back: {stdout:?}"
     );
+}
+
+/// The child's exit code comes back whole. The `shell` tool reports it to the
+/// model, and a wrapper that turned every failure into `1` said `cargo test`'s
+/// 101 and grep's "no match" 1 were the same thing.
+#[test]
+fn the_wrapper_propagates_the_childs_exit_code() {
+    if hrdr_test_support::skip_for_want_of(
+        "cmd.exe",
+        std::path::Path::new(r"C:\Windows\System32\cmd.exe").exists(),
+    ) {
+        return;
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_hrdr"))
+        .args(["__sandbox-exec", "--", "cmd", "/c", "exit 101"])
+        .status()
+        .expect("spawning the hrdr sandbox wrapper");
+    assert_eq!(status.code(), Some(101));
 }
 
 /// The wrapper must not run the command when it cannot confine it. Given no

@@ -28,6 +28,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving the alternate screen and releasing mouse capture, and the `?` on it
   ended the session. The push and pop are now best-effort on their own
   (`crates/hrdr-tui`).
+- **Windows: the `read`-mode sandbox wrapper passes the command's exit code
+  through.** Every failure used to come back as `exit status: 1`, so
+  `cargo test`'s 101 and grep's no-match were indistinguishable (`apps/hrdr`).
 
 - **Cancelling a turn no longer leaves a cached running-tool spinner on
   screen.** Settling an interrupted tool now refreshes its render identity, so

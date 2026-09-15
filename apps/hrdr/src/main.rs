@@ -464,7 +464,7 @@ async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
 /// fatal: running the command unconfined while the backend reports itself active
 /// is the one outcome worse than having no backend at all.
 #[cfg(windows)]
-fn run_sandbox_exec_wrapper() -> Option<Result<std::process::ExitCode>> {
+fn run_sandbox_exec_wrapper() -> Option<Result<i32>> {
     // Scoped to this function: `main.rs` imports only `anyhow::Result`, and a
     // top-level `use` would be an unused import on every non-Windows build.
     use anyhow::Context as _;
@@ -484,11 +484,10 @@ fn run_sandbox_exec_wrapper() -> Option<Result<std::process::ExitCode>> {
             .args(args)
             .status()
             .with_context(|| format!("__sandbox-exec: spawning {}", program.display()))?;
-        // Propagate the child's code so the caller's exit-status handling is
-        // unchanged by the extra process in between.
-        Ok(std::process::ExitCode::from(
-            u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
-        ))
+        // Propagate the child's code, whole, so the caller's exit-status handling
+        // is unchanged by the extra process in between: `cargo test`'s 101 and
+        // grep's 2 mean something, and Windows codes do not fit in a `u8`.
+        Ok(status.code().unwrap_or(1))
     })())
 }
 
@@ -498,13 +497,9 @@ async fn main() -> Result<()> {
     // process may be a confinement wrapper rather than an hrdr session.
     #[cfg(windows)]
     if let Some(result) = run_sandbox_exec_wrapper() {
-        let code = result?;
-        // `ExitCode` cannot be returned from a `Result`-returning main, and the
-        // wrapper must not fall through into a session.
-        std::process::exit(match code == std::process::ExitCode::SUCCESS {
-            true => 0,
-            false => 1,
-        });
+        // Exit here, with the child's own code: the wrapper must not fall through
+        // into a session.
+        std::process::exit(result?);
     }
 
     tracing_subscriber::fmt()
