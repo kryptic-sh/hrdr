@@ -49,6 +49,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instance could steal it, while the temp-dir sweeps did nothing at all. The new
   `hrdr_tools::process_alive` asks `OpenProcess`/`WaitForSingleObject` on
   Windows and `kill(pid, 0)` on unix (`crates/hrdr-tools`, `crates/hrdr-agent`).
+- **Windows: `$VISUAL`/`$EDITOR` launch the editor they name.** A backslash was
+  read as a shell escape, so `EDITOR=C:\tools\vim.exe` became `C:toolsvim.exe`;
+  `code` (`code.cmd`) was never found; the fallback was `vi`, which Windows does
+  not have (it is now `notepad` there); and a draft saved with CRLF line endings
+  came back with `\r` in the input box. A Ctrl+G editor that fails to launch now
+  says so instead of doing nothing (`crates/hrdr-tui`).
 - **A running `!command` stops growing its block at 256 KiB of live output
   again.** The cap was lost when `!` moved onto the shell tool's streaming path;
   the only bound left was the stream channel dropping what a busy TUI fell

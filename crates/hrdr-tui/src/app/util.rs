@@ -1,22 +1,31 @@
 //! Free helper functions with no `App` receiver.
 
+/// Split a `$VISUAL`/`$EDITOR` value into words, by this platform's convention
+/// for a backslash: an escape on unix, a path separator on Windows — where
+/// `EDITOR=C:\tools\vim.exe` is the value people actually set. See
+/// [`split_words`].
+pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
+    split_words(input, !cfg!(windows))
+}
+
 /// Split a command string into words using POSIX-ish shell rules.
 ///
 /// Handles the quoting seen in `$EDITOR`/`$VISUAL` values without shelling
 /// out to a real shell (which would add injection/quoting hazards):
 /// - whitespace separates words;
-/// - double quotes group text, honoring backslash escapes for `"` and `\`;
+/// - double quotes group text; a backslash inside them escapes `"` (and, with
+///   `backslash_escapes`, `\`);
 /// - single quotes group text literally (no escapes recognized inside);
-/// - a backslash outside quotes escapes the next character verbatim.
+/// - with `backslash_escapes`, a backslash outside quotes escapes the next
+///   character verbatim; without it, a backslash is an ordinary character.
 ///
 /// Unterminated quote handling: if the string ends while still inside a
 /// quote (or right after a trailing backslash), the accumulated text is
 /// emitted as-is rather than erroring. `$EDITOR` is trusted local config,
 /// so best-effort recovery beats failing to launch the editor.
 ///
-/// Windows note: the same parser applies. `cmd`-style `%VAR%` expansion and
-/// caret (`^`) quoting are out of scope; use forward slashes / this quoting.
-pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
+/// `cmd`-style `%VAR%` expansion and caret (`^`) quoting are out of scope.
+fn split_words(input: &str, backslash_escapes: bool) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut has_word = false;
@@ -42,19 +51,19 @@ pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
             }
             '"' => {
                 has_word = true;
-                // Double quotes: backslash escapes `"` and `\` only.
                 while let Some(dc) = chars.next() {
                     match dc {
                         '"' => break,
                         '\\' => match chars.peek() {
-                            Some('"') | Some('\\') => cur.push(chars.next().unwrap()),
+                            Some('"') => cur.push(chars.next().unwrap()),
+                            Some('\\') if backslash_escapes => cur.push(chars.next().unwrap()),
                             _ => cur.push('\\'),
                         },
                         _ => cur.push(dc),
                     }
                 }
             }
-            '\\' => {
+            '\\' if backslash_escapes => {
                 has_word = true;
                 // Outside quotes a backslash escapes the next char verbatim;
                 // a trailing backslash is emitted literally.
@@ -76,29 +85,82 @@ pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
     words
 }
 
-/// Run `$VISUAL`/`$EDITOR` (falling back to `vi`) on `path`, inheriting stdio.
-/// The command string may carry quoted args and paths with spaces (e.g.
-/// `code --profile "Work Profile" -w`); it is parsed with [`split_shell_words`].
+/// The editor used when neither `$VISUAL` nor `$EDITOR` names one: the one every
+/// install of the platform has.
+const DEFAULT_EDITOR: &str = if cfg!(windows) { "notepad" } else { "vi" };
+
+/// Run `$VISUAL`/`$EDITOR` (falling back to [`DEFAULT_EDITOR`]) on `path`,
+/// inheriting stdio. The command string may carry quoted args and paths with
+/// spaces (e.g. `code --profile "Work Profile" -w`); it is parsed with
+/// [`split_shell_words`], and the program is found through `PATH` the way
+/// [`hrdr_tools::resolve_program`] finds every other one — VS Code's `code` is
+/// `code.cmd` on Windows.
 pub(crate) fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
+        .unwrap_or_else(|_| DEFAULT_EDITOR.to_string());
     let mut parts = split_shell_words(&editor);
-    // Empty/whitespace-only value parses to no words; fall back to `vi`.
+    // Empty/whitespace-only value parses to no words; fall back to the default.
     let program = if parts.is_empty() {
-        "vi".to_string()
+        DEFAULT_EDITOR.to_string()
     } else {
         parts.remove(0)
     };
-    std::process::Command::new(program)
+    std::process::Command::new(hrdr_tools::resolve_program(&program, None))
         .args(parts)
         .arg(path)
         .status()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("launching `{program}`: {e}")))
+}
+
+/// The draft an editor saved, as the input box should hold it: CRLF line endings
+/// (Notepad's, or any editor configured for them) folded to `\n`, and the one
+/// trailing newline editors append dropped so the draft doesn't submit blank.
+pub(crate) fn draft_from_editor(text: &str) -> String {
+    let text = text.replace("\r\n", "\n");
+    match text.strip_suffix('\n') {
+        Some(trimmed) => trimmed.to_string(),
+        None => text,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_shell_words;
+    use super::{draft_from_editor, split_words};
+
+    /// The unix convention, which every test below exercises unless it says
+    /// otherwise.
+    fn split_shell_words(input: &str) -> Vec<String> {
+        split_words(input, true)
+    }
+
+    /// Windows: a backslash is a path separator, not an escape, so the value
+    /// people set there survives whole — quoted or not.
+    #[test]
+    fn windows_paths_keep_their_backslashes() {
+        assert_eq!(
+            split_words(r"C:\tools\vim.exe -f", false),
+            [r"C:\tools\vim.exe", "-f"]
+        );
+        assert_eq!(
+            split_words(r#""C:\Program Files\Neovim\bin\nvim.exe" --clean"#, false),
+            [r"C:\Program Files\Neovim\bin\nvim.exe", "--clean"]
+        );
+        // An escaped quote inside double quotes is still a quote.
+        assert_eq!(split_words(r#""a\"b""#, false), [r#"a"b"#]);
+    }
+
+    /// What an editor saved comes back as the draft: CRLF folded, one trailing
+    /// newline dropped, anything else kept.
+    #[test]
+    fn a_saved_draft_folds_crlf_and_drops_one_trailing_newline() {
+        assert_eq!(
+            draft_from_editor("line one\r\nline two\r\n"),
+            "line one\nline two"
+        );
+        assert_eq!(draft_from_editor("kept\n\n"), "kept\n");
+        assert_eq!(draft_from_editor("no newline"), "no newline");
+    }
 
     #[test]
     fn simple_flag() {

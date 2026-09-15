@@ -56,7 +56,7 @@ use std::io;
 /// A path with a separator is left for the spawn to interpret (relative to the
 /// child's working directory, which `which` does not know), and a name nothing on
 /// `PATH` provides is passed through so the spawn error still names it.
-pub(crate) fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
+pub fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
     if std::path::Path::new(program).components().count() != 1 {
         return program.into();
     }

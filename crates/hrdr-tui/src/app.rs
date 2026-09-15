@@ -99,7 +99,7 @@ pub(crate) use selector::{
 };
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
-pub(crate) use util::run_editor;
+pub(crate) use util::{draft_from_editor, run_editor};
 
 /// A running user `!command`: enough to cancel it (abort the task — the
 /// child is `kill_on_drop`) and close its transcript block coherently.

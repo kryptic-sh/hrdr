@@ -12,7 +12,7 @@ use crossterm::event::{Event, EventStream};
 use crossterm::execute;
 use futures_util::StreamExt;
 
-use crate::app::{Action, App, run_editor};
+use crate::app::{Action, App, draft_from_editor, run_editor};
 use crate::{Tui, resume_terminal, suspend_terminal, ui};
 
 /// Tell the terminal what the cursor should look like, when it changes.
@@ -188,12 +188,13 @@ fn open_in_editor(app: &mut App, terminal: &mut Tui) -> Result<()> {
     resume_terminal(terminal)?;
     terminal.clear()?;
 
-    if status.is_ok()
-        && let Ok(text) = std::fs::read_to_string(&path)
-    {
-        // Editors append a trailing newline; drop one so it doesn't submit blank.
-        let text = text.strip_suffix('\n').unwrap_or(&text);
-        app.editor.set_content(text);
+    match status {
+        Ok(_) => {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                app.editor.set_content(&draft_from_editor(&text));
+            }
+        }
+        Err(e) => app.system(format!("editor failed: {e}")),
     }
     // `named` drop closes the fd and deletes the temp file.
     drop(named);
