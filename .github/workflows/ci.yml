@@ -118,8 +118,12 @@ jobs:
   # (a new tests/*.rs missing the link line, a doctest) before it reaches a real machine.
   # Gated on HRDR_LEAK_GUARD so a plain `cargo test` never invokes itself.
   leak-guard:
-    name: no test writes real user state
-    runs-on: ubuntu-latest
+    name: no test writes real user state ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
