@@ -1013,24 +1013,17 @@ fn open_attach_file(
     let resolved = resolve_under(cwd, path_str);
     let file = std::fs::File::open(&resolved)
         .map_err(|e| anyhow::anyhow!("can't open {}: {e}", resolved.display()))?;
-    // Validate on every platform (rejects unsafe attaches); the returned path is
-    // only consumed by the Unix handle-identity check below, so it is
-    // `_`-prefixed to stay warning-clean on Windows under `-D warnings`.
-    let _canon = validate_attach_path(path_str, cwd)?;
+    let canon = validate_attach_path(path_str, cwd)?;
 
-    // On Unix, prove the opened descriptor is the same object canonicalization
-    // validated. If any path component changed during validation, reject it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let opened = file.metadata()?;
-        let validated = std::fs::metadata(&_canon)?;
-        if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
-            anyhow::bail!(
-                "{} changed while it was being validated",
-                resolved.display()
-            );
-        }
+    // Prove the opened handle is the same object canonicalization validated. If
+    // any path component changed during validation, reject it. Compared through
+    // [`FileIdentity`], which both platforms implement — this check was once
+    // unix-only while the Windows identity helpers sat unused beside it.
+    if file_identity(&file)? != path_identity(&canon)? {
+        anyhow::bail!(
+            "{} changed while it was being validated",
+            resolved.display()
+        );
     }
     Ok((file, resolved))
 }
