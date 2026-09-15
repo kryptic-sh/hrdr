@@ -312,6 +312,7 @@ use common::{Chat, MockServer, stop_chunk, text_chunk};
 #[allow(clippy::type_complexity)]
 fn spawn_pty(
     base_url: &str,
+    env: &[(&str, &str)],
 ) -> (
     Box<dyn portable_pty::Child + Send + Sync>,
     Box<dyn portable_pty::MasterPty + Send>,
@@ -361,6 +362,9 @@ fn spawn_pty(
     for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
         cmd.env_remove(key);
     }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
 
     let child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     drop(pty.slave);
@@ -396,7 +400,12 @@ struct Session {
 
 impl Session {
     fn spawn(base_url: &str) -> Session {
-        let (child, master, mut reader, writer, home, project, runtime) = spawn_pty(base_url);
+        Self::spawn_with_env(base_url, &[])
+    }
+
+    /// [`Session::spawn`] with extra environment for the child.
+    fn spawn_with_env(base_url: &str, env: &[(&str, &str)]) -> Session {
+        let (child, master, mut reader, writer, home, project, runtime) = spawn_pty(base_url, env);
         let screen = Arc::new(Mutex::new(String::new()));
         let writer = Arc::new(Mutex::new(writer));
         let sink = Arc::clone(&screen);
@@ -680,6 +689,63 @@ fn a_mouse_drag_selects_the_transcript_and_copies_it() -> Result<(), String> {
     assert!(
         status.success(),
         "clean exit after a drag-copy. Screen:\n{}",
+        s.snapshot()
+    );
+    Ok(())
+}
+
+/// 11. Ctrl+G hands the terminal to `$VISUAL` and takes it back: what the editor
+///     wrote lands in the input box of a TUI that is still running, which then
+///     quits cleanly.
+///
+/// Suspending and resuming is the terminal handover no other test performs, and
+/// the one that broke on Windows: crossterm refuses the keyboard-enhancement pop
+/// there, the refusal aborted the restore, and the `?` on it ended the session —
+/// pressing Ctrl+G quit hrdr instead of opening the editor.
+///
+/// The "editor" is a one-line Python script that overwrites the draft file: only
+/// an editor that really ran, followed by a TUI that really resumed and repainted,
+/// puts its text on the screen.
+#[test]
+fn ctrl_g_returns_from_the_editor_to_a_live_tui() -> Result<(), String> {
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let python = ["python3", "python"].into_iter().find(|exe| {
+        std::process::Command::new(exe)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    if hrdr_test_support::skip_for_want_of("a Python interpreter", python.is_some()) {
+        return Ok(());
+    }
+    let editor = format!(
+        "{} -c \"import sys; open(sys.argv[1], 'w').write('EDITED_BY_THE_EDITOR')\"",
+        python.expect("checked above")
+    );
+    let server = MockServer::start(vec![]);
+    let mut s = Session::spawn_with_env(&server.base_url(), &[("VISUAL", &editor)]);
+    s.wait_for("mock-model", BOOT);
+
+    s.send("\x07");
+    s.wait_for("EDITED_BY_THE_EDITOR", EXIT);
+    assert!(
+        s.is_alive(),
+        "returning from the editor must resume the TUI, not end it. Screen:\n{}",
+        s.snapshot()
+    );
+    assert!(
+        !s.snapshot().contains("panicked at"),
+        "the TUI panicked around the editor. Screen:\n{}",
+        s.snapshot()
+    );
+
+    s.send("\x11");
+    let status = s.wait_exit(EXIT);
+    assert!(
+        status.success(),
+        "clean exit after the editor. Screen:\n{}",
         s.snapshot()
     );
     Ok(())

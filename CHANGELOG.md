@@ -22,6 +22,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Windows: Ctrl+G and `/edit` open the editor instead of quitting hrdr, and
+  exiting restores the terminal.** crossterm refuses the keyboard-enhancement
+  pop on every Windows terminal; inside one `execute!` that error skipped
+  leaving the alternate screen and releasing mouse capture, and the `?` on it
+  ended the session. The push and pop are now best-effort on their own
+  (`crates/hrdr-tui`).
+
 - **Cancelling a turn no longer leaves a cached running-tool spinner on
   screen.** Settling an interrupted tool now refreshes its render identity, so
   standalone `edit`/`replace` blocks and expanded tool groups redraw as failed

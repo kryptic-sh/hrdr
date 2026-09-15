@@ -53,32 +53,41 @@ impl TerminalGuard {
             EnableBracketedPaste,
             EnableMouseCapture,
         )?;
-        // Keyboard enhancement is a *nicety*: with it, `Shift+Enter` and friends
-        // arrive unambiguously; without it, they don't, and everything else works
-        // exactly as before. So it must never be the reason hrdr fails to start —
-        // and it was. crossterm has no implementation of it for the legacy Windows
-        // console API and returns an error there, which this propagated with `?`:
-        // on a Windows terminal without VT support, hrdr printed
-        // "Keyboard progressive enhancement not implemented for the legacy Windows
-        // API" and exited 1, before painting a single frame. Ask for it; carry on
-        // without it.
-        let _ = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        );
+        push_keyboard_enhancement(&mut out);
         Ok(Self)
     }
+}
+
+/// Ask for keyboard enhancement, and carry on without it if refused.
+///
+/// Enhancement is a *nicety*: with it, `Shift+Enter` and friends arrive
+/// unambiguously; without it, they don't, and everything else works exactly as
+/// before. So it must never be the reason hrdr fails to start — and it was.
+/// crossterm implements neither the push nor the pop for Windows at all (both
+/// report `Unsupported` on every Windows terminal, VT-capable or not), and a
+/// `?` on it made hrdr print "Keyboard progressive enhancement not implemented
+/// for the legacy Windows API" and exit 1 before painting a single frame.
+fn push_keyboard_enhancement(out: &mut impl std::io::Write) {
+    let _ = execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    );
 }
 
 /// Restore the terminal to its normal state: the cursor style, keyboard
 /// enhancement flags, mouse capture, alternate screen and bracketed paste
 /// hrdr switched on. Idempotent; errors are the caller's to handle.
 fn restore_terminal_state(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    // Hand the cursor back the way we found it.
+    execute!(out, SetCursorStyle::DefaultUserShape)?;
+    // Popped before leaving the alternate screen, whose flag stack it belongs to,
+    // and on its own: it fails on every Windows terminal (see
+    // [`push_keyboard_enhancement`]), and inside one `execute!` that error
+    // short-circuits every command after it — the alternate screen was never
+    // left, mouse capture never released, and suspending for `$EDITOR` quit hrdr.
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
     execute!(
         out,
-        // Hand the cursor back the way we found it.
-        SetCursorStyle::DefaultUserShape,
-        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste,
@@ -112,8 +121,8 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
         EnterAlternateScreen,
         EnableBracketedPaste,
         EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
+    push_keyboard_enhancement(terminal.backend_mut());
     Ok(())
 }
 
