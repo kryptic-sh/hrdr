@@ -260,30 +260,14 @@ reason below is what the attempt showed — not a guess about what it might do.
   tarballs and an Alpine `.apk`; in a scratch or distroless container there is
   no system cert store, so every provider request would fail TLS while the build
   stayed green. Take this only with a decided answer on root certs, and test it
-  in a container with no `/etc/ssl/certs`.
-- **`ctor` 0.6 → 1.0 needs a new dependency.** 1.0 removed `#[ctor::dtor]` — it
-  lives in a separate `dtor` crate now — and requires `#[ctor(unsafe)]` at every
-  `#[ctor]` site. `hrdr-test-support`'s `remove_sandbox` dtor is what keeps the
-  suite from leaving a sandbox dir per test binary in `/tmp`, so it cannot just
-  be dropped. Adding `dtor` is a manifest decision for the owner, which is why
-  this stopped here rather than proceeding.
-- **`windows-sys` 0.52 → 0.61 cannot be verified locally.** The crate is
-  `cfg(windows)`-only, so a local build compiles none of it and CI is the only
-  verdict, one full round trip per attempt. At least one break is already
-  visible by reading: `HANDLE` became a pointer in 0.59, so `sandbox.rs`'s
-  `let mut token: HANDLE = 0;` and any `!= 0` comparison have to become
-  `null_mut()`/`is_null()`. That code lowers the process integrity level, so it
-  is the wrong place to write blind and confirm later. Worth doing as its own
-  change, with the CI round trips budgeted.
-
-**What the sweep did catch, worth remembering:** `toml` 1.0 changed `Value`'s
-`FromStr` to parse a single VALUE rather than a document, so
-`text.parse::<toml::Value>()` now fails on any real config with
-`unexpected content, expected nothing`. Both call sites swallowed it with
-`.ok()?` — one of them `provider_alias_collision_error`, a startup refusal that
-would have gone on refusing nothing at all. Parse a `toml::Table` for a
-document. Three existing tests went red and are the only reason this was not
-shipped silently.
+  in a container with no `/etc/ssl/certs`. **What the sweep did catch, worth
+  remembering:** `toml` 1.0 changed `Value`'s `FromStr` to parse a single VALUE
+  rather than a document, so `text.parse::<toml::Value>()` now fails on any real
+  config with `unexpected content, expected nothing`. Both call sites swallowed
+  it with `.ok()?` — one of them `provider_alias_collision_error`, a startup
+  refusal that would have gone on refusing nothing at all. Parse a `toml::Table`
+  for a document. Three existing tests went red and are the only reason this was
+  not shipped silently.
 
 ## Compaction rewrite
 
@@ -589,27 +573,11 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   inlines text files, and `@` is ordinary punctuation in prose a model writes.
   Both feed one builder, so the difference is input rather than a second
   implementation — pinned by `the_two_paths_build_the_same_message`.
-- **A real Windows liveness probe is still the better fix for `store_lock`.**
-  The staleness age is now per-`StoreKind` (`SmallFileRewrite` keeps 60s,
-  `BlobStore` gets a span sized from a save's own worst case), which is what
-  keeps a save's lock from being stolen mid-write on a platform where
-  `process_alive` cannot tell. But the age only matters at all _because_
-  `process_alive` has no dependency-free probe on Windows and reports every pid
-  dead; everywhere else a live owner is never reaped whatever its age. An
-  `OpenProcess`/`GetExitCodeProcess` probe would make both ages a formality —
-  and needs a Windows API dependency, which is the owner's call. Not taken here
-  for that reason alone.
-- **Half the cross-process lock coverage is unix-only, and one thing is untested
-  everywhere.** `store_lock`'s tests now re-execute the test binary
-  (`LockHolder`, driving the `#[ignore]`d `child_process_holds_the_lock`), so
-  `O_EXCL` exclusion between real processes and the guard's cross-process
-  release are checked on every platform.
-  `a_dead_holders_lock_is_reaped_by_the_next_process` is `#[cfg(unix)]`: reaping
-  turns on `process_alive`, which on Windows answers `false` for every pid, so
-  there it would pass while proving nothing. What no test covers on any platform
-  is a lock genuinely aged past its window in real time — every staleness test
-  backdates the timestamp, so the clock arithmetic is exercised but a minute of
-  real waiting is not.
+- **No lock test waits out a staleness window in real time.** The cross-process
+  `store_lock` tests (`LockHolder`, driving the `#[ignore]`d
+  `child_process_holds_the_lock`) run on every platform, liveness probe
+  included, but every staleness test backdates the timestamp: the clock
+  arithmetic is exercised, a minute of real waiting is not.
 - **An image is now priced for the endpoint it is bound for** (`TokenTarget` in
   `media.rs`, threaded through `estimate_tokens_in_messages`), which closes the
   "charged at Anthropic's tier for every dialect" entry that stood here. What is
@@ -1201,13 +1169,14 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   Windows-drift audit pass, which **ran** and landed three fixes (`8e5bc9d`):
   the credential `sync_all` gated on unix though portable, `atomic_write`'s
   symlink guard likewise, and owner-only file creation re-decided at four sites.
-  All ~130 `cfg` gates were classified; ~25 are `#[cfg(unix)]` on _tests_
-  (needing bash, python3 or symlinks) and are not findings, and `proc.rs`, the
-  pid-liveness probes and `prompt.rs`'s package-manager names are deliberate and
-  documented. The guarantee left on Windows is the containing per-user
-  directory's inherited default, stated once on `hrdr_llm::owner_only_options`.
-  Per-user ACLs need a new dependency in `hrdr-llm` and are a deliberate
-  non-goal until someone runs hrdr on Windows in anger.
+  All ~130 `cfg` gates were classified at the time; `proc.rs` and `prompt.rs`'s
+  package-manager names are deliberate and documented. (The unix-gated _tests_
+  that pass called "not findings" were mostly shell and python tests Windows
+  could run all along, and now does — see "Windows support review 2026-09-15".)
+  The guarantee left on Windows is the containing per-user directory's inherited
+  default, stated once on `hrdr_llm::owner_only_options`. Per-user ACLs need a
+  new dependency in `hrdr-llm` and are a deliberate non-goal until someone runs
+  hrdr on Windows in anger.
 - **`O_NOFOLLOW` covers only the final path component.** A symlinked _parent_
   directory is still traversed on the wire-log open, and there is no Windows
   equivalent at all, so callers relying on it keep their own preflight check.
@@ -1229,10 +1198,14 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   closure that returns `false`. Deleting the defaults would force the test hosts
   to spell out the no-ops; keeping them keeps a documented seam. Worth a
   decision either way rather than drifting.
-- **A disarmed process group leaks one Windows job handle.** Recorded on
-  `GroupKill::disarm`: clearing `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before
-  closing the handle would remove it, but verifying that needs a Windows CI
-  round trip, so it is documented rather than written blind.
+- **A disarmed process group leaks one Windows job handle — and its kill still
+  fires at exit.** Recorded on `GroupKill::disarm`: the forgotten handle is
+  closed when hrdr exits, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` then kills
+  whatever a _successful_ command deliberately left running in the background
+  (`npm run dev &`). On unix that child survives hrdr. Clearing the limit with
+  `SetInformationJobObject` before closing the handle fixes both; it needs a
+  Windows CI round trip to verify, and the survive-a-successful-run test only
+  checks while hrdr is still running.
 
 ---
 
@@ -2256,6 +2229,84 @@ Promoted here when the effort that taught them was deleted:
   pub-surface decision. The shared helper `assistant_with_calls` lives there as
   `pub(crate)` and is imported back into `mod tests`.
 
+## Windows support review 2026-09-15
+
+Two read-only review passes over the whole tree for Windows defects, plus a
+per-test diff of the CI logs at `b640b41`: Linux ran 2195 tests, Windows 2111,
+and 88 ran only on Linux. Shipped the same day: the whole
+shell/hook/MCP/LSP/process-tree suite un-gated onto Windows (2174 tests there at
+`5a8d8a5`), terminal restore around the editor, PATH resolution of bare program
+names (`resolve_program`), the read-mode wrapper's exit code, the `@file` swap
+check, a process liveness probe for locks and temp sweeps, `$EDITOR` parsing,
+vscode-uri drive URIs, the `!command` live-output cap, the test-support
+data-root leak, and the leak guard on all three OSes. Everything below was found
+and **not** fixed.
+
+**Open — needs a decision:**
+
+- **CRLF files through `replace` and `write`.** `edit` recovers a CRLF file
+  (`is_crlf_dominant` in `edit.rs`), `replace` does not: a pattern containing
+  `\n` never matches a CRLF file, and a `\n` in the replacement leaves mixed
+  endings. `read` presents lines without `\r`, so a `write` of content built
+  from a read silently converts a CRLF file to LF and the diff shows every line
+  changed — the normal state of a Windows checkout with `core.autocrlf=true`.
+  The choice is whether `write`/`replace` preserve an existing file's dominant
+  line ending (what `edit` effectively does) or write exactly what they were
+  given. Verified from code; not observed in a session.
+
+**Open — found, not fixed:**
+
+- **No `Event::Paste` on Windows.** crossterm's Windows event source never
+  produces one, so a multi-line paste arrives as key presses and plain-mode
+  Enter submits at the first newline. Ctrl+] (clipboard paste) is the
+  workaround. Inferred from crossterm source, not observed.
+- **`cwd_slug` hashes the raw `current_dir()`.** Windows keeps whatever drive
+  and path case the shell was started with (VS Code's terminal uses `c:\`), so
+  one project can get two session folders and `/resume` cannot see the other's
+  sessions. Inferred.
+- **`sandbox_denial_note` only recognises EROFS wording.** A Low-integrity write
+  refusal reads "Access is denied" / "Permission denied", so Windows `read` mode
+  never gets the explanatory note. Low confidence that this is Windows-only.
+- **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
+  path whose case differs from the workspace root gets no diagnostics on a
+  case-insensitive filesystem.
+- **`display_dir` / `collapse_home` read only `HOME` and match only `/`**, so no
+  path shortens to `~` on Windows. Cosmetic.
+- **The Job Object is assigned after spawn.** A descendant forked in that window
+  escapes the tree kill; documented in the `proc` module docs. The race-free
+  form (`CREATE_SUSPENDED` → assign → resume) is awkward through tokio.
+
+**Coverage gaps (stated as gaps):**
+
+- **33 tests still run only on Linux** (CI at `5a8d8a5`). Unix by nature: the
+  mode-bit tests (`*_owner_only`, `*_0600*`,
+  `ensure_private_dir_sets_0700_on_unix`,
+  `atomic_write_preserves_mode_and_replaces_content`), `O_NOFOLLOW`
+  (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
+  Windows equivalent exists, see Hardening notes) and the Landlock backend.
+  **Not unix by nature, still gated:** the symlink tests
+  (`guard_not_swapped_rejects_a_path_repointed_after_open`,
+  `a_secret_line_memo_is_a_per_run_snapshot`, `canonicalize_nearest_*`,
+  `atomic_write_writes_through_a_symlink`, the commands/skills/trust discovery
+  symlink tests, `confinement_resolves_a_symlinked_workspace_root`). The guards
+  they cover do run on Windows. A portable test helper (`symlink_file` /
+  `symlink_dir` by target kind, skipping locally without the privilege and never
+  on CI, where runners have it) would un-gate them; expect `\\?\` canonical
+  prefixes and file-URI formatting in the tests themselves to need fixing.
+  `a_bang_command_runs_unsandboxed` stays unix-only on purpose (its doc says
+  why).
+- **The Windows leak guard sees less than the others.** `dirs::home_dir()`
+  ignores `HOME`/`USERPROFILE` there, so a test that writes through a `dirs`
+  fallback lands in the runner's real profile, not the sentinel. Its temp-dir
+  check does work.
+- **One Windows leak-guard run left 17 `.tmpXXXXXX` dirs in `%TEMP%`**, in the
+  same run a `!command` e2e test failed; the next run was clean. Not reproduced,
+  so not attributed. A likely shape if it returns: Windows cannot delete a
+  directory that is a live process's cwd or holds an open file, so a `TempDir`
+  dropped while a spawned child is still being torn down leaks silently. The
+  guard now lists what each leaked dir holds, which names the test.
+- **Not reviewed:** the `hjkl-clipboard` Windows backend.
+
 ## Correctness review 2026-08-14
 
 `:review` (low depth) over the whole tree (working tree clean at the time),
@@ -2265,27 +2316,19 @@ candidate the passes raised was re-traced at its cited lines by the sweep lead;
 nothing survived as a defect. **Status: no findings — all items below are
 hardening (correct today, fragile). Four shipped 2026-08-14/15: `split_fence`
 opening-fence whitespace, the wrap-up History gap, the `read_capped_text`
-truncation marker, and the Windows lock pid-ownership guard (residual below).**
+truncation marker, and the Windows lock pid-ownership guard (its residual, a
+Windows liveness probe, shipped 2026-09-15 as `hrdr_tools::process_alive`).**
 
 **Hardening (open — triage):**
 
-1. **Windows: a live session lock is still reapable past 60 s.** The
-   pid-ownership guard shipped 2026-08-15 (all three locks remove their file
-   only while it names their own pid), which closes the destructive half — a
-   reaped/re-claimed lock survives its original holder's `Drop`. What remains is
-   the reap itself: Windows has no liveness probe, so past `STALE_LOCK_AGE_SECS`
-   a _live_ second instance can still steal a session's open-lock (the first
-   instance then runs on without its lock). Full fix: a real
-   `OpenProcess`/`GetExitCodeProcess` probe via `windows-sys` in hrdr-agent —
-   needs a Windows CI round trip to verify.
-2. **`compaction_tail_start` charges the always-kept newest turn against the
+1. **`compaction_tail_start` charges the always-kept newest turn against the
    preserve budget** (`hrdr-agent/src/compaction.rs`). `tokens` accumulates
    newest-first, so once the newest turn alone exceeds `preserve_recent_tokens`
    the walk breaks at the first older turn — no older turns are kept even if
    each is tiny, and the tail can be far smaller than the budget suggests.
    Matches the documented walk; worth revisiting only if a large newest turn is
    seen to starve the tail.
-3. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
+2. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
    any message ending in `\` never submits on plain Enter (it becomes a newline
    and eats the backslash); sending needs a second Enter. Documented escape
    design (Alt/Shift+Enter also newline), so deliberate — noted for a Windows
@@ -2421,8 +2464,11 @@ gate, mcp/*, the tool implementations), hrdr-tui (render paths, trust*prompt),
 `apps/hrdr/src/main.rs`. Skimmed, not line-by-line: `chatgpt_models.rs`
 account-catalog fetch, compaction summarization internals, budget.rs, MCP client
 wiring, the TUI's `app.rs` input-handler detail and selectors,
-`apps/hrdr/tests/*`beyond the headless suite. GAP:`hrdr-app/src/login.rs`wizard/browser-login completion lines and`hrdr-agent/src/prompt.rs`prompt *text* — read, not audited line-by-line.`apps/hrdr/src/main.rs`
-beyond the trust gate was not audited by chunk 1 (covered by chunk 2).
+`apps/hrdr/tests/*`beyond the headless suite.
+GAP:`hrdr-app/src/login.rs`wizard/browser-login completion lines
+and`hrdr-agent/src/prompt.rs`prompt _text_ — read, not audited
+line-by-line.`apps/hrdr/src/main.rs` beyond the trust gate was not audited by
+chunk 1 (covered by chunk 2).
 
 ## Tidy review 2026-08-14
 
