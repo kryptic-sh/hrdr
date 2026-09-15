@@ -197,9 +197,11 @@ mod tests {
     /// The diff rides back in full even when a hook failed: a hook warning
     /// (and, by the same path, an LSP-diagnostics block) still sits with the
     /// result — an edit must not bury a "this no longer builds".
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_edit_result_carries_the_full_diff_and_the_hook_notes() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many.txt");
         std::fs::write(

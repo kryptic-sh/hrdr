@@ -2468,32 +2468,6 @@ mod tests {
         assert_eq!(args[2..], ["--", "bash", "-c", "echo hi"]);
     }
 
-    /// Whether to skip a backend test for want of the backend — **never in CI**.
-    ///
-    /// Locally a missing `sandbox-exec` or shell is an environment fact and
-    /// failing on it says nothing about the code. On a runner it is a broken
-    /// environment, and the only useful thing a test can do is fail: a skip that
-    /// cannot tell those apart turns an infrastructure failure into a green tick,
-    /// which is worse than either. Same reasoning, and same shape, as
-    /// `skip_for_want_of_a_pty` in `apps/hrdr/tests/tui_pty.rs`.
-    ///
-    /// This is why the backlog could still say Seatbelt "has never run": the test
-    /// below returned early on both conditions, so a run that exercised nothing
-    /// was indistinguishable from one that passed.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    fn skip_for_want_of(what: &str, present: bool) -> bool {
-        if present {
-            return false;
-        }
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "{what} is missing on a CI runner — that is a broken environment, not a \
-             reason to report this backend as tested"
-        );
-        eprintln!("skipping: {what} is not available on this machine");
-        true
-    }
-
     /// CI must exercise a REAL backend, not the `None` fallback. Without this,
     /// every backend test on the runner could be silently confining nothing and
     /// still pass: `detect_backend` degrades to `None` by design, which is right
@@ -2579,11 +2553,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn shell_write_outside_roots_is_denied_under_seatbelt() {
-        if skip_for_want_of(SEATBELT_PROGRAM, Path::new(SEATBELT_PROGRAM).exists()) {
+        if hrdr_test_support::skip_for_want_of(
+            SEATBELT_PROGRAM,
+            Path::new(SEATBELT_PROGRAM).exists(),
+        ) {
             return;
         }
         let detected = crate::Shell::detect();
-        if skip_for_want_of("a shell (bash or sh)", detected.is_some()) {
+        if hrdr_test_support::skip_for_want_of("a shell (bash or sh)", detected.is_some()) {
             return;
         }
         let shell = detected.expect("checked above");

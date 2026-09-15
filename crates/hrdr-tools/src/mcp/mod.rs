@@ -74,9 +74,6 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::{Mutex, oneshot};
 
-    // Only the tests that spawn a stdio server exercise a real `Tool`, and those
-    // are `#[cfg(unix)]` — on Windows this import would be unused (`-D warnings`).
-    #[cfg(unix)]
     use crate::{Tool, ToolContext};
 
     use super::*;
@@ -206,7 +203,6 @@ data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}
     /// a GET stream that emits the `endpoint` event then carries responses to
     /// requests POSTed there). HTTP modes print their ephemeral port on the first
     /// stdout line. `-u` keeps stdout unbuffered so responses aren't withheld.
-    #[cfg(unix)]
     const MOCK_SERVER: &str = r#"
 import sys, json, os
 
@@ -324,22 +320,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 {"http": run_http, "sse": run_sse}.get(mode, run_stdio)()
 "#;
 
-    #[cfg(unix)]
-    fn python() -> Option<&'static str> {
-        ["python3", "python"].into_iter().find(|exe| {
-            std::process::Command::new(exe)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
-    }
-
     /// Kills its child process (and reaps it) on drop, so an HTTP/SSE mock server
     /// doesn't outlive the test even if an assertion panics.
-    #[cfg(unix)]
     struct Killer(std::process::Child);
-    #[cfg(unix)]
     impl Drop for Killer {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -349,29 +332,30 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 
     /// Spawn the mock server in `http`/`sse` mode; returns the child (as a
     /// [`Killer`] guard) and the port it bound. `None` if python is unavailable.
-    #[cfg(unix)]
     fn spawn_mock_server(mode: &str) -> Option<(Killer, u16)> {
         use std::io::BufRead;
-        let py = python()?;
+        let py = crate::test_env::python()?;
         let mut child = std::process::Command::new(py)
             .args(["-u", "-c", MOCK_SERVER, mode])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .ok()?;
+            .expect("the mock server spawns");
         // (env toggles like MOCK_NOCAPS are only exercised over stdio.)
         let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take()?)
+        std::io::BufReader::new(child.stdout.take().expect("stdout is piped"))
             .read_line(&mut line)
-            .ok()?;
-        let port: u16 = line.trim().parse().ok()?;
+            .expect("the mock server prints its port");
+        let port: u16 = line
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("the first line is the port: {line:?}"));
         Some((Killer(child), port))
     }
 
     /// Exercise every capability the mock advertises: the `echo` tool, resource
     /// list/read, and prompt list/get. Shared across every transport.
-    #[cfg(unix)]
     async fn exercise_all(server: &str, tools: Vec<Arc<dyn Tool>>) {
         let by = |suffix: &str| {
             let want = format!("{server}_{suffix}");
@@ -453,14 +437,12 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         assert!(rendered.contains("user: Hello Sam"), "{rendered}");
     }
 
-    // The MCP client is cross-platform; these end-to-end tests are unix-only to
-    // avoid Windows python/newline-translation flakiness in CI (the pure-logic
-    // tests above run everywhere).
-    #[cfg(unix)]
+    // End to end against a real Python server process, on every platform — a
+    // Python MCP server on Windows writes `\r\n` line endings, and the client has
+    // to read those too.
     #[tokio::test]
     async fn stdio_transport_tools_resources_prompts() {
-        let Some(py) = python() else {
-            eprintln!("skipping: no python interpreter");
+        let Some(py) = crate::test_env::python() else {
             return;
         };
         let args = vec![
@@ -477,11 +459,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         exercise_all("stdio", tools).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn streamable_http_transport_tools_resources_prompts() {
         let Some((_guard, port)) = spawn_mock_server("http") else {
-            eprintln!("skipping: no python interpreter");
             return;
         };
         let url = format!("http://127.0.0.1:{port}/mcp");
@@ -503,11 +483,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         exercise_all("http", tools).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn legacy_http_sse_transport_tools_resources_prompts() {
         let Some((_guard, port)) = spawn_mock_server("sse") else {
-            eprintln!("skipping: no python interpreter");
             return;
         };
         let url = format!("http://127.0.0.1:{port}/sse");
@@ -519,12 +497,11 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     }
 
     /// Spawn the stdio mock with extra env, returning its discovered tools.
-    #[cfg(unix)]
     async fn connect_stdio_mock(
         server: &str,
         env: &[(String, String)],
     ) -> Option<Vec<Arc<dyn Tool>>> {
-        let py = python()?;
+        let py = crate::test_env::python()?;
         let args = vec![
             "-u".to_string(),
             "-c".to_string(),
@@ -540,12 +517,10 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     }
 
     // A server that doesn't advertise `resources`/`prompts` gets no op-tools.
-    #[cfg(unix)]
     #[tokio::test]
     async fn absent_capabilities_omit_resource_and_prompt_tools() {
         let env = vec![("MOCK_NOCAPS".to_string(), "1".to_string())];
         let Some(tools) = connect_stdio_mock("nocaps", &env).await else {
-            eprintln!("skipping: no python interpreter");
             return;
         };
         // Only the real tools — no list/read/get op-tools.
@@ -562,12 +537,10 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     }
 
     // Empty resource/prompt lists render as a friendly placeholder.
-    #[cfg(unix)]
     #[tokio::test]
     async fn empty_resource_and_prompt_lists_render_placeholders() {
         let env = vec![("MOCK_EMPTY".to_string(), "1".to_string())];
         let Some(tools) = connect_stdio_mock("empty", &env).await else {
-            eprintln!("skipping: no python interpreter");
             return;
         };
         let ctx = ToolContext::new(".");
@@ -601,11 +574,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     /// Regression caught: any breakage in how `tools/call` requests are
     /// formatted or how their `content[].text` values are extracted — without
     /// requiring resources/prompts to also be working.
-    #[cfg(unix)]
     #[tokio::test]
     async fn tools_call_round_trip_over_stdio() {
-        let Some(py) = python() else {
-            eprintln!("skipping: no python interpreter");
+        let Some(py) = crate::test_env::python() else {
             return;
         };
         let args = vec![
@@ -652,7 +623,6 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     /// access its private fields.  The channel receiver is dropped before the
     /// transport is used, guaranteeing `stdin_tx.send()` returns `Err`
     /// synchronously — no timing dependency.
-    #[cfg(unix)]
     #[tokio::test]
     async fn stdio_request_send_error_removes_pending_id() {
         use tokio::sync::mpsc;
@@ -663,14 +633,17 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 
         // A trivial child satisfies the `_child: Child` field.  Its stdio is
         // irrelevant since the send fails before anything is written.
-        let child = tokio::process::Command::new("sh")
-            .args(["-c", ""])
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
+        let child = shell
+            .command("exit 0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("sh must be available on unix");
+            .expect("the detected shell spawns");
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let t = StdioTransport {
@@ -701,7 +674,6 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     /// released — not hung — the instant the child exits (its writer task drops
     /// the receiver). Simulate a full channel + a receiver drop and assert the
     /// blocked `stdio_request` errors out promptly and cleans up its pending id.
-    #[cfg(unix)]
     #[tokio::test]
     async fn stdio_request_full_channel_releases_when_child_exits() {
         use tokio::sync::mpsc;
@@ -713,14 +685,17 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             stdin_tx.send("queued".to_string()).await.unwrap();
         }
 
-        let child = tokio::process::Command::new("sh")
-            .args(["-c", ""])
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
+        let child = shell
+            .command("exit 0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("sh must be available on unix");
+            .expect("the detected shell spawns");
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let t = StdioTransport {

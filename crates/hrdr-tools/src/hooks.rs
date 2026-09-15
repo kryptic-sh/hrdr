@@ -406,9 +406,11 @@ mod tests {
         assert_eq!(cmd, r"fmt '/tmp/a'\''; rm -rf /; '\''.rs'");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn hooks_run_fail_and_time_out() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
@@ -443,7 +445,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)] // only the unix-gated integration test below builds these
     fn event_hook(event: HookEvent, on: &str, run: &str) -> EventHook {
         EventHook {
             event,
@@ -476,9 +477,11 @@ mod tests {
     /// payload on stdin, exit 2 blocking with stderr as the reason (and
     /// stopping later hooks), other failures becoming notes, and stdout of a
     /// clean hook landing in `context`.
-    #[cfg(unix)]
     #[tokio::test]
     async fn event_hooks_block_note_and_inject() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let payload = serde_json::json!({"event": "pre_tool", "tool": "bash"});
 

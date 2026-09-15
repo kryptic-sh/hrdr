@@ -274,7 +274,6 @@ mod tests {
     /// A hardlinked target keeps both names pointing at the same bytes: the
     /// in-place fallback updates the shared inode instead of renaming a fresh
     /// inode over one name (which would silently split the link).
-    #[cfg(unix)]
     #[tokio::test]
     async fn atomic_write_keeps_hardlinks_in_sync() {
         let dir = tempfile::tempdir().unwrap();

@@ -971,6 +971,7 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_env;
 
     /// The exit-status line carries a NUMBER, not the platform's rendering of
     /// `ExitStatus`.
@@ -982,7 +983,7 @@ mod tests {
     /// every failure; it should say the same thing everywhere.
     #[tokio::test]
     async fn the_exit_status_line_is_the_code_not_the_platform_wording() {
-        let Some(shell) = Shell::detect() else {
+        let Some(shell) = test_env::shell() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1007,7 +1008,7 @@ mod tests {
     /// hint says "52 lines, 104 bytes".
     #[tokio::test]
     async fn the_overflow_spool_keeps_the_line_that_crosses_the_byte_cap() {
-        let Some(shell) = Shell::detect() else {
+        let Some(shell) = test_env::shell() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1048,8 +1049,8 @@ mod tests {
     /// there is nothing to check.
     #[test]
     fn a_detected_shell_can_actually_run_a_command() {
-        let Some(shell) = Shell::detect() else {
-            return; // no usable shell here — `None` is the honest answer
+        let Some(shell) = test_env::shell() else {
+            return;
         };
         assert!(
             shell.runs(),
@@ -1287,13 +1288,15 @@ mod tests {
     ///
     /// `printf` is used rather than a real formatter so this asserts the tool's
     /// behaviour and not some other program's colour policy.
-    #[cfg(unix)]
     #[tokio::test]
     async fn colour_is_stripped_from_output_unless_it_was_asked_for() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let ctx = ToolContext::new(std::path::PathBuf::from("."));
         let cmd = r#"printf '\033[31m-        removed\033[m\n\033[32m+        added\033[m\n'"#;
 
-        let clean = ShellTool::new(Shell::Bash)
+        let clean = ShellTool::new(shell)
             .execute(json!({"command": cmd}), &ctx)
             .await
             .expect("the command runs");
@@ -1306,7 +1309,7 @@ mod tests {
             "no escape reaches the model by default: {clean:?}"
         );
 
-        let raw = ShellTool::new(Shell::Bash)
+        let raw = ShellTool::new(shell)
             .execute(json!({"command": cmd, "keep_ansi": true}), &ctx)
             .await
             .expect("the command runs");
@@ -1325,15 +1328,17 @@ mod tests {
     /// owns is whether it overrides these, not what the surrounding environment
     /// holds. CI sets `CARGO_TERM_COLOR=always` for its own logs, so a test
     /// demanding an unset variable passes on a clean laptop and fails there.
-    #[cfg(unix)]
     #[tokio::test]
     async fn the_child_is_told_not_to_colour_unless_escapes_were_asked_for() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let ctx = ToolContext::new(std::path::PathBuf::from("."));
         let cmd = "echo \"NO_COLOR=[$NO_COLOR] CARGO_TERM_COLOR=[$CARGO_TERM_COLOR]\"";
         let ambient = |k: &str| std::env::var(k).unwrap_or_default();
 
         // Default: hrdr's values win, whatever the environment said.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": cmd}), &ctx)
             .await
             .unwrap();
@@ -1342,7 +1347,7 @@ mod tests {
 
         // `keep_ansi`: hrdr sets nothing, so the child sees exactly what this
         // process sees — which is the property, and it holds on any machine.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": cmd, "keep_ansi": true}), &ctx)
             .await
             .unwrap();
@@ -1369,77 +1374,64 @@ mod tests {
     /// `bash`; the backgrounded `sleep` — same process group, same session,
     /// no controlling terminal to notice `bash` is gone — keeps running for
     /// its full 5s, and the marker file would appear right on schedule.
-    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_whole_process_tree_not_just_the_leader() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("grandchild-finished");
-        let pid_file = dir.path().join("grandchild.pid");
 
-        // Background a subshell that sleeps 5s and then touches `marker`
-        // (standing in for a long-lived `node` server); record its pid; then
-        // block in the foreground on a sleep of our own so `bash` is still
-        // alive when the one-second timeout below fires.
+        // Background a grandchild that will touch `marker` unless it is killed
+        // (standing in for a long-lived `node` server), then block in the
+        // foreground on a sleep of our own so the leader is still alive when
+        // the one-second timeout below fires.
         let command = format!(
-            "(sleep 5 && touch {m}) & echo $! > {p}; sleep 5",
-            m = marker.display(),
-            p = pid_file.display(),
+            "{} sleep 30",
+            test_env::backgrounded_grandchild(shell, &marker)
         );
 
         // A one-second deadline is the whole point of this test, so opt out of
         // the floor that would otherwise raise it to the default.
         let mut ctx = ToolContext::new(dir.path().to_path_buf());
         ctx.enforce_timeout_floor = false;
-        let err = ShellTool::new(Shell::Bash)
+        let started = std::time::Instant::now();
+        let err = ShellTool::new(shell)
             .execute(json!({"command": command, "timeout_secs": 1}), &ctx)
             .await
             .expect_err("a killed command is not a successful one");
         let out = err.to_string();
         assert!(out.contains("timed out"), "{out}");
 
-        // Give the group-kill a moment to land, then check the grandchild
-        // (background `sleep`) directly via `kill(pid, 0)` — no signal sent,
-        // just a liveness probe; ESRC means it's gone.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let grandchild_pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("the background job recorded its pid before bash was killed")
-            .trim()
-            .parse()
-            .unwrap();
-        let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(
-            !alive,
-            "grandchild pid {grandchild_pid} survived the timeout — only the \
-             `bash` leader was killed, not its process group"
-        );
-
-        // And it never got far enough to touch the marker — proof the kill
-        // landed well before the grandchild's own 5s sleep would have
-        // finished on its own.
-        assert!(
-            !marker.exists(),
-            "the grandchild's sleep completed — it was never actually killed"
+            !test_env::grandchild_finished(&marker, started).await,
+            "the grandchild survived the timeout — only the leader was killed, \
+             not its process tree"
         );
     }
 
     /// The mirror of the timeout test above: a command that finishes *normally*
     /// owns its descendants. One that backgrounded a child with stdio fully
     /// redirected away from the tool's pipes (a `dev/null` daemon) reports
-    /// success and returns — and the guard's drop must NOT SIGKILL the
+    /// success and returns — and the guard's drop must NOT kill the
     /// backgrounded child milliseconds after the leader exits. Only the cancel
     /// path (timeout/abort/error) may take the whole tree down.
-    #[cfg(unix)]
     #[tokio::test]
     async fn backgrounded_child_survives_a_successful_run() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild-finished");
         let ctx = ToolContext::new(dir.path().to_path_buf());
-        // Background a `sleep` with stdio redirected away from the tool's
-        // pipes, echo its pid, and exit 0 — a normal, successful run, exactly
-        // the shape that used to get the child SIGKILLed on the guard's drop.
-        let command = "sleep 60 </dev/null >/dev/null 2>&1 & echo $!";
+        // Background a child with stdio redirected away from the tool's pipes
+        // and exit 0 — a normal, successful run, exactly the shape that used to
+        // get the child killed on the guard's drop.
+        let command = test_env::backgrounded_grandchild(shell, &marker);
+        let started = std::time::Instant::now();
         let out = run_streamed_command(
-            Shell::Bash.command(command),
-            command,
+            shell.command(&command),
+            &command,
             Duration::from_secs(60),
             false,
             &ctx,
@@ -1451,21 +1443,9 @@ mod tests {
             "a successful run reports success: {}",
             out.output
         );
-        let pid: i32 = out
-            .output
-            .lines()
-            .find_map(|line| line.trim().parse().ok())
-            .expect("the command echoed the backgrounded pid");
-        // Give the old drop-kill a moment to land and be reaped, so a killed
-        // child can't linger as a zombie and read as alive.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
-        // Clean up before asserting: never leak a `sleep`, even when the
-        // assertion below fails.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
         assert!(
-            alive,
-            "backgrounded child pid {pid} was killed by the guard's drop after its \
+            test_env::grandchild_finished(&marker, started).await,
+            "the backgrounded child was killed by the guard's drop after its \
              leader's run finished normally — disarm-on-success is missing"
         );
     }
@@ -1476,14 +1456,16 @@ mod tests {
     /// working. The note fires even though the command succeeded — the number
     /// the model chose was not the number used, and without saying so the next
     /// call repeats it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_short_timeout_is_raised_to_the_default_and_said_so() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path().to_path_buf());
         assert!(ctx.enforce_timeout_floor, "a real session always floors");
 
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": "echo hi", "timeout_secs": 30}), &ctx)
             .await
             .unwrap();
@@ -1494,7 +1476,7 @@ mod tests {
         );
 
         // Longer than the default is honoured untouched, and says nothing.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": "echo hi", "timeout_secs": 900}), &ctx)
             .await
             .unwrap();
@@ -1504,7 +1486,7 @@ mod tests {
         );
 
         // And an unset one is the default already — not something "raised".
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": "echo hi"}), &ctx)
             .await
             .unwrap();
@@ -1516,9 +1498,11 @@ mod tests {
     /// three-crate `cargo test` got its suite killed, read the success flag, and
     /// committed — the prose in the body said "timed out" and the flag said
     /// otherwise, and the flag is what gets skimmed.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_timeout_fails_the_call_but_a_non_zero_exit_does_not() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ToolContext::new(dir.path().to_path_buf());
         ctx.enforce_timeout_floor = false;
@@ -1526,7 +1510,7 @@ mod tests {
         // Killed by the deadline: Err, and the partial output survives on it —
         // dropping that would force a re-run of the command that just cost the
         // deadline.
-        let err = ShellTool::new(Shell::Bash)
+        let err = ShellTool::new(shell)
             .execute(
                 json!({"command": "echo starting; sleep 30", "timeout_secs": 1}),
                 &ctx,
@@ -1542,7 +1526,7 @@ mod tests {
 
         // Ran to completion and said no: still Ok. The command answered, and the
         // answer is the output — only the deadline case is unknowable.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(json!({"command": "echo nope; exit 3"}), &ctx)
             .await
             .expect("a non-zero exit is a result, not a tool failure");
@@ -1557,9 +1541,11 @@ mod tests {
     /// contract every other tool (`truncate_saved`) honours. This pins the
     /// returned size to a tight multiple of the cap, not merely "under 2000
     /// bytes for a 200-byte cap" (10x — loose enough to pass even the bug).
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_output_is_trimmed_to_the_display_budget_not_the_5x_ring() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut c = ToolContext::new(dir.path());
         c.max_output = 200;
@@ -1568,7 +1554,7 @@ mod tests {
         // 50 lines of ~33 chars each (~1650 bytes total) — comfortably over
         // both caps, and small enough to stay under the 5x in-memory ring too
         // (so this exercises the final display trim, not the ring cap).
-        let result = ShellTool::new(Shell::Bash)
+        let result = ShellTool::new(shell)
             .execute(
                 serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
                 &c,
@@ -1631,13 +1617,15 @@ mod tests {
     /// A pipeline ending in `grep` that matched nothing exits 1 — and a model
     /// reading that as "the build failed" re-runs the whole suite. The note says
     /// which exit 1 this is. The exit status itself is untouched.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_grep_tail_that_matched_nothing_is_annotated() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let c = ToolContext::new(dir.path());
-        async fn run(c: &ToolContext, cmd: &str) -> String {
-            ShellTool::new(Shell::Bash)
+        async fn run(shell: Shell, c: &ToolContext, cmd: &str) -> String {
+            ShellTool::new(shell)
                 .execute(serde_json::json!({"command": cmd}), c)
                 .await
                 .unwrap()
@@ -1646,6 +1634,7 @@ mod tests {
         // Upstream succeeded and wrote to stderr (as `cargo` does); the grep
         // matched nothing, so stdout is empty and the pipeline exits 1.
         let out = run(
+            shell,
             &c,
             "printf 'building\\n' >&2; printf 'ok\\n' | grep -E 'Summary|FAIL'",
         )
@@ -1660,14 +1649,14 @@ mod tests {
         );
 
         // The grep matched, so exit 0 — nothing to explain.
-        let out = run(&c, "printf 'ok\\n' | grep ok").await;
+        let out = run(shell, &c, "printf 'ok\\n' | grep ok").await;
         assert!(
             !out.contains("matched nothing"),
             "a matching grep needs no note: {out}"
         );
 
         // Exit 1 from something that isn't a grep tail means what it says.
-        let out = run(&c, "printf 'ok\\n' | tail -1; exit 1").await;
+        let out = run(shell, &c, "printf 'ok\\n' | tail -1; exit 1").await;
         assert!(out.contains("exit status: 1"), "{out}");
         assert!(
             !out.contains("matched nothing"),
@@ -1676,7 +1665,7 @@ mod tests {
 
         // A grep that *did* print matches while something else failed keeps a
         // plain exit 1: stdout is non-empty, so the no-match story is false.
-        let out = run(&c, "printf 'ok\\n' | grep ok && exit 1").await;
+        let out = run(shell, &c, "printf 'ok\\n' | grep ok && exit 1").await;
         assert!(
             !out.contains("matched nothing"),
             "grep printed matches — the note would be a lie: {out}"
@@ -1687,9 +1676,11 @@ mod tests {
     /// command minus its trailing filter), so re-running it under a different
     /// `grep` is answered with the spool path instead of paying for the run
     /// again. A different command gets no note.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_re_run_of_a_spilled_command_is_pointed_back_at_the_spool() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut c = ToolContext::new(dir.path());
         // Tiny caps so a small command overflows and spills.
@@ -1697,7 +1688,7 @@ mod tests {
         c.max_output_lines = 10;
         let expensive = "for i in $(seq 1 50); do echo \"line $i: padding text\"; done";
 
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": expensive}), &c)
             .await
             .unwrap();
@@ -1711,7 +1702,7 @@ mod tests {
             .expect("the spill was recorded under the command's base");
 
         // Same work, different trailing filter: the note names the spool file.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(
                 serde_json::json!({"command": format!("{expensive} | grep 'line 7:'")}),
                 &c,
@@ -1725,7 +1716,7 @@ mod tests {
         );
 
         // A different command is a different question — no note.
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": "echo unrelated"}), &c)
             .await
             .unwrap();

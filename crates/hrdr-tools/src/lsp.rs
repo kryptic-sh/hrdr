@@ -1367,20 +1367,18 @@ mod tests {
 
     /// `pre_warm` spawns the matching server without any edit having
     /// happened; unknown extensions are skipped silently.
-    #[cfg(unix)]
     #[tokio::test]
     async fn pre_warm_spawns_the_server_before_any_edit() {
-        if which::which("python3").is_err() {
-            eprintln!("skipping: python3 not on PATH");
+        let Some(python) = crate::test_env::python() else {
             return;
-        }
+        };
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("fake_lsp.py");
         std::fs::write(&server, FAKE_LSP_PY).unwrap();
         let registry = LspRegistry::new(
             dir.path().to_path_buf(),
             vec![LspServerConfig {
-                command: "python3".to_string(),
+                command: python.to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
                 initialization_options: None,
@@ -1397,17 +1395,14 @@ mod tests {
         );
     }
 
-    /// The full round-trip against a scripted LSP server (python3): spawn,
+    /// The full round-trip against a scripted LSP server (Python): spawn,
     /// initialize, didOpen → publishDiagnostics with an error → formatted
-    /// note; a clean follow-up didChange → no note. Skips when python3 is
-    /// absent.
-    #[cfg(unix)]
+    /// note; a clean follow-up didChange → no note.
     #[tokio::test]
     async fn registry_reports_errors_from_a_real_server_process() {
-        if which::which("python3").is_err() {
-            eprintln!("skipping: python3 not on PATH");
+        let Some(python) = crate::test_env::python() else {
             return;
-        }
+        };
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("fake_lsp.py");
         std::fs::write(&server, FAKE_LSP_PY).unwrap();
@@ -1416,7 +1411,7 @@ mod tests {
         let registry = Arc::new(LspRegistry::new(
             dir.path().to_path_buf(),
             vec![LspServerConfig {
-                command: "python3".to_string(),
+                command: python.to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
                 initialization_options: None,
@@ -1472,13 +1467,11 @@ mod tests {
     /// not be silently discarded so it surfaces as an empty, misleading "no
     /// edits"/"no definition" instead. The fake server here answers every
     /// navigation request with an `error`, never a `result`.
-    #[cfg(unix)]
     #[tokio::test]
     async fn json_rpc_error_responses_are_forwarded_not_discarded() {
-        if which::which("python3").is_err() {
-            eprintln!("skipping: python3 not on PATH");
+        let Some(python) = crate::test_env::python() else {
             return;
-        }
+        };
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("fake_lsp_error.py");
         std::fs::write(&server, FAKE_LSP_ERROR_PY).unwrap();
@@ -1488,7 +1481,7 @@ mod tests {
         let registry = LspRegistry::new(
             dir.path().to_path_buf(),
             vec![LspServerConfig {
-                command: "python3".to_string(),
+                command: python.to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
                 initialization_options: None,
@@ -1686,20 +1679,18 @@ mod tests {
     /// not hang the edit: the bounded write times out, diagnostics degrade to
     /// `None` (the edit still succeeds), and the server is retired so later
     /// edits skip it fast instead of each re-hitting the timeout.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_wedged_server_times_out_and_is_retired() {
-        if which::which("python3").is_err() {
-            eprintln!("skipping: python3 not on PATH");
+        let Some(python) = crate::test_env::python() else {
             return;
-        }
+        };
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("wedged_lsp.py");
         std::fs::write(&server, FAKE_LSP_WEDGED_PY).unwrap();
         let registry = LspRegistry::new(
             dir.path().to_path_buf(),
             vec![LspServerConfig {
-                command: "python3".to_string(),
+                command: python.to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
                 initialization_options: None,
@@ -1741,7 +1732,6 @@ mod tests {
     /// line containing "boom" on `didOpen`/`didChange` (with the document's
     /// version, exercising the stale-publish guard), and serves
     /// definition/references/rename for the word "boom" from the synced text.
-    #[cfg(unix)] // used only by the unix-gated integration tests above
     const FAKE_LSP_PY: &str = r#"
 import json, sys
 
@@ -1834,7 +1824,6 @@ while True:
     /// then answers every navigation request with a JSON-RPC `error` instead
     /// of a `result` — modelling a server refusing e.g. an unrenameable
     /// symbol, to exercise error-message forwarding.
-    #[cfg(unix)]
     const FAKE_LSP_ERROR_PY: &str = r#"
 import json, sys
 
@@ -1878,7 +1867,6 @@ while True:
     /// reading its stdin entirely — modelling a crashed-but-not-exited / wedged
     /// server. The next large write fills the pipe and blocks, exercising the
     /// per-write timeout.
-    #[cfg(unix)]
     const FAKE_LSP_WEDGED_PY: &str = r#"
 import json, sys, time
 

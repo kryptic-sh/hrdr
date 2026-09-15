@@ -384,9 +384,11 @@ mod tests {
     /// refusal names it — "modified by `…`" — so the model re-reads instead of
     /// suspecting its own bookkeeping (the observed failure mode: distrusting
     /// `edit` and rewriting whole files with `write`).
-    #[cfg(unix)]
     #[tokio::test]
     async fn stale_edit_error_names_the_shell_command_that_changed_the_file() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fmt_me.rs");
         std::fs::write(&path, "fn a(){}\n").unwrap();
@@ -394,7 +396,7 @@ mod tests {
         let p = path.to_str().unwrap();
 
         ReadTool.execute(json!({"path": p}), &c).await.unwrap();
-        ShellTool::new(Shell::Bash)
+        ShellTool::new(shell)
             .execute(
                 json!({"command": "printf 'fn a() {}\\nfn b() {}\\n' > fmt_me.rs # pretend-fmt"}),
                 &c,
@@ -833,26 +835,22 @@ mod tests {
 
     #[tokio::test]
     async fn bash_guardrail_blocks_command() {
-        if which::which("bash").is_err() {
-            return; // no bash on this machine
-        }
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let err = ShellTool::new(Shell::Bash)
+        let err = ShellTool::new(shell)
             .execute(serde_json::json!({"command": "git add -A"}), &c)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("command blocked"), "{err}");
-        // Harmless commands still run. Unix-only: on Windows CI `bash` on
-        // PATH is the WSL stub, which errors without a distro installed.
-        #[cfg(unix)]
-        {
-            let out = ShellTool::new(Shell::Bash)
-                .execute(serde_json::json!({"command": "echo ok"}), &c)
-                .await
-                .unwrap();
-            assert!(out.contains("ok"));
-        }
+        // Harmless commands still run.
+        let out = ShellTool::new(shell)
+            .execute(serde_json::json!({"command": "echo ok"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("ok"));
     }
 
     #[tokio::test]
@@ -885,9 +883,11 @@ mod tests {
         assert!(err.to_string().contains("may have changed"), "{err}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn edit_diff_reflects_post_hook_content() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "hello\n").unwrap();
@@ -1293,36 +1293,42 @@ mod tests {
         assert!(parse_todos(json!({ "todos": [{"status": "pending"}] })).is_err());
     }
 
-    // ---- bash ---- (unix-only: these spawn a real `bash` shell)
+    // ---- bash ---- (these spawn the real detected shell)
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_echo_captures_output() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let c = ctx(std::path::PathBuf::from("."));
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": "echo hello_hrdr"}), &c)
             .await
             .unwrap();
         assert!(out.contains("hello_hrdr"), "echo output missing: {out}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_exit_nonzero_includes_status() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let c = ctx(std::path::PathBuf::from("."));
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": "exit 42"}), &c)
             .await
             .unwrap();
         assert!(out.contains("exit status"), "status marker missing: {out}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout_kills_process_and_keeps_partial_output() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let mut c = ctx(std::path::PathBuf::from("."));
         c.enforce_timeout_floor = false;
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(
                 serde_json::json!({"command": "echo early; sleep 30", "timeout_secs": 1}),
                 &c,
@@ -1345,12 +1351,14 @@ mod tests {
     /// `cargo` is shadowed by a shell function so this asserts on the ledger
     /// rather than spawning the real suite; the ledger classifies the
     /// command text, which is exactly what a real session hands it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_commit_after_an_unverified_edit_carries_the_verification_note() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let bash = ShellTool::new(Shell::Bash);
+        let bash = ShellTool::new(shell);
         let run = async |command: &str| {
             bash.execute(serde_json::json!({ "command": command }), &c)
                 .await
@@ -1408,12 +1416,14 @@ mod tests {
     /// Small output that never crosses either cap must not mention (or need)
     /// an overflow file at all — the overflow file is created only once
     /// output actually exceeds the caps, not eagerly on the first line.
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_small_output_has_no_overflow_pointer() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let out = ShellTool::new(Shell::Bash)
+        let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": "echo tiny"}), &c)
             .await
             .unwrap();
@@ -1426,9 +1436,11 @@ mod tests {
 
     /// Verify that run_streamed_command caps in-memory usage and produces a
     /// truncation marker when output exceeds max_output.
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_output_bounded_and_marker_present() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut c = ToolContext::new(dir.path());
         // Tiny output cap so even a small command overflows.
@@ -1436,7 +1448,7 @@ mod tests {
         c.max_output_lines = 10;
 
         // Generate 50 lines of ~20 chars each (well above both caps).
-        let result = ShellTool::new(Shell::Bash)
+        let result = ShellTool::new(shell)
             .execute(
                 serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
                 &c,
@@ -1463,9 +1475,11 @@ mod tests {
     /// must come back *bounded* rather than hang or OOM: the per-line read is
     /// capped as it streams, so the result is a small, marked truncation — not a
     /// gigabyte buffered whole and only then trimmed.
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_newlineless_run_is_bounded_not_hung() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut c = ToolContext::new(dir.path());
         c.max_output = 200;
@@ -1474,7 +1488,7 @@ mod tests {
         // 2 MiB of 'a' with no newline at all.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            ShellTool::new(Shell::Bash).execute(
+            ShellTool::new(shell).execute(
                 serde_json::json!({
                     "command": "head -c 2097152 /dev/zero | tr '\\0' 'a'"
                 }),

@@ -340,12 +340,14 @@ mod windows_job {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::Instant;
+
+    use crate::test_env;
 
     /// A grandchild started by a `configure`d command is reachable through
-    /// its group: killing `-pid` (not just `pid`) actually reaches it.
+    /// its group: the kill reaches it, not just the leader.
     ///
     /// This exercises the primitive directly (spawn a shell that backgrounds
     /// a sleep, then kill the group) rather than going through a `Tool`, to
@@ -354,15 +356,16 @@ mod tests {
     /// lives in `tools/shell.rs`.
     #[tokio::test]
     async fn killing_the_group_reaches_a_backgrounded_grandchild() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("still-alive");
-        let pid_file = dir.path().join("child.pid");
 
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c").arg(format!(
-            "(sleep 5 && touch {m}) & echo $! > {p}; wait",
-            m = marker.display(),
-            p = pid_file.display(),
+        let started = Instant::now();
+        let mut cmd = shell.command(&format!(
+            "{} wait",
+            test_env::backgrounded_grandchild(shell, &marker)
         ));
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -375,44 +378,31 @@ mod tests {
 
         // Give the backgrounded `sleep` a moment to actually start before we
         // kill the group out from under it.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let grandchild_pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         group.kill(pid);
         let _ = child.kill().await; // reap the leader, as every real call site does
 
-        // The grandchild must be gone almost immediately — well before its
-        // own 5s sleep would have finished on its own.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(
-            !alive,
-            "grandchild pid {grandchild_pid} survived a group kill"
-        );
-        assert!(
-            !marker.exists(),
-            "the grandchild's sleep completed — it was never actually killed"
+            !test_env::grandchild_finished(&marker, started).await,
+            "the grandchild's sleep completed — the group kill never reached it"
         );
     }
 
     /// The Esc/cancel path drops the future's locals without calling `kill()`.
     /// Dropping the [`ProcessGroup`](super::ProcessGroup) guard must still take
-    /// the whole tree down on unix, not just the leader `kill_on_drop` reaps.
+    /// the whole tree down, not just the leader `kill_on_drop` reaps.
     #[tokio::test]
     async fn dropping_the_guard_kills_the_group_not_just_the_leader() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("still-alive");
-        let pid_file = dir.path().join("child.pid");
 
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c").arg(format!(
-            "(sleep 5 && touch {m}) & echo $! > {p}; wait",
-            m = marker.display(),
-            p = pid_file.display(),
+        let started = Instant::now();
+        let mut cmd = shell.command(&format!(
+            "{} wait",
+            test_env::backgrounded_grandchild(shell, &marker)
         ));
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -421,12 +411,7 @@ mod tests {
 
         let child = cmd.spawn().unwrap();
         let group = super::ProcessGroup::attach(&child).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let grandchild_pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Simulate the cancelled future's teardown: drop the guard (group-kill
         // via `Drop`) and the child (`kill_on_drop` reaps the leader). No
@@ -434,12 +419,9 @@ mod tests {
         drop(group);
         drop(child);
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(
-            !alive,
-            "grandchild pid {grandchild_pid} survived the guard being dropped"
+            !test_env::grandchild_finished(&marker, started).await,
+            "the grandchild's sleep completed — dropping the guard did not reach it"
         );
-        assert!(!marker.exists());
     }
 }

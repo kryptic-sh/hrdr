@@ -741,25 +741,20 @@ mod tests {
     /// before the `ProcessGroup` guard was stored on `StdioTransport` that
     /// grandchild outlived the transport indefinitely — holding sockets and
     /// file locks. Dropping the client must now take the whole tree down.
-    ///
-    /// Unix-only for the same reason as the other spawning MCP tests (and
-    /// matching `proc.rs`'s `#[cfg(all(test, unix))]` convention): the
-    /// liveness probe is `kill(pid, 0)`. The Windows path is covered by the
-    /// same `ProcessGroup::attach` call, which assigns the child to a
-    /// kill-on-close Job Object.
-    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_stdio_transport_reaps_a_backgrounded_grandchild() {
+        let Some(shell) = crate::test_env::shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("still-alive");
-        let pid_file = dir.path().join("grandchild.pid");
 
-        // A minimal MCP server in bash that first backgrounds a long-lived
+        // A minimal MCP server in shell that first backgrounds a long-lived
         // grandchild (the thing that used to leak), then answers just enough
         // JSON-RPC for `connect_stdio`'s handshake to succeed.
         let script = format!(
             r#"
-(sleep 30 && touch {m}) & echo $! > {p}
+{grandchild}
 while IFS= read -r line; do
   id=${{line#*\"id\":}}
   id=${{id%%,*}}
@@ -771,41 +766,29 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            m = marker.display(),
-            p = pid_file.display(),
+            grandchild = crate::test_env::backgrounded_grandchild(shell, &marker),
         );
 
-        let (client, tools) =
-            McpClient::connect_stdio("leaky", "bash", &["-c".to_string(), script], &[])
-                .await
-                .expect("handshake against the bash mock server");
+        let started = std::time::Instant::now();
+        let args: Vec<String> = shell
+            .invoke_args()
+            .iter()
+            .map(|a| a.to_string())
+            .chain([script])
+            .collect();
+        let (client, tools) = McpClient::connect_stdio("leaky", shell.program(), &args, &[])
+            .await
+            .expect("handshake against the shell mock server");
         assert!(tools.is_empty(), "the mock advertises no tools");
 
-        // The grandchild is backgrounded before the server's read loop starts,
-        // so a successful handshake means its pid file is already written.
-        let grandchild_pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("server must have recorded its grandchild's pid")
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(
-            unsafe { libc::kill(grandchild_pid, 0) == 0 },
-            "grandchild {grandchild_pid} should still be alive before teardown"
-        );
-
         // Teardown: dropping the client drops the `StdioTransport`, whose
-        // `_group` guard's `Drop` group-kills the server *and* the grandchild.
+        // `_group` guard's `Drop` kills the server's whole tree.
         drop(client);
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            unsafe { libc::kill(grandchild_pid, 0) != 0 },
-            "grandchild {grandchild_pid} survived the MCP stdio transport being \
-             dropped — teardown reaped only the leader pid"
-        );
-        assert!(
-            !marker.exists(),
-            "the grandchild's sleep completed — it was never actually killed"
+            !crate::test_env::grandchild_finished(&marker, started).await,
+            "the grandchild survived the MCP stdio transport being dropped — \
+             teardown reaped only the leader"
         );
     }
 }

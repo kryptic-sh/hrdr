@@ -8429,16 +8429,25 @@ async fn model_catalog_matching_generation_merges_rows() {
     );
 }
 
+/// Whether a `!command` test must skip for want of a shell — locally only; on CI
+/// a missing shell fails it.
+fn no_user_shell() -> bool {
+    hrdr_test_support::skip_for_want_of(
+        "a shell (bash or sh)",
+        hrdr_tools::Shell::detect().is_some(),
+    )
+}
+
 /// `!command` runs the shell directly: the output streams into a transcript
 /// tool block, and on ToolEnd the command + output are committed through the
 /// same plumbing as a finished turn — the user note enters the agent's
 /// history synchronously and an autosave writes the session, so nothing rides
-/// a later turn's save. No model turn is spawned. Unix-only: the Windows
-/// runners' `bash`/`pwsh` mix isn't predictable enough to assert output
-/// verbatim.
-#[cfg(unix)]
+/// a later turn's save. No model turn is spawned.
 #[tokio::test]
 async fn bang_runs_a_user_shell_command_and_records_it() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str("!echo hello-from-shell");
@@ -8531,9 +8540,11 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
 /// live escape — the render sanitizer replaces control bytes with a visible
 /// cell before they become buffer symbols. Without it, `\x1b[2J` (clear
 /// screen) or `\x1b[?25l` (hide cursor) would be written straight through.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_hostile_shell_outputs_esc_never_reaches_the_terminal_buffer() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     // `printf` is a bash builtin, so no external binary is needed.
@@ -8580,9 +8591,11 @@ async fn a_hostile_shell_outputs_esc_never_reaches_the_terminal_buffer() {
 /// muscle memory types `:!git status` and means the shell, not a command
 /// named `!`. It takes the exact `!` path: no model turn spawns, the
 /// output streams into a tool block, and ToolEnd commits the note.
-#[cfg(unix)]
 #[tokio::test]
 async fn colon_bang_runs_the_same_user_shell_command() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str(":!echo hello-from-colon-bang");
@@ -8637,9 +8650,11 @@ async fn colon_bang_runs_the_same_user_shell_command() {
 /// ToolStart. On the pre-fix code the refused submission opened a second
 /// `done: false` block that nothing ever closed, and it resurfaced as a
 /// settled-failed block on resume.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_second_bang_command_while_one_runs_leaves_no_phantom_block() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     // A command that stays alive long enough for a second submission.
@@ -8720,6 +8735,12 @@ async fn a_second_bang_command_while_one_runs_leaves_no_phantom_block() {
 /// writable root on any of them — it would die on EROFS. Read mode rather than a
 /// path outside the roots on purpose: in `write` mode `env::temp_dir()` is
 /// writable, and every path a test can write to lives under it.
+///
+/// Unix-only: Windows `read` mode confines by re-executing
+/// `std::env::current_exe()`, which inside this test binary is the test harness —
+/// a regression here would hand libtest the wrapper's argv and wedge the job
+/// instead of failing it. `apps/hrdr/tests/sandbox_windows.rs` covers that backend
+/// against the real binary.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_bang_command_runs_unsandboxed() {
@@ -8770,11 +8791,12 @@ async fn a_bang_command_runs_unsandboxed() {
 /// grow the in-memory buffer to match: the bytes actually forwarded over the
 /// channel for display stay bounded well below what the command wrote, and
 /// the process still runs to completion — the pipes are drained the whole
-/// time regardless of the cap, so nothing backs up and deadlocks. Unix-only,
-/// like the other `!command` tests.
-#[cfg(unix)]
+/// time regardless of the cap, so nothing backs up and deadlocks.
 #[tokio::test]
 async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     // ~2 MB of output — comfortably past the 256 KiB streaming cap and the
@@ -8830,9 +8852,11 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
 /// landing in a closed block. And `max_output` was raised to 50_000 bytes while
 /// `max_output_lines` kept its default of 50, so `!seq 1 500` — or any `!git
 /// log` — settled to 50 lines and a spool pointer.
-#[cfg(unix)]
 #[tokio::test]
 async fn bang_command_output_lands_before_the_block_closes_and_is_not_line_capped() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str("!seq 1 500");
@@ -8897,9 +8921,11 @@ async fn bang_command_output_lands_before_the_block_closes_and_is_not_line_cappe
 /// block closes as "(cancelled)", the cancellation note commits to history +
 /// disk like any other transcript entry, and the slot frees for the next
 /// command.
-#[cfg(unix)]
 #[tokio::test]
 async fn esc_cancels_a_running_user_shell_command() {
+    if no_user_shell() {
+        return;
+    }
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str("!sleep 30");
@@ -9053,9 +9079,11 @@ async fn a_stale_tool_end_does_not_null_a_newer_shell() {
 /// the spawned task would keep running to its own five-minute timeout and the
 /// marker would appear ~3s after the tool started; the assert below waits past
 /// that deadline, so a detached task fails it.
-#[cfg(unix)]
 #[tokio::test]
 async fn esc_esc_cancels_a_turn_mid_tool_call_and_aborts_the_tool_task() {
+    if no_user_shell() {
+        return;
+    }
     let mut h = Harness::new(vec![
         MockReply::ToolCall {
             name: "shell".to_string(),

@@ -840,9 +840,11 @@ mod tests {
     /// A post-edit hook that further rewrites the file is reflected in the
     /// diff `replace` reports — the diff must show what actually landed on
     /// disk, not the tool's own in-memory substitution.
-    #[cfg(unix)]
     #[tokio::test]
     async fn diff_reflects_post_hook_content() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ToolContext::new(dir.path());
         ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
@@ -868,9 +870,11 @@ mod tests {
     /// A hook that fails is surfaced in the result, tagged with the file it
     /// belongs to — a project-wide rename that breaks the build must not
     /// report bare success.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_failing_hook_note_is_surfaced_and_tagged_with_its_file() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ToolContext::new(dir.path());
         ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
@@ -901,9 +905,11 @@ mod tests {
     /// `dry_run` still shows the `before -> after` diff computed in memory,
     /// and runs no hooks at all — nothing is written, so there's nothing for
     /// a hook to fire on and no notes to report.
-    #[cfg(unix)]
     #[tokio::test]
     async fn dry_run_shows_the_in_memory_diff_and_runs_no_hooks() {
+        if crate::test_env::shell().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ToolContext::new(dir.path());
         ctx.hooks = std::sync::Arc::new(vec![crate::Hook {

@@ -2177,8 +2177,16 @@ async fn agent_run_does_not_re_nudge_when_todos_are_resolved_in_place() {
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
 }
 
+/// Whether the hook tests below must skip for want of a shell to run hooks
+/// through — locally only; on CI a missing shell fails them.
+fn no_hook_shell() -> bool {
+    hrdr_test_support::skip_for_want_of(
+        "a shell (bash or sh)",
+        hrdr_tools::Shell::detect().is_some(),
+    )
+}
+
 /// One `[[hooks]]` entry with an `event`, for the lifecycle tests.
-#[cfg(unix)] // the lifecycle tests are unix-gated (they shell out)
 fn event_hook_cfg(event: &str, on: &str, run: &str) -> crate::HookConfig {
     crate::HookConfig {
         timeout_ms: None,
@@ -2193,9 +2201,11 @@ fn event_hook_cfg(event: &str, on: &str, run: &str) -> crate::HookConfig {
 /// A `pre_tool` hook exiting 2 vetoes the call: the tool never runs and
 /// the model sees the hook's stderr as the tool error. A `post_tool`
 /// hook's failure rides back appended to the (successful) result.
-#[cfg(unix)]
 #[tokio::test]
 async fn tool_hooks_block_and_annotate() {
+    if no_hook_shell() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let test_file = dir.path().join("data.txt");
     std::fs::write(&test_file, "file content").unwrap();
@@ -2272,9 +2282,11 @@ async fn tool_hooks_block_and_annotate() {
 /// `user_prompt` hooks bracket the message: stdout is injected as
 /// context for the model (the history's user message carries it), and
 /// exit 2 blocks the turn before anything enters history.
-#[cfg(unix)]
 #[tokio::test]
 async fn user_prompt_hooks_inject_and_block() {
+    if no_hook_shell() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start(vec![MockResp::Sse(vec![
         text_chunk("c1", "ok"),
@@ -2329,9 +2341,11 @@ async fn user_prompt_hooks_inject_and_block() {
 
 /// `turn_end` fires before TurnDone, and the frontend-driven
 /// `session_start`/`session_end` hooks run via `run_session_hooks`.
-#[cfg(unix)]
 #[tokio::test]
 async fn turn_end_and_session_hooks_fire() {
+    if no_hook_shell() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start(vec![MockResp::Sse(vec![
         text_chunk("c1", "ok"),

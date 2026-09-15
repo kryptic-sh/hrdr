@@ -12,6 +12,8 @@
 // test writing the developer's real sessions. Do not remove it.
 #[cfg(test)]
 extern crate hrdr_test_support;
+#[cfg(test)]
+mod test_env;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -2837,10 +2839,8 @@ mod tests {
     }
 
     /// The link count is 1 for a lone file and rises with each extra name — the
-    /// only distinction `atomic_write` asks it to make. (Unix-only as a test
-    /// because `hard_link` is the portable part; the count itself is read on both
-    /// platforms.)
-    #[cfg(unix)]
+    /// only distinction `atomic_write` asks it to make. Read through `nlink` on
+    /// unix and `GetFileInformationByHandle` on Windows.
     #[test]
     fn hardlink_count_sees_the_extra_name() {
         let dir = tempfile::tempdir().unwrap();
