@@ -107,7 +107,7 @@ fn no_test_in_the_workspace_writes_real_user_state() {
         std::env::temp_dir().display(),
         new_tmp
             .iter()
-            .map(|p| format!("  {}", p.display()))
+            .map(|p| format!("  {}  [{}]", p.display(), sample_entries(p)))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -128,6 +128,23 @@ fn tool_home(var: &str, fallback: &str) -> PathBuf {
     hrdr_test_support::real_home()
         .map(|h| h.join(fallback))
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+/// A few entry names from inside a leaked directory — `tempfile` names say nothing,
+/// and what a directory holds is what names the test that made it.
+fn sample_entries(dir: &Path) -> String {
+    const SAMPLE: usize = 4;
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.truncate(SAMPLE);
+    names.join(", ")
 }
 
 /// Every path under `dir`, recursively — files *and* directories. An empty
