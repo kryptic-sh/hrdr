@@ -440,6 +440,19 @@ mod tests {
         tokio::fs::read_to_string(path).await.unwrap()
     }
 
+    fn append_hook_command(text: &str) -> String {
+        let shell = crate::test_env::shell().expect("a shell to run hooks with");
+        match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                format!("printf '{}' >> {{path}}", text.replace('\'', r"'\''"))
+            }
+            crate::Shell::PowerShell => format!(
+                "Add-Content -LiteralPath {{path}} -NoNewline -Value {}",
+                crate::Shell::PowerShell.quote(text)
+            ),
+        }
+    }
+
     /// `.git` metadata is never a rewrite target: the walker's `hidden(false)`
     /// descends into it, and without the `.git`-component skip a broad literal
     /// like `a` matches the 40-hex SHA in `refs/heads/main` (p ≈ 92%) and
@@ -850,7 +863,7 @@ mod tests {
         ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
             on: "replace".to_string(),
             glob: None,
-            run: "printf 'hooked\\n' >> {path}".to_string(),
+            run: append_hook_command("hooked\n"),
             timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         write(&dir.path().join("a.txt"), "old\n").await;
@@ -915,7 +928,7 @@ mod tests {
         ctx.hooks = std::sync::Arc::new(vec![crate::Hook {
             on: "replace".to_string(),
             glob: None,
-            run: "printf 'hooked\\n' >> {path}".to_string(),
+            run: append_hook_command("hooked\n"),
             timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         write(&dir.path().join("a.txt"), "old\n").await;

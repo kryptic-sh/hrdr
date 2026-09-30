@@ -2181,9 +2181,27 @@ async fn agent_run_does_not_re_nudge_when_todos_are_resolved_in_place() {
 /// through — locally only; on CI a missing shell fails them.
 fn no_hook_shell() -> bool {
     hrdr_test_support::skip_for_want_of(
-        "a shell (bash or sh)",
+        "a shell (PowerShell, bash, or sh)",
         hrdr_tools::Shell::detect().is_some(),
     )
+}
+
+fn hook_stdout(text: &str) -> String {
+    match hrdr_tools::Shell::detect().expect("a shell to run hooks with") {
+        hrdr_tools::Shell::Bash | hrdr_tools::Shell::Posix => format!("echo {text}"),
+        hrdr_tools::Shell::PowerShell => format!("Write-Output '{text}'"),
+    }
+}
+
+fn hook_stderr_exit(text: &str, code: u8) -> String {
+    match hrdr_tools::Shell::detect().expect("a shell to run hooks with") {
+        hrdr_tools::Shell::Bash | hrdr_tools::Shell::Posix => {
+            format!("echo {text} >&2; exit {code}")
+        }
+        hrdr_tools::Shell::PowerShell => {
+            format!("[Console]::Error.WriteLine('{text}'); exit {code}")
+        }
+    }
 }
 
 /// One `[[hooks]]` entry with an `event`, for the lifecycle tests.
@@ -2232,9 +2250,9 @@ async fn tool_hooks_block_and_annotate() {
     let mut cfg = test_cfg(server.base_url(), dir.path());
     cfg.hooks = vec![
         // Vetoes the read…
-        event_hook_cfg("pre_tool", "read", "echo not-allowed >&2; exit 2"),
+        event_hook_cfg("pre_tool", "read", &hook_stderr_exit("not-allowed", 2)),
         // …so this one must never fire for the blocked call.
-        event_hook_cfg("post_tool", "read", "echo lint-warning >&2; exit 1"),
+        event_hook_cfg("post_tool", "read", &hook_stderr_exit("lint-warning", 1)),
     ];
     let mut agent = Agent::new(cfg).unwrap();
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -2262,7 +2280,7 @@ async fn tool_hooks_block_and_annotate() {
     cfg.hooks = vec![event_hook_cfg(
         "post_tool",
         "*",
-        "echo lint-warning >&2; exit 1",
+        &hook_stderr_exit("lint-warning", 1),
     )];
     let mut agent = Agent::new(cfg).unwrap();
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -2298,7 +2316,7 @@ async fn user_prompt_hooks_inject_and_block() {
     cfg.hooks = vec![event_hook_cfg(
         "user_prompt",
         "*",
-        "echo remember-the-context",
+        &hook_stdout("remember-the-context"),
     )];
     let mut agent = Agent::new(cfg).unwrap();
     agent.run_input("do the thing", |_| {}).await.unwrap();
@@ -2322,7 +2340,7 @@ async fn user_prompt_hooks_inject_and_block() {
     cfg.hooks = vec![event_hook_cfg(
         "user_prompt",
         "*",
-        "echo denied >&2; exit 2",
+        &hook_stderr_exit("denied", 2),
     )];
     let mut agent = Agent::new(cfg).unwrap();
     let before = agent.messages_owned().len();

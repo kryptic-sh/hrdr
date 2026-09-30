@@ -155,6 +155,30 @@ mod tests {
         ToolContext::new(cwd)
     }
 
+    fn append_hook_command(text: &str) -> String {
+        let shell = crate::test_env::shell().expect("a shell to run hooks with");
+        match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                format!("printf '{}' >> {{path}}", text.replace('\'', r"'\''"))
+            }
+            crate::Shell::PowerShell => format!(
+                "Add-Content -LiteralPath {{path}} -NoNewline -Value {}",
+                crate::Shell::PowerShell.quote(text)
+            ),
+        }
+    }
+
+    fn output_lines_command(shell: crate::Shell) -> &'static str {
+        match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"
+            }
+            crate::Shell::PowerShell => {
+                "for ($i = 1; $i -le 50; $i++) { \"line $($i): some padding text here\" }"
+            }
+        }
+    }
+
     // ---- read → write contract: partial-read (#8) + stale-file (#4) guards ----
 
     /// A full read of a file lets a `write` overwrite it; a paged (`limit`) read
@@ -396,11 +420,16 @@ mod tests {
         let p = path.to_str().unwrap();
 
         ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        let rewrite_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                "printf 'fn a() {}\\nfn b() {}\\n' > fmt_me.rs # pretend-fmt"
+            }
+            crate::Shell::PowerShell => {
+                "Write-Output 'pretend-fmt'; [System.IO.File]::WriteAllText('fmt_me.rs', \"fn a() {}`nfn b() {}`n\", [System.Text.UTF8Encoding]::new($false))"
+            }
+        };
         ShellTool::new(shell)
-            .execute(
-                json!({"command": "printf 'fn a() {}\\nfn b() {}\\n' > fmt_me.rs # pretend-fmt"}),
-                &c,
-            )
+            .execute(json!({"command": rewrite_cmd}), &c)
             .await
             .unwrap();
 
@@ -895,7 +924,7 @@ mod tests {
         c.hooks = std::sync::Arc::new(vec![crate::Hook {
             on: "edit".to_string(),
             glob: None,
-            run: "printf 'hooked\\n' >> {path}".to_string(),
+            run: append_hook_command("hooked\n"),
             timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         c.mark_read(&path);
@@ -1365,10 +1394,16 @@ mod tests {
         };
 
         // A real repo, so the commit really commits.
-        run("git init -q . && git config user.email a@example.com \
-             && git config user.name a && git config commit.gpgsign false")
-        .await
-        .unwrap();
+        let init_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                "git init -q . && git config user.email a@example.com \
+             && git config user.name a && git config commit.gpgsign false"
+            }
+            crate::Shell::PowerShell => {
+                "git init -q .; git config user.email a@example.com; git config user.name a; git config commit.gpgsign false"
+            }
+        };
+        run(init_cmd).await.unwrap();
         // A source edit through the real mutation path.
         WriteTool
             .execute(
@@ -1379,13 +1414,21 @@ mod tests {
             .unwrap();
         // A whole-tree run that failed. `false` short-circuits the `&&`, so no
         // cargo is spawned — and a red tree settles nothing anyway.
-        let out = run("false && cargo test --workspace").await.unwrap();
+        let failed_check_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => "false && cargo test --workspace",
+            crate::Shell::PowerShell => "exit 1; cargo test --workspace",
+        };
+        let out = run(failed_check_cmd).await.unwrap();
         assert!(
             out.contains("exit status"),
             "the run must have failed: {out}"
         );
 
-        let out = run("git add lib.rs && git commit -q -m wip").await.unwrap();
+        let commit_wip_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => "git add lib.rs && git commit -q -m wip",
+            crate::Shell::PowerShell => "git add lib.rs; git commit -q -m wip",
+        };
+        let out = run(commit_wip_cmd).await.unwrap();
         assert!(out.contains("[verify]"), "no note on the commit: {out}");
         assert!(out.contains("test"), "the owed kind is named: {out}");
         assert!(
@@ -1401,12 +1444,18 @@ mod tests {
             )
             .await
             .unwrap();
-        run("cargo() { return 0; }; cargo test --workspace")
-            .await
-            .unwrap();
-        let out = run("git add lib.rs && git commit -q -m done")
-            .await
-            .unwrap();
+        let passing_check_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => {
+                "cargo() { return 0; }; cargo test --workspace"
+            }
+            crate::Shell::PowerShell => "function cargo { }; cargo test --workspace",
+        };
+        run(passing_check_cmd).await.unwrap();
+        let commit_done_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => "git add lib.rs && git commit -q -m done",
+            crate::Shell::PowerShell => "git add lib.rs; git commit -q -m done",
+        };
+        let out = run(commit_done_cmd).await.unwrap();
         assert!(
             !out.contains("[verify]"),
             "a whole-tree pass at the current epoch owes nothing: {out}"
@@ -1450,7 +1499,7 @@ mod tests {
         // Generate 50 lines of ~20 chars each (well above both caps).
         let result = ShellTool::new(shell)
             .execute(
-                serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
+                serde_json::json!({"command": output_lines_command(shell)}),
                 &c,
             )
             .await
@@ -1486,11 +1535,15 @@ mod tests {
         c.max_output_lines = 10;
 
         // 2 MiB of 'a' with no newline at all.
+        let newlineless_cmd = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => "head -c 2097152 /dev/zero | tr '\\0' 'a'",
+            crate::Shell::PowerShell => "[Console]::Out.Write(('a' * 2097152))",
+        };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             ShellTool::new(shell).execute(
                 serde_json::json!({
-                    "command": "head -c 2097152 /dev/zero | tr '\\0' 'a'"
+                    "command": newlineless_cmd
                 }),
                 &c,
             ),

@@ -24,25 +24,6 @@ Conventions:
 
 ---
 
-## Windows first-class shell and tool lookup
-
-Current support still treats Windows as a Unix-shell host: README says
-PowerShell is intentionally unsupported, `Shell::detect` only probes bash and
-POSIX `sh`, and the prompt/tool descriptions assume one shell language. In this
-session, `prettier --write CHANGELOG.md docs/backlog.md` failed from the harness
-shell with `prettier: command not found`, while PowerShell found
-`C:\Users\sitem\AppData\Local\nvim-data\mason\bin\prettier.cmd`. That is the
-user-visible symptom: tools installed as Windows `.cmd` shims can be invisible
-to Git Bash/MSYS `PATH` even though they are available to the Windows account.
-
-Actionable next slice after the owner picks the policy: make PowerShell a
-first-class shell backend (`pwsh`/`powershell.exe`, quoting, prompt text,
-`Shell::tool_description`, hooks/verify/watch command execution, and tests for a
-`.cmd` shim visible only through the Windows shell). The open design choice is
-whether PowerShell is a Windows fallback only, the Windows default even when Git
-Bash exists, or a separate tool/shell selection so POSIX commands and Windows
-commands can coexist.
-
 ## GitHub Actions setup-zig cache verification
 
 `step-security/setup-zig` v2.2.2 was adopted for its Node.js 24 runtime after a

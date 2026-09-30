@@ -8834,7 +8834,15 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
     // ~2 MB of output — comfortably past the live-output cap and the
     // 50_000-char final display cap alike.
     let line = "0123456789abcdef0123456789abcdef0123456789abcdef";
-    h.type_str(&format!("!yes {line} | head -c 2000000"));
+    let command = match hrdr_tools::Shell::detect().expect("user shell already checked") {
+        hrdr_tools::Shell::Bash | hrdr_tools::Shell::Posix => {
+            format!("!yes {line} | head -c 2000000")
+        }
+        hrdr_tools::Shell::PowerShell => {
+            format!("!for ($i = 0; $i -lt 40000; $i++) {{ '{line}' }}")
+        }
+    };
+    h.type_str(&command);
     h.press(KeyCode::Enter);
     assert!(h.app.user_shell.is_some(), "the shell task is tracked");
 

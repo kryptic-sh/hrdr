@@ -51,6 +51,8 @@ mod frag {
     pub const SHELL: &str = include_str!("templates/shell.md");
     /// …and that shell is plain POSIX `sh`, not bash.
     pub const SHELL_POSIX: &str = include_str!("templates/shell_posix.md");
+    /// …and that shell is Windows PowerShell, not POSIX shell.
+    pub const SHELL_POWERSHELL: &str = include_str!("templates/shell_powershell.md");
     /// `can_write`: commit discipline shared by main and sub agents.
     pub const COMMITTING: &str = include_str!("templates/committing.md");
     /// `can_write` and NOT a sub-agent: changelog ownership, push rules.
@@ -159,6 +161,9 @@ pub fn capability_sections_for(
             if shell.needs_posix_caveat() {
                 out.push((SECTION_SHELL_POSIX, frag::SHELL_POSIX));
             }
+            if shell.is_powershell() {
+                out.push((SECTION_SHELL_POWERSHELL, frag::SHELL_POWERSHELL));
+            }
         }
         out.push((SECTION_COMMITTING, frag::COMMITTING));
         // The sub-agent half of this used to be its own fragment; it now lives in
@@ -266,6 +271,7 @@ pub const SECTION_JAIL: &str = "jail";
 pub const SECTION_WRITE: &str = "write";
 pub const SECTION_SHELL: &str = "shell";
 pub const SECTION_SHELL_POSIX: &str = "shell_posix";
+pub const SECTION_SHELL_POWERSHELL: &str = "shell_powershell";
 pub const SECTION_COMMITTING: &str = "committing";
 pub const SECTION_WRITE_MAIN: &str = "write_main";
 pub const SECTION_COMMITTING_MAIN: &str = "committing_main";
@@ -1923,31 +1929,25 @@ mod tests {
         assert!(!says(&p, ".log` 2>&1"), "no manual redirect syntax: {p}");
     }
 
-    /// The Shell section renders when a shell exists, and the POSIX-`sh` pitfall
-    /// note renders only when the shell is plain `sh` rather than bash.
+    /// The Shell section renders when a shell exists, and dialect-specific
+    /// pitfall notes render only for the shell that needs them.
     ///
     /// The single `shell` tool is registered only when a shell is on PATH, so the
-    /// prompt keys off the tool set. The general shell guidance assumes bash; the
-    /// extra `shell_posix` note warns off bashisms when only `sh` is present.
+    /// prompt keys off the tool set. The general shell guidance is shared; the
+    /// extra `shell_posix` and `shell_powershell` notes warn off syntax from the
+    /// wrong shell family.
     #[test]
     fn the_shell_rules_match_the_shell_the_machine_has() {
-        // Drive the gates directly rather than depending on the test machine's
-        // shell: `has_shell` (is there a shell at all) and `shell_posix` (is it
-        // plain POSIX `sh`).
-        let render = |has_shell: bool, shell_posix: bool| -> String {
-            let shell = match (has_shell, shell_posix) {
-                (false, _) => None,
-                (true, false) => Some(hrdr_tools::Shell::Bash),
-                (true, true) => Some(hrdr_tools::Shell::Posix),
-            };
+        let render = |shell: Option<hrdr_tools::Shell>| -> String {
             render_flags(true, false, false, shell)
         };
 
         // bash shell: the Shell section and the run-raw rule (once), and NO
-        // POSIX-sh note.
-        let p = render(true, false);
+        // dialect pitfall note.
+        let p = render(Some(hrdr_tools::Shell::Bash));
         assert!(says(&p, "Shell:"), "{p}");
         assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(!says(&p, "Windows PowerShell"), "{p}");
         assert_eq!(
             p.matches("Run a slow or noisy command once, raw").count(),
             1,
@@ -1955,14 +1955,23 @@ mod tests {
         );
 
         // POSIX sh: the Shell section plus the bashism warning.
-        let p = render(true, true);
+        let p = render(Some(hrdr_tools::Shell::Posix));
         assert!(says(&p, "Shell:"), "{p}");
         assert!(says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(!says(&p, "Windows PowerShell"), "{p}");
 
-        // No shell: no Shell section, and so no POSIX note either.
-        let p = render(false, false);
+        // PowerShell: the Shell section plus the PowerShell syntax warning.
+        let p = render(Some(hrdr_tools::Shell::PowerShell));
+        assert!(says(&p, "Shell:"), "{p}");
+        assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(says(&p, "write PowerShell, not POSIX shell"), "{p}");
+        assert!(says(&p, "$env:NAME"), "{p}");
+
+        // No shell: no Shell section, and so no dialect note either.
+        let p = render(None);
         assert!(!says(&p, "Shell:"), "{p}");
         assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(!says(&p, "Windows PowerShell"), "{p}");
     }
 
     /// The gate is wired to the tool set, not to a guess about the platform. The
@@ -1984,6 +1993,11 @@ mod tests {
             shell.is_some_and(|s| s.needs_posix_caveat()),
             says(&p, "POSIX `sh`, NOT bash"),
             "the POSIX-sh note appears exactly when the shell asks for it"
+        );
+        assert_eq!(
+            shell.is_some_and(|s| s.is_powershell()),
+            says(&p, "write PowerShell, not POSIX shell"),
+            "the PowerShell note appears exactly when the shell asks for it"
         );
     }
 

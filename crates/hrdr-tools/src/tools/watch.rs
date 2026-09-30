@@ -397,8 +397,33 @@ fn finish(ctx: &ToolContext, id: u64, result: String) {
 mod tests {
     use super::*;
 
+    fn shell() -> Shell {
+        Shell::detect().expect("a shell to watch with")
+    }
+
     fn tool() -> WatchTool {
-        WatchTool::new(Shell::detect().expect("a shell to watch with"))
+        WatchTool::new(shell())
+    }
+
+    fn instant_success(shell: Shell) -> &'static str {
+        match shell {
+            Shell::Bash | Shell::Posix => "true",
+            Shell::PowerShell => "exit 0",
+        }
+    }
+
+    fn instant_failure(shell: Shell) -> &'static str {
+        match shell {
+            Shell::Bash | Shell::Posix => "false",
+            Shell::PowerShell => "exit 1",
+        }
+    }
+
+    fn delayed_success(shell: Shell, secs: u64) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => format!("sleep {secs} && exit 0"),
+            Shell::PowerShell => format!("Start-Sleep -Seconds {secs}; exit 0"),
+        }
     }
 
     /// The `#N` from the acknowledgement ("watching #N — …").
@@ -441,17 +466,29 @@ mod tests {
     /// A check that exits 0 only after `pass_after` runs, counting into a file
     /// in `dir` — the shape the "condition flips" tests need.
     fn flip_check(dir: &std::path::Path, pass_after: u64) -> String {
+        let shell = shell();
         let counter = dir.join("count");
-        // Shell-safe form of the path: forward slashes (a `C:\…` spelling is
-        // read cwd-relative by Git Bash, so the check counts in a file the
-        // test cannot see) and shell-quoted (spaces/globs would break it
-        // either way).
-        let normalized = counter.to_string_lossy().replace('\\', "/");
-        let counter = shell_words::quote(&normalized);
-        format!(
-            "c=$(cat {counter} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\"; echo \"$c\" > {counter}; \
-             test \"$c\" -ge {pass_after}"
-        )
+        match shell {
+            Shell::Bash | Shell::Posix => {
+                // Shell-safe form of the path: forward slashes (a `C:\…` spelling is
+                // read cwd-relative by Git Bash, so the check counts in a file the
+                // test cannot see) and shell-quoted (spaces/globs would break it
+                // either way).
+                let normalized = counter.to_string_lossy().replace('\\', "/");
+                let counter = shell_words::quote(&normalized);
+                format!(
+                    "c=$(cat {counter} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\"; echo \"$c\" > {counter}; \
+                     test \"$c\" -ge {pass_after}"
+                )
+            }
+            Shell::PowerShell => {
+                let counter = Shell::PowerShell.quote(&counter.to_string_lossy());
+                format!(
+                    "$p = {counter}; $c = if (Test-Path -LiteralPath $p) {{ [int](Get-Content -LiteralPath $p) }} else {{ 0 }}; \
+                     $c = $c + 1; Write-Output $c; [System.IO.File]::WriteAllText($p, [string]$c, [System.Text.UTF8Encoding]::new($false)); exit ([int]($c -lt {pass_after}))"
+                )
+            }
+        }
     }
 
     fn counter_value(dir: &std::path::Path) -> u64 {
@@ -470,7 +507,10 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         let started = std::time::Instant::now();
         let ack = tool()
-            .execute(serde_json::json!({"check": "sleep 5 && exit 0"}), &ctx)
+            .execute(
+                serde_json::json!({"check": delayed_success(shell(), 5)}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(
@@ -501,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path());
         let ack = tool()
-            .execute(serde_json::json!({"check": "true"}), &ctx)
+            .execute(serde_json::json!({"check": instant_success(shell())}), &ctx)
             .await
             .unwrap();
         let id = ack_id(&ack);
@@ -556,7 +596,7 @@ mod tests {
         ctx.enforce_timeout_floor = false;
         let ack = tool()
             .execute(
-                serde_json::json!({"check": "false", "interval_secs": 1, "timeout_secs": 1}),
+                serde_json::json!({"check": instant_failure(shell()), "interval_secs": 1, "timeout_secs": 1}),
                 &ctx,
             )
             .await
@@ -700,7 +740,7 @@ mod tests {
 
         let err = t
             .execute(
-                serde_json::json!({"check": "true", "interval_secs": 5}),
+                serde_json::json!({"check": instant_success(shell()), "interval_secs": 5}),
                 &ctx,
             )
             .await
@@ -710,7 +750,7 @@ mod tests {
 
         let err = t
             .execute(
-                serde_json::json!({"check": "true", "timeout_secs": 4000}),
+                serde_json::json!({"check": instant_success(shell()), "timeout_secs": 4000}),
                 &ctx,
             )
             .await
@@ -723,7 +763,7 @@ mod tests {
         // asked for 30 seconds.
         let err = t
             .execute(
-                serde_json::json!({"check": "true", "timeout_ms": 30_000}),
+                serde_json::json!({"check": instant_success(shell()), "timeout_ms": 30_000}),
                 &ctx,
             )
             .await

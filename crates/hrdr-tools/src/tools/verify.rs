@@ -270,8 +270,31 @@ mod tests {
         ctx
     }
 
+    fn shell() -> Shell {
+        Shell::detect().expect("a shell to run the gate with")
+    }
+
     fn tool() -> VerifyTool {
-        VerifyTool::new(Shell::detect().expect("a shell to run the gate with"))
+        VerifyTool::new(shell())
+    }
+
+    fn stderr_exit(shell: Shell, message: &str, code: u8) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => format!("echo '{message}' >&2; exit {code}"),
+            Shell::PowerShell => format!("[Console]::Error.WriteLine('{message}'); exit {code}"),
+        }
+    }
+
+    fn create_marker(shell: Shell, marker: &std::path::Path) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => {
+                format!("touch {}", shell.quote(&marker.to_string_lossy()))
+            }
+            Shell::PowerShell => format!(
+                "New-Item -ItemType File -Path {} -Force | Out-Null",
+                shell.quote(&marker.to_string_lossy())
+            ),
+        }
     }
 
     #[tokio::test]
@@ -301,15 +324,15 @@ mod tests {
     async fn the_first_failure_ends_the_run_and_says_what_did_not_run() {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("ran-the-suite");
+        let shell = shell();
+        let fail = stderr_exit(shell, "clippy is angry", 1);
+        let marker_cmd = create_marker(shell, &marker);
         let ctx = ctx_with_gate(
             dir.path(),
             &[
                 (CheckKind::Format, "echo formatted"),
-                (CheckKind::Lint, "echo 'clippy is angry' >&2; exit 1"),
-                (
-                    CheckKind::Test,
-                    &format!("touch {}", marker.to_string_lossy()),
-                ),
+                (CheckKind::Lint, &fail),
+                (CheckKind::Test, &marker_cmd),
             ],
         );
         let err = tool()

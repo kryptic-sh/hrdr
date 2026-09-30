@@ -15,43 +15,48 @@ use super::{BASH_LINE_CAP, DEFAULT_TOOL_TIMEOUT_SECS};
 // ---- shell ----
 
 /// The shell interpreter this session runs commands through, resolved once from
-/// `PATH`: `bash`, then POSIX `sh`. hrdr targets UNIX workflows, so there is no
-/// PowerShell path; on Windows this means WSL or Git Bash. The model is told
-/// which one it has (see [`Shell::tool_description`]) so it can avoid bashisms
-/// when only `sh` is present.
+/// `PATH`: Windows prefers PowerShell, while Unix prefers `bash` and falls back
+/// to POSIX `sh`. The model is told which one it has (see
+/// [`Shell::tool_description`]) so it can write for the real dialect.
 ///
 /// **This enum is the single seam for shell support.** Everything that differs
 /// between shells lives on it: how the interpreter is invoked, how an argument
 /// is quoted for it, what the model is told it has. Callers spawn through
 /// [`Shell::command`] and quote through [`Shell::quote`] rather than assembling
-/// a program name and `-c` themselves — so adding a dialect (PowerShell, say)
-/// means adding a variant and filling in these methods, with no caller left
-/// branching on which shell it got.
+/// a program name and `-c` themselves — so adding a dialect means adding a
+/// variant and filling in these methods, with no caller left branching on which
+/// shell it got.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shell {
     Bash,
     Posix,
+    PowerShell,
 }
 
 impl Shell {
-    /// Resolve the session's shell: `bash`, then POSIX `sh`, and **only if it
-    /// actually runs**. `None` when neither does (on Windows, install WSL properly
-    /// or Git Bash).
+    /// Resolve the session's shell, and **only if it actually runs**. Windows
+    /// prefers native PowerShell; other platforms prefer `bash` and fall back to
+    /// POSIX `sh`. `None` when no supported shell can run.
     ///
     /// Existence on `PATH` is not enough, and Windows is why. `C:\Windows\System32\
     /// bash.exe` is the **WSL launcher**, which exists on a stock install whether or
     /// not a distro does — so `which("bash")` succeeds, every command then fails with
     /// a UTF-16 error message and a non-zero exit, and the failure names neither WSL
     /// nor hrdr. It shadows Git Bash on `PATH`, so the machine looks shell-less while
-    /// a working `sh.exe` sits in the same directory as the `bash.exe` that could not
-    /// be used.
+    /// a working Windows-native shell is available.
     ///
-    /// So each candidate is *probed* — `<shell> -c "exit 0"` must succeed — and the
-    /// answer is cached for the process, because this costs a subprocess and the
+    /// So each candidate is *probed* — `<shell> <args> "exit 0"` must succeed — and
+    /// the answer is cached for the process, because this costs a subprocess and the
     /// answer cannot change under a running session.
     pub fn detect() -> Option<Shell> {
         static SHELL: std::sync::OnceLock<Option<Shell>> = std::sync::OnceLock::new();
-        *SHELL.get_or_init(|| [Shell::Bash, Shell::Posix].into_iter().find(|s| s.runs()))
+        *SHELL.get_or_init(|| {
+            #[cfg(windows)]
+            const CANDIDATES: &[Shell] = &[Shell::PowerShell, Shell::Bash, Shell::Posix];
+            #[cfg(not(windows))]
+            const CANDIDATES: &[Shell] = &[Shell::Bash, Shell::Posix];
+            CANDIDATES.iter().copied().find(|s| s.runs())
+        })
     }
 
     /// Whether this shell is on `PATH` **and** can run a trivial command.
@@ -76,6 +81,16 @@ impl Shell {
         match self {
             Shell::Bash => "bash",
             Shell::Posix => "sh",
+            Shell::PowerShell => "powershell.exe",
+        }
+    }
+
+    /// The arguments that precede the command string. Separate from
+    /// [`Shell::program`] because it is not universally `-c`.
+    pub(crate) fn invoke_args(self) -> &'static [&'static str] {
+        match self {
+            Shell::Bash | Shell::Posix => &["-c"],
+            Shell::PowerShell => &["-NoProfile", "-NonInteractive", "-Command"],
         }
     }
 
@@ -85,26 +100,30 @@ impl Shell {
     pub(crate) fn executable(self) -> &'static std::ffi::OsStr {
         static BASH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
         static POSIX: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+        static POWERSHELL: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
         let resolved = match self {
             Shell::Bash => &BASH,
             Shell::Posix => &POSIX,
+            Shell::PowerShell => &POWERSHELL,
         };
         resolved.get_or_init(|| crate::proc::resolve_program(self.program(), None))
     }
 
-    /// The arguments that precede the command string. Separate from
-    /// [`Shell::program`] because it is not universally `-c` — PowerShell would
-    /// want `-NoProfile -Command`. Visible to the crate so the sandbox backends
-    /// can build a shell invocation from its parts.
-    pub(crate) fn invoke_args(self) -> &'static [&'static str] {
-        match self {
-            Shell::Bash | Shell::Posix => &["-c"],
-        }
+    fn powershell_prelude() -> &'static str {
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+         $OutputEncoding = [Console]::OutputEncoding; \
+         $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'; \
+         $PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'; \
+         $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'"
     }
 
     /// A `Command` that runs `command` through this shell. Nothing else is
     /// configured — the caller owns cwd, stdio, timeouts and process groups.
     pub fn command(self, command: &str) -> tokio::process::Command {
+        let command = match self {
+            Shell::PowerShell => format!("{}; {command}", Self::powershell_prelude()),
+            Shell::Bash | Shell::Posix => command.to_string(),
+        };
         let mut cmd = tokio::process::Command::new(self.executable());
         cmd.args(self.invoke_args()).arg(command);
         cmd
@@ -119,6 +138,7 @@ impl Shell {
     pub fn quote(self, s: &str) -> String {
         match self {
             Shell::Bash | Shell::Posix => format!("'{}'", s.replace('\'', r"'\''")),
+            Shell::PowerShell => format!("'{}'", s.replace('\'', "''")),
         }
     }
 
@@ -128,6 +148,7 @@ impl Shell {
         match self {
             Shell::Bash => BASH_DESC,
             Shell::Posix => SH_DESC,
+            Shell::PowerShell => POWERSHELL_DESC,
         }
     }
 
@@ -136,6 +157,7 @@ impl Shell {
         match self {
             Shell::Bash => "bash",
             Shell::Posix => "sh (POSIX — avoid bashisms)",
+            Shell::PowerShell => "PowerShell (Windows native)",
         }
     }
 
@@ -144,14 +166,20 @@ impl Shell {
     pub fn needs_posix_caveat(self) -> bool {
         match self {
             Shell::Posix => true,
-            Shell::Bash => false,
+            Shell::Bash | Shell::PowerShell => false,
         }
+    }
+
+    /// Whether the shell's language is PowerShell rather than a POSIX dialect.
+    pub fn is_powershell(self) -> bool {
+        matches!(self, Shell::PowerShell)
     }
 }
 
 /// The single, platform-agnostic `shell` tool. It runs whatever shell was
-/// auto-detected (`bash` or POSIX `sh`); its name is always `shell`, and its
-/// description names the actual interpreter in use.
+/// auto-detected (PowerShell on native Windows, otherwise `bash` or POSIX `sh`);
+/// its name is always `shell`, and its description names the actual interpreter
+/// in use.
 pub struct ShellTool {
     shell: Shell,
 }
@@ -179,6 +207,15 @@ const SH_DESC: &str = "Run a shell command via `sh -c` — this session's shell 
      or use paths from the cwd; `cd` does NOT persist between calls. Git: stage explicit \
      paths (`git add <file> …`); blanket staging, force-push, hook-skipping, and \
      destructive commands are rejected.";
+
+const POWERSHELL_DESC: &str = "Run a shell command via Windows PowerShell (`powershell.exe -NoProfile \
+     -NonInteractive -Command`) in the working directory. Use PowerShell syntax, not POSIX shell \
+     syntax: environment variables are `$env:NAME`, command chaining uses `;` or explicit \
+     `if ($LASTEXITCODE -eq 0) { ... }`, and common Windows tools may be `.cmd` shims. Use for \
+     build, test, git, and anything without a dedicated tool. Output is captured and \
+     length-bounded. Each call starts fresh in the working directory; `Set-Location` does NOT \
+     persist between calls. Git: stage explicit paths (`git add <file> ...`); blanket staging, \
+     force-push, hook-skipping, and destructive commands are rejected.";
 
 /// Byte index of the last **top-level** `|` in `command`: a pipe that is outside
 /// single/double quotes and is not half of a `||`. Deliberately a lexer-lite
@@ -1029,13 +1066,19 @@ mod tests {
         ctx.max_output_lines = 10_000;
         // 52 lines of "x" = 104 bytes: line 51 is the one that crosses the cap,
         // and it is exactly the line the spool used to drop.
-        let command = "printf 'x\\n%.0s' {1..52}";
+        let command = match shell {
+            Shell::Bash => "printf 'x\\n%.0s' {1..52}".to_string(),
+            Shell::Posix => {
+                "i=0; while [ $i -lt 52 ]; do printf 'x\\n'; i=$((i+1)); done".to_string()
+            }
+            Shell::PowerShell => "1..52 | ForEach-Object { 'x' }".to_string(),
+        };
         let out = ShellTool::new(shell)
-            .execute(serde_json::json!({"command": command}), &ctx)
+            .execute(serde_json::json!({"command": command.clone()}), &ctx)
             .await
             .expect("a command that overflows is still a result");
         let spool = ctx
-            .spooled_output_for(command)
+            .spooled_output_for(&command)
             .expect("the run spilled to a spool file");
         let contents = std::fs::read_to_string(&spool).expect("spool readable");
         assert_eq!(
@@ -1092,7 +1135,7 @@ mod tests {
     /// — which is the point of keeping them on one type.
     #[test]
     fn every_shell_answers_the_whole_seam() {
-        for shell in [Shell::Bash, Shell::Posix] {
+        for shell in [Shell::Bash, Shell::Posix, Shell::PowerShell] {
             assert!(!shell.program().is_empty());
             assert!(!shell.invoke_args().is_empty());
             assert!(!shell.env_label().is_empty());
@@ -1105,10 +1148,16 @@ mod tests {
                 shell.executable(),
                 "{shell:?} spawns its own program"
             );
-            assert!(
-                std::path::Path::new(shell.executable())
-                    .file_stem()
-                    .is_some_and(|stem| stem == shell.program()),
+            let stem = std::path::Path::new(shell.executable())
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_ascii_lowercase());
+            let program_stem = shell
+                .program()
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase();
+            assert_eq!(
+                stem.as_deref(),
+                Some(program_stem.as_str()),
                 "{shell:?}'s executable is its program, wherever PATH found it: {:?}",
                 shell.executable()
             );
@@ -1118,7 +1167,11 @@ mod tests {
                 .collect();
             let mut expected: Vec<String> =
                 shell.invoke_args().iter().map(|a| a.to_string()).collect();
-            expected.push("echo hi".to_string());
+            let expected_command = match shell {
+                Shell::PowerShell => format!("{}; echo hi", Shell::powershell_prelude()),
+                Shell::Bash | Shell::Posix => "echo hi".to_string(),
+            };
+            expected.push(expected_command);
             assert_eq!(args, expected, "{shell:?} passes the command last");
 
             // Quoting is a wrapper, not a passthrough: the raw string can't
@@ -1135,6 +1188,7 @@ mod tests {
     fn only_posix_sh_asks_for_the_bashism_caveat() {
         assert!(Shell::Posix.needs_posix_caveat());
         assert!(!Shell::Bash.needs_posix_caveat());
+        assert!(!Shell::PowerShell.needs_posix_caveat());
     }
 
     /// A newline-less run far larger than the cap is bounded *as it is read* —
@@ -1206,6 +1260,7 @@ mod tests {
         let schemas = [
             ShellTool::new(Shell::Bash).parameters(),
             ShellTool::new(Shell::Posix).parameters(),
+            ShellTool::new(Shell::PowerShell).parameters(),
         ];
         for schema in schemas {
             assert!(
@@ -1311,7 +1366,14 @@ mod tests {
             return;
         };
         let ctx = ToolContext::new(std::path::PathBuf::from("."));
-        let cmd = r#"printf '\033[31m-        removed\033[m\n\033[32m+        added\033[m\n'"#;
+        let cmd = match shell {
+            Shell::Bash | Shell::Posix => {
+                r#"printf '\033[31m-        removed\033[m\n\033[32m+        added\033[m\n'"#
+            }
+            Shell::PowerShell => {
+                r#"Write-Output "$([char]27)[31m-        removed$([char]27)[m"; Write-Output "$([char]27)[32m+        added$([char]27)[m""#
+            }
+        };
 
         let clean = ShellTool::new(shell)
             .execute(json!({"command": cmd}), &ctx)
@@ -1351,7 +1413,14 @@ mod tests {
             return;
         };
         let ctx = ToolContext::new(std::path::PathBuf::from("."));
-        let cmd = "echo \"NO_COLOR=[$NO_COLOR] CARGO_TERM_COLOR=[$CARGO_TERM_COLOR]\"";
+        let cmd = match shell {
+            Shell::Bash | Shell::Posix => {
+                "echo \"NO_COLOR=[$NO_COLOR] CARGO_TERM_COLOR=[$CARGO_TERM_COLOR]\""
+            }
+            Shell::PowerShell => {
+                "Write-Output \"NO_COLOR=[$env:NO_COLOR] CARGO_TERM_COLOR=[$env:CARGO_TERM_COLOR]\""
+            }
+        };
         let ambient = |k: &str| std::env::var(k).unwrap_or_default();
 
         // Default: hrdr's values win, whatever the environment said.
@@ -1403,10 +1472,16 @@ mod tests {
         // (standing in for a long-lived `node` server), then block in the
         // foreground on a sleep of our own so the leader is still alive when
         // the one-second timeout below fires.
-        let command = format!(
-            "{} sleep 30",
-            test_env::backgrounded_grandchild(shell, &marker)
-        );
+        let command = match shell {
+            Shell::Bash | Shell::Posix => format!(
+                "{} sleep 30",
+                test_env::backgrounded_grandchild(shell, &marker)
+            ),
+            Shell::PowerShell => format!(
+                "{}; Start-Sleep -Seconds 30",
+                test_env::backgrounded_grandchild(shell, &marker)
+            ),
+        };
 
         // A one-second deadline is the whole point of this test, so opt out of
         // the floor that would otherwise raise it to the default.
@@ -1527,11 +1602,12 @@ mod tests {
         // Killed by the deadline: Err, and the partial output survives on it —
         // dropping that would force a re-run of the command that just cost the
         // deadline.
+        let timeout_cmd = match shell {
+            Shell::Bash | Shell::Posix => "echo starting; sleep 30",
+            Shell::PowerShell => "Write-Output starting; Start-Sleep -Seconds 30",
+        };
         let err = ShellTool::new(shell)
-            .execute(
-                json!({"command": "echo starting; sleep 30", "timeout_secs": 1}),
-                &ctx,
-            )
+            .execute(json!({"command": timeout_cmd, "timeout_secs": 1}), &ctx)
             .await
             .expect_err("a killed command is not a successful one");
         let msg = err.to_string();
@@ -1543,8 +1619,12 @@ mod tests {
 
         // Ran to completion and said no: still Ok. The command answered, and the
         // answer is the output — only the deadline case is unknowable.
+        let nonzero_cmd = match shell {
+            Shell::Bash | Shell::Posix => "echo nope; exit 3",
+            Shell::PowerShell => "Write-Output nope; exit 3",
+        };
         let out = ShellTool::new(shell)
-            .execute(json!({"command": "echo nope; exit 3"}), &ctx)
+            .execute(json!({"command": nonzero_cmd}), &ctx)
             .await
             .expect("a non-zero exit is a result, not a tool failure");
         assert!(out.contains("nope") && out.contains("exit status"), "{out}");
@@ -1571,11 +1651,16 @@ mod tests {
         // 50 lines of ~33 chars each (~1650 bytes total) — comfortably over
         // both caps, and small enough to stay under the 5x in-memory ring too
         // (so this exercises the final display trim, not the ring cap).
+        let output_cmd = match shell {
+            Shell::Bash | Shell::Posix => {
+                "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"
+            }
+            Shell::PowerShell => {
+                "for ($i = 1; $i -le 50; $i++) { \"line $($i): some padding text here\" }"
+            }
+        };
         let result = ShellTool::new(shell)
-            .execute(
-                serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
-                &c,
-            )
+            .execute(serde_json::json!({"command": output_cmd}), &c)
             .await
             .unwrap();
 
@@ -1639,6 +1724,9 @@ mod tests {
         let Some(shell) = test_env::shell() else {
             return;
         };
+        if shell.is_powershell() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let c = ToolContext::new(dir.path());
         async fn run(shell: Shell, c: &ToolContext, cmd: &str) -> String {
@@ -1703,7 +1791,12 @@ mod tests {
         // Tiny caps so a small command overflows and spills.
         c.max_output = 200;
         c.max_output_lines = 10;
-        let expensive = "for i in $(seq 1 50); do echo \"line $i: padding text\"; done";
+        let expensive = match shell {
+            Shell::Bash | Shell::Posix => {
+                "for i in $(seq 1 50); do echo \"line $i: padding text\"; done"
+            }
+            Shell::PowerShell => "for ($i = 1; $i -le 50; $i++) { \"line $($i): padding text\" }",
+        };
 
         let out = ShellTool::new(shell)
             .execute(serde_json::json!({"command": expensive}), &c)

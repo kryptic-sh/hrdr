@@ -60,10 +60,19 @@ const GRANDCHILD_STARTUP_SLACK: Duration = Duration::from_secs(10);
 /// marker *does* appear when nothing kills it — the control that keeps the
 /// others honest on every platform.
 pub(crate) fn backgrounded_grandchild(shell: Shell, marker: &Path) -> String {
-    format!(
-        "(sleep {GRANDCHILD_SECS} && touch {m}) </dev/null >/dev/null 2>&1 &",
-        m = shell.quote(&marker.to_string_lossy()),
-    )
+    match shell {
+        Shell::Bash | Shell::Posix => format!(
+            "(sleep {GRANDCHILD_SECS} && touch {m}) </dev/null >/dev/null 2>&1 &",
+            m = shell.quote(&marker.to_string_lossy()),
+        ),
+        Shell::PowerShell => format!(
+            "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',{script})",
+            script = Shell::PowerShell.quote(&format!(
+                "Start-Sleep -Seconds {GRANDCHILD_SECS}; New-Item -ItemType File -Path {} -Force | Out-Null",
+                Shell::PowerShell.quote(&marker.to_string_lossy())
+            )),
+        ),
+    }
 }
 
 /// Wait until a grandchild started at `started` would have created `marker`,

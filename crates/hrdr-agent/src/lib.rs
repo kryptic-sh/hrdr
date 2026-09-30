@@ -4556,6 +4556,9 @@ mod tests {
         if tools.shell().is_some_and(|s| s.needs_posix_caveat()) {
             expected.push("shell_posix");
         }
+        if tools.shell().is_some_and(|s| s.is_powershell()) {
+            expected.push("shell_powershell");
+        }
         expected.extend([
             "committing",
             // git mechanics + the release workflow, main-only: a sub-agent is
@@ -5533,11 +5536,22 @@ mod tests {
         // path must be shell-safe: forward slashes (a `C:\…` spelling is read
         // cwd-relative by Git Bash, so the check would count in a file the
         // assertions cannot see) and quoted (spaces/globs would break it).
-        let normalized = counter.to_string_lossy().replace('\\', "/");
-        let counter_arg = shell_words::quote(&normalized);
-        let check = format!(
-            "c=$(cat {counter_arg} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\" > {counter_arg}; test \"$c\" -ge 3"
-        );
+        let check = match shell {
+            hrdr_tools::Shell::Bash | hrdr_tools::Shell::Posix => {
+                let normalized = counter.to_string_lossy().replace('\\', "/");
+                let counter_arg = shell_words::quote(&normalized);
+                format!(
+                    "c=$(cat {counter_arg} 2>/dev/null || echo 0); c=$((c+1)); echo \"$c\" > {counter_arg}; test \"$c\" -ge 3"
+                )
+            }
+            hrdr_tools::Shell::PowerShell => {
+                let counter_arg = shell.quote(&counter.to_string_lossy());
+                format!(
+                    "$p = {counter_arg}; $c = if (Test-Path -LiteralPath $p) {{ [int](Get-Content -LiteralPath $p) }} else {{ 0 }}; \
+                     $c = $c + 1; [System.IO.File]::WriteAllText($p, [string]$c, [System.Text.UTF8Encoding]::new($false)); exit ([int]($c -lt 3))"
+                )
+            }
+        };
         let ack = hrdr_tools::WatchTool::new(shell)
             .execute(
                 serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": 60}),

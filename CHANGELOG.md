@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Windows-native PowerShell shell backend.** On Windows, `shell`, `watch`,
+  `verify`, hooks, and MCP stdio fixtures now run through
+  `powershell.exe -NoProfile -NonInteractive -Command` before falling back to
+  Git Bash/POSIX shells, with UTF-8 output defaults and prompt guidance for
+  PowerShell syntax (`crates/hrdr-tools`, `crates/hrdr-agent`).
 - **ChatGPT/Codex GPT-6 Sol and GPT-6 Luna bootstrap metadata.** Explicit
   `chatgpt://gpt-6-sol` and `chatgpt://gpt-6-luna` selections now use the same
   Responses Lite transport bootstrap as GPT-6 Astra until the live account

@@ -765,8 +765,9 @@ mod tests {
         // A minimal MCP server in shell that first backgrounds a long-lived
         // grandchild (the thing that used to leak), then answers just enough
         // JSON-RPC for `connect_stdio`'s handshake to succeed.
-        let script = format!(
-            r#"
+        let script = match shell {
+            crate::Shell::Bash | crate::Shell::Posix => format!(
+                r#"
 {grandchild}
 while IFS= read -r line; do
   id=${{line#*\"id\":}}
@@ -779,8 +780,25 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            grandchild = crate::test_env::backgrounded_grandchild(shell, &marker),
-        );
+                grandchild = crate::test_env::backgrounded_grandchild(shell, &marker),
+            ),
+            crate::Shell::PowerShell => format!(
+                r#"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+{grandchild}
+while (($line = [Console]::In.ReadLine()) -ne $null) {{
+  if ($line -match '"id":([^,}}]+)') {{ $id = $Matches[1] }} else {{ $id = '0' }}
+  if ($line.Contains('"method":"initialize"')) {{
+    Write-Output "{{`"jsonrpc`":`"2.0`",`"id`":$id,`"result`":{{`"capabilities`":{{}}}}}}"
+  }} elseif ($line.Contains('"method":"tools/list"')) {{
+    Write-Output "{{`"jsonrpc`":`"2.0`",`"id`":$id,`"result`":{{`"tools`":[]}}}}"
+  }}
+}}
+"#,
+                grandchild = crate::test_env::backgrounded_grandchild(shell, &marker),
+            ),
+        };
 
         let started = std::time::Instant::now();
         let args: Vec<String> = shell

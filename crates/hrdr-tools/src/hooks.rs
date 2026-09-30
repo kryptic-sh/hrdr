@@ -406,21 +406,61 @@ mod tests {
         assert_eq!(cmd, r"fmt '/tmp/a'\''; rm -rf /; '\''.rs'");
     }
 
+    fn hook_append_y(shell: Shell) -> &'static str {
+        match shell {
+            Shell::Bash | Shell::Posix => "printf y >> {path}",
+            Shell::PowerShell => "Add-Content -LiteralPath {path} -NoNewline -Value y",
+        }
+    }
+
+    fn stderr_exit(shell: Shell, message: &str, code: u8) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => format!("echo {message} >&2; exit {code}"),
+            Shell::PowerShell => format!("[Console]::Error.WriteLine('{message}'); exit {code}"),
+        }
+    }
+
+    fn sleep_cmd(shell: Shell, secs: u64) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => format!("sleep {secs}"),
+            Shell::PowerShell => format!("Start-Sleep -Seconds {secs}"),
+        }
+    }
+
+    fn event_stdout(shell: Shell, text: &str) -> String {
+        match shell {
+            Shell::Bash | Shell::Posix => format!("cat > /dev/null; echo {text}"),
+            Shell::PowerShell => {
+                format!("$null = [Console]::In.ReadToEnd(); Write-Output '{text}'")
+            }
+        }
+    }
+
+    fn event_payload_probe(shell: Shell) -> &'static str {
+        match shell {
+            Shell::Bash | Shell::Posix => "grep -o pre_tool",
+            Shell::PowerShell => {
+                "$payload = [Console]::In.ReadToEnd(); if ($payload -match 'pre_tool') { 'pre_tool' }"
+            }
+        }
+    }
+
     #[tokio::test]
     async fn hooks_run_fail_and_time_out() {
         if crate::test_env::shell().is_none() {
             return;
         }
+        let shell = crate::test_env::shell().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
         // A hook that mutates the file runs quietly…
-        let ok = hook("edit", None, "printf y >> {path}");
+        let ok = hook("edit", None, hook_append_y(shell));
         let notes = run_file_hooks(&[ok], "edit", &file, dir.path()).await;
         assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "xy");
         // …a failing hook reports, with its stderr…
-        let bad = hook("edit", None, "echo broken >&2; exit 3");
+        let bad = hook("edit", None, &stderr_exit(shell, "broken", 3));
         let notes = run_file_hooks(&[bad], "edit", &file, dir.path()).await;
         assert_eq!(notes.len(), 1);
         assert!(
@@ -432,7 +472,7 @@ mod tests {
         // `100` — that was 100 *milliseconds* when this field was `timeout_ms`,
         // and reading it as seconds would make this test wait a minute and a half
         // for a `sleep 5` that the timeout is supposed to cut short.
-        let mut slow = hook("edit", None, "sleep 5");
+        let mut slow = hook("edit", None, &sleep_cmd(shell, 5));
         slow.timeout_secs = 1;
         let notes = run_file_hooks(&[slow], "edit", &file, dir.path()).await;
         assert_eq!(notes.len(), 1);
@@ -482,14 +522,15 @@ mod tests {
         if crate::test_env::shell().is_none() {
             return;
         }
+        let shell = crate::test_env::shell().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let payload = serde_json::json!({"event": "pre_tool", "tool": "bash"});
 
         // Only hooks for this event + tool run.
         let hooks = vec![
-            event_hook(HookEvent::PostTool, "*", "exit 2"), // wrong event
-            event_hook(HookEvent::PreTool, "edit", "exit 2"), // wrong tool
-            event_hook(HookEvent::PreTool, "bash", "cat > /dev/null; echo saw-it"),
+            event_hook(HookEvent::PostTool, "*", &stderr_exit(shell, "unused", 2)), // wrong event
+            event_hook(HookEvent::PreTool, "edit", &stderr_exit(shell, "unused", 2)), // wrong tool
+            event_hook(HookEvent::PreTool, "bash", &event_stdout(shell, "saw-it")),
         ];
         let out = run_event_hooks(
             &hooks,
@@ -504,7 +545,11 @@ mod tests {
         assert_eq!(out.context, vec!["saw-it".to_string()]);
 
         // The payload arrives on stdin.
-        let hooks = vec![event_hook(HookEvent::PreTool, "*", "grep -o pre_tool")];
+        let hooks = vec![event_hook(
+            HookEvent::PreTool,
+            "*",
+            event_payload_probe(shell),
+        )];
         let out = run_event_hooks(
             &hooks,
             HookEvent::PreTool,
@@ -517,8 +562,8 @@ mod tests {
 
         // Exit 2 blocks with stderr as the reason and stops the chain.
         let hooks = vec![
-            event_hook(HookEvent::PreTool, "*", "echo nope >&2; exit 2"),
-            event_hook(HookEvent::PreTool, "*", "echo never-runs"),
+            event_hook(HookEvent::PreTool, "*", &stderr_exit(shell, "nope", 2)),
+            event_hook(HookEvent::PreTool, "*", &event_stdout(shell, "never-runs")),
         ];
         let out = run_event_hooks(
             &hooks,
@@ -535,7 +580,7 @@ mod tests {
         let hooks = vec![event_hook(
             HookEvent::TurnEnd,
             "*",
-            "echo broken >&2; exit 1",
+            &stderr_exit(shell, "broken", 1),
         )];
         let out = run_event_hooks(&hooks, HookEvent::TurnEnd, None, &payload, dir.path()).await;
         assert!(out.block.is_none());
@@ -546,7 +591,7 @@ mod tests {
         // unit the field is actually in. One second, not the old `100`: that
         // was 100 *milliseconds* back when the field was `timeout_ms`, and
         // reading it as seconds would make this wait a minute and a half.
-        let mut slow = event_hook(HookEvent::TurnEnd, "*", "sleep 5");
+        let mut slow = event_hook(HookEvent::TurnEnd, "*", &sleep_cmd(shell, 5));
         slow.timeout_secs = 1;
         let out = run_event_hooks(&[slow], HookEvent::TurnEnd, None, &payload, dir.path()).await;
         assert!(out.block.is_none());
