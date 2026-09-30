@@ -3758,24 +3758,19 @@ Ranked by impact, biggest first:
 7. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
    line per call.** `crates/hrdr-app/src/highlight.rs:140` `block.lines.clone()`
    per streaming frame of a growing code block. Open.
-8. **MEDIUM (re-confirmed, 08-30 #9) — shell overflow spool, one unbuffered
-   `write(2)` per line past the cap.**
-   `crates/hrdr-tools/src/tools/shell.rs:650` (the seed writes at 637-639 are
-   fine; 650 is the steady-state per-line one). 100 KLOC build wall ≈ 100 K
-   syscalls. Fix: `BufWriter`, flush on drop. Open.
-9. **MEDIUM (re-confirmed, 08-30 #10) — per-file `canonicalize_nearest` in the
+8. **MEDIUM (re-confirmed, 08-30 #10) — per-file `canonicalize_nearest` in the
    grep/replace walkers.** `grep.rs:233,339` / `replace.rs:351` — every walked
    file pays an lstat + full realpath for the deny-list check. Fix as recorded
    (raw-path `secret_file_reason` first). Open.
-10. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
-    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
-    matches only after the whole read. Open.
-11. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
+9. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
+   cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
+   matches only after the whole read. Open.
+10. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
     request.** `catalog.rs:219,257,318-324`; caller sites unchanged
     (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-12. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+11. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
     page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-13. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+12. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
     acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
     `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
     in the transcript projection (`transcript_log.rs:114-115`); runs per
@@ -3784,15 +3779,15 @@ Ranked by impact, biggest first:
     `to_write` feeds both the deque and the transcript write, so
     `Record::from_event` would need to borrow the payload from the deque entry.
     Still available; open.
-14. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+13. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-15. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
+14. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
     pre-scan.** `client.rs:1557`, immediately before the same O(len) parse.
     Open.
-16. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
+15. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
     insert into `args_streamed`.** `codex.rs:450`. Open.
-17. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+16. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `memory.rs`
     (#13 recall lowercasing per token), `budget.rs` (#16 no-usage re-estimate —
     held open by decision) or the hrdr-tools dispatch (#17 args clone). Presumed

@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shell overflow spool files now buffer steady-state writes after the output
+  cap is exceeded.** Large command output still preserves the full spool file,
+  but avoids one `write(2)` syscall per spilled line (`crates/hrdr-tools`).
+
 ## [0.16.0] - 2026-09-15
 
 ### Breaking

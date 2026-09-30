@@ -1,3 +1,4 @@
+use std::io::{BufWriter, Write as _};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -552,7 +553,7 @@ pub(crate) async fn run_streamed_command(
     // point is appended as it arrives, same as before.
     let overflow_dir = crate::tool_output_dir();
     let mut overflow_path: Option<std::path::PathBuf> = None;
-    let mut overflow_file: Option<std::fs::File> = None;
+    let mut overflow_file: Option<BufWriter<std::fs::File>> = None;
     // Lines dropped for naming a credential file. Counted rather than silently
     // swallowed: output that vanished with no explanation reads as a broken command,
     // and a model that cannot tell "filtered" from "no matches" re-runs the search.
@@ -638,12 +639,12 @@ pub(crate) async fn run_streamed_command(
                             std::sync::atomic::AtomicU64::new(0);
                         let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let p = overflow_dir.join(format!("shell-{stamp}-{seq}.txt"));
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                        if let Ok(f) = std::fs::OpenOptions::new()
                             .create(true)
                             .write(true)
                             .open(&p)
                         {
-                            use std::io::Write as _;
+                            let mut f = BufWriter::new(f);
                             let _ = f.write_all(head.as_bytes());
                             if went_to_tail {
                                 let _ = f.write_all(line.as_bytes());
@@ -654,9 +655,8 @@ pub(crate) async fn run_streamed_command(
                     }
                 } else if let Some(f) = &mut overflow_file {
                     // Already over the cap and the file is open: keep it in sync
-                    // one line at a time (it was already seeded with everything
-                    // up to the line that tripped `over_cap` above).
-                    use std::io::Write as _;
+                    // through the buffered writer (it was already seeded with
+                    // everything up to the line that tripped `over_cap` above).
                     let _ = f.write_all(line.as_bytes());
                 }
                 // Stream to the UI last, moving the owned line — the trailing
@@ -774,7 +774,9 @@ pub(crate) async fn run_streamed_command(
     }
 
     // Flush the overflow file (drop closes it).
-    drop(overflow_file);
+    if let Some(mut f) = overflow_file.take() {
+        let _ = f.flush();
+    }
 
     // ---- result notes: appended to whichever body is returned below ----
     let mut notes = String::new();
