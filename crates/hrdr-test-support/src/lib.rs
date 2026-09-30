@@ -269,7 +269,8 @@ pub fn real_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Assert that `path` is inside this process's sandbox, and not under the real home.
+/// Assert that `path` is inside this process's sandbox, and not under the real
+/// home when the OS temp root itself is outside that home.
 ///
 /// The shape of the promise this crate makes, spelled out for a test that wants to
 /// check it: whatever hrdr resolved as a user-state path came from the sandbox.
@@ -281,7 +282,9 @@ pub fn assert_sandboxed(path: &Path) {
         path.display(),
         root.display()
     );
-    if let Some(real) = real_home() {
+    if let Some(real) = real_home()
+        && !root.starts_with(&real)
+    {
         assert!(
             !path.starts_with(&real),
             "{} is under the developer's real home {}",

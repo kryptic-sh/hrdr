@@ -129,8 +129,9 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
 
     for k in keys {
         // A beat between keys: the menu redraws on a timer, and a burst would
-        // test the input buffer rather than the menu.
-        std::thread::sleep(Duration::from_millis(150));
+        // test the input buffer rather than the menu. Windows PTY input can lag
+        // by several ticks while the full suite is running.
+        std::thread::sleep(Duration::from_millis(500));
         let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
         let _ = w.write_all(k.as_bytes());
         let _ = w.flush();

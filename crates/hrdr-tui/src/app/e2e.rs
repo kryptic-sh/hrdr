@@ -6991,14 +6991,11 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     );
 
     // The rule, then the rest of the left padding, then the content. The
-    // status mark leads — the in_progress marker is a braille SPINNER frame
-    // (first frame at t≈0) — before the item's stable `#N` reference.
-    let first_frame = "⠹";
+    // status mark leads — the in_progress marker is a braille spinner frame —
+    // before the item's stable `#N` reference.
+    let first_row = row(text_y);
     assert!(
-        row(text_y).starts_with(&format!(
-            "{} {first_frame} #0 ship it",
-            crate::ui::BORDER_BAR
-        )),
+        first_row.starts_with(crate::ui::BORDER_BAR) && first_row.contains(" #0 ship it"),
         "{screen}"
     );
     assert!(

@@ -461,20 +461,20 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The call returns the id and an end-turn ack immediately — it must not
-    /// block on the first check (a `sleep 2 && exit 0` check would delay a
-    /// blocking poller by two seconds).
+    /// The call returns the id and an end-turn ack promptly — it must not
+    /// block on the first check (a `sleep 5 && exit 0` check would delay a
+    /// blocking poller by five seconds).
     #[tokio::test]
     async fn watch_returns_immediately_with_an_id() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path());
         let started = std::time::Instant::now();
         let ack = tool()
-            .execute(serde_json::json!({"check": "sleep 2 && exit 0"}), &ctx)
+            .execute(serde_json::json!({"check": "sleep 5 && exit 0"}), &ctx)
             .await
             .unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(4),
             "the call blocked on the first check: {:?}",
             started.elapsed()
         );

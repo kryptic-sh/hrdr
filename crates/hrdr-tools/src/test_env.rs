@@ -46,9 +46,9 @@ pub(crate) fn python() -> Option<&'static str> {
 const GRANDCHILD_SECS: u64 = 2;
 
 /// Headroom past [`GRANDCHILD_SECS`] for a slow runner to start the grandchild:
-/// process creation under Git Bash on Windows costs a visible fraction of a
-/// second per fork.
-const GRANDCHILD_STARTUP_SLACK: Duration = Duration::from_secs(3);
+/// process creation under Git Bash on Windows can take seconds when the whole
+/// suite is compiling and running in parallel.
+const GRANDCHILD_STARTUP_SLACK: Duration = Duration::from_secs(10);
 
 /// A shell fragment that backgrounds a grandchild which, if nothing kills it,
 /// creates `marker` after [`GRANDCHILD_SECS`].
