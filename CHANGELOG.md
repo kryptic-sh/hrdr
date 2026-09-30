@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **ChatGPT/Codex GPT-6 Sol and GPT-6 Luna bootstrap metadata.** Explicit
+  `chatgpt://gpt-6-sol` and `chatgpt://gpt-6-luna` selections now use the same
+  Responses Lite transport bootstrap as GPT-6 Astra until the live account
+  catalog supplies fresher per-account metadata (`crates/hrdr-agent`).
+
 ### Fixed
 
 - **Shell overflow spool files now buffer steady-state writes after the output

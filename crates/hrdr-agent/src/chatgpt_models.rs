@@ -315,11 +315,11 @@ fn builtin_fallback() -> Vec<ChatGptModel> {
 /// account catalog cache can be read or written. The caller must additionally
 /// gate this on the trusted Codex OAuth endpoint; catalog metadata wins whenever
 /// a row is present.
-pub fn builtin_protocol_metadata(slug: &str) -> Option<ChatGptModel> {
-    (slug == "gpt-6-astra").then(|| ChatGptModel {
+fn gpt_6_bootstrap_metadata(slug: &str, label: &str, context_window: Option<u32>) -> ChatGptModel {
+    ChatGptModel {
         slug: slug.to_string(),
-        label: "GPT-6 Astra".to_string(),
-        context_window: Some(272_000),
+        label: label.to_string(),
+        context_window,
         use_responses_lite: true,
         tool_mode: Some("code_mode_only".to_string()),
         multi_agent_reasoning_effort: Some("xhigh".to_string()),
@@ -331,7 +331,16 @@ pub fn builtin_protocol_metadata(slug: &str) -> Option<ChatGptModel> {
         .collect(),
         input_modalities: default_input_modalities(),
         picker_visible: false,
-    })
+    }
+}
+
+pub fn builtin_protocol_metadata(slug: &str) -> Option<ChatGptModel> {
+    match slug {
+        "gpt-6-astra" => Some(gpt_6_bootstrap_metadata(slug, "GPT-6 Astra", Some(272_000))),
+        "gpt-6-sol" => Some(gpt_6_bootstrap_metadata(slug, "GPT-6 Sol", None)),
+        "gpt-6-luna" => Some(gpt_6_bootstrap_metadata(slug, "GPT-6 Luna", None)),
+        _ => None,
+    }
 }
 
 // ── Cache I/O (path-injectable cores) ───────────────────────────────────────
@@ -761,6 +770,40 @@ mod tests {
         assert!(out[3].picker_visible);
         assert!(!out[4].picker_visible);
         assert!(!astra.input_modalities.iter().any(|value| value == "pdf"));
+    }
+
+    #[test]
+    fn builtin_protocol_metadata_bootstraps_current_gpt_6_codex_models() {
+        let slugs = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+        for slug in slugs {
+            let model = builtin_protocol_metadata(slug).expect("GPT-6 Codex metadata");
+            assert_eq!(model.slug, slug);
+            assert!(model.use_responses_lite, "{slug}");
+            assert_eq!(model.tool_mode.as_deref(), Some("code_mode_only"));
+            assert_eq!(model.multi_agent_reasoning_effort.as_deref(), Some("xhigh"));
+            assert!(
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|effort| effort == "ultra"),
+                "{slug} exposes the display-only ultra tier"
+            );
+            assert!(
+                !model.picker_visible,
+                "catalog rows decide picker visibility"
+            );
+        }
+        assert_eq!(
+            builtin_protocol_metadata("gpt-6-astra").and_then(|model| model.context_window),
+            Some(272_000),
+            "Astra's validated context window stays bootstrapped"
+        );
+        assert_eq!(
+            builtin_protocol_metadata("gpt-6-sol").and_then(|model| model.context_window),
+            None,
+            "Sol uses the account catalog when a window is needed"
+        );
+        assert!(builtin_protocol_metadata("gpt-6-terra").is_none());
     }
 
     #[test]
