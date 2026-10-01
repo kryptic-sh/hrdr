@@ -6936,6 +6936,45 @@ mod tests {
         assert_eq!(msgs[start].role, Role::User);
     }
 
+    #[test]
+    fn mega_turn_tail_start_splits_an_oversized_newest_turn() {
+        let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+        let msgs = vec![
+            ChatMessage::system("sys"),                 // 0
+            ChatMessage::user("u1"),                    // 1
+            ChatMessage::assistant("small"),            // 2
+            ChatMessage::user("u2"),                    // 3 — newest turn starts here
+            assistant_with_calls(&["a"]),               // 4
+            ChatMessage::tool_result("a", big.clone()), // 5
+            ChatMessage::assistant(big.clone()),        // 6
+            assistant_with_calls(&["b"]),               // 7
+            ChatMessage::tool_result("b", big.clone()), // 8
+            ChatMessage::assistant("final answer"),     // 9
+        ];
+        let turn_start = compaction_tail_start(&msgs, 2, 8_000, TokenTarget::Anthropic);
+        assert_eq!(turn_start, 3, "the whole newest turn is the initial tail");
+        assert!(
+            estimate_tokens_in_messages(&msgs[turn_start..], TokenTarget::Anthropic) > 8_000,
+            "precondition: newest turn exceeds the verbatim-tail budget"
+        );
+
+        let split = mega_turn_tail_start(&msgs, turn_start, 8_000, TokenTarget::Anthropic);
+        assert!(
+            split > turn_start,
+            "must split inside the newest turn, got {split}"
+        );
+        assert!(split < msgs.len(), "must still keep a suffix, got {split}");
+        assert_ne!(
+            msgs[split].role,
+            Role::Tool,
+            "tail must not start on a tool result"
+        );
+        assert!(
+            estimate_tokens_in_messages(&msgs[split..], TokenTarget::Anthropic) <= 8_000,
+            "split tail should fit the budget"
+        );
+    }
+
     /// Only a real user turn is a turn boundary. A nudge, a background task's
     /// report and a compaction summary are all `Role::User` messages the
     /// HARNESS wrote, and counting them shortens the verbatim tail to almost

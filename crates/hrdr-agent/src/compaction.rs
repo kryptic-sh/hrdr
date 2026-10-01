@@ -779,7 +779,20 @@ impl Agent {
             self.preserve_recent_tokens,
             self.client.token_target(),
         );
-        if tail_start <= 2 {
+        let target = self.client.token_target();
+        let tail_tokens = estimate_tokens_in_messages(&self.messages[tail_start..], target);
+        if tail_start < self.messages.len() && tail_tokens > self.preserve_recent_tokens {
+            // The newest turn is allowed through `compaction_tail_start` even when
+            // it alone exceeds the verbatim-tail budget. Split inside that turn
+            // rather than carrying an unbounded tail forward after compaction.
+            tail_start = mega_turn_tail_start(
+                &self.messages,
+                tail_start,
+                self.preserve_recent_tokens,
+                target,
+            );
+        }
+        if tail_start <= 1 {
             // No earlier turn boundary exists before the tail: the newest (and
             // only) turn *is* the whole history beyond the system prompt. That
             // still may be worth shrinking — a single turn balloons through many

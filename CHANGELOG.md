@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Compaction now splits oversized newest turns instead of preserving them
+  whole.** When the latest turn exceeds the verbatim-tail token budget,
+  `Agent::compact` keeps only a message-aligned suffix so compacted sessions do
+  not retain a huge tool-heavy tail (`crates/hrdr-agent`).
 - **`replace` now counts regex matches during bounded replacement.** Regex mode
   no longer scans candidate files once to count matches and again to build the
   replacement output (`crates/hrdr-tools`).

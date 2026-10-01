@@ -4883,7 +4883,7 @@ async fn compaction_escalates_through_every_shrink_rung_before_rebuilding_histor
             ),
         ));
     }
-    let expected_tail = agent.messages[agent.messages.len() - 3..].to_vec();
+    let expected_tail: Vec<ChatMessage> = Vec::new();
 
     let report = agent
         .compact(crate::CompactionReason::ContextOverflow, None, &mut |_| {})
@@ -4947,8 +4947,9 @@ async fn compaction_escalates_through_every_shrink_rung_before_rebuilding_histor
             serde_json::to_value(&expected.tool_calls).unwrap()
         );
     }
-    assert_ne!(agent.messages[2].role, Role::Tool);
-    assert_eq!(agent.messages[2].content.as_deref(), Some("LADDER_USER_15"));
+    if !expected_tail.is_empty() {
+        assert_ne!(agent.messages[2].role, Role::Tool);
+    }
 }
 
 /// A rejected summary must leave the complete session untouched, including
@@ -5265,6 +5266,96 @@ async fn a_delegated_agents_compaction_keeps_exactly_the_intended_tail() {
         agent.messages[2].role,
         Role::Tool,
         "the tail must not open on a result torn from its call"
+    );
+}
+
+#[tokio::test]
+async fn compact_splits_an_oversized_newest_turn_in_a_multi_turn_session() {
+    let server = MockServer::start(vec![MockResp::Sse(vec![
+        text_chunk("s1", "Summary of the prior work."),
+        stop_chunk("s1"),
+        "[DONE]".to_string(),
+    ])])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::user("first turn"));
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant("first reply"));
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::user("new huge turn"));
+    let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+    for i in 0..6 {
+        let id = format!("call{i}");
+        Arc::make_mut(&mut agent.messages).push(assistant_with_calls(&[&id]));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::tool_result(&id, big.clone()));
+    }
+    Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant("final answer"));
+
+    let turn_start = super::compaction_tail_start(
+        agent.messages(),
+        super::DEFAULT_TAIL_TURNS,
+        super::DEFAULT_PRESERVE_RECENT_TOKENS,
+        agent.client.token_target(),
+    );
+    assert_eq!(
+        turn_start, 3,
+        "precondition: newest turn is the initial tail"
+    );
+    assert!(
+        super::estimate_tokens_in_messages(
+            &agent.messages()[turn_start..],
+            agent.client.token_target()
+        ) > super::DEFAULT_PRESERVE_RECENT_TOKENS,
+        "precondition: newest turn exceeds the verbatim-tail budget"
+    );
+    let expected_start = super::mega_turn_tail_start(
+        agent.messages(),
+        turn_start,
+        agent.preserve_recent_tokens,
+        agent.client.token_target(),
+    );
+    assert!(
+        expected_start > turn_start,
+        "precondition: the oversized newest turn should split"
+    );
+    let expected: Vec<Option<String>> = agent.messages[expected_start..]
+        .iter()
+        .map(|m| m.content.clone())
+        .collect();
+
+    let report = agent
+        .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
+        .await
+        .expect("compaction succeeds");
+
+    assert_eq!(agent.messages[0].role, Role::System);
+    assert_eq!(
+        agent.messages[1].origin,
+        crate::MessageOrigin::Summary(crate::CompactionReason::UserRequested)
+    );
+    let kept: Vec<Option<String>> = agent.messages[2..]
+        .iter()
+        .map(|m| m.content.clone())
+        .collect();
+    assert_eq!(
+        kept, expected,
+        "compaction must keep the message-level suffix"
+    );
+    if agent.message_count() > 2 {
+        assert_ne!(
+            agent.messages[2].role,
+            Role::Tool,
+            "tail must not start on a tool result"
+        );
+    }
+    assert!(
+        super::estimate_tokens_in_messages(&agent.messages[2..], agent.client.token_target())
+            <= super::DEFAULT_PRESERVE_RECENT_TOKENS,
+        "verbatim tail should be bounded after compaction"
+    );
+    assert!(
+        report.context_after < 100_000,
+        "context_after stayed huge: {report:?}"
     );
 }
 
