@@ -164,34 +164,18 @@ impl Tool for ReplaceTool {
             let Ok(before) = tokio::fs::read_to_string(&path).await else {
                 continue; // binary or unreadable: not ours to rewrite
             };
-            let hits = re.find_iter(&before).count();
-            if hits == 0 {
-                continue;
-            }
-            if planned.len() >= MAX_FILES {
-                bail!(
-                    "more than {MAX_FILES} files match {:?} — narrow the sweep with `glob` \
-                     or `path`",
-                    a.pattern
-                );
-            }
-            // Only now is the file a mutation target, so only now must it satisfy
-            // this agent's extension allow-list.
-            //
-            // Bound output size before it can OOM: `pattern="e"`, `replace=50KB`
-            // could expand even a single sub-2 MB file into gigabytes. The two
-            // modes are bounded differently because only one admits an exact
-            // pre-projection:
-            //   * LITERAL — each hit grows the output by exactly
-            //     `replace.len() - pattern.len()`, so the projection below is
-            //     exact and can refuse before allocating anything.
-            //   * REGEX — the template's capture references (`$1`, `${name}`,
-            //     `$0`) expand to matched text of unknown size, so no pre-hoc
-            //     estimate off `replace.len()` is safe (it under-counts and would
-            //     let a `$1$1$1…` template OOM). It is bounded *incrementally*
-            //     while the output is built (`bounded_regex_replace`), aborting
-            //     the moment the real output crosses the ceiling.
-            let after = if a.literal {
+            let (after, hits) = if a.literal {
+                let hits = re.find_iter(&before).count();
+                if hits == 0 {
+                    continue;
+                }
+                if planned.len() >= MAX_FILES {
+                    bail!(
+                        "more than {MAX_FILES} files match {:?} — narrow the sweep with `glob` \
+                         or `path`",
+                        a.pattern
+                    );
+                }
                 if a.replace.len() > a.pattern.len() {
                     let projected = before
                         .len()
@@ -205,17 +189,29 @@ impl Tool for ReplaceTool {
                         );
                     }
                 }
-                before.replace(&a.pattern, &a.replace)
+                (before.replace(&a.pattern, &a.replace), hits)
             } else {
-                match bounded_regex_replace(&re, &a.replace, &before, MAX_EDIT_OUTPUT_BYTES) {
-                    Ok(after) => after,
-                    Err(len) => bail!(
-                        "replacing {:?} in {} would produce ~{len}+ bytes; narrow `pattern` or \
+                let (after, hits) =
+                    match bounded_regex_replace(&re, &a.replace, &before, MAX_EDIT_OUTPUT_BYTES) {
+                        Ok(replaced) => replaced,
+                        Err(len) => bail!(
+                            "replacing {:?} in {} would produce ~{len}+ bytes; narrow `pattern` or \
                          the sweep",
-                        a.pattern,
-                        super::rel_display(&path, &ctx.cwd)
-                    ),
+                            a.pattern,
+                            super::rel_display(&path, &ctx.cwd)
+                        ),
+                    };
+                if hits == 0 {
+                    continue;
                 }
+                if planned.len() >= MAX_FILES {
+                    bail!(
+                        "more than {MAX_FILES} files match {:?} — narrow the sweep with `glob` \
+                         or `path`",
+                        a.pattern
+                    );
+                }
+                (after, hits)
             };
             if after == before {
                 continue;
@@ -381,7 +377,8 @@ fn collect_files(
 /// [`regex::Captures::expand`] — the very `$`-expansion `replace_all` uses. The
 /// only added behaviour is the ceiling: this returns `Err(len)` (a lower bound
 /// on the true output) instead of finishing the allocation once the output
-/// would pass `cap`.
+/// would pass `cap`. On success, the returned count is collected while building
+/// the replacement, so callers do not need a separate match-counting pass.
 ///
 /// The ceiling is checked BEFORE each `expand`, against a per-match upper bound —
 /// the gap plus the template length plus (number of `$` references × this
@@ -396,14 +393,16 @@ fn bounded_regex_replace(
     template: &str,
     input: &str,
     cap: usize,
-) -> std::result::Result<String, usize> {
+) -> std::result::Result<(String, usize), usize> {
     // Conservative count of expansion sites: every `$` could begin a capture
     // reference. `$$` (a literal `$`) is counted too — that only over-estimates,
     // which is safe (it can never let an over-cap expansion through).
     let refs = template.matches('$').count();
     let mut out = String::new();
     let mut last_end = 0;
+    let mut matches = 0;
     for caps in re.captures_iter(input) {
+        matches += 1;
         let m = caps.get(0).expect("group 0 always participates in a match");
         let gap = m.start() - last_end;
         let match_len = m.end() - m.start();
@@ -421,7 +420,7 @@ fn bounded_regex_replace(
         last_end = m.end();
     }
     out.push_str(&input[last_end..]);
-    Ok(out)
+    Ok((out, matches))
 }
 
 #[cfg(test)]
@@ -1010,7 +1009,9 @@ mod tests {
         // and expand to nothing — the exact gotcha `replace_all` also has.
         let template = "${1}_x";
         let expected = re.replace_all(input, template).into_owned();
-        let got = bounded_regex_replace(&re, template, input, MAX_EDIT_OUTPUT_BYTES).unwrap();
+        let (got, matches) =
+            bounded_regex_replace(&re, template, input, MAX_EDIT_OUTPUT_BYTES).unwrap();
+        assert_eq!(matches, 7);
         assert_eq!(got, expected);
         assert_eq!(
             got,
@@ -1018,8 +1019,11 @@ mod tests {
         );
 
         let none = "!!! ??? ...";
+        let (none_replaced, none_matches) =
+            bounded_regex_replace(&re, template, none, MAX_EDIT_OUTPUT_BYTES).unwrap();
+        assert_eq!(none_matches, 0);
         assert_eq!(
-            bounded_regex_replace(&re, template, none, MAX_EDIT_OUTPUT_BYTES).unwrap(),
+            none_replaced,
             re.replace_all(none, template).into_owned(),
             "a no-match input is returned unchanged, like replace_all"
         );

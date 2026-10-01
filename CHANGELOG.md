@@ -18,6 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`replace` now counts regex matches during bounded replacement.** Regex mode
+  no longer scans candidate files once to count matches and again to build the
+  replacement output (`crates/hrdr-tools`).
 - **`ToolRegistry::execute` avoids cloning tool args for output-source labels.**
   Jailed tool output still derives its provenance from the original args without
   cloning the JSON value (`crates/hrdr-tools`).

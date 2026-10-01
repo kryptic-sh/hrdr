@@ -3339,20 +3339,16 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
     (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
     and stop once `matches > max_matches`.
-12. **LOW-MEDIUM — every `replace` candidate file is regex-matched twice.**
-    `replace.rs`: `find_iter().count()` for the count, then a second pass builds
-    the replacement, then `after == before` compares. Fix: have the bounded
-    regex replace return the match count — one pass.
-13. **LOW — recall lowercases name/description/body once per token, per turn.**
+12. **LOW — recall lowercases name/description/body once per token, per turn.**
     `hrdr-tools/src/memory.rs` `recall_score` → `relevance_score` per query
     token: ~100–300 lowercased copies of content per turn (both scopes). Fix:
     lowercase the three fields once per memory outside the token loop.
-14. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
+13. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
     `WindowScanner`: each page re-counts newlines from the start — O(N) per
     page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
     `ReadRecord` carry the last-scanned byte offset and resume there (coverage
     already guarantees contiguous-from-line-1 paging).
-15. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
+14. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
     hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
@@ -3361,7 +3357,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     (Prior `## Performance review — second pass 2026-08-04` #2 made the same
     measurement and dropped it as infeasible for the `Record::from_event` half —
     this adds the still-available `deque double-push` half.)
-16. **LOW — no-usage fallback re-estimates the whole history every round.**
+15. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
