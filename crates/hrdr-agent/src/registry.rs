@@ -195,6 +195,8 @@ pub struct AgentEntry {
     /// This agent's TODO list — the live one its `todo` tool writes. Every agent has
     /// its own; a frontend showing this agent shows *its* list.
     pub todos: Arc<Mutex<Vec<hrdr_tools::TodoItem>>>,
+    /// This agent's goal list — the live one its `goal` tool writes.
+    pub goals: Arc<Mutex<Vec<hrdr_tools::GoalItem>>>,
     /// Its own token/cost counters, folded from every call it makes — by
     /// [`AgentRegistry::send_prompt`] for a turn the user drove, and by the `task`
     /// tool for the delegated run. A frontend showing this agent reads its usage
@@ -359,6 +361,7 @@ impl AgentRegistry {
                 compaction_reserved: 0,
                 sandbox,
                 todos: Default::default(),
+                goals: Default::default(),
                 usage,
                 events: event_log(),
                 reasoning_open: false,
@@ -1017,6 +1020,7 @@ mod tests {
             compaction_reserved: 0,
             sandbox: hrdr_tools::SandboxMode::None,
             todos: Default::default(),
+            goals: Default::default(),
             usage: crate::AgentUsage::default(),
             events: event_log(),
             reasoning_open: false,

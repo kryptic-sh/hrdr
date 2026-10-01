@@ -1237,9 +1237,15 @@ fn todo_row(t: &hrdr_tools::TodoItem, mark: &str) -> String {
     format!("{mark} #{} {}", t.id, t.content)
 }
 
-/// The TODO panel's rows — one per task still to do, marked by status — and the
-/// index of the "finished" row, when there is one. `None` when the panel has
-/// nothing to show at all.
+/// One goal panel row. The `goal#N` prefix keeps goal references distinct from
+/// TODO `#N` rows while keeping both lists in the same panel.
+fn goal_row(g: &hrdr_agent::Goal) -> String {
+    format!("○ goal#{} {}", g.id, g.content)
+}
+
+/// The TODO panel's rows — pending goals first, then one row per task still to
+/// do, marked by status — and the index of the "finished" row, when there is
+/// one. `None` when the panel has nothing to show at all.
 ///
 /// Finished tasks (completed, cancelled) are folded away behind that last row:
 /// the panel is about what is left, and a list that keeps everything ever done
@@ -1249,6 +1255,18 @@ fn todo_row(t: &hrdr_tools::TodoItem, mark: &str) -> String {
 /// The list belongs to the agent on screen — every agent has its own, and the
 /// `todo` tool a sub-agent calls writes to *its* list, not the main one's.
 fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
+    let goals: Vec<hrdr_agent::Goal> = app
+        .panes
+        .active_pane()
+        .goals
+        .lock()
+        .map(|g| {
+            g.iter()
+                .filter(|goal| goal.status != "cancelled")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let mut todos = app
         .panes
         .active_pane()
@@ -1256,7 +1274,7 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
-    if todos.is_empty() {
+    if goals.is_empty() && todos.is_empty() {
         return None;
     }
     // The one being worked on (in_progress) at the top, then the not-yet-started
@@ -1273,22 +1291,30 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
 
     let bg = app.theme.user_bg;
     let frame = spinner_frame(app.header_anchor.elapsed());
-    let mut lines: Vec<Line<'static>> = todos
+    let mut lines: Vec<Line<'static>> = goals
         .iter()
         .take(TODO_PANEL_MAX_ITEMS as usize)
-        .map(|t| {
-            let (mark, color) = match t.status.as_str() {
-                "completed" => ("✓", app.theme.success),
-                "cancelled" => ("✗", app.theme.dim),
-                "in_progress" => (frame, app.theme.warn),
-                _ => (" ", app.theme.dim),
-            };
+        .map(|g| {
             Line::from(Span::styled(
-                todo_row(t, mark),
-                Style::default().fg(color).bg(bg),
+                goal_row(g),
+                Style::default().fg(app.theme.accent).bg(bg),
             ))
         })
         .collect();
+
+    let remaining = (TODO_PANEL_MAX_ITEMS as usize).saturating_sub(lines.len());
+    lines.extend(todos.iter().take(remaining).map(|t| {
+        let (mark, color) = match t.status.as_str() {
+            "completed" => ("✓", app.theme.success),
+            "cancelled" => ("✗", app.theme.dim),
+            "in_progress" => (frame, app.theme.warn),
+            _ => (" ", app.theme.dim),
+        };
+        Line::from(Span::styled(
+            todo_row(t, mark),
+            Style::default().fg(color).bg(bg),
+        ))
+    }));
 
     // The finished ones are still in the list (they age out after `todo_ttl`),
     // so the panel offers them rather than pretending they never happened.
@@ -1312,7 +1338,7 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
 
 #[cfg(test)]
 mod todo_panel_tests {
-    use super::todo_row;
+    use super::{goal_row, todo_row};
 
     /// The panel row leads with the status mark — the spinner sits before the
     /// `#N` reference, which is the same shape the `todo` tool's render shows,
@@ -1336,6 +1362,16 @@ mod todo_panel_tests {
             evidence: None,
         };
         assert_eq!(todo_row(&t, "✓"), "✓ #0 legacy");
+    }
+
+    #[test]
+    fn a_goal_row_leads_with_goal_reference() {
+        let g = hrdr_agent::Goal {
+            content: "keep releases green".to_string(),
+            id: 3,
+            status: "pending".to_string(),
+        };
+        assert_eq!(goal_row(&g), "○ goal#3 keep releases green");
     }
 }
 

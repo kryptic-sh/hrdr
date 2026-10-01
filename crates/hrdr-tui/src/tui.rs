@@ -10,6 +10,7 @@ use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use futures_util::StreamExt;
 
 use crate::app::{Action, App, draft_from_editor, run_editor};
@@ -40,6 +41,53 @@ fn sync_cursor<W: std::io::Write>(
     Ok(())
 }
 
+fn terminal_title(session_name: &str) -> String {
+    let name: String = session_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        "hrdr".to_string()
+    } else {
+        format!("hrdr - {name}")
+    }
+}
+
+fn sync_title<W: std::io::Write>(
+    out: &mut W,
+    title: String,
+    last: &mut Option<String>,
+) -> Result<()> {
+    if last.as_deref() == Some(title.as_str()) {
+        return Ok(());
+    }
+    execute!(out, SetTitle(title.clone()))?;
+    *last = Some(title);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_title;
+
+    #[test]
+    fn terminal_title_uses_session_name() {
+        assert_eq!(terminal_title("release work"), "hrdr - release work");
+        assert_eq!(terminal_title("  release work  "), "hrdr - release work");
+    }
+
+    #[test]
+    fn terminal_title_drops_control_sequences() {
+        assert_eq!(
+            terminal_title("ship\u{1b}]0;spoof\u{7}"),
+            "hrdr - ship]0;spoof"
+        );
+        assert_eq!(terminal_title("\n\t"), "hrdr");
+    }
+}
+
 /// Drive `app` against the terminal until it quits: draw, then await terminal
 /// input, agent messages, config-file changes, or a spinner tick.
 pub(crate) async fn run_loop(
@@ -65,6 +113,7 @@ pub(crate) async fn run_loop(
     // The editor's insert state drives the cursor shape (see `sync_cursor`).
     // `None` forces the first frame to emit it.
     let mut cursor_insert: Option<bool> = None;
+    let mut terminal_title_sent: Option<String> = None;
 
     // A command handed to hrdr on the command line (`hrdr /new`, `hrdr /model`,
     // `hrdr '!git status'`) runs here — after the session is up and any auto-resume
@@ -95,8 +144,14 @@ pub(crate) async fn run_loop(
         if app.take_terminal_lost() {
             resume_terminal(terminal)?;
             terminal.clear()?;
+            terminal_title_sent = None;
         }
         terminal.draw(|f| ui::draw(f, app))?;
+        sync_title(
+            terminal.backend_mut(),
+            terminal_title(&app.state().name),
+            &mut terminal_title_sent,
+        )?;
         sync_cursor(
             terminal.backend_mut(),
             app.editor.is_insert(),
@@ -131,10 +186,12 @@ pub(crate) async fn run_loop(
                     Action::OpenEditor => {
                         open_in_editor(app, terminal)?;
                         cursor_insert = None;
+                        terminal_title_sent = None;
                     }
                     Action::OpenFile(path) => {
                         open_file_in_editor(app, terminal, &path)?;
                         cursor_insert = None;
+                        terminal_title_sent = None;
                     }
                     Action::Redraw => terminal.clear()?,
                     Action::None => {}

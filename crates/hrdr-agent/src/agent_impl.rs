@@ -580,6 +580,7 @@ impl Agent {
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
             todo_ttl: config.todo_ttl,
+            suppress_goal_nudge_once: false,
             compaction_tail_turns: config.compaction_tail_turns,
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_instructions,
@@ -743,6 +744,7 @@ impl Agent {
         // A cleared conversation is a NEW conversation: it must not keep the
         // previous one's OpenCode session id, or the gateway would group two
         // unrelated conversations together.
+        self.suppress_goal_nudge_once = false;
         self.session_id = new_prompt_cache_key();
         self.client.set_session_id(Some(self.session_id.clone()));
     }
@@ -948,10 +950,14 @@ impl Agent {
     /// while the agent went on talking to the endpoint it launched with, and the bar
     /// would confidently name a provider the request never went to.
     pub fn attach_live(&mut self, live: AgentRegistry, key: u64) {
-        // The agent's own TODO list, so a frontend showing this agent shows *its*
-        // list rather than the main agent's.
+        // The agent's own TODO and goal lists, so a frontend showing this agent
+        // shows *its* state rather than the main agent's.
         let todos = Arc::clone(&self.ctx.todos);
-        live.update(key, |e| e.todos = todos);
+        let goals = Arc::clone(&self.ctx.goals);
+        live.update(key, |e| {
+            e.todos = todos;
+            e.goals = goals;
+        });
         self.live_home = Some((live, key));
         self.publish_delegation_runtime();
     }
@@ -1272,6 +1278,14 @@ impl Agent {
     /// way, so the next model call sees what the user ran.
     pub fn push_user_note(&mut self, text: impl Into<String>) {
         Arc::make_mut(&mut self.messages).push(ChatMessage::user(text));
+    }
+
+    /// Append a hidden setup note and let exactly its next run finish without the
+    /// pending-goal backstop. Used by `/goal`: the turn's purpose is to record a
+    /// standing goal, so nudging it to resolve that goal would be backwards.
+    pub fn push_user_note_without_goal_nudge(&mut self, text: impl Into<String>) {
+        self.push_user_note(text);
+        self.suppress_goal_nudge_once = true;
     }
 
     /// Status of the post-edit LSP layer for `/doctor`:

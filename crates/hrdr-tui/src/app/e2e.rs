@@ -679,6 +679,69 @@ async fn tool_call_runs_the_tool_then_finishes() {
 }
 
 #[tokio::test]
+async fn slash_goal_sends_a_hidden_goal_request_to_the_model() {
+    let mut h = Harness::new(vec![
+        MockReply::ToolCall {
+            name: "goal".to_string(),
+            args: r#"{"op":"add","content":"keep releases green"}"#.to_string(),
+        },
+        MockReply::Text("Goal set: keep releases green.".to_string()),
+    ])
+    .await;
+
+    h.submit("/goal keep releases green").await;
+
+    let goals = h.app.goals.lock().unwrap().clone();
+    assert_eq!(goals.len(), 1, "goal tool should have run: {goals:?}");
+    assert_eq!(goals[0].content, "keep releases green");
+    assert_eq!(goals[0].status, "pending");
+    assert_eq!(
+        h._mock.request_count(),
+        2,
+        "the setup turn should call the model once for the tool call and once for the final reply, with no goal nudge round"
+    );
+    let kinds: Vec<&EntryKind> = h.app.transcript().iter().map(|e| &e.kind).collect();
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, EntryKind::User(t) if t.contains("/goal"))),
+        "the slash command should not be recorded as a literal user message: {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn goal_rows_render_above_todo_rows_in_the_todo_panel() {
+    let mut h = Harness::new(vec![
+        MockReply::ToolCalls(vec![
+            (
+                "goal".to_string(),
+                r#"{"op":"add","content":"keep releases green"}"#.to_string(),
+            ),
+            (
+                "todo".to_string(),
+                r#"{"todos":[{"content":"write more tests","status":"in_progress"}]}"#.to_string(),
+            ),
+        ]),
+        MockReply::Text("Tracked.".to_string()),
+    ])
+    .await;
+
+    h.submit("track work").await;
+
+    let screen = h.render();
+    let goal_at = screen
+        .find("goal#1 keep releases green")
+        .unwrap_or_else(|| panic!("goal row missing:\n{screen}"));
+    let todo_at = screen
+        .find("write more tests")
+        .unwrap_or_else(|| panic!("todo row missing:\n{screen}"));
+    assert!(
+        goal_at < todo_at,
+        "goal row must render above todo row:\n{screen}"
+    );
+}
+
+#[tokio::test]
 async fn parallel_tool_calls_in_one_turn_all_run() {
     // One turn requests two tools; the follow-up request ends with text.
     let mut h = Harness::new(vec![
@@ -5912,6 +5975,7 @@ async fn main_scrollback_pruning_preserves_an_open_subagent_thought() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -6300,6 +6364,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -6372,6 +6437,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -6472,6 +6538,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -6606,6 +6673,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         // A small local window, most of it already used — nothing like the
         // parent's.
         usage: hrdr_agent::AgentUsage {
@@ -7499,6 +7567,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -10467,6 +10536,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: sub_todos.clone(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -10545,6 +10615,7 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: sub_todos.clone(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -10985,6 +11056,7 @@ async fn resumed_session_panels_are_not_cut_off_with_a_finished_subagent() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: Default::default(),
+        goals: Default::default(),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -11172,6 +11244,7 @@ async fn an_image_typed_into_a_sub_agent_pane_goes_to_that_sub_agent() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,
@@ -11257,6 +11330,7 @@ async fn a_finished_sub_agent_is_not_steered_and_the_draft_comes_back() {
         compaction_reserved: 0,
         sandbox: hrdr_tools::SandboxMode::None,
         todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        goals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         reasoning_open: false,

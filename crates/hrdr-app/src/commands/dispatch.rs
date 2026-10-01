@@ -346,6 +346,18 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             host.info("/init — exploring the project to write AGENTS.md…".to_string());
             host.send_prompt(INIT_PROMPT.to_string(), false);
         }
+        "goal" => {
+            if arg.is_empty() {
+                host.info("usage: /goal <goal description>".to_string());
+                return true;
+            }
+            if host.is_busy() {
+                host.info(busy_guard("/goal"));
+                return true;
+            }
+            host.info("/goal — asking the model to set a tracked goal…".to_string());
+            host.send_goal_prompt(goal_prompt(&arg));
+        }
         "todo-ttl" | "todottl" | "todos" => {
             if arg.is_empty() {
                 let ttl = host.todo_ttl();
@@ -633,6 +645,18 @@ Do this:
 Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
 When finished, give a one-line summary of what you wrote.";
 
+/// Instruction sent to the model by `/goal <description>`.
+fn goal_prompt(description: &str) -> String {
+    format!(
+        "The user wants to add a durable long-horizon goal from this description:\n\n\
+         ```text\n{description}\n```\n\n\
+         Turn it into one concise, actionable goal in your own words, then call the \
+         `goal` tool with `op: add` and that goal as `content`. Do not do other \
+         project work for this command. After the tool call succeeds, reply with one \
+         terse line naming the goal you set."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +682,8 @@ mod tests {
         busy: bool,
         model: hrdr_agent::ModelRef,
         input: String,
+        /// What prompts command dispatch asked the frontend to run, with visibility.
+        prompts: Vec<(String, bool)>,
         /// `/compact` runs started (idle dispatch), in order.
         started_compactions: Vec<Option<String>>,
         /// `/compact` requests queued (busy dispatch), in order.
@@ -688,6 +714,7 @@ mod tests {
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
+                prompts: Vec::new(),
                 started_compactions: Vec::new(),
                 queued_compactions: Vec::new(),
                 cache: None,
@@ -741,7 +768,9 @@ mod tests {
         fn is_busy(&self) -> bool {
             self.busy
         }
-        fn send_prompt(&mut self, _prompt: String, _show_as_user: bool) {}
+        fn send_prompt(&mut self, prompt: String, show_as_user: bool) {
+            self.prompts.push((prompt, show_as_user));
+        }
         fn set_input(&mut self, text: String) {
             self.input = text;
         }
@@ -763,6 +792,57 @@ mod tests {
         fn queue_compaction(&mut self, instructions: Option<String>) {
             self.queued_compactions.push(instructions);
         }
+    }
+
+    /// `/goal` starts a hidden model turn: the model, not the slash parser,
+    /// normalizes the user's words and writes the goal through the `goal` tool.
+    #[tokio::test]
+    async fn goal_command_asks_the_model_to_create_the_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/goal keep releases green"));
+
+        assert_eq!(host.prompts.len(), 1);
+        let (prompt, show_as_user) = &host.prompts[0];
+        assert!(
+            !show_as_user,
+            "the synthetic instruction stays out of transcript"
+        );
+        assert!(prompt.contains("keep releases green"), "{prompt}");
+        assert!(prompt.contains("`goal` tool"), "{prompt}");
+        assert!(prompt.contains("`op: add`"), "{prompt}");
+        assert!(prompt.contains("Do not do other project work"), "{prompt}");
+    }
+
+    /// Empty or busy `/goal` commands must not create a prompt that could be
+    /// misread as ordinary project work.
+    #[tokio::test]
+    async fn goal_command_requires_text_and_an_idle_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/goal"));
+        assert!(host.prompts.is_empty());
+        assert!(
+            host.info_log
+                .last()
+                .is_some_and(|l| l.contains("usage: /goal <goal description>")),
+            "{:?}",
+            host.info_log
+        );
+
+        host.info_log.clear();
+        host.busy = true;
+        assert!(dispatch(&mut host, "/goal keep releases green"));
+        assert!(host.prompts.is_empty());
+        assert!(
+            host.info_log
+                .last()
+                .is_some_and(|l| l.contains("can't /goal while a turn is running")),
+            "{:?}",
+            host.info_log
+        );
     }
 
     /// `/model` always opens the picker — an argument no longer switches

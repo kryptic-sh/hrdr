@@ -3011,21 +3011,38 @@ impl App {
     /// path is deliberately not used: it emits `Steered`, which the frontend would
     /// fold into a visible user entry.
     fn launch_hidden(&mut self, prompt: String) {
+        self.push_hidden_note(prompt, false);
+        self.launch_turn();
+    }
+
+    fn launch_hidden_without_goal_nudge(&mut self, prompt: String) {
+        self.push_hidden_note(prompt, true);
+        self.launch_turn();
+    }
+
+    fn push_hidden_note(&mut self, prompt: String, suppress_goal_nudge: bool) {
         // The command guard ensured no turn is running, so the lock is free; push
         // the note synchronously so it precedes the request the opener-less turn
         // issues. On the off chance the lock is momentarily held, fall back to a
         // task — it still lands before `run`'s first request, which waits on the
         // same lock.
+        let push = move |a: &mut hrdr_agent::Agent, prompt| {
+            if suppress_goal_nudge {
+                a.push_user_note_without_goal_nudge(prompt);
+            } else {
+                a.push_user_note(prompt);
+            }
+        };
         match self.agent.try_lock() {
-            Ok(mut a) => a.push_user_note(prompt),
+            Ok(mut a) => push(&mut a, prompt),
             Err(_) => {
                 let agent = self.agent.clone();
                 tokio::spawn(async move {
-                    agent.lock().await.push_user_note(prompt);
+                    let mut agent = agent.lock().await;
+                    push(&mut agent, prompt);
                 });
             }
         }
-        self.launch_turn();
     }
 
     /// Connect the configured MCP servers (once, at startup), showing a status
@@ -3617,6 +3634,7 @@ mod tests {
             compaction_reserved: 0,
             sandbox: hrdr_tools::SandboxMode::None,
             todos: Default::default(),
+            goals: Default::default(),
             usage: Default::default(),
             events: hrdr_agent::event_log(),
             reasoning_open: false,

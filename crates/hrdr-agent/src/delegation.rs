@@ -465,6 +465,7 @@ async fn spawn_background(
             .map(|s| s.sandbox_policy().mode)
             .unwrap_or(hrdr_tools::SandboxMode::None),
         todos: Default::default(),
+        goals: Default::default(),
         usage: usage_for_live,
         events: registry::event_log(),
         reasoning_open: false,
@@ -2986,6 +2987,7 @@ mod attachment_tests {
             compaction_reserved: 0,
             sandbox: hrdr_tools::SandboxMode::None,
             todos: Default::default(),
+            goals: Default::default(),
             usage: crate::AgentUsage::default(),
             events: registry::event_log(),
             reasoning_open: false,

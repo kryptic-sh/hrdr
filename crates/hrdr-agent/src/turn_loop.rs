@@ -546,6 +546,7 @@ impl Agent {
         // At most one turn-end nudge (see below) per turn — a genuinely blocked
         // or deferring model must still be able to stop.
         let mut nudged_this_turn = false;
+        let suppress_goal_nudge = std::mem::take(&mut self.suppress_goal_nudge_once);
         // One soft checkpoint warning per turn at 80% of the round budget.
         let mut checkpoint_warned = false;
         // Armed by the turn-end nudge: the unfinished items it named, plus the
@@ -711,7 +712,7 @@ impl Agent {
                 // turn with goals still pending either keeps working toward them
                 // or cancels each one explicitly (achieved or abandoned — the
                 // goal tool's cancel is the only way out of the nudge).
-                if !nudged_this_turn && self.bg_handle_count() == 0 {
+                if !suppress_goal_nudge && !nudged_this_turn && self.bg_handle_count() == 0 {
                     let pending: Vec<GoalItem> = self
                         .ctx
                         .goals

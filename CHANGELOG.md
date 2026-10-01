@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/goal <description>` captures user-requested long-horizon goals.** The
+  slash command sends the description through the model so it can normalize the
+  text and call the existing `goal` tool, and the TUI now renders pending goals
+  above TODO rows in the existing TODO panel (`hrdr-app`, `hrdr-tui`).
+- **The TUI sets the terminal title from the session name.** Interactive
+  sessions now emit a cross-platform terminal title in the form
+  `hrdr - {session_name}` as the session is named or renamed (`hrdr-tui`).
+
 ## [0.16.1] - 2026-10-01
 
 ### Added

@@ -368,6 +368,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             self.app.launch_hidden(prompt);
         }
     }
+    fn send_goal_prompt(&mut self, prompt: String) {
+        self.app.scroll_offset = 0;
+        self.app.launch_hidden_without_goal_nudge(prompt);
+    }
     fn set_input(&mut self, text: String) {
         self.app.editor.set_content(&text);
     }

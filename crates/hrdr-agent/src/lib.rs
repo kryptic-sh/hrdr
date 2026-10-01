@@ -968,6 +968,10 @@ pub struct Agent {
     todo_turn: u64,
     todo_completed_at: HashMap<String, u64>,
     todo_ttl: u64,
+    /// Headless setup turns (currently `/goal`) can set this before launching a
+    /// hidden run so the goal they create is recorded, not immediately treated as
+    /// unfinished work by the turn-end backstop.
+    suppress_goal_nudge_once: bool,
     /// The prompt-token reading at which a proactive compaction last failed, so
     /// a summariser that fails for a non-transient reason (a 401, a model that
     /// refuses the request) is not retried on every subsequent round.
@@ -5892,6 +5896,7 @@ mod tests {
                     compaction_reserved: 0,
                     sandbox: hrdr_tools::SandboxMode::None,
                     todos: Default::default(),
+                    goals: Default::default(),
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
                     reasoning_open: false,
@@ -6010,6 +6015,7 @@ mod tests {
                     compaction_reserved: 0,
                     sandbox: hrdr_tools::SandboxMode::None,
                     todos: Default::default(),
+                    goals: Default::default(),
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
                     reasoning_open: false,

@@ -109,6 +109,8 @@ pub struct Pane {
     pub sandbox: hrdr_tools::SandboxMode,
     /// This agent's live TODO list — the one its own `todo` tool writes.
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
+    /// This agent's live goal list — the one its own `goal` tool writes.
+    pub goals: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::GoalItem>>>,
     /// The `task` call that spawned this agent, when there was one — what
     /// [`apply_replayed`] matches a finished `task` block against. Set at
     /// registration, never changes (see [`crate::AgentEntry::tool_id`]).
@@ -289,6 +291,7 @@ impl Default for PaneSet {
                 compaction_reserved: 0,
                 sandbox: hrdr_tools::SandboxMode::None,
                 todos: Default::default(),
+                goals: Default::default(),
                 tool_id: None,
                 delegation: None,
                 consumed: 0,
@@ -452,6 +455,7 @@ impl PaneSet {
                         compaction_reserved: 0,
                         sandbox: s.sandbox,
                         todos: Default::default(),
+                        goals: Default::default(),
                         tool_id: None,
                         delegation: None,
                         consumed: 0,
@@ -471,6 +475,7 @@ impl PaneSet {
             pane.compaction_reserved = s.compaction_reserved;
             pane.sandbox = s.sandbox;
             pane.todos = s.todos;
+            pane.goals = s.goals;
             // The registry still carries the agent's identity as two values; it is
             // paired back up here, at the edge, exactly as the session file's is.
             pane.state.model = crate::ModelRef::new(
@@ -536,6 +541,7 @@ struct LiveSnapshot {
     compaction_reserved: u32,
     sandbox: hrdr_tools::SandboxMode,
     todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
+    goals: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::GoalItem>>>,
     usage: crate::SessionUsage,
     turn: crate::TurnStats,
     running: bool,
@@ -582,6 +588,7 @@ impl From<&AgentEntry> for LiveSnapshot {
             compaction_reserved: e.compaction_reserved,
             sandbox: e.sandbox,
             todos: std::sync::Arc::clone(&e.todos),
+            goals: std::sync::Arc::clone(&e.goals),
             usage: e.usage,
             turn: e.turn,
             running: e.running,
@@ -637,6 +644,8 @@ fn pane_holds(entry: &AgentEntry, pane: &Pane) -> bool {
         && pane.sandbox == entry.sandbox
         // Same Arc means an in-place `todo` mutation is visible without a rebuild.
         && std::sync::Arc::ptr_eq(&pane.todos, &entry.todos)
+        // Same for goals: each displayed agent owns its own goal list.
+        && std::sync::Arc::ptr_eq(&pane.goals, &entry.goals)
         && pane.state.usage == entry.usage
         && pane.state.model.provider().as_str() == entry.provider.as_deref().unwrap_or("local")
         && pane.state.model.model() == entry.model
@@ -744,6 +753,40 @@ mod tests {
         // And the main agent's own counters are untouched by any of it.
         assert_eq!(panes.main().state.usage.tokens_in, 0);
         assert_eq!(panes.main().model(), "opus");
+    }
+
+    #[test]
+    fn active_pane_carries_its_own_goal_list() {
+        let live = live_with(&[crate::MAIN_KEY, 1]);
+        live.update(crate::MAIN_KEY, |e| {
+            e.goals.lock().unwrap().push(hrdr_tools::GoalItem {
+                id: 1,
+                content: "main goal".to_string(),
+                status: "pending".to_string(),
+            });
+        });
+        live.update(1, |e| {
+            e.goals.lock().unwrap().push(hrdr_tools::GoalItem {
+                id: 2,
+                content: "sub-agent goal".to_string(),
+                status: "pending".to_string(),
+            });
+        });
+
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        assert_eq!(
+            panes.main().goals.lock().unwrap()[0].content,
+            "main goal",
+            "main pane keeps the main agent's goals"
+        );
+
+        panes.focus(PaneId(1));
+        assert_eq!(
+            panes.active_pane().goals.lock().unwrap()[0].content,
+            "sub-agent goal",
+            "sub-agent pane must not render the main agent's goals"
+        );
     }
 
     /// A fresh session has only the main agent, and a one-row list of the thing
@@ -1115,6 +1158,7 @@ mod tests {
             compaction_reserved: 0,
             sandbox: hrdr_tools::SandboxMode::Write,
             todos: Default::default(),
+            goals: Default::default(),
             usage: crate::AgentUsage::default(),
             events: crate::event_log(),
             reasoning_open: false,
@@ -1168,6 +1212,7 @@ mod tests {
                 compaction_reserved: 0,
                 sandbox: hrdr_tools::SandboxMode::None,
                 todos: Default::default(),
+                goals: Default::default(),
                 usage: crate::AgentUsage::default(),
                 events: crate::event_log(),
                 reasoning_open: false,

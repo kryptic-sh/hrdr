@@ -78,6 +78,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "expand every tool's output (on|off; bare toggles)",
     ),
     ("/init", "analyze the project and write an AGENTS.md"),
+    ("/goal", "turn a request into a tracked goal"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
     ("/todo-ttl", "turns a finished todo stays shown"),
     ("/reload", "reload AGENTS.md + config"),
@@ -119,7 +120,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Files & context",
-        &["/init", "/cwd", "/tools", "/verbose", "/paste"],
+        &["/init", "/goal", "/cwd", "/tools", "/verbose", "/paste"],
     ),
     ("Reply", &["/export", "/cost"]),
     ("Appearance", &["/theme", "/statusbar", "/todo-ttl"]),

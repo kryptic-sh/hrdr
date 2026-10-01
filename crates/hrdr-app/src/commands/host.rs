@@ -131,6 +131,11 @@ pub trait CommandHost {
     /// Launch a model turn with `prompt`. `show_as_user` displays it as a user
     /// message; `false` keeps it out of the transcript (`/init`).
     fn send_prompt(&mut self, prompt: String, show_as_user: bool);
+    /// Launch the hidden setup turn for `/goal`. Frontends with an agent loop can
+    /// suppress the pending-goal turn-end backstop for this one run.
+    fn send_goal_prompt(&mut self, prompt: String) {
+        self.send_prompt(prompt, false);
+    }
     /// Replace the input buffer.
     fn set_input(&mut self, text: String);
     /// Prepend text to the input buffer (`/add` attaches a file block).
