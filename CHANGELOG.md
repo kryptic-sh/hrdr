@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sessions now emit a cross-platform terminal title in the form
   `hrdr - {session_name}` as the session is named or renamed (`hrdr-tui`).
 
+### Changed
+
+- **`ToolRegistry::execute` avoids cloning tool args for output-source labels.**
+  Jailed tool output still derives its provenance from the original args without
+  cloning the JSON value (`crates/hrdr-tools`).
+
 ## [0.16.1] - 2026-10-01
 
 ### Added

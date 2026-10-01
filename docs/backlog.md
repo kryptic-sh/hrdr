@@ -3366,9 +3366,6 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
     re-proposed.
-17. **LOW — trivial dispatch clone.** `hrdr-tools/src/lib.rs` tool dispatch
-    clones the args JSON per call just to render the output-source label; pass a
-    borrow.
 
 **Checked, not findings:** prompt build runs once per session and on
 `/clear`/compaction — no per-turn rebuild; transcript jsonl is coalesced (512 B

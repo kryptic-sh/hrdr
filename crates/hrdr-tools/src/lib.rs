@@ -1925,10 +1925,11 @@ impl ToolRegistry {
         // Every result that carries content the model did not author passes through
         // one envelope, here, because here is the only place every tool goes. See
         // `SandboxPolicy::wrap_tool_results`.
-        let args_for_source = args.clone();
+        let source = (ctx.sandbox.wrap_tool_results && !tool.wraps_own_output())
+            .then(|| tool.output_source(&args));
         let wrap = |out: String| -> String {
-            if ctx.sandbox.wrap_tool_results && !tool.wraps_own_output() {
-                wrap_untrusted(&tool.output_source(&args_for_source), &out)
+            if let Some(source) = source.as_ref() {
+                wrap_untrusted(source, &out)
             } else {
                 out
             }
