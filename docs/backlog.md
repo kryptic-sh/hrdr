@@ -36,17 +36,37 @@ push each verified slice to `main` before proceeding to the next slice.
    Discovery exposes session ID, session name, and session working directory.
    Incoming messages clearly identify the sending agent, wake an idle agent, and
    queue for a busy agent like user messages. Preserve sender provenance rather
-   than presenting peer text as a human instruction. The transport, same-user
-   access controls, session lifecycle, and cross-process test design still need
-   implementation planning. Verify delivery, discovery, disabling, busy/idle
-   behavior, and sender attribution before declaring this complete. Support
-   Windows, macOS, and Linux with equivalent discovery and delivery behavior.
-   Run native cross-process messaging and access-control tests on each supported
-   platform through the CI matrix. Local native Windows and Linux (WSL) runs
-   provide faster feedback, not replacements for any CI matrix job. macOS
-   runtime verification relies on CI. A Windows-only pass or cross-compilation
-   alone does not establish macOS/Linux runtime correctness. Record any missing
-   platform verification explicitly rather than treating it as passed.
+   than presenting peer text as a human instruction. Resume from
+   `hrdr-agent::messaging::Messaging::{start, descriptor, refresh, discover, send, dequeue, wait, close}`
+   and `hrdr-tools::local_ipc`; do not rebuild the existing transport,
+   registration, or peer-provenance layers. Remaining slices:
+   - Default-enabled `session_messaging` configuration and disable control.
+   - Model-facing session discovery/send tools exposing safe session selections,
+     not endpoint-bearing internal descriptors; runtime-issued child-agent
+     identities rather than caller-supplied sender metadata.
+   - TUI and headless lifecycle integration: start after session selection, wake
+     idle agents, queue busy-agent delivery, update name/cwd metadata, rotate
+     generations on session replacement, and report queued cancellation.
+     Preserve bounded admission through transfer into steering queues, not just
+     the runtime inbox. Keep headless commands finite after accepted work
+     drains.
+   - Real client-process end-to-end tests for tools, disabling, busy/idle
+     delivery, session switches and shutdown on the Windows/macOS/Linux CI
+     matrix.
+   - Review runtime discovery's sequential probe budget and error behavior
+     before exposing it through tools; currently `MAX_PROBES` and protocol
+     `DEADLINE` bound it, and saturation is an explicit error.
+
+   Verify delivery, discovery, disabling, busy/idle behavior, and sender
+   attribution before declaring this complete. Support Windows, macOS, and Linux
+   with equivalent discovery and delivery behavior. Run native cross-process
+   messaging and access-control tests on each supported platform through the CI
+   matrix. Local native Windows and Linux (WSL) runs provide faster feedback,
+   not replacements for any CI matrix job. macOS runtime verification relies on
+   CI. A Windows-only pass or cross-compilation alone does not establish
+   macOS/Linux runtime correctness. Record any missing platform verification
+   explicitly rather than treating it as passed.
+
 2. **Remaining actionable backlog.** After messaging is finished and fully
    tested, reassess the entries against current code and implement actionable
    slices, with tests, review, verification, and separate coherent commits. Keep
@@ -105,16 +125,64 @@ push each verified slice to `main` before proceeding to the next slice.
    behavior. When interactive UI is unavoidable, require explicit permission
    before running on the user's desktop and report the limitation. Validate
    platform-specific instructions and add regression coverage for the guidance.
+10. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
+    job it is waiting for, so the harness can track the dependency. Suppress
+    end-of-turn completion nudges for items blocked on a running watch and let
+    the agent wait for its result. Continue nudging unrelated actionable TODOs.
+    On watch success, failure, timeout, or cancellation, deliver the outcome and
+    reassess the dependent TODO rather than silently completing it or leaving it
+    blocked forever. Validate references and cover watch completion races and
+    stale links in tests. This interprets the request's repeated "TODO item"
+    wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
+    are additionally wanted before expanding the scope.
+
+**Resume/verification gaps — 2026-10-09:** Work after the current messaging
+runtime slice was deferred at the user's wrap-up request. The queue above stays
+open. Local Linux execution needs a Rust toolchain in WSL; macOS execution
+relies on CI. Native foreign-account access-denial and remote-machine pipe
+rejection were not exercised; retain those as security coverage gaps. Transport
+CI run `37799426844` passed after rerunning its unprovisioned macOS Clippy job;
+that result does not cover later registration/runtime changes.
+
+Registration CI run `37816556829` failed Unix ordinary workspace tests in
+`socket_only_turnover_stays_bounded_with_live_survivor`: `Listener::bind`
+returned `WouldBlock` during turnover. Unix nextest passed. Trace the lock
+holder if necessary and, with approval of the test-contract correction, use
+existing bounded `retry_busy` around ordinary binds while retaining deliberate
+contention assertions. The Windows test job independently failed the streaming
+deadline test below. No leak was reported by these failures. Latest runtime
+native Linux/macOS verification remains pending CI; do not describe the full
+feature as cross-platform verified.
+
+A local default-concurrency gate failed
+`tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
+workspace gate commands passed with `CARGO_BUILD_JOBS=1` and
+`NEXTEST_TEST_THREADS=4`, without assertion changes. Investigate concurrency
+sensitivity rather than claiming that default execution is reliably green.
+Additional runs during the session also reported intermittent
+`transcript_log::tests::a_coalesced_transcript_folds_exactly_like_the_event_stream`
+(`took_ms` mismatch), watch-delivery timing, and session-save timing failures.
+These were not root-caused or fixed in the messaging slice.
 
 **Shell timeout follow-up:** Investigate intermittent missing-prefix failures in
 `tools::shell::tests::a_timeout_fails_the_call_but_a_non_zero_exit_does_not` and
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output` under
-concurrent Windows test load. Both the serialized workspace run and a later
-normal-concurrency verification gate passed unchanged, so this is not a
-currently reproduced blocker. Distinguish interpreter startup latency from
-output capture with deterministic readiness-based coverage; do not weaken the
-partial-output assertions. A read-only investigation also reported a possible
-post-kill output-drain gap in `ShellTool`; verify that separately before fixing.
+concurrent Windows test load. Earlier serialized and normal-concurrency runs
+passed unchanged, but the timeout failure recurred during final verification.
+Distinguish interpreter startup latency from output capture with deterministic
+readiness-based coverage; do not weaken the partial-output assertions. A
+read-only investigation also reported a possible post-kill output-drain gap in
+`ShellTool`; verify that separately before fixing.
+
+**Windows CI streaming-test deadline:** Run `37779585497` failed
+`bang_command_output_is_capped_while_streaming_not_just_at_the_end` in
+`crates/hrdr-tui/src/app/e2e.rs` while waiting for shell events. The test
+imposes an inter-event timeout even though `forward_user_shell_output`
+deliberately stops forwarding after `USER_SHELL_LIVE_OUTPUT_CAP`. Investigate
+and, subject to user approval of the test-contract correction, use the existing
+overall deadline for receives while preserving completion and byte-cap
+assertions. The eventual child completion time in that CI failure remains
+unverified.
 
 ## GitHub Actions setup-zig cache verification
 

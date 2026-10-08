@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
+  provides same-user native transport and bounded session registrations with
+  kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,
+  attributed delivery, bounded inboxes, and explicit shutdown. Peer provenance
+  survives queueing and transcript replay without becoming human input. This is
+  not yet exposed through model tools or wired into interactive/headless session
+  lifecycles; default-enabled configuration and frontend integration remain
+  open.
 - **`/goal <description>` captures user-requested long-horizon goals.** The
   slash command sends the description through the model so it can normalize the
   text and call the existing `goal` tool, and the TUI now renders pending goals
