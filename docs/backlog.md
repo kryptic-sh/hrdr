@@ -24,6 +24,98 @@ Conventions:
 
 ---
 
+## Session coordination and queued work — 2026-10-08
+
+Work in this order; these entries preserve the queue across sessions. Commit and
+push each verified slice to `main` before proceeding to the next slice.
+
+1. **Cross-client agent messaging.** Implement, fully test, review, and commit
+   before starting the remaining backlog work. All running hrdr sessions under
+   the same OS user can discover and message each other without consent or
+   opt-in groups. Enable by default, with a configuration flag to disable it.
+   Discovery exposes session ID, session name, and session working directory.
+   Incoming messages clearly identify the sending agent, wake an idle agent, and
+   queue for a busy agent like user messages. Preserve sender provenance rather
+   than presenting peer text as a human instruction. The transport, same-user
+   access controls, session lifecycle, and cross-process test design still need
+   implementation planning. Verify delivery, discovery, disabling, busy/idle
+   behavior, and sender attribution before declaring this complete. Support
+   Windows, macOS, and Linux with equivalent discovery and delivery behavior.
+   Run native cross-process messaging and access-control tests on each supported
+   platform through the CI matrix. Local native Windows and Linux (WSL) runs
+   provide faster feedback, not replacements for any CI matrix job. macOS
+   runtime verification relies on CI. A Windows-only pass or cross-compilation
+   alone does not establish macOS/Linux runtime correctness. Record any missing
+   platform verification explicitly rather than treating it as passed.
+2. **Remaining actionable backlog.** After messaging is finished and fully
+   tested, reassess the entries against current code and implement actionable
+   slices, with tests, review, verification, and separate coherent commits. Keep
+   items requiring user decisions explicit rather than guessing answers.
+3. **Backlog pruning.** Remove obsolete or already-resolved entries after
+   checking the current implementation and relevant verification evidence. Age
+   alone is not a reason to delete an entry; preserve unresolved work and
+   coverage gaps. Remove completed entries as each implementation slice lands.
+4. **LLM-managed session names.** Generate the default session name through the
+   LLM on its first turn. Let the agent rename the session when its direction,
+   goal, or progress changes enough that the existing name no longer fits.
+   Implement and test initial naming and subsequent meaningful renaming after
+   the preceding queued work. The handling of explicitly user-assigned names
+   remains a design decision to resolve before implementation.
+5. **Queued-work system-prompt rule.** Update hrdr's system prompt so that, when
+   a backlog file exists, every new task requested by the user is recorded
+   there, including work added while another task is in progress. Keep the
+   backlog current as work is completed so sessions can stop and resume without
+   losing queued requests. Add regression coverage for the prompt rule.
+6. **Dependency updates.** Update the project's dependencies to current stable
+   releases using the package manager, regenerate lockfiles, resolve API
+   compatibility changes, and run the full verification and dependency checks.
+   Reassess previously deferred upgrades against current upstream releases;
+   record any upgrades still blocked and why. Commit and push verified slices to
+   `main` after the preceding queued work.
+7. **Cross-platform terminal titles.** Fix the reported Windows behavior where
+   the title remains `PowerShell`. On Windows, macOS, and Linux, display the
+   working-directory basename and current session name, prefixed by a status
+   emoji as the first character, similar to Claude Code CLI. Distinguish busy /
+   working, idle, done, and waiting for user answers at a glance. Keep the title
+   synchronized with cwd, session-name, and status changes. Extend the existing
+   title implementation rather than adding a competing update path. Test the
+   title content and lifecycle updates across the supported CI matrix, with
+   local Windows and WSL checks for faster feedback.
+8. **Multiple selectable shells.** Extend the shell tool so the LLM can select
+   an available shell per command on Windows, macOS, and Linux. Prefer Bash by
+   default on every platform: on Windows specifically resolve Git Bash ahead of
+   PowerShell, falling back to PowerShell when Git Bash is unavailable. Do not
+   mistake the WSL `bash.exe` launcher for Git Bash. Expose both Git Bash and
+   PowerShell when installed, rather than selecting one for the whole session;
+   similarly expose supported installed alternatives on macOS/Linux. Update the
+   system prompt with the available shells, their default, and shell-specific
+   syntax guidance so the model chooses the appropriate shell. Preserve
+   guardrails, quoting, timeouts, and process cleanup for each selected shell.
+   Test discovery, priority, explicit selection, missing-shell errors, and
+   prompt accuracy across the supported CI matrix.
+9. **Headless-first GUI testing guidelines.** Add guidance to hrdr's system
+   prompt for unit and end-to-end tests requiring graphical facilities: prefer
+   headless execution or an isolated graphical environment so tests do not open
+   windows, steal focus, or send input to the user's active desktop. Cover Linux
+   headless Sway/Wayland and Xvfb/X11, framework-native headless browser testing
+   across platforms, and verified Windows/macOS isolation techniques.
+   Distinguish genuinely headless tests from GUI tests requiring a dedicated
+   desktop/session or VM/CI runner; do not claim every native GUI framework can
+   run headlessly. Prefer non-windowed unit tests where they exercise the real
+   behavior. When interactive UI is unavoidable, require explicit permission
+   before running on the user's desktop and report the limitation. Validate
+   platform-specific instructions and add regression coverage for the guidance.
+
+**Shell timeout follow-up:** Investigate intermittent missing-prefix failures in
+`tools::shell::tests::a_timeout_fails_the_call_but_a_non_zero_exit_does_not` and
+`tools::tests::bash_timeout_kills_process_and_keeps_partial_output` under
+concurrent Windows test load. Both the serialized workspace run and a later
+normal-concurrency verification gate passed unchanged, so this is not a
+currently reproduced blocker. Distinguish interpreter startup latency from
+output capture with deterministic readiness-based coverage; do not weaken the
+partial-output assertions. A read-only investigation also reported a possible
+post-kill output-drain gap in `ShellTool`; verify that separately before fixing.
+
 ## GitHub Actions setup-zig cache verification
 
 `step-security/setup-zig` v2.2.2 was adopted for its Node.js 24 runtime after a
