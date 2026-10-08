@@ -293,8 +293,9 @@ pub fn prepare_outgoing(
     names: &[String],
     cwd: &Path,
     project: hrdr_agent::ProjectInstructions,
+    unix_style_paths: bool,
 ) -> String {
-    prepare_outgoing_tracked(input, names, cwd, project, &[]).into_text()
+    prepare_outgoing_tracked(input, names, cwd, project, &[], unix_style_paths).into_text()
 }
 
 /// [`prepare_outgoing`], as the [`Outgoing`] it really is: the text, the
@@ -316,6 +317,7 @@ pub fn prepare_outgoing_tracked(
     cwd: &Path,
     project: hrdr_agent::ProjectInstructions,
     todos: &[hrdr_tools::TodoItem],
+    unix_style_paths: bool,
 ) -> Outgoing {
     // A `:command` template or `:skill` body may itself carry `@file` / `@agent`
     // mentions — they get the same expansion below.
@@ -325,6 +327,7 @@ pub fn prepare_outgoing_tracked(
             input,
             &crate::discover_commands(cwd, project),
             &crate::discover_skills(cwd, project).skills,
+            unix_style_paths,
         ) {
             Some(prompt) => {
                 expanded = prompt;
@@ -905,12 +908,13 @@ mod tests {
         std::fs::write(root.join("note.txt"), "the note").unwrap();
         let names = vec!["explore".to_string()];
 
-        let out = prepare_outgoing_tracked("read @note.txt", &names, root, LOAD, &[]);
+        let out = prepare_outgoing_tracked("read @note.txt", &names, root, LOAD, &[], true);
         assert!(out.text().contains("the note"));
         assert_eq!(out.inlined(), [root.join("note.txt")]);
 
         // Routed at a sub-agent: same expansion, same report.
-        let out = prepare_outgoing_tracked("@explore read @note.txt", &names, root, LOAD, &[]);
+        let out =
+            prepare_outgoing_tracked("@explore read @note.txt", &names, root, LOAD, &[], true);
         assert!(out.text().contains("`explore`") && out.text().contains("the note"));
         assert_eq!(out.inlined(), [root.join("note.txt")]);
     }
@@ -974,9 +978,15 @@ mod tests {
             evidence: None,
         }];
 
-        let sent =
-            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, LOAD, &todos)
-                .into_text();
+        let sent = prepare_outgoing_tracked(
+            "read @note.txt then todo#2",
+            &names,
+            root,
+            LOAD,
+            &todos,
+            true,
+        )
+        .into_text();
         // The todo section comes after the @file section.
         let file_at = sent.find("--- Referenced paths (via @) ---").unwrap();
         let todo_at = sent.find("--- Referenced todos ---").unwrap();
@@ -984,8 +994,8 @@ mod tests {
         assert!(sent.contains("add a test"), "{sent}");
 
         // Routed at a sub-agent: same expansion, wrapped in the directive.
-        let sent =
-            prepare_outgoing_tracked("@explore do todo#2", &names, root, LOAD, &todos).into_text();
+        let sent = prepare_outgoing_tracked("@explore do todo#2", &names, root, LOAD, &todos, true)
+            .into_text();
         assert!(
             sent.contains("`explore`") && sent.contains("add a test"),
             "{sent}"
@@ -1044,20 +1054,99 @@ mod tests {
     }
 
     #[test]
+    fn skill_footer_path_style_through_outgoing_preserves_authored_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = if cfg!(unix) {
+            dir.path().join(r"literal\name")
+        } else {
+            dir.path().join("nested")
+        };
+        let base = root.join(".hrdr/skills/footer-style");
+        std::fs::create_dir_all(&base).unwrap();
+        let body = r"Run scripts\build.sh and scripts/build.sh. $ARGUMENTS";
+        let description = r"Description\with/slashes";
+        std::fs::write(
+            base.join("SKILL.md"),
+            format!("---\nname: footer-style\ndescription: {description}\n---\n{body}"),
+        )
+        .unwrap();
+        let commands = root.join(".hrdr/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("footer-command.md"),
+            r"Command\with/slashes $ARGUMENTS",
+        )
+        .unwrap();
+        let trailing = r"trailing\with/slashes";
+        for style in [false, true] {
+            let out = prepare_outgoing_tracked(
+                &format!(":footer-style {trailing}"),
+                &[],
+                &root,
+                LOAD,
+                &[],
+                style,
+            );
+            let raw = base.display().to_string();
+            let expected = if cfg!(windows) {
+                if style {
+                    raw.replace('\\', "/")
+                } else {
+                    raw.replace('/', "\\")
+                }
+            } else {
+                raw
+            };
+            assert_eq!(
+                out.text(),
+                format!(
+                    "{body}\n\n{trailing}\n\nBase directory for this skill: {expected}\nRelative paths in this skill (e.g. `scripts/`, \
+                 `references/`) are relative to that directory — resolve them against it before reading \
+                 or running anything."
+                )
+            );
+            let found = crate::discover_skills(&root, LOAD);
+            let skill = found
+                .skills
+                .iter()
+                .find(|s| s.name == "footer-style")
+                .unwrap();
+            assert_eq!(skill.base_dir, base);
+            assert_eq!(skill.body, body);
+            assert_eq!(skill.description, description);
+            assert_eq!(
+                prepare_outgoing_tracked(
+                    &format!(":footer-command {trailing}"),
+                    &[],
+                    &root,
+                    LOAD,
+                    &[],
+                    style
+                )
+                .text(),
+                format!(r"Command\with/slashes {trailing}")
+            );
+        }
+    }
+
+    #[test]
     fn prepare_outgoing_expands_a_command_invocation() {
         let dir = tempfile::tempdir().unwrap();
         let commands = dir.path().join(".hrdr/commands");
         std::fs::create_dir_all(&commands).unwrap();
         std::fs::write(commands.join("ship.md"), "Run the checklist for $ARGUMENTS").unwrap();
 
-        let out = prepare_outgoing(":ship v2", &[], dir.path(), LOAD);
+        let out = prepare_outgoing(":ship v2", &[], dir.path(), LOAD, true);
         assert_eq!(out, "Run the checklist for v2");
         // An unknown :name goes to the model verbatim.
-        assert_eq!(prepare_outgoing(":nope", &[], dir.path(), LOAD), ":nope");
+        assert_eq!(
+            prepare_outgoing(":nope", &[], dir.path(), LOAD, true),
+            ":nope"
+        );
         // A command body's own @file mentions expand too.
         std::fs::write(dir.path().join("notes.txt"), "note body").unwrap();
         std::fs::write(commands.join("review.md"), "Review @notes.txt please").unwrap();
-        let out = prepare_outgoing(":review", &[], dir.path(), LOAD);
+        let out = prepare_outgoing(":review", &[], dir.path(), LOAD, true);
         assert!(out.contains("note body"), "{out}");
     }
 
@@ -1087,28 +1176,28 @@ mod tests {
 
         // Control: a trusted session expands both.
         assert!(
-            prepare_outgoing(":ship", &[], root, LOAD).contains("PROJECT-COMMAND-BODY"),
+            prepare_outgoing(":ship", &[], root, LOAD, true).contains("PROJECT-COMMAND-BODY"),
             "control: a trusted project's command expands"
         );
         assert!(
-            prepare_outgoing(":proj-skill", &[], root, LOAD).contains("PROJECT-SKILL-BODY"),
+            prepare_outgoing(":proj-skill", &[], root, LOAD, true).contains("PROJECT-SKILL-BODY"),
             "control: a trusted project's skill expands"
         );
 
         // Declined: the repository's own files reach the model through neither.
         assert_eq!(
-            prepare_outgoing(":ship", &[], root, SKIP),
+            prepare_outgoing(":ship", &[], root, SKIP, true),
             ":ship",
             "an untrusted project's command must go verbatim"
         );
         assert_eq!(
-            prepare_outgoing(":proj-skill", &[], root, SKIP),
+            prepare_outgoing(":proj-skill", &[], root, SKIP, true),
             ":proj-skill",
             "an untrusted project's skill must go verbatim"
         );
 
         // The vetted built-ins are unaffected — a jailed session still has them.
-        let built_in = prepare_outgoing(":commit", &[], root, SKIP);
+        let built_in = prepare_outgoing(":commit", &[], root, SKIP, true);
         assert_ne!(
             built_in, ":commit",
             "the built-in still expands: {built_in}"
@@ -1125,7 +1214,7 @@ mod tests {
 
         // Known @agent mention: body gets expand_mentions treatment and a routing
         // directive is prepended.
-        let out = prepare_outgoing("@bot check @note.txt please", &names, root, LOAD);
+        let out = prepare_outgoing("@bot check @note.txt please", &names, root, LOAD, true);
         assert!(
             out.contains("[Directed to the `bot` agent"),
             "delegation directive missing: {out}"
@@ -1136,7 +1225,7 @@ mod tests {
         );
 
         // Plain input with a resolvable @file: no delegation, just expansion.
-        let out = prepare_outgoing("look at @note.txt", &names, root, LOAD);
+        let out = prepare_outgoing("look at @note.txt", &names, root, LOAD, true);
         assert!(
             !out.contains("[Directed to"),
             "no agent mention, should not route: {out}"
@@ -1147,7 +1236,7 @@ mod tests {
         );
 
         // No matches at all: passes through unchanged.
-        let out = prepare_outgoing("just some text", &names, root, LOAD);
+        let out = prepare_outgoing("just some text", &names, root, LOAD, true);
         assert_eq!(out, "just some text");
     }
 
@@ -1522,11 +1611,19 @@ mod tests {
         std::fs::write(root.join("note.txt"), "the note").unwrap();
         let names = vec!["explore".to_string()];
 
-        let out = prepare_outgoing_tracked("read @note.txt and @shot.png", &names, root, LOAD, &[]);
+        let out = prepare_outgoing_tracked(
+            "read @note.txt and @shot.png",
+            &names,
+            root,
+            LOAD,
+            &[],
+            true,
+        );
         assert!(out.text().contains("the note"));
         assert_eq!(out.attachments().len(), 1);
 
-        let out = prepare_outgoing_tracked("@explore what is @shot.png", &names, root, LOAD, &[]);
+        let out =
+            prepare_outgoing_tracked("@explore what is @shot.png", &names, root, LOAD, &[], true);
         assert!(out.text().contains("`explore`"), "{:?}", out.text());
         assert_eq!(out.attachments().len(), 1);
         // The label block trails the delegation directive it belongs to.

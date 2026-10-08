@@ -21,6 +21,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   editor notices format their path labels with the same setting. Session lists,
   login storage notices, and theme source labels also honor it; open theme
   pickers and completions refresh on reload without changing stored theme specs.
+  Skill base-directory footers follow the setting for both model loading and
+  user invocation, without rewriting skill bodies or trailing instructions.
   Access checks, LSP protocol paths, and diagnostic message text remain
   unchanged. Stale-read errors preserve the original culprit command. Headline
   caches refresh on configuration reload, which also updates subsequent

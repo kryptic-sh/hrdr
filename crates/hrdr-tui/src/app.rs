@@ -1900,8 +1900,12 @@ impl App {
     /// the mid-turn steer and the fresh turn alike — so neither can quietly drop
     /// what the other carries.
     fn steer_for_main(&mut self, input: String) -> hrdr_agent::Steer {
-        let mut out =
-            hrdr_app::prepare_outgoing_via(&self.agent, &input, self.project_instructions);
+        let mut out = hrdr_app::prepare_outgoing_via(
+            &self.agent,
+            &input,
+            self.project_instructions,
+            self.unix_style_paths(),
+        );
         out.attach(std::mem::take(&mut self.pending_attachments));
         self.note_attachments(out.attachments());
         out.into_steer(input)
@@ -2432,8 +2436,12 @@ impl App {
         // sub-agent — so no `@file` read-state marking on this handle. The
         // composer's pasted images go wherever the message goes, which on this
         // pane is the sub-agent.
-        let mut out =
-            hrdr_app::prepare_outgoing_relayed(&self.agent, &input, self.project_instructions);
+        let mut out = hrdr_app::prepare_outgoing_relayed(
+            &self.agent,
+            &input,
+            self.project_instructions,
+            self.unix_style_paths(),
+        );
         // Taken off the composer, but kept in hand until delivery is settled: an
         // `Attachment`'s bytes live behind an `Arc`, so the copy costs a pointer,
         // and it is what lets a refused message go back whole.

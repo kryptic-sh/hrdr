@@ -442,6 +442,7 @@ pub fn prepare_outgoing_via(
     agent: &Arc<Mutex<Agent>>,
     input: &str,
     project: hrdr_agent::ProjectInstructions,
+    unix_style_paths: bool,
 ) -> crate::Outgoing {
     let out = crate::prepare_outgoing_tracked(
         input,
@@ -449,6 +450,7 @@ pub fn prepare_outgoing_via(
         &agent_cwd(agent),
         project,
         &agent_todos(agent),
+        unix_style_paths,
     );
     // Best-effort, and deliberately not blocking: a turn in flight holds the
     // lock, and the same `try_lock` gate already decides whether `@agent`
@@ -477,11 +479,19 @@ pub fn prepare_outgoing_relayed(
     agent: &Arc<Mutex<Agent>>,
     input: &str,
     project: hrdr_agent::ProjectInstructions,
+    unix_style_paths: bool,
 ) -> crate::Outgoing {
     // `&[]`: `todo#N` expansion resolves against the *receiving* agent's list, and
     // this message is not going to the one whose list is in reach here — the same
     // reason the read-state marking above is skipped.
-    crate::prepare_outgoing_tracked(input, &agent_names(agent), &agent_cwd(agent), project, &[])
+    crate::prepare_outgoing_tracked(
+        input,
+        &agent_names(agent),
+        &agent_cwd(agent),
+        project,
+        &[],
+        unix_style_paths,
+    )
 }
 
 /// The working-tree `git diff` for `cwd` (stdout on success, stderr message on

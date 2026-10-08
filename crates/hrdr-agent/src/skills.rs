@@ -349,7 +349,7 @@ fn is_valid_skill_name(name: &str) -> bool {
 ///
 /// Shared by the `:name` path and the `skill` tool, so a user-invoked skill and
 /// a model-loaded one are byte-identical below the tool's own header.
-pub fn skill_prompt(skill: &Skill, trailing: &str) -> String {
+pub fn skill_prompt(skill: &Skill, trailing: &str, unix_style_paths: bool) -> String {
     let mut out = skill.body.clone();
     let trailing = trailing.trim();
     if !trailing.is_empty() {
@@ -362,7 +362,7 @@ pub fn skill_prompt(skill: &Skill, trailing: &str) -> String {
         "\n\nBase directory for this skill: {}\nRelative paths in this skill (e.g. `scripts/`, \
          `references/`) are relative to that directory — resolve them against it before reading \
          or running anything.",
-        skill.base_dir.display()
+        hrdr_tools::display_path(&skill.base_dir, unix_style_paths)
     ));
     out
 }
@@ -379,6 +379,7 @@ pub fn expand_invocation(
     input: &str,
     commands: &[crate::Command],
     skills: &[Skill],
+    unix_style_paths: bool,
 ) -> Option<String> {
     if let Some(prompt) = crate::expand_command(input, commands) {
         return Some(prompt);
@@ -386,7 +387,7 @@ pub fn expand_invocation(
     let (name, rest) = crate::commands::split_invocation(input)?;
     let key = skill_match_key(name);
     let skill = skills.iter().find(|s| skill_match_key(&s.name) == key)?;
-    Some(skill_prompt(skill, rest))
+    Some(skill_prompt(skill, rest, unix_style_paths))
 }
 
 /// The live skill set, shared between the agent — which re-discovers it whenever
@@ -478,7 +479,7 @@ impl hrdr_tools::Tool for SkillTool {
              it for this task.\n\n{}",
             skill.name,
             skill.source,
-            skill_prompt(skill, "")
+            skill_prompt(skill, "", ctx.unix_style_paths)
         );
         Ok(hrdr_tools::truncate_saved(
             &body,
@@ -734,12 +735,12 @@ mod tests {
             compatibility: None,
             metadata: BTreeMap::new(),
         }];
-        let out = expand_invocation(":ship", &commands, &skills).unwrap();
+        let out = expand_invocation(":ship", &commands, &skills, true).unwrap();
         assert_eq!(out, "Run the command.");
         assert!(!out.contains("Run the skill."));
         // With no command of that name, the skill answers.
         assert!(
-            expand_invocation(":ship", &[], &skills)
+            expand_invocation(":ship", &[], &skills, true)
                 .unwrap()
                 .contains("Run the skill.")
         );
@@ -760,7 +761,7 @@ mod tests {
             compatibility: None,
             metadata: BTreeMap::new(),
         }];
-        let out = expand_invocation(":audit focus on the parser", &[], &skills).unwrap();
+        let out = expand_invocation(":audit focus on the parser", &[], &skills, true).unwrap();
         assert!(out.contains("Audit the tree. $ARGUMENTS"), "{out}");
         assert!(out.contains("\n\nfocus on the parser\n"), "{out}");
         // …and the base-directory footer rides along on the `:` path too, so a
@@ -770,8 +771,8 @@ mod tests {
             "{out}"
         );
         // Not an invocation / unknown name → None (sent to the model as-is).
-        assert!(expand_invocation(":nope", &[], &skills).is_none());
-        assert!(expand_invocation("hello :audit", &[], &skills).is_none());
+        assert!(expand_invocation(":nope", &[], &skills, true).is_none());
+        assert!(expand_invocation("hello :audit", &[], &skills, true).is_none());
     }
 
     /// The tool that makes skills model-invocable: it resolves a name against
@@ -818,6 +819,66 @@ mod tests {
         );
         // Read-only: a read-only sub-agent keeps it.
         assert!(tool.read_only());
+    }
+
+    #[tokio::test]
+    async fn skill_footer_path_style_preserves_authored_text_and_raw_base() {
+        use hrdr_tools::Tool;
+        let skill = Skill {
+            name: "path-style".into(),
+            description: r"Keep description\with/slashes".into(),
+            body: r"Run scripts\fill.py and scripts/fill.py. $ARGUMENTS".into(),
+            source: r"source\with/slashes".into(),
+            base_dir: PathBuf::from(r"/tmp/literal\name/skill"),
+            license: None,
+            compatibility: None,
+            metadata: BTreeMap::new(),
+        };
+        let tool = SkillTool {
+            skills: Arc::new(Mutex::new(vec![skill.clone()])),
+        };
+        let trailing = r"Keep trailing\with/slashes";
+        for style in [false, true] {
+            let expected_path = if cfg!(windows) {
+                if style {
+                    "/tmp/literal/name/skill"
+                } else {
+                    r"\tmp\literal\name\skill"
+                }
+            } else {
+                r"/tmp/literal\name/skill"
+            };
+            let footer = format!(
+                "\n\nBase directory for this skill: {expected_path}\nRelative paths in this skill (e.g. `scripts/`, \
+                 `references/`) are relative to that directory — resolve them against it before reading \
+                 or running anything."
+            );
+            let mut ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+            ctx.unix_style_paths = style;
+            let out = tool
+                .execute(serde_json::json!({"name": "path-style"}), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "Skill `path-style` (source: {}) — a procedure bundle from the user or this project; follow it for this task.\n\n{}{footer}",
+                    skill.source, skill.body
+                )
+            );
+            assert_eq!(
+                skill_prompt(&skill, trailing, style),
+                format!("{}\n\n{trailing}{footer}", skill.body)
+            );
+            let stored = tool.skills.lock().unwrap();
+            assert_eq!(
+                stored[0].base_dir,
+                PathBuf::from(r"/tmp/literal\name/skill")
+            );
+            assert_eq!(stored[0].body, skill.body);
+            assert_eq!(stored[0].description, skill.description);
+            assert_eq!(stored[0].source, skill.source);
+        }
     }
 
     /// An unknown name is an error that names what *is* available; a missing

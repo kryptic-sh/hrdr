@@ -967,6 +967,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         &agent.cwd(),
         agent.project_instructions(),
         &todos,
+        agent.unix_style_paths(),
     );
     // A fully inlined `@file` is content the model has already seen — tell the
     // read-before-edit guard so it doesn't demand a redundant re-read.

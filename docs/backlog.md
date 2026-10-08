@@ -2481,11 +2481,11 @@ and **not** fixed.
   filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
   overflow pointers, cwd chrome, session-picker cwd rows, command/status output,
   reload/resume notices, default editor notices, session listings, login storage
-  notices, and theme source labels already use it. Remaining work includes
-  command/skill discovery labels, path-bearing notices, prompts,
-  attachments/completion labels, and other tools. Live reload updates subsequent
-  main-agent tool calls and newly spawned children; existing children retain
-  their own setting. Cwd/picker caches restyle on reload. Keep this
+  notices, theme source labels, and skill base-directory footers already use it.
+  Remaining work includes command/skill discovery labels, path-bearing notices,
+  prompts, attachments/completion labels, and other tools. Live reload updates
+  subsequent main-agent tool calls and newly spawned children; existing children
+  retain their own setting. Cwd/picker caches restyle on reload. Keep this
   display-only: do not change filesystem targets or literal Unix backslashes.
   Preserve unified-diff prefix semantics. Never rewrite file bodies, user prose,
   or captured shell output. Cover both settings and unchanged Unix behavior at
