@@ -31,6 +31,7 @@ pub mod local_ipc;
 mod lsp;
 mod mcp;
 pub mod memory;
+mod presentation;
 mod proc;
 pub mod sandbox;
 mod test_nudge;
@@ -54,6 +55,7 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
+pub use presentation::display_path;
 pub use proc::{process_alive, resolve_program};
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
@@ -258,6 +260,8 @@ impl BackgroundStatus {
 pub struct ToolContext {
     /// Working directory tool paths resolve against.
     pub cwd: PathBuf,
+    /// Windows path-label separators; ignored on Unix. Defaults to `true`.
+    pub unix_style_paths: bool,
     /// Shared TODO list, mutated by `todo`, surfaced to the UI.
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// Shared goal list, mutated by `goal`, read by the turn-end nudge (a turn
@@ -379,6 +383,7 @@ impl ToolContext {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
+            unix_style_paths: true,
             todos: Arc::new(Mutex::new(Vec::new())),
             goals: Arc::new(Mutex::new(Vec::new())),
             crons: Arc::new(Mutex::new(Vec::new())),

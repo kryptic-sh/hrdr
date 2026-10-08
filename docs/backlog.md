@@ -136,6 +136,28 @@ push each verified slice to `main` before proceeding to the next slice.
     wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
     are additionally wanted before expanding the scope.
 
+11. **Self-update, restart, and turn continuation — requested 2026-10-09.**
+    Highest priority after finishing the current path-rendering slice, per the
+    user's clarification; take this before the other Windows backlog items. Add
+    a model tool for working on the hrdr codebase that installs hrdr through
+    Cargo, restarts the running application into the newly installed version,
+    and automatically resumes the same session and continues the interrupted
+    turn. Support the agent working on hrdr itself: install the exact
+    version/source revision it has tested, rather than silently fetching an
+    unrelated newer revision. Preserve session history, goals, TODOs, working
+    directory, and the continuation point durably before handing control to the
+    replacement process. Avoid replaying completed side-effecting tool calls or
+    recursively repeating the update on resume. Define handling for active child
+    tasks, watches, queued messages, and session locks; do not claim they
+    survive without a tested handoff/recovery mechanism. Handle Windows
+    executable-in-use replacement and terminal handoff as well as Unix restart
+    behavior. A failed build/install must leave the current instance usable; a
+    failed restart must leave a recoverable session and actionable diagnostics.
+    Resolve installation source/root, verification requirements, and restart
+    recovery protocol before implementation. Test actual process replacement,
+    version identity, automatic turn continuation, exact goal/TODO preservation,
+    and failure recovery on the supported platform matrix.
+
 **Resume/verification gaps — 2026-10-09:** Work after the current messaging
 runtime slice was deferred at the user's wrap-up request. The queue above stays
 open. Local Linux execution needs a Rust toolchain in WSL; macOS execution
@@ -2418,10 +2440,20 @@ and **not** fixed.
 
 **Open — found, not fixed:**
 
-- **No `Event::Paste` on Windows.** crossterm's Windows event source never
-  produces one, so a multi-line paste arrives as key presses and plain-mode
-  Enter submits at the first newline. Ctrl+] (clipboard paste) is the
-  workaround. Inferred from crossterm source, not observed.
+- **Multiline paste submits at newlines — observed on Windows 2026-10-09.** The
+  user reports pasted lines being sent as separate messages rather than the
+  whole paste appearing in the input box. Keep pasted LF/CRLF text together in
+  the composer without submitting until an explicit submit action. Investigate
+  native terminal input and bracketed-paste handling; an earlier inspection
+  suggested the Windows crossterm source did not emit `Event::Paste`, but verify
+  the installed implementation and actual event stream before assigning cause.
+  Ctrl+] clipboard paste was previously suggested as a workaround; recheck it.
+  Whether Linux/macOS are affected is unknown. Regression tests MUST run across
+  the full Linux, Windows, and macOS CI matrix, exercising the real input path
+  as well as composer handling. Cover LF/CRLF multiline content, no premature
+  submissions, complete paste preservation within the existing paste cap, and
+  ordinary explicit Enter submission afterward. Do not claim cross-platform
+  correctness from Windows-only tests or synthetic `Event::Paste` tests alone.
 - **`cwd_slug` hashes the raw `current_dir()`.** Windows keeps whatever drive
   and path case the shell was started with (VS Code's terminal uses `c:\`), so
   one project can get two session folders and `/resume` cannot see the other's
@@ -2432,19 +2464,19 @@ and **not** fixed.
 - **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
   path whose case differs from the workspace root gets no diagnostics on a
   case-insensitive filesystem.
-- **Mixed Windows separators in rendered tool paths — reported 2026-10-09.**
-  Edit results render paths such as
-  `C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`, including unified
-  diff headers `--- a/C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`
-  and `+++ b/C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`. Trace
-  result messages and diff-label construction. Add a Windows-only boolean
-  configuration setting named `unix_style_paths`, default `true`: `true` renders
-  path separators as `/`, and `false` renders them as `\`. Linux/macOS rendering
-  remains unchanged. This is display-only: do not change filesystem targets or
-  treat literal Unix backslashes as separators. Preserve unified-diff prefix
-  semantics. Cover the default, both values, result messages, diff headers, and
-  unchanged Unix behavior with regression tests. Handle after the current
-  home-path display slice.
+- **Finish Windows path presentation — reported 2026-10-09.** Extend
+  `hrdr_tools::display_path` and the existing `unix_style_paths` boolean to ALL
+  remaining hrdr-rendered path values. The setting defaults to `true` (`/`);
+  `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
+  labels and diff paths already use it; remaining work includes tool headlines
+  such as `edit docs/backlog.md`, nested/error labels (including stale-read
+  errors), cwd/status displays, pickers, path-bearing notices, other tools,
+  overflow pointers, and reload propagation. Keep this display-only: do not
+  change filesystem targets or literal Unix backslashes. Preserve unified-diff
+  prefix semantics. Never rewrite file bodies, user prose, or captured shell
+  output. Cover both settings and unchanged Unix behavior at each real rendering
+  seam, including config-to-agent wiring. Complete these presentation surfaces
+  before moving to the newly prioritized self-update tool.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

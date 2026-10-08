@@ -290,6 +290,7 @@ impl Agent {
             runtime.public.delegation_enabled = delegation_enabled;
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
+        ctx.unix_style_paths = config.unix_style_paths;
         ctx.lsp = lsp;
         let mut sandbox = hrdr_tools::SandboxPolicy::for_agent(
             sandbox_mode,

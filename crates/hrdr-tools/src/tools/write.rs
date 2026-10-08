@@ -98,21 +98,18 @@ impl Tool for WriteTool {
         let fc = super::mutation::apply_file_change(ctx, &path, "write", &a.content).await?;
         ctx.mark_read(&path); // the model authored (or just saw) this content
         let warn = fc.formatted_notes();
+        let label = crate::display_path(&path, ctx.unix_style_paths);
         if existed {
-            let diff = unified_diff(&path.display().to_string(), &old, &fc.content_after);
+            let diff = unified_diff(&label, &old, &fc.content_after);
             let body = if diff.is_empty() {
                 "(no changes)".to_string()
             } else {
                 diff
             };
-            Ok(format!(
-                "Wrote {bytes} bytes to {}{warn}\n{body}",
-                path.display()
-            ))
+            Ok(format!("Wrote {bytes} bytes to {label}{warn}\n{body}"))
         } else {
             Ok(format!(
-                "Created {} ({} lines){warn}",
-                path.display(),
+                "Created {label} ({} lines){warn}",
                 fc.content_after.lines().count()
             ))
         }

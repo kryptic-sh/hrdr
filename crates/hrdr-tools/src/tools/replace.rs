@@ -217,7 +217,10 @@ impl Tool for ReplaceTool {
                 continue;
             }
             total += hits;
-            let rel = super::rel_display(&path, &ctx.cwd).to_string();
+            let rel = crate::display_path(
+                path.strip_prefix(&ctx.cwd).unwrap_or(&path),
+                ctx.unix_style_paths,
+            );
             planned.push((path, before, after, rel));
         }
 

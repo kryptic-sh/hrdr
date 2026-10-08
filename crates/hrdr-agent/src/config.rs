@@ -234,6 +234,8 @@ pub struct AgentConfig {
     /// server I run, and whatever model it serves".
     pub model: ModelRef,
     pub cwd: PathBuf,
+    /// Windows path-label separators; ignored on Unix. Defaults to `true`.
+    pub unix_style_paths: bool,
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
     pub max_steps: usize,
@@ -786,6 +788,7 @@ pub(crate) struct ToolOutputConfig {
 pub(crate) struct FileConfig {
     pub(crate) api_key: Option<String>,
     pub(crate) model: Option<ModelSpec>,
+    pub(crate) unix_style_paths: Option<bool>,
     pub(crate) temperature: Option<f32>,
     pub(crate) context_window: Option<u32>,
     pub(crate) max_tokens: Option<u32>,
@@ -1016,6 +1019,7 @@ impl Default for AgentConfig {
             // carried, now spelled as the one identity they always were.
             model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            unix_style_paths: true,
             temperature: None,
             max_steps: 300,
             retry: RetryPolicy::default(),
@@ -1626,6 +1630,9 @@ impl AgentConfig {
     /// [`load_checked`](Self::load_checked) and applied there, since it layers
     /// against the environment.
     pub(crate) fn apply_file(&mut self, fc: FileConfig) {
+        if let Some(v) = fc.unix_style_paths {
+            self.unix_style_paths = v;
+        }
         if let Some(v) = fc.api_key {
             self.api_key = Some(v);
         }
@@ -2525,6 +2532,32 @@ mod sandbox_tests {
             effective_sandbox(SandboxMode::None, false),
             SandboxMode::None
         );
+    }
+
+    #[test]
+    fn unix_style_paths_config() {
+        let mut cfg = AgentConfig::default();
+        assert!(cfg.unix_style_paths);
+        let missing: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(missing.unix_style_paths, None);
+        cfg.apply_file(missing);
+        assert!(cfg.unix_style_paths);
+        for value in [false, true] {
+            let fc: FileConfig = toml::from_str(&format!("unix_style_paths = {value}")).unwrap();
+            assert_eq!(fc.unix_style_paths, Some(value));
+            cfg.apply_file(fc);
+            assert_eq!(cfg.unix_style_paths, value);
+            cfg.apply_file(toml::from_str("").unwrap());
+            assert_eq!(cfg.unix_style_paths, value);
+            assert_eq!(cfg.clone().unix_style_paths, value);
+            assert_eq!(
+                crate::delegation::subagent_base_config(&cfg).unix_style_paths,
+                value
+            );
+        }
+        for value in ["\"false\"", "1", "[]"] {
+            assert!(toml::from_str::<FileConfig>(&format!("unix_style_paths = {value}")).is_err());
+        }
     }
 
     /// The config-file key parses the three spellings, and a misspelling is a

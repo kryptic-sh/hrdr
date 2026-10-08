@@ -485,12 +485,12 @@ impl Tool for EditTool {
         // edit/write this turn sees Fresh rather than a false Stale.
         ctx.mark_read(&path);
         let warn = fc.formatted_notes();
-        let diff = unified_diff(&path.display().to_string(), &text, &fc.content_after);
+        let label = crate::display_path(&path, ctx.unix_style_paths);
+        let diff = unified_diff(&label, &text, &fc.content_after);
         // The full diff rides back uncapped — it is what the transcript shows
         // the user; the agent abbreviates the model's copy.
         Ok(format!(
-            "Replaced {count} occurrence(s) in {}{warn}{fuzzy_note}{stale_note}\n{diff}",
-            path.display()
+            "Replaced {count} occurrence(s) in {label}{warn}{fuzzy_note}{stale_note}\n{diff}"
         ))
     }
 }
