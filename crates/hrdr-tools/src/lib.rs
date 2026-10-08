@@ -27,6 +27,7 @@ mod ansi;
 mod gate;
 mod guardrails;
 mod hooks;
+pub mod local_ipc;
 mod lsp;
 mod mcp;
 pub mod memory;
