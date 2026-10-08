@@ -83,7 +83,7 @@ const GREP_MAX_CONTEXT: usize = 10;
 #[async_trait]
 impl Tool for GrepTool {
     /// Pattern and path, so a hit's provenance travels with it.
-    fn output_source(&self, args: &serde_json::Value) -> String {
+    fn output_source(&self, args: &serde_json::Value, unix_style_paths: bool) -> String {
         let field = |k: &str| {
             args.get(k)
                 .and_then(|v| v.as_str())
@@ -96,6 +96,7 @@ impl Tool for GrepTool {
         } else {
             path
         };
+        let path = crate::display_path(std::path::Path::new(&path), unix_style_paths);
         format!("grep {:?} in {path}", field("pattern"))
     }
 
@@ -215,6 +216,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
     // every value it touches (root, cwd, the parsed glob/regex, the limits), so
     // nothing borrows `ctx` or `a` across the boundary.
     let cwd = ctx.cwd.clone();
+    let unix_style_paths = ctx.unix_style_paths;
     let max_output = ctx.max_output;
     let max_output_lines = ctx.max_output_lines;
     let hidden = a.hidden;
@@ -244,7 +246,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue; // skip binary / non-UTF-8 files
             };
-            let disp = path.strip_prefix(&cwd).unwrap_or(path);
+            let disp = crate::display_path(path.strip_prefix(&cwd).unwrap_or(path), unix_style_paths);
             if n_ctx == 0 {
                 for (i, line) in text.lines().enumerate() {
                     if re.is_match(line) {
@@ -255,7 +257,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
                             );
                             break 'walk;
                         }
-                        out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
+                        out.push_str(&format!("{}:{}:{}\n", disp, i + 1, line));
                         if out.len() > max_output {
                             break 'walk;
                         }
@@ -279,7 +281,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
                     hits.push(i);
                 }
             }
-            emit_context_windows(&mut out, &disp.display().to_string(), &lines, &hits, n_ctx);
+            emit_context_windows(&mut out, &disp, &lines, &hits, n_ctx);
             if capped {
                 out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
                 break 'walk;
@@ -321,6 +323,7 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
 
     // Same one-closure-per-walk structure as `grep_builtin` — see there for why.
     let cwd = ctx.cwd.clone();
+    let unix_style_paths = ctx.unix_style_paths;
     let max_output = ctx.max_output;
     let max_output_lines = ctx.max_output_lines;
     let hidden = a.hidden;
@@ -379,19 +382,14 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
             if !matched_lines.is_empty() {
                 let mut hits: Vec<usize> = matched_lines.into_iter().collect();
                 hits.sort_unstable();
-                let disp = path.strip_prefix(&cwd).unwrap_or(path);
+                let disp =
+                    crate::display_path(path.strip_prefix(&cwd).unwrap_or(path), unix_style_paths);
                 if n_ctx == 0 {
                     for i in hits {
-                        out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, lines[i]));
+                        out.push_str(&format!("{}:{}:{}\n", disp, i + 1, lines[i]));
                     }
                 } else {
-                    emit_context_windows(
-                        &mut out,
-                        &disp.display().to_string(),
-                        &lines,
-                        &hits,
-                        n_ctx,
-                    );
+                    emit_context_windows(&mut out, &disp, &lines, &hits, n_ctx);
                 }
             }
             if capped {

@@ -18,8 +18,9 @@ struct LsArgs {
 #[async_trait]
 impl Tool for LsTool {
     /// The directory listed — a hostile *filename* is a real injection vector.
-    fn output_source(&self, args: &serde_json::Value) -> String {
+    fn output_source(&self, args: &serde_json::Value, unix_style_paths: bool) -> String {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = crate::display_path(std::path::Path::new(path), unix_style_paths);
         format!("listing of {path}")
     }
 
@@ -46,13 +47,17 @@ impl Tool for LsTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: LsArgs = crate::tool_args("ls", args)?;
         let dir = ctx.resolve_read(a.path.as_deref().unwrap_or("."))?;
-        let mut rd = tokio::fs::read_dir(&dir)
-            .await
-            .with_context(|| format!("listing {}", dir.display()))?;
+        let mut rd = tokio::fs::read_dir(&dir).await.with_context(|| {
+            format!(
+                "listing {}",
+                crate::display_path(&dir, ctx.unix_style_paths)
+            )
+        })?;
         let mut entries: Vec<String> = Vec::new();
         while let Some(e) = rd.next_entry().await? {
             let name = e.file_name().to_string_lossy().to_string();
             let suffix = match e.file_type().await {
+                Ok(t) if t.is_dir() && cfg!(windows) && !ctx.unix_style_paths => "\\",
                 Ok(t) if t.is_dir() => "/",
                 Ok(t) if t.is_symlink() => "@",
                 _ => "",

@@ -23,7 +23,7 @@ struct FindArgs {
 #[async_trait]
 impl Tool for FindTool {
     /// The glob that produced these paths.
-    fn output_source(&self, args: &serde_json::Value) -> String {
+    fn output_source(&self, args: &serde_json::Value, _unix_style_paths: bool) -> String {
         let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
         format!("glob {pattern:?}")
     }
@@ -68,6 +68,7 @@ impl Tool for FindTool {
         // owns everything it touches (the cwd, the flags, the parsed glob), so
         // nothing borrows `ctx` across the `spawn_blocking` boundary.
         let cwd = ctx.cwd.clone();
+        let unix_style_paths = ctx.unix_style_paths;
         let hidden = a.hidden;
         let no_ignore = a.no_ignore;
         let mut paths = tokio::task::spawn_blocking(move || {
@@ -85,7 +86,7 @@ impl Tool for FindTool {
                 let name = path.file_name().map(|n| n.to_string_lossy());
                 let hit = name.as_deref().is_some_and(|n| pat.matches(n)) || pat.matches_path(rel);
                 if hit {
-                    paths.push(rel.to_string_lossy().to_string());
+                    paths.push(crate::display_path(rel, unix_style_paths));
                 }
             }
             paths

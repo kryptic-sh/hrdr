@@ -129,10 +129,15 @@ impl WindowScanner {
 #[async_trait]
 impl Tool for ReadTool {
     /// The file itself — in an audit, provenance per byte is the whole point.
-    fn output_source(&self, args: &serde_json::Value) -> String {
+    fn output_source(&self, args: &serde_json::Value, unix_style_paths: bool) -> String {
         args.get("path")
             .and_then(|v| v.as_str())
-            .map(|p| format!("file {p}"))
+            .map(|p| {
+                format!(
+                    "file {}",
+                    crate::display_path(std::path::Path::new(p), unix_style_paths)
+                )
+            })
             .unwrap_or_else(|| "file".to_string())
     }
     fn read_only(&self) -> bool {
@@ -199,11 +204,12 @@ impl Tool for ReadTool {
         // the window's text and the file's total line count; the guards and the
         // size cap run inside it, with the same errors.
         let resolved = path.clone();
+        let unix_style_paths = ctx.unix_style_paths;
         let (text, total_lines) = tokio::task::spawn_blocking(move || -> Result<(String, usize)> {
             // Open the file first so the handle is fixed before any path resolution —
             // this closes the TOCTOU window between secret-file validation and reading.
             let mut file = std::fs::File::open(&resolved)
-                .with_context(|| format!("opening {}", resolved.display()))?;
+                .with_context(|| format!("opening {}", crate::display_path(&resolved, unix_style_paths)))?;
 
             // Validate the path is not a secret file.
             crate::guard_secret_read(&resolved)?;
@@ -217,14 +223,14 @@ impl Tool for ReadTool {
             // Check file size from the open handle (not a separate stat).
             let file_len = file
                 .metadata()
-                .with_context(|| format!("statting {}", resolved.display()))?
+                .with_context(|| format!("statting {}", crate::display_path(&resolved, unix_style_paths)))?
                 .len();
             if file_len > MAX_READ_BYTES {
                 bail!(
                     "{} is {} bytes, over this tool's {MAX_READ_BYTES}-byte cap — it's too large to \
                      load whole; use `grep` to search it or `bash` (`sed`/`head`/`tail`) to slice out \
                      the range you need",
-                    resolved.display(),
+                    crate::display_path(&resolved, unix_style_paths),
                     file_len
                 );
             }
@@ -243,7 +249,7 @@ impl Tool for ReadTool {
             loop {
                 let n = file
                     .read(&mut buf)
-                    .with_context(|| format!("reading {}", resolved.display()))?;
+                    .with_context(|| format!("reading {}", crate::display_path(&resolved, unix_style_paths)))?;
                 if n == 0 {
                     break;
                 }
@@ -264,7 +270,7 @@ impl Tool for ReadTool {
                     bail!(
                         "{} is not a text file (invalid UTF-8{}) — this tool only reads text; \
                          inspect binaries via bash (`file`, `hexdump -C`, `strings`) if needed",
-                        resolved.display(),
+                        crate::display_path(&resolved, unix_style_paths),
                         if a.full { "" } else { " in the requested lines" }
                     );
                 }
@@ -348,6 +354,172 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn path_style_read_errors_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(
+            dir.path().join("nested/text.txt"),
+            r"body C:\raw\file /literal",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("nested/binary"), [0xff]).unwrap();
+        let large = std::fs::File::create(dir.path().join("nested/large")).unwrap();
+        large.set_len(MAX_READ_BYTES + 1).unwrap();
+        for style in [true, false] {
+            let mut ctx = ToolContext::new(dir.path());
+            ctx.unix_style_paths = style;
+            let out = ReadTool
+                .execute(json!({"path": "nested/text.txt"}), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(out, "     1: body C:\\raw\\file /literal\n");
+            for (name, prefix, suffix) in [
+                ("missing", "opening ", ""),
+                ("binary", "", " is not a text file (invalid UTF-8"),
+                ("large", "", " is "),
+            ] {
+                let input = format!("nested/{name}");
+                let label = crate::display_path(&ctx.resolve_read(&input).unwrap(), style);
+                let error = ReadTool
+                    .execute(json!({"path": input}), &ctx)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.starts_with(&format!("{prefix}{label}{suffix}")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn path_style_filesystem_tools_and_registry() {
+        use crate::tools::{FindTool, GrepTool, LsTool, TreeTool};
+        let dir = tempfile::tempdir().unwrap();
+        // A backslash is a filename character on Unix, not a separator.
+        let folder = if cfg!(windows) {
+            "nested"
+        } else {
+            r"nested\literal"
+        };
+        std::fs::create_dir(dir.path().join(folder)).unwrap();
+        let relative = format!("{folder}/text.txt");
+        std::fs::write(
+            dir.path().join(&relative),
+            "before\\context\nneedle\\body\nafter/context\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(folder).join("excluded.rs"),
+            "needle\\body\n",
+        )
+        .unwrap();
+        let mut registry = crate::ToolRegistry::new();
+        for tool in [
+            std::sync::Arc::new(ReadTool) as std::sync::Arc<dyn Tool>,
+            std::sync::Arc::new(FindTool),
+            std::sync::Arc::new(GrepTool),
+            std::sync::Arc::new(LsTool),
+            std::sync::Arc::new(TreeTool),
+        ] {
+            registry.register(tool);
+        }
+        for style in [true, false] {
+            let mut ctx = ToolContext::new(dir.path());
+            ctx.unix_style_paths = style;
+            let label = crate::display_path(std::path::Path::new(&relative), style);
+            let marker = if cfg!(windows) && !style { "\\" } else { "/" };
+            let pattern = format!("{folder}/*.txt");
+            assert_eq!(
+                FindTool
+                    .execute(json!({"pattern": pattern}), &ctx)
+                    .await
+                    .unwrap(),
+                label
+            );
+            assert_eq!(
+                LsTool.execute(json!({}), &ctx).await.unwrap(),
+                format!("{folder}{marker}")
+            );
+            let missing = ctx.resolve_read("absent/dir").unwrap();
+            let error = LsTool
+                .execute(json!({"path":"absent/dir"}), &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("listing {}", crate::display_path(&missing, style))
+            );
+            let tree = TreeTool
+                .execute(json!({"path":folder}), &ctx)
+                .await
+                .unwrap();
+            assert!(tree.starts_with(&format!("{folder}{marker}\n")), "{tree}");
+            let root_tree = TreeTool.execute(json!({}), &ctx).await.unwrap();
+            assert!(
+                root_tree.contains(&format!("{folder}{marker}\n")),
+                "{root_tree}"
+            );
+            for multiline in [false, true] {
+                for context in [0, 1] {
+                    let out = GrepTool.execute(json!({"pattern":r"needle\body", "literal":true, "glob":pattern, "multiline":multiline, "context":context}), &ctx).await.unwrap();
+                    let expected = if context == 0 {
+                        format!("{label}:2:needle\\body")
+                    } else {
+                        format!(
+                            "{label}-1-before\\context\n{label}:2:needle\\body\n{label}-3-after/context"
+                        )
+                    };
+                    assert_eq!(out, expected);
+                }
+            }
+            ctx.sandbox = std::sync::Arc::new(crate::SandboxPolicy::for_agent(
+                crate::SandboxMode::Jail,
+                dir.path(),
+                &[],
+            ));
+            for (tool, args, source) in [
+                ("read", json!({"path":relative}), format!("file {label}")),
+                (
+                    "find",
+                    json!({"pattern":pattern}),
+                    format!("glob {pattern:?}"),
+                ),
+                (
+                    "ls",
+                    json!({"path":format!("{folder}/.")}),
+                    format!(
+                        "listing of {}",
+                        crate::display_path(std::path::Path::new(&format!("{folder}/.")), style)
+                    ),
+                ),
+                (
+                    "tree",
+                    json!({"path":format!("{folder}/.")}),
+                    format!(
+                        "tree of {}",
+                        crate::display_path(std::path::Path::new(&format!("{folder}/.")), style)
+                    ),
+                ),
+                (
+                    "grep",
+                    json!({"path":relative,"pattern":r"needle\body","literal":true}),
+                    format!("grep {:?} in {label}", r"needle\body"),
+                ),
+            ] {
+                let out = registry.execute(tool, args, &ctx).await.unwrap();
+                let source = source.replace('"', "");
+                assert!(out.contains(&format!("source=\"{source}\"")), "{out}");
+                if tool == "read" || tool == "grep" {
+                    assert!(out.contains(r"needle\body"), "{out}");
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn read_allows_outside_cwd() {

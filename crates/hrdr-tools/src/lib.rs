@@ -1514,8 +1514,9 @@ pub trait Tool: Send + Sync {
     /// In an audit this is exactly what you want attached to every byte: the file
     /// path for `read`, the pattern and path for `grep`, the command for `shell`.
     /// Defaults to the tool's name, which is true but uninformative — override it
-    /// wherever the arguments say something better.
-    fn output_source(&self, _args: &serde_json::Value) -> String {
+    /// wherever the arguments say something better. Apply `unix_style_paths` only
+    /// to known filesystem paths, never patterns, commands, or arbitrary content.
+    fn output_source(&self, _args: &serde_json::Value, _unix_style_paths: bool) -> String {
         self.name().to_string()
     }
 
@@ -1932,7 +1933,7 @@ impl ToolRegistry {
         // one envelope, here, because here is the only place every tool goes. See
         // `SandboxPolicy::wrap_tool_results`.
         let source = (ctx.sandbox.wrap_tool_results && !tool.wraps_own_output())
-            .then(|| tool.output_source(&args));
+            .then(|| tool.output_source(&args, ctx.unix_style_paths));
         let wrap = |out: String| -> String {
             if let Some(source) = source.as_ref() {
                 wrap_untrusted(source, &out)
@@ -2707,7 +2708,7 @@ mod tests {
             fn read_only(&self) -> bool {
                 true
             }
-            fn output_source(&self, args: &serde_json::Value) -> String {
+            fn output_source(&self, args: &serde_json::Value, _unix_style_paths: bool) -> String {
                 format!("file {}", args["path"].as_str().unwrap_or("?"))
             }
             async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {

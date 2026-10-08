@@ -47,8 +47,9 @@ struct Collected {
 #[async_trait]
 impl Tool for TreeTool {
     /// The directory walked — as with `ls`, the names themselves are content.
-    fn output_source(&self, args: &serde_json::Value) -> String {
+    fn output_source(&self, args: &serde_json::Value, unix_style_paths: bool) -> String {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = crate::display_path(Path::new(path), unix_style_paths);
         format!("tree of {path}")
     }
 
@@ -119,7 +120,7 @@ impl Tool for TreeTool {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.to_string_lossy().to_string())
         };
-        let out = render_tree(&root_label, &entries);
+        let out = render_tree(&root_label, &entries, ctx.unix_style_paths);
 
         Ok(truncate(&out, ctx.max_output))
     }
@@ -294,8 +295,14 @@ fn build_sorted(
 /// second left-to-right pass carrying a small stack of each open ancestor's
 /// own last-child flag (that's what decides whether its column draws a
 /// continuation bar `│` or a blank gap).
-fn render_tree(root_label: &str, entries: &[Collected]) -> String {
-    let mut buf = format!("{}/\n", root_label);
+fn render_tree(root_label: &str, entries: &[Collected], unix_style_paths: bool) -> String {
+    let directory_suffix = if cfg!(windows) && !unix_style_paths {
+        "\\"
+    } else {
+        "/"
+    };
+    let root_label = crate::display_path(Path::new(root_label), unix_style_paths);
+    let mut buf = format!("{root_label}{directory_suffix}\n");
     if entries.is_empty() {
         return buf;
     }
@@ -340,11 +347,14 @@ fn render_tree(root_label: &str, entries: &[Collected]) -> String {
             "├── "
         });
 
-        let name = &entries[i].components[depth - 1];
+        let name = crate::display_path(
+            Path::new(&entries[i].components[depth - 1]),
+            unix_style_paths,
+        );
         let suffix = if entries[i].is_symlink {
             "@"
         } else if entries[i].is_dir {
-            "/"
+            directory_suffix
         } else {
             ""
         };
@@ -483,21 +493,27 @@ mod tests {
     #[test]
     fn render_tree_matches_naive_reference() {
         let entries = sample_entries();
-        let fast = render_tree("root", &entries);
+        let fast = render_tree("root", &entries, true);
         let naive = render_tree_naive("root", &entries);
         assert_eq!(fast, naive, "linear render diverged from reference");
 
         // Empty, single-entry, and a deep single chain (exercises every prefix
         // column at successive depths) all agree too.
-        assert_eq!(render_tree("root", &[]), render_tree_naive("root", &[]));
+        assert_eq!(
+            render_tree("root", &[], true),
+            render_tree_naive("root", &[])
+        );
         let one = vec![collected("only.rs")];
-        assert_eq!(render_tree("root", &one), render_tree_naive("root", &one));
+        assert_eq!(
+            render_tree("root", &one, true),
+            render_tree_naive("root", &one)
+        );
         let chain: Vec<Collected> = ["a/", "a/b/", "a/b/c/", "a/b/c/d.rs"]
             .iter()
             .map(|s| collected(s))
             .collect();
         assert_eq!(
-            render_tree("root", &chain),
+            render_tree("root", &chain, true),
             render_tree_naive("root", &chain)
         );
 
@@ -507,7 +523,7 @@ mod tests {
             .map(|s| collected(s))
             .collect();
         assert_eq!(
-            render_tree("root", &last_dir_with_children),
+            render_tree("root", &last_dir_with_children, true),
             render_tree_naive("root", &last_dir_with_children)
         );
 
@@ -518,7 +534,7 @@ mod tests {
             .map(|s| collected(s))
             .collect();
         assert_eq!(
-            render_tree("root", &non_last_dir_with_children),
+            render_tree("root", &non_last_dir_with_children, true),
             render_tree_naive("root", &non_last_dir_with_children)
         );
 
@@ -529,7 +545,7 @@ mod tests {
             .map(|s| collected(s))
             .collect();
         assert_eq!(
-            render_tree("root", &deep_non_last),
+            render_tree("root", &deep_non_last, true),
             render_tree_naive("root", &deep_non_last)
         );
         let deep_last: Vec<Collected> = ["a/", "a/b/", "a/b/c.txt"]
@@ -537,7 +553,7 @@ mod tests {
             .map(|s| collected(s))
             .collect();
         assert_eq!(
-            render_tree("root", &deep_last),
+            render_tree("root", &deep_last, true),
             render_tree_naive("root", &deep_last)
         );
     }
@@ -551,7 +567,7 @@ mod tests {
             .iter()
             .map(|s| collected(s))
             .collect();
-        let out = render_tree("root", &entries);
+        let out = render_tree("root", &entries, true);
 
         assert!(
             out.contains("└── d/"),
@@ -580,7 +596,7 @@ mod tests {
             .iter()
             .map(|s| collected(s))
             .collect();
-        let out = render_tree("root", &entries);
+        let out = render_tree("root", &entries, true);
 
         assert!(out.contains("├── d/"), "non-last dir needs ├──: {out}");
         assert!(
@@ -604,7 +620,7 @@ mod tests {
             .iter()
             .map(|s| collected(s))
             .collect();
-        let out = render_tree("root", &non_last);
+        let out = render_tree("root", &non_last, true);
         assert!(out.contains("├── a/"), "non-last a/: {out}");
         assert!(out.contains("│   └── b/"), "b under non-last a/: {out}");
         assert!(
@@ -619,7 +635,7 @@ mod tests {
             .iter()
             .map(|s| collected(s))
             .collect();
-        let out = render_tree("root", &last);
+        let out = render_tree("root", &last, true);
         assert!(out.contains("└── a/"), "last a/: {out}");
         assert!(out.contains("    └── b/"), "b under last a/: {out}");
         assert!(
