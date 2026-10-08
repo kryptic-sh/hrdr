@@ -1049,6 +1049,9 @@ mod tests {
         fn cwd(&self) -> std::path::PathBuf {
             std::env::temp_dir()
         }
+        fn unix_style_paths(&self) -> bool {
+            self.cfg.unix_style_paths
+        }
         fn project_instructions(&self) -> hrdr_agent::ProjectInstructions {
             // This host's agent is built without a sandbox, so it is not jailed.
             hrdr_agent::ProjectInstructions::Load

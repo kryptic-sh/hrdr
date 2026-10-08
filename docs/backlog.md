@@ -180,6 +180,11 @@ verified. Fifth-push check `37846228890` (`9f3690b`) passed nextest, Clippy,
 build/smoke on Windows/Linux/macOS and the Windows leak guard. Linux/macOS
 ordinary tests under the leak guard still failed on the same registration
 `WouldBlock`; the bounded-retry test correction remains approval-blocked.
+Tenth-push run `37855182787` (`b707018`) also failed Windows nextest in
+`bang_command_output_is_capped_while_streaming_not_just_at_the_end` with
+`timed out waiting for shell events`. macOS ordinary tests additionally hit
+`WouldBlock` in `mutation_lock_blocks_independent_handles_and_registration`. The
+registration and streaming test-contract corrections still await approval.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
@@ -2474,17 +2479,17 @@ and **not** fixed.
   and refusal labels (including stale-read errors), skipped-file lists, diff
   paths, built-in filesystem tool headlines, read/search/listing labels and
   filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
-  overflow pointers, cwd chrome, and session-picker cwd rows already use it.
-  Remaining work includes command/status output, discovery/theme labels,
-  path-bearing notices, prompts, attachments/completion labels, and other tools.
-  Live reload updates subsequent main-agent tool calls and newly spawned
-  children; existing children retain their own setting. Cwd/picker caches
-  restyle on reload. Keep this display-only: do not change filesystem targets or
-  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
-  rewrite file bodies, user prose, or captured shell output. Cover both settings
-  and unchanged Unix behavior at each real rendering seam, including
-  config-to-agent wiring. Complete these presentation surfaces before moving to
-  the newly prioritized self-update tool.
+  overflow pointers, cwd chrome, session-picker cwd rows, command/status output,
+  reload/resume notices, and default editor notices already use it. Remaining
+  work includes discovery/theme labels, path-bearing notices, prompts,
+  attachments/completion labels, and other tools. Live reload updates subsequent
+  main-agent tool calls and newly spawned children; existing children retain
+  their own setting. Cwd/picker caches restyle on reload. Keep this
+  display-only: do not change filesystem targets or literal Unix backslashes.
+  Preserve unified-diff prefix semantics. Never rewrite file bodies, user prose,
+  or captured shell output. Cover both settings and unchanged Unix behavior at
+  each real rendering seam, including config-to-agent wiring. Complete these
+  presentation surfaces before moving to the newly prioritized self-update tool.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

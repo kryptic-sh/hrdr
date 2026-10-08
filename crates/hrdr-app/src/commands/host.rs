@@ -58,6 +58,9 @@ pub trait CommandHost {
     /// Working directory the tools operate in.
     fn cwd(&self) -> PathBuf;
 
+    /// Path-label style currently used by the frontend's chrome.
+    fn unix_style_paths(&self) -> bool;
+
     /// Whether this session may read project-scoped instruction files out of
     /// [`Self::cwd`] — the session agent's own
     /// [`hrdr_agent::Agent::project_instructions`], and the only answer a
@@ -258,9 +261,10 @@ pub trait CommandHost {
     /// handler (`xdg-open` / `open` / `start`); the TUI overrides to suspend the
     /// terminal and run `$EDITOR` instead.
     fn open_editor(&mut self, path: PathBuf) {
+        let label = hrdr_tools::display_path(&path, self.unix_style_paths());
         let line = match open_system_handler(&path) {
-            Ok(()) => format!("opened {} in the system editor", path.display()),
-            Err(e) => format!("couldn't open {}: {e}", path.display()),
+            Ok(()) => format!("opened {label} in the system editor"),
+            Err(e) => format!("couldn't open {label}: {e}"),
         };
         self.info(line);
     }

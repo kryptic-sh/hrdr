@@ -2815,7 +2815,7 @@ impl App {
                 self.system(if manual {
                     hrdr_app::RELOAD_MANUAL_MSG.to_string()
                 } else {
-                    hrdr_app::reload_hot_message()
+                    hrdr_app::reload_hot_message(self.unix_style_paths())
                 });
             }
             Err(e) => self.system(hrdr_app::reload_invalid_message(&e)),

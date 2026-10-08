@@ -495,6 +495,7 @@ impl super::App {
             &session.state,
             std::path::Path::new(&self.current_cwd()),
             &self.state().base_url,
+            self.unix_style_paths(),
         );
         self.adopt_state(session.state, Some(id));
         self.scroll_offset = 0;

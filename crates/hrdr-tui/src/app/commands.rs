@@ -310,6 +310,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn cwd(&self) -> std::path::PathBuf {
         hrdr_app::agent_cwd(&self.app.agent)
     }
+    fn unix_style_paths(&self) -> bool {
+        self.app.unix_style_paths()
+    }
     fn project_instructions(&self) -> hrdr_agent::ProjectInstructions {
         self.app.project_instructions
     }

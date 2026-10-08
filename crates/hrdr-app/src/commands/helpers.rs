@@ -25,9 +25,12 @@ pub const RELOAD_MANUAL_MSG: &str = "reloaded config (theme, effort, toggles)";
 /// Hot-reload notice, naming the config file that changed (home collapsed to
 /// `~`). Falls back to the bare notice when there's no resolvable config path
 /// (no `HOME` / `XDG_CONFIG_HOME`).
-pub fn reload_hot_message() -> String {
+pub fn reload_hot_message(unix_style_paths: bool) -> String {
     match hrdr_agent::config_file_path() {
-        Some(p) => format!("config reloaded ({})", crate::display_dir(&p)),
+        Some(p) => format!(
+            "config reloaded ({})",
+            hrdr_agent::display_dir_with_style(&p, unix_style_paths)
+        ),
         None => "config reloaded".to_string(),
     }
 }
@@ -84,7 +87,12 @@ pub struct ResumePlan {
 
 /// The `/resume` semantics: follow the session's working directory (in-process
 /// only) and surface the notices that go with it.
-pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
+pub fn resume_plan(
+    session: &SessionState,
+    prev_cwd: &Path,
+    current_base_url: &str,
+    unix_style_paths: bool,
+) -> ResumePlan {
     let mut lines = vec![format!(
         "resumed '{}' ({} messages)",
         session.name,
@@ -94,13 +102,16 @@ pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &s
     if !session.cwd.is_empty() && Path::new(&session.cwd) != prev_cwd {
         let target = PathBuf::from(&session.cwd);
         if target.is_dir() {
-            lines.push(format!("cwd → {}", target.display()));
+            lines.push(format!(
+                "cwd → {}",
+                hrdr_tools::display_path(&target, unix_style_paths)
+            ));
             new_cwd = Some(target);
         } else {
             lines.push(format!(
                 "note: session cwd {} no longer exists; staying in {}",
-                session.cwd,
-                prev_cwd.display()
+                hrdr_tools::display_path(&target, unix_style_paths),
+                hrdr_tools::display_path(prev_cwd, unix_style_paths)
             ));
         }
     }
@@ -491,17 +502,71 @@ pub async fn git_working_diff(cwd: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod reload_message_tests {
-    /// The hot-reload notice names the config file that changed. The path is
-    /// whatever `config_file_path()` resolves to (home collapsed to `~`), so
-    /// assert on its shape rather than an absolute path.
     #[test]
-    fn hot_reload_notice_names_the_config_file() {
-        let msg = super::reload_hot_message();
-        assert!(msg.starts_with("config reloaded"), "{msg}");
-        // With no HOME/XDG the path is unresolvable and the bare notice is used.
-        if hrdr_agent::config_file_path().is_some() {
-            assert!(msg.contains("config.toml"), "{msg}");
-            assert!(msg.ends_with(')'), "{msg}");
+    fn hot_reload_path_style_names_the_config_file() {
+        let path = hrdr_agent::config_file_path().expect("sandbox config path");
+        for style in [true, false] {
+            assert_eq!(
+                super::reload_hot_message(style),
+                format!(
+                    "config reloaded ({})",
+                    hrdr_agent::display_dir_with_style(&path, style)
+                )
+            );
+        }
+        let error = r"invalid user text C:\keep/this";
+        assert_eq!(
+            super::reload_invalid_message(&error),
+            format!("config invalid — keeping current settings: {error}")
+        );
+    }
+
+    #[test]
+    fn resume_path_style_preserves_state_and_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = dir.path().join("previous");
+        let target = dir.path().join(if cfg!(unix) {
+            r"literal\name"
+        } else {
+            "target"
+        });
+        std::fs::create_dir(&target).unwrap();
+        for cwd in [&target, &dir.path().join("missing/child")] {
+            let session = crate::SessionState {
+                cwd: cwd.display().to_string(),
+                name: r"user\name/unchanged".to_string(),
+                base_url: r"https://example.invalid/user\text".to_string(),
+                ..Default::default()
+            };
+            let before = serde_json::to_string(&session).unwrap();
+            let slug = hrdr_agent::cwd_slug(&session.cwd);
+            for style in [true, false] {
+                let plan = super::resume_plan(&session, &prev, "current", style);
+                assert_eq!(plan.lines[0], r"resumed 'user\name/unchanged' (0 messages)");
+                if cwd == &target {
+                    assert_eq!(plan.new_cwd.as_ref(), Some(&target));
+                    assert_eq!(
+                        plan.lines[1],
+                        format!("cwd → {}", hrdr_tools::display_path(cwd, style))
+                    );
+                } else {
+                    assert!(plan.new_cwd.is_none());
+                    assert_eq!(
+                        plan.lines[1],
+                        format!(
+                            "note: session cwd {} no longer exists; staying in {}",
+                            hrdr_tools::display_path(cwd, style),
+                            hrdr_tools::display_path(&prev, style)
+                        )
+                    );
+                }
+                assert_eq!(
+                    plan.lines[2],
+                    r"note: session endpoint was https://example.invalid/user\text (current: current)"
+                );
+                assert_eq!(serde_json::to_string(&session).unwrap(), before);
+                assert_eq!(hrdr_agent::cwd_slug(&session.cwd), slug);
+            }
         }
     }
 }

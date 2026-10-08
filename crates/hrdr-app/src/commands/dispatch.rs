@@ -84,6 +84,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let model = host.model();
             let base_url = host.base_url();
             let cwd = host.cwd();
+            let unix_style_paths = host.unix_style_paths();
             let session = match (host.session_id(), host.session_label()) {
                 (Some(id), Some(name)) => format!("{id}  (name: {name})"),
                 (Some(id), None) => id,
@@ -123,7 +124,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                     let a = agent.lock().await;
                     (a.temperature(), a.message_count(), a.prompt_cache_active())
                 };
-                let dir = crate::display_dir(&cwd);
+                let dir = hrdr_agent::display_dir_with_style(&cwd, unix_style_paths);
                 let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
                 format!(
                     "session: {session}\nmodel: {model}\nendpoint: {base_url}\ncwd: {dir} \
@@ -139,6 +140,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         "export" => {
             let agent = host.agent();
             let cwd = host.cwd();
+            let unix_style_paths = host.unix_style_paths();
             let arg = arg.clone();
             host.spawn_line(Box::pin(async move {
                 let msgs = agent.lock().await.messages_owned();
@@ -148,7 +150,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                     .await
                 {
                     Ok(Ok((path, lines))) => {
-                        format!("exported transcript to {} ({lines} lines)", path.display())
+                        format!(
+                            "exported transcript to {} ({lines} lines)",
+                            hrdr_tools::display_path(&path, unix_style_paths)
+                        )
                     }
                     Ok(Err(e)) => format!("export failed: {e}"),
                     Err(e) => format!("export task failed: {e}"),
@@ -251,8 +256,12 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "cwd" => {
             let cur = host.cwd();
+            let unix_style_paths = host.unix_style_paths();
             if arg.is_empty() {
-                host.info(format!("cwd: {}", cur.display()));
+                host.info(format!(
+                    "cwd: {}",
+                    hrdr_tools::display_path(&cur, unix_style_paths)
+                ));
                 return true;
             }
             if host.is_busy() {
@@ -261,7 +270,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             let new = crate::resolve_under(&cur, &arg);
             if !new.is_dir() {
-                host.info(format!("not a directory: {}", new.display()));
+                host.info(format!(
+                    "not a directory: {}",
+                    hrdr_tools::display_path(&new, unix_style_paths)
+                ));
                 return true;
             }
             let new = new.canonicalize().unwrap_or(new);
@@ -276,7 +288,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(format!(
                     "not a trusted directory: {} — hrdr asks about a directory when it opens \
                      there, and cannot ask mid-session. Start hrdr in it to answer.",
-                    new.display()
+                    hrdr_tools::display_path(&new, unix_style_paths)
                 ));
                 return true;
             }
@@ -287,7 +299,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 String::new()
             }));
             host.cwd_changed(&new);
-            host.info(format!("cwd → {}", new.display()));
+            host.info(format!(
+                "cwd → {}",
+                hrdr_tools::display_path(&new, unix_style_paths)
+            ));
         }
         "verbose" => {
             // A strict on/off toggle: a bare `/verbose` flips the current
@@ -494,9 +509,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let model = host.model();
             let base_url = host.base_url();
             let cwd = host.cwd();
+            let unix_style_paths = host.unix_style_paths();
             let ctx_win = host.context_window();
             let config_path = hrdr_agent::config_file_path()
-                .map(|p| p.display().to_string())
+                .map(|p| hrdr_tools::display_path(&p, unix_style_paths))
                 .unwrap_or_else(|| "—".to_string());
             let ctx_win_str = ctx_win.map_or_else(|| "—".to_string(), |w| w.to_string());
             // Only pure computations here: every filesystem probe (git
@@ -505,7 +521,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             host.info(format!(
                 "model: {model}\nendpoint: {base_url}\ncontext window: {ctx_win_str}\n\
                  cwd: {}\nconfig: {config_path}\nprobing endpoint…",
-                crate::display_dir(&cwd),
+                hrdr_agent::display_dir_with_style(&cwd, unix_style_paths),
             ));
             host.spawn_popup(Box::pin(async move {
                 // `in_git_repo` walks ancestors calling `.exists()` and
@@ -522,7 +538,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                         let exists = p.exists();
                         format!(
                             "auth: {} ({})",
-                            p.display(),
+                            hrdr_tools::display_path(&p, unix_style_paths),
                             if exists { "found" } else { "not found" }
                         )
                     })
@@ -680,6 +696,7 @@ mod tests {
         /// command output (export results, /doctor reports) is assertable.
         async_log: Arc<std::sync::Mutex<Vec<String>>>,
         busy: bool,
+        unix_style_paths: bool,
         model: hrdr_agent::ModelRef,
         input: String,
         /// What prompts command dispatch asked the frontend to run, with visibility.
@@ -692,6 +709,7 @@ mod tests {
         cache: Option<(f64, usize, usize)>,
         /// What `/paste` reads back, when a test sets it.
         clipboard: Option<String>,
+        resumed: Option<(String, Session)>,
     }
 
     impl TestHost {
@@ -712,6 +730,7 @@ mod tests {
                 popup_log: Vec::new(),
                 async_log: Arc::new(std::sync::Mutex::new(Vec::new())),
                 busy: false,
+                unix_style_paths: true,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
                 prompts: Vec::new(),
@@ -719,6 +738,7 @@ mod tests {
                 queued_compactions: Vec::new(),
                 cache: None,
                 clipboard: None,
+                resumed: None,
             }
         }
     }
@@ -739,6 +759,12 @@ mod tests {
         fn cwd(&self) -> std::path::PathBuf {
             self.cwd.clone()
         }
+        fn unix_style_paths(&self) -> bool {
+            self.unix_style_paths
+        }
+        fn cwd_changed(&mut self, new: &Path) {
+            self.cwd = new.to_path_buf();
+        }
         fn project_instructions(&self) -> hrdr_agent::ProjectInstructions {
             // This host's agent is built without a sandbox, so it is not jailed.
             hrdr_agent::ProjectInstructions::Load
@@ -758,7 +784,9 @@ mod tests {
         }
         fn set_session_label(&mut self, _name: String) {}
         fn autosave(&mut self) {}
-        fn resume(&mut self, _id: String, _session: Session) {}
+        fn resume(&mut self, id: String, session: Session) {
+            self.resumed = Some((id, session));
+        }
         fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send> {
             let log = self.async_log.clone();
             Box::new(move |_, line| {
@@ -791,6 +819,188 @@ mod tests {
         }
         fn queue_compaction(&mut self, instructions: Option<String>) {
             self.queued_compactions.push(instructions);
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_refusal_path_style_does_not_launch_a_handler() {
+        for style in [true, false] {
+            let mut host = TestHost::new(std::env::temp_dir());
+            host.unix_style_paths = style;
+            // A NUL cannot be passed as an OS argument, so no editor is launched.
+            let path = host.cwd.join("nested\\file\0.md");
+            host.open_editor(path.clone());
+            let output = host.info_log.last().unwrap();
+            let prefix = format!("couldn't open {}: ", hrdr_tools::display_path(&path, style));
+            assert!(output.starts_with(&prefix), "{output:?}");
+            assert!(!output.strip_prefix(&prefix).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_path_style_keeps_raw_lookup_identity() {
+        hrdr_test_support::with_test_env(|dir| {
+            let cwd = dir.path().join(r"lookup\raw");
+            let raw = cwd.display().to_string();
+            let normalized = raw.replace('\\', "/");
+            assert_ne!(raw, normalized);
+            let session = Session::new(crate::SessionState {
+                cwd: raw.clone(),
+                name: "raw identity".to_string(),
+                ..Default::default()
+            });
+            let decoy = Session::new(crate::SessionState {
+                cwd: normalized,
+                name: "wrong identity".to_string(),
+                ..Default::default()
+            });
+            let saved = session.save("path-style-lookup").unwrap();
+            let other = decoy.save("path-style-lookup").unwrap();
+            assert_ne!(saved, other);
+            for style in [true, false] {
+                let mut host = TestHost::new(cwd.clone());
+                host.unix_style_paths = style;
+                assert!(dispatch(&mut host, "/resume path-style-lookup"));
+                let (id, loaded) = host.resumed.as_ref().expect("resolved session");
+                assert_eq!(id, "path-style-lookup");
+                assert_eq!(loaded.state.cwd, raw);
+                assert_eq!(loaded.state.name, "raw identity");
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn cwd_path_style_preserves_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        let target = dir.path().join(if cfg!(unix) {
+            r"literal\name"
+        } else {
+            "target"
+        });
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        for style in [true, false] {
+            let mut host = TestHost::new(here.clone());
+            host.unix_style_paths = style;
+            assert!(dispatch(&mut host, "/cwd"));
+            assert_eq!(
+                host.info_log.last().unwrap(),
+                &format!("cwd: {}", hrdr_tools::display_path(&here, style))
+            );
+            let missing = here.join("missing/child");
+            assert!(dispatch(&mut host, "/cwd missing/child"));
+            assert_eq!(
+                host.info_log.last().unwrap(),
+                &format!(
+                    "not a directory: {}",
+                    hrdr_tools::display_path(&missing, style)
+                )
+            );
+            let untrusted = dir.path().join(format!("untrusted-{style}"));
+            std::fs::create_dir(&untrusted).unwrap();
+            assert!(dispatch(
+                &mut host,
+                &format!("/cwd {}", untrusted.display())
+            ));
+            assert!(host.info_log.last().unwrap().starts_with(&format!(
+                "not a trusted directory: {} —",
+                hrdr_tools::display_path(&untrusted.canonicalize().unwrap(), style)
+            )));
+            assert_eq!(host.cwd, here);
+            hrdr_agent::trust::trust(&target).unwrap();
+            assert!(dispatch(&mut host, &format!("/cwd {}", target.display())));
+            let raw = target.canonicalize().unwrap();
+            assert_eq!(
+                host.info_log.last().unwrap(),
+                &format!("cwd → {}", hrdr_tools::display_path(&raw, style))
+            );
+            assert_eq!(host.cwd, raw);
+            settle(|| host.agent.try_lock().is_ok_and(|a| a.cwd() == raw)).await;
+            assert_eq!(host.agent.lock().await.cwd(), raw);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_path_style_uses_frontend_setting() {
+        let cwd = std::path::PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .unwrap(),
+        )
+        .join(r"project\name");
+        for style in [true, false] {
+            let mut host = TestHost::new(cwd.clone());
+            host.unix_style_paths = style;
+            assert!(dispatch(&mut host, "/status"));
+            settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+            let output = host.async_log.lock().unwrap().join("\n");
+            let expected = hrdr_agent::display_dir_with_style(&cwd, style);
+            assert!(expected.starts_with('~'));
+            assert!(output.contains(&format!("cwd: {expected} (")), "{output}");
+            assert_eq!(host.agent.lock().await.cwd(), cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn export_path_style_preserves_written_target() {
+        for style in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host = TestHost::new(dir.path().to_path_buf());
+            host.unix_style_paths = style;
+            let name = if cfg!(unix) {
+                r"literal\export.md"
+            } else {
+                "export.md"
+            };
+            let target = dir.path().join(name);
+            assert!(dispatch(&mut host, &format!("/export {name}")));
+            settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+            let output = host.async_log.lock().unwrap().join("\n");
+            assert!(
+                output.starts_with(&format!(
+                    "exported transcript to {} (",
+                    hrdr_tools::display_path(&target, style)
+                )),
+                "{output}"
+            );
+            assert!(target.is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_path_style_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        for style in [true, false] {
+            let mut host = TestHost::new(dir.path().to_path_buf());
+            host.unix_style_paths = style;
+            assert!(dispatch(&mut host, "/doctor"));
+            let header = host.info_log.last().unwrap();
+            assert!(
+                header.contains(&format!(
+                    "cwd: {}\n",
+                    hrdr_agent::display_dir_with_style(dir.path(), style)
+                )),
+                "{header}"
+            );
+            let config = hrdr_agent::config_file_path().unwrap();
+            assert!(
+                header.contains(&format!(
+                    "config: {}\n",
+                    hrdr_tools::display_path(&config, style)
+                )),
+                "{header}"
+            );
+            settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+            let output = host.async_log.lock().unwrap().join("\n");
+            let auth = hrdr_agent::auth_file_path().unwrap();
+            assert!(
+                output.contains(&format!(
+                    "auth: {} (",
+                    hrdr_tools::display_path(&auth, style)
+                )),
+                "{output}"
+            );
         }
     }
 
