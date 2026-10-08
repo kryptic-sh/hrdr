@@ -43,9 +43,9 @@ pub fn cwd_slug(cwd: &str) -> String {
 /// Display form of `dir`, with the home directory collapsed to `~`.
 pub fn display_dir(dir: &Path) -> String {
     let s = dir.to_string_lossy();
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => collapse_home(&s, &home),
-        _ => s.into_owned(),
+    match crate::agents_dir::home_dir() {
+        Some(home) => collapse_home(&s, &home.to_string_lossy()),
+        None => s.into_owned(),
     }
 }
 
@@ -56,8 +56,9 @@ pub fn display_dir(dir: &Path) -> String {
 /// string, or the next char is a separator. Pure, so it's testable without
 /// touching the process-wide `HOME`.
 fn collapse_home(path: &str, home: &str) -> String {
-    if let Some(rest) = path.strip_prefix(home)
-        && (rest.is_empty() || rest.starts_with('/'))
+    if !home.is_empty()
+        && let Some(rest) = path.strip_prefix(home)
+        && (rest.is_empty() || rest.starts_with(std::path::is_separator))
     {
         return format!("~{rest}");
     }
@@ -70,6 +71,95 @@ mod tests {
 
     // These test the pure `collapse_home` core rather than `display_dir` so they
     // never touch the process-wide `HOME` — no env mutation, no cross-test race.
+
+    #[test]
+    fn empty_home_does_not_collapse() {
+        assert_eq!(collapse_home("/proj", ""), "/proj");
+        assert_eq!(collapse_home("", ""), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_collapses_without_changing_suffix_separators() {
+        let home = r"C:\Users\mx";
+        assert_eq!(collapse_home(home, home), "~");
+        assert_eq!(collapse_home(r"C:\Users\mx\proj", home), r"~\proj");
+        assert_eq!(collapse_home(r"C:\Users\mx/proj\src", home), r"~/proj\src");
+        assert_eq!(
+            collapse_home(r"C:\Users\mxaddict\proj", home),
+            r"C:\Users\mxaddict\proj"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_dir_uses_sandboxed_userprofile_without_home() {
+        let home = std::env::var_os("HOME");
+        let profile = std::env::var_os("USERPROFILE");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "paths::tests::display_dir_userprofile_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(hrdr_test_support::WINDOWS_USERPROFILE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("USERPROFILE fallback assertions completed"));
+        assert_eq!(std::env::var_os("HOME"), home);
+        assert_eq!(std::env::var_os("USERPROFILE"), profile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run by display_dir_uses_sandboxed_userprofile_without_home in a private process"]
+    fn display_dir_userprofile_child() {
+        let root = hrdr_test_support::sandbox_root();
+        assert_eq!(
+            root,
+            std::env::temp_dir().join(format!("hrdr-test-sandbox-{}", std::process::id()))
+        );
+        let home = root.join("home");
+        assert!(std::env::var_os("HOME").is_none());
+        assert!(std::env::var_os(hrdr_test_support::WINDOWS_USERPROFILE_CHILD_ENV).is_none());
+        assert_eq!(
+            std::env::var_os("USERPROFILE").as_deref(),
+            Some(home.as_os_str())
+        );
+        for (var, dir) in [
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            let expected = root.join(dir);
+            assert_eq!(std::env::var_os(var).as_deref(), Some(expected.as_os_str()));
+            assert!(expected.is_dir());
+            hrdr_test_support::assert_sandboxed(&expected);
+        }
+        assert!(home.is_dir());
+        assert_eq!(display_dir(&home.join("child")), r"~\child");
+        let sibling = root.join("home-other").join("child");
+        assert_eq!(display_dir(&sibling), sibling.to_string_lossy());
+        println!("USERPROFILE fallback assertions completed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_literal_backslash_is_not_a_home_boundary() {
+        assert_eq!(
+            collapse_home(r"/home/mx\proj", "/home/mx"),
+            r"/home/mx\proj"
+        );
+    }
 
     #[test]
     fn display_dir_collapses_home_at_a_path_boundary() {

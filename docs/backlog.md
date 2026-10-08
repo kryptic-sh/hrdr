@@ -2432,8 +2432,41 @@ and **not** fixed.
 - **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
   path whose case differs from the workspace root gets no diagnostics on a
   case-insensitive filesystem.
-- **`display_dir` / `collapse_home` read only `HOME` and match only `/`**, so no
-  path shortens to `~` on Windows. Cosmetic.
+- **Mixed Windows separators in rendered tool paths — reported 2026-10-09.**
+  Edit results render paths such as
+  `C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`, including unified
+  diff headers `--- a/C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`
+  and `+++ b/C:\Users\sitem\Projects\kryptic-sh\hrdr\docs/backlog.md`. Trace
+  result messages and diff-label construction. Add a Windows-only boolean
+  configuration setting named `unix_style_paths`, default `true`: `true` renders
+  path separators as `/`, and `false` renders them as `\`. Linux/macOS rendering
+  remains unchanged. This is display-only: do not change filesystem targets or
+  treat literal Unix backslashes as separators. Preserve unified-diff prefix
+  semantics. Cover the default, both values, result messages, diff headers, and
+  unchanged Unix behavior with regression tests. Handle after the current
+  home-path display slice.
+- **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
+  reproduced the same issue in both Alacritty and Windows 11 Terminal,
+  correcting the earlier observation that Windows 11 Terminal was unaffected.
+  The user reports blinking in sync with text updates: the cursor briefly moves
+  from transcript text to the input box, apparently following the render
+  cadence. Prioritize visibility during frame writes and final input-cursor
+  positioning, rather than assuming this is the terminal's periodic cursor-blink
+  setting. Investigate cursor visibility/style commands, rendering and focus
+  lifecycle, Windows console/ConPTY behavior, and Alacritty defaults.
+  Distinguish intended input-cursor blinking from an unintended visible cursor
+  or redraw flicker. Reproduce without disturbing the user's desktop; fix the
+  cause if feasible and cover cursor command/lifecycle behavior with regression
+  tests. If not fixable in hrdr, record the verified limitation and reason here,
+  including any external setting/workaround and unverified reproduction gaps. Do
+  not attribute the cause to Alacritty without evidence.
+- **Logo animation stalls in Windows 11 Terminal — reported 2026-10-09.** The
+  header's animated hrdr logo does not animate until the user types. Trace timer
+  ticks, idle event polling, redraw scheduling, and animation cache keys;
+  reproduce without keyboard events. Verify expected idle animation behavior
+  before fixing it and test timer-driven redraws. Keep this distinct from cursor
+  flicker unless evidence establishes a shared cause; record any reproduction
+  limitation or external-terminal blocker.
 - **The Job Object is assigned after spawn.** A descendant forked in that window
   escapes the tree kill; documented in the `proc` module docs. The race-free
   form (`CREATE_SUSPENDED` → assign → resume) is awkward through tokio.
@@ -2466,7 +2499,11 @@ and **not** fixed.
   so not attributed. A likely shape if it returns: Windows cannot delete a
   directory that is a live process's cwd or holds an open file, so a `TempDir`
   dropped while a spawned child is still being torn down leaks silently. The
-  guard now lists what each leaked dir holds, which names the test.
+  guard now lists what each leaked dir holds, which names the test. During the
+  2026-10-09 home-display slice, an additional armed leak-guard failure was
+  reported: leftover `.tmp*` directories containing `data`, while the
+  real-user-state sentinel passed. This result has not been independently
+  reproduced or attributed; do not report the armed guard as green.
 - **Not reviewed:** the `hjkl-clipboard` Windows backend.
 
 ## Correctness review 2026-08-14

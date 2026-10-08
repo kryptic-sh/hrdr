@@ -37,6 +37,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Jailed tool output still derives its provenance from the original args without
   cloning the JSON value (`crates/hrdr-tools`).
 
+### Fixed
+
+- **Windows home-directory display now falls back to `USERPROFILE`.**
+  `display_dir` reuses the shared home resolver and recognizes native separator
+  boundaries, so home descendants shorten to `~` without collapsing similarly
+  prefixed sibling directories or changing literal Unix backslashes.
+
 ## [0.16.1] - 2026-10-01
 
 ### Added

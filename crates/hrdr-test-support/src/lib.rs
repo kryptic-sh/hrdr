@@ -46,6 +46,11 @@ const SANDBOX_ENV: &str = "HRDR_TEST_SANDBOX";
 /// test can assert it never wrote there.
 const REAL_HOME_ENV: &str = "HRDR_TEST_REAL_HOME";
 
+/// Child-test mode: leave `HOME` absent while keeping `USERPROFILE` sandboxed.
+/// The ctor consumes this flag; its value must be `1`, never a profile path.
+#[cfg(windows)]
+pub const WINDOWS_USERPROFILE_CHILD_ENV: &str = "HRDR_TEST_WINDOWS_USERPROFILE_CHILD";
+
 /// Point `$HOME` and every XDG root at a throwaway directory, before `main`.
 ///
 /// Runs once per test binary, at load, single-threaded. `unsafe` marks the
@@ -74,6 +79,14 @@ fn sandbox_user_state() {
         }
         std::env::set_var(SANDBOX_ENV, &root);
         std::env::set_var("HOME", &home);
+        #[cfg(windows)]
+        {
+            let profile_child = std::env::var_os(WINDOWS_USERPROFILE_CHILD_ENV);
+            std::env::remove_var(WINDOWS_USERPROFILE_CHILD_ENV);
+            if profile_child.as_deref() == Some(std::ffi::OsStr::new("1")) {
+                std::env::remove_var("HOME");
+            }
+        }
         // hrdr's own `home_dir()` helpers fall back to this one where `HOME` is
         // unset. `dirs::home_dir()` does NOT read it on Windows — it asks the shell
         // API for the profile folder — so every user-state root below has to stay
