@@ -367,8 +367,30 @@ fn arg_str(v: &serde_json::Value, key: &str) -> Option<String> {
 /// Classify a tool call for display: what goes on the header line, and how the
 /// detail area is rendered. Falls back to a truncated args preview + plain text
 /// for tools with no special treatment (including MCP tools).
-pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
+pub fn tool_display(name: &str, args: &str, unix_style_paths: bool) -> ToolDisplay {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    let path = arg_str(&v, "path").or_else(|| {
+        matches!(name, "read" | "write" | "edit")
+            .then(|| {
+                [
+                    "file_path",
+                    "filepath",
+                    "file",
+                    "filename",
+                    "file_name",
+                    "path_to_file",
+                ]
+                .iter()
+                .find_map(|key| arg_str(&v, key))
+            })
+            .flatten()
+    });
+    let path_label = |fallback: &str| {
+        hrdr_tools::display_path(
+            std::path::Path::new(path.as_deref().unwrap_or(fallback)),
+            unix_style_paths,
+        )
+    };
     let plain = |headline: String| ToolDisplay {
         headline,
         body: ToolBody::Text,
@@ -381,14 +403,13 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
             },
         },
         "write" => {
-            let path = arg_str(&v, "path").unwrap_or_else(|| "?".into());
-            let lang = std::path::Path::new(&path)
+            let lang = std::path::Path::new(path.as_deref().unwrap_or("?"))
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
             ToolDisplay {
-                headline: path,
+                headline: path_label("?"),
                 body: ToolBody::Code {
                     lang,
                     content: arg_str(&v, "content").unwrap_or_default(),
@@ -398,24 +419,24 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
         // `edit` and `replace` return the patch they applied — the diff IS the
         // point of the call, so both render in full whether collapsed or not.
         "edit" | "replace" => ToolDisplay {
-            headline: arg_str(&v, "path").unwrap_or_else(|| "?".into()),
+            headline: path_label("?"),
             body: ToolBody::Diff,
         },
         "read" => ToolDisplay {
-            headline: read_args_summary(&v),
+            headline: read_args_summary(&v, path_label("?")),
             body: ToolBody::Read,
         },
         "grep" | "find" => {
             let mut s = arg_str(&v, "pattern").unwrap_or_default();
-            if let Some(p) = arg_str(&v, "path") {
-                s.push_str(&format!("  in {p}"));
+            if path.is_some() {
+                s.push_str(&format!("  in {}", path_label(".")));
             }
             if let Some(g) = arg_str(&v, "glob") {
                 s.push_str(&format!("  ({g})"));
             }
             plain(s)
         }
-        "ls" | "tree" => plain(arg_str(&v, "path").unwrap_or_else(|| ".".into())),
+        "ls" | "tree" => plain(path_label(".")),
         // `verify` usually takes no arguments at all, so the generic
         // arguments-as-rows fallback would render a header with nothing under
         // it. What the call is *for* is fixed, so say that.
@@ -479,12 +500,7 @@ fn arg_details(v: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 /// Compact summary of `read` args: `path  (offset: N, limit: M)`.
-fn read_args_summary(v: &serde_json::Value) -> String {
-    let mut s = v
-        .get("path")
-        .and_then(|p| p.as_str())
-        .unwrap_or("?")
-        .to_string();
+fn read_args_summary(v: &serde_json::Value, mut s: String) -> String {
     let mut parts = Vec::new();
     if let Some(o) = v.get("offset").and_then(|o| o.as_u64()).filter(|&o| o > 1) {
         parts.push(format!("offset: {o}"));
@@ -864,8 +880,80 @@ mod tool_display_tests {
     use super::*;
 
     #[test]
+    fn builtin_path_headlines_follow_style_without_rewriting_payloads() {
+        let path = r"docs\nested/backlog.rs";
+        let pattern = r"a\b/c";
+        for style in [true, false] {
+            let expected = if cfg!(windows) {
+                if style {
+                    "docs/nested/backlog.rs"
+                } else {
+                    r"docs\nested\backlog.rs"
+                }
+            } else {
+                path
+            };
+            let args = serde_json::json!({"path": path, "pattern": pattern,
+                "glob": pattern, "content": pattern, "offset": 10, "limit": 5})
+            .to_string();
+            for name in [
+                "write", "edit", "replace", "read", "grep", "find", "ls", "tree",
+            ] {
+                let d = tool_display(name, &args, style);
+                let headline = match name {
+                    "read" => format!("{expected}  (offset: 10, limit: 5)"),
+                    "grep" | "find" => format!("{pattern}  in {expected}  ({pattern})"),
+                    _ => expected.to_string(),
+                };
+                assert_eq!(d.headline, headline, "{name}, style={style}");
+                if name == "write" {
+                    assert_eq!(
+                        d.body,
+                        ToolBody::Code {
+                            lang: "rs".into(),
+                            content: pattern.into()
+                        }
+                    );
+                }
+            }
+            for name in ["read", "write", "edit"] {
+                for key in [
+                    "file_path",
+                    "filepath",
+                    "file",
+                    "filename",
+                    "file_name",
+                    "path_to_file",
+                ] {
+                    let args = serde_json::json!({key: path}).to_string();
+                    assert_eq!(
+                        tool_display(name, &args, style).headline,
+                        expected,
+                        "{name} {key}"
+                    );
+                }
+            }
+            let args = serde_json::json!({"path": path, "pattern": pattern}).to_string();
+            assert_eq!(
+                tool_display("mcp__files__read", &args, style).body,
+                ToolBody::Details(vec![
+                    ("path".into(), path.into()),
+                    ("pattern".into(), pattern.into())
+                ])
+            );
+            let args = serde_json::json!({"command": pattern}).to_string();
+            assert_eq!(
+                tool_display("shell", &args, style).body,
+                ToolBody::Shell {
+                    command: pattern.into()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn shell_puts_the_command_in_the_body_not_the_headline() {
-        let d = tool_display("shell", r#"{"command":"ls -la"}"#);
+        let d = tool_display("shell", r#"{"command":"ls -la"}"#, true);
         assert!(d.headline.is_empty());
         assert_eq!(
             d.body,
@@ -877,7 +965,11 @@ mod tool_display_tests {
 
     #[test]
     fn write_shows_path_and_contents_with_the_extension_as_lang() {
-        let d = tool_display("write", r#"{"path":"src/a.rs","content":"fn main() {}"}"#);
+        let d = tool_display(
+            "write",
+            r#"{"path":"src/a.rs","content":"fn main() {}"}"#,
+            true,
+        );
         assert_eq!(d.headline, "src/a.rs");
         assert_eq!(
             d.body,
@@ -893,6 +985,7 @@ mod tool_display_tests {
         let d = tool_display(
             "edit",
             r#"{"path":"x.rs","old_string":"a","new_string":"b"}"#,
+            true,
         );
         assert_eq!(d.headline, "x.rs");
         assert_eq!(d.body, ToolBody::Diff);
@@ -900,17 +993,21 @@ mod tool_display_tests {
 
     #[test]
     fn read_summarizes_offset_and_limit() {
-        let d = tool_display("read", r#"{"path":"x.rs","offset":10,"limit":5}"#);
+        let d = tool_display("read", r#"{"path":"x.rs","offset":10,"limit":5}"#, true);
         assert_eq!(d.headline, "x.rs  (offset: 10, limit: 5)");
         assert_eq!(d.body, ToolBody::Read);
         // offset 1 is the default — not worth the noise.
-        let d = tool_display("read", r#"{"path":"x.rs","offset":1}"#);
+        let d = tool_display("read", r#"{"path":"x.rs","offset":1}"#, true);
         assert_eq!(d.headline, "x.rs");
     }
 
     #[test]
     fn grep_shows_pattern_scope_and_glob() {
-        let d = tool_display("grep", r#"{"pattern":"fn ","path":"src","glob":"*.rs"}"#);
+        let d = tool_display(
+            "grep",
+            r#"{"pattern":"fn ","path":"src","glob":"*.rs"}"#,
+            true,
+        );
         assert_eq!(d.headline, "fn   in src  (*.rs)");
         assert_eq!(d.body, ToolBody::Text);
     }
@@ -922,6 +1019,7 @@ mod tool_display_tests {
         let d = tool_display(
             "task",
             r#"{"agent":"explore","description":"Explore the crate","prompt":"You are\n  an agent"}"#,
+            true,
         );
         assert_eq!(d.headline, "", "nothing beside the tool name");
         assert_eq!(
@@ -936,7 +1034,7 @@ mod tool_display_tests {
         );
 
         // Non-string values render as compact JSON, not as Rust debug output.
-        let d = tool_display("mcp__x__y", r#"{"a":1,"b":true,"c":[1,2],"d":null}"#);
+        let d = tool_display("mcp__x__y", r#"{"a":1,"b":true,"c":[1,2],"d":null}"#, true);
         assert_eq!(
             d.body,
             ToolBody::Details(vec![
@@ -948,11 +1046,11 @@ mod tool_display_tests {
         );
 
         // No args at all: no rows, and nothing beside the name.
-        let d = tool_display("mcp__x__y", "{}");
+        let d = tool_display("mcp__x__y", "{}", true);
         assert_eq!(d.body, ToolBody::Details(vec![]));
 
         // A bare (non-object) argument becomes one unlabelled row.
-        let d = tool_display("mcp__x__y", r#""just a string""#);
+        let d = tool_display("mcp__x__y", r#""just a string""#, true);
         assert_eq!(
             d.body,
             ToolBody::Details(vec![(String::new(), "just a string".into())])
@@ -960,10 +1058,10 @@ mod tool_display_tests {
 
         // Malformed args must not panic: they parse as null, so no rows.
         assert_eq!(
-            tool_display("mcp__x__y", "not json").body,
+            tool_display("mcp__x__y", "not json", true).body,
             ToolBody::Details(vec![])
         );
-        assert_eq!(tool_display("write", "not json").headline, "?");
+        assert_eq!(tool_display("write", "not json", true).headline, "?");
     }
 
     /// `todo` renders only its normalized replacement list from the result.
@@ -972,6 +1070,7 @@ mod tool_display_tests {
         let d = tool_display(
             "todo",
             r#"{"todos":[{"content":"first","status":"completed"}]}"#,
+            true,
         );
         assert_eq!(d.headline, "");
         assert_eq!(d.body, ToolBody::Text);
@@ -979,35 +1078,35 @@ mod tool_display_tests {
 
     #[test]
     fn git_shows_subcommand_and_args_inline() {
-        let d = tool_display("git", r#"{"args":["status","--short","--branch"]}"#);
+        let d = tool_display("git", r#"{"args":["status","--short","--branch"]}"#, true);
         assert_eq!(d.headline, "status --short --branch");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_without_args_shows_only_subcommand() {
-        let d = tool_display("git", r#"{"args":["log"]}"#);
+        let d = tool_display("git", r#"{"args":["log"]}"#, true);
         assert_eq!(d.headline, "log");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_with_empty_args_array_shows_only_subcommand() {
-        let d = tool_display("git", r#"{"args":["status"]}"#);
+        let d = tool_display("git", r#"{"args":["status"]}"#, true);
         assert_eq!(d.headline, "status");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_malformed_args_falls_back_to_empty_headline() {
-        let d = tool_display("git", "not json");
+        let d = tool_display("git", "not json", true);
         assert_eq!(d.headline, "");
         assert_eq!(d.body, ToolBody::Text);
     }
 
     #[test]
     fn git_no_args_falls_back_to_empty_headline() {
-        let d = tool_display("git", "{}");
+        let d = tool_display("git", "{}", true);
         assert_eq!(d.headline, "");
         assert_eq!(d.body, ToolBody::Text);
     }

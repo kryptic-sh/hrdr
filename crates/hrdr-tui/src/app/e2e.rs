@@ -9643,6 +9643,55 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
     }
 }
 
+#[tokio::test]
+async fn path_style_reload_rebuilds_warm_tool_headers_without_changing_payloads() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.verbose = true;
+    h.app.cfg.unix_style_paths = true;
+    let args = r#"{"path":"docs/backlog.md","old_string":"a\\b/c","new_string":"x\\y/z"}"#;
+    let result = "@@ -1 +1 @@\n-a\\b/c\n+x\\y/z";
+    let idx = h.app.transcript().len();
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "path-style".into(),
+        name: "edit".into(),
+        args: args.into(),
+        result: result.into(),
+        ok: true,
+        done: true,
+    }));
+    assert!(h.render().contains("edit docs/backlog.md"));
+    let warm = crate::ui::block_cache_ptr(h.app.render_cache_id, idx);
+    assert!(warm.is_some());
+    h.render();
+    assert_eq!(crate::ui::block_cache_ptr(h.app.render_cache_id, idx), warm);
+    for style in [false, true] {
+        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+            .unwrap();
+        h.app.apply_config_reload(true);
+        assert_eq!(h.app.cfg.unix_style_paths, style);
+        assert!(crate::ui::block_cache_ptr(h.app.render_cache_id, idx).is_none());
+        let screen = h.render();
+        let expected = if cfg!(windows) && !style {
+            r"edit docs\backlog.md"
+        } else {
+            "edit docs/backlog.md"
+        };
+        assert!(screen.contains(expected), "{screen}");
+        assert!(crate::ui::block_cache_ptr(h.app.render_cache_id, idx).is_some());
+        let EntryKind::Tool {
+            args: actual_args,
+            result: actual_result,
+            ..
+        } = &h.app.transcript()[idx].kind
+        else {
+            panic!("tool disappeared")
+        };
+        assert_eq!(actual_args, args);
+        assert_eq!(actual_result, result);
+    }
+}
+
 /// A `/theme` switch invalidates every cached block and the next render
 /// rebuilds them with the new theme's colors — the bug that made old colors
 /// persist in cached rows.

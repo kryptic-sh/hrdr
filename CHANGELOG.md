@@ -8,10 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Windows mutation-result path style is configurable.** `unix_style_paths`
-  defaults to `true`, rendering edit/write/replace success labels and diff paths
-  with `/`; `false` selects `\`. Unix rendering, file contents, and filesystem
-  targets are unchanged. Other path presentation surfaces remain pending.
+- **Windows path style is configurable for mutation results and tool
+  headlines.** `unix_style_paths` defaults to `true`, rendering
+  edit/write/replace success labels, diff paths, and built-in filesystem tool
+  headlines with `/`; `false` selects `\`. Headline caches refresh on
+  configuration reload. Unix rendering, stored tool arguments/results, file
+  contents, and filesystem targets are unchanged. Other path presentation
+  surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

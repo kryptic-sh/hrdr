@@ -2760,6 +2760,10 @@ impl App {
         self.rediscover(new);
     }
 
+    pub(crate) fn unix_style_paths(&self) -> bool {
+        self.cfg.unix_style_paths
+    }
+
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does
     /// NOT touch the model/provider/endpoint (those are session-scoped).
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {

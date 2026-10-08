@@ -3431,6 +3431,7 @@ fn assemble_transcript(
                 let body = cached_body(app.render_cache_id, i, ck, || {
                     tool_lines(
                         theme,
+                        app.unix_style_paths(),
                         name,
                         args,
                         result,
@@ -4081,9 +4082,11 @@ fn tool_group_summary_block(
 /// Whether a settled call's full output fits the preview cap. Such a call
 /// renders in full with nothing to expand or collapse — the preview and the
 /// full body are the same thing.
-fn tool_fits_preview(name: &str, args: &str, result: &str) -> bool {
+fn tool_fits_preview(name: &str, args: &str, result: &str, unix_style_paths: bool) -> bool {
     // A mutation's body is its written content (from the args), not the result.
-    if let hrdr_app::ToolBody::Code { content, .. } = hrdr_app::tool_display(name, args).body {
+    if let hrdr_app::ToolBody::Code { content, .. } =
+        hrdr_app::tool_display(name, args, unix_style_paths).body
+    {
         return content.lines().count() <= TOOL_RESULT_PREVIEW_LINES;
     }
     result.lines().count() <= TOOL_RESULT_PREVIEW_LINES
@@ -4108,7 +4111,7 @@ fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBl
     else {
         unreachable!("only tool members render as tool blocks");
     };
-    let small = *done && tool_fits_preview(name, args, result);
+    let small = *done && tool_fits_preview(name, args, result, app.unix_style_paths());
     let full = app.verbose || app.active_tool_is_open(id) || small;
     let body_key = (
         member.content_hash,
@@ -4120,6 +4123,7 @@ fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBl
     let body = cached_body(app.render_cache_id, idx, body_key, || {
         tool_lines(
             theme,
+            app.unix_style_paths(),
             name,
             args,
             result,
@@ -4213,6 +4217,7 @@ struct ToolState {
 /// head for a mutation (`edit`/`replace`/`write` — the change is at the front).
 fn tool_lines(
     theme: &Theme,
+    unix_style_paths: bool,
     name: &str,
     args: &str,
     result: &str,
@@ -4230,7 +4235,7 @@ fn tool_lines(
     } else {
         ("✗", theme.error)
     };
-    let disp = hrdr_app::tool_display(name, args);
+    let disp = hrdr_app::tool_display(name, args, unix_style_paths);
     let mark_name = |summary: &str| {
         let mut spans = vec![
             Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
@@ -6035,6 +6040,7 @@ mod block_tests {
         let head = |ok, done| {
             let lines = tool_lines(
                 &t,
+                true,
                 "ls",
                 r#"{"path":"src"}"#,
                 "",
@@ -6057,6 +6063,32 @@ mod block_tests {
         assert!(head(true, true).contains("ls src"));
     }
 
+    #[test]
+    fn edit_backlog_headline_uses_the_requested_path_style() {
+        let t = Theme::default();
+        for style in [true, false] {
+            let lines = tool_lines(
+                &t,
+                style,
+                "edit",
+                r#"{"path":"docs/backlog.md"}"#,
+                "",
+                ToolState {
+                    ok: true,
+                    done: true,
+                    preview: false,
+                    frame: "",
+                },
+            );
+            let expected = if cfg!(windows) && !style {
+                r"✓ edit docs\backlog.md"
+            } else {
+                "✓ edit docs/backlog.md"
+            };
+            assert_eq!(text(&lines[0]), expected);
+        }
+    }
+
     /// Ratatui measures a `\t` as one cell and draws nothing, so tab-indented
     /// text clumps against the margin. Every path that turns raw bytes into a
     /// block-body span must expand tabs first.
@@ -6072,6 +6104,7 @@ mod block_tests {
         // A finished tool result (a `read`, a shell run, a diff).
         let result = tool_lines(
             &t,
+            true,
             "read",
             r#"{"path":"a.rs"}"#,
             indented,
@@ -6089,6 +6122,7 @@ mod block_tests {
         // A shell block's command rows.
         let shell = tool_lines(
             &t,
+            true,
             "shell",
             "{\"command\":\"if true; then\\n\\techo hi\\nfi\"}",
             "",
@@ -6105,6 +6139,7 @@ mod block_tests {
         // A still-running call, whose live tail is a different loop.
         let live = tool_lines(
             &t,
+            true,
             "shell",
             r#"{"command":"x"}"#,
             indented,
@@ -6133,6 +6168,7 @@ mod block_tests {
         let t = Theme::default();
         let lines = tool_lines(
             &t,
+            true,
             "shell",
             r#"{"command":"ls\nwc -l"}"#,
             "a.rs\nb.rs",
@@ -6160,6 +6196,7 @@ mod block_tests {
         let diff_result = "--- a/a.rs\n+++ b/a.rs\n+fn main() {}";
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "write",
             args,
             diff_result,
@@ -6206,6 +6243,7 @@ mod block_tests {
         let args = format!(r#"{{"path":"a.rs","content":"{escaped}"}}"#);
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "write",
             &args,
             "",
@@ -6241,6 +6279,7 @@ mod block_tests {
         let args = r#"{"path":"a.rs","content":"fn main() {\n    let x = 1;\n}"}"#;
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "write",
             args,
             "",
@@ -6269,6 +6308,7 @@ mod block_tests {
         let args = r#"{"agent":"explore","description":"Explore hrdr-editor","prompt":"line one\nline two"}"#;
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "task",
             args,
             "",
@@ -6536,6 +6576,7 @@ mod block_tests {
 
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "task",
             &args,
             "",
@@ -6562,6 +6603,7 @@ mod block_tests {
         let args = r#"{"path":"a.rs","content":"x"}"#;
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "write",
             args,
             "Error: denied",
@@ -6586,6 +6628,7 @@ mod block_tests {
         let args = r#"{"path":"a.rs","old_string":"a","new_string":"b"}"#;
         let lines = tool_lines(
             &t,
+            true,
             "edit",
             args,
             "@@ -1 +1 @@\n-a\n+b",
@@ -6609,6 +6652,7 @@ mod block_tests {
         let t = Theme::default();
         let lines = tool_lines(
             &t,
+            true,
             "replace",
             r#"{"pattern":"a","replace":"b"}"#,
             "@@ -1 +1 @@\n-a\n+b",
@@ -6703,6 +6747,7 @@ mod block_tests {
             .collect();
         let rows: Vec<String> = tool_lines(
             &t,
+            true,
             "bash",
             r#"{"command":"x"}"#,
             &result,
