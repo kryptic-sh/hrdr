@@ -26,7 +26,7 @@ impl EntryId {
     fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("transcript entry ID exhausted");

@@ -74,7 +74,7 @@ const MAX_PASTE_CHARS: usize = 256 * 1024;
 
 fn fresh_render_cache_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
         next.checked_add(1)
     })
     .expect("TUI render cache ID exhausted")

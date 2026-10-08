@@ -41,7 +41,7 @@ impl SubagentSlots {
         use std::sync::atomic::Ordering;
         let counter = if write { &self.write } else { &self.read_only };
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()?;
@@ -73,7 +73,7 @@ impl Drop for SubagentSlot {
         } else {
             &self.slots.read_only
         };
-        let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             Some(n.saturating_sub(1))
         });
     }
