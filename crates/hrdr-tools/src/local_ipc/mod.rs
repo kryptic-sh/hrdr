@@ -2,6 +2,13 @@
 
 use std::{fs::File, io, path::Path};
 
+mod registration;
+mod storage;
+pub use registration::{
+    MAX_DIRECTORY_ENTRIES, MAX_RECORD_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_NAME_BYTES,
+    MAX_WORKING_DIRECTORY_BYTES, Registration, SessionDescriptor,
+};
+
 mod transport;
 pub use transport::{Connection, EndpointId, Listener, MAX_FRAME_BYTES};
 
@@ -21,7 +28,6 @@ mod platform;
 #[derive(Debug)]
 pub struct UserDirectory {
     _directory: File,
-    #[cfg(unix)]
     path: std::path::PathBuf,
 }
 
@@ -41,7 +47,6 @@ impl UserDirectory {
         let parent = parent.canonicalize()?;
         Ok(Self {
             _directory: platform::open(&parent)?,
-            #[cfg(unix)]
             path: parent.join(platform::name()),
         })
     }

@@ -232,7 +232,7 @@ fn create(path: &Path, sddl: &str) -> io::Result<()> {
     })
 }
 
-fn wide(path: &Path) -> io::Result<Vec<u16>> {
+pub(super) fn wide(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
     let mut text: Vec<u16> = path.as_os_str().encode_wide().collect();
     if text.contains(&0) {

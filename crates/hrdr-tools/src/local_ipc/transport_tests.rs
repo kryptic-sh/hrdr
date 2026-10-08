@@ -164,7 +164,12 @@ async fn refuses_spoofed_endpoint_pid_before_frames() {
     let directory = UserDirectory::open_in(root.path()).unwrap();
     let mut endpoint = EndpointId::fresh();
     endpoint.pid = endpoint.pid.checked_add(1).unwrap();
-    let _imposter = platform::Listener::bind(&directory, &endpoint).unwrap();
+    let _imposter = platform::Listener::bind(
+        &directory,
+        &endpoint,
+        &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+    )
+    .unwrap();
     let error = Connection::connect(&directory, &endpoint, DEADLINE)
         .await
         .err()

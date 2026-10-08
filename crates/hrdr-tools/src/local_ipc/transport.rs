@@ -58,7 +58,7 @@ impl From<EndpointId> for EndpointWire {
 }
 
 impl EndpointId {
-    fn fresh() -> Self {
+    pub(super) fn fresh() -> Self {
         let mut generation = [0; 16];
         while generation == [0; 16] {
             rand::rng().fill(&mut generation);
@@ -73,7 +73,17 @@ impl EndpointId {
         self.pid
     }
 
-    fn name(&self) -> String {
+    pub(super) fn from_name(name: &str) -> Option<Self> {
+        let (pid, generation) = name.split_once('-')?;
+        let endpoint = Self::try_from(EndpointWire {
+            pid: pid.parse().ok()?,
+            generation: u128::from_str_radix(generation, 16).ok()?.to_be_bytes(),
+        })
+        .ok()?;
+        (endpoint.name() == name).then_some(endpoint)
+    }
+
+    pub(super) fn name(&self) -> String {
         let generation = u128::from_be_bytes(self.generation);
         format!("{}-{generation:032x}", self.pid)
     }
@@ -82,16 +92,29 @@ impl EndpointId {
 /// A listener retaining its private directory and endpoint generation.
 pub struct Listener {
     inner: platform::Listener,
+    // Field order closes the transport before releasing the generation lock.
+    _lease: std::fs::File,
     endpoint: EndpointId,
+    pub(super) directory: UserDirectory,
 }
 
 impl Listener {
-    /// Bind a fresh endpoint. Never removes an existing endpoint to make room.
+    /// Bind a fresh endpoint after reclaiming released, securely leased generations.
     pub fn bind(directory: &UserDirectory) -> io::Result<Self> {
+        let mutation = super::storage::MutationGuard::acquire(directory)?;
+        let names = mutation.reap(directory)?;
+        super::storage::require_room(names.len(), 1 + usize::from(cfg!(unix)))?;
         let endpoint = EndpointId::fresh();
+        let lease = super::storage::create(directory, &format!("{}.lease", endpoint.name()))?;
+        lease.try_lock().map_err(io::Error::from)?;
         Ok(Self {
-            inner: platform::Listener::bind(directory, &endpoint)?,
+            inner: platform::Listener::bind(directory, &endpoint, &mutation)?,
+            _lease: lease,
             endpoint,
+            directory: UserDirectory {
+                _directory: directory._directory.try_clone()?,
+                path: directory.path.clone(),
+            },
         })
     }
 

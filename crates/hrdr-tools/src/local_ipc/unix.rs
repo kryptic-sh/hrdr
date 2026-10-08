@@ -48,7 +48,7 @@ fn validate_metadata(metadata: &std::fs::Metadata, uid: libc::uid_t) -> io::Resu
 }
 
 #[cfg(target_os = "macos")]
-mod macos_acl {
+pub(super) mod macos_acl {
     use super::*;
     use std::{ffi::c_void, os::fd::AsRawFd, ptr::NonNull};
 
@@ -77,7 +77,7 @@ mod macos_acl {
         }
     }
 
-    pub(super) fn reject_extended_acl(directory: &File) -> io::Result<()> {
+    pub(in crate::local_ipc) fn reject_extended_acl(directory: &File) -> io::Result<()> {
         // SAFETY: the borrowed File keeps its descriptor live throughout this call.
         let raw = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
         let Some(raw) = NonNull::new(raw) else {

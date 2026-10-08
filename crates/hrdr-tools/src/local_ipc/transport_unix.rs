@@ -37,7 +37,11 @@ fn revalidate(directory: &File, path: &Path) -> io::Result<()> {
 }
 
 impl Listener {
-    pub(super) fn bind(directory: &UserDirectory, endpoint: &EndpointId) -> io::Result<Self> {
+    pub(super) fn bind(
+        directory: &UserDirectory,
+        endpoint: &EndpointId,
+        _mutation: &crate::local_ipc::storage::MutationGuard,
+    ) -> io::Result<Self> {
         let retained = directory._directory.try_clone()?;
         revalidate(&retained, &directory.path)?;
         let path = directory.path.join(endpoint.name());
@@ -63,9 +67,8 @@ impl Listener {
     }
 }
 
-// No pathname cleanup on drop: even an identity check followed by unlink races
-// with replacement. Random generations are never reused; discovery must ignore
-// stale endpoints whose connection attempt fails.
+// No pathname cleanup on drop: the next guarded scan reclaims the generation
+// only after its independent kernel lease can be locked.
 
 pub(super) async fn connect(
     directory: &UserDirectory,
@@ -102,6 +105,7 @@ fn authenticate(stream: &UnixStream, expected: Option<u32>) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_ipc::storage::MutationGuard;
     use std::os::unix::fs::{DirBuilderExt, symlink};
 
     #[tokio::test]
@@ -109,9 +113,21 @@ mod tests {
         let root = super::super::tests::test_root();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let listener = Listener::bind(&directory, &endpoint).unwrap();
+        let listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let path = directory.path.join(endpoint.name());
-        assert!(Listener::bind(&directory, &endpoint).is_err());
+        assert!(
+            Listener::bind(
+                &directory,
+                &endpoint,
+                &MutationGuard::acquire(&directory).unwrap()
+            )
+            .is_err()
+        );
         let moved = directory.path.join("old-socket");
         std::fs::rename(&path, &moved).unwrap();
         let replacement = UnixListener::bind(&path).unwrap();
@@ -129,7 +145,12 @@ mod tests {
         let root = super::super::tests::test_root();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let _listener = Listener::bind(&directory, &endpoint).unwrap();
+        let _listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let alias = EndpointId::fresh();
         symlink(
             directory.path.join(endpoint.name()),
@@ -147,7 +168,12 @@ mod tests {
         let root = super::super::tests::test_root();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let listener = Listener::bind(&directory, &endpoint).unwrap();
+        let listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let path = directory.path.join(endpoint.name());
         let original = identity(&std::fs::symlink_metadata(&path).unwrap());
         drop(listener);
@@ -156,7 +182,14 @@ mod tests {
             original
         );
         assert!(connect(&directory, &endpoint).await.is_err());
-        assert!(Listener::bind(&directory, &endpoint).is_err());
+        assert!(
+            Listener::bind(
+                &directory,
+                &endpoint,
+                &MutationGuard::acquire(&directory).unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -164,7 +197,12 @@ mod tests {
         let root = super::super::tests::test_root();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let mut listener = Listener::bind(&directory, &endpoint).unwrap();
+        let mut listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         std::fs::rename(&directory.path, root.path().join("moved")).unwrap();
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -173,10 +211,14 @@ mod tests {
         let replacement = directory.path.join(endpoint.name());
         std::fs::write(&replacement, b"replacement").unwrap();
         assert_eq!(
-            Listener::bind(&directory, &EndpointId::fresh())
-                .err()
-                .unwrap()
-                .kind(),
+            Listener::bind(
+                &directory,
+                &EndpointId::fresh(),
+                &MutationGuard::acquire(&directory).unwrap()
+            )
+            .err()
+            .unwrap()
+            .kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
@@ -198,6 +240,13 @@ mod tests {
         let moved = root.path().join("moved");
         std::fs::rename(&directory.path, &moved).unwrap();
         symlink(&moved, &directory.path).unwrap();
-        assert!(Listener::bind(&directory, &EndpointId::fresh()).is_err());
+        assert!(
+            Listener::bind(
+                &directory,
+                &EndpointId::fresh(),
+                &MutationGuard::acquire(&directory).unwrap()
+            )
+            .is_err()
+        );
     }
 }

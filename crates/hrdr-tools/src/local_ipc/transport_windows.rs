@@ -102,7 +102,11 @@ fn instance(name: &str, sddl: &str, first: bool) -> io::Result<NamedPipeServer> 
 }
 
 impl Listener {
-    pub(super) fn bind(directory: &UserDirectory, endpoint: &EndpointId) -> io::Result<Self> {
+    pub(super) fn bind(
+        directory: &UserDirectory,
+        endpoint: &EndpointId,
+        _mutation: &crate::local_ipc::storage::MutationGuard,
+    ) -> io::Result<Self> {
         let user = User::current()?;
         let sddl = user.sddl()?;
         let name = name(endpoint);
@@ -189,8 +193,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let mut listener = Listener::bind(&directory, &endpoint).unwrap();
-        assert!(Listener::bind(&directory, &endpoint).is_err());
+        let mut listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Listener::bind(
+                &directory,
+                &endpoint,
+                &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap()
+            )
+            .is_err()
+        );
         for _ in 0..3 {
             validate(&listener.pending, &listener.user).unwrap();
             assert!(instance(&listener.name, &listener.sddl, true).is_err());
@@ -207,7 +223,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let listener = Listener::bind(&directory, &endpoint).unwrap();
+        let listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let client = ClientOptions::new().open(&listener.name).unwrap();
         listener.pending.connect().await.unwrap();
         let different = User::different_for_test();
@@ -238,7 +259,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let mut listener = Listener::bind(&directory, &endpoint).unwrap();
+        let mut listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let _peer = ClientOptions::new().open(&listener.name).unwrap();
         let handle = listener.pending.as_raw_handle() as usize;
         let mut sender = listener.accept().await.unwrap();
@@ -258,7 +284,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let mut listener = Listener::bind(&directory, &endpoint).unwrap();
+        let mut listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let _peer = ClientOptions::new().open(&listener.name).unwrap();
         let handle = listener.pending.as_raw_handle() as usize;
         let mut sender = listener.accept().await.unwrap();
@@ -301,7 +332,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = UserDirectory::open_in(root.path()).unwrap();
         let endpoint = EndpointId::fresh();
-        let listener = Listener::bind(&directory, &endpoint).unwrap();
+        let listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
         let _client = ClientOptions::new().open(&listener.name).unwrap();
         listener.pending.connect().await.unwrap();
         let error = Connection::connect(&directory, &endpoint, Duration::from_millis(20))
