@@ -120,12 +120,20 @@ impl Listener {
     }
 
     pub(super) async fn accept(&mut self) -> io::Result<Connection> {
+        self.accept_authenticated(|stream, user| authenticate(stream, true, None, user))
+            .await
+    }
+
+    async fn accept_authenticated(
+        &mut self,
+        authenticate: impl FnOnce(&NamedPipeServer, &User) -> io::Result<u32>,
+    ) -> io::Result<Connection> {
         self.pending.connect().await?;
         // Keep the name occupied continuously, including on authentication failure.
         // Every replacement instance receives the same explicit private DACL.
         let next = instance(&self.name, &self.sddl, false)?;
         let stream = std::mem::replace(&mut self.pending, next);
-        let pid = authenticate(&stream, true, None, &self.user)?;
+        let pid = authenticate(&stream, &self.user)?;
         Ok(Connection::new(Pipe(stream), pid))
     }
 }
@@ -151,6 +159,16 @@ pub(super) async fn connect(
     Ok(Connection::new(Pipe(stream), pid))
 }
 
+fn process_open_error(error: io::Error) -> io::Error {
+    // The kernel-reported peer PID can disappear before OpenProcess runs.
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32)
+    {
+        io::Error::new(io::ErrorKind::ConnectionAborted, error)
+    } else {
+        error
+    }
+}
+
 fn authenticate(
     pipe: &impl AsRawHandle,
     server: bool,
@@ -173,7 +191,7 @@ fn authenticate(
     // SAFETY: requests a noninherited query-only handle for the kernel-reported PID.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw.is_null() {
-        return Err(io::Error::last_os_error());
+        return Err(process_open_error(io::Error::last_os_error()));
     }
     // SAFETY: successful OpenProcess transferred ownership; retain through SID check.
     let process = unsafe { OwnedHandle::from_raw_handle(raw) };
@@ -187,6 +205,44 @@ fn authenticate(
 mod tests {
     use super::*;
     use crate::local_ipc::platform::validate;
+
+    #[tokio::test]
+    async fn exited_peer_authentication_preserves_listener() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = UserDirectory::open_in(root.path()).unwrap();
+        let endpoint = EndpointId::fresh();
+        let mut listener = Listener::bind(
+            &directory,
+            &endpoint,
+            &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
+        )
+        .unwrap();
+        let peer = connect(&directory, &endpoint).await.unwrap();
+        let rejected = listener
+            .accept_authenticated(|_, _| {
+                let error = io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                Err(process_open_error(error))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(rejected.kind(), io::ErrorKind::ConnectionAborted);
+        drop(peer);
+        let denied = process_open_error(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(denied.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        let mut peer = connect(&directory, &endpoint).await.unwrap();
+        let mut accepted = listener.accept().await.unwrap();
+        let (sent, received) = tokio::join!(
+            peer.write_frame(b"after rejection", Duration::from_secs(2)),
+            accepted.read_frame(Duration::from_secs(2)),
+        );
+        sent.unwrap();
+        assert_eq!(received.unwrap(), b"after rejection");
+    }
 
     #[tokio::test]
     async fn every_instance_is_private_and_name_remains_reserved() {
