@@ -57,7 +57,7 @@ impl Tool for WriteTool {
             bail!(
                 "refusing to write to {}: {reason} — secret/credential files are off-limits to \
                  the write/edit tools; if the user genuinely needs this, they must provide it",
-                path.display()
+                crate::display_path(&path, ctx.unix_style_paths)
             );
         }
         let existed = super::path_exists(&path).await;
@@ -69,7 +69,7 @@ impl Tool for WriteTool {
                 crate::ReadState::Unread => bail!(
                     "{} exists but you haven't read it — call read first so the rewrite \
                      starts from its real content (or use edit for a partial change)",
-                    path.display()
+                    crate::display_path(&path, ctx.unix_style_paths)
                 ),
                 crate::ReadState::Partial => bail!(
                     "you've only read part of {} — a write replaces the whole file, so read \
@@ -78,12 +78,12 @@ impl Tool for WriteTool {
                      line over {MAX_LINE} bytes, a normal read clips that line every time and \
                      can never mark it fully read — read it once with `full: true` (whole \
                      file, no clipping) to unblock the rewrite, or use `edit`/`shell`",
-                    path.display()
+                    crate::display_path(&path, ctx.unix_style_paths)
                 ),
                 crate::ReadState::Stale => bail!(
                     "{} changed on disk since you read it — re-read it before overwriting, \
                      or the edit made in the meantime (an editor save, a formatter) is lost",
-                    path.display()
+                    crate::display_path(&path, ctx.unix_style_paths)
                 ),
                 crate::ReadState::Fresh => {}
             }
@@ -93,7 +93,7 @@ impl Tool for WriteTool {
         } else {
             String::new()
         };
-        super::ensure_parent_dir(&path).await?;
+        super::ensure_parent_dir(&path, ctx.unix_style_paths).await?;
         let bytes = a.content.len();
         let fc = super::mutation::apply_file_change(ctx, &path, "write", &a.content).await?;
         ctx.mark_read(&path); // the model authored (or just saw) this content

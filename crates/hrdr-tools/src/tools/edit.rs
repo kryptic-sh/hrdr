@@ -74,7 +74,7 @@ fn stale_error(ctx: &ToolContext, path: &std::path::Path) -> anyhow::Error {
     anyhow::anyhow!(
         "{} changed on disk since you read it{} — re-read it and copy old_string \
          from the current content",
-        path.display(),
+        crate::display_path(path, ctx.unix_style_paths),
         culprit_clause(ctx, path)
     )
 }
@@ -306,7 +306,7 @@ impl Tool for EditTool {
             bail!(
                 "refusing to edit {}: {reason} — secret/credential files are off-limits to \
                  the write/edit tools; if the user genuinely needs this, they must provide it",
-                path.display()
+                crate::display_path(&path, ctx.unix_style_paths)
             );
         }
         // `edit` matches `old_string` against the file's live on-disk content, so
@@ -322,7 +322,7 @@ impl Tool for EditTool {
             crate::ReadState::Unread => bail!(
                 "you haven't read {} yet — call read first, then copy old_string \
                  exactly from its output",
-                path.display()
+                crate::display_path(&path, ctx.unix_style_paths)
             ),
             crate::ReadState::Stale => true,
             crate::ReadState::Partial | crate::ReadState::Fresh => false,
@@ -336,13 +336,16 @@ impl Tool for EditTool {
         {
             bail!(
                 "{} is {} bytes; too large to edit — narrow the change or use `replace`/`bash`",
-                path.display(),
+                crate::display_path(&path, ctx.unix_style_paths),
                 meta.len()
             );
         }
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text = tokio::fs::read_to_string(&path).await.with_context(|| {
+            format!(
+                "reading {}",
+                crate::display_path(&path, ctx.unix_style_paths)
+            )
+        })?;
         let mut old_string: Cow<str> = Cow::Borrowed(&a.old_string);
         let mut new_string: Cow<str> = Cow::Borrowed(&a.new_string);
         let mut count = text.matches(old_string.as_ref()).count();
@@ -400,14 +403,14 @@ impl Tool for EditTool {
                         "old_string not found in {}, but a near-match differing only in \
                          whitespace/indentation exists — copy the exact text from read \
                          output (keep tabs/spaces, strip the line-number prefix)",
-                        path.display()
+                        crate::display_path(&path, ctx.unix_style_paths)
                     );
                 }
                 bail!(
                     "old_string not found in {} — the file may have changed since you read it; \
                      re-read it and copy the exact current text (whitespace included, no \
                      line-number prefixes)",
-                    path.display()
+                    crate::display_path(&path, ctx.unix_style_paths)
                 );
             }
         }
@@ -415,7 +418,7 @@ impl Tool for EditTool {
             bail!(
                 "old_string is not unique in {} ({count} matches) — include more \
                  surrounding lines to pin one occurrence, or set replace_all",
-                path.display()
+                crate::display_path(&path, ctx.unix_style_paths)
             );
         }
         // Read the attribution before the write: `mark_read` below clears it (the
@@ -499,6 +502,62 @@ impl Tool for EditTool {
 mod tests {
     use super::*;
     use crate::ToolContext;
+
+    #[tokio::test]
+    async fn mutation_refusals_follow_path_style_without_changing_content() {
+        for unix_style in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = if cfg!(windows) {
+                "nested/file.txt"
+            } else {
+                "nested/literal\\file.txt"
+            };
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = "original\\content/unchanged";
+            std::fs::write(&path, original).unwrap();
+            let mut c = ToolContext::new(dir.path());
+            c.unix_style_paths = unix_style;
+            let label = crate::display_path(&path, unix_style);
+            if cfg!(unix) {
+                assert!(label.contains("literal\\file.txt"));
+            }
+            let edit = json!({"path": path, "old_string": original, "new_string": "replacement"});
+            let write = json!({"path": path, "content": "replacement"});
+            for err in [
+                EditTool.execute(edit.clone(), &c).await.unwrap_err(),
+                super::super::write::WriteTool
+                    .execute(write.clone(), &c)
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(err.to_string().contains(&label), "{err}");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            c.mark_read(&path);
+            let before = c.tracked_sigs();
+            let changed = "externally changed\\content/untouched";
+            std::fs::write(&path, changed).unwrap();
+            let culprit = r"formatter C:\raw\input /unchanged";
+            c.note_modifying_command(&before, culprit);
+            let err = EditTool.execute(edit, &c).await.unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("{label} changed on disk")),
+                "{err}"
+            );
+            assert!(err.contains(culprit), "{err}");
+            let err = super::super::write::WriteTool
+                .execute(write, &c)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!("{label} changed on disk")),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        }
+    }
 
     /// The `read` path-name synonyms work here too — a call spelled `file` (or
     /// `file_path`) must not die on a "missing field `path`".

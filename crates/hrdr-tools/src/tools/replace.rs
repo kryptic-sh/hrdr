@@ -185,7 +185,7 @@ impl Tool for ReplaceTool {
                             "replacing {:?} in {} would produce ~{projected} bytes; narrow \
                              `pattern` or the sweep",
                             a.pattern,
-                            super::rel_display(&path, &ctx.cwd)
+                            super::rel_display(&path, &ctx.cwd, ctx.unix_style_paths)
                         );
                     }
                 }
@@ -198,7 +198,7 @@ impl Tool for ReplaceTool {
                             "replacing {:?} in {} would produce ~{len}+ bytes; narrow `pattern` or \
                          the sweep",
                             a.pattern,
-                            super::rel_display(&path, &ctx.cwd)
+                            super::rel_display(&path, &ctx.cwd, ctx.unix_style_paths)
                         ),
                     };
                 if hits == 0 {
@@ -217,10 +217,7 @@ impl Tool for ReplaceTool {
                 continue;
             }
             total += hits;
-            let rel = crate::display_path(
-                path.strip_prefix(&ctx.cwd).unwrap_or(&path),
-                ctx.unix_style_paths,
-            );
+            let rel = super::rel_display(&path, &ctx.cwd, ctx.unix_style_paths);
             planned.push((path, before, after, rel));
         }
 
@@ -359,8 +356,7 @@ fn collect_files(
             }
         }
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
-            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(&path);
-            oversized.push(rel.display().to_string());
+            oversized.push(super::rel_display(&path, &ctx.cwd, ctx.unix_style_paths));
             continue;
         }
         out.push(path);
@@ -430,6 +426,84 @@ fn bounded_regex_replace(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn expansion_errors_follow_path_style() {
+        for unix_style in [true, false] {
+            for literal in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let name = if cfg!(windows) {
+                    "nested/file.txt"
+                } else {
+                    "nested/literal\\file.txt"
+                };
+                let path = dir.path().join(name);
+                let content = "a".repeat(1024);
+                write(&path, &content).await;
+                let mut ctx = ToolContext::new(dir.path());
+                ctx.unix_style_paths = unix_style;
+                let (pattern, replacement) = if literal {
+                    ("a", "b".repeat(MAX_EDIT_OUTPUT_BYTES / content.len() + 1))
+                } else {
+                    (
+                        "(a+)",
+                        "$1".repeat(MAX_EDIT_OUTPUT_BYTES / content.len() + 1),
+                    )
+                };
+                let err = ReplaceTool
+                    .execute(
+                        json!({"pattern": pattern, "replace": replacement, "literal": literal}),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                let label = crate::display_path(std::path::Path::new(name), unix_style);
+                assert!(
+                    err.starts_with(&format!("replacing {pattern:?} in {label} would produce")),
+                    "{err}"
+                );
+                assert_eq!(read(&path).await, content);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_list_follows_path_style() {
+        for unix_style in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = if cfg!(windows) {
+                "nested/large.txt"
+            } else {
+                "nested/literal\\large.txt"
+            };
+            let path = dir.path().join(name);
+            write(&path, "untouched\\content").await;
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(MAX_FILE_BYTES + 1).unwrap();
+            drop(file);
+            let before = std::fs::read(&path).unwrap();
+            let mut ctx = ToolContext::new(dir.path());
+            ctx.unix_style_paths = unix_style;
+            let out = ReplaceTool
+                .execute(
+                    json!({"pattern": r"a\b", "replace": "x", "literal": true}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let label = crate::display_path(std::path::Path::new(name), unix_style);
+            assert!(
+                out.ends_with(&format!("1 file over 2 MiB skipped: {label}")),
+                "{out}"
+            );
+            assert!(
+                out.starts_with(&format!("No file matches {:?}", r"a\b")),
+                "{out}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
 
     async fn write(path: &std::path::Path, body: &str) {
         if let Some(p) = path.parent() {

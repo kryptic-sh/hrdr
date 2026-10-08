@@ -80,13 +80,16 @@ pub(crate) const NO_MATCHES: &str = "(no matches)";
 /// Create `path`'s parent directory (and any missing ancestors), so a write to a
 /// path in a directory that doesn't exist yet succeeds. A path with no parent
 /// (a bare root) is a no-op.
-pub(crate) async fn ensure_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) async fn ensure_parent_dir(
+    path: &std::path::Path,
+    unix_style: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| format!("creating {}", parent.display()))?;
+            .with_context(|| format!("creating {}", crate::display_path(parent, unix_style)))?;
     }
     Ok(())
 }
@@ -117,11 +120,12 @@ pub(crate) fn ignore_walker(root: &std::path::Path, hidden: bool, no_ignore: boo
 
 /// `path` displayed relative to `cwd`, falling back to the full path when it
 /// lies outside — the short form the tools show the model.
-pub(crate) fn rel_display<'a>(
-    path: &'a std::path::Path,
+pub(crate) fn rel_display(
+    path: &std::path::Path,
     cwd: &std::path::Path,
-) -> std::path::Display<'a> {
-    path.strip_prefix(cwd).unwrap_or(path).display()
+    unix_style: bool,
+) -> String {
+    crate::display_path(path.strip_prefix(cwd).unwrap_or(path), unix_style)
 }
 
 pub use edit::EditTool;

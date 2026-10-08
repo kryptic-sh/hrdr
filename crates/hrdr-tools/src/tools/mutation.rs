@@ -61,9 +61,12 @@ pub async fn apply_file_change(
     // Re-check immediately before the pathname operation. This portable guard
     // cannot make arbitrary filesystems transactional, but closes the long
     // validation/planning window and refuses any symlink inserted meanwhile.
-    atomic_write(path, content)
-        .await
-        .with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(path, content).await.with_context(|| {
+        format!(
+            "writing {}",
+            crate::display_path(path, ctx.unix_style_paths)
+        )
+    })?;
     // The write landed, so whatever this session had verified is now verified
     // about older code. Same gate as the nudge — a `rename`/rollback is not the
     // model changing code, and a file with no test idiom is not code — and the
@@ -80,9 +83,12 @@ pub async fn apply_file_change(
     }
     let mut notes = crate::run_file_hooks(&ctx.hooks, hook_event, path, &ctx.cwd).await;
     let content_after = if !ctx.hooks.is_empty() {
-        tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("rereading {} after {hook_event} hook", path.display()))?
+        tokio::fs::read_to_string(path).await.with_context(|| {
+            format!(
+                "rereading {} after {hook_event} hook",
+                crate::display_path(path, ctx.unix_style_paths)
+            )
+        })?
     } else {
         content.to_string()
     };

@@ -2468,15 +2468,16 @@ and **not** fixed.
   `hrdr_tools::display_path` and the existing `unix_style_paths` boolean to ALL
   remaining hrdr-rendered path values. The setting defaults to `true` (`/`);
   `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
-  labels, diff paths, and built-in filesystem tool headlines already use it;
-  remaining work includes nested/error labels (including stale-read errors),
-  cwd/status displays, pickers, path-bearing notices, other tools, overflow
-  pointers, and reload propagation. Keep this display-only: do not change
-  filesystem targets or literal Unix backslashes. Preserve unified-diff prefix
-  semantics. Never rewrite file bodies, user prose, or captured shell output.
-  Cover both settings and unchanged Unix behavior at each real rendering seam,
-  including config-to-agent wiring. Complete these presentation surfaces before
-  moving to the newly prioritized self-update tool.
+  and refusal labels (including stale-read errors), skipped-file lists, diff
+  paths, and built-in filesystem tool headlines already use it; remaining work
+  includes shared sandbox/secret/swap guard and LSP labels, cwd/status displays,
+  pickers, path-bearing notices, other tools, overflow pointers, and reload
+  propagation. Keep this display-only: do not change filesystem targets or
+  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
+  rewrite file bodies, user prose, or captured shell output. Cover both settings
+  and unchanged Unix behavior at each real rendering seam, including
+  config-to-agent wiring. Complete these presentation surfaces before moving to
+  the newly prioritized self-update tool.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.
