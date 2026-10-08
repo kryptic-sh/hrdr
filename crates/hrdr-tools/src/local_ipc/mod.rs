@@ -1,9 +1,9 @@
-//! Private discovery-directory foundation for local IPC.
-//!
-//! Opening validates an existing directory rather than repairing its permissions.
-//! No registration-file or transport operations are implemented here.
+//! Same-user local IPC directories and authenticated, bounded byte transport.
 
 use std::{fs::File, io, path::Path};
+
+mod transport;
+pub use transport::{Connection, EndpointId, Listener, MAX_FRAME_BYTES};
 
 #[cfg(unix)]
 #[path = "unix.rs"]
@@ -15,11 +15,14 @@ mod platform;
 /// An open, validated per-user discovery directory.
 ///
 /// The retained handle identifies the validated object even if its pathname changes.
-/// Future registration reads and atomic writes must be anchored to this handle, not
-/// reopen an unchecked pathname. This type deliberately exposes no file operations yet.
+/// Registration reads and atomic writes must be anchored to this handle, not
+/// reopen an unchecked pathname. Unix socket operations revalidate its identity
+/// around pathname calls; callers must keep the trusted parent stable throughout.
 #[derive(Debug)]
 pub struct UserDirectory {
     _directory: File,
+    #[cfg(unix)]
+    path: std::path::PathBuf,
 }
 
 impl UserDirectory {
@@ -35,8 +38,11 @@ impl UserDirectory {
     /// its protection against replacement; the final child is independently validated.
     /// Canonicalizing the parent permits the system `/tmp` symlink on macOS.
     pub fn open_in(parent: &Path) -> io::Result<Self> {
+        let parent = parent.canonicalize()?;
         Ok(Self {
-            _directory: platform::open(&parent.canonicalize()?)?,
+            _directory: platform::open(&parent)?,
+            #[cfg(unix)]
+            path: parent.join(platform::name()),
         })
     }
 }

@@ -88,9 +88,9 @@ pub(super) fn name() -> &'static str {
 
 // usize storage provides TOKEN_USER's pointer alignment; the allocation never moves
 // while its embedded SID pointer is used.
-struct User(Vec<usize>);
+pub(super) struct User(Vec<usize>);
 impl User {
-    fn current() -> io::Result<Self> {
+    pub(super) fn current() -> io::Result<Self> {
         let mut raw = null_mut();
         // SAFETY: pseudo-handle and writable output are valid; no handle is inherited.
         if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) } == 0 {
@@ -105,6 +105,26 @@ impl User {
         }
         // SAFETY: successful token open transfers ownership of a real handle.
         let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+        Self::from_token(&token)
+    }
+
+    pub(super) fn of_process(process: &OwnedHandle) -> io::Result<Self> {
+        let mut raw = null_mut();
+        // SAFETY: process is retained and the token output is writable.
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful OpenProcessToken transfers ownership.
+        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+        Self::from_token(&token)
+    }
+
+    pub(super) fn same_user(&self, other: &Self) -> bool {
+        // SAFETY: both SID allocations are retained by their User values.
+        unsafe { EqualSid(self.sid(), other.sid()) != 0 }
+    }
+
+    fn from_token(token: &OwnedHandle) -> io::Result<Self> {
         let mut bytes = 0;
         // SAFETY: a null buffer with zero size requests the required allocation size.
         let result = unsafe {
@@ -133,12 +153,26 @@ impl User {
         Ok(Self(data))
     }
 
+    #[cfg(test)]
+    pub(super) fn different_for_test() -> Self {
+        use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount};
+        let user = Self::current().unwrap();
+        // SAFETY: current() owns a valid SID; mutate its last existing subauthority
+        // without changing its size or layout. No OS token is modified.
+        unsafe {
+            let count = *GetSidSubAuthorityCount(user.sid());
+            assert!(count > 0);
+            *GetSidSubAuthority(user.sid(), u32::from(count - 1)) ^= 1;
+        }
+        user
+    }
+
     fn sid(&self) -> PSID {
         // SAFETY: current populated the aligned buffer with a successful TOKEN_USER query.
         unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
     }
 
-    fn sddl(&self) -> io::Result<String> {
+    pub(super) fn sddl(&self) -> io::Result<String> {
         let mut string = null_mut();
         // SAFETY: SID is backed by self; the API allocates a terminated string.
         if unsafe { ConvertSidToStringSidW(self.sid(), &mut string) } == 0 {
@@ -158,7 +192,10 @@ impl User {
     }
 }
 
-fn create(path: &Path, sddl: &str) -> io::Result<()> {
+pub(super) fn with_security_attributes<T>(
+    sddl: &str,
+    create: impl FnOnce(&mut SECURITY_ATTRIBUTES) -> io::Result<T>,
+) -> io::Result<T> {
     let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = LocalAllocation(null_mut());
     // SAFETY: terminated input and valid output; revision 1 is SDDL_REVISION_1.
@@ -173,20 +210,26 @@ fn create(path: &Path, sddl: &str) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    let attributes = SECURITY_ATTRIBUTES {
+    let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
+    create(&mut attributes)
+}
+
+fn create(path: &Path, sddl: &str) -> io::Result<()> {
     let path = wide(path)?;
-    // SAFETY: both pointers remain valid for this synchronous call.
-    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-            return Err(error);
+    with_security_attributes(sddl, |attributes| {
+        // SAFETY: both pointers remain valid for this synchronous call.
+        if unsafe { CreateDirectoryW(path.as_ptr(), attributes) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(error);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
@@ -239,7 +282,7 @@ pub(super) fn open(parent: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn validate(file: &File, user: &User) -> io::Result<()> {
+pub(super) fn validate(file: &impl AsRawHandle, user: &User) -> io::Result<()> {
     let mut descriptor = LocalAllocation(null_mut());
     let mut owner = null_mut();
     let mut acl: *mut ACL = null_mut();

@@ -25,14 +25,19 @@ pub(super) fn open(parent: &Path) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
+    validate(&directory)?;
+    Ok(directory)
+}
+
+pub(super) fn validate(directory: &File) -> io::Result<()> {
     // File::metadata uses fstat on the retained descriptor, not the pathname.
     let metadata = directory.metadata()?;
     // SAFETY: geteuid has no pointer arguments or preconditions.
     let uid = unsafe { libc::geteuid() };
     validate_metadata(&metadata, uid)?;
     #[cfg(target_os = "macos")]
-    macos_acl::reject_extended_acl(&directory)?;
-    Ok(directory)
+    macos_acl::reject_extended_acl(directory)?;
+    Ok(())
 }
 
 fn validate_metadata(metadata: &std::fs::Metadata, uid: libc::uid_t) -> io::Result<()> {
@@ -74,11 +79,19 @@ mod macos_acl {
 
     pub(super) fn reject_extended_acl(directory: &File) -> io::Result<()> {
         // SAFETY: the borrowed File keeps its descriptor live throughout this call.
-        let acl =
-            Acl(
-                NonNull::new(unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) })
-                    .ok_or_else(io::Error::last_os_error)?,
-            );
+        let raw = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        let Some(raw) = NonNull::new(raw) else {
+            let error = io::Error::last_os_error();
+            // Apple's Libc posix1e/acl_file.c queries FILESEC_ACL after fstatx_np;
+            // gen/filesec.c returns ENOENT when that property is absent. With a
+            // retained descriptor, this means no ACL, not a missing pathname.
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        };
+        let acl = Acl(raw);
         // SAFETY: acl owns a live ACL allocation.
         if unsafe { acl_valid(acl.0.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
@@ -154,6 +167,25 @@ mod tests {
         assert_eq!(identity(&retained), identity(&original));
         assert_eq!(identity(&retained), identity(&renamed));
         assert_ne!(identity(&retained), identity(&replacement));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_directory_after_explicit_acl_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(name());
+        DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let output = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let directory = UserDirectory::open_in(root.path()).unwrap();
+        assert_eq!(
+            directory._directory.metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
     }
 
     #[cfg(target_os = "macos")]
