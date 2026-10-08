@@ -2163,7 +2163,11 @@ mod tests {
         jailed
             .ctx
             .sandbox
-            .check_read(&hrdr_tools::canonicalize_nearest(&bundle), &bundle)
+            .check_read(
+                &hrdr_tools::canonicalize_nearest(&bundle),
+                &bundle,
+                jailed.ctx.unix_style_paths,
+            )
             .expect("the skill root is readable in jail");
         // The grant is exactly the skill roots, not the home directory around them:
         // a sibling under `~/.claude` is still refused.
@@ -2172,7 +2176,11 @@ mod tests {
             jailed
                 .ctx
                 .sandbox
-                .check_read(&hrdr_tools::canonicalize_nearest(&sibling), &sibling)
+                .check_read(
+                    &hrdr_tools::canonicalize_nearest(&sibling),
+                    &sibling,
+                    jailed.ctx.unix_style_paths
+                )
                 .is_err(),
             "only the skill roots are granted"
         );

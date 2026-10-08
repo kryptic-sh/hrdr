@@ -293,7 +293,12 @@ impl SandboxPolicy {
     /// nothing else, while refusing legitimate `.git/info/exclude` edits and hooks
     /// the user had asked for. Oversight of git belongs at the shell layer, where
     /// guardrails run.
-    pub fn check_write(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
+    pub fn check_write(
+        &self,
+        canon: &Path,
+        shown: &Path,
+        unix_style_paths: bool,
+    ) -> anyhow::Result<()> {
         if self.mode == SandboxMode::None {
             return Ok(());
         }
@@ -302,8 +307,8 @@ impl SandboxPolicy {
                 "sandbox: refusing to write {} — it is outside this agent's writable roots. \
                  You may write only under: {}{}. Keep work inside your working directory; \
                  use the scratch dir for throwaway files.",
-                shown.display(),
-                join_paths(self.project_writable_roots()),
+                crate::display_path(shown, unix_style_paths),
+                join_paths(self.project_writable_roots(), unix_style_paths),
                 self.cache_roots_clause()
             )
         }
@@ -314,15 +319,20 @@ impl SandboxPolicy {
     /// outside every readable root. A no-op in every other mode — `Read` means
     /// "writes nowhere", not "reads nowhere", so like `Write` it reads broadly
     /// (builds and review tools read all over the filesystem).
-    pub fn check_read(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
+    pub fn check_read(
+        &self,
+        canon: &Path,
+        shown: &Path,
+        unix_style_paths: bool,
+    ) -> anyhow::Result<()> {
         if self.mode != SandboxMode::Jail || is_under_any(canon, &self.readable_roots) {
             return Ok(());
         }
         anyhow::bail!(
             "sandbox: refusing to read {} — this agent is strictly confined and may read only \
              under: {}.",
-            shown.display(),
-            join_paths(&self.readable_roots)
+            crate::display_path(shown, unix_style_paths),
+            join_paths(&self.readable_roots, unix_style_paths)
         )
     }
 }
@@ -350,14 +360,14 @@ fn is_under_any(canon: &Path, roots: &[PathBuf]) -> bool {
 
 /// The paths as the refusal messages list them — one helper for owned roots
 /// and borrowed sets alike.
-fn join_paths<I, P>(paths: I) -> String
+fn join_paths<I, P>(paths: I, unix_style_paths: bool) -> String
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
     paths
         .into_iter()
-        .map(|r| r.as_ref().display().to_string())
+        .map(|r| crate::display_path(r.as_ref(), unix_style_paths))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -982,7 +992,11 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
 /// about a failure: offer to re-run the command outside the sandbox, or not. With
 /// escalation gone there is nothing to decide, and the network and ssh kinds went
 /// with the confinements that caused them. Explaining the failure is the whole job.
-pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
+pub fn sandbox_denial_note(
+    policy: &SandboxPolicy,
+    output: &str,
+    unix_style_paths: bool,
+) -> Option<String> {
     if policy.mode == SandboxMode::None {
         return None;
     }
@@ -995,7 +1009,7 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
     } else {
         format!(
             "writable here: {}{}",
-            join_paths(policy.project_writable_roots()),
+            join_paths(policy.project_writable_roots(), unix_style_paths),
             policy.cache_roots_clause(),
         )
     };
@@ -1508,6 +1522,54 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
 mod tests {
     use super::*;
 
+    #[test]
+    fn refusal_labels_follow_path_style_without_changing_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("allowed");
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(windows)]
+        let name = "outside.txt";
+        #[cfg(not(windows))]
+        let name = r"outside\literal.txt";
+        let outside = dir.path().join(name);
+        std::fs::write(&outside, "outside").unwrap();
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, "inside").unwrap();
+        let mut ctx = confined_ctx(&root, SandboxMode::Jail);
+        let roots_before = ctx.sandbox.readable_roots.clone();
+        for style in [true, false] {
+            ctx.unix_style_paths = style;
+            let shown = crate::display_path(&outside, style);
+            let roots = crate::display_path(&canonicalize_nearest(&root), style);
+            let read = ctx
+                .resolve_read(outside.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                read,
+                format!(
+                    "sandbox: refusing to read {shown} — this agent is strictly confined and may read only under: {roots}."
+                )
+            );
+            let write = ctx
+                .resolve_write(outside.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                write,
+                format!(
+                    "sandbox: refusing to write {shown} — it is outside this agent's writable roots. You may write only under: {roots}. Keep work inside your working directory; use the scratch dir for throwaway files."
+                )
+            );
+            assert_eq!(ctx.resolve_read(inside.to_str().unwrap()).unwrap(), inside);
+            assert_eq!(ctx.resolve_write(inside.to_str().unwrap()).unwrap(), inside);
+            assert_eq!(ctx.sandbox.readable_roots, roots_before);
+            let note = sandbox_denial_note(&ctx.sandbox, "EROFS", style).unwrap();
+            assert!(note.contains(&format!("writable here: {roots}.")), "{note}");
+            assert!(sandbox_denial_note(&ctx.sandbox, "Permission denied", style).is_none());
+        }
+    }
+
     /// The defaults have to make `cargo build` and `npm i` work with no
     /// configuration, which is the whole point of granting them: config and
     /// `--sandbox-writable-root` are the escape hatch for a bespoke layout, not
@@ -1530,7 +1592,7 @@ mod tests {
             assert!(cache.is_dir(), "{} was not created", cache.display());
             let probe = cache.join("probe");
             policy
-                .check_write(&canonicalize_nearest(&probe), &probe)
+                .check_write(&canonicalize_nearest(&probe), &probe, true)
                 .unwrap_or_else(|e| panic!("{} must be writable: {e}", cache.display()));
             assert!(
                 policy
@@ -1547,7 +1609,7 @@ mod tests {
         let bin = cargo_home.join("bin").join("malware");
         assert!(
             policy
-                .check_write(&canonicalize_nearest(&bin), &bin)
+                .check_write(&canonicalize_nearest(&bin), &bin, true)
                 .is_err(),
             "a directory on PATH must not be writable"
         );
@@ -1555,7 +1617,7 @@ mod tests {
         let creds = cargo_home.join("credentials.toml");
         assert!(
             policy
-                .check_write(&canonicalize_nearest(&creds), &creds)
+                .check_write(&canonicalize_nearest(&creds), &creds, true)
                 .is_err(),
             "granting a cache must not grant its parent"
         );
@@ -1668,7 +1730,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        let note = sandbox_denial_note(&write, NPX_EROFS).expect("the denial is recognized");
+        let note = sandbox_denial_note(&write, NPX_EROFS, true).expect("the denial is recognized");
         assert!(note.contains("[sandbox]"), "{note}");
         assert!(note.contains("writable here:"), "{note}");
         // It must say the thing the model got wrong, in as many words.
@@ -1681,12 +1743,13 @@ mod tests {
         // A read-mode agent has no writable root at all — say that, rather than
         // printing an empty list.
         let read = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
-        let ro_note = sandbox_denial_note(&read, NPX_EROFS).expect("recognized in read mode too");
+        let ro_note =
+            sandbox_denial_note(&read, NPX_EROFS, true).expect("recognized in read mode too");
         assert!(ro_note.contains("read-only mode"), "{ro_note}");
 
         // Unconfined: the sandbox did not do this, so it says nothing.
         assert_eq!(
-            sandbox_denial_note(&SandboxPolicy::unconfined(), NPX_EROFS),
+            sandbox_denial_note(&SandboxPolicy::unconfined(), NPX_EROFS, true),
             None
         );
         // …and NARROW: an ordinary failure is never editorialized over. A bare
@@ -1698,7 +1761,11 @@ mod tests {
             "fatal: not a git repository",
             "",
         ] {
-            assert_eq!(sandbox_denial_note(&write, ordinary), None, "{ordinary}");
+            assert_eq!(
+                sandbox_denial_note(&write, ordinary, true),
+                None,
+                "{ordinary}"
+            );
         }
     }
 
@@ -1712,7 +1779,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
 
-        let note = sandbox_denial_note(&write, "EROFS: read-only file system").expect("explained");
+        let note =
+            sandbox_denial_note(&write, "EROFS: read-only file system", true).expect("explained");
         assert!(note.contains("[sandbox]"), "{note}");
         // An error that explains the cause and withholds the fix is half an error.
         assert!(note.contains("--sandbox-writable-root"), "{note}");
@@ -1724,12 +1792,16 @@ mod tests {
             "Bad owner or permissions on /etc/ssh/ssh_config",
             "hipErrorNoDevice: failed to open /dev/kfd",
         ] {
-            assert_eq!(sandbox_denial_note(&write, foreign), None, "{foreign}");
+            assert_eq!(
+                sandbox_denial_note(&write, foreign, true),
+                None,
+                "{foreign}"
+            );
         }
         // …in every mode, including the one that used to claim the GPU case.
         let jail = SandboxPolicy::for_agent(SandboxMode::Jail, dir.path(), &[]);
         assert_eq!(
-            sandbox_denial_note(&jail, "hipErrorNoDevice: failed to open /dev/kfd"),
+            sandbox_denial_note(&jail, "hipErrorNoDevice: failed to open /dev/kfd", true),
             None
         );
     }
@@ -1795,14 +1867,14 @@ mod tests {
             repo.join(".git").join("refs").join("heads").join("main"),
         ] {
             policy
-                .check_write(&canonicalize_nearest(&path), &path)
+                .check_write(&canonicalize_nearest(&path), &path, true)
                 .unwrap_or_else(|e| panic!("{} must be writable: {e}", path.display()));
         }
         // A sibling crate is not: the grant is the metadata, not the repository.
         let sibling = repo.join("crates").join("bar").join("src").join("lib.rs");
         assert!(
             policy
-                .check_write(&canonicalize_nearest(&sibling), &sibling)
+                .check_write(&canonicalize_nearest(&sibling), &sibling, true)
                 .is_err(),
             "scoping must still mean something"
         );
@@ -1826,7 +1898,7 @@ mod tests {
         ] {
             let canon = canonicalize_nearest(&path);
             policy
-                .check_write(&canon, &path)
+                .check_write(&canon, &path, true)
                 .unwrap_or_else(|e| panic!("{} must be writable: {e}", path.display()));
         }
     }
@@ -1853,7 +1925,7 @@ mod tests {
                 "ping: connect: Network is unreachable",
             ] {
                 assert_eq!(
-                    sandbox_denial_note(&policy, failure),
+                    sandbox_denial_note(&policy, failure, true),
                     None,
                     "{mode:?} does not confine the network: {failure}"
                 );
@@ -1863,12 +1935,12 @@ mod tests {
 
     /// `check_write` with the canonicalization its callers owe it.
     fn check_write(policy: &SandboxPolicy, path: &Path) -> anyhow::Result<()> {
-        policy.check_write(&canonicalize_nearest(path), path)
+        policy.check_write(&canonicalize_nearest(path), path, true)
     }
 
     /// `check_read` with the canonicalization its callers owe it.
     fn check_read(policy: &SandboxPolicy, path: &Path) -> anyhow::Result<()> {
-        policy.check_read(&canonicalize_nearest(path), path)
+        policy.check_read(&canonicalize_nearest(path), path, true)
     }
 
     #[test]
@@ -1928,7 +2000,7 @@ mod tests {
         assert!(err.contains("You may write only under"), "{err}");
         for root in policy.project_writable_roots() {
             assert!(
-                err.contains(&root.display().to_string()),
+                err.contains(&crate::display_path(root, true)),
                 "{err} should name {root:?}"
             );
         }
@@ -1950,7 +2022,10 @@ mod tests {
         assert!(err.contains("refusing to read /etc/passwd"), "{err}");
         assert!(err.contains("strictly confined and may read only"), "{err}");
         assert!(
-            err.contains(&canonicalize_nearest(dir.path()).display().to_string()),
+            err.contains(&crate::display_path(
+                &canonicalize_nearest(dir.path()),
+                true
+            )),
             "{err}"
         );
         // Read mode writes nothing anywhere.
@@ -2053,7 +2128,7 @@ mod tests {
         std::os::unix::fs::symlink("../outside.txt", &link).unwrap();
         assert!(
             policy
-                .check_write(&canonicalize_nearest(&link), &link)
+                .check_write(&canonicalize_nearest(&link), &link, true)
                 .is_err(),
             "a dangling symlink must not write outside the root"
         );
@@ -2066,7 +2141,7 @@ mod tests {
         std::os::unix::fs::symlink("new.txt", &benign).unwrap();
         assert!(
             policy
-                .check_write(&canonicalize_nearest(&benign), &benign)
+                .check_write(&canonicalize_nearest(&benign), &benign, true)
                 .is_ok(),
             "a dangling symlink inside the root must stay writable"
         );
@@ -2792,13 +2867,13 @@ mod tests {
         let inside = dir.path().join("audit-me.rs");
         assert!(
             policy
-                .check_read(&canonicalize_nearest(&inside), &inside)
+                .check_read(&canonicalize_nearest(&inside), &inside, true)
                 .is_ok(),
             "its own working directory is readable, or it cannot audit anything"
         );
         for outside in [Path::new("/etc/hostname"), Path::new("/usr/bin/env")] {
             let err = policy
-                .check_read(&canonicalize_nearest(outside), outside)
+                .check_read(&canonicalize_nearest(outside), outside, true)
                 .expect_err("outside the roots must be refused")
                 .to_string();
             assert!(err.contains("strictly confined"), "{err}");
@@ -2864,7 +2939,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
         assert_eq!(
-            sandbox_denial_note(&write, "Bad owner or permissions on /etc/ssh/ssh_config"),
+            sandbox_denial_note(
+                &write,
+                "Bad owner or permissions on /etc/ssh/ssh_config",
+                true
+            ),
             None,
             "no user namespace, no sandbox explanation to offer"
         );

@@ -440,7 +440,7 @@ impl ToolContext {
     pub fn resolve_read(&self, path: &str) -> anyhow::Result<PathBuf> {
         let shown = self.resolve(path);
         self.sandbox
-            .check_read(&canonicalize_nearest(&shown), &shown)?;
+            .check_read(&canonicalize_nearest(&shown), &shown, self.unix_style_paths)?;
         Ok(shown)
     }
 
@@ -449,7 +449,7 @@ impl ToolContext {
     pub fn resolve_write(&self, path: &str) -> anyhow::Result<PathBuf> {
         let shown = self.resolve(path);
         self.sandbox
-            .check_write(&canonicalize_nearest(&shown), &shown)?;
+            .check_write(&canonicalize_nearest(&shown), &shown, self.unix_style_paths)?;
         Ok(shown)
     }
 
@@ -844,18 +844,30 @@ fn canonicalize_nearest_bounded(path: &std::path::Path, budget: usize) -> PathBu
 /// Callers must open first, guard second, then call this. The order matters: it
 /// is what makes the handle the fixed point and the path the thing under
 /// suspicion.
-pub fn guard_not_swapped(file: &std::fs::File, path: &std::path::Path) -> anyhow::Result<()> {
+pub fn guard_not_swapped(
+    file: &std::fs::File,
+    path: &std::path::Path,
+    unix_style_paths: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let canon = canonicalize_nearest(path);
-    let opened = file_identity(file)
-        .with_context(|| format!("identifying the opened {}", path.display()))?;
-    let named = path_identity(&canon)
-        .with_context(|| format!("identifying the canonical {}", canon.display()))?;
+    let opened = file_identity(file).with_context(|| {
+        format!(
+            "identifying the opened {}",
+            display_path(path, unix_style_paths)
+        )
+    })?;
+    let named = path_identity(&canon).with_context(|| {
+        format!(
+            "identifying the canonical {}",
+            display_path(&canon, unix_style_paths)
+        )
+    })?;
     if opened != named {
         anyhow::bail!(
             "{} changed while it was being validated — re-read the file",
-            path.display()
+            display_path(path, unix_style_paths)
         );
     }
     Ok(())
@@ -1352,13 +1364,13 @@ pub fn secret_file_reason(path: &std::path::Path) -> Option<&'static str> {
 /// Guard a content read: canonicalize `path` (resolving symlinks and `..`) then
 /// reject it with a corrective error when it names a credential/secret file per
 /// [`secret_file_reason`]. Used by the `read` and `grep` tools.
-pub(crate) fn guard_secret_read(path: &std::path::Path) -> Result<()> {
+pub(crate) fn guard_secret_read(path: &std::path::Path, unix_style_paths: bool) -> Result<()> {
     let resolved = canonicalize_nearest(path);
     if let Some(reason) = secret_file_reason(&resolved) {
         return Err(anyhow!(
             "refusing to read {}: {reason} — secret/credential files are off-limits to \
              the read/grep tools; if the user genuinely needs this, they must provide it",
-            path.display()
+            display_path(path, unix_style_paths)
         ));
     }
     Ok(())
@@ -2619,6 +2631,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn secret_and_swap_refusal_labels_follow_path_style() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let subdir = dir.path().join("nested");
+        #[cfg(not(windows))]
+        let subdir = dir.path().join(r"nested\literal");
+        std::fs::create_dir(&subdir).unwrap();
+        let secret = subdir.join(".env");
+        std::fs::write(&secret, "test fixture").unwrap();
+        let path = subdir.join("notes.txt");
+        std::fs::write(&path, "original").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, subdir.join("original.txt")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        for style in [true, false] {
+            let reason = secret_file_reason(&canonicalize_nearest(&secret)).unwrap();
+            let shown = display_path(&secret, style);
+            assert_eq!(
+                guard_secret_read(&secret, style).unwrap_err().to_string(),
+                format!(
+                    "refusing to read {shown}: {reason} — secret/credential files are off-limits to the read/grep tools; if the user genuinely needs this, they must provide it"
+                )
+            );
+            assert!(guard_secret_read(&path, style).is_ok());
+            let shown = display_path(&path, style);
+            assert_eq!(
+                guard_not_swapped(&file, &path, style)
+                    .unwrap_err()
+                    .to_string(),
+                format!("{shown} changed while it was being validated — re-read the file")
+            );
+            let current = std::fs::File::open(&path).unwrap();
+            assert!(guard_not_swapped(&current, &path, style).is_ok());
+        }
+        std::fs::remove_file(&path).unwrap();
+        for style in [true, false] {
+            let err = guard_not_swapped(&file, &path, style).unwrap_err();
+            let shown = display_path(&canonicalize_nearest(&path), style);
+            assert_eq!(
+                err.to_string(),
+                format!("identifying the canonical {shown}")
+            );
+            let source = err.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+
     // ---- open-handle identity guard ----
 
     /// The guard passes for an ordinary file: the handle and the path name the
@@ -2630,7 +2690,7 @@ mod tests {
         std::fs::write(&path, "hello").unwrap();
 
         let file = std::fs::File::open(&path).unwrap();
-        assert!(guard_not_swapped(&file, &path).is_ok());
+        assert!(guard_not_swapped(&file, &path, true).is_ok());
     }
 
     /// The TOCTOU case the guard exists for: open resolves to one object, then
@@ -2661,7 +2721,7 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&decoy, &link).unwrap();
 
-        let err = guard_not_swapped(&file, &link).expect_err("the swap must be caught");
+        let err = guard_not_swapped(&file, &link, true).expect_err("the swap must be caught");
         assert!(
             err.to_string()
                 .contains("changed while it was being validated"),
@@ -2679,7 +2739,7 @@ mod tests {
 
         let file = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert!(guard_not_swapped(&file, &path).is_err());
+        assert!(guard_not_swapped(&file, &path, true).is_err());
     }
 
     /// **Every tool result is enveloped in jail, at the one place every tool passes

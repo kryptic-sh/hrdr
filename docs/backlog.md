@@ -176,7 +176,10 @@ deadline test below. Runtime CI run `37821267488` (`52caee9`) repeated those
 Unix `WouldBlock` and Windows streaming-timeout failures. Linux/macOS nextest,
 all platform Clippy/build/smoke jobs, and dependency checks passed, but the full
 matrix is not green. Do not describe the full feature as cross-platform
-verified.
+verified. Fifth-push check `37846228890` (`9f3690b`) passed nextest, Clippy,
+build/smoke on Windows/Linux/macOS and the Windows leak guard. Linux/macOS
+ordinary tests under the leak guard still failed on the same registration
+`WouldBlock`; the bounded-retry test correction remains approval-blocked.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
@@ -2470,8 +2473,8 @@ and **not** fixed.
   `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
   and refusal labels (including stale-read errors), skipped-file lists, diff
   paths, built-in filesystem tool headlines, read/search/listing labels and
-  filesystem provenance already use it; remaining work includes shared
-  sandbox/secret/swap guard and LSP labels, cwd/status displays, pickers,
+  filesystem provenance and shared sandbox/secret/swap guard labels already use
+  it; remaining work includes LSP labels, cwd/status displays, pickers,
   path-bearing notices, other tools, overflow pointers, and reload propagation.
   Keep this display-only: do not change filesystem targets or literal Unix
   backslashes. Preserve unified-diff prefix semantics. Never rewrite file

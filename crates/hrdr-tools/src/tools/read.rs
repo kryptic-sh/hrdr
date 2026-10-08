@@ -212,13 +212,13 @@ impl Tool for ReadTool {
                 .with_context(|| format!("opening {}", crate::display_path(&resolved, unix_style_paths)))?;
 
             // Validate the path is not a secret file.
-            crate::guard_secret_read(&resolved)?;
+            crate::guard_secret_read(&resolved, unix_style_paths)?;
 
             // Prove the handle we opened is still the object this path names — if any
             // component was swapped between the open and the guard above, reject it.
             // Enforced on every platform (unix via dev/ino, Windows via the file
             // index), so the guard is not quietly weaker on one of them.
-            crate::guard_not_swapped(&file, &resolved)?;
+            crate::guard_not_swapped(&file, &resolved, unix_style_paths)?;
 
             // Check file size from the open handle (not a separate stat).
             let file_len = file
@@ -848,17 +848,16 @@ mod tests {
         assert!(
             err.contains(&format!(
                 "sandbox: refusing to read {}",
-                outside_file.display()
+                crate::display_path(&outside_file, ctx.unix_style_paths)
             )),
             "{err}"
         );
         assert!(err.contains("strictly confined and may read only"), "{err}");
         assert!(
-            err.contains(
-                &crate::canonicalize_nearest(cwd.path())
-                    .display()
-                    .to_string()
-            ),
+            err.contains(&crate::display_path(
+                &crate::canonicalize_nearest(cwd.path()),
+                ctx.unix_style_paths,
+            )),
             "the refusal must name the readable root: {err}"
         );
 

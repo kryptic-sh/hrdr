@@ -320,11 +320,10 @@ mod tests {
         assert!(err.contains("sandbox: refusing to write"), "{err}");
         assert!(err.contains("You may write only under"), "{err}");
         assert!(
-            err.contains(
-                &crate::canonicalize_nearest(cwd.path())
-                    .display()
-                    .to_string()
-            ),
+            err.contains(&crate::display_path(
+                &crate::canonicalize_nearest(cwd.path()),
+                ctx.unix_style_paths,
+            )),
             "the refusal must name the writable root: {err}"
         );
         assert!(!target.exists(), "nothing may be written");

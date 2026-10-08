@@ -447,7 +447,8 @@ impl Tool for ShellTool {
         // sandbox did, that the tool is not broken, and how the user can widen
         // the boundary if the write is genuinely wanted.
         if let Ok(text) = &mut out
-            && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
+            && let Some(note) =
+                crate::sandbox::sandbox_denial_note(&ctx.sandbox, text, ctx.unix_style_paths)
         {
             text.push_str(&note);
         }

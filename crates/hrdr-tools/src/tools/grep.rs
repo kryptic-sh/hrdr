@@ -143,7 +143,7 @@ impl Tool for GrepTool {
         // no path it searches cwd, which is confined by construction.
         if let Some(p) = &a.path {
             let root = ctx.resolve_read(p)?;
-            crate::guard_secret_read(&root)?;
+            crate::guard_secret_read(&root, ctx.unix_style_paths)?;
         }
         // Look-around needs PCRE2, which only the ripgrep backend can switch on
         // (`--pcre2`). POSIX `grep -E` and the built-in `regex` walker have no
