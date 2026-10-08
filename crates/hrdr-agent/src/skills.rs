@@ -450,7 +450,7 @@ impl hrdr_tools::Tool for SkillTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &hrdr_tools::ToolContext,
+        ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
         let name = args
             .get("name")
@@ -486,6 +486,7 @@ impl hrdr_tools::Tool for SkillTool {
             usize::MAX,
             hrdr_tools::TruncateSide::Head,
             "skill",
+            ctx.unix_style_paths,
         ))
     }
 }

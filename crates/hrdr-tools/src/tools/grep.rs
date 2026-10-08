@@ -299,6 +299,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
                 max_output_lines,
                 TruncateSide::Head,
                 "grep",
+                unix_style_paths,
             ))
         }
     })
@@ -411,6 +412,7 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
                 max_output_lines,
                 TruncateSide::Head,
                 "grep",
+                unix_style_paths,
             ))
         }
     })

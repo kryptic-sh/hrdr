@@ -14,12 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and built-in filesystem tool headlines with `/`; `false` selects `\`. Read
   errors, find/grep results, directory listings, tree labels, and filesystem
   provenance labels also honor the setting, as do sandbox root/refusal labels,
-  secret-file refusals, swapped-path errors, and LSP diagnostic path labels.
-  Access checks, LSP protocol paths, and diagnostic message text remain
-  unchanged. Stale-read errors preserve the original culprit command. Headline
-  caches refresh on configuration reload. Unix rendering, stored tool
-  arguments/results, file contents, and filesystem targets are unchanged. Other
-  path presentation surfaces remain pending.
+  secret-file refusals, swapped-path errors, LSP diagnostic path labels, and
+  saved-output pointers (including shell re-run reminders). Access checks, LSP
+  protocol paths, and diagnostic message text remain unchanged. Stale-read
+  errors preserve the original culprit command. Headline caches refresh on
+  configuration reload. Unix rendering, stored tool arguments/results, file
+  contents, and filesystem targets are unchanged. Other path presentation
+  surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

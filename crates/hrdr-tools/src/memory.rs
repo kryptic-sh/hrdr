@@ -232,6 +232,7 @@ impl Tool for MemoryTool {
                         ctx.max_output_lines,
                         crate::TruncateSide::Head,
                         "memory",
+                        ctx.unix_style_paths,
                     ))
                 }
             },

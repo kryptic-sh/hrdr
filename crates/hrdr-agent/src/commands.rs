@@ -500,7 +500,7 @@ impl hrdr_tools::Tool for CommandTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &hrdr_tools::ToolContext,
+        ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
         let name = args
             .get("name")
@@ -551,6 +551,7 @@ impl hrdr_tools::Tool for CommandTool {
             usize::MAX,
             hrdr_tools::TruncateSide::Head,
             "command",
+            ctx.unix_style_paths,
         ))
     }
 }

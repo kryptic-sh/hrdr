@@ -2263,8 +2263,17 @@ pub fn truncate_saved(
     max_lines: usize,
     side: TruncateSide,
     label: &str,
+    unix_style_paths: bool,
 ) -> String {
-    truncate_saved_in(text, max_bytes, max_lines, side, label, &tool_output_dir())
+    truncate_saved_in(
+        text,
+        max_bytes,
+        max_lines,
+        side,
+        label,
+        &tool_output_dir(),
+        unix_style_paths,
+    )
 }
 
 /// The standard overflow pointer shared by every tool that spills its full output
@@ -2275,12 +2284,13 @@ pub(crate) fn overflow_hint(
     saved: Option<&std::path::Path>,
     total_lines: usize,
     total_bytes: usize,
+    unix_style_paths: bool,
 ) -> String {
     match saved {
         Some(p) => format!(
             "… [full output ({total_lines} lines, {total_bytes} bytes) saved to {} — `read` it \
              (with offset/limit) or `grep` it (pattern + path) for the rest, don't re-run] …",
-            p.display()
+            display_path(p, unix_style_paths)
         ),
         None => {
             format!("… [output truncated — {total_lines} lines, {total_bytes} bytes total] …")
@@ -2299,8 +2309,9 @@ pub(crate) fn overflow_preview(
     saved: Option<&std::path::Path>,
     total_lines: usize,
     total_bytes: usize,
+    unix_style_paths: bool,
 ) -> String {
-    let hint = overflow_hint(saved, total_lines, total_bytes);
+    let hint = overflow_hint(saved, total_lines, total_bytes, unix_style_paths);
     let head = head.trim_end();
     let tail = tail.trim_start();
     if tail.is_empty() {
@@ -2318,6 +2329,7 @@ fn truncate_saved_in(
     side: TruncateSide,
     label: &str,
     dir: &std::path::Path,
+    unix_style_paths: bool,
 ) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     // Within both caps: hand it back untouched.
@@ -2338,7 +2350,7 @@ fn truncate_saved_in(
     match side {
         TruncateSide::Head => {
             let head = collect_lines(&lines, max_lines, max_bytes, false);
-            overflow_preview(&head, "", Some(&path), lines_n, bytes_n)
+            overflow_preview(&head, "", Some(&path), lines_n, bytes_n, unix_style_paths)
         }
         // ~1/5 of each budget for the head, the rest for the tail (shell errors
         // trail), with the pointer bridging the gap.
@@ -2350,7 +2362,14 @@ fn truncate_saved_in(
                 max_bytes - max_bytes / 5,
                 true,
             );
-            overflow_preview(&head, &tail, Some(&path), lines_n, bytes_n)
+            overflow_preview(
+                &head,
+                &tail,
+                Some(&path),
+                lines_n,
+                bytes_n,
+                unix_style_paths,
+            )
         }
     }
 }
@@ -3432,6 +3451,50 @@ TAIL-ERROR-LINE",
     }
 
     #[test]
+    fn overflow_pointer_styles_preserve_saved_bytes() {
+        for unix_style_paths in [true, false] {
+            for side in [TruncateSide::Head, TruncateSide::Middle] {
+                let temp = tempfile::tempdir().unwrap();
+                let dir = if cfg!(unix) {
+                    temp.path().join(r"literal\backslash")
+                } else {
+                    temp.path().join("nested")
+                };
+                std::fs::create_dir(&dir).unwrap();
+                let text = "C:\\head/mixed\nsecond\nthird\nfourth\nC:\\tail/mixed";
+                let out = truncate_saved_in(text, 1000, 2, side, "grep", &dir, unix_style_paths);
+                let files: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .collect();
+                assert_eq!(files.len(), 1);
+                let path = files[0].path();
+                assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+                let raw = path.display().to_string();
+                let label = if cfg!(windows) {
+                    if unix_style_paths {
+                        raw.replace('\\', "/")
+                    } else {
+                        raw.replace('/', "\\")
+                    }
+                } else {
+                    assert!(raw.contains(r"literal\backslash"));
+                    raw
+                };
+                let hint = format!(
+                    "… [full output (5 lines, {} bytes) saved to {label} — `read` it (with offset/limit) or `grep` it (pattern + path) for the rest, don't re-run] …",
+                    text.len()
+                );
+                let expected = match side {
+                    TruncateSide::Head => format!("C:\\head/mixed\nsecond\n\n{hint}"),
+                    TruncateSide::Middle => format!("\n\n{hint}\n\nfourth\nC:\\tail/mixed"),
+                };
+                assert_eq!(out, expected);
+            }
+        }
+    }
+
+    #[test]
     fn truncate_saved_persists_overflow_and_points_at_it() {
         let dir = tempfile::tempdir().unwrap();
         let text = format!("HEAD\n{}\nTAIL", "x".repeat(50_000));
@@ -3445,6 +3508,7 @@ TAIL-ERROR-LINE",
             TruncateSide::Head,
             "grep",
             dir.path(),
+            false,
         );
         assert!(out.starts_with("HEAD"));
         assert!(out.contains("full output"));
@@ -3469,6 +3533,7 @@ TAIL-ERROR-LINE",
             TruncateSide::Middle,
             "bash",
             dir.path(),
+            false,
         );
         assert!(mid.starts_with("HEAD"));
         assert!(mid.trim_end().ends_with("TAIL"), "tail must survive");
@@ -3489,6 +3554,7 @@ TAIL-ERROR-LINE",
             TruncateSide::Head,
             "grep",
             dir.path(),
+            false,
         );
         // Truncated by lines (kept the head), full copy saved, pointer present.
         assert!(out.starts_with("line 0"));
@@ -3502,7 +3568,15 @@ TAIL-ERROR-LINE",
         let dir = tempfile::tempdir().unwrap();
         // One 500 KB line, no newlines (minified bundle / single-line JSON log).
         let text = "x".repeat(500_000);
-        let out = truncate_saved_in(&text, 10_000, 2000, TruncateSide::Head, "bash", dir.path());
+        let out = truncate_saved_in(
+            &text,
+            10_000,
+            2000,
+            TruncateSide::Head,
+            "bash",
+            dir.path(),
+            false,
+        );
         // The preview must be bounded, not the whole half-megabyte line.
         assert!(
             out.len() < 20_000,
@@ -3518,6 +3592,7 @@ TAIL-ERROR-LINE",
             TruncateSide::Middle,
             "bash",
             dir.path(),
+            false,
         );
         assert!(
             mid.len() < 20_000,
@@ -3529,10 +3604,21 @@ TAIL-ERROR-LINE",
     #[test]
     fn truncate_saved_leaves_small_output_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            truncate_saved_in("short", 100, 100, TruncateSide::Head, "grep", dir.path()),
-            "short"
-        );
+        let text = r"C:\original/mixed\output";
+        for unix_style_paths in [true, false] {
+            assert_eq!(
+                truncate_saved_in(
+                    text,
+                    100,
+                    100,
+                    TruncateSide::Head,
+                    "grep",
+                    dir.path(),
+                    unix_style_paths
+                ),
+                text
+            );
+        }
         // No file written when nothing overflowed.
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }

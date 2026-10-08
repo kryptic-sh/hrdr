@@ -2473,9 +2473,9 @@ and **not** fixed.
   `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
   and refusal labels (including stale-read errors), skipped-file lists, diff
   paths, built-in filesystem tool headlines, read/search/listing labels and
-  filesystem provenance, shared sandbox/secret/swap guard labels, and LSP labels
-  already use it; remaining work includes cwd/status displays, pickers,
-  path-bearing notices, other tools, overflow pointers, and reload propagation.
+  filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
+  and overflow pointers already use it; remaining work includes cwd/status
+  displays, pickers, path-bearing notices, other tools, and reload propagation.
   Keep this display-only: do not change filesystem targets or literal Unix
   backslashes. Preserve unified-diff prefix semantics. Never rewrite file
   bodies, user prose, or captured shell output. Cover both settings and

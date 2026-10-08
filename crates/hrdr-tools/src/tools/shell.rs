@@ -831,7 +831,7 @@ pub(crate) async fn run_streamed_command(
         notes.push_str(&format!(
             "\nnote: this command's full output from an earlier run is saved at {} — \
              grep/read that file instead of re-running, if you only need a different filter",
-            prior.display()
+            crate::display_path(prior, ctx.unix_style_paths)
         ));
     }
     // Record this run's own spool for the next re-run (newest wins per base).
@@ -927,6 +927,7 @@ pub(crate) async fn run_streamed_command(
         overflow_path.as_deref(),
         total_lines,
         total_bytes,
+        ctx.unix_style_paths,
     );
     finish(format!("{body}{notes}"), timed_out, passed, exit_code)
 }
@@ -1631,6 +1632,59 @@ mod tests {
         assert!(out.contains("nope") && out.contains("exit status"), "{out}");
     }
 
+    #[tokio::test]
+    async fn overflow_pointer_styles_preserve_shell_spool_and_reminder() {
+        let Some(shell) = test_env::shell() else {
+            return;
+        };
+        for unix_style_paths in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ctx = ToolContext::new(dir.path());
+            ctx.unix_style_paths = unix_style_paths;
+            ctx.max_output_lines = 2;
+            let command = match shell {
+                Shell::Bash | Shell::Posix => {
+                    r#"printf '%s\n' 'C:\head/mixed' second third fourth 'C:\tail/mixed'"#
+                }
+                Shell::PowerShell => {
+                    r#"Write-Output 'C:\head/mixed' second third fourth 'C:\tail/mixed'"#
+                }
+            };
+            let tool = ShellTool::new(shell);
+            let out = tool
+                .execute(json!({"command": command}), &ctx)
+                .await
+                .unwrap();
+            let spool = ctx.spooled_output_for(command).expect("saved output");
+            let bytes = b"C:\\head/mixed\nsecond\nthird\nfourth\nC:\\tail/mixed\n";
+            assert_eq!(std::fs::read(&spool).unwrap(), bytes);
+            let raw = spool.display().to_string();
+            let label = if cfg!(windows) {
+                if unix_style_paths {
+                    raw.replace('\\', "/")
+                } else {
+                    raw.replace('/', "\\")
+                }
+            } else {
+                raw
+            };
+            let hint = format!(
+                "… [full output (5 lines, {} bytes) saved to {label} — `read` it (with offset/limit) or `grep` it (pattern + path) for the rest, don't re-run] …",
+                bytes.len()
+            );
+            assert_eq!(out, format!("C:\\head/mixed\n\n{hint}"));
+            let repeated = tool
+                .execute(json!({"command": command}), &ctx)
+                .await
+                .unwrap();
+            let reminder = format!(
+                "\nnote: this command's full output from an earlier run is saved at {label} — grep/read that file instead of re-running, if you only need a different filter"
+            );
+            assert!(repeated.ends_with(&reminder), "{repeated}");
+            assert_eq!(std::fs::read(&spool).unwrap(), bytes);
+        }
+    }
+
     /// Regression (MAJOR): head + hint + tail must be re-trimmed to the
     /// `max_output`/`max_output_lines` budget before returning, not just kept
     /// under the roomy 5x in-memory ring. Before the fix, a 200-byte cap could
@@ -1822,7 +1876,7 @@ mod tests {
             .unwrap();
         assert!(
             out.contains("full output from an earlier run is saved at")
-                && out.contains(&spool.display().to_string()),
+                && out.contains(&crate::display_path(&spool, c.unix_style_paths)),
             "the re-run must be pointed at the spool: {out}"
         );
 
