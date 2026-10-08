@@ -150,9 +150,11 @@ returned `WouldBlock` during turnover. Unix nextest passed. Trace the lock
 holder if necessary and, with approval of the test-contract correction, use
 existing bounded `retry_busy` around ordinary binds while retaining deliberate
 contention assertions. The Windows test job independently failed the streaming
-deadline test below. No leak was reported by these failures. Latest runtime
-native Linux/macOS verification remains pending CI; do not describe the full
-feature as cross-platform verified.
+deadline test below. Runtime CI run `37821267488` (`52caee9`) repeated those
+Unix `WouldBlock` and Windows streaming-timeout failures. Linux/macOS nextest,
+all platform Clippy/build/smoke jobs, and dependency checks passed, but the full
+matrix is not green. Do not describe the full feature as cross-platform
+verified.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
