@@ -49,6 +49,11 @@ pub fn display_dir(dir: &Path) -> String {
     }
 }
 
+/// Display form of `dir`, collapsing home before applying the chosen separators.
+pub fn display_dir_with_style(dir: &Path, unix_style_paths: bool) -> String {
+    hrdr_tools::display_path(Path::new(&display_dir(dir)), unix_style_paths)
+}
+
 /// Collapse `home` at a path boundary in `path` to `~`. A prefix match alone
 /// isn't enough: `home = /home/mx` would strip the `/home/mx` off
 /// `/home/mxaddict/proj` too, collapsing it to the bogus `~addict/proj`. Only
@@ -69,8 +74,50 @@ fn collapse_home(path: &str, home: &str) -> String {
 mod tests {
     use super::*;
 
-    // These test the pure `collapse_home` core rather than `display_dir` so they
-    // never touch the process-wide `HOME` — no env mutation, no cross-test race.
+    // Home-boundary cases exercise the pure core without process-wide env mutation.
+
+    #[test]
+    fn explicit_style_collapses_home_before_rendering_and_preserves_identity() {
+        let home = crate::agents_dir::home_dir().expect("sandbox home");
+        let child = home.join("nested").join("child");
+        let sibling = home.with_file_name(format!(
+            "{}-other",
+            home.file_name().unwrap().to_string_lossy()
+        ));
+        let raw = child.to_string_lossy().into_owned();
+        let slug = cwd_slug(&raw);
+        for style in [false, true] {
+            assert_eq!(display_dir_with_style(&home, style), "~");
+            let expected = if cfg!(windows) && !style {
+                r"~\nested\child"
+            } else {
+                "~/nested/child"
+            };
+            assert_eq!(display_dir_with_style(&child, style), expected);
+            let sibling_expected = if cfg!(windows) && style {
+                sibling.to_string_lossy().replace('\\', "/")
+            } else {
+                sibling.to_string_lossy().into_owned()
+            };
+            assert_eq!(display_dir_with_style(&sibling, style), sibling_expected);
+            assert_eq!(child.to_string_lossy(), raw);
+            assert_eq!(cwd_slug(&raw), slug);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_style_preserves_unix_literal_backslashes() {
+        let home = crate::agents_dir::home_dir().expect("sandbox home");
+        let sibling = format!("{}\\literal", home.display());
+        for style in [false, true] {
+            assert_eq!(display_dir_with_style(Path::new(&sibling), style), sibling);
+            assert_eq!(
+                display_dir_with_style(&home.join(r"literal\name"), style),
+                r"~/literal\name"
+            );
+        }
+    }
 
     #[test]
     fn empty_home_does_not_collapse() {

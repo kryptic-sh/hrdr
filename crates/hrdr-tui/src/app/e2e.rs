@@ -9644,6 +9644,83 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
 }
 
 #[tokio::test]
+async fn path_style_reload_updates_cwd_chrome_and_warm_session_picker() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let initial_cwd = h.app.current_cwd();
+    let initial_expected = if cfg!(windows) {
+        initial_cwd.replace('\\', "/")
+    } else {
+        initial_cwd.clone()
+    };
+    assert_eq!(h.app.dir, initial_expected);
+    let cwd = h._tmp.path().join("nested");
+    std::fs::create_dir(&cwd).unwrap();
+    h.app.apply_cwd(cwd.clone());
+    let raw_cwd = cwd.to_string_lossy().into_owned();
+    assert_eq!(
+        h.app.dir,
+        if cfg!(windows) {
+            raw_cwd.replace('\\', "/")
+        } else {
+            raw_cwd.clone()
+        }
+    );
+    let slug = hrdr_agent::cwd_slug(&raw_cwd);
+    let session_path = h._tmp.path().join("session.json");
+    h.app.session_selector = Some(crate::app::session_selector(vec![hrdr_app::SessionMeta {
+        id: "path-style".into(),
+        name: "Path style".into(),
+        cwd: raw_cwd.clone(),
+        updated: chrono::Local::now().timestamp() as u64,
+        path: session_path.clone(),
+        error: None,
+    }]));
+    h.render();
+    let width = h.app.session_rows.as_ref().unwrap().inner_w;
+    for style in [false, true] {
+        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+            .unwrap();
+        let agent = h.app.agent.clone();
+        let guard = agent.lock().await;
+        h.app.apply_config_reload(true);
+        let expected = if cfg!(windows) && style {
+            raw_cwd.replace('\\', "/")
+        } else {
+            raw_cwd.clone()
+        };
+        assert_eq!(
+            h.app.dir, expected,
+            "chrome updates before the agent unlocks"
+        );
+        h.render();
+        let cache = h.app.session_rows.as_ref().unwrap();
+        assert_eq!(cache.inner_w, width);
+        assert_eq!(cache.filter, "");
+        assert_eq!(cache.rows[0].3, expected);
+        let meta = h
+            .app
+            .session_selector
+            .as_ref()
+            .unwrap()
+            .rows()
+            .next()
+            .unwrap();
+        assert_eq!(meta.cwd, raw_cwd);
+        assert_eq!(meta.id, "path-style");
+        assert_eq!(meta.path, session_path);
+        assert_eq!(guard.cwd(), cwd);
+        drop(guard);
+        assert_eq!(h.app.current_cwd(), raw_cwd);
+        assert_eq!(hrdr_agent::cwd_slug(&h.app.current_cwd()), slug);
+        let selector = h.app.session_selector.take();
+        let screen = h.render();
+        assert!(screen.contains(&expected), "{screen}");
+        h.app.session_selector = selector;
+    }
+}
+
+#[tokio::test]
 async fn path_style_reload_reaches_following_tool_results() {
     let _home = isolated_data_home();
     let replies = [false, true]

@@ -90,8 +90,9 @@ mod session;
 mod util;
 
 pub(crate) use completion::Completions;
+use hrdr_agent::display_dir_with_style;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{display_dir, git_branch, is_known_command, is_quit_command};
+use hrdr_app::{git_branch, is_known_command, is_quit_command};
 pub(crate) use selector::{
     CommandSelector, EffortSelector, LoginProviderSelector, ModelSelector, Selector,
     SessionSelector, ThemeSelector, command_selector, effort_selector, login_provider_selector,
@@ -541,6 +542,8 @@ pub(crate) struct App {
     // ---- status bar info ----
     /// Working directory, home-shortened for display.
     pub(crate) dir: String,
+    /// Raw cwd backing the chrome, available while a turn holds the agent lock.
+    dir_cwd: std::path::PathBuf,
     /// Current git branch, if the cwd is in a repo.
     pub(crate) branch: Option<String>,
     /// Icon set for the TUI chrome (status bar glyphs).
@@ -863,7 +866,7 @@ impl App {
         };
         let vim_mode = ui.vim_mode;
         let theme = Theme::load(ui.theme.as_deref());
-        let dir = display_dir(&config.cwd);
+        let dir = display_dir_with_style(&config.cwd, config.unix_style_paths);
         let branch = git_branch(&config.cwd);
         let cwd_for_commands = config.cwd.clone();
         let context_window = config.context_window;
@@ -972,6 +975,7 @@ impl App {
             header_anchor: Instant::now(),
             statusbar_mode,
             dir,
+            dir_cwd: cwd_for_commands.clone(),
             branch,
             icon_mode,
             cfg,
@@ -2753,7 +2757,8 @@ impl App {
     /// common, whether the agent's cwd was set here or the agent itself reported
     /// a change (see [`TuiHost::cwd_changed`](crate::app::commands::TuiHost)).
     fn apply_cwd_view(&mut self, new: &std::path::Path) {
-        self.dir = display_dir(new);
+        self.dir_cwd = new.to_path_buf();
+        self.dir = display_dir_with_style(new, self.cfg.unix_style_paths);
         self.branch = git_branch(new);
         self.file_index_cwd = None; // force a rebuild for the new directory
         self.arm_file_watcher(new);
@@ -2768,6 +2773,7 @@ impl App {
     /// NOT touch the model/provider/endpoint (those are session-scoped).
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
         self.theme = Theme::load(ui.theme.as_deref());
+        self.dir = display_dir_with_style(&self.dir_cwd, cfg.unix_style_paths);
         crate::ui::clear_transcript_cache();
         // Effort and the compaction thresholds are the *agent's* — it publishes them
         // back into the chrome. Updating a frontend copy instead was how a reload

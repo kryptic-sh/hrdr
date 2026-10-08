@@ -2474,16 +2474,17 @@ and **not** fixed.
   and refusal labels (including stale-read errors), skipped-file lists, diff
   paths, built-in filesystem tool headlines, read/search/listing labels and
   filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
-  and overflow pointers already use it; remaining work includes cwd/status
-  displays, pickers, path-bearing notices, and other tools. Live reload updates
-  subsequent main-agent tool calls and newly spawned children; existing children
-  retain their own setting. Cached cwd/picker presentation still needs wiring.
-  Keep this display-only: do not change filesystem targets or literal Unix
-  backslashes. Preserve unified-diff prefix semantics. Never rewrite file
-  bodies, user prose, or captured shell output. Cover both settings and
-  unchanged Unix behavior at each real rendering seam, including config-to-agent
-  wiring. Complete these presentation surfaces before moving to the newly
-  prioritized self-update tool.
+  overflow pointers, cwd chrome, and session-picker cwd rows already use it.
+  Remaining work includes command/status output, discovery/theme labels,
+  path-bearing notices, prompts, attachments/completion labels, and other tools.
+  Live reload updates subsequent main-agent tool calls and newly spawned
+  children; existing children retain their own setting. Cwd/picker caches
+  restyle on reload. Keep this display-only: do not change filesystem targets or
+  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
+  rewrite file bodies, user prose, or captured shell output. Cover both settings
+  and unchanged Unix behavior at each real rendering seam, including
+  config-to-agent wiring. Complete these presentation surfaces before moving to
+  the newly prioritized self-update tool.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

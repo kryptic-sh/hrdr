@@ -135,7 +135,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     if let Some(sel) = &app.model_selector {
         draw_model_selector(f, &app.theme, sel, app.model_loading, app.model_source);
     } else if let Some(sel) = &app.session_selector {
-        draw_session_selector(f, &app.theme, sel, &mut app.session_rows);
+        let unix_style_paths = app.unix_style_paths();
+        draw_session_selector(f, &app.theme, sel, &mut app.session_rows, unix_style_paths);
     } else if let Some(sel) = &app.theme_selector {
         draw_theme_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.effort_selector {
@@ -647,17 +648,16 @@ fn draw_theme_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ThemeSele
     );
 }
 
-/// Pre-rendered rows + column widths for the `/resume` picker, recomputed only
-/// when the filter or the modal width moves. The picker repaints every frame,
-/// and the `relative_time`/`display_dir` formatting plus the three width passes
-/// are pure functions of the (filter, width) pair — caching them keeps a frame
-/// from redoing all of it for rows that have not changed.
+/// Pre-rendered rows + column widths for the `/resume` picker, recomputed when
+/// the filter, modal width or path style changes. The picker repaints every
+/// frame; caching keeps unchanged rows from repeating formatting and width passes.
 pub(crate) struct SessionRows {
     /// The filter these rows and widths were derived from.
     pub(crate) filter: String,
     /// The modal inner width they were laid out for (changes on terminal
     /// resize, which narrows the modal below its 110-column cap).
     pub(crate) inner_w: usize,
+    unix_style_paths: bool,
     /// id · name · age · cwd · error, in filtered display order.
     pub(crate) rows: Vec<(String, String, String, String, Option<String>)>,
     pub(crate) id_w: usize,
@@ -667,7 +667,7 @@ pub(crate) struct SessionRows {
 }
 
 impl SessionRows {
-    fn build(sel: &crate::app::SessionSelector, inner_w: usize) -> Self {
+    fn build(sel: &crate::app::SessionSelector, inner_w: usize, unix_style_paths: bool) -> Self {
         // Pre-render each visible row's cells: id · name · age · cwd · error.
         let rows: Vec<(String, String, String, String, Option<String>)> = sel
             .rows()
@@ -675,7 +675,10 @@ impl SessionRows {
                 let ts = chrono::DateTime::from_timestamp(m.updated as i64, 0)
                     .map(|t| hrdr_app::relative_time(t.with_timezone(&chrono::Local)))
                     .unwrap_or_else(|| "—".to_string());
-                let cwd = hrdr_app::display_dir(std::path::Path::new(&m.cwd));
+                let cwd = hrdr_agent::display_dir_with_style(
+                    std::path::Path::new(&m.cwd),
+                    unix_style_paths,
+                );
                 (m.id.clone(), m.name.clone(), ts, cwd, m.error.clone())
             })
             .collect();
@@ -707,6 +710,7 @@ impl SessionRows {
         Self {
             filter: sel.filter.clone(),
             inner_w,
+            unix_style_paths,
             rows,
             id_w,
             ts_w,
@@ -724,6 +728,7 @@ fn draw_session_selector(
     theme: &Theme,
     sel: &crate::app::SessionSelector,
     cache: &mut Option<SessionRows>,
+    unix_style_paths: bool,
 ) {
     // A wider modal than the two-column pickers, and a custom four-column body,
     // so it keeps its own layout on top of the shared `modal_frame` chrome.
@@ -732,13 +737,11 @@ fn draw_session_selector(
     };
     let inner_w = inner.width as usize;
 
-    // The rows and widths only move with the filter or the width — serve the
-    // memoized set and keep the per-frame work to the highlight window.
-    if cache
-        .as_ref()
-        .is_none_or(|c| c.filter != sel.filter || c.inner_w != inner_w)
-    {
-        *cache = Some(SessionRows::build(sel, inner_w));
+    // Keep per-frame work to the highlight window while the cache key matches.
+    if cache.as_ref().is_none_or(|c| {
+        c.filter != sel.filter || c.inner_w != inner_w || c.unix_style_paths != unix_style_paths
+    }) {
+        *cache = Some(SessionRows::build(sel, inner_w, unix_style_paths));
     }
     let rows = &cache.as_ref().expect("just built").rows;
     let id_w = cache.as_ref().expect("just built").id_w;

@@ -39,7 +39,7 @@ pub use chatgpt_models::{
     chatgpt_model_catalog, parse_catalog,
 };
 mod paths;
-pub use paths::{cwd_slug, display_dir};
+pub use paths::{cwd_slug, display_dir, display_dir_with_style};
 mod commands;
 pub use commands::{
     Command, builtin_commands, command_match_key, discover_commands, expand_body, expand_command,
