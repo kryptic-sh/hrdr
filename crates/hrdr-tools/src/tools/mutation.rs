@@ -94,7 +94,9 @@ pub async fn apply_file_change(
     };
     // Diagnostics run on the *post-hook* content — what's actually on disk.
     if let Some(lsp) = &ctx.lsp
-        && let Some(note) = lsp.diagnostics_note(path, &content_after).await
+        && let Some(note) = lsp
+            .diagnostics_note(path, &content_after, ctx.unix_style_paths)
+            .await
     {
         notes.push(note);
     }

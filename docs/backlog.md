@@ -2473,8 +2473,8 @@ and **not** fixed.
   `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
   and refusal labels (including stale-read errors), skipped-file lists, diff
   paths, built-in filesystem tool headlines, read/search/listing labels and
-  filesystem provenance and shared sandbox/secret/swap guard labels already use
-  it; remaining work includes LSP labels, cwd/status displays, pickers,
+  filesystem provenance, shared sandbox/secret/swap guard labels, and LSP labels
+  already use it; remaining work includes cwd/status displays, pickers,
   path-bearing notices, other tools, overflow pointers, and reload propagation.
   Keep this display-only: do not change filesystem targets or literal Unix
   backslashes. Preserve unified-diff prefix semantics. Never rewrite file

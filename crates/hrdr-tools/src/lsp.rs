@@ -204,7 +204,12 @@ impl LspRegistry {
     /// format any **errors** as a note for the tool result. `None` when the
     /// file has no server, the server isn't installed, nothing arrived in
     /// time, or the file is clean.
-    pub async fn diagnostics_note(&self, path: &Path, content: &str) -> Option<String> {
+    pub async fn diagnostics_note(
+        &self,
+        path: &Path,
+        content: &str,
+        unix_style_paths: bool,
+    ) -> Option<String> {
         // Only files inside the workspace the servers were initialized
         // against. A sub-agent scoped to a subdirectory (or a temp-dir
         // scratch file) sits outside the servers' rootUri, where diagnostics
@@ -240,7 +245,7 @@ impl LspRegistry {
                 return None;
             }
         };
-        format_diagnostics(&self.root, path, &diags)
+        format_diagnostics(&self.root, path, &diags, unix_style_paths)
     }
 
     /// The running client for `config`, spawning it on first use. `None` when
@@ -1111,7 +1116,12 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Resul
 /// hints are deliberately dropped — they'd bury the signal on lint-heavy
 /// codebases; the model gets what would actually break the build. Repeats —
 /// same start position, severity, message and `source` — collapse to one.
-fn format_diagnostics(root: &Path, path: &Path, diags: &[Value]) -> Option<String> {
+fn format_diagnostics(
+    root: &Path,
+    path: &Path,
+    diags: &[Value],
+    unix_style_paths: bool,
+) -> Option<String> {
     // The same problem reaches us more than once: servers re-publish overlapping
     // sets, and separate analysis passes report one error twice. Dedupe *before*
     // the error filter and the cap, so the cap's budget goes to distinct
@@ -1141,7 +1151,7 @@ fn format_diagnostics(root: &Path, path: &Path, diags: &[Value]) -> Option<Strin
     if errors.is_empty() {
         return None;
     }
-    let rel = path.strip_prefix(root).unwrap_or(path).display();
+    let rel = crate::display_path(path.strip_prefix(root).unwrap_or(path), unix_style_paths);
     let mut lines = Vec::with_capacity(errors.len().min(MAX_DIAG_LINES) + 1);
     lines.push(format!(
         "[lsp] {} error{} in {rel}:",
@@ -1236,6 +1246,34 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_path_styles_preserve_message_and_source() {
+        let root = Path::new("/proj");
+        let path = root.join(r"src/nested\name/main.rs");
+        let message = r"expected src/a.rs, found src\b.rs";
+        let diags = [
+            json!({"message": message, "source": "check/a"}),
+            json!({"message": message, "source": r"check\a"}),
+        ];
+        for style in [true, false] {
+            let label = if cfg!(windows) {
+                if style {
+                    "src/nested/name/main.rs"
+                } else {
+                    r"src\nested\name\main.rs"
+                }
+            } else {
+                r"src/nested\name/main.rs"
+            };
+            assert_eq!(
+                format_diagnostics(root, &path, &diags, style).unwrap(),
+                format!(
+                    "[lsp] 2 errors in {label}:\n  {label}:1:1 {message}\n  {label}:1:1 {message}"
+                )
+            );
+        }
+    }
+
+    #[test]
     fn diagnostics_format_errors_only_and_cap() {
         let root = Path::new("/proj");
         let path = Path::new("/proj/src/main.rs");
@@ -1248,12 +1286,17 @@ mod tests {
 
         // Warnings alone → clean.
         assert_eq!(
-            format_diagnostics(root, path, std::slice::from_ref(&warn)),
+            format_diagnostics(root, path, std::slice::from_ref(&warn), true),
             None
         );
         // Errors are listed 1-based, warnings dropped.
-        let note =
-            format_diagnostics(root, path, &[warn, err(9, "mismatched types\nlong help")]).unwrap();
+        let note = format_diagnostics(
+            root,
+            path,
+            &[warn, err(9, "mismatched types\nlong help")],
+            true,
+        )
+        .unwrap();
         assert!(note.contains("1 error in src/main.rs"), "{note}");
         assert!(
             note.contains("src/main.rs:10:5 mismatched types"),
@@ -1261,7 +1304,7 @@ mod tests {
         );
         // The cap kicks in past MAX_DIAG_LINES.
         let many: Vec<Value> = (0..12).map(|i| err(i, "boom")).collect();
-        let note = format_diagnostics(root, path, &many).unwrap();
+        let note = format_diagnostics(root, path, &many, true).unwrap();
         assert!(note.contains("12 errors"), "{note}");
         assert!(note.contains("…and 2 more"), "{note}");
     }
@@ -1295,6 +1338,7 @@ mod tests {
                 err(4, 8, "mismatched types", Some("clippy")),
                 err(4, 8, "mismatched types", Some("rustc")),
             ],
+            true,
         )
         .unwrap();
         assert!(note.contains("4 errors"), "{note}");
@@ -1317,6 +1361,7 @@ mod tests {
                 err(1, 1, "first", None),
                 err(9, 1, "second", None),
             ],
+            true,
         )
         .unwrap();
         let listed: Vec<&str> = note.lines().skip(1).collect();
@@ -1329,7 +1374,7 @@ mod tests {
         let unique: Vec<Value> = (0..10).map(|i| err(i, 0, "boom", None)).collect();
         let mut doubled = unique.clone();
         doubled.extend(unique);
-        let note = format_diagnostics(root, path, &doubled).unwrap();
+        let note = format_diagnostics(root, path, &doubled, true).unwrap();
         assert!(note.contains("10 errors"), "{note}");
         assert!(!note.contains("more"), "{note}");
     }
@@ -1354,7 +1399,7 @@ mod tests {
             LspServerStatus::NotYetUsed
         );
         let _ = registry
-            .diagnostics_note(&dir.path().join("a.xyz"), "x")
+            .diagnostics_note(&dir.path().join("a.xyz"), "x", true)
             .await;
         assert_eq!(
             registry.statuses().await[0].status,
@@ -1381,7 +1426,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .diagnostics_note(Path::new("/elsewhere/a.xyz"), "boom")
+                .diagnostics_note(Path::new("/elsewhere/a.xyz"), "boom", true)
                 .await,
             None
         );
@@ -1428,7 +1473,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("fake_lsp.py");
         std::fs::write(&server, FAKE_LSP_PY).unwrap();
-        let file = dir.path().join("main.xyz");
+        let relative = Path::new(r"src/nested\name/main.xyz");
+        let file = dir.path().join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
 
         let registry = Arc::new(LspRegistry::new(
             dir.path().to_path_buf(),
@@ -1443,15 +1490,23 @@ mod tests {
 
         // The fake server flags any line containing "boom".
         std::fs::write(&file, "ok\nboom here\n").unwrap();
-        let note = registry
-            .diagnostics_note(&file, "ok\nboom here\n")
-            .await
-            .expect("an error note");
-        assert!(note.contains("1 error in main.xyz"), "{note}");
-        assert!(note.contains("main.xyz:2:1 found boom"), "{note}");
+        for style in [true, false, true] {
+            let note = registry
+                .diagnostics_note(&file, "ok\nboom here\n", style)
+                .await
+                .expect("an error note");
+            let label = crate::display_path(relative, style);
+            assert_eq!(
+                note,
+                format!("[lsp] 1 error in {label}:\n  {label}:2:1 found boom")
+            );
+        }
 
         // Clean content → no note (didChange path, same warm server).
-        assert_eq!(registry.diagnostics_note(&file, "all good\n").await, None);
+        assert_eq!(
+            registry.diagnostics_note(&file, "all good\n", true).await,
+            None
+        );
         assert_eq!(
             registry.statuses().await[0].status,
             LspServerStatus::Running,
@@ -1461,7 +1516,7 @@ mod tests {
         // No server registered for the extension → silent no-op.
         assert_eq!(
             registry
-                .diagnostics_note(Path::new("/tmp/x.nope"), "boom")
+                .diagnostics_note(Path::new("/tmp/x.nope"), "boom", true)
                 .await,
             None
         );
@@ -1471,17 +1526,29 @@ mod tests {
         use crate::Tool as _;
         let mut ctx = crate::ToolContext::new(dir.path());
         ctx.lsp = Some(registry);
-        let result = crate::WriteTool
-            .execute(
-                serde_json::json!({"path": "fresh.xyz", "content": "boom again\n"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(
-            result.contains("[lsp] 1 error in fresh.xyz"),
-            "the diagnostics note rides the write result: {result}"
-        );
+        for (index, style) in [true, false, true].into_iter().enumerate() {
+            ctx.unix_style_paths = style;
+            let relative = relative.with_file_name(format!("fresh-{index}.xyz"));
+            let content = "boom src/a.rs src\\b.rs\n";
+            let result = crate::WriteTool
+                .execute(
+                    serde_json::json!({"path": relative, "content": content}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let label = crate::display_path(&relative, style);
+            assert!(
+                result.contains(&format!(
+                    "[lsp] 1 error in {label}:\n  {label}:1:1 found boom"
+                )),
+                "the diagnostics note rides the write result: {result}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(&relative)).unwrap(),
+                content
+            );
+        }
     }
 
     /// Regression (MINOR): a JSON-RPC `error` response (e.g. `rename`'s
@@ -1752,7 +1819,7 @@ mod tests {
         let file = dir.path().join("main.xyz");
 
         let start = std::time::Instant::now();
-        let note = registry.diagnostics_note(&file, &big).await;
+        let note = registry.diagnostics_note(&file, &big, true).await;
         assert_eq!(
             note, None,
             "a wedged server yields no diagnostics, not a hang"
@@ -1767,7 +1834,7 @@ mod tests {
         // returns immediately without re-hitting the write timeout.
         assert_eq!(registry.statuses().await[0].status, LspServerStatus::Failed);
         let start = std::time::Instant::now();
-        assert_eq!(registry.diagnostics_note(&file, &big).await, None);
+        assert_eq!(registry.diagnostics_note(&file, &big, true).await, None);
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "a retired server is skipped fast: took {:?}",
