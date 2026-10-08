@@ -9644,6 +9644,56 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
 }
 
 #[tokio::test]
+async fn path_style_reload_reaches_following_tool_results() {
+    let _home = isolated_data_home();
+    let replies = [false, true]
+        .into_iter()
+        .flat_map(|_| {
+            [
+                MockReply::ToolCall {
+                    name: "read".into(),
+                    args: r#"{"path":"nested/missing"}"#.into(),
+                },
+                MockReply::Text("done".into()),
+            ]
+        })
+        .collect();
+    let mut h = Harness::new(replies).await;
+    for style in [false, true] {
+        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+            .unwrap();
+        let agent = h.app.agent.clone();
+        let guard = agent.lock().await;
+        h.app.apply_config_reload(true);
+        tokio::task::yield_now().await;
+        drop(guard);
+        assert_eq!(agent.lock().await.unix_style_paths(), style);
+        h.submit("read the missing file").await;
+        let result = h
+            .app
+            .transcript()
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::Tool {
+                    name,
+                    result,
+                    done: true,
+                    ..
+                } if name == "read" => Some(result),
+                _ => None,
+            })
+            .expect("the real read tool completed");
+        let suffix = if cfg!(windows) && !style {
+            r"nested\missing"
+        } else {
+            "nested/missing"
+        };
+        assert!(result.contains(suffix), "{result}");
+    }
+}
+
+#[tokio::test]
 async fn path_style_reload_rebuilds_warm_tool_headers_without_changing_payloads() {
     let _home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;

@@ -1459,6 +1459,7 @@ impl hrdr_tools::Tool for SubagentTool {
             .to_string();
 
         let mut cfg = self.base.clone();
+        cfg.unix_style_paths = ctx.unix_style_paths;
         let runtime = self
             .runtime
             .lock()

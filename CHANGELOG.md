@@ -18,9 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saved-output pointers (including shell re-run reminders). Access checks, LSP
   protocol paths, and diagnostic message text remain unchanged. Stale-read
   errors preserve the original culprit command. Headline caches refresh on
-  configuration reload. Unix rendering, stored tool arguments/results, file
-  contents, and filesystem targets are unchanged. Other path presentation
-  surfaces remain pending.
+  configuration reload, which also updates subsequent main-agent tool calls and
+  newly spawned children; existing children retain their own setting. Unix
+  rendering, stored tool arguments/results, file contents, and filesystem
+  targets are unchanged. Other path presentation surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

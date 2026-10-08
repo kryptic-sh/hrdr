@@ -2772,10 +2772,11 @@ impl App {
         // Effort and the compaction thresholds are the *agent's* — it publishes them
         // back into the chrome. Updating a frontend copy instead was how a reload
         // could move the context gauge while the agent kept its old behaviour.
-        let (effort, auto_compact, reserved) = (
+        let (effort, auto_compact, reserved, unix_style_paths) = (
             cfg.effort.clone(),
             cfg.auto_compact,
             cfg.compaction_reserved,
+            cfg.unix_style_paths,
         );
         let agent = self.agent.clone();
         tokio::spawn(async move {
@@ -2783,6 +2784,7 @@ impl App {
             a.set_effort(effort);
             a.set_auto_compact(auto_compact);
             a.set_compaction_reserved(reserved);
+            a.set_unix_style_paths(unix_style_paths);
         });
         self.bell = ui.bell;
         self.todo_ttl = ui.todo_ttl;

@@ -1412,6 +1412,16 @@ impl Agent {
         self.publish_delegation_runtime();
     }
 
+    /// Whether tool-result path labels use Unix-style separators.
+    pub fn unix_style_paths(&self) -> bool {
+        self.ctx.unix_style_paths
+    }
+
+    /// Set path-label presentation for subsequent tool calls.
+    pub fn set_unix_style_paths(&mut self, enabled: bool) {
+        self.ctx.unix_style_paths = enabled;
+    }
+
     /// Shared TODO list, mutated by the `todo` tool.
     pub fn todos(&self) -> Arc<Mutex<Vec<TodoItem>>> {
         self.ctx.todos.clone()

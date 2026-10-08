@@ -5804,6 +5804,90 @@ fn read_events(ts_dir: &std::path::Path) -> (std::path::PathBuf, Vec<transcript_
     (files[0].clone(), events)
 }
 
+#[tokio::test]
+async fn path_style_agent_constructor_and_live_tool_results() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg("http://127.0.0.1:1/v1".into(), cwd.path());
+    cfg.unix_style_paths = false;
+    let mut agent = Agent::new(cfg).unwrap();
+    for style in [false, true, false] {
+        assert_eq!(agent.unix_style_paths(), style);
+        let error = agent
+            .tools
+            .get("read")
+            .unwrap()
+            .execute(json!({"path": "nested/missing"}), &agent.ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        let suffix = if cfg!(windows) && !style {
+            r"nested\missing"
+        } else {
+            "nested/missing"
+        };
+        assert!(error.ends_with(suffix), "{error}");
+        agent.set_unix_style_paths(!style);
+    }
+}
+
+#[tokio::test]
+async fn path_style_new_child_inherits_invocation_not_startup() {
+    use hrdr_tools::Tool;
+    for style in [false, true] {
+        let server = MockServer::start(vec![MockResp::Sse(vec![
+            text_chunk("c1", "done"),
+            stop_chunk("c1"),
+            "[DONE]".into(),
+        ])])
+        .await;
+        let cwd = tempfile::tempdir().unwrap();
+        let live = super::AgentRegistry::new();
+        let mut cfg = test_cfg(server.base_url(), cwd.path());
+        cfg.read_only = true;
+        cfg.unix_style_paths = !style;
+        let runtime = super::new_delegation_runtime(&cfg, &super::ResolvedModel::from_config(&cfg));
+        let tool = SubagentTool::new(
+            cfg,
+            runtime,
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            None,
+            live.clone(),
+        );
+        let mut ctx = hrdr_tools::ToolContext::new(cwd.path());
+        ctx.unix_style_paths = style;
+        tool.execute(json!({"prompt": "p", "description": "path style"}), &ctx)
+            .await
+            .unwrap();
+        await_background(&tool, &ctx).await;
+        let child = live.with(|entries| {
+            assert_eq!(entries.len(), 1);
+            entries[0].agent.clone()
+        });
+        // Later parent changes do not rewrite a retained child's settings.
+        ctx.unix_style_paths = !style;
+        let child = child.lock().await;
+        assert_eq!(child.unix_style_paths(), style);
+        let error = child
+            .tools
+            .get("read")
+            .unwrap()
+            .execute(json!({"path": "nested/missing"}), &child.ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        let suffix = if cfg!(windows) && !style {
+            r"nested\missing"
+        } else {
+            "nested/missing"
+        };
+        assert!(error.ends_with(suffix), "{error}");
+    }
+}
+
 /// A delegated sub-agent stays addressable: registered while it runs, and
 /// once its answer has reached the main agent it survives the prune only
 /// while a frontend is looking at it.

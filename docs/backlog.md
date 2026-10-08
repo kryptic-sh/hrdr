@@ -2475,7 +2475,9 @@ and **not** fixed.
   paths, built-in filesystem tool headlines, read/search/listing labels and
   filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
   and overflow pointers already use it; remaining work includes cwd/status
-  displays, pickers, path-bearing notices, other tools, and reload propagation.
+  displays, pickers, path-bearing notices, and other tools. Live reload updates
+  subsequent main-agent tool calls and newly spawned children; existing children
+  retain their own setting. Cached cwd/picker presentation still needs wiring.
   Keep this display-only: do not change filesystem targets or literal Unix
   backslashes. Preserve unified-diff prefix semantics. Never rewrite file
   bodies, user prose, or captured shell output. Cover both settings and
