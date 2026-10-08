@@ -552,7 +552,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 out.push('\n');
                 out.push_str(&lsp_status_text(&agent).await);
                 // Session health: report any corrupt/unreadable files.
-                let diags = crate::session_diagnostics();
+                let diags = crate::session_diagnostics(unix_style_paths);
                 if !diags.is_empty() {
                     out.push_str(&format!("\nsessions: {} corrupt file(s)", diags.len()));
                     for (path, err) in &diags {
@@ -1002,6 +1002,62 @@ mod tests {
                 "{output}"
             );
         }
+    }
+
+    #[test]
+    fn session_list_and_doctor_use_host_path_style() {
+        hrdr_test_support::with_test_env(|tmp| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let cwd = tmp.path().join(r"literal\session");
+                let mut host = TestHost::new(cwd.clone());
+                for style in [true, false] {
+                    host.unix_style_paths = style;
+                    host.begin_session_selector();
+                    assert_eq!(
+                        host.info_log.last().unwrap(),
+                        &format!(
+                            "no saved sessions in {}",
+                            hrdr_tools::display_path(&crate::sessions_dir(), style)
+                        )
+                    );
+                }
+                let state = crate::SessionState {
+                    name: "path-style".into(),
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    messages: vec![hrdr_agent::Message::user("hi")],
+                    ..Default::default()
+                };
+                crate::Session::new(state).save("path-style").unwrap();
+                let path = crate::session_file_path(&cwd.to_string_lossy(), "path-style");
+                let broken = path.parent().unwrap().join("broken.json");
+                std::fs::write(&broken, "{{{").unwrap();
+                let error = crate::list_sessions()
+                    .into_iter()
+                    .find(|m| m.error.is_some())
+                    .unwrap()
+                    .error
+                    .unwrap();
+                for style in [true, false] {
+                    host.unix_style_paths = style;
+                    host.begin_session_selector();
+                    assert!(host.info_log.last().unwrap().contains(&format!(
+                        "path-style — path-style  [{}]",
+                        hrdr_tools::display_path(&cwd, style)
+                    )));
+                    host.async_log.lock().unwrap().clear();
+                    assert!(dispatch(&mut host, "/doctor"));
+                    settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+                    let output = host.async_log.lock().unwrap().join("\n");
+                    assert!(
+                        output.contains(&format!(
+                            "\n  {}: {error}",
+                            hrdr_tools::display_path(&broken, style)
+                        )),
+                        "{output}"
+                    );
+                }
+            });
+        });
     }
 
     /// `/goal` starts a hidden model turn: the model, not the slash parser,

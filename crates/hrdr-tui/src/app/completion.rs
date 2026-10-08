@@ -58,7 +58,9 @@ impl super::App {
         }
         // Argument completion: "/cmd partial" / ":command partial" — enum
         // values, theme names, session ids, or a command's declared `args:`.
-        if let Some((start, items)) = arg_completions(content, &self.commands) {
+        if let Some((start, items)) =
+            arg_completions(content, &self.commands, self.unix_style_paths())
+        {
             return Some(Completions {
                 kind: CompletionKind::Arg { token_start: start },
                 anchor_col: content[..start].chars().count(),

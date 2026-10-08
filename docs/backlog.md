@@ -2480,8 +2480,9 @@ and **not** fixed.
   paths, built-in filesystem tool headlines, read/search/listing labels and
   filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
   overflow pointers, cwd chrome, session-picker cwd rows, command/status output,
-  reload/resume notices, and default editor notices already use it. Remaining
-  work includes discovery/theme labels, path-bearing notices, prompts,
+  reload/resume notices, default editor notices, session listings, login storage
+  notices, and theme source labels already use it. Remaining work includes
+  command/skill discovery labels, path-bearing notices, prompts,
   attachments/completion labels, and other tools. Live reload updates subsequent
   main-agent tool calls and newly spawned children; existing children retain
   their own setting. Cwd/picker caches restyle on reload. Keep this

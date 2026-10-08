@@ -176,6 +176,23 @@ pub(crate) fn theme_selector(choices: Vec<ThemeChoice>) -> ThemeSelector {
     Selector::new(choices, theme_choice_haystack, filter_themes)
 }
 
+impl Selector<ThemeChoice> {
+    /// Refresh source labels while retaining the query and the selected raw spec.
+    pub(crate) fn replace_theme_choices(&mut self, choices: Vec<ThemeChoice>) {
+        let current = self.current().map(|c| c.spec.clone());
+        self.haystacks = choices.iter().map(theme_choice_haystack).collect();
+        self.choices = choices;
+        self.filtered = (self.filter_fn)(&self.haystacks, &self.filter);
+        self.selected = current
+            .and_then(|spec| {
+                self.filtered
+                    .iter()
+                    .position(|&i| self.choices[i].spec == spec)
+            })
+            .unwrap_or(0);
+    }
+}
+
 pub(crate) type EffortSelector = Selector<EffortChoice>;
 pub(crate) fn effort_selector(choices: Vec<EffortChoice>) -> EffortSelector {
     Selector::new(choices, effort_choice_haystack, filter_effort_choices)

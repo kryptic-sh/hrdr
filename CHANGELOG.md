@@ -18,13 +18,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saved-output pointers (including shell re-run reminders). Cwd chrome and
   session-picker cwd rows also honor the setting and refresh on reload.
   `/status`, `/cwd`, `/export`, `/doctor`, reload/resume notices, and default
-  editor notices format their path labels with the same setting. Access checks,
-  LSP protocol paths, and diagnostic message text remain unchanged. Stale-read
-  errors preserve the original culprit command. Headline caches refresh on
-  configuration reload, which also updates subsequent main-agent tool calls and
-  newly spawned children; existing children retain their own setting. Unix
-  rendering, stored tool arguments/results, file contents, and filesystem
-  targets are unchanged. Other path presentation surfaces remain pending.
+  editor notices format their path labels with the same setting. Session lists,
+  login storage notices, and theme source labels also honor it; open theme
+  pickers and completions refresh on reload without changing stored theme specs.
+  Access checks, LSP protocol paths, and diagnostic message text remain
+  unchanged. Stale-read errors preserve the original culprit command. Headline
+  caches refresh on configuration reload, which also updates subsequent
+  main-agent tool calls and newly spawned children; existing children retain
+  their own setting. Unix rendering, stored tool arguments/results, file
+  contents, and filesystem targets are unchanged. Other path presentation
+  surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

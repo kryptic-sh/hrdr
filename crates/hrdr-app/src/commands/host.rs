@@ -368,7 +368,7 @@ pub trait CommandHost {
     /// saved sessions, newest first. A frontend that supports it stashes the
     /// selector in a modal slot; the default falls back to the text listing.
     fn begin_session_selector(&mut self) {
-        self.info(crate::session_list_text());
+        self.info(crate::session_list_text(self.unix_style_paths()));
     }
 
     /// Open the interactive `/commands` picker — the discovered `:name` prompt
@@ -420,7 +420,7 @@ pub trait CommandHost {
     /// modal slot; the default lists the choices as text.
     fn begin_theme_selector(&mut self) {
         let mut s = String::from("themes (apply with /theme <name or path>):");
-        for c in crate::theme_choices() {
+        for c in crate::theme_choices(self.unix_style_paths()) {
             s.push_str(&format!("\n  {}  [{}]", c.name, c.source));
         }
         self.info(s);

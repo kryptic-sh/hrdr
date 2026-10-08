@@ -52,7 +52,7 @@ pub struct ThemeChoice {
 /// `*.toml` under [`user_themes_dir`], sorted by name. A user theme whose stem
 /// collides with a built-in name still appears — its path spec keeps the two
 /// distinct.
-pub fn theme_choices() -> Vec<ThemeChoice> {
+pub fn theme_choices(unix_style_paths: bool) -> Vec<ThemeChoice> {
     let mut out: Vec<ThemeChoice> = BUILTIN_THEMES
         .iter()
         .map(|(name, _)| ThemeChoice {
@@ -74,7 +74,7 @@ pub fn theme_choices() -> Vec<ThemeChoice> {
             Some(ThemeChoice {
                 name: path.file_stem()?.to_string_lossy().into_owned(),
                 spec: path.display().to_string(),
-                source: crate::display_dir(path.parent()?),
+                source: hrdr_agent::display_dir_with_style(path.parent()?, unix_style_paths),
             })
         })
         .collect();
@@ -151,14 +151,34 @@ mod tests {
         assert!(builtin_theme_toml("TokyoNight").is_some());
         assert!(builtin_theme_toml(" nord ").is_some());
         assert!(builtin_theme_toml("no-such-theme").is_none());
-        let choices = theme_choices();
+        let choices = theme_choices(true);
         assert_eq!(choices[0].name, "tokyonight", "default first");
         assert!(choices.len() >= BUILTIN_THEMES.len());
     }
 
     #[test]
+    fn theme_path_labels_follow_style_without_changing_spec() {
+        hrdr_test_support::with_test_env(|_| {
+            let dir = user_themes_dir().unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("custom.toml");
+            std::fs::write(&path, BUILTIN_THEMES[0].1).unwrap();
+            for style in [true, false] {
+                let choices = theme_choices(style);
+                let custom = choices.iter().find(|c| c.name == "custom").unwrap();
+                assert_eq!(custom.spec, path.to_string_lossy());
+                assert_eq!(
+                    custom.source,
+                    hrdr_agent::display_dir_with_style(&dir, style)
+                );
+                assert_eq!(choices[0].source, "built-in");
+            }
+        });
+    }
+
+    #[test]
     fn filter_themes_matches_name_and_source() {
-        let choices: Vec<ThemeChoice> = theme_choices()
+        let choices: Vec<ThemeChoice> = theme_choices(true)
             .into_iter()
             .filter(|c| c.source == "built-in")
             .collect();

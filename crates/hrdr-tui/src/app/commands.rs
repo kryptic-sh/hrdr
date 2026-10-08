@@ -542,7 +542,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         if sessions.is_empty() {
             self.info(format!(
                 "no saved sessions yet in {}",
-                hrdr_app::sessions_dir().display()
+                hrdr_tools::display_path(&hrdr_app::sessions_dir(), self.app.unix_style_paths())
             ));
             return;
         }
@@ -561,7 +561,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // Remember the theme in force for Esc / a filter that matches nothing
         // (the picker live-previews the highlighted row).
         self.app.theme_original = Some(self.app.theme.clone());
-        self.app.theme_selector = Some(super::theme_selector(hrdr_app::theme_choices()));
+        self.app.theme_selector = Some(super::theme_selector(hrdr_app::theme_choices(
+            self.app.unix_style_paths(),
+        )));
     }
     fn help_tips(&self) -> Option<String> {
         // The footer no longer repeats these, so `/help` is where they live.
@@ -764,7 +766,8 @@ impl super::App {
                     self.login_modal = match pick {
                         hrdr_app::LoginPick::Done => None,
                         hrdr_app::LoginPick::NeedsKey { name } => {
-                            let warning = hrdr_app::login_key_warning(&name);
+                            let warning =
+                                hrdr_app::login_key_warning(&name, self.unix_style_paths());
                             Some(super::LoginModal::Key {
                                 name,
                                 label: c.label,

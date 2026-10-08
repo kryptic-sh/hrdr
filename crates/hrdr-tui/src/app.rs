@@ -2774,6 +2774,12 @@ impl App {
     fn apply_runtime_config(&mut self, cfg: &AgentConfig, ui: &hrdr_app::UiConfig) {
         self.theme = Theme::load(ui.theme.as_deref());
         self.dir = display_dir_with_style(&self.dir_cwd, cfg.unix_style_paths);
+        if self.cfg.unix_style_paths != cfg.unix_style_paths {
+            self.completion_cache = None;
+            if let Some(sel) = &mut self.theme_selector {
+                sel.replace_theme_choices(hrdr_app::theme_choices(cfg.unix_style_paths));
+            }
+        }
         crate::ui::clear_transcript_cache();
         // Effort and the compaction thresholds are the *agent's* — it publishes them
         // back into the chrome. Updating a frontend copy instead was how a reload
@@ -3682,6 +3688,62 @@ mod tests {
         // The cwd goes back with it: an app whose working directory has been
         // deleted saves and reads nothing like a real one.
         (app, key, tmp)
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_restyles_warm_theme_picker_and_completion() {
+        use hrdr_app::CommandHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = AgentConfig {
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            unix_style_paths: false,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false,
+            ..Default::default()
+        };
+        let mut app = App::new(cfg.clone(), ui.clone(), "logo").unwrap();
+        let dir = hrdr_app::user_themes_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["style-reload-a", "style-reload-b"] {
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                hrdr_app::BUILTIN_THEMES[0].1,
+            )
+            .unwrap();
+        }
+        super::commands::TuiHost { app: &mut app }.begin_theme_selector();
+        let sel = app.theme_selector.as_mut().unwrap();
+        for c in "style-reload".chars() {
+            sel.push_char(c);
+        }
+        sel.down();
+        let spec = sel.current().unwrap().spec.clone();
+        app.editor.set_content("/theme style-reload-b");
+        assert_eq!(
+            app.active_completions().unwrap().items[0].1,
+            hrdr_agent::display_dir_with_style(&dir, false)
+        );
+        for style in [true, false] {
+            cfg.unix_style_paths = style;
+            app.apply_runtime_config(&cfg, &ui);
+            app.cfg = cfg.clone();
+            let sel = app.theme_selector.as_ref().unwrap();
+            assert_eq!(sel.filter, "style-reload");
+            assert_eq!(sel.selected, 1);
+            assert_eq!(sel.current().unwrap().spec, spec);
+            assert_eq!(
+                sel.current().unwrap().source,
+                hrdr_agent::display_dir_with_style(&dir, style)
+            );
+            assert_eq!(
+                app.active_completions().unwrap().items[0].1,
+                hrdr_agent::display_dir_with_style(&dir, style)
+            );
+        }
     }
 
     #[test]

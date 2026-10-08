@@ -286,12 +286,12 @@ fn apply_keyless(name: &str, host: &mut dyn CommandHost) {
 }
 
 /// The plaintext-storage warning shown before the key is entered.
-pub fn login_key_warning(name: &str) -> String {
+pub fn login_key_warning(name: &str, unix_style_paths: bool) -> String {
     format!(
         "Enter your API key for {name} ({}).\n⚠ It will be saved in PLAINTEXT at {} — anyone \
          who can read that file can use the key.",
         provider_label(name),
-        auth_location(),
+        auth_location(unix_style_paths),
     )
 }
 
@@ -301,7 +301,7 @@ pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
     // Save first so the credential survives even if the live switch races a
     // busy turn; report the exact path back to the user.
     let saved = match hrdr_agent::save_auth_token(name, key) {
-        Ok(path) => path.display().to_string(),
+        Ok(path) => hrdr_tools::display_path(&path, host.unix_style_paths()),
         Err(e) => {
             host.info(format!("couldn't save the API key: {e}"));
             return;
@@ -342,9 +342,9 @@ fn provider_prompt() -> String {
 }
 
 /// Where credentials are written, for the on-wizard warning.
-fn auth_location() -> String {
+fn auth_location(unix_style_paths: bool) -> String {
     hrdr_agent::auth_file_path()
-        .map(|p| p.display().to_string())
+        .map(|p| hrdr_tools::display_path(&p, unix_style_paths))
         .unwrap_or_else(|| "the hrdr config directory".to_string())
 }
 
@@ -412,7 +412,7 @@ impl LoginWizard {
             LoginPick::NeedsKey { name } => {
                 host.info(format!(
                     "{}\nPaste the key, or /cancel to abort.",
-                    login_key_warning(&name)
+                    login_key_warning(&name, host.unix_style_paths())
                 ));
                 self.step = Step::Key { name };
                 false
@@ -997,6 +997,39 @@ mod tests {
             "both auth methods are shown"
         );
         assert!(p.contains("/cancel"), "prompt should note how to abort");
+    }
+
+    #[test]
+    fn login_path_labels_follow_style_without_exposing_key() {
+        hrdr_test_support::with_test_env(|_| {
+            for style in [true, false] {
+                let mut host = RouteTestHost::new();
+                host.cfg.unix_style_paths = style;
+                let path = hrdr_agent::auth_file_path().unwrap();
+                let label = hrdr_tools::display_path(&path, style);
+                let mut wizard = LoginWizard::start(&mut host);
+                assert!(!wizard.step("anthropic", &mut host));
+                assert!(
+                    host.info_lines
+                        .last()
+                        .unwrap()
+                        .contains(&format!("PLAINTEXT at {label}"))
+                );
+                login_enter_key("local", "test-fake-key-path-style", &mut host);
+                assert!(
+                    host.info_lines
+                        .last()
+                        .unwrap()
+                        .contains(&format!("Key saved to {label}"))
+                );
+                assert!(
+                    host.info_lines
+                        .iter()
+                        .all(|line| !line.contains("test-fake-key-path-style"))
+                );
+                assert!(path.exists());
+            }
+        });
     }
 
     /// A minimal [`CommandHost`] for the routing tests: real provider resolution

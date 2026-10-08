@@ -233,6 +233,7 @@ pub fn command_arg_offset(rest: &str) -> Option<usize> {
 pub fn arg_completions(
     input: &str,
     commands: &[crate::Command],
+    unix_style_paths: bool,
 ) -> Option<(usize, Vec<(String, String)>)> {
     let (sigil, rest) = match input.chars().next()? {
         c @ ('/' | ':') => (c, &input[1..]),
@@ -272,7 +273,7 @@ pub fn arg_completions(
             ]),
             "find" => set(&[("clear", "drop the search")]),
             "theme" => {
-                let mut rows: Vec<(String, String)> = crate::theme_choices()
+                let mut rows: Vec<(String, String)> = crate::theme_choices(unix_style_paths)
                     .into_iter()
                     .map(|c| (c.name, c.source))
                     .collect();
@@ -419,7 +420,7 @@ mod tests {
             model_invocable: true,
         }];
         let vals = |i: &str| {
-            arg_completions(i, &commands)
+            arg_completions(i, &commands, true)
                 .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
                 .unwrap_or_default()
         };
@@ -434,12 +435,12 @@ mod tests {
         assert_eq!(vals(":deploy st"), vec!["staging"]);
         assert_eq!(vals(":deploy ").len(), 2);
         // No argument yet, unknown command, or no match → nothing.
-        assert!(arg_completions("/statusbar", &commands).is_none());
-        assert!(arg_completions("/help x", &commands).is_none());
-        assert!(arg_completions("/statusbar zz", &commands).is_none());
-        assert!(arg_completions("hello there", &commands).is_none());
+        assert!(arg_completions("/statusbar", &commands, true).is_none());
+        assert!(arg_completions("/help x", &commands, true).is_none());
+        assert!(arg_completions("/statusbar zz", &commands, true).is_none());
+        assert!(arg_completions("hello there", &commands, true).is_none());
         // The offset points at the argument, past the whitespace run.
-        let (start, _) = arg_completions("/verbose   off", &commands).unwrap();
+        let (start, _) = arg_completions("/verbose   off", &commands, true).unwrap();
         assert_eq!(&"/verbose   off"[start..], "off");
     }
 
@@ -543,7 +544,7 @@ mod tests {
     fn resume_completion_memoizes_and_refreshes_on_session_change() {
         let commands = Vec::new();
         let vals = |i: &str| {
-            arg_completions(i, &commands)
+            arg_completions(i, &commands, true)
                 .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
                 .unwrap_or_default()
         };

@@ -49,10 +49,13 @@ pub fn open_latest_session_for_cwd(
 ///
 /// Corrupt/unreadable sessions are shown with an `[error]` tag in place of
 /// the name and cwd, so they are visible rather than silently skipped.
-pub fn session_list_text() -> String {
+pub fn session_list_text(unix_style_paths: bool) -> String {
     let sessions = crate::list_sessions();
     if sessions.is_empty() {
-        return format!("no saved sessions in {}", crate::sessions_dir().display());
+        return format!(
+            "no saved sessions in {}",
+            hrdr_tools::display_path(&crate::sessions_dir(), unix_style_paths)
+        );
     }
     let mut s = String::from("saved sessions (newest first; resume by id or name):");
     let mut corrupt = 0;
@@ -61,7 +64,12 @@ pub fn session_list_text() -> String {
             corrupt += 1;
             s.push_str(&format!("\n  {} — [unreadable: {err}]", m.id));
         } else {
-            s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
+            s.push_str(&format!(
+                "\n  {} — {}  [{}]",
+                m.id,
+                m.name,
+                hrdr_tools::display_path(std::path::Path::new(&m.cwd), unix_style_paths)
+            ));
         }
     }
     if corrupt > 0 {
@@ -74,10 +82,13 @@ pub fn session_list_text() -> String {
 
 /// Return diagnostic information about every corrupt/unreadable session file
 /// found in the sessions directory. Used by `/doctor` to report session health.
-pub fn session_diagnostics() -> Vec<(String, String)> {
+pub fn session_diagnostics(unix_style_paths: bool) -> Vec<(String, String)> {
     crate::list_sessions()
         .into_iter()
-        .filter_map(|m| m.error.map(|err| (m.path.display().to_string(), err)))
+        .filter_map(|m| {
+            m.error
+                .map(|err| (hrdr_tools::display_path(&m.path, unix_style_paths), err))
+        })
         .collect()
 }
 
@@ -133,9 +144,57 @@ mod tests {
                 .to_path_buf();
             std::fs::write(dir.join("broken.json"), "{{{").unwrap();
 
-            let diags = session_diagnostics();
+            let diags = session_diagnostics(true);
             assert_eq!(diags.len(), 1);
             assert!(diags[0].0.ends_with("broken.json"), "path: {}", diags[0].0);
+        });
+    }
+
+    #[test]
+    fn session_path_labels_follow_style_without_changing_identity() {
+        hrdr_test_support::with_test_env(|tmp| {
+            for style in [true, false] {
+                assert_eq!(
+                    session_list_text(style),
+                    format!(
+                        "no saved sessions in {}",
+                        hrdr_tools::display_path(&crate::sessions_dir(), style)
+                    )
+                );
+            }
+            let cwd = tmp
+                .path()
+                .join(r"literal\name")
+                .to_string_lossy()
+                .into_owned();
+            Session::new(state("valid", &cwd)).save("valid").unwrap();
+            let path = crate::session_file_path(&cwd, "valid");
+            let broken = path.parent().unwrap().join("broken.json");
+            std::fs::write(&broken, "{{{").unwrap();
+            let raw = crate::list_sessions();
+            let error = raw
+                .iter()
+                .find(|m| m.error.is_some())
+                .unwrap()
+                .error
+                .clone()
+                .unwrap();
+            for style in [true, false] {
+                assert!(session_list_text(style).contains(&format!(
+                    "valid — valid  [{}]",
+                    hrdr_tools::display_path(std::path::Path::new(&cwd), style)
+                )));
+                assert_eq!(
+                    session_diagnostics(style),
+                    vec![(hrdr_tools::display_path(&broken, style), error.clone())]
+                );
+                let valid = raw.iter().find(|m| m.id == "valid").unwrap();
+                assert_eq!(valid.cwd, cwd);
+                assert_eq!(
+                    session_haystack(valid),
+                    format!("valid valid {cwd}").to_lowercase()
+                );
+            }
         });
     }
 
